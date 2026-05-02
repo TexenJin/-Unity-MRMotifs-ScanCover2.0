@@ -1,0 +1,690 @@
+﻿<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>ScanCover Master Strategy Document</title>
+<style>
+body { font-family: Calibri, Microsoft YaHei, sans-serif; font-size: 11pt; line-height: 1.5; margin: 28px; }
+h1 { font-size: 20pt; margin: 18px 0 10px 0; }
+h2 { font-size: 16pt; margin: 16px 0 8px 0; }
+h3 { font-size: 13pt; margin: 14px 0 6px 0; }
+p { margin: 6px 0; }
+ul { margin: 6px 0 6px 24px; }
+li { margin: 2px 0; }
+code { font-family: Consolas, monospace; font-size: 10pt; }
+</style>
+</head>
+<body>
+<h1>ScanCover Master Strategy Document</h1>
+<h2>1. Document Purpose</h2>
+<p>This is the consolidated planning document for the current ScanCover direction.</p>
+<p>It merges:</p>
+<ul>
+<li>Phase 0 architecture lock</li>
+<li>Phase 0.5 external project findings</li>
+<li>overall strategy</li>
+<li>engineering roadmap</li>
+<li>staged implementation plan</li>
+<li>current script responsibility boundaries</li>
+</ul>
+<p>This document does not modify runtime behavior. It defines the technical direction before Phase 1 implementation starts.</p>
+<h2>2. Problem Statement</h2>
+<p>The existing ScanCover pipeline can already:</p>
+<ul>
+<li>accumulate scan evidence</li>
+<li>commit stable spatial cells</li>
+<li>build chunk-based frozen geometry</li>
+<li>build a blue display shell from chunk output</li>
+<li>provide HUD and interaction flow</li>
+</ul>
+<p>But current tests showed a clear limitation:</p>
+<p><b>chunk-based geometry is good at representing occupancy, not continuous surface</b></p>
+<p><b>chunk growth and state changes are not equivalent to actual geometric shrink-wrap</b></p>
+<p><b>display smoothing can improve appearance without proving real surface convergence</b></p>
+<p><b>the current route is insufficient for the target visual effect shown by Quest-like room mesh examples</b></p>
+<p>The main problem is therefore:</p>
+<p>**ScanCover currently has a support geometry pipeline, but does not yet have a true primary surface pipeline.**</p>
+<h2>3. Target Effect</h2>
+<p>The target effect is not just &quot;scan coverage.&quot;</p>
+<p>The intended result is:</p>
+<ul>
+<li>a thin, room-facing, continuous surface</li>
+<li>gradual geometric correction over time</li>
+<li>visible surface attachment to walls, floor, furniture, and other room boundaries</li>
+<li>a blue mesh that reflects real surface evolution</li>
+<li>no visible large frame hitches during interaction</li>
+</ul>
+<p>More specifically:</p>
+<p><b>early scan:</b></p>
+<ul>
+<li>surface appears quickly, even if rough</li>
+</ul>
+<p><b>mid scan:</b></p>
+<ul>
+<li>surface visibly adjusts</li>
+<li>edges tighten</li>
+<li>local geometry becomes more room-aligned</li>
+</ul>
+<p><b>late scan:</b></p>
+<ul>
+<li>surface stabilizes</li>
+<li>display mesh becomes coherent and presentation-ready</li>
+</ul>
+<h2>4. Locked Core Conclusion</h2>
+<h3>4.1 Main Direction</h3>
+<p>The future ScanCover mainline should be:</p>
+<ul>
+<li>`depth-driven surface` as the primary geometry layer</li>
+<li>`voxel/chunk` as the support layer</li>
+<li>blue display mesh as the visualization of `depth-driven surface`</li>
+</ul>
+<h3>4.2 Why</h3>
+<p>Because:</p>
+<ul>
+<li>voxel/chunk logic is fundamentally occupancy-oriented</li>
+<li>target effect is fundamentally surface-oriented</li>
+<li>a support layer can remain coarse and stable</li>
+<li>the primary surface must remain continuous and locally correctable</li>
+</ul>
+<h3>4.3 What Must Stop</h3>
+<p>The following should no longer be treated as the main path:</p>
+<p><b>chunk state/color change as proof of geometric convergence</b></p>
+<p><b>display-layer smoothing as proof of real shrink-wrap</b></p>
+<p><b>chunk-driven visual surface as the long-term architecture</b></p>
+<p><b>full-scene synchronous rebuild as the standard update path</b></p>
+<h2>5. Layer Model</h2>
+<h2>5.1 Depth-Driven Surface</h2>
+<p>Role:</p>
+<ul>
+<li>primary geometry</li>
+<li>boundary owner</li>
+<li>shrink-wrap carrier</li>
+<li>room-facing surface</li>
+<li>future source of the blue display mesh</li>
+</ul>
+<p>It should be:</p>
+<ul>
+<li>world-space stable</li>
+<li>continuously correctable</li>
+<li>patch-local</li>
+<li>surface-first rather than occupancy-first</li>
+</ul>
+<p>This is the future:</p>
+<ul>
+<li>knife</li>
+<li>cage</li>
+<li>surface itself</li>
+</ul>
+<h2>5.2 Voxel / Chunk Support Layer</h2>
+<p>Role:</p>
+<ul>
+<li>collision</li>
+<li>anchoring</li>
+<li>coarse occupancy</li>
+<li>fallback support</li>
+</ul>
+<p>It should be:</p>
+<ul>
+<li>low frequency</li>
+<li>low resolution compared to the surface layer</li>
+<li>stable</li>
+<li>decoupled from display updates</li>
+</ul>
+<p>This is not the final visual truth.</p>
+<h2>5.3 Blue Display Mesh</h2>
+<p>Role:</p>
+<ul>
+<li>observation layer</li>
+<li>presentation layer</li>
+<li>validation layer for surface evolution</li>
+</ul>
+<p>It should visualize:</p>
+<ul>
+<li>the primary `depth-driven surface`</li>
+<li>not chunk occupancy as the final authority</li>
+</ul>
+<p>It should support:</p>
+<ul>
+<li>wireframe</li>
+<li>thin shell</li>
+<li>previous vs current comparison when needed</li>
+</ul>
+<h2>5.4 HUD / Debug Layer</h2>
+<p>Role:</p>
+<ul>
+<li>reporting only</li>
+<li>not geometry truth</li>
+</ul>
+<p>It should provide:</p>
+<ul>
+<li>coverage metrics</li>
+<li>stability metrics</li>
+<li>hole fill metrics</li>
+<li>mesh/display metrics</li>
+<li>patch/debug state as needed</li>
+</ul>
+<h2>6. Why The Previous Chunk Route Was Insufficient</h2>
+<p>Earlier observations showed:</p>
+<p><b>chunk bodies often appeared as a large mass and then stabilized</b></p>
+<p><b>red/blue state transitions did not correspond to visible shrink-wrap</b></p>
+<p><b>geometry did not visibly tighten around observed surfaces</b></p>
+<p><b>visual smoothing could create the impression of improvement without real underlying correction</b></p>
+<p>This happened because:</p>
+<p><b>the system confirmed occupied voxels rather than fitting continuous surfaces</b></p>
+<p><b>voxel positions were largely locked to grid structure</b></p>
+<p><b>commit behavior expressed stability, not iterative geometric correction</b></p>
+<p><b>hole fill filled occupancy gaps but did not fit a continuous boundary</b></p>
+<p>Conclusion:</p>
+<p>**The old route was not failing due to parameter tuning alone. It was structurally the wrong primary representation for the target effect.**</p>
+<h2>7. External Findings From `v83PCA-Rebuild`</h2>
+<p>An external project review was done at:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild`</li>
+</ul>
+<p>This review strongly reinforced the new direction.</p>
+<h3>7.1 Highest-Value External Scripts</h3>
+<p>#### A. <code>CustomEnvironmentDepthRaycaster.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/Scripts/鏍稿績/CustomEnvironmentDepthRaycaster.cs`</li>
+</ul>
+<p>Most important value:</p>
+<ul>
+<li>ready-made depth-query backbone</li>
+</ul>
+<p>Notable capabilities:</p>
+<ul>
+<li>depth texel to world position</li>
+<li>world position to linear depth</li>
+<li>normal reconstruction</li>
+<li>depth-based raycast</li>
+<li>camera/frustum matrix handling</li>
+</ul>
+<p>Strategic value:</p>
+<ul>
+<li>likely direct conceptual backbone for Phase 1 surface input</li>
+</ul>
+<p>#### B. <code>RgbZMapCPUBuilder.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/Scripts/妫嬬洏鏍″噯/妫嬬洏鏍″噯/娣卞害鏁版嵁/RgbZMapCPUBuilder.cs`</li>
+</ul>
+<p>Most important value:</p>
+<ul>
+<li>temporal stabilization strategy for surface-driven data</li>
+</ul>
+<p>Notable capabilities:</p>
+<ul>
+<li>event-driven rebuild cadence</li>
+<li>RGB-aligned z map construction</li>
+<li>CPU z-buffer rasterization</li>
+<li>motion-aware EMA</li>
+<li>jump reset logic</li>
+<li>hole fill</li>
+<li>readiness heuristics</li>
+</ul>
+<p>Strategic value:</p>
+<ul>
+<li>provides direct inspiration for surface patch stabilization and update budgeting</li>
+</ul>
+<p>#### C. <code>DepthGridPointCloud.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/Scripts/妫嬬洏鏍″噯/瀹為獙/DepthGridPointCloud.cs`</li>
+</ul>
+<p>Most important value:</p>
+<ul>
+<li>demonstrates a direct world-space visible-surface sample field</li>
+</ul>
+<p>Strategic value:</p>
+<ul>
+<li>useful conceptual minimal model for `depth-driven surface`</li>
+</ul>
+<p>#### D. <code>RandomPlaneScatter.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/Scripts/鏍稿績/RandomPlaneScatter.cs`</li>
+</ul>
+<p>Most important value:</p>
+<ul>
+<li>demonstrates low-cost normal-aligned placement on visible depth surfaces</li>
+</ul>
+<p>Strategic value:</p>
+<ul>
+<li>close to &quot;tile/patch on surface&quot; prototype logic</li>
+</ul>
+<h3>7.2 Secondary References</h3>
+<p>#### <code>MetaDepthTextureConvert2OCV.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/Scripts/鏍稿績/MetaDepthTextureConvert2OCV.cs`</li>
+</ul>
+<p>Value:</p>
+<ul>
+<li>debugging / offline analysis tool</li>
+</ul>
+<p>#### <code>CameraToWorldManager.cs</code></p>
+<p>Path:</p>
+<ul>
+<li>`D:/PCA/v83PCA-Rebuild/Assets/Calib/CameraToWorld/Scripts/CameraToWorldManager.cs`</li>
+</ul>
+<p>Value:</p>
+<ul>
+<li>camera/world alignment reference</li>
+</ul>
+<h3>7.3 External Review Conclusion</h3>
+<p>The external review does not provide a ready-made final solver.</p>
+<p>It does provide strong evidence that the right route is:</p>
+<p><b>depth query backbone</b></p>
+<p><b>world-space visible surface samples</b></p>
+<p><b>temporal stabilization</b></p>
+<p><b>patch-local reconstruction</b></p>
+<p><b>display mesh derived from that surface</b></p>
+<h2>8. Performance Reality</h2>
+<p>The target system must maintain:</p>
+<ul>
+<li>good visual quality</li>
+<li>no visible frame hitches</li>
+</ul>
+<p>This does not mean &quot;perfect full-scene high-quality reconstruction every frame.&quot;</p>
+<p>It means:</p>
+<ul>
+<li>the user should not perceive obvious stutter</li>
+<li>quality should be prioritized in the active region</li>
+<li>convergence should be progressive rather than instantaneous</li>
+</ul>
+<h2>8.1 Main Performance Pressure Sources</h2>
+<p><b>primary surface update cost</b></p>
+<p><b>temporal stabilization cost</b></p>
+<p><b>local patch topology update cost</b></p>
+<p><b>display mesh refresh cost</b></p>
+<p><b>support collision layer refresh cost</b></p>
+<p>The biggest cost is not the blue mesh itself.</p>
+<p>The biggest cost is maintaining a stable, correctable primary surface beneath it.</p>
+<h2>8.2 Performance Rules</h2>
+<p><b>never rebuild the whole scene every frame</b></p>
+<p><b>decouple surface, display, and collider frequencies</b></p>
+<p><b>only rebuild dirty patches</b></p>
+<p><b>keep collider lower-frequency than display</b></p>
+<p><b>budget work per frame</b></p>
+<p><b>prioritize center/active area quality over global uniformity</b></p>
+<h2>8.3 Practical Standard</h2>
+<p>The real target is:</p>
+<ul>
+<li>no visible hitching</li>
+<li>not mathematically maximal quality at all times</li>
+</ul>
+<p>This is realistic.</p>
+<p>A full-scene, fully dynamic, always-high-resolution reconstruction path is not realistic on-device.</p>
+<h2>9. Full Strategy</h2>
+<h2>9.1 Overall Direction</h2>
+<p><b>stop extending chunk as if chunk were the final surface</b></p>
+<p><b>build a new `depth-driven surface` path alongside the current support stack</b></p>
+<p><b>keep voxel/chunk for:</b></p>
+<ul>
+<li>collision</li>
+<li>anchoring</li>
+<li>coarse occupancy</li>
+<li>fallback support</li>
+</ul>
+<p><b>migrate blue display mesh to the surface path once the surface becomes valid</b></p>
+<h2>9.2 Visual Interpretation</h2>
+<p>During debugging, the best external manifestation of geometric correction is:</p>
+<p><b>wireframe shell</b></p>
+<p><b>thin transparent shell</b></p>
+<p><b>previous vs current comparison</b></p>
+<p>Chunk blocks are not a good long-term observation medium for shrink-wrap behavior.</p>
+<h2>9.3 Intended Representation Evolution</h2>
+<p><b>early phase:</b></p>
+<ul>
+<li>points / surfels / tiles</li>
+</ul>
+<p><b>middle phase:</b></p>
+<ul>
+<li>local patch shell</li>
+</ul>
+<p><b>late phase:</b></p>
+<ul>
+<li>blue triangle mesh shell</li>
+</ul>
+<p>This staged representation can align with the target video-like appearance while controlling cost.</p>
+<h2>10. Engineering Roadmap</h2>
+<h2>10.1 Data Structures</h2>
+<h3>A. Primary Surface Sample</h3>
+<p>Each surface sample or patch-local support element should eventually track:</p>
+<ul>
+<li>`positionWS`</li>
+<li>`normalWS`</li>
+<li>`confidence`</li>
+<li>`stability`</li>
+<li>`lastUpdateTime`</li>
+<li>source patch id</li>
+<li>room-facing / valid-facing state</li>
+</ul>
+<h3>B. Support Voxel</h3>
+<p>Each support element only needs:</p>
+<ul>
+<li>occupancy</li>
+<li>hit count</li>
+<li>update time</li>
+<li>support-state / collider-state</li>
+<li>patch relation if needed</li>
+</ul>
+<h3>C. Patch Container</h3>
+<p>Each patch should track:</p>
+<ul>
+<li>spatial bounds</li>
+<li>local sample set</li>
+<li>current display cache</li>
+<li>previous display cache if needed</li>
+<li>dirty flag</li>
+<li>stable flag</li>
+<li>priority</li>
+</ul>
+<h2>10.2 Update Pipeline</h2>
+<h3>A. Sampling Stage</h3>
+<p>Input:</p>
+<ul>
+<li>depth data</li>
+<li>pose</li>
+<li>current view/sampling region</li>
+</ul>
+<p>Output:</p>
+<ul>
+<li>visible world-space samples</li>
+<li>local normal estimates</li>
+</ul>
+<h3>B. Surface Fusion Stage</h3>
+<p>Input:</p>
+<ul>
+<li>new visible samples</li>
+<li>existing patch samples</li>
+</ul>
+<p>Output:</p>
+<ul>
+<li>updated primary surface state</li>
+</ul>
+<p>Should include:</p>
+<ul>
+<li>nearest association</li>
+<li>local correction</li>
+<li>confidence accumulation</li>
+<li>stability update</li>
+<li>outlier rejection</li>
+</ul>
+<h3>C. Dirty Patch Decision Stage</h3>
+<p>Determines:</p>
+<ul>
+<li>which patches need display rebuild</li>
+<li>which patches need support-layer refresh</li>
+</ul>
+<h3>D. Display Rebuild Stage</h3>
+<p>Builds:</p>
+<ul>
+<li>wireframe</li>
+<li>shell mesh</li>
+<li>local blue mesh output</li>
+</ul>
+<p>Only for dirty patches.</p>
+<h3>E. Support Layer Refresh Stage</h3>
+<p>Updates:</p>
+<ul>
+<li>coarse voxel/chunk/collider representation</li>
+</ul>
+<p>At a lower frequency.</p>
+<h2>10.3 Frequency Separation</h2>
+<h3>High Frequency</h3>
+<ul>
+<li>sample ingestion</li>
+<li>local sample fusion</li>
+</ul>
+<h3>Mid Frequency</h3>
+<ul>
+<li>patch stabilization</li>
+<li>patch priority updates</li>
+</ul>
+<h3>Low Frequency</h3>
+<ul>
+<li>display shell rebuild</li>
+</ul>
+<h3>Lower Frequency</h3>
+<ul>
+<li>voxel/collider refresh</li>
+</ul>
+<h2>10.4 What Must Never Be Reintroduced</h2>
+<p><b>full-scene synchronous display rebuild as normal path</b></p>
+<p><b>collider refresh at the same rate as visible surface updates</b></p>
+<p><b>chunk color-state logic presented as geometric truth</b></p>
+<p><b>display smoothing treated as proof of convergence</b></p>
+<h2>11. Staged Implementation Plan</h2>
+<h2>Phase 0: Architecture Lock</h2>
+<p>Status:</p>
+<ul>
+<li>complete</li>
+</ul>
+<p>Output:</p>
+<ul>
+<li>architecture lock</li>
+<li>script responsibility map</li>
+</ul>
+<p>Acceptance:</p>
+<ul>
+<li>`depth-driven surface` accepted as mainline</li>
+<li>chunk/voxel accepted as support layer</li>
+</ul>
+<h2>Phase 0.5: External Reference Review</h2>
+<p>Status:</p>
+<ul>
+<li>complete</li>
+</ul>
+<p>Output:</p>
+<ul>
+<li>`v83PCA-Rebuild` findings document</li>
+</ul>
+<p>Acceptance:</p>
+<ul>
+<li>external references identified for Phase 1 input</li>
+</ul>
+<h2>Phase 1: Minimal Surface Path</h2>
+<p>Goal:</p>
+<ul>
+<li>introduce a new `depth-driven surface` prototype path without replacing the current stack yet</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>world-space visible surface samples</li>
+<li>patch-local update path</li>
+<li>no obvious hitch from basic updates</li>
+</ul>
+<p>Not yet required:</p>
+<ul>
+<li>final blue mesh</li>
+<li>final collider integration</li>
+</ul>
+<h2>Phase 2: Real Shrink-Wrap Validation</h2>
+<p>Goal:</p>
+<ul>
+<li>prove that geometry itself changes over time in watched regions</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>the same observed region visibly corrects over time</li>
+<li>not just color/state changes</li>
+</ul>
+<p>Validation methods:</p>
+<ul>
+<li>wireframe shell</li>
+<li>current vs previous shell comparison</li>
+</ul>
+<h2>Phase 3: Blue Surface Display</h2>
+<p>Goal:</p>
+<ul>
+<li>let blue mesh directly reflect the primary surface</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>patch-local blue mesh generation</li>
+<li>wireframe mode and thin-shell mode</li>
+<li>no full-scene rebuild dependency</li>
+</ul>
+<h2>Phase 4: Support Layer Refactor</h2>
+<p>Goal:</p>
+<ul>
+<li>reframe voxel/chunk strictly as support/collision layer</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>collision remains stable</li>
+<li>display and collision become clearly decoupled</li>
+</ul>
+<h2>Phase 5: Performance Stabilization</h2>
+<p>Goal:</p>
+<ul>
+<li>achieve no visible hitching</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>patch budgeting</li>
+<li>dirty-region update only</li>
+<li>lower-frequency collider updates</li>
+<li>bounded per-frame work</li>
+</ul>
+<h2>Phase 6: Final Presentation Layer</h2>
+<p>Goal:</p>
+<ul>
+<li>push toward final visual quality</li>
+</ul>
+<p>Required result:</p>
+<ul>
+<li>stable blue shell appearance</li>
+<li>reduced obstruction</li>
+<li>visual polish and motif integration</li>
+</ul>
+<h2>Phase 7: Metrics And Acceptance</h2>
+<p>Goal:</p>
+<ul>
+<li>make visual quality and runtime metrics correlate</li>
+</ul>
+<p>Candidate metrics:</p>
+<ul>
+<li>coverage</li>
+<li>stability</li>
+<li>surface change rate</li>
+<li>patch stable ratio</li>
+<li>visible mesh completeness</li>
+<li>average and peak frame cost</li>
+</ul>
+<h2>12. Current Script Responsibility Map</h2>
+<h2>12.1 Core Scan Stack</h2>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonBuilder_A.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>scan acquisition</li>
+<li>voxel/cell accumulation</li>
+<li>summary statistics</li>
+<li>reveal-wave gated acquisition</li>
+<li>sampling bounds filtering</li>
+</ul>
+<p>Not the future primary surface.</p>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonMesher_B.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>chunk generation from confirmed voxel cells</li>
+<li>collider generation</li>
+<li>voxel hole fill</li>
+</ul>
+<p>Support layer only.</p>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonSessionController.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>scan/freeze/clear/toggle session orchestration</li>
+<li>auto-commit logic</li>
+<li>builder/mesher/display coordination</li>
+<li>new Input System controller input</li>
+</ul>
+<p>Not a geometry solver.</p>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonHUD.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>four-score HUD</li>
+<li>state display</li>
+<li>sampling bounds UI</li>
+</ul>
+<p>Debug/reporting only.</p>
+<h2>12.2 Display Stack</h2>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverDisplaySurfaceBuilder.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>merges chunk output into display shell</li>
+<li>compare modes</li>
+<li>wire/face display modes</li>
+<li>locked display snapshots</li>
+<li>near-view and small-island culling</li>
+</ul>
+<p>Useful as an observation layer reference.</p>
+<p>Not the future source of true geometric convergence.</p>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverDisplaySurfaceRenderer.cs`</h3>
+<p>Current role:</p>
+<ul>
+<li>display visibility control</li>
+<li>display rebuild timing</li>
+<li>source chunk hide/show coordination</li>
+</ul>
+<p>Presentation coordinator only.</p>
+<h2>12.3 Debug / Prototype Stack</h2>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonDebugViz_A.cs`</h3>
+<ul>
+<li>debug visualization</li>
+</ul>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/05/ScanCoverCollisionVerifier.cs`</h3>
+<ul>
+<li>collider validation tool</li>
+</ul>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/05/ScanCoverTileOverlayPrototype.cs`</h3>
+<ul>
+<li>lightweight surface-aligned tile/patch prototype</li>
+<li>conceptually closer to future surface presentation than chunk bodies are</li>
+</ul>
+<h2>12.4 Integration / Effect Stack</h2>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/01/...`</h3>
+<ul>
+<li>reference frame support</li>
+<li>snapping/following</li>
+<li>shockwave bridge</li>
+<li>isolated effect driver</li>
+</ul>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/02/...`</h3>
+<ul>
+<li>reveal manager</li>
+<li>shockwave scan spawner motif</li>
+</ul>
+<h3>`Assets/MRMotifs/ScanCover/Scripts/03/...`</h3>
+<ul>
+<li>URP depth reveal overlay renderer feature</li>
+</ul>
+<p>These are downstream integration layers.</p>
+<p>They should not define the new geometry core.</p>
+<h2>13. Phase 1 Entry Conditions</h2>
+<p>Phase 1 should only begin under these assumptions:</p>
+<p><b>chunk is no longer treated as the final visual truth</b></p>
+<p><b>`depth-driven surface` is accepted as the new main path</b></p>
+<p><b>blue mesh will eventually be driven from the new surface path</b></p>
+<p><b>Phase 1 may start as a parallel prototype path inside ScanCover</b></p>
+<p><b>current runtime remains intact until the new path proves itself</b></p>
+<h2>14. Immediate Next Step</h2>
+<p>The next concrete task after this document is:</p>
+<p><b>define the minimal data structure for `depth-driven surface`</b></p>
+<p><b>define the first script/module boundary for the new path</b></p>
+<p><b>decide whether the first representation is:</b></p>
+<ul>
+<li>point/surfel</li>
+<li>tile/patch</li>
+<li>local shell mesh</li>
+</ul>
+<p>The recommended starting point is:</p>
+<ul>
+<li>patch-local surface samples first</li>
+<li>blue mesh later</li>
+</ul>
+<p>Because that is the lowest-risk way to prove real geometric correction before building final presentation.</p>
+</body>
+</html>

@@ -1,0 +1,116 @@
+#pragma kernel Clear
+#pragma kernel Integrate
+#pragma kernel CopyVolumeToBuffer
+
+Texture2D<float4> _SourceWorldPositionTexture;
+Texture2D<float4> _SourceWorldNormalTexture;
+Texture2D<float4> _SourceObservationMetaTexture;
+
+RWTexture3D<float> _TsdfVolume;
+RWTexture3D<float> _WeightVolume;
+RWStructuredBuffer<float> _TsdfReadbackBuffer;
+RWStructuredBuffer<float> _WeightReadbackBuffer;
+
+float4 _SourceSize;
+int3 _VolumeSize;
+int _VolumeVoxelCount;
+float _VoxelSize;
+float _TruncationPositiveMeters;
+float _TruncationNegativeMeters;
+float _MinObservationConfidence;
+float _MinNormalFacingDot;
+float _MinDepthMeters;
+float _MaxDepthMeters;
+float _MaxIntegratedWeight;
+float4 _CameraWorldPosition;
+float4x4 _WorldToClip;
+float4x4 _VolumeLocalToWorld;
+
+float3 VoxelIndexToLocalPosition(uint3 id)
+{
+    float3 volumeSize = float3(_VolumeSize);
+    return ((float3)id + 0.5 - 0.5 * volumeSize) * _VoxelSize;
+}
+
+[numthreads(4, 4, 4)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_VolumeSize.x || id.y >= (uint)_VolumeSize.y || id.z >= (uint)_VolumeSize.z)
+        return;
+
+    _TsdfVolume[id] = 1.0;
+    _WeightVolume[id] = 0.0;
+}
+
+[numthreads(4, 4, 4)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_VolumeSize.x || id.y >= (uint)_VolumeSize.y || id.z >= (uint)_VolumeSize.z)
+        return;
+
+    float3 voxelLocal = VoxelIndexToLocalPosition(id);
+    float3 voxelWorld = mul(_VolumeLocalToWorld, float4(voxelLocal, 1.0)).xyz;
+    float4 clip = mul(_WorldToClip, float4(voxelWorld, 1.0));
+    if (clip.w <= 1e-5)
+        return;
+
+    float3 ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < -1.0 || ndc.z > 1.0)
+        return;
+
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    int2 pixel = int2(saturate(uv) * max(_SourceSize.xy - 1.0, 0.0));
+
+    float4 meta = _SourceObservationMetaTexture.Load(int3(pixel, 0));
+    if (meta.x < 0.5 || meta.y < _MinObservationConfidence || meta.w < 0.5)
+        return;
+
+    if (meta.z < _MinDepthMeters || meta.z > _MaxDepthMeters)
+        return;
+
+    float3 sampleWorld = _SourceWorldPositionTexture.Load(int3(pixel, 0)).xyz;
+    float3 sampleNormal = _SourceWorldNormalTexture.Load(int3(pixel, 0)).xyz;
+
+    float3 ray = sampleWorld - _CameraWorldPosition.xyz;
+    float rayLengthSq = dot(ray, ray);
+    if (rayLengthSq < 1e-8)
+        return;
+
+    float3 rayDir = ray * rsqrt(rayLengthSq);
+    float normalDot = -dot(rayDir, normalize(sampleNormal));
+    if (normalDot < _MinNormalFacingDot)
+        return;
+
+    float signedDistance = dot(sampleWorld - voxelWorld, rayDir);
+    if (signedDistance <= _TruncationNegativeMeters || signedDistance >= _TruncationPositiveMeters)
+        return;
+
+    float normalizedTsdf = signedDistance / _TruncationPositiveMeters;
+    float minNormalized = _TruncationNegativeMeters / _TruncationPositiveMeters;
+    normalizedTsdf = clamp(normalizedTsdf, minNormalized, 1.0);
+
+    float oldWeight = _WeightVolume[id];
+    float newWeight = min(oldWeight + 1.0, _MaxIntegratedWeight);
+    float oldTsdf = _TsdfVolume[id];
+    float blendedTsdf = (oldWeight > 0.0) ? ((oldTsdf * oldWeight) + normalizedTsdf) / (oldWeight + 1.0) : normalizedTsdf;
+
+    _TsdfVolume[id] = blendedTsdf;
+    _WeightVolume[id] = newWeight;
+}
+
+[numthreads(64, 1, 1)]
+void CopyVolumeToBuffer(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_VolumeVoxelCount)
+        return;
+
+    uint xy = (uint)_VolumeSize.x * (uint)_VolumeSize.y;
+    uint z = id / xy;
+    uint rem = id - z * xy;
+    uint y = rem / (uint)_VolumeSize.x;
+    uint x = rem - y * (uint)_VolumeSize.x;
+    uint3 coord = uint3(x, y, z);
+
+    _TsdfReadbackBuffer[id] = _TsdfVolume[coord];
+    _WeightReadbackBuffer[id] = _WeightVolume[coord];
+}

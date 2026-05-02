@@ -1,0 +1,56 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: Custom_MRDepthRevealOverlay_Fixed2
+  m_Shader: {fileID: 4800000, guid: 7455558da9e374d45818ebe5632bc5d9, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs: []
+    m_Ints: []
+    m_Floats:
+    - _BaseAlpha: 0
+    - _Cull: 0
+    - _DepthEdgeSoft: 0.03
+    - _DepthEdgeStrength: 1
+    - _DepthEdgeThresh: 0.015
+    - _FadeEndMeters: 0
+    - _FadeStartMeters: 0
+    - _FillEmission: 1.1
+    - _FresnelIntensity: 1
+    - _FresnelPower: 2
+    - _GridFwidthMax: 0.25
+    - _GridIntensity: 1.2
+    - _GridScale: 6
+    - _GridThickness: 0.03
+    - _LineSoftness: 0.08
+    - _LineThreshold: 0.35
+    - _MinDepth01: 0.001
+    - _RevealAlpha: 0.75
+    - _RoomboxEnableFloor: 1
+    - _RoomboxEnableWall: 1
+    - _RoomboxFallbackToWorld: 0
+    - _RoomboxMatchBandMeters: 0.1
+    - _RoomboxOcclusionBiasMeters: 0.02
+    - _UseRoombox: 1
+    m_Colors:
+    - _BaseColor: {r: 0.09999997, g: 0.21999997, b: 0.24999997, a: 1}
+    - _RevealColor: {r: 0.049999982, g: 1, b: 0.95, a: 1}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1

@@ -1,0 +1,198 @@
+#pragma kernel CSMain
+
+Texture2DArray<float> _SourceDepthTexture;
+RWTexture2D<float4> _WorldPositionTexture;
+RWTexture2D<float4> _WorldNormalTexture;
+RWTexture2D<float4> _ObservationMetaTexture;
+
+float4x4 _InverseReprojectionMatrices[2];
+float4 _SourceSize;
+float4 _OutputSize;
+float4 _CameraWorldPosition;
+int _SelectedEye;
+float _MinDepth01;
+float _DepthEdgeThreshold;
+float _DepthEdgeSoftness;
+float _MinLinearDepthMeters;
+float _MaxLinearDepthMeters;
+float _SmoothingDepthDeltaMeters;
+
+float SampleDepth01(int2 outputPixel)
+{
+    float2 uv = (float2(outputPixel) + 0.5) / max(_OutputSize.xy, float2(1.0, 1.0));
+    return _SourceDepthTexture.Load(int4(
+        int2(saturate(uv) * max(_SourceSize.xy - float2(1.0, 1.0), float2(0.0, 0.0))),
+        _SelectedEye,
+        0)).r;
+}
+
+bool TryReconstructWorldPosition(int2 outputPixel, out float3 worldPosition, out float depth01, out float linearDepthMeters)
+{
+    depth01 = SampleDepth01(outputPixel);
+    linearDepthMeters = 0.0;
+    if (depth01 <= _MinDepth01)
+    {
+        worldPosition = 0.0.xxx;
+        return false;
+    }
+
+    float2 uv = (float2(outputPixel) + 0.5) / max(_OutputSize.xy, float2(1.0, 1.0));
+    float4 clip = float4(uv * 2.0 - 1.0, depth01 * 2.0 - 1.0, 1.0);
+    float4 world = mul(_InverseReprojectionMatrices[_SelectedEye], clip);
+    worldPosition = world.xyz / max(1e-6, world.w);
+
+    float cameraDistanceMeters = distance(worldPosition, _CameraWorldPosition.xyz);
+    linearDepthMeters = cameraDistanceMeters;
+    if (linearDepthMeters < _MinLinearDepthMeters || linearDepthMeters > _MaxLinearDepthMeters)
+    {
+        worldPosition = 0.0.xxx;
+        return false;
+    }
+
+    return true;
+}
+
+float ComputeEdgeConfidence(float depth01, float left, float right, float down, float up)
+{
+    float maxDiff = 0.0;
+    maxDiff = max(maxDiff, abs(depth01 - left));
+    maxDiff = max(maxDiff, abs(depth01 - right));
+    maxDiff = max(maxDiff, abs(depth01 - down));
+    maxDiff = max(maxDiff, abs(depth01 - up));
+
+    float edge = smoothstep(
+        _DepthEdgeThreshold,
+        _DepthEdgeThreshold + max(0.0001, _DepthEdgeSoftness),
+        maxDiff);
+    return 1.0 - saturate(edge);
+}
+
+float3 SelectDerivative(
+    bool negativeValid,
+    float3 negativeWorld,
+    bool positiveValid,
+    float3 positiveWorld,
+    float3 centerWorld,
+    out float derivativeValid)
+{
+    derivativeValid = 0.0;
+
+    if (negativeValid && positiveValid)
+    {
+        derivativeValid = 1.0;
+        return positiveWorld - negativeWorld;
+    }
+
+    if (positiveValid)
+    {
+        derivativeValid = 1.0;
+        return positiveWorld - centerWorld;
+    }
+
+    if (negativeValid)
+    {
+        derivativeValid = 1.0;
+        return centerWorld - negativeWorld;
+    }
+
+    return 0.0.xxx;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_OutputSize.x || id.y >= (uint)_OutputSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float3 centerWorld;
+    float centerDepth01;
+    float centerLinearDepthMeters;
+    bool centerValid = TryReconstructWorldPosition(pixel, centerWorld, centerDepth01, centerLinearDepthMeters);
+
+    if (!centerValid)
+    {
+        _WorldPositionTexture[pixel] = 0.0.xxxx;
+        _WorldNormalTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        _ObservationMetaTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 leftWorld;
+    float3 rightWorld;
+    float3 downWorld;
+    float3 upWorld;
+    float leftDepth01;
+    float rightDepth01;
+    float downDepth01;
+    float upDepth01;
+    float leftLinearDepthMeters;
+    float rightLinearDepthMeters;
+    float downLinearDepthMeters;
+    float upLinearDepthMeters;
+    bool leftValid = TryReconstructWorldPosition(pixel + int2(-1, 0), leftWorld, leftDepth01, leftLinearDepthMeters);
+    bool rightValid = TryReconstructWorldPosition(pixel + int2(1, 0), rightWorld, rightDepth01, rightLinearDepthMeters);
+    bool downValid = TryReconstructWorldPosition(pixel + int2(0, -1), downWorld, downDepth01, downLinearDepthMeters);
+    bool upValid = TryReconstructWorldPosition(pixel + int2(0, 1), upWorld, upDepth01, upLinearDepthMeters);
+
+    float confidence = ComputeEdgeConfidence(
+        centerDepth01,
+        leftValid ? leftDepth01 : centerDepth01,
+        rightValid ? rightDepth01 : centerDepth01,
+        downValid ? downDepth01 : centerDepth01,
+        upValid ? upDepth01 : centerDepth01);
+
+    float3 filteredWorld = centerWorld;
+    float filteredWeight = 1.0;
+    float depthDeltaThreshold = max(0.0, _SmoothingDepthDeltaMeters);
+
+    if (leftValid && abs(leftLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+    {
+        filteredWorld += leftWorld;
+        filteredWeight += 1.0;
+    }
+
+    if (rightValid && abs(rightLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+    {
+        filteredWorld += rightWorld;
+        filteredWeight += 1.0;
+    }
+
+    if (downValid && abs(downLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+    {
+        filteredWorld += downWorld;
+        filteredWeight += 1.0;
+    }
+
+    if (upValid && abs(upLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+    {
+        filteredWorld += upWorld;
+        filteredWeight += 1.0;
+    }
+
+    filteredWorld /= filteredWeight;
+
+    float neighborSupport = (leftValid ? 1.0 : 0.0) + (rightValid ? 1.0 : 0.0) + (downValid ? 1.0 : 0.0) + (upValid ? 1.0 : 0.0);
+    confidence *= saturate((neighborSupport + 1.0) / 5.0);
+
+    float3 worldNormal = float3(0.0, 0.0, 1.0);
+    float normalValid = 0.0;
+    float horizontalValid;
+    float verticalValid;
+    float3 horizontalDerivative = SelectDerivative(leftValid, leftWorld, rightValid, rightWorld, filteredWorld, horizontalValid);
+    float3 verticalDerivative = SelectDerivative(downValid, downWorld, upValid, upWorld, filteredWorld, verticalValid);
+    if (horizontalValid > 0.5 && verticalValid > 0.5)
+    {
+        float3 crossNormal = cross(verticalDerivative, horizontalDerivative);
+        float normalLengthSq = dot(crossNormal, crossNormal);
+        if (normalLengthSq > 1e-10)
+        {
+            worldNormal = normalize(crossNormal);
+            normalValid = 1.0;
+        }
+    }
+
+    _WorldPositionTexture[pixel] = float4(filteredWorld, 1.0);
+    _WorldNormalTexture[pixel] = float4(worldNormal, normalValid);
+    _ObservationMetaTexture[pixel] = float4(1.0, confidence, centerLinearDepthMeters, normalValid);
+}

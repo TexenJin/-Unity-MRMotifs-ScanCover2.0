@@ -1,0 +1,698 @@
+ ScanCover整体策略书、工程实施路线图与阶段实现计划书
+
+ 1. 文档目的
+
+本文档是当前 ScanCover 方向的总规划文档。
+
+它整合了以下内容：
+ Phase 0 架构锁定
+ Phase 0.5 外部工程搜查结论
+ 整体策略书
+ 工程实施路线图
+ 阶段实现计划书
+ 当前脚本职责边界
+
+本文档本身不改变工程运行逻辑。它用于在 Phase 1 真正开始前，先把技术方向锁定清楚。
+
+ 2. 问题定义
+
+当前 ScanCover 工程已经具备以下能力：
+ 累积扫描证据
+ 提交稳定空间单元
+ 构建基于 chunk 的冻结几何
+ 从 chunk 输出生成蓝色显示壳层
+ 提供 HUD 与交互流程
+
+但之前的验证已经暴露出一个核心问题：
+
+1. `chunk/voxel` 更擅长表达“占据”，不擅长表达“连续表面”
+2. chunk 的出现、提交和状态变化，不等于真实的几何贴合
+3. 显示层平滑可能改善观感，但不等于底层几何真的发生收缩
+4. 当前主线还不足以达到目标视频所体现的房间表面效果
+
+因此当前真正缺的不是“更多 chunk 调参”，而是：
+
+**ScanCover 现在有一条支撑几何链路，但还没有一条真正的主表面链路。**
+
+ 3. 目标效果
+
+目标并不只是“扫描到哪里了”。
+
+目标效果应当是：
+ 一层朝向室内、连续、轻薄的表面
+ 表面会随着持续观测逐步贴合真实墙面、地面、桌面、家具等边界
+ 蓝色网格能够反映这种真实的表面演化
+ 整个过程没有肉眼可见的明显卡顿
+
+更细分地说：
+
+1. 扫描初期
+ 表面快速出现，即使还比较粗糙也可以接受
+
+2. 扫描中期
+ 表面边界会逐步纠正
+ 包裹会变得更贴近真实环境
+
+3. 扫描后期
+ 表面趋于稳定
+ 蓝色网格形成可展示的连续壳层
+
+ 4. 已锁定的核心结论
+
+ 4.1 主方向
+
+未来 ScanCover 的主线应当是：
+
+ `depthdriven surface` 作为主几何层
+ `voxel/chunk` 作为支撑层
+ 蓝色显示网格作为 `depthdriven surface` 的显示层
+
+ 4.2 原因
+
+原因很明确：
+ `voxel/chunk` 天然是“占据表达”
+ 目标效果本质上是“表面表达”
+ 支撑层可以粗、稳定、低频
+ 主表面必须连续、可修正、可局部收敛
+
+ 4.3 必须停止的旧思路
+
+以下内容不应继续被当作主方向：
+
+1. 用 chunk 颜色或状态变化替代真实几何收敛
+2. 用显示层平滑替代底层几何贴合
+3. 继续把 chunk 当成最终视觉主表面
+4. 继续把全场同步重建当成标准更新方式
+
+ 5. 分层模型
+
+ 5.1 DepthDriven Surface
+
+角色：
+ 主几何
+ 边界定义者
+ 收缩/贴合的承载体
+ 朝向室内的真实表面
+ 未来蓝色网格的来源
+
+它应当具备：
+ 世界坐标中的稳定表达
+ 持续局部修正能力
+ patch 局部更新能力
+ 面向“表面”而不是“占据”
+
+在概念上，它就是：
+ 刀
+ 笼子
+ 表面本身
+
+ 5.2 Voxel / Chunk 支撑层
+
+角色：
+ 碰撞体
+ 锚点
+ 粗占据
+ 兜底支撑
+
+它应当具备：
+ 低频更新
+ 低于主表面的分辨率
+ 稳定
+ 与显示层解耦
+
+它不再是最终视觉真实几何。
+
+ 5.3 蓝色显示网格
+
+角色：
+ 观察层
+ 表现层
+ 验证层
+
+它应当表现的是：
+ `depthdriven surface` 的当前状态
+ 而不是把 chunk 占据伪装成最终表面
+
+它应支持：
+ 线框
+ 薄壳
+ 必要时的上一轮/当前轮对比显示
+
+ 5.4 HUD / 调试层
+
+角色：
+ 报告和验证
+ 不是几何真相本身
+
+它应提供：
+ 覆盖度
+ 稳定度
+ 补洞质量
+ mesh/display 状态
+ patch 调试信息
+
+ 6. 为什么之前的 chunk 路线不够
+
+之前的验证已经说明：
+
+1. chunk 小方块更像“一大团占据”逐渐稳定
+2. 红蓝变色更多表达的是统计状态，而不是几何贴合
+3. 几何轮廓没有明显往真实环境持续纠偏
+4. 显示层平滑有时只是“看起来更柔”，并不代表底层真的收缩
+
+其根本原因在于：
+
+1. 系统确认的是 voxel 是否被占据，不是表面穿过 voxel 的精确位置
+2. 几何受规则体素网格限制，天然离散
+3. commit 表达的是稳定，不是持续优化
+4. 补洞解决的是占据空洞，不是连续曲面拟合
+
+结论：
+
+**旧路线的问题不只是参数，而是主几何表达方式本身不适合目标效果。**
+
+ 7. Phase 0.5：来自 `v83PCARebuild` 的外部结论
+
+已对以下外部工程进行了定向搜查：
+ `D:/PCA/v83PCARebuild`
+
+这次搜查强化了当前新方向的正确性。
+
+ 7.1 最有价值的脚本
+
+ A. `CustomEnvironmentDepthRaycaster.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/Scripts/核心/CustomEnvironmentDepthRaycaster.cs`
+
+价值：
+ 它已经提供了构建新主表面所需的底层查询能力
+
+关键能力：
+ 深度像素到世界坐标反投影
+ 世界坐标到线性深度
+ 法线重建
+ 基于深度的射线查询
+ 相机 / 视锥矩阵维护
+
+对 Phase 1 的意义：
+ 很可能直接成为新的 `depthdriven surface` 输入层参考
+
+ B. `RgbZMapCPUBuilder.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/Scripts/棋盘校准/棋盘校准/深度数据/RgbZMapCPUBuilder.cs`
+
+价值：
+ 它比简单点云更有启发，尤其是“表面稳定化”的策略
+
+关键能力：
+ 深度前向投影到 RGB 对齐平面
+ CPU Zbuffer 栅格化
+ 洞填充
+ 事件驱动更新
+ 运动感知 EMA
+ 突变重置
+ 构建前有效性判断
+
+对 Phase 1 的意义：
+ 可直接借鉴为主表面 patch 的稳定化策略
+
+ C. `DepthGridPointCloud.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/Scripts/棋盘校准/实验/DepthGridPointCloud.cs`
+
+价值：
+ 它清楚演示了“深度像素 > 世界表面点”这条逻辑
+
+对 Phase 1 的意义：
+ 可作为 `depthdriven surface` 的最小概念原型
+
+ D. `RandomPlaneScatter.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/Scripts/核心/RandomPlaneScatter.cs`
+
+价值：
+ 它与“贴瓷砖 / 贴片显示”的方向非常接近
+
+对 Phase 1 的意义：
+ 可直接借鉴为轻量表面贴片原型
+
+ 7.2 次级但仍有用的脚本
+
+ `MetaDepthTextureConvert2OCV.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/Scripts/核心/MetaDepthTextureConvert2OCV.cs`
+
+用途：
+ 更适合调试与离线分析
+ 不适合作为主运行时链路
+
+ `CameraToWorldManager.cs`
+
+路径：
+ `D:/PCA/v83PCARebuild/Assets/Calib/CameraToWorld/Scripts/CameraToWorldManager.cs`
+
+用途：
+ 更适合相机与世界坐标对齐验证
+ 不属于主表面构建核心
+
+ 7.3 外部结论
+
+外部工程并没有直接给出一个现成的最终 shrinkwrap 算法。
+
+但它清楚证明了一件事：
+
+未来主线应围绕以下 5 个点建立：
+
+1. 深度查询底座
+2. 世界坐标中的可见表面采样
+3. 时序稳定化
+4. patch 局部更新
+5. 从主表面派生显示层
+
+ 8. 算力与性能现实
+
+目标必须同时兼顾：
+ 画面质量
+ 无肉眼可见卡顿
+
+这不意味着：
+ 全场每帧都高质量重建
+
+这意味着：
+ 用户不应明显感知卡顿
+ 高质量优先给当前关注区域
+ 收敛是渐进的，不是瞬间完成的
+
+ 8.1 主要算力压力来源
+
+1. 主表面的持续更新
+2. 时序稳定化运算
+3. 局部 patch 的拓扑更新
+4. 蓝色网格的刷新
+5. 碰撞支撑层的更新
+
+最大的压力不在蓝色网格本身，而在支撑蓝色网格的主表面维护。
+
+ 8.2 性能规则
+
+1. 绝不每帧全场重建主表面
+2. 主表面、显示层、碰撞层必须分频
+3. 只重建脏 patch
+4. 碰撞层刷新频率必须低于显示层
+5. 每帧工作量必须有固定预算
+6. 当前采样区和中心视野优先，外围允许降级
+
+ 8.3 现实目标
+
+真正现实的标准是：
+ 不出现肉眼可见卡顿
+
+而不是：
+ 全场、全时、满精度、无代价更新
+
+只要坚持局部化、分层、分频，这个目标是工程上可争取的。
+
+ 9. 整体策略书
+
+ 9.1 总方向
+
+1. 停止继续把 chunk 往最终主表面方向强行推进
+2. 新建 `depthdriven surface` 路线
+3. 保留 voxel/chunk 作为：
+ 碰撞
+ 锚定
+ 粗占据
+ 兜底层
+4. 未来蓝色网格直接显示 `depthdriven surface`
+
+ 9.2 视觉观察策略
+
+用于验证几何纠偏/收缩最合适的外在表现是：
+
+1. 线框外壳
+2. 半透明薄壳
+3. 上一轮 / 当前轮对比
+
+而不是继续盯着 chunk 方块本体。
+
+ 9.3 期望的表面表达演化
+
+1. 初期
+ 点 / surfel / 贴片
+
+2. 中期
+ patch 局部壳层
+
+3. 后期
+ 蓝色三角网格薄壳
+
+这条路线既更贴近视频表现，也更有利于控制算力。
+
+ 10. 工程实施路线图
+
+ 10.1 数据结构设计
+
+ A. 主表面采样单元
+
+建议包含：
+ `positionWS`
+ `normalWS`
+ `confidence`
+ `stability`
+ `lastUpdateTime`
+ patch id
+ 室内面有效性标记
+
+ B. 支撑 voxel 单元
+
+建议包含：
+ 占据状态
+ 命中次数
+ 最近更新时间
+ 是否已固化为碰撞层
+ 所属 patch 关系
+
+ C. Patch 容器
+
+建议包含：
+ 空间边界
+ 局部表面采样集合
+ 当前显示网格缓存
+ 上一轮显示网格缓存
+ 脏标记
+ 稳定标记
+ 优先级
+
+ 10.2 更新管线设计
+
+ A. 采样阶段
+
+输入：
+ 深度数据
+ 头显姿态
+ 当前采样框
+
+输出：
+ 世界坐标表面采样点
+ 法线估计
+ 当前视野有效样本
+
+ B. 表面融合阶段
+
+输入：
+ 当前帧样本
+ 已有 patch 表面数据
+
+输出：
+ 更新后的主表面状态
+
+应包含：
+ 近邻关联
+ 位置修正
+ 法线修正
+ 置信度累积
+ 稳定度更新
+ 异常点剔除
+
+ C. 脏 patch 判定阶段
+
+输出：
+ 需要重建显示的 patch
+ 需要刷新支撑层的 patch
+
+ D. 显示重建阶段
+
+输出：
+ 线框
+ 壳层
+ 蓝色局部网格
+
+要求：
+ 只重建脏 patch
+ 不全场重建
+
+ E. 支撑层更新阶段
+
+输出：
+ voxel / chunk / collider
+
+要求：
+ 低频
+ 粗分辨率
+ 与主表面解耦
+
+ 10.3 频率分离
+
+ 高频
+ 深度采样
+ 样本融合
+
+ 中频
+ patch 稳定化
+ patch 优先级调度
+
+ 低频
+ 蓝色网格 patch 重建
+
+ 更低频
+ voxel / collider 更新
+
+ 10.4 绝不能回退的做法
+
+1. 全场同步重建
+2. 碰撞层与显示层同频
+3. 用 chunk 状态色冒充几何收敛
+4. 用显示平滑冒充底层贴合
+
+ 11. 阶段实现计划书
+
+ Phase 0：架构锁定
+
+状态：
+ 已完成
+
+输出：
+ 架构锁定
+ 脚本职责清单
+
+验收：
+ 接受 `depthdriven surface` 为主线
+ 接受 chunk/voxel 只做支撑层
+
+ Phase 0.5：外部工程搜查
+
+状态：
+ 已完成
+
+输出：
+ `v83PCARebuild` 参考结论
+
+验收：
+ 确认 Phase 1 的外部参考输入清单
+
+ Phase 1：最小主表面原型
+
+目标：
+ 在不替换当前 ScanCover 主链的前提下，建立一条新的 `depthdriven surface` 最小原型路径
+
+要求达成：
+ 世界坐标中的可见表面样本
+ patch 局部更新
+ 基本运行时无明显卡顿
+
+此阶段暂不要求：
+ 最终蓝色网格
+ 最终碰撞一体化
+
+ Phase 2：真实收缩验证
+
+目标：
+ 证明同一区域的几何本体会随着持续观测而真实纠偏
+
+要求达成：
+ 同一区域连续观察时，边界确实在修正
+ 不再只是颜色变化
+
+建议验证方式：
+ 线框壳层
+ 上一轮 / 当前轮对比
+
+ Phase 3：蓝色主表面显示层
+
+目标：
+ 让蓝色网格直接表现主表面
+
+要求达成：
+ patch 级蓝色网格生成
+ 线框与薄壳两种模式
+ 不依赖全场重建
+
+ Phase 4：支撑层重构
+
+目标：
+ 明确 voxel/chunk 只做碰撞与锚定
+
+要求达成：
+ 碰撞稳定可用
+ 显示与碰撞彻底解耦
+
+ Phase 5：性能收敛
+
+目标：
+ 压到“无肉眼可见卡顿”
+
+要求达成：
+ patch 预算调度
+ 脏区更新
+ collider 低频更新
+ 每帧工作量受控
+
+ Phase 6：成品化视觉
+
+目标：
+ 向目标视频观感靠拢
+
+要求达成：
+ 蓝色壳层稳定、连续
+ 遮挡可控
+ 视觉语言统一
+
+ Phase 7：指标与验收闭环
+
+目标：
+ 建立定量指标与观感之间的映射关系
+
+建议指标：
+ 覆盖度
+ 稳定度
+ 表面变化率
+ patch 稳定比例
+ 蓝色网格完整度
+ 平均帧耗时与峰值帧耗时
+
+ 12. 当前脚本职责边界
+
+ 12.1 核心扫描栈
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonBuilder_A.cs`
+
+当前职责：
+ 扫描采样
+ voxel / cell 累积
+ 汇总统计
+ reveal wave 门控
+ 采样框过滤
+
+它不是未来的主表面。
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonMesher_B.cs`
+
+当前职责：
+ 从确认 voxel 生成 chunk
+ 构建碰撞体
+ voxel 补洞
+
+它是支撑层，不是未来主表面。
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonSessionController.cs`
+
+当前职责：
+ 扫描 / 冻结 / 清理 / 切换流程控制
+ autocommit 管理
+ builder、mesher、display 之间的协调
+ New Input System 控制器输入
+
+它不是几何求解器。
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonHUD.cs`
+
+当前职责：
+ 四分值 HUD
+ 状态显示
+ 采样框 HUD
+
+它只负责观察与报告。
+
+ 12.2 显示栈
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverDisplaySurfaceBuilder.cs`
+
+当前职责：
+ 从 chunk 合并生成显示壳层
+ Raw/Smoothed 对比
+ 线框/面片模式
+ 锁定显示快照
+ 近距裁剪与小岛剔除
+
+它可作为未来显示层的参考，但不是未来真正收缩机制的来源。
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverDisplaySurfaceRenderer.cs`
+
+当前职责：
+ 控制显示显隐
+ 协调显示重建时机
+ 管理 source chunk 的隐藏与恢复
+
+它是表现协调层，不是几何拥有者。
+
+ 12.3 调试 / 原型层
+
+ `Assets/MRMotifs/ScanCover/Scripts/04/ScanCoverSkeletonDebugViz_A.cs`
+ 低层调试可视化
+
+ `Assets/MRMotifs/ScanCover/Scripts/05/ScanCoverCollisionVerifier.cs`
+ 碰撞验证工具
+
+ `Assets/MRMotifs/ScanCover/Scripts/05/ScanCoverTileOverlayPrototype.cs`
+ 轻量表面贴片原型
+ 在概念上更接近未来主表面的显示方式
+
+ 12.4 集成 / 特效层
+
+ `Assets/MRMotifs/ScanCover/Scripts/01/...`
+ 参考系
+ 跟随
+ snap
+ shockwave bridge
+
+ `Assets/MRMotifs/ScanCover/Scripts/02/...`
+ reveal manager
+ shockwave motif
+
+ `Assets/MRMotifs/ScanCover/Scripts/03/...`
+ URP 深度 reveal overlay
+
+这些脚本都应位于几何架构之下，而不是定义新的主几何架构。
+
+ 13. Phase 1 启动前提
+
+进入 Phase 1 之前，应默认接受以下前提：
+
+1. chunk 不再被视为最终表面真相
+2. `depthdriven surface` 被接受为新主线
+3. 蓝色网格未来应显示主表面
+4. Phase 1 可以先在 ScanCover 中并行建立一条新链路
+5. 旧运行链保持可用，直到新链路证明自己
+
+ 14. 当前最自然的下一步
+
+在本文档完成后，下一步最自然的工作是：
+
+1. 定义 `depthdriven surface` 的最小数据结构
+2. 定义新链路的首批脚本边界
+3. 决定 Phase 1 的最初承载形式：
+ 点 / surfel
+ 贴片 / patch
+ 局部壳层网格
+
+当前建议的切入顺序是：
+
+ 先 patch 级表面样本
+ 再蓝色网格
+
+因为这条路线最适合先验证真实收缩，再去做最终展示层。
