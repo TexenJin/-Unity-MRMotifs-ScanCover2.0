@@ -53,11 +53,12 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     [Header("Markers")] [SerializeField] private bool showMarkers = false; [SerializeField] private bool updateEveryFrame = true; [SerializeField] private bool orientToNormal = false; [SerializeField, Min(0f)] private float surfaceBiasMeters = 0.0015f; [SerializeField, Min(0.001f)] private float fallbackMarkerScaleMeters = 0.012f; [SerializeField] private Gradient confidenceGradient;
     [Header("Preview Visibility")] [SerializeField] private bool previewDisplayVisible = true;
     [Header("Display Frame")] [SerializeField] private bool useWorldSpaceDisplayRoots = false; [SerializeField] private bool lockUnfrozenDisplayRoll = false; [SerializeField] private bool lockUnfrozenDisplayPitch = false; [SerializeField] private bool lockUnfrozenDisplayYaw = false; [SerializeField] private bool compensateRegularGridRollSampling = false; [SerializeField] private bool showRuntimeAxisDebug = false; [SerializeField] private Vector3 runtimeAxisOffset = new Vector3(0f, 0f, 0.8f); [SerializeField, Min(0.01f)] private float runtimeAxisCubeSize = 0.12f; [SerializeField, Min(0.02f)] private float runtimeAxisLength = 0.4f; [SerializeField, Min(0.002f)] private float runtimeAxisThickness = 0.03f;
-[Header("Grid Lines")] [SerializeField] private bool showGridLines = false; [SerializeField] private bool showGridOuterContourOnly = true; [SerializeField] private bool showGridTriangulation = false; [SerializeField] private bool rectifyGridLinesAfterDepthWrap = false; [SerializeField, Range(1.05f, 6f)] private float rectifiedGridLineMaxSpanMultiplier = 2.35f; [SerializeField, Range(0f, 1f)] private float rectifiedGridLineMinValidRatio = 0.18f; [SerializeField] private bool gridLineRequireCompleteCellSupport = false; [SerializeField, Min(1)] private int gridLineMinCompleteCellIslandCount = 8; [SerializeField, Min(1)] private int gridLineKeepLargestCompleteCellIslands = 1; [SerializeField] private Material gridLineMaterialOverride; [SerializeField] private Color gridLineColor = Color.white; [SerializeField, Min(0f)] private float gridLineSurfaceOffsetMeters = 0.004f; [SerializeField] private bool gridLinesRenderBehindCandidatePatch = false; [SerializeField] private bool syncGridLinesToFocusedCandidate = false; [SerializeField, Min(0f)] private float focusedGridPlaneToleranceMeters = 0.08f; [SerializeField, Min(0f)] private float focusedGridExpandMeters = 0.06f;
+    [Header("Grid Lines")] [SerializeField] private bool showGridLines = false; [SerializeField] private bool showGridOuterContourOnly = true; [SerializeField] private bool showRectilinearFillInsideContour = false; [SerializeField, Range(1, 4)] private int rectilinearRennetStride = 2; [SerializeField, Range(0f, 1f)] private float rectilinearRennetMinNormalDot = 0.45f; [SerializeField, Range(1f, 8f)] private float rectilinearRennetMaxEdgeSpanMultiplier = 3f; [SerializeField] private bool showGridTriangulation = false; [SerializeField] private bool rectifyGridLinesAfterDepthWrap = false; [SerializeField] private bool gridLineRequireContinuousSurface = true; [SerializeField, Range(1.05f, 6f)] private float rectifiedGridLineMaxSpanMultiplier = 2.35f; [SerializeField, Range(0f, 1f)] private float rectifiedGridLineMinValidRatio = 0.18f; [SerializeField, Range(-1f, 1f)] private float gridLineMinNeighborNormalDot = 0.2f; [SerializeField] private bool gridLineRequireCompleteCellSupport = false; [SerializeField, Min(1)] private int gridLineMinCompleteCellIslandCount = 8; [SerializeField, Min(1)] private int gridLineKeepLargestCompleteCellIslands = 1; [SerializeField] private Material gridLineMaterialOverride; [SerializeField] private Color gridLineColor = Color.white; [SerializeField, Min(0f)] private float gridLineSurfaceOffsetMeters = 0.004f; [SerializeField] private bool gridLinesRenderBehindCandidatePatch = false; [SerializeField] private bool syncGridLinesToFocusedCandidate = false; [SerializeField, Min(0f)] private float focusedGridPlaneToleranceMeters = 0.08f; [SerializeField, Min(0f)] private float focusedGridExpandMeters = 0.06f;
     [Header("Grid Interior Display")] [SerializeField] private bool showGridInteriorMesh = false; [SerializeField] private GridInteriorDisplayMode gridInteriorDisplayMode = GridInteriorDisplayMode.Hidden;
     [Header("Surface Mesh")] [SerializeField] private bool showSurfaceMesh = false; [SerializeField] private bool keepSurfaceMeshAvailableWhenHidden = false; [SerializeField] private bool useIndexConnectivity = true; [SerializeField] private Material surfaceMaterialOverride; [SerializeField, Min(0.01f)] private float maxEdgeLengthMeters = 0.20f; [SerializeField, Range(-1f, 1f)] private float minNeighborNormalDot = 0.35f; [SerializeField] private Color surfaceColor = new Color(0.18f, 0.95f, 0.98f, 1f); [SerializeField] private bool surfaceDoubleSided = true;
+    [Header("Height Slice Contour")] [SerializeField] private bool showHeightSliceContour = false; [SerializeField] private bool heightSliceUseFrozenScreenCenterHeight = true; [SerializeField, Min(1)] private int heightSliceRowCount = 32; [SerializeField] private bool heightSliceShowPerpendicularColumns = true; [SerializeField, Min(1)] private int heightSliceColumnCount = 32; [SerializeField] private bool showHeightSlicePlaneFrame = true; [SerializeField] private bool heightSliceShowSampleColumnPlaneFrames = false; [SerializeField, Range(1, 16)] private int heightSliceSampleColumnPlaneFrameCount = 5; [SerializeField, Min(0.001f)] private float heightSliceEpsilonMeters = 0.01f; [SerializeField, Min(0.01f)] private float heightSliceMaxSegmentMeters = 0.28f; [SerializeField, Min(0.0005f)] private float heightSliceLineWidthMeters = 0.006f; [SerializeField] private Color heightSliceContourColor = new Color(0.08f, 0.85f, 1f, 0.95f); [SerializeField] private Color heightSlicePlaneFrameColor = new Color(1f, 1f, 1f, 0.35f);
     [Header("Surface Regions")] [SerializeField] private bool colorizeSurfaceRegions = true; [SerializeField] private bool showIrregularSurfaceBucket = true; [SerializeField, Range(0f, 1f)] private float irregularSurfaceBucketAlpha = 0.18f; [SerializeField, Range(1f, 89f)] private float surfaceRegionCreaseAngleDegrees = 12f; [SerializeField, Min(1)] private int surfaceRegionMinQuadCount = 12; [SerializeField, Range(1f, 45f)] private float surfaceNormalPatchMergeAngleDegrees = 10f; [SerializeField, Range(1f, 45f)] private float surfaceNormalFamilyAngleDegrees = 18f; [SerializeField, Range(0.5f, 0.999f)] private float surfaceNormalAxisBucketMinDot = 0.82f; [SerializeField, Min(1)] private int surfaceLargeComponentMinTriangleCount = 48; [SerializeField, Range(0.05f, 1f)] private float surfaceLargeComponentKeepRatio = 0.22f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxNeighborDistanceMeters = 0.12f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxPlaneOffsetMeters = 0.03f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorSaturation = 0.62f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorValue = 0.95f;
-    [Header("Candidate Surface Display")] [SerializeField] private bool isolateTopCandidateSurfaces = false; [SerializeField, Min(0)] private int topCandidateSurfaceCount = 4; [SerializeField, Min(0)] private int topCandidateSurfaceMinTriangleCount = 48; [SerializeField] private bool candidatePreferViewCenter = true; [SerializeField, Range(0.05f, 0.75f)] private float candidateViewCenterRadius = 0.28f; [SerializeField, Range(0f, 8f)] private float candidateViewCenterScoreWeight = 1.25f; [SerializeField, Range(0f, 2f)] private float candidateFaceCountScoreWeight = 0.35f; [SerializeField, Range(0f, 8f)] private float candidateFacingScoreWeight = 0.9f; [SerializeField, Range(0f, 1f)] private float candidateMinFacingScore = 0.55f; [SerializeField, Range(0f, 1f)] private float candidateCenterFacingRelaxation = 0.12f; [SerializeField, Range(1f, 45f)] private float candidateSurfaceMergeAngleDegrees = 14f; [SerializeField, Min(0.001f)] private float candidateSurfaceMergePlaneOffsetMeters = 0.05f; [SerializeField, Min(1)] private int candidateSurfaceMergeMinSharedEdges = 2; [SerializeField] private bool rebuildLargestCandidateAsRegularGrid = true; [SerializeField] private bool largestCandidateUseTriangularLattice = true; [SerializeField] private bool largestCandidateUseOriginalGridTerrain = true; [SerializeField] private bool largestCandidateShowFill = false; [SerializeField, Min(0.01f)] private float largestCandidateGridCellSizeMeters = 0.08f; [SerializeField, Min(4)] private int largestCandidateGridMaxColumns = 64; [SerializeField, Min(4)] private int largestCandidateGridMaxRows = 64; [SerializeField, Range(0.05f, 1f)] private float largestCandidateGridFillAlpha = 0.28f; [SerializeField] private Color largestCandidateGridLineColor = new Color(1f, 1f, 1f, 0.92f); [SerializeField, Min(0.0005f)] private float largestCandidateGridLineWidthMeters = 0.006f; [SerializeField] private bool largestCandidateGridShowCellDiagonals = false; [SerializeField, Range(0, 8)] private int largestCandidateGridMinNeighborCount = 2; [SerializeField, Min(0)] private int largestCandidateGridMinIslandCellCount = 3; [SerializeField, Min(0)] private int largestCandidateGridMinCellCount = 12; [SerializeField, Min(0)] private int largestCandidateGridMinIslandSpanCells = 3; [SerializeField, Min(0)] private int largestCandidateGridKeepTopIslandCount = 2; [SerializeField] private bool largestCandidateGridUseViewportFilter = true; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportMaxSpan = 0.10f; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportArea = 0.008f;
+    [Header("Candidate Surface Display")] [SerializeField] private bool isolateTopCandidateSurfaces = false; [SerializeField, Min(0)] private int topCandidateSurfaceCount = 4; [SerializeField, Min(0)] private int topCandidateSurfaceMinTriangleCount = 48; [SerializeField] private bool candidatePreferViewCenter = true; [SerializeField, Range(0.05f, 0.75f)] private float candidateViewCenterRadius = 0.28f; [SerializeField, Range(0f, 8f)] private float candidateViewCenterScoreWeight = 1.25f; [SerializeField, Range(0f, 2f)] private float candidateFaceCountScoreWeight = 0.35f; [SerializeField, Range(0f, 8f)] private float candidateFacingScoreWeight = 0.9f; [SerializeField, Range(0f, 1f)] private float candidateMinFacingScore = 0.55f; [SerializeField, Range(0f, 1f)] private float candidateCenterFacingRelaxation = 0.12f; [SerializeField, Range(1f, 45f)] private float candidateSurfaceMergeAngleDegrees = 14f; [SerializeField, Min(0.001f)] private float candidateSurfaceMergePlaneOffsetMeters = 0.05f; [SerializeField, Min(1)] private int candidateSurfaceMergeMinSharedEdges = 2; [SerializeField] private bool rebuildLargestCandidateAsRegularGrid = true; [SerializeField] private bool largestCandidateUseTriangularLattice = true; [SerializeField] private bool largestCandidateUseOriginalGridTerrain = true; [SerializeField] private bool largestCandidateProjectRegularGridToMeshTerrain = true; [SerializeField] private bool largestCandidateShowFill = false; [SerializeField, Min(0.01f)] private float largestCandidateGridCellSizeMeters = 0.08f; [SerializeField, Min(4)] private int largestCandidateGridMaxColumns = 64; [SerializeField, Min(4)] private int largestCandidateGridMaxRows = 64; [SerializeField, Range(0.05f, 1f)] private float largestCandidateGridFillAlpha = 0.28f; [SerializeField] private Color largestCandidateGridLineColor = new Color(1f, 1f, 1f, 0.92f); [SerializeField, Min(0.0005f)] private float largestCandidateGridLineWidthMeters = 0.006f; [SerializeField] private bool largestCandidateGridShowCellDiagonals = false; [SerializeField, Range(0, 8)] private int largestCandidateGridMinNeighborCount = 2; [SerializeField, Min(0)] private int largestCandidateGridMinIslandCellCount = 3; [SerializeField, Min(0)] private int largestCandidateGridMinCellCount = 12; [SerializeField, Min(0)] private int largestCandidateGridMinIslandSpanCells = 3; [SerializeField, Min(0)] private int largestCandidateGridKeepTopIslandCount = 2; [SerializeField] private bool largestCandidateGridUseViewportFilter = true; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportMaxSpan = 0.10f; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportArea = 0.008f;
     [Header("Candidate Plane Objects")] [SerializeField] private bool showCandidatePlaneObjects = true; [SerializeField, Min(1)] private int candidatePlaneObjectCount = 4; [SerializeField, Min(0.01f)] private float candidatePlaneMinSizeMeters = 0.08f; [SerializeField, Min(0f)] private float candidatePlanePaddingMeters = 0.01f; [SerializeField, Min(0f)] private float candidatePlaneSurfaceOffsetMeters = 0.004f; [SerializeField, Range(0.05f, 1f)] private float candidatePlaneAlpha = 0.32f; [SerializeField] private Color candidatePlaneColor = new Color(1f, 0.18f, 0.12f, 0.32f);
     [NonSerialized] private float surfacePlaneClusterNormalDot = 0.965f;
     [NonSerialized] private float surfacePlaneClusterOffsetMeters = 0.08f;
@@ -95,6 +96,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private Vector3 _frozenHeadsetScreenCenterPoint;
     private Vector3 _frozenHeadsetScreenCenterNormal;
     private bool _frozenHeadsetScreenCenterNormalValid;
+    private bool _hasFrozenHeightSliceFrame;
+    private Vector3 _frozenHeightSliceRightWorld = Vector3.right;
+    private Vector3 _frozenHeightSliceForwardWorld = Vector3.forward;
 
     private void Reset() => EnsureGradient();
     private void Awake() { ResolveRefs(); EnsureGradient(); EnsurePropertyBlock(); EnsureDisplayRoots(); if (updateEveryFrame) RefreshNow(); }
@@ -158,6 +162,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private bool ShouldShowGridLines()
     {
+        if (showHeightSliceContour)
+            return false;
         return _previewVisible && previewDisplayVisible && showGridLines;
     }
 
@@ -214,6 +220,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         _frozenHeadsetScreenCenterPoint = Vector3.zero;
         _frozenHeadsetScreenCenterNormal = Vector3.forward;
         _frozenHeadsetScreenCenterNormalValid = false;
+        _hasFrozenHeightSliceFrame = false;
+        _frozenHeightSliceRightWorld = Vector3.right;
+        _frozenHeightSliceForwardWorld = Vector3.forward;
         _cells.Clear();
         _groups.Clear();
         _validScratch.Clear();
@@ -631,6 +640,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         RebuildGridLineValidScratch(_gridLineValidScratch, pixelCount, worldPositions, worldNormals, observationMeta);
         _hasFrozenHeadsetScreenCenterPoint = false;
         _frozenHeadsetScreenCenterNormalValid = false;
+        _hasFrozenHeightSliceFrame = false;
         bool useDepthHitPlane = false;
         bool useFixedWorldWindow = false;
         bool useVerticalDepthPlane = false;
@@ -652,6 +662,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 _frozenHeadsetScreenCenterPoint = centerPoint;
                 _frozenHeadsetScreenCenterNormal = headsetCenterNormal.sqrMagnitude > 1e-8f ? headsetCenterNormal.normalized : Vector3.forward;
                 _frozenHeadsetScreenCenterNormalValid = headsetCenterNormalValid && _frozenHeadsetScreenCenterNormal.sqrMagnitude > 1e-8f && Finite(_frozenHeadsetScreenCenterNormal);
+                CaptureFrozenHeightSliceFrame(origin);
                 depthHitPlaneCenter = centerPoint;
                 depthHitPlaneOrigin = origin;
                 bool allowVerticalDepthPlane = regularGridUseVerticalDepthPlaneExperiment && !regularGridUseViewportCoverage;
@@ -744,7 +755,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         }
 
         if (!ShouldShowMarkers()) HideAllMarkers();
-        if (ShouldShowGridLines()) BuildGridLineMesh(lineValid, positions, normals, confidences); else SetGridLinesVisible(false);
+        bool[] gridLineSourceValid = showRectilinearFillInsideContour ? valid : lineValid;
+        if (ShouldShowGridLines()) BuildGridLineMesh(gridLineSourceValid, positions, normals, confidences); else SetGridLinesVisible(false);
         if (showCandidatePlaneObjects) BuildCandidatePlaneObjectsFromGrid(valid, positions, normals, ShouldShowSurfaceMesh());
         else
         {
@@ -1227,10 +1239,23 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         {
             SetSurfaceVisible(false);
             SetSurfaceNormalIndicatorsVisible(false);
+            if (showHeightSliceContour)
+                BuildLargestCandidateGridLineMesh(new List<Vector3>(), new List<Vector3>(), new List<int>(), false);
             return;
         }
         _surfaceMesh.SetVertices(_verts);
         _surfaceMesh.SetNormals(_normals);
+        if (showHeightSliceContour)
+        {
+            BuildHeightSliceContourDisplay(_verts, _normals, _tris, visibleAfterBuild);
+            _surfaceMesh.Clear();
+            SetSurfaceVisible(false);
+            SetSurfaceNormalIndicatorsVisible(false);
+            SetCenterDebugMarkersVisible(false);
+            SetCandidatePlaneObjectsVisible(false);
+            return;
+        }
+
         if (buildGridInteriorMesh)
         {
             _surfaceMesh.SetTriangles(_tris, 0, true);
@@ -1958,7 +1983,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             displayValid[i] = true;
         }
 
-        if (rectifyGridLinesAfterDepthWrap && !regularGridUseVerticalDepthPlaneExperiment)
+        bool useRectilinearContourFill = showRectilinearFillInsideContour && !regularGridUseVerticalDepthPlaneExperiment;
+        if (rectifyGridLinesAfterDepthWrap && !useRectilinearContourFill && !regularGridUseVerticalDepthPlaneExperiment)
         {
             for (int g = 0; g < _groups.Count; g++)
             {
@@ -1979,11 +2005,21 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             GridGroup group = _groups[g];
             if (group.columns <= 0 || group.rows <= 0) continue;
             float maxLineSpan = 0f;
+            if (useRectilinearContourFill)
+            {
+                maxLineSpan = EstimateGridLineMaxSpan(group, displayValid, sourceLocalPositions);
+                AddRectilinearFilledContourGridEdges(group, displayValid, vertexIndices, sourceLocalPositions, maxLineSpan);
+                continue;
+            }
+
             if (showGridOuterContourOnly)
             {
                 AddGridOuterContourEdges(group, displayValid, vertexIndices, sourceLocalPositions, maxLineSpan);
                 continue;
             }
+
+            if (gridLineRequireContinuousSurface || gridLineRequireCompleteCellSupport)
+                maxLineSpan = EstimateGridLineMaxSpan(group, displayValid, sourceLocalPositions);
 
             bool[] supportedHorizontalEdges = null;
             bool[] supportedVerticalEdges = null;
@@ -1993,7 +2029,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 supportedHorizontalEdges = new bool[group.rows * (group.columns - 1)];
                 supportedVerticalEdges = new bool[(group.rows - 1) * group.columns];
                 supportedCells = new bool[(group.rows - 1) * (group.columns - 1)];
-                BuildCompleteCellSupportedGridEdges(group, displayValid, sourceLocalPositions, maxLineSpan, supportedHorizontalEdges, supportedVerticalEdges, supportedCells);
+                BuildCompleteCellSupportedGridEdges(group, displayValid, sourceLocalPositions, sourceLocalNormals, maxLineSpan, supportedHorizontalEdges, supportedVerticalEdges, supportedCells);
                 PruneCompleteCellIslands(group, supportedCells);
                 RebuildCompleteCellSupportedGridEdges(group, supportedCells, supportedHorizontalEdges, supportedVerticalEdges);
             }
@@ -2005,7 +2041,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 {
                     if (supportedHorizontalEdges != null && !supportedHorizontalEdges[row * (group.columns - 1) + col])
                         continue;
-                    AddGridLineEdge(rowStart + col, rowStart + col + 1, displayValid, vertexIndices, sourceLocalPositions, maxLineSpan);
+                    AddGridLineEdge(rowStart + col, rowStart + col + 1, displayValid, vertexIndices, sourceLocalPositions, sourceLocalNormals, maxLineSpan);
                 }
             }
 
@@ -2017,7 +2053,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 {
                     if (supportedVerticalEdges != null && !supportedVerticalEdges[row * group.columns + col])
                         continue;
-                    AddGridLineEdge(rowStart + col, nextRowStart + col, displayValid, vertexIndices, sourceLocalPositions, maxLineSpan);
+                    AddGridLineEdge(rowStart + col, nextRowStart + col, displayValid, vertexIndices, sourceLocalPositions, sourceLocalNormals, maxLineSpan);
                 }
             }
 
@@ -2043,6 +2079,11 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
         // Keep the raw depth-wrapped grid lines; cleanup passes can remove valid reference lines.
 
+        ApplyBuiltGridLineMesh(valid, positions, normals);
+    }
+
+    private void ApplyBuiltGridLineMesh(bool[] valid, Vector3[] positions, Vector3[] normals)
+    {
         _lineMesh.Clear();
         if (_lineIndices.Count <= 0)
         {
@@ -2056,6 +2097,318 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         UpdateOriginalGridCenterMarker(valid, positions, normals);
         UpdateHeadsetScreenCenterMarker();
         SetGridLinesVisible(true);
+    }
+
+    private bool TryBuildIndependentRectilinearRennetGrid(bool[] valid, Vector3[] sourceLocalPositions, Vector3[] sourceLocalNormals)
+    {
+        if (valid == null || sourceLocalPositions == null || _groups.Count <= 0)
+            return false;
+
+        _verts.Clear();
+        _lineIndices.Clear();
+
+        bool builtAny = false;
+        List<Vector3> renetVertexNormals = new List<Vector3>(_cells.Count);
+        int stride = Mathf.Max(1, rectilinearRennetStride);
+        for (int g = 0; g < _groups.Count; g++)
+        {
+            GridGroup group = _groups[g];
+            if (group.columns < 2 || group.rows < 2)
+                continue;
+
+            List<int> sourceRows = BuildStridedGridAxisIndices(group.rows, stride);
+            List<int> sourceColumns = BuildStridedGridAxisIndices(group.columns, stride);
+            if (sourceRows.Count < 2 || sourceColumns.Count < 2)
+                continue;
+
+            int renetColumns = sourceColumns.Count;
+            int renetRows = sourceRows.Count;
+            float maxRennetEdgeSpan = EstimateGridLineMaxSpan(group, valid, sourceLocalPositions) *
+                                      Mathf.Max(1, stride) *
+                                      Mathf.Max(1f, rectilinearRennetMaxEdgeSpanMultiplier);
+
+            int[] renetVertexIndices = new int[renetColumns * renetRows];
+            for (int i = 0; i < renetVertexIndices.Length; i++)
+                renetVertexIndices[i] = -1;
+
+            for (int row = 0; row < renetRows; row++)
+            {
+                int sourceRow = sourceRows[row];
+                int sourceRowStart = group.startIndex + sourceRow * group.columns;
+                for (int col = 0; col < renetColumns; col++)
+                {
+                    int sourceColumn = sourceColumns[col];
+                    int sourceIndex = sourceRowStart + sourceColumn;
+                    if (sourceIndex < 0 ||
+                        sourceIndex >= valid.Length ||
+                        sourceIndex >= sourceLocalPositions.Length ||
+                        !valid[sourceIndex] ||
+                        !Finite(sourceLocalPositions[sourceIndex]))
+                        continue;
+
+                    renetVertexIndices[row * renetColumns + col] = _verts.Count;
+                    _verts.Add(sourceLocalPositions[sourceIndex]);
+                    Vector3 normal = sourceLocalNormals != null && sourceIndex < sourceLocalNormals.Length
+                        ? sourceLocalNormals[sourceIndex]
+                        : Vector3.zero;
+                    renetVertexNormals.Add(normal.sqrMagnitude > 1e-8f ? normal.normalized : Vector3.zero);
+                }
+            }
+
+            for (int row = 0; row < renetRows; row++)
+            {
+                int rowStart = row * renetColumns;
+                for (int col = 0; col < renetColumns - 1; col++)
+                    AddRennetLineEdge(renetVertexIndices[rowStart + col], renetVertexIndices[rowStart + col + 1], renetVertexNormals, maxRennetEdgeSpan);
+            }
+
+            for (int row = 0; row < renetRows - 1; row++)
+            {
+                int rowStart = row * renetColumns;
+                int nextRowStart = (row + 1) * renetColumns;
+                for (int col = 0; col < renetColumns; col++)
+                    AddRennetLineEdge(renetVertexIndices[rowStart + col], renetVertexIndices[nextRowStart + col], renetVertexNormals, maxRennetEdgeSpan);
+            }
+
+            builtAny |= _lineIndices.Count > 0;
+        }
+
+        return builtAny;
+    }
+
+    private static List<int> BuildStridedGridAxisIndices(int count, int stride)
+    {
+        List<int> indices = new List<int>(Mathf.Max(2, Mathf.CeilToInt(count / (float)Mathf.Max(1, stride))));
+        if (count <= 0)
+            return indices;
+
+        stride = Mathf.Max(1, stride);
+        for (int i = 0; i < count; i += stride)
+            indices.Add(i);
+
+        int last = count - 1;
+        if (indices.Count == 0 || indices[indices.Count - 1] != last)
+            indices.Add(last);
+
+        return indices;
+    }
+
+    private bool TryGetGroupProjectedBounds(GridGroup group, bool[] valid, Vector3[] sourceLocalPositions, out float minX, out float maxX, out float minY, out float maxY)
+    {
+        minX = float.PositiveInfinity;
+        maxX = float.NegativeInfinity;
+        minY = float.PositiveInfinity;
+        maxY = float.NegativeInfinity;
+        int count = 0;
+
+        for (int row = 0; row < group.rows; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            for (int col = 0; col < group.columns; col++)
+            {
+                int index = rowStart + col;
+                if (index < 0 || index >= valid.Length || index >= sourceLocalPositions.Length || !valid[index])
+                    continue;
+
+                Vector3 p = sourceLocalPositions[index];
+                if (!Finite(p))
+                    continue;
+
+                minX = Mathf.Min(minX, p.x);
+                maxX = Mathf.Max(maxX, p.x);
+                minY = Mathf.Min(minY, p.y);
+                maxY = Mathf.Max(maxY, p.y);
+                count++;
+            }
+        }
+
+        return count >= 4 &&
+               float.IsFinite(minX) && float.IsFinite(maxX) &&
+               float.IsFinite(minY) && float.IsFinite(maxY) &&
+               maxX > minX && maxY > minY;
+    }
+
+    private bool TryProjectRectilinearPointToSourceSurface(
+        GridGroup group,
+        float x,
+        float y,
+        bool[] valid,
+        Vector3[] sourceLocalPositions,
+        Vector3[] sourceLocalNormals,
+        float sourceMaxSpan,
+        out Vector3 hitPosition,
+        out Vector3 hitNormal)
+    {
+        hitPosition = Vector3.zero;
+        hitNormal = Vector3.forward;
+        bool found = false;
+        float bestZ = float.PositiveInfinity;
+
+        for (int row = 0; row < group.rows - 1; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            int nextRowStart = group.startIndex + (row + 1) * group.columns;
+            for (int col = 0; col < group.columns - 1; col++)
+            {
+                int i00 = rowStart + col;
+                int i10 = i00 + 1;
+                int i01 = nextRowStart + col;
+                int i11 = i01 + 1;
+                if (!IsCoherentSourceQuad(i00, i10, i01, i11, valid, sourceLocalPositions, sourceLocalNormals, sourceMaxSpan))
+                    continue;
+
+                TrySampleProjectedTriangle(x, y, i00, i10, i11, sourceLocalPositions, sourceLocalNormals, ref found, ref bestZ, ref hitPosition, ref hitNormal);
+                TrySampleProjectedTriangle(x, y, i00, i11, i01, sourceLocalPositions, sourceLocalNormals, ref found, ref bestZ, ref hitPosition, ref hitNormal);
+            }
+        }
+
+        return found;
+    }
+
+    private bool IsCoherentSourceQuad(int i00, int i10, int i01, int i11, bool[] valid, Vector3[] sourceLocalPositions, Vector3[] sourceLocalNormals, float maxSpan)
+    {
+        if (!IsValidSourcePoint(i00, valid, sourceLocalPositions) ||
+            !IsValidSourcePoint(i10, valid, sourceLocalPositions) ||
+            !IsValidSourcePoint(i01, valid, sourceLocalPositions) ||
+            !IsValidSourcePoint(i11, valid, sourceLocalPositions))
+            return false;
+
+        float spanLimit = Mathf.Max(0.01f, maxSpan);
+        if (!SourceEdgeWithinSpan(i00, i10, sourceLocalPositions, spanLimit) ||
+            !SourceEdgeWithinSpan(i00, i01, sourceLocalPositions, spanLimit) ||
+            !SourceEdgeWithinSpan(i10, i11, sourceLocalPositions, spanLimit) ||
+            !SourceEdgeWithinSpan(i01, i11, sourceLocalPositions, spanLimit) ||
+            !SourceEdgeWithinSpan(i00, i11, sourceLocalPositions, spanLimit * 1.45f) ||
+            !SourceEdgeWithinSpan(i10, i01, sourceLocalPositions, spanLimit * 1.45f))
+            return false;
+
+        return SourceNormalsAreCoherent(i00, i10, i01, i11, sourceLocalNormals);
+    }
+
+    private static bool SourceEdgeWithinSpan(int a, int b, Vector3[] sourceLocalPositions, float maxSpan)
+    {
+        float distance = Vector3.Distance(sourceLocalPositions[a], sourceLocalPositions[b]);
+        return float.IsFinite(distance) && distance <= maxSpan;
+    }
+
+    private bool SourceNormalsAreCoherent(int i00, int i10, int i01, int i11, Vector3[] sourceLocalNormals)
+    {
+        if (sourceLocalNormals == null)
+            return true;
+
+        return SourceNormalPairIsCoherent(i00, i10, sourceLocalNormals) &&
+               SourceNormalPairIsCoherent(i00, i01, sourceLocalNormals) &&
+               SourceNormalPairIsCoherent(i10, i11, sourceLocalNormals) &&
+               SourceNormalPairIsCoherent(i01, i11, sourceLocalNormals);
+    }
+
+    private bool SourceNormalPairIsCoherent(int a, int b, Vector3[] sourceLocalNormals)
+    {
+        if (a < 0 || b < 0 || a >= sourceLocalNormals.Length || b >= sourceLocalNormals.Length)
+            return true;
+
+        Vector3 na = sourceLocalNormals[a];
+        Vector3 nb = sourceLocalNormals[b];
+        if (na.sqrMagnitude <= 1e-8f || nb.sqrMagnitude <= 1e-8f)
+            return true;
+
+        return Vector3.Dot(na.normalized, nb.normalized) >= rectilinearRennetMinNormalDot;
+    }
+
+    private static bool IsValidSourcePoint(int index, bool[] valid, Vector3[] sourceLocalPositions)
+    {
+        return index >= 0 &&
+               valid != null &&
+               sourceLocalPositions != null &&
+               index < valid.Length &&
+               index < sourceLocalPositions.Length &&
+               valid[index] &&
+               Finite(sourceLocalPositions[index]);
+    }
+
+    private void TrySampleProjectedTriangle(
+        float x,
+        float y,
+        int ia,
+        int ib,
+        int ic,
+        Vector3[] sourceLocalPositions,
+        Vector3[] sourceLocalNormals,
+        ref bool found,
+        ref float bestZ,
+        ref Vector3 hitPosition,
+        ref Vector3 hitNormal)
+    {
+        Vector3 a = sourceLocalPositions[ia];
+        Vector3 b = sourceLocalPositions[ib];
+        Vector3 c = sourceLocalPositions[ic];
+        if (!TryBarycentricXY(x, y, a, b, c, out float wa, out float wb, out float wc))
+            return;
+
+        float z = a.z * wa + b.z * wb + c.z * wc;
+        if (!float.IsFinite(z) || z < 0f || z >= bestZ)
+            return;
+
+        Vector3 normal = Vector3.zero;
+        if (sourceLocalNormals != null)
+        {
+            if (ia < sourceLocalNormals.Length) normal += sourceLocalNormals[ia] * wa;
+            if (ib < sourceLocalNormals.Length) normal += sourceLocalNormals[ib] * wb;
+            if (ic < sourceLocalNormals.Length) normal += sourceLocalNormals[ic] * wc;
+        }
+
+        if (normal.sqrMagnitude <= 1e-8f)
+            normal = Vector3.Cross(b - a, c - a);
+
+        bestZ = z;
+        found = true;
+        hitPosition = new Vector3(x, y, z);
+        hitNormal = normal.sqrMagnitude > 1e-8f ? normal.normalized : Vector3.forward;
+    }
+
+    private static bool TryBarycentricXY(float x, float y, Vector3 a, Vector3 b, Vector3 c, out float wa, out float wb, out float wc)
+    {
+        Vector2 p = new Vector2(x, y);
+        Vector2 a2 = new Vector2(a.x, a.y);
+        Vector2 b2 = new Vector2(b.x, b.y);
+        Vector2 c2 = new Vector2(c.x, c.y);
+        Vector2 v0 = b2 - a2;
+        Vector2 v1 = c2 - a2;
+        Vector2 v2 = p - a2;
+        float denom = v0.x * v1.y - v1.x * v0.y;
+        if (Mathf.Abs(denom) <= 1e-8f)
+        {
+            wa = wb = wc = 0f;
+            return false;
+        }
+
+        wb = (v2.x * v1.y - v1.x * v2.y) / denom;
+        wc = (v0.x * v2.y - v2.x * v0.y) / denom;
+        wa = 1f - wb - wc;
+        const float epsilon = -0.0001f;
+        return wa >= epsilon && wb >= epsilon && wc >= epsilon;
+    }
+
+    private void AddRennetLineEdge(int a, int b, List<Vector3> renetVertexNormals, float maxSpan)
+    {
+        if (a < 0 || b < 0 || a >= _verts.Count || b >= _verts.Count)
+            return;
+
+        float distance = Vector3.Distance(_verts[a], _verts[b]);
+        if (!float.IsFinite(distance) || distance <= 1e-5f || distance > Mathf.Max(0.01f, maxSpan))
+            return;
+
+        if (renetVertexNormals != null && a < renetVertexNormals.Count && b < renetVertexNormals.Count)
+        {
+            Vector3 na = renetVertexNormals[a];
+            Vector3 nb = renetVertexNormals[b];
+            if (na.sqrMagnitude > 1e-8f && nb.sqrMagnitude > 1e-8f &&
+                Vector3.Dot(na.normalized, nb.normalized) < rectilinearRennetMinNormalDot)
+                return;
+        }
+
+        _lineIndices.Add(a);
+        _lineIndices.Add(b);
     }
 
     private void BuildFocusedGridOverlayLineMesh(bool[] valid, Vector3[] positions, Vector3[] normals)
@@ -2216,7 +2569,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             return;
         }
 
-        if (!TryBuildCandidateLineRibbonMesh(lineVertices, lineNormals, lineIndices, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles))
+        if (!TryBuildCandidateLineRibbonMesh(lineVertices, lineNormals, lineIndices, largestCandidateGridLineWidthMeters, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles))
         {
             SetRemeshGridLinesVisible(false);
             return;
@@ -2229,11 +2582,305 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         SetRemeshGridLinesVisible(visibleAfterBuild);
     }
 
-    private bool TryBuildCandidateLineRibbonMesh(List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles)
+    private void BuildHeightSliceContourDisplay(List<Vector3> vertices, List<Vector3> normals, List<int> triangles, bool visibleAfterBuild)
+    {
+        EnsureRemeshGridLineObjects();
+        bool contourVisible = _previewVisible && previewDisplayVisible && showHeightSliceContour;
+        if (_remeshLineMesh == null)
+        {
+            SetRemeshGridLinesVisible(false);
+            return;
+        }
+
+        if (vertices == null || triangles == null || vertices.Count <= 0 || triangles.Count < 3 ||
+            !TryGetHeightSlicePlaneLocal(vertices, out Vector3 planeOrigin, out Vector3 planeNormal, out Vector3 planeRight, out Vector3 planeForward))
+        {
+            _remeshLineMesh.Clear();
+            SetRemeshGridLinesVisible(false);
+            return;
+        }
+
+        List<Vector3> lineVertices = new List<Vector3>(triangles.Count);
+        List<Vector3> lineNormals = new List<Vector3>(triangles.Count);
+        List<int> lineIndices = new List<int>(triangles.Count);
+        float epsilon = Mathf.Max(0.0005f, heightSliceEpsilonMeters);
+        float maxSegmentLength = Mathf.Max(0.01f, heightSliceMaxSegmentMeters);
+
+        AppendHeightSliceIntersectionRows(vertices, triangles, planeOrigin, planeNormal, Mathf.Max(1, heightSliceRowCount), epsilon, maxSegmentLength, lineVertices, lineNormals, lineIndices);
+        if (heightSliceShowPerpendicularColumns)
+            AppendHeightSliceIntersectionRows(vertices, triangles, planeOrigin, planeRight, Mathf.Max(1, heightSliceColumnCount), epsilon, maxSegmentLength, lineVertices, lineNormals, lineIndices);
+
+        if (showHeightSlicePlaneFrame)
+            AddHeightSlicePlaneFrame(vertices, planeOrigin, planeNormal, planeRight, planeForward, lineVertices, lineNormals, lineIndices);
+        if (heightSliceShowPerpendicularColumns && heightSliceShowSampleColumnPlaneFrames)
+            AddHeightSliceSamplePlaneFrames(vertices, planeOrigin, planeRight, planeNormal, planeForward, Mathf.Max(1, heightSliceSampleColumnPlaneFrameCount), lineVertices, lineNormals, lineIndices);
+
+        _remeshLineMesh.Clear();
+        if (lineIndices.Count <= 0 ||
+            !TryBuildCandidateLineRibbonMesh(lineVertices, lineNormals, lineIndices, heightSliceLineWidthMeters, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles))
+        {
+            SetRemeshGridLinesVisible(false);
+            return;
+        }
+
+        _remeshLineMesh.SetVertices(ribbonVertices);
+        _remeshLineMesh.SetTriangles(ribbonTriangles, 0, true);
+        _remeshLineMesh.RecalculateBounds();
+        ApplyRemeshGridLineRendererColor(heightSliceContourColor);
+        SetRemeshGridLinesVisible(contourVisible);
+    }
+
+    private void AddHeightSliceSamplePlaneFrames(List<Vector3> vertices, Vector3 baseOrigin, Vector3 sliceNormal, Vector3 planeAxisA, Vector3 planeAxisB, int sampleCount, List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices)
+    {
+        if (vertices == null || vertices.Count <= 0 || sliceNormal.sqrMagnitude <= 1e-8f || planeAxisA.sqrMagnitude <= 1e-8f || planeAxisB.sqrMagnitude <= 1e-8f)
+            return;
+
+        sliceNormal.Normalize();
+        planeAxisA = Vector3.ProjectOnPlane(planeAxisA, sliceNormal);
+        planeAxisB = Vector3.ProjectOnPlane(planeAxisB, sliceNormal);
+        if (planeAxisA.sqrMagnitude <= 1e-8f || planeAxisB.sqrMagnitude <= 1e-8f)
+            return;
+        planeAxisA.Normalize();
+        planeAxisB.Normalize();
+
+        float minDistance = float.PositiveInfinity;
+        float maxDistance = float.NegativeInfinity;
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 vertex = vertices[i];
+            if (!Finite(vertex))
+                continue;
+            float distance = Vector3.Dot(vertex - baseOrigin, sliceNormal);
+            minDistance = Mathf.Min(minDistance, distance);
+            maxDistance = Mathf.Max(maxDistance, distance);
+        }
+
+        if (!float.IsFinite(minDistance) || !float.IsFinite(maxDistance))
+            return;
+
+        for (int i = 0; i < sampleCount; i++)
+        {
+            float t = sampleCount <= 1 ? 0.5f : i / (float)(sampleCount - 1);
+            Vector3 planeOrigin = baseOrigin + sliceNormal * Mathf.Lerp(minDistance, maxDistance, t);
+            AddHeightSlicePlaneFrame(vertices, planeOrigin, sliceNormal, planeAxisA, planeAxisB, lineVertices, lineNormals, lineIndices);
+        }
+    }
+
+    private void AppendHeightSliceIntersectionRows(List<Vector3> vertices, List<int> triangles, Vector3 baseOrigin, Vector3 sliceNormal, int sliceCount, float epsilon, float maxSegmentLength, List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices)
+    {
+        if (vertices == null || triangles == null || sliceNormal.sqrMagnitude <= 1e-8f)
+            return;
+
+        sliceNormal.Normalize();
+        float minPlaneDistance = float.PositiveInfinity;
+        float maxPlaneDistance = float.NegativeInfinity;
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 vertex = vertices[i];
+            if (!Finite(vertex))
+                continue;
+            float distance = Vector3.Dot(vertex - baseOrigin, sliceNormal);
+            minPlaneDistance = Mathf.Min(minPlaneDistance, distance);
+            maxPlaneDistance = Mathf.Max(maxPlaneDistance, distance);
+        }
+
+        if (!float.IsFinite(minPlaneDistance) || !float.IsFinite(maxPlaneDistance))
+            return;
+
+        List<Vector3> intersections = new List<Vector3>(3);
+        Vector3 surfaceOffset = sliceNormal * Mathf.Max(0f, gridLineSurfaceOffsetMeters);
+        for (int row = 0; row < sliceCount; row++)
+        {
+            float t = sliceCount <= 1 ? 0.5f : row / (float)(sliceCount - 1);
+            Vector3 sliceOrigin = baseOrigin + sliceNormal * Mathf.Lerp(minPlaneDistance, maxPlaneDistance, t);
+
+            for (int i = 0; i + 2 < triangles.Count; i += 3)
+            {
+                int ia = triangles[i];
+                int ib = triangles[i + 1];
+                int ic = triangles[i + 2];
+                if (ia < 0 || ib < 0 || ic < 0 || ia >= vertices.Count || ib >= vertices.Count || ic >= vertices.Count)
+                    continue;
+
+                Vector3 a = vertices[ia];
+                Vector3 b = vertices[ib];
+                Vector3 c = vertices[ic];
+                if (!Finite(a) || !Finite(b) || !Finite(c))
+                    continue;
+
+                intersections.Clear();
+                float da = Vector3.Dot(a - sliceOrigin, sliceNormal);
+                float db = Vector3.Dot(b - sliceOrigin, sliceNormal);
+                float dc = Vector3.Dot(c - sliceOrigin, sliceNormal);
+                TryAddPlaneIntersection(a, da, b, db, epsilon, intersections);
+                TryAddPlaneIntersection(b, db, c, dc, epsilon, intersections);
+                TryAddPlaneIntersection(c, dc, a, da, epsilon, intersections);
+
+                if (intersections.Count != 2)
+                    continue;
+
+                Vector3 p0 = intersections[0] + surfaceOffset;
+                Vector3 p1 = intersections[1] + surfaceOffset;
+                if ((p1 - p0).magnitude > maxSegmentLength)
+                    continue;
+
+                AddDirectLineSegment(p0, p1, sliceNormal, lineVertices, lineNormals, lineIndices);
+            }
+        }
+    }
+
+    private bool TryGetHeightSlicePlaneLocal(List<Vector3> vertices, out Vector3 planeOrigin, out Vector3 planeNormal, out Vector3 planeRight, out Vector3 planeForward)
+    {
+        Transform surfaceTransform = ResolveDisplayLocalTransform();
+        planeOrigin = Vector3.zero;
+        planeNormal = Vector3.up;
+        planeRight = Vector3.right;
+        planeForward = Vector3.forward;
+
+        if (heightSliceUseFrozenScreenCenterHeight && _hasFrozenHeadsetScreenCenterPoint)
+        {
+            Vector3 worldOrigin = _frozenHeadsetScreenCenterPoint;
+            Vector3 worldNormal = Vector3.up;
+            planeOrigin = surfaceTransform != null ? surfaceTransform.InverseTransformPoint(worldOrigin) : worldOrigin;
+            planeNormal = surfaceTransform != null ? surfaceTransform.InverseTransformDirection(worldNormal) : worldNormal;
+        }
+        else
+        {
+            if (vertices == null || vertices.Count <= 0)
+                return false;
+            Vector3 sum = Vector3.zero;
+            int count = 0;
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                if (!Finite(vertices[i]))
+                    continue;
+                sum += vertices[i];
+                count++;
+            }
+            if (count <= 0)
+                return false;
+            planeOrigin = sum / count;
+            planeNormal = surfaceTransform != null ? surfaceTransform.InverseTransformDirection(Vector3.up) : Vector3.up;
+        }
+
+        if (planeNormal.sqrMagnitude <= 1e-8f || !Finite(planeNormal))
+            return false;
+        planeNormal.Normalize();
+
+        Vector3 rightWorld = _hasFrozenHeightSliceFrame ? _frozenHeightSliceRightWorld : Vector3.right;
+        Vector3 forwardWorld = _hasFrozenHeightSliceFrame ? _frozenHeightSliceForwardWorld : Vector3.forward;
+        Vector3 rightHint = surfaceTransform != null ? surfaceTransform.InverseTransformDirection(rightWorld) : rightWorld;
+        planeRight = Vector3.ProjectOnPlane(rightHint, planeNormal);
+        if (planeRight.sqrMagnitude <= 1e-8f)
+        {
+            Vector3 forwardHint = surfaceTransform != null ? surfaceTransform.InverseTransformDirection(forwardWorld) : forwardWorld;
+            planeRight = Vector3.ProjectOnPlane(forwardHint, planeNormal);
+        }
+        if (planeRight.sqrMagnitude <= 1e-8f)
+            return false;
+        planeRight.Normalize();
+        planeForward = Vector3.Cross(planeRight, planeNormal);
+        if (planeForward.sqrMagnitude <= 1e-8f)
+            return false;
+        planeForward.Normalize();
+        return true;
+    }
+
+    private void CaptureFrozenHeightSliceFrame(Transform origin)
+    {
+        _hasFrozenHeightSliceFrame = false;
+        Vector3 forward = origin != null ? origin.forward : Vector3.forward;
+        forward = Vector3.ProjectOnPlane(forward, Vector3.up);
+        if (forward.sqrMagnitude <= 1e-8f || !Finite(forward))
+            forward = Vector3.forward;
+        forward.Normalize();
+
+        Vector3 right = Vector3.Cross(Vector3.up, forward);
+        if (right.sqrMagnitude <= 1e-8f || !Finite(right))
+            right = Vector3.right;
+        right.Normalize();
+
+        _frozenHeightSliceForwardWorld = forward;
+        _frozenHeightSliceRightWorld = right;
+        _hasFrozenHeightSliceFrame = true;
+    }
+
+    private void TryAddPlaneIntersection(Vector3 from, float fromDistance, Vector3 to, float toDistance, float epsilon, List<Vector3> intersections)
+    {
+        bool fromOnPlane = Mathf.Abs(fromDistance) <= epsilon;
+        bool toOnPlane = Mathf.Abs(toDistance) <= epsilon;
+        if (fromOnPlane && toOnPlane)
+            return;
+        if (!fromOnPlane && !toOnPlane && Mathf.Sign(fromDistance) == Mathf.Sign(toDistance))
+            return;
+
+        Vector3 point;
+        if (fromOnPlane)
+            point = from;
+        else if (toOnPlane)
+            point = to;
+        else
+        {
+            float denom = fromDistance - toDistance;
+            if (Mathf.Abs(denom) <= 1e-8f)
+                return;
+            point = Vector3.Lerp(from, to, Mathf.Clamp01(fromDistance / denom));
+        }
+
+        AddUniquePlaneIntersection(intersections, point);
+    }
+
+    private static void AddUniquePlaneIntersection(List<Vector3> intersections, Vector3 point)
+    {
+        const float MinDistanceSqr = 0.000001f;
+        for (int i = 0; i < intersections.Count; i++)
+        {
+            if ((intersections[i] - point).sqrMagnitude <= MinDistanceSqr)
+                return;
+        }
+
+        intersections.Add(point);
+    }
+
+    private void AddHeightSlicePlaneFrame(List<Vector3> vertices, Vector3 planeOrigin, Vector3 planeNormal, Vector3 planeRight, Vector3 planeForward, List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices)
+    {
+        float minU = float.PositiveInfinity;
+        float maxU = float.NegativeInfinity;
+        float minV = float.PositiveInfinity;
+        float maxV = float.NegativeInfinity;
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 p = vertices[i];
+            if (!Finite(p))
+                continue;
+            Vector3 offset = p - planeOrigin;
+            float u = Vector3.Dot(offset, planeRight);
+            float v = Vector3.Dot(offset, planeForward);
+            minU = Mathf.Min(minU, u);
+            maxU = Mathf.Max(maxU, u);
+            minV = Mathf.Min(minV, v);
+            maxV = Mathf.Max(maxV, v);
+        }
+
+        if (!float.IsFinite(minU) || !float.IsFinite(maxU) || !float.IsFinite(minV) || !float.IsFinite(maxV))
+            return;
+
+        Vector3 bias = planeNormal * Mathf.Max(0f, gridLineSurfaceOffsetMeters);
+        Vector3 p00 = planeOrigin + planeRight * minU + planeForward * minV + bias;
+        Vector3 p10 = planeOrigin + planeRight * maxU + planeForward * minV + bias;
+        Vector3 p11 = planeOrigin + planeRight * maxU + planeForward * maxV + bias;
+        Vector3 p01 = planeOrigin + planeRight * minU + planeForward * maxV + bias;
+        AddDirectLineSegment(p00, p10, planeNormal, lineVertices, lineNormals, lineIndices);
+        AddDirectLineSegment(p10, p11, planeNormal, lineVertices, lineNormals, lineIndices);
+        AddDirectLineSegment(p11, p01, planeNormal, lineVertices, lineNormals, lineIndices);
+        AddDirectLineSegment(p01, p00, planeNormal, lineVertices, lineNormals, lineIndices);
+    }
+
+    private bool TryBuildCandidateLineRibbonMesh(List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices, float lineWidthMeters, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles)
     {
         ribbonVertices = new List<Vector3>(Mathf.Max(4, lineIndices != null ? lineIndices.Count * 2 : 4));
         ribbonTriangles = new List<int>(Mathf.Max(6, lineIndices != null ? lineIndices.Count * 3 : 6));
-        float halfWidth = Mathf.Max(0.00025f, largestCandidateGridLineWidthMeters * 0.5f);
+        float halfWidth = Mathf.Max(0.00025f, lineWidthMeters * 0.5f);
         if (lineIndices == null || lineVertices == null || lineIndices.Count < 2 || lineVertices.Count <= 0)
             return false;
 
@@ -2515,7 +3162,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         distances.Add(distance);
     }
 
-    private void BuildCompleteCellSupportedGridEdges(GridGroup group, bool[] valid, Vector3[] sourcePositions, float maxSpan, bool[] horizontalEdges, bool[] verticalEdges, bool[] cells)
+    private void BuildCompleteCellSupportedGridEdges(GridGroup group, bool[] valid, Vector3[] sourcePositions, Vector3[] sourceNormals, float maxSpan, bool[] horizontalEdges, bool[] verticalEdges, bool[] cells)
     {
         if (valid == null || horizontalEdges == null || verticalEdges == null || cells == null || group.columns < 2 || group.rows < 2)
             return;
@@ -2532,10 +3179,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 int i01 = nextRowStart + col;
                 int i11 = i01 + 1;
                 bool complete =
-                    IsGridLineEdgeUsable(i00, i10, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i01, i11, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i00, i01, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i10, i11, valid, sourcePositions, maxSpan);
+                    IsGridLineEdgeUsable(i00, i10, valid, sourcePositions, sourceNormals, maxSpan) &&
+                    IsGridLineEdgeUsable(i01, i11, valid, sourcePositions, sourceNormals, maxSpan) &&
+                    IsGridLineEdgeUsable(i00, i01, valid, sourcePositions, sourceNormals, maxSpan) &&
+                    IsGridLineEdgeUsable(i10, i11, valid, sourcePositions, sourceNormals, maxSpan);
                 if (!complete)
                     continue;
 
@@ -2675,10 +3322,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 int i01 = nextRowStart + col;
                 int i11 = i01 + 1;
                 cells[row * cellColumns + col] =
-                    IsGridLineEdgeUsable(i00, i10, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i01, i11, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i00, i01, valid, sourcePositions, maxSpan) &&
-                    IsGridLineEdgeUsable(i10, i11, valid, sourcePositions, maxSpan);
+                    IsGridLineEdgeUsable(i00, i10, valid, sourcePositions, null, maxSpan) &&
+                    IsGridLineEdgeUsable(i01, i11, valid, sourcePositions, null, maxSpan) &&
+                    IsGridLineEdgeUsable(i00, i01, valid, sourcePositions, null, maxSpan) &&
+                    IsGridLineEdgeUsable(i10, i11, valid, sourcePositions, null, maxSpan);
             }
         }
 
@@ -2692,7 +3339,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 if (cellAbove == cellBelow)
                     continue;
 
-                AddGridLineEdge(rowStart + col, rowStart + col + 1, valid, vertexIndices, sourcePositions, maxSpan);
+                AddGridLineEdge(rowStart + col, rowStart + col + 1, valid, vertexIndices, sourcePositions, null, maxSpan);
             }
         }
 
@@ -2707,27 +3354,101 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 if (cellLeft == cellRight)
                     continue;
 
-                AddGridLineEdge(rowStart + col, nextRowStart + col, valid, vertexIndices, sourcePositions, maxSpan);
+                AddGridLineEdge(rowStart + col, nextRowStart + col, valid, vertexIndices, sourcePositions, null, maxSpan);
             }
         }
     }
 
-    private void AddGridLineEdge(int a, int b, bool[] valid, int[] vertexIndices, Vector3[] sourcePositions, float maxSpan)
+    private void AddRectilinearFilledContourGridEdges(GridGroup group, bool[] valid, int[] vertexIndices, Vector3[] sourcePositions, float maxSpan)
+    {
+        if (valid == null || vertexIndices == null || group.columns < 2 || group.rows < 2)
+            return;
+
+        bool[] supportedHorizontalEdges = new bool[group.rows * (group.columns - 1)];
+        bool[] supportedVerticalEdges = new bool[(group.rows - 1) * group.columns];
+        bool[] supportedCells = new bool[(group.rows - 1) * (group.columns - 1)];
+        BuildMeshBackedCompleteCellGridEdges(group, valid, supportedHorizontalEdges, supportedVerticalEdges, supportedCells);
+        PruneCompleteCellIslands(group, supportedCells);
+        RebuildCompleteCellSupportedGridEdges(group, supportedCells, supportedHorizontalEdges, supportedVerticalEdges);
+
+        for (int row = 0; row < group.rows; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            for (int col = 0; col < group.columns - 1; col++)
+            {
+                if (!supportedHorizontalEdges[row * (group.columns - 1) + col])
+                    continue;
+
+                AddLineEdge(rowStart + col, rowStart + col + 1, valid, vertexIndices);
+            }
+        }
+
+        for (int row = 0; row < group.rows - 1; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            int nextRowStart = group.startIndex + (row + 1) * group.columns;
+            for (int col = 0; col < group.columns; col++)
+            {
+                if (!supportedVerticalEdges[row * group.columns + col])
+                    continue;
+
+                AddLineEdge(rowStart + col, nextRowStart + col, valid, vertexIndices);
+            }
+        }
+    }
+
+    private static void BuildMeshBackedCompleteCellGridEdges(GridGroup group, bool[] valid, bool[] horizontalEdges, bool[] verticalEdges, bool[] cells)
+    {
+        if (valid == null || horizontalEdges == null || verticalEdges == null || cells == null || group.columns < 2 || group.rows < 2)
+            return;
+
+        int cellColumns = group.columns - 1;
+        for (int row = 0; row < group.rows - 1; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            int nextRowStart = group.startIndex + (row + 1) * group.columns;
+            for (int col = 0; col < cellColumns; col++)
+            {
+                int i00 = rowStart + col;
+                int i10 = i00 + 1;
+                int i01 = nextRowStart + col;
+                int i11 = i01 + 1;
+                cells[row * cellColumns + col] = valid[i00] && valid[i10] && valid[i01] && valid[i11];
+            }
+        }
+
+        RebuildCompleteCellSupportedGridEdges(group, cells, horizontalEdges, verticalEdges);
+    }
+
+    private void AddGridLineEdge(int a, int b, bool[] valid, int[] vertexIndices, Vector3[] sourcePositions, Vector3[] sourceNormals, float maxSpan)
     {
         if (a < 0 || b < 0 || valid == null || vertexIndices == null || a >= valid.Length || b >= valid.Length || a >= vertexIndices.Length || b >= vertexIndices.Length)
             return;
-        if (!IsGridLineEdgeUsable(a, b, valid, sourcePositions, maxSpan))
+        if (!IsGridLineEdgeUsable(a, b, valid, sourcePositions, sourceNormals, maxSpan))
             return;
 
         AddLineEdge(a, b, valid, vertexIndices);
     }
 
-    private static bool IsGridLineEdgeUsable(int a, int b, bool[] valid, Vector3[] sourcePositions, float maxSpan)
+    private bool IsGridLineEdgeUsable(int a, int b, bool[] valid, Vector3[] sourcePositions, Vector3[] sourceNormals, float maxSpan)
     {
         if (a < 0 || b < 0 || valid == null || a >= valid.Length || b >= valid.Length)
             return false;
         if (!valid[a] || !valid[b])
             return false;
+
+        if (gridLineRequireContinuousSurface && sourceNormals != null && a < sourceNormals.Length && b < sourceNormals.Length)
+        {
+            Vector3 normalA = sourceNormals[a];
+            Vector3 normalB = sourceNormals[b];
+            if (normalA.sqrMagnitude > 1e-6f && normalB.sqrMagnitude > 1e-6f)
+            {
+                float normalDot = Vector3.Dot(normalA.normalized, normalB.normalized);
+                if (!float.IsFinite(normalDot) || normalDot < gridLineMinNeighborNormalDot)
+                    return false;
+            }
+        }
+
         if (sourcePositions != null && a < sourcePositions.Length && b < sourcePositions.Length && maxSpan > 0f)
         {
             float sourceDistance = Vector3.Distance(sourcePositions[a], sourcePositions[b]);
@@ -2937,9 +3658,27 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             if (candidate.faceIndices == null || (!disableMinTriangleFilter && candidate.faceIndices.Count < minTriangleCount))
                 continue;
 
-            bool built = largestCandidateUseOriginalGridTerrain && !largestCandidateUseTriangularLattice
-                ? TryBuildCandidateTerrainGridMesh(vertices, triangles, candidate, sourceValid, sourcePositions, sourceNormals, sourceConfidences, localVertices, localNormals, out List<int> subMeshTriangles, localLineVertices, localLineNormals, localLineIndices)
-                : TryBuildCandidateRegularGridMesh(vertices, triangles, candidate, localVertices, localNormals, out subMeshTriangles, localLineVertices, localLineNormals, localLineIndices);
+            bool built;
+            List<int> subMeshTriangles;
+            if (largestCandidateUseOriginalGridTerrain && largestCandidateProjectRegularGridToMeshTerrain && !largestCandidateUseTriangularLattice)
+            {
+                built = TryBuildCandidateProjectedRennetTerrainMesh(
+                    vertices,
+                    triangles,
+                    candidate,
+                    localVertices,
+                    localNormals,
+                    out subMeshTriangles,
+                    localLineVertices,
+                    localLineNormals,
+                    localLineIndices);
+            }
+            else
+            {
+                built = largestCandidateUseOriginalGridTerrain && !largestCandidateUseTriangularLattice
+                    ? TryBuildCandidateTerrainGridMesh(vertices, triangles, candidate, sourceValid, sourcePositions, sourceNormals, sourceConfidences, localVertices, localNormals, out subMeshTriangles, localLineVertices, localLineNormals, localLineIndices)
+                    : TryBuildCandidateRegularGridMesh(vertices, triangles, candidate, localVertices, localNormals, out subMeshTriangles, localLineVertices, localLineNormals, localLineIndices);
+            }
             if (!built)
                 continue;
 
@@ -3480,6 +4219,261 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         }
 
         return subMeshTriangles.Count > 0;
+    }
+
+    private bool TryBuildCandidateProjectedRennetTerrainMesh(List<Vector3> vertices, List<int> triangles, CandidateSurfaceInfo candidate, List<Vector3> localVertices, List<Vector3> localNormals, out List<int> subMeshTriangles, List<Vector3> localLineVertices, List<Vector3> localLineNormals, List<int> localLineIndices)
+    {
+        subMeshTriangles = new List<int>();
+        if (candidate.faceIndices == null || candidate.faceIndices.Count <= 0 || vertices == null || triangles == null)
+            return false;
+
+        int baseVertexCount = localVertices.Count;
+        int baseNormalCount = localNormals.Count;
+        int baseLineVertexCount = localLineVertices.Count;
+        int baseLineIndexCount = localLineIndices.Count;
+
+        if (!TryGetCandidatePlaneFrame(candidate, out Vector3 planeOrigin, out Vector3 planeNormal, out Vector3 localRight, out Vector3 localUp))
+            return false;
+
+        List<RennetTerrainTriangle> terrainTriangles = new List<RennetTerrainTriangle>(candidate.faceIndices.Count);
+        float minU = float.PositiveInfinity;
+        float maxU = float.NegativeInfinity;
+        float minV = float.PositiveInfinity;
+        float maxV = float.NegativeInfinity;
+
+        for (int i = 0; i < candidate.faceIndices.Count; i++)
+        {
+            int triStart = candidate.faceIndices[i] * 3;
+            if (triStart < 0 || triStart + 2 >= triangles.Count)
+                continue;
+
+            int ia = triangles[triStart];
+            int ib = triangles[triStart + 1];
+            int ic = triangles[triStart + 2];
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= vertices.Count || ib >= vertices.Count || ic >= vertices.Count)
+                continue;
+
+            Vector3 pa = vertices[ia];
+            Vector3 pb = vertices[ib];
+            Vector3 pc = vertices[ic];
+            if (!Finite(pa) || !Finite(pb) || !Finite(pc))
+                continue;
+
+            Vector3 triangleNormal = Vector3.Cross(pb - pa, pc - pa);
+            if (triangleNormal.sqrMagnitude <= 1e-10f)
+                continue;
+
+            triangleNormal.Normalize();
+            if (Vector3.Dot(triangleNormal, planeNormal) < 0f)
+                triangleNormal = -triangleNormal;
+
+            Vector2 a = new Vector2(Vector3.Dot(pa - planeOrigin, localRight), Vector3.Dot(pa - planeOrigin, localUp));
+            Vector2 b = new Vector2(Vector3.Dot(pb - planeOrigin, localRight), Vector3.Dot(pb - planeOrigin, localUp));
+            Vector2 c = new Vector2(Vector3.Dot(pc - planeOrigin, localRight), Vector3.Dot(pc - planeOrigin, localUp));
+            if (Mathf.Abs(SignedTriangleArea2D(a, b, c)) <= 1e-7f)
+                continue;
+
+            terrainTriangles.Add(new RennetTerrainTriangle
+            {
+                a = a,
+                b = b,
+                c = c,
+                pa = pa,
+                pb = pb,
+                pc = pc,
+                normal = triangleNormal,
+                minX = Mathf.Min(a.x, b.x, c.x),
+                maxX = Mathf.Max(a.x, b.x, c.x),
+                minY = Mathf.Min(a.y, b.y, c.y),
+                maxY = Mathf.Max(a.y, b.y, c.y)
+            });
+
+            minU = Mathf.Min(minU, a.x, b.x, c.x);
+            maxU = Mathf.Max(maxU, a.x, b.x, c.x);
+            minV = Mathf.Min(minV, a.y, b.y, c.y);
+            maxV = Mathf.Max(maxV, a.y, b.y, c.y);
+        }
+
+        if (terrainTriangles.Count <= 0 ||
+            !float.IsFinite(minU) || !float.IsFinite(maxU) ||
+            !float.IsFinite(minV) || !float.IsFinite(maxV) ||
+            maxU <= minU || maxV <= minV)
+        {
+            return false;
+        }
+
+        float step = Mathf.Max(0.01f, largestCandidateGridCellSizeMeters);
+        int cellColumns = Mathf.Clamp(Mathf.CeilToInt((maxU - minU) / step), 1, Mathf.Max(4, largestCandidateGridMaxColumns));
+        int cellRows = Mathf.Clamp(Mathf.CeilToInt((maxV - minV) / step), 1, Mathf.Max(4, largestCandidateGridMaxRows));
+        int vertexColumns = cellColumns + 1;
+        int vertexRows = cellRows + 1;
+        int[] gridVertexIndices = new int[vertexColumns * vertexRows];
+        Vector3[] gridNormals = new Vector3[vertexColumns * vertexRows];
+        for (int i = 0; i < gridVertexIndices.Length; i++)
+            gridVertexIndices[i] = -1;
+
+        int GridIndex(int x, int y) => y * vertexColumns + x;
+        for (int y = 0; y < vertexRows; y++)
+        {
+            float v = Mathf.Lerp(minV, maxV, y / (float)Mathf.Max(1, vertexRows - 1));
+            for (int x = 0; x < vertexColumns; x++)
+            {
+                float u = Mathf.Lerp(minU, maxU, x / (float)Mathf.Max(1, vertexColumns - 1));
+                if (!TrySampleProjectedRennetTerrain(terrainTriangles, new Vector2(u, v), planeOrigin, planeNormal, out Vector3 position, out Vector3 normal))
+                    continue;
+
+                int index = GridIndex(x, y);
+                gridVertexIndices[index] = localVertices.Count;
+                gridNormals[index] = normal;
+                localVertices.Add(position);
+                localNormals.Add(normal);
+            }
+        }
+
+        bool[] cellMask = new bool[cellColumns * cellRows];
+        int activeCellCount = 0;
+        for (int y = 0; y < cellRows; y++)
+        {
+            for (int x = 0; x < cellColumns; x++)
+            {
+                int i00 = gridVertexIndices[GridIndex(x, y)];
+                int i10 = gridVertexIndices[GridIndex(x + 1, y)];
+                int i01 = gridVertexIndices[GridIndex(x, y + 1)];
+                int i11 = gridVertexIndices[GridIndex(x + 1, y + 1)];
+                if (i00 < 0 || i10 < 0 || i01 < 0 || i11 < 0)
+                    continue;
+
+                cellMask[y * cellColumns + x] = true;
+            }
+        }
+
+        FilterCandidateGridCellMask(cellMask, cellColumns, cellRows);
+
+        Dictionary<int, int> lineVertexIndices = new Dictionary<int, int>();
+        int EnsureLineVertex(int gridIndex)
+        {
+            if (lineVertexIndices.TryGetValue(gridIndex, out int existing))
+                return existing;
+
+            int sourceIndex = gridVertexIndices[gridIndex];
+            if (sourceIndex < 0 || sourceIndex >= localVertices.Count)
+                return -1;
+
+            Vector3 normal = gridNormals[gridIndex].sqrMagnitude > 1e-8f ? gridNormals[gridIndex].normalized : planeNormal;
+            int created = localLineVertices.Count;
+            localLineVertices.Add(localVertices[sourceIndex] + normal * Mathf.Max(0f, gridLineSurfaceOffsetMeters));
+            localLineNormals.Add(normal);
+            lineVertexIndices[gridIndex] = created;
+            return created;
+        }
+
+        HashSet<EdgeKey> emittedEdges = new HashSet<EdgeKey>();
+        void AddGridEdge(int ax, int ay, int bx, int by)
+        {
+            int ia = EnsureLineVertex(GridIndex(ax, ay));
+            int ib = EnsureLineVertex(GridIndex(bx, by));
+            if (ia < 0 || ib < 0)
+                return;
+
+            EdgeKey edge = new EdgeKey(ia, ib);
+            if (!emittedEdges.Add(edge))
+                return;
+
+            localLineIndices.Add(ia);
+            localLineIndices.Add(ib);
+        }
+
+        for (int y = 0; y < cellRows; y++)
+        {
+            for (int x = 0; x < cellColumns; x++)
+            {
+                if (!cellMask[y * cellColumns + x])
+                    continue;
+
+                int i00 = gridVertexIndices[GridIndex(x, y)];
+                int i10 = gridVertexIndices[GridIndex(x + 1, y)];
+                int i01 = gridVertexIndices[GridIndex(x, y + 1)];
+                int i11 = gridVertexIndices[GridIndex(x + 1, y + 1)];
+                if (i00 < 0 || i10 < 0 || i01 < 0 || i11 < 0)
+                    continue;
+
+                activeCellCount++;
+                subMeshTriangles.Add(i00);
+                subMeshTriangles.Add(i10);
+                subMeshTriangles.Add(i11);
+                subMeshTriangles.Add(i00);
+                subMeshTriangles.Add(i11);
+                subMeshTriangles.Add(i01);
+
+                AddGridEdge(x, y, x + 1, y);
+                AddGridEdge(x + 1, y, x + 1, y + 1);
+                AddGridEdge(x + 1, y + 1, x, y + 1);
+                AddGridEdge(x, y + 1, x, y);
+                if (largestCandidateGridShowCellDiagonals)
+                    AddGridEdge(x, y, x + 1, y + 1);
+            }
+        }
+
+        if (activeCellCount < Mathf.Max(0, largestCandidateGridMinCellCount) ||
+            (!PassesCandidateViewportFilter(localVertices.Count > baseVertexCount ? localVertices : localLineVertices, localVertices.Count > baseVertexCount ? baseVertexCount : baseLineVertexCount)))
+        {
+            RollBackCandidateRegularGridBuild(localVertices, localNormals, localLineVertices, localLineNormals, localLineIndices, baseVertexCount, baseNormalCount, baseLineVertexCount, baseLineIndexCount);
+            subMeshTriangles.Clear();
+            return false;
+        }
+
+        return subMeshTriangles.Count > 0 || localLineIndices.Count > baseLineIndexCount;
+    }
+
+    private bool TrySampleProjectedRennetTerrain(List<RennetTerrainTriangle> terrainTriangles, Vector2 uv, Vector3 planeOrigin, Vector3 planeNormal, out Vector3 position, out Vector3 normal)
+    {
+        position = Vector3.zero;
+        normal = planeNormal;
+        if (terrainTriangles == null || terrainTriangles.Count <= 0)
+            return false;
+
+        bool found = false;
+        float bestPlaneDistance = float.PositiveInfinity;
+        for (int i = 0; i < terrainTriangles.Count; i++)
+        {
+            RennetTerrainTriangle triangle = terrainTriangles[i];
+            if (uv.x < triangle.minX || uv.x > triangle.maxX || uv.y < triangle.minY || uv.y > triangle.maxY)
+                continue;
+
+            if (!TryBarycentric2D(uv, triangle.a, triangle.b, triangle.c, out float wa, out float wb, out float wc))
+                continue;
+
+            Vector3 candidatePosition = triangle.pa * wa + triangle.pb * wb + triangle.pc * wc;
+            float planeDistance = Mathf.Abs(Vector3.Dot(candidatePosition - planeOrigin, planeNormal));
+            if (!float.IsFinite(planeDistance) || planeDistance >= bestPlaneDistance)
+                continue;
+
+            bestPlaneDistance = planeDistance;
+            position = candidatePosition;
+            normal = triangle.normal.sqrMagnitude > 1e-8f ? triangle.normal : planeNormal;
+            found = true;
+        }
+
+        return found;
+    }
+
+    private static bool TryBarycentric2D(Vector2 p, Vector2 a, Vector2 b, Vector2 c, out float wa, out float wb, out float wc)
+    {
+        Vector2 v0 = b - a;
+        Vector2 v1 = c - a;
+        Vector2 v2 = p - a;
+        float denom = v0.x * v1.y - v1.x * v0.y;
+        if (Mathf.Abs(denom) <= 1e-8f)
+        {
+            wa = wb = wc = 0f;
+            return false;
+        }
+
+        wb = (v2.x * v1.y - v1.x * v2.y) / denom;
+        wc = (v0.x * v2.y - v2.x * v0.y) / denom;
+        wa = 1f - wb - wc;
+        const float epsilon = -0.0001f;
+        return wa >= epsilon && wb >= epsilon && wc >= epsilon;
     }
 
     private bool TryBuildCandidateTerrainGridMesh(List<Vector3> vertices, List<int> triangles, CandidateSurfaceInfo candidate, bool[] sourceValid, Vector3[] sourcePositions, Vector3[] sourceNormals, float[] sourceConfidences, List<Vector3> localVertices, List<Vector3> localNormals, out List<int> subMeshTriangles, List<Vector3> localLineVertices, List<Vector3> localLineNormals, List<int> localLineIndices)
@@ -5095,6 +6089,21 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         public Vector2 a;
         public Vector2 b;
         public Vector2 c;
+        public float minX;
+        public float maxX;
+        public float minY;
+        public float maxY;
+    }
+
+    private struct RennetTerrainTriangle
+    {
+        public Vector2 a;
+        public Vector2 b;
+        public Vector2 c;
+        public Vector3 pa;
+        public Vector3 pb;
+        public Vector3 pc;
+        public Vector3 normal;
         public float minX;
         public float maxX;
         public float minY;
@@ -7004,7 +8013,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private bool ShouldMaintainSurfaceMesh()
     {
-        return !showCandidatePlaneObjects && (showSurfaceMesh || ShouldShowGridInteriorMesh() || keepSurfaceMeshAvailableWhenHidden);
+        return !showCandidatePlaneObjects && (showSurfaceMesh || ShouldShowGridInteriorMesh() || keepSurfaceMeshAvailableWhenHidden || showHeightSliceContour);
     }
 
     private void ApplyColor(int index, Color color)

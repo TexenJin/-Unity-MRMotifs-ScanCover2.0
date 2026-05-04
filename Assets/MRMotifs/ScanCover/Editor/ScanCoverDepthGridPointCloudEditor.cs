@@ -110,16 +110,29 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
         BeginSection("Visible Output");
         Draw("showGridLines");
         Draw("showGridOuterContourOnly");
+        Draw("showRectilinearFillInsideContour");
         Draw("showGridTriangulation");
         Draw("showGridInteriorMesh");
         Draw("gridInteriorDisplayMode");
         Draw("showSurfaceMesh");
+        Draw("showHeightSliceContour");
+        Draw("heightSliceUseFrozenScreenCenterHeight");
+        Draw("heightSliceRowCount");
+        Draw("heightSliceShowPerpendicularColumns");
+        Draw("heightSliceColumnCount");
+        Draw("showHeightSlicePlaneFrame");
+        Draw("heightSliceShowSampleColumnPlaneFrames");
+        Draw("heightSliceSampleColumnPlaneFrameCount");
         Draw("showCandidatePlaneObjects");
         Draw("showMarkers");
         EditorGUILayout.Space(3f);
         Draw("gridLineColor");
         Draw("gridLineMaterialOverride");
         Draw("gridLineSurfaceOffsetMeters");
+        Draw("heightSliceEpsilonMeters");
+        Draw("heightSliceMaxSegmentMeters");
+        Draw("heightSliceLineWidthMeters");
+        Draw("heightSliceContourColor");
         Draw("surfaceColor");
         Draw("surfaceMaterialOverride");
         EndSection();
@@ -168,6 +181,9 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
             using (new EditorGUI.IndentLevelScope())
             {
                 Draw("rectifyGridLinesAfterDepthWrap");
+                Draw("rectilinearRennetStride");
+                Draw("rectilinearRennetMinNormalDot");
+                Draw("rectilinearRennetMaxEdgeSpanMultiplier");
                 Draw("rectifiedGridLineMaxSpanMultiplier");
                 Draw("rectifiedGridLineMinValidRatio");
                 Draw("gridLineRequireCompleteCellSupport");
@@ -204,6 +220,16 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
                 Draw("surfaceRegionMaxPlaneOffsetMeters");
                 Draw("surfaceRegionColorSaturation");
                 Draw("surfaceRegionColorValue");
+                EditorGUILayout.Space(3f);
+                Draw("isolateTopCandidateSurfaces");
+                Draw("rebuildLargestCandidateAsRegularGrid");
+                Draw("largestCandidateUseTriangularLattice");
+                Draw("largestCandidateUseOriginalGridTerrain");
+                Draw("largestCandidateProjectRegularGridToMeshTerrain");
+                Draw("largestCandidateShowFill");
+                Draw("largestCandidateGridCellSizeMeters");
+                Draw("largestCandidateGridMaxColumns");
+                Draw("largestCandidateGridMaxRows");
             }
         }
 

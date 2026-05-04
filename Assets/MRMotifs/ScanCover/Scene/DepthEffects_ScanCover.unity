@@ -1,4 +1,4 @@
-﻿%YAML 1.1
+%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
 --- !u!29 &1
 OcclusionCullingSettings:
@@ -8837,6 +8837,7 @@ MonoBehaviour:
   runtimeCore: {fileID: 910400000000000008}
   surfaceSnapshotManager: {fileID: 0}
   depthGridPointCloud: {fileID: 920710000000000003}
+  depthGridSnapshot64: {fileID: 920710000000000004}
   depthProbeRows: []
   autoStartOnEnable: 1
   clearOnAutoStart: 1
@@ -8860,7 +8861,9 @@ MonoBehaviour:
   debugLog: 0
   inputDebounceSeconds: 0.35
   ignoreInputWhileCaptureBurstRunning: 1
-  useCaptureBurst: 1
+  usePureDepthGridSnapshot64Route: 1
+  clearPureSnapshotOnClearAll: 1
+  useCaptureBurst: 0
   captureBurstRefreshCount: 1
   captureBurstTimeoutSeconds: 0.6
   captureSurfaceSnapshotOnManualCapture: 0
@@ -8876,7 +8879,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1961903629088574029}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: a7a9d303a1224c04b97c7d7a1ca17b32, type: 3}
   m_Name: 
@@ -8917,6 +8920,7 @@ GameObject:
   m_Component:
   - component: {fileID: 920710000000000002}
   - component: {fileID: 920710000000000003}
+  - component: {fileID: 920710000000000004}
   - component: {fileID: 920710000000000099}
   m_Layer: 0
   m_Name: DepthGridPointCloud_Right
@@ -8947,7 +8951,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 9ca0fc213af84db28e0bd5469b31718d, type: 3}
   m_Name: 
@@ -8967,6 +8971,12 @@ MonoBehaviour:
   regularGridViewportCoverageScale: 1
   regularGridUseFixedWorldSize: 0
   regularGridUseDepthHitPlaneOnly: 0
+  regularGridUseVerticalDepthPlaneExperiment: 0
+  regularGridUseSurfacePlaneAxesForVerticalDepthGrid: 0
+  verticalDepthGridSurfaceAxisMinFacingDot: 0.18
+  verticalDepthGridSurfaceAxisMaxWorldUpDot: 0.82
+  verticalDepthGridSampleRadiusMultiplier: 0.85
+  verticalDepthGridMaxForwardOffsetMeters: 2.5
   regularGridWorldCellSizeMeters: 0.04
   regularGridFixedWorldWindowScale: 0.5
   regularGridUseSmoothDistanceScale: 1
@@ -9044,8 +9054,20 @@ MonoBehaviour:
   runtimeAxisLength: 0.4
   runtimeAxisThickness: 0.03
   showGridLines: 1
-  showGridOuterContourOnly: 1
+  showGridOuterContourOnly: 0
+  showRectilinearFillInsideContour: 0
+  rectilinearRennetStride: 2
+  rectilinearRennetMinNormalDot: 0.45
+  rectilinearRennetMaxEdgeSpanMultiplier: 3
   showGridTriangulation: 0
+  rectifyGridLinesAfterDepthWrap: 0
+  gridLineRequireContinuousSurface: 1
+  rectifiedGridLineMaxSpanMultiplier: 2.35
+  rectifiedGridLineMinValidRatio: 0.18
+  gridLineMinNeighborNormalDot: 0.2
+  gridLineRequireCompleteCellSupport: 0
+  gridLineMinCompleteCellIslandCount: 8
+  gridLineKeepLargestCompleteCellIslands: 1
   gridLineMaterialOverride: {fileID: 0}
   gridLineColor: {r: 1, g: 1, b: 1, a: 0.32}
   gridLineSurfaceOffsetMeters: 0.001
@@ -9055,7 +9077,7 @@ MonoBehaviour:
   focusedGridExpandMeters: 0.06
   showGridInteriorMesh: 0
   gridInteriorDisplayMode: 0
-  showSurfaceMesh: 0
+  showSurfaceMesh: 1
   keepSurfaceMeshAvailableWhenHidden: 0
   useIndexConnectivity: 1
   surfaceMaterialOverride: {fileID: 2100000, guid: 88525e94ba60b634e8281cd32171859e, type: 2}
@@ -9063,6 +9085,19 @@ MonoBehaviour:
   minNeighborNormalDot: 0.35
   surfaceColor: {r: 0.18, g: 0.95, b: 0.98, a: 1}
   surfaceDoubleSided: 1
+  showHeightSliceContour: 0
+  heightSliceUseFrozenScreenCenterHeight: 1
+  heightSliceRowCount: 32
+  heightSliceShowPerpendicularColumns: 1
+  heightSliceColumnCount: 32
+  showHeightSlicePlaneFrame: 0
+  heightSliceShowSampleColumnPlaneFrames: 0
+  heightSliceSampleColumnPlaneFrameCount: 5
+  heightSliceEpsilonMeters: 0.01
+  heightSliceMaxSegmentMeters: 0.28
+  heightSliceLineWidthMeters: 0.006
+  heightSliceContourColor: {r: 1, g: 1, b: 1, a: 0.95}
+  heightSlicePlaneFrameColor: {r: 1, g: 1, b: 1, a: 0.35}
   colorizeSurfaceRegions: 1
   showIrregularSurfaceBucket: 1
   irregularSurfaceBucketAlpha: 0.35
@@ -9093,6 +9128,7 @@ MonoBehaviour:
   rebuildLargestCandidateAsRegularGrid: 0
   largestCandidateUseTriangularLattice: 0
   largestCandidateUseOriginalGridTerrain: 0
+  largestCandidateProjectRegularGridToMeshTerrain: 1
   largestCandidateShowFill: 1
   largestCandidateGridCellSizeMeters: 0.08
   largestCandidateGridMaxColumns: 64
@@ -9143,7 +9179,7 @@ MonoBehaviour:
   logBounds: 0
   dumpRosterOnceOnPlay: 0
   dumpOnlyValidCellsInRoster: 0
---- !u!114 &920710000000000099
+--- !u!114 &920710000000000004
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -9151,6 +9187,45 @@ MonoBehaviour:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
   m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e2b945b1b2f24e088b81eb2dfc7bd430, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  depthRaycaster: {fileID: 0}
+  environmentDepthManager: {fileID: 1177598827}
+  sessionController: {fileID: 910400000000000003}
+  displayParent: {fileID: 0}
+  captureOnStart: 0
+  retryUntilFirstSnapshot: 0
+  updateEveryFrame: 0
+  captureKey: 32
+  captureWhenSessionFrozen: 0
+  eye: 1
+  freezeDisplayInWorldSpace: 1
+  compensateHeadsetRollSampling: 0
+  rollReference: {fileID: 2140226223}
+  depthPixelVFlip: 1
+  neighborFill: 1
+  neighborRadiusPixels: 1
+  minLinearDepthMeters: 0.05
+  maxLinearDepthMeters: 8
+  usePrefieldRenet: 0
+  renetGridSize: 32
+  maxPrefieldCellEdgeMeters: 0.7
+  maxPrefieldCellDepthDeltaMeters: 0.45
+  maxRenetSegmentMeters: 0.8
+  maxRenetDepthDeltaMeters: 0.5
+  useWorldRuleRenet: 0
+  worldRuleCoverage: 1
+  debugLog: 0
+--- !u!114 &920710000000000099
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7d2db57f5f9640d3b2b3419a47c8d6d2, type: 3}
   m_Name: 

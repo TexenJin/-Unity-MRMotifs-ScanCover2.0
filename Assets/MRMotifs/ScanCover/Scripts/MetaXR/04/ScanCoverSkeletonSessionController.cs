@@ -31,6 +31,7 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public ScanCoverSkeletonRuntimeCore runtimeCore;
     public ScanCoverSurfaceSnapshotManager surfaceSnapshotManager;
     public ScanCoverDepthGridPointCloud depthGridPointCloud;
+    public ScanCoverDepthGridSnapshot64 depthGridSnapshot64;
     public DepthEffectsDepthProbeRowRenderer[] depthProbeRows;
 
     [Header("Startup")]
@@ -69,6 +70,10 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     [Min(0f)]
     public float inputDebounceSeconds = 0.35f;
     public bool ignoreInputWhileCaptureBurstRunning = true;
+
+    [Header("Pure 64x64 Depth Grid Snapshot")]
+    public bool usePureDepthGridSnapshot64Route = true;
+    public bool clearPureSnapshotOnClearAll = true;
 
     [Header("Capture Burst")]
     public bool useCaptureBurst = true;
@@ -136,6 +141,17 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void StartNewScan(bool clearExisting)
     {
         ResolveRefs();
+
+        if (usePureDepthGridSnapshot64Route)
+        {
+            if (clearExisting && clearPureSnapshotOnClearAll)
+                depthGridSnapshot64?.ClearSnapshot();
+
+            ClearHudStats();
+            State = SessionState.Scanning;
+            return;
+        }
+
         if (runtimeCore == null)
             return;
 
@@ -148,6 +164,14 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void CaptureSnapshotNow()
     {
         ResolveRefs();
+
+        if (usePureDepthGridSnapshot64Route)
+        {
+            CapturePureDepthGridSnapshot();
+            State = SessionState.Scanning;
+            return;
+        }
+
         if (runtimeCore == null)
             return;
 
@@ -172,6 +196,14 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void FreezeAndBuild()
     {
         ResolveRefs();
+
+        if (usePureDepthGridSnapshot64Route)
+        {
+            CapturePureDepthGridSnapshot();
+            State = SessionState.Frozen;
+            return;
+        }
+
         if (runtimeCore == null)
             return;
 
@@ -215,7 +247,16 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             _captureBurstRoutine = null;
         }
 
-        runtimeCore?.ClearAll(hideDepthPreviewOnClearAll, forceClearSurfaceSnapshotsOnClearAll);
+        if (usePureDepthGridSnapshot64Route)
+        {
+            if (clearPureSnapshotOnClearAll)
+                depthGridSnapshot64?.ClearSnapshot();
+        }
+        else
+        {
+            runtimeCore?.ClearAll(hideDepthPreviewOnClearAll, forceClearSurfaceSnapshotsOnClearAll);
+        }
+
         ClearHudStats();
         State = SessionState.Idle;
     }
@@ -327,6 +368,21 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             surfaceSnapshotManager.ExportIncrementalReferenceShellAsObj();
     }
 
+    private bool CapturePureDepthGridSnapshot()
+    {
+        if (depthGridSnapshot64 == null)
+        {
+            if (debugLog)
+                Debug.LogWarning("[ScanCoverSkeletonSessionController] Pure depth grid snapshot component is missing.");
+            return false;
+        }
+
+        bool captured = depthGridSnapshot64.CaptureSnapshot();
+        if (!captured && debugLog)
+            Debug.LogWarning("[ScanCoverSkeletonSessionController] Pure depth grid snapshot capture failed.");
+        return captured;
+    }
+
     private bool ConsumeOneInputAction()
     {
         if (Time.unscaledTime < _nextAcceptedInputTime)
@@ -392,6 +448,18 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
 
     private void ResolveRefs()
     {
+        if (depthGridSnapshot64 == null)
+            depthGridSnapshot64 = GetComponentInChildren<ScanCoverDepthGridSnapshot64>(true);
+        if (depthGridSnapshot64 == null)
+            depthGridSnapshot64 = FindAnyObjectByType<ScanCoverDepthGridSnapshot64>(FindObjectsInactive.Include);
+
+        if (usePureDepthGridSnapshot64Route)
+        {
+            if (runtimeCore == null)
+                runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
+            return;
+        }
+
         if (runtimeCore == null)
             runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
         if (runtimeCore == null)
@@ -403,6 +471,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             surfaceSnapshotManager = runtimeCore.surfaceSnapshotManager;
         if (depthGridPointCloud == null)
             depthGridPointCloud = runtimeCore.depthGridPointCloud;
+        if (depthGridSnapshot64 == null && runtimeCore != null)
+            depthGridSnapshot64 = runtimeCore.GetComponentInChildren<ScanCoverDepthGridSnapshot64>(true);
         if (depthProbeRows == null || depthProbeRows.Length == 0)
             depthProbeRows = runtimeCore.depthProbeRows;
     }
