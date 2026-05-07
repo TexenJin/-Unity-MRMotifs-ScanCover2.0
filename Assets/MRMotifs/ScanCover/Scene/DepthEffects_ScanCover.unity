@@ -8838,6 +8838,7 @@ MonoBehaviour:
   surfaceSnapshotManager: {fileID: 0}
   depthGridPointCloud: {fileID: 920710000000000003}
   depthGridSnapshot64: {fileID: 920710000000000004}
+  seedConfidencePatch: {fileID: 920710000000000106}
   depthProbeRows: []
   autoStartOnEnable: 1
   clearOnAutoStart: 1
@@ -8861,8 +8862,11 @@ MonoBehaviour:
   debugLog: 0
   inputDebounceSeconds: 0.35
   ignoreInputWhileCaptureBurstRunning: 1
-  usePureDepthGridSnapshot64Route: 1
+  usePureDepthGridSnapshot64Route: 0
   clearPureSnapshotOnClearAll: 1
+  useSeedConfidencePatchRoute: 1
+  clearSeedConfidenceOnClearAll: 1
+  disableLegacyRoutesWhenSeedRoute: 1
   useCaptureBurst: 0
   captureBurstRefreshCount: 1
   captureBurstTimeoutSeconds: 0.6
@@ -8922,6 +8926,7 @@ GameObject:
   - component: {fileID: 920710000000000003}
   - component: {fileID: 920710000000000004}
   - component: {fileID: 920710000000000099}
+  - component: {fileID: 920710000000000106}
   m_Layer: 0
   m_Name: DepthGridPointCloud_Right
   m_TagString: Untagged
@@ -9186,7 +9191,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: e2b945b1b2f24e088b81eb2dfc7bd430, type: 3}
   m_Name: 
@@ -9218,6 +9223,57 @@ MonoBehaviour:
   useWorldRuleRenet: 0
   worldRuleCoverage: 1
   debugLog: 0
+--- !u!114 &920710000000000106
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0c7ad9035f3d4a6b90e6d22e6aaf4107, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  depthRaycaster: {fileID: 0}
+  environmentDepthManager: {fileID: 1177598827}
+  sessionController: {fileID: 910400000000000003}
+  displayParent: {fileID: 0}
+  centerCamera: {fileID: 2140226224}
+  collectOnFreeze: 0
+  collectContinuously: 0
+  eye: 1
+  samplingCenterMode: 1
+  roiPixels: 24
+  sampleStridePixels: 2
+  requiredFrames: 8
+  maxStoredFrames: 20
+  depthPixelVFlip: 1
+  neighborFill: 1
+  neighborRadiusPixels: 1
+  minLinearDepthMeters: 0.05
+  maxLinearDepthMeters: 8
+  baseResidualMeters: 0.01
+  residualPerMeter: 0.02
+  candidateFrames: 3
+  trustedFrames: 8
+  stableFrames: 15
+  maxNormalChangeDegrees: 15
+  maxCenterDriftMeters: 0.03
+  minValidRatio: 0.55
+  minInlierRatio: 0.7
+  showDiagnostics: 1
+  diagnosticScaleMeters: 0.025
+  candidateColor: {r: 0, g: 1, b: 1, a: 1}
+  trustedColor: {r: 0.1, g: 1, b: 0.25, a: 1}
+  stableColor: {r: 1, g: 1, b: 1, a: 1}
+  failedColor: {r: 1, g: 0.25, b: 0.9, a: 1}
+  debugLog: 1
+  saveCaptureToDesktop: 1
+  desktopFolderName: ScanCoverSeedConfidence
+  exportFolderOverride:
+  saveSummaryJson: 1
+  saveFrameCsv: 1
 --- !u!114 &920710000000000099
 MonoBehaviour:
   m_ObjectHideFlags: 0

@@ -32,6 +32,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public ScanCoverSurfaceSnapshotManager surfaceSnapshotManager;
     public ScanCoverDepthGridPointCloud depthGridPointCloud;
     public ScanCoverDepthGridSnapshot64 depthGridSnapshot64;
+    public ScanCoverSeedConfidencePatch seedConfidencePatch;
+    public ScanCoverDepthPointBurstWindow depthPointBurstWindow;
     public DepthEffectsDepthProbeRowRenderer[] depthProbeRows;
 
     [Header("Startup")]
@@ -75,6 +77,16 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public bool usePureDepthGridSnapshot64Route = true;
     public bool clearPureSnapshotOnClearAll = true;
 
+    [Header("Depth Point Burst Window Route")]
+    public bool useDepthPointBurstWindowRoute = true;
+    public bool clearDepthPointBurstOnClearAll = true;
+    public bool disableLegacyRoutesWhenPointBurstRoute = true;
+
+    [Header("Seed Confidence Patch Route")]
+    public bool useSeedConfidencePatchRoute = true;
+    public bool clearSeedConfidenceOnClearAll = true;
+    public bool disableLegacyRoutesWhenSeedRoute = true;
+
     [Header("Capture Burst")]
     public bool useCaptureBurst = true;
     [Min(1)] public int captureBurstRefreshCount = 1;
@@ -103,6 +115,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     private bool _autoStarted;
     private Coroutine _captureBurstRoutine;
     private float _nextAcceptedInputTime;
+    private bool _legacyRoutesDisabledForSeedRoute;
+    private bool _legacyRoutesDisabledForPointBurstRoute;
 
     private void Awake()
     {
@@ -142,6 +156,28 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     {
         ResolveRefs();
 
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            if (clearExisting && clearDepthPointBurstOnClearAll)
+                depthPointBurstWindow?.ClearCapture();
+
+            ClearHudStats();
+            State = SessionState.Scanning;
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            if (clearExisting && clearSeedConfidenceOnClearAll)
+                seedConfidencePatch?.ClearDiagnostics();
+
+            ClearHudStats();
+            State = SessionState.Scanning;
+            return;
+        }
+
         if (usePureDepthGridSnapshot64Route)
         {
             if (clearExisting && clearPureSnapshotOnClearAll)
@@ -164,6 +200,22 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void CaptureSnapshotNow()
     {
         ResolveRefs();
+
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            depthPointBurstWindow?.BeginBurstCapture();
+            State = SessionState.Scanning;
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            seedConfidencePatch?.BeginSeedCapture();
+            State = SessionState.Scanning;
+            return;
+        }
 
         if (usePureDepthGridSnapshot64Route)
         {
@@ -189,6 +241,22 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void ToggleSnapshotFreeze()
     {
         ResolveRefs();
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            depthPointBurstWindow?.BeginBurstCapture();
+            State = SessionState.Frozen;
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            seedConfidencePatch?.BeginSeedCapture();
+            State = SessionState.Frozen;
+            return;
+        }
+
         runtimeCore?.ToggleProbeRowSnapshotFreeze();
     }
 
@@ -196,6 +264,22 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void FreezeAndBuild()
     {
         ResolveRefs();
+
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            depthPointBurstWindow?.BeginBurstCapture();
+            State = SessionState.Frozen;
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            seedConfidencePatch?.BeginSeedCapture();
+            State = SessionState.Frozen;
+            return;
+        }
 
         if (usePureDepthGridSnapshot64Route)
         {
@@ -247,7 +331,19 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             _captureBurstRoutine = null;
         }
 
-        if (usePureDepthGridSnapshot64Route)
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            if (clearDepthPointBurstOnClearAll)
+                depthPointBurstWindow?.ClearCapture();
+        }
+        else if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            if (clearSeedConfidenceOnClearAll)
+                seedConfidencePatch?.ClearDiagnostics();
+        }
+        else if (usePureDepthGridSnapshot64Route)
         {
             if (clearPureSnapshotOnClearAll)
                 depthGridSnapshot64?.ClearSnapshot();
@@ -265,11 +361,39 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void TogglePreview()
     {
         ResolveRefs();
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            return;
+        }
+
         runtimeCore?.TogglePreviewVisible();
     }
 
     private void StartCaptureBurst(bool captureSurfaceSnapshot, bool freezeAfterCapture, bool runFreezeExports)
     {
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            depthPointBurstWindow?.BeginBurstCapture();
+            State = freezeAfterCapture ? SessionState.Frozen : SessionState.Scanning;
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            seedConfidencePatch?.BeginSeedCapture();
+            State = freezeAfterCapture ? SessionState.Frozen : SessionState.Scanning;
+            return;
+        }
+
         if (_captureBurstRoutine != null)
             StopCoroutine(_captureBurstRoutine);
 
@@ -448,10 +572,38 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
 
     private void ResolveRefs()
     {
+        if (depthPointBurstWindow == null)
+            depthPointBurstWindow = GetComponentInChildren<ScanCoverDepthPointBurstWindow>(true);
+        if (depthPointBurstWindow == null)
+            depthPointBurstWindow = FindAnyObjectByType<ScanCoverDepthPointBurstWindow>(FindObjectsInactive.Include);
+        if (depthPointBurstWindow == null && useDepthPointBurstWindowRoute)
+            depthPointBurstWindow = gameObject.AddComponent<ScanCoverDepthPointBurstWindow>();
+
+        if (seedConfidencePatch == null)
+            seedConfidencePatch = GetComponentInChildren<ScanCoverSeedConfidencePatch>(true);
+        if (seedConfidencePatch == null)
+            seedConfidencePatch = FindAnyObjectByType<ScanCoverSeedConfidencePatch>(FindObjectsInactive.Include);
+
         if (depthGridSnapshot64 == null)
             depthGridSnapshot64 = GetComponentInChildren<ScanCoverDepthGridSnapshot64>(true);
         if (depthGridSnapshot64 == null)
             depthGridSnapshot64 = FindAnyObjectByType<ScanCoverDepthGridSnapshot64>(FindObjectsInactive.Include);
+
+        if (useDepthPointBurstWindowRoute)
+        {
+            DisableLegacyRoutesForPointBurstRoute();
+            if (runtimeCore == null)
+                runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
+            return;
+        }
+
+        if (useSeedConfidencePatchRoute)
+        {
+            DisableLegacyRoutesForSeedRoute();
+            if (runtimeCore == null)
+                runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
+            return;
+        }
 
         if (usePureDepthGridSnapshot64Route)
         {
@@ -475,6 +627,107 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             depthGridSnapshot64 = runtimeCore.GetComponentInChildren<ScanCoverDepthGridSnapshot64>(true);
         if (depthProbeRows == null || depthProbeRows.Length == 0)
             depthProbeRows = runtimeCore.depthProbeRows;
+    }
+
+    private void DisableLegacyRoutesForSeedRoute()
+    {
+        if (!disableLegacyRoutesWhenSeedRoute || _legacyRoutesDisabledForSeedRoute)
+            return;
+
+        string[] legacyTypeNames =
+        {
+            nameof(ScanCoverDepthGridPointCloud),
+            nameof(ScanCoverDepthGridSnapshot64),
+            "ScanCoverDepthObservationBuilderAdapter",
+            "ScanCoverDepthObservationDebugPoints",
+            "ScanCoverDepthObservationGridProvider",
+            "ScanCoverStableObservationCloudAccumulator",
+            "ScanCoverObservationSurfaceMesher",
+            "ScanCoverPatchLocalLatticeDebugPoints",
+            "ScanCoverPatchLocalLatticeProvider",
+            "ScanCoverSurfacePatchAccumulator",
+            "ScanCoverSurfacePatchCandidateProvider",
+            "ScanCoverSurfacePatchDebugQuads",
+            "ScanCoverTsdfBranch",
+            "ScanCoverHybridSurfaceReceiver",
+            "ScanCoverDisplaySurfaceBuilder",
+            "ScanCoverDisplaySurfaceRenderer",
+            "ScanCoverFusedPointCloudDisplayRenderer",
+            "ScanCoverFusedPointCloudManager",
+            "ScanCoverSkeletonBuilder_A",
+            "ScanCoverSkeletonMesher_B",
+            "ScanCoverSkeletonDebugViz_A"
+        };
+
+        MonoBehaviour[] behaviours = FindObjectsByType<MonoBehaviour>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (MonoBehaviour behaviour in behaviours)
+        {
+            if (behaviour == null || behaviour == this || behaviour == seedConfidencePatch)
+                continue;
+
+            string typeName = behaviour.GetType().Name;
+            for (int i = 0; i < legacyTypeNames.Length; i++)
+            {
+                if (typeName != legacyTypeNames[i])
+                    continue;
+
+                behaviour.enabled = false;
+                break;
+            }
+        }
+
+        _legacyRoutesDisabledForSeedRoute = true;
+    }
+
+    private void DisableLegacyRoutesForPointBurstRoute()
+    {
+        if (!disableLegacyRoutesWhenPointBurstRoute || _legacyRoutesDisabledForPointBurstRoute)
+            return;
+
+        string[] legacyTypeNames =
+        {
+            nameof(ScanCoverDepthGridPointCloud),
+            nameof(ScanCoverDepthGridSnapshot64),
+            nameof(ScanCoverSeedConfidencePatch),
+            "ScanCoverDepthObservationBuilderAdapter",
+            "ScanCoverDepthObservationDebugPoints",
+            "ScanCoverDepthObservationGridProvider",
+            "ScanCoverStableObservationCloudAccumulator",
+            "ScanCoverObservationSurfaceMesher",
+            "ScanCoverPatchLocalLatticeDebugPoints",
+            "ScanCoverPatchLocalLatticeProvider",
+            "ScanCoverSurfacePatchAccumulator",
+            "ScanCoverSurfacePatchCandidateProvider",
+            "ScanCoverSurfacePatchDebugQuads",
+            "ScanCoverTsdfBranch",
+            "ScanCoverHybridSurfaceReceiver",
+            "ScanCoverDisplaySurfaceBuilder",
+            "ScanCoverDisplaySurfaceRenderer",
+            "ScanCoverFusedPointCloudDisplayRenderer",
+            "ScanCoverFusedPointCloudManager",
+            "ScanCoverSkeletonBuilder_A",
+            "ScanCoverSkeletonMesher_B",
+            "ScanCoverSkeletonDebugViz_A"
+        };
+
+        MonoBehaviour[] behaviours = FindObjectsByType<MonoBehaviour>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        foreach (MonoBehaviour behaviour in behaviours)
+        {
+            if (behaviour == null || behaviour == this || behaviour == depthPointBurstWindow)
+                continue;
+
+            string typeName = behaviour.GetType().Name;
+            for (int i = 0; i < legacyTypeNames.Length; i++)
+            {
+                if (typeName != legacyTypeNames[i])
+                    continue;
+
+                behaviour.enabled = false;
+                break;
+            }
+        }
+
+        _legacyRoutesDisabledForPointBurstRoute = true;
     }
 
     private void ClearHudStats()
