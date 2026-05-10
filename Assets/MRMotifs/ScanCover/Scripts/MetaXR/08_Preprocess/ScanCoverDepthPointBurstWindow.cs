@@ -81,6 +81,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(1)] private int terrainDiagnosticsSamplesPerFrame = 512;
     [SerializeField, Min(1)] private int terrainDiagnosticsFramesPerBurst = 45;
     [SerializeField, Min(1000)] private int terrainDiagnosticsMaxAccumulatedPoints = 30000;
+    [SerializeField] private bool terrainDiagnosticsUseDepthImagePatchSampling = true;
+    [SerializeField, Min(4)] private int terrainDiagnosticsPatchPixels = 96;
     [SerializeField] private bool terrainDiagnosticsUsePureRandomSampling = false;
     [SerializeField] private bool terrainDiagnosticsKeepPointClassification = true;
     [SerializeField] private bool terrainDiagnosticsShowSamplingWindow = true;
@@ -113,6 +115,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Range(0.1f, 1f)] private float terrainPlaneMinInlierRatio = 0.75f;
     [SerializeField, Min(0.001f)] private float terrainPlaneInlierResidualMeters = 0.025f;
     [SerializeField, Min(0.001f)] private float terrainPlaneMaxProjectionOffsetMeters = 0.045f;
+    [SerializeField] private bool terrainPlaneAllowBoundaryStableCells = true;
     [SerializeField] private bool terrainDiagnosticsShowPlanarizedMeshPreview = true;
     [SerializeField] private bool terrainDiagnosticsUsePlanarizedCellTiles = true;
     [SerializeField] private bool terrainDiagnosticsShowPlanarizedPointFallback = true;
@@ -121,6 +124,18 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private Color terrainPlanarizedAcceptedColor = new Color(0.15f, 0.75f, 1f, 0.98f);
     [SerializeField] private Color terrainPlanarizedMeshColor = new Color(0.05f, 0.55f, 1f, 0.38f);
     [SerializeField] private Color terrainPlanarizedRejectedColor = new Color(1f, 0.12f, 0.12f, 0.85f);
+
+    [Header("Terrain Triangle Wire Preview")]
+    [SerializeField] private bool terrainDiagnosticsShowTriangleWirePreview = true;
+    [SerializeField] private bool terrainTriangleWireUseDepthBreaksAsBorders = true;
+    [SerializeField] private bool terrainTriangleWireIncludeBoundaryCells = true;
+    [SerializeField] private bool terrainTriangleWireConnectLooseEdges = true;
+    [SerializeField] private bool terrainTriangleWireStabilizeRepresentatives = true;
+    [SerializeField, Min(0)] private int terrainTriangleWireStabilizationIterations = 2;
+    [SerializeField, Range(0f, 1f)] private float terrainTriangleWireStabilizationBlend = 0.65f;
+    [SerializeField, Min(0.001f)] private float terrainTriangleWireWidthMeters = 0.004f;
+    [SerializeField, Min(0.005f)] private float terrainTriangleWireMaxEdgeMeters = 0.09f;
+    [SerializeField] private Color terrainTriangleWireColor = new Color(0.05f, 0.55f, 1f, 0.92f);
 
     [Header("Point Display")]
     [SerializeField] private PointBurstDisplayMode displayMode = PointBurstDisplayMode.TrustedThinBox;
@@ -303,6 +318,9 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         public readonly HashSet<int> supportFrames = new HashSet<int>();
         public Vector3 worldSum;
         public int depthEdgeSamples;
+        public int primaryPlaneSamples;
+        public int secondaryPlaneSamples;
+        public int planeLabel;
         public float depthP10;
         public float depthMedian;
         public float depthP90;
@@ -428,6 +446,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     private bool EffectiveStratifiedJitter => pointCloudTerrainDiagnosticsOnly ? !terrainDiagnosticsUsePureRandomSampling : stratifiedJitter;
     private bool EffectiveShowSamplingWindow => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsShowSamplingWindow : showSamplingWindow;
     private bool EffectivePlanePointClassification => !pointCloudTerrainDiagnosticsOnly || terrainDiagnosticsKeepPointClassification;
+    private bool UseDepthImagePatchTerrainSampling => pointCloudTerrainDiagnosticsOnly && terrainDiagnosticsUseDepthImagePatchSampling;
 
     private void CollectOneFrame()
     {
@@ -437,6 +456,14 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             return;
 
         depthRaycaster.SetEye(eye);
+
+        if (UseDepthImagePatchTerrainSampling)
+        {
+            CollectDepthImagePatchFrame();
+            ClassifyValidSamplesForDisplay();
+            RebuildPointDisplay();
+            return;
+        }
 
         if (useCameraCenterHitPhysicalWindow)
         {
@@ -474,9 +501,9 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         int targetSamples = Mathf.Max(1, EffectiveSamplesPerFrame);
 
         if (EffectiveStratifiedJitter)
-            CollectStratifiedJitteredFrame(minX, maxX, minY, maxY, center, targetSamples, globalFrame);
+            CollectStratifiedJitteredFrame(minX, maxX, minY, maxY, center, center, targetSamples, globalFrame);
         else
-            CollectUniformRandomFrame(minX, maxX, minY, maxY, center, targetSamples, globalFrame);
+            CollectUniformRandomFrame(minX, maxX, minY, maxY, center, center, targetSamples, globalFrame);
 
         ClassifyValidSamplesForDisplay();
         RebuildPointDisplay();
@@ -574,6 +601,90 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             float localV = (NextRandom01() - 0.5f) * window.sizeMeters;
             TryAddPhysicalWindowSample(window, localU, localV, i, globalFrame);
         }
+    }
+
+    private void CollectDepthImagePatchFrame()
+    {
+        if (!TryBuildWorldSamplingWindow(out WorldSamplingWindow window))
+            return;
+
+        int textureSize = CustomEnvironmentDepthRaycaster.TextureSize;
+        Vector2Int centerTexCoord = ClampTexCoord(new Vector2Int(window.centerTextureX, window.centerTextureY), textureSize);
+        int centerX = centerTexCoord.x;
+        int centerY = depthPixelVFlip ? textureSize - 1 - centerTexCoord.y : centerTexCoord.y;
+        int half = Mathf.Clamp(terrainDiagnosticsPatchPixels / 2, 1, textureSize / 2);
+        int minX = Mathf.Max(0, centerX - half);
+        int maxX = Mathf.Min(textureSize - 1, centerX + half);
+        int minY = Mathf.Max(0, centerY - half);
+        int maxY = Mathf.Min(textureSize - 1, centerY + half);
+
+        int globalFrame = _totalFramesCollected++;
+        int targetSamples = Mathf.Max(1, EffectiveSamplesPerFrame);
+        CollectDepthImagePatchClippedFrame(minX, maxX, minY, maxY, centerX, centerY, targetSamples, globalFrame, window);
+    }
+
+    private void CollectDepthImagePatchClippedFrame(
+        int minX,
+        int maxX,
+        int minY,
+        int maxY,
+        int centerX,
+        int centerY,
+        int targetSamples,
+        int globalFrame,
+        WorldSamplingWindow window)
+    {
+        int startCount = _samples.Count;
+        int maxAttempts = Mathf.Max(targetSamples, targetSamples * 8);
+
+        if (EffectiveStratifiedJitter)
+        {
+            int columns = Mathf.CeilToInt(Mathf.Sqrt(maxAttempts));
+            int rows = Mathf.CeilToInt(maxAttempts / (float)columns);
+            float width = maxX - minX + 1f;
+            float height = maxY - minY + 1f;
+
+            for (int i = 0; i < maxAttempts && _samples.Count - startCount < targetSamples; i++)
+            {
+                int col = i % columns;
+                int row = i / columns;
+                float u = (col + NextRandom01()) / columns;
+                float v = (row + NextRandom01()) / rows;
+                int x = Mathf.Clamp(Mathf.FloorToInt(minX + u * width), minX, maxX);
+                int y = Mathf.Clamp(Mathf.FloorToInt(minY + v * height), minY, maxY);
+                TryAddSample(x, y, centerX, centerY, i, globalFrame, window);
+            }
+
+            return;
+        }
+
+        for (int i = 0; i < maxAttempts && _samples.Count - startCount < targetSamples; i++)
+        {
+            int x = _random.Next(minX, maxX + 1);
+            int y = _random.Next(minY, maxY + 1);
+            TryAddSample(x, y, centerX, centerY, i, globalFrame, window);
+        }
+    }
+
+    private Vector2Int ResolveDepthPatchCenterTexCoord(int textureSize)
+    {
+        Camera cam = ResolveCenterCamera();
+        if (cam != null)
+        {
+            Ray centerRay = new Ray(cam.transform.position, cam.transform.forward);
+            var centerHit = depthRaycaster.Raycast02(centerRay, maxLinearDepthMeters, eye, true);
+            if (centerHit.status == DepthRaycastResult.Success && IsFinite(centerHit.position))
+                return ClampTexCoord(depthRaycaster.WorldPosToNonNormalizedTextureCoords02(centerHit.position), textureSize);
+        }
+
+        return new Vector2Int(textureSize / 2, textureSize / 2);
+    }
+
+    private static Vector2Int ClampTexCoord(Vector2Int texCoord, int textureSize)
+    {
+        return new Vector2Int(
+            Mathf.Clamp(texCoord.x, 0, textureSize - 1),
+            Mathf.Clamp(texCoord.y, 0, textureSize - 1));
     }
 
     private bool TryAddPhysicalWindowSample(WorldSamplingWindow window, float localU, float localV, int sampleIndex, int globalFrame)
@@ -775,7 +886,12 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         }
     }
 
-    private void CollectStratifiedJitteredFrame(int minX, int maxX, int minY, int maxY, int center, int targetSamples, int globalFrame)
+    private void CollectStratifiedJitteredFrame(int minX, int maxX, int minY, int maxY, int centerX, int centerY, int targetSamples, int globalFrame)
+    {
+        CollectStratifiedJitteredFrame(minX, maxX, minY, maxY, centerX, centerY, targetSamples, globalFrame, null);
+    }
+
+    private void CollectStratifiedJitteredFrame(int minX, int maxX, int minY, int maxY, int centerX, int centerY, int targetSamples, int globalFrame, WorldSamplingWindow? clipWindow)
     {
         int columns = Mathf.CeilToInt(Mathf.Sqrt(targetSamples));
         int rows = Mathf.CeilToInt(targetSamples / (float)columns);
@@ -790,21 +906,31 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             float v = (row + NextRandom01()) / rows;
             int x = Mathf.Clamp(Mathf.FloorToInt(minX + u * width), minX, maxX);
             int y = Mathf.Clamp(Mathf.FloorToInt(minY + v * height), minY, maxY);
-            TryAddSample(x, y, center, i, globalFrame);
+            TryAddSample(x, y, centerX, centerY, i, globalFrame, clipWindow);
         }
     }
 
-    private void CollectUniformRandomFrame(int minX, int maxX, int minY, int maxY, int center, int targetSamples, int globalFrame)
+    private void CollectUniformRandomFrame(int minX, int maxX, int minY, int maxY, int centerX, int centerY, int targetSamples, int globalFrame)
+    {
+        CollectUniformRandomFrame(minX, maxX, minY, maxY, centerX, centerY, targetSamples, globalFrame, null);
+    }
+
+    private void CollectUniformRandomFrame(int minX, int maxX, int minY, int maxY, int centerX, int centerY, int targetSamples, int globalFrame, WorldSamplingWindow? clipWindow)
     {
         for (int i = 0; i < targetSamples; i++)
         {
             int x = _random.Next(minX, maxX + 1);
             int y = _random.Next(minY, maxY + 1);
-            TryAddSample(x, y, center, i, globalFrame);
+            TryAddSample(x, y, centerX, centerY, i, globalFrame, clipWindow);
         }
     }
 
-    private bool TryAddSample(int x, int y, int center, int sampleIndex, int globalFrame)
+    private bool TryAddSample(int x, int y, int centerX, int centerY, int sampleIndex, int globalFrame)
+    {
+        return TryAddSample(x, y, centerX, centerY, sampleIndex, globalFrame, null);
+    }
+
+    private bool TryAddSample(int x, int y, int centerX, int centerY, int sampleIndex, int globalFrame, WorldSamplingWindow? clipWindow)
     {
         if (_samples.Count >= Mathf.Max(1, EffectiveMaxAccumulatedPoints))
             return false;
@@ -818,6 +944,43 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         int textureSize = CustomEnvironmentDepthRaycaster.TextureSize;
         int sampledY = depthPixelVFlip ? textureSize - 1 - y : y;
         bool depthEdge = IsDepthEdgeTexCoord(new Vector2Int(x, sampledY), linearDepth);
+        float windowLocalU = 0f;
+        float windowLocalV = 0f;
+        float windowSizeMeters = 0f;
+        Vector3 windowCenter = default;
+        Vector3 windowAxisU = default;
+        Vector3 windowAxisV = default;
+        bool fromDepthImagePatch = UseDepthImagePatchTerrainSampling;
+        if (clipWindow.HasValue)
+        {
+            WorldSamplingWindow window = clipWindow.Value;
+            Vector3 delta = worldPoint - window.center;
+            windowLocalU = Vector3.Dot(delta, window.axisU);
+            windowLocalV = Vector3.Dot(delta, window.axisV);
+            float halfWindow = window.sizeMeters * 0.5f;
+            if (Mathf.Abs(windowLocalU) > halfWindow || Mathf.Abs(windowLocalV) > halfWindow)
+                return false;
+
+            windowCenter = window.center;
+            windowAxisU = window.axisU;
+            windowAxisV = window.axisV;
+            windowSizeMeters = window.sizeMeters;
+            fromDepthImagePatch = true;
+        }
+        else if (fromDepthImagePatch)
+        {
+            Camera cam = ResolveCenterCamera();
+            windowAxisU = cam != null ? cam.transform.right : Vector3.right;
+            windowAxisV = cam != null ? cam.transform.up : Vector3.up;
+            if (!TryReadWorldPoint(centerX, centerY, out windowCenter, out _))
+                windowCenter = worldPoint;
+
+            Vector3 delta = worldPoint - windowCenter;
+            windowLocalU = Vector3.Dot(delta, windowAxisU);
+            windowLocalV = Vector3.Dot(delta, windowAxisV);
+            windowSizeMeters = Mathf.Max(0.005f, terrainDiagnosticsWindowSizeMeters);
+        }
+
         _samples.Add(new SampleRecord
         {
             burstId = _burstId,
@@ -826,10 +989,17 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             sampleIndexInFrame = sampleIndex,
             textureX = x,
             textureY = y,
-            windowX = x - center,
-            windowY = y - center,
+            windowX = x - centerX,
+            windowY = y - centerY,
             linearDepth = linearDepth,
             worldPosition = worldPoint,
+            windowLocalU = windowLocalU,
+            windowLocalV = windowLocalV,
+            windowCenter = windowCenter,
+            windowAxisU = windowAxisU,
+            windowAxisV = windowAxisV,
+            windowSizeMeters = windowSizeMeters,
+            fromPhysicalWindow = fromDepthImagePatch,
             valid = true,
             status = depthEdge ? SampleStatus.DepthEdge : SampleStatus.Valid
         });
@@ -1254,7 +1424,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
         int drawn = 0;
         var planarizedCells = new HashSet<Vector2Int>();
-        if (terrainDiagnosticsShowPlanarizedPreview)
+        Dictionary<Vector2Int, Vector3> triangleWireRepresentatives = null;
+        if (terrainDiagnosticsShowTriangleWirePreview)
+        {
+            triangleWireRepresentatives = BuildTerrainTriangleWireRepresentatives(cells);
+            drawn += AddTerrainTriangleWirePreview(triangleWireRepresentatives, displayTransform, cam);
+        }
+        else if (terrainDiagnosticsShowPlanarizedPreview)
         {
             drawn += AddPlanarizedTerrainPreview(cells, planarizedCells, displayTransform, cam, localRight, localUp, halfSize);
         }
@@ -1281,8 +1457,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             if (representativeIndex < 0)
                 continue;
 
+            Vector3 representativeWorld = triangleWireRepresentatives != null &&
+                                          triangleWireRepresentatives.TryGetValue(pair.Key, out Vector3 stabilizedRepresentative)
+                ? stabilizedRepresentative
+                : _samples[representativeIndex].worldPosition;
+
             AddTerrainRepresentative(
-                _samples[representativeIndex],
+                representativeWorld,
                 ResolveTerrainCellColor(cell.classification),
                 displayTransform,
                 localRight,
@@ -1292,6 +1473,290 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         }
 
         return drawn > 0;
+    }
+
+    private Dictionary<Vector2Int, Vector3> BuildTerrainTriangleWireRepresentatives(Dictionary<Vector2Int, TerrainCell> cells)
+    {
+        if (cells == null || cells.Count == 0)
+            return null;
+
+        var representativeByCell = new Dictionary<Vector2Int, Vector3>(cells.Count);
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            TerrainCell cell = pair.Value;
+            if (cell == null || cell.indices.Count == 0)
+                continue;
+
+            if (!IsTerrainTriangleWireCell(cell))
+                continue;
+
+            int representativeIndex = FindSampleClosestToDepth(cell, cell.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
+            if (representativeIndex < 0 || representativeIndex >= _samples.Count)
+                continue;
+
+            SampleRecord sample = _samples[representativeIndex];
+            if (!sample.valid || !IsFinite(sample.worldPosition))
+                continue;
+
+            representativeByCell[pair.Key] = sample.worldPosition;
+        }
+
+        if (representativeByCell.Count < 3)
+            return representativeByCell;
+
+        if (terrainTriangleWireStabilizeRepresentatives)
+            StabilizeTerrainTriangleWireRepresentatives(cells, representativeByCell);
+
+        return representativeByCell;
+    }
+
+    private int AddTerrainTriangleWirePreview(
+        Dictionary<Vector2Int, Vector3> representativeByCell,
+        Transform displayTransform,
+        Camera cam)
+    {
+        if (representativeByCell == null || representativeByCell.Count < 3)
+            return 0;
+
+        float maxEdge = Mathf.Max(terrainTriangleWireMaxEdgeMeters, terrainCellSizeMeters * 2.5f);
+        float halfWidth = Mathf.Max(0.0005f, terrainTriangleWireWidthMeters * 0.5f);
+        Vector3 camForward = cam != null ? cam.transform.forward : Vector3.forward;
+        var drawnEdges = new HashSet<string>();
+        int lines = 0;
+
+        foreach (KeyValuePair<Vector2Int, Vector3> pair in representativeByCell)
+        {
+            Vector2Int aKey = pair.Key;
+            Vector2Int bKey = aKey + new Vector2Int(1, 0);
+            Vector2Int cKey = aKey + new Vector2Int(0, 1);
+            Vector2Int dKey = aKey + new Vector2Int(1, 1);
+
+            if (!representativeByCell.TryGetValue(bKey, out Vector3 b) ||
+                !representativeByCell.TryGetValue(cKey, out Vector3 c) ||
+                !representativeByCell.TryGetValue(dKey, out Vector3 d))
+            {
+                continue;
+            }
+
+            Vector3 a = pair.Value;
+            if (!TriangleWireEdgeOk(a, b, maxEdge) ||
+                !TriangleWireEdgeOk(a, c, maxEdge) ||
+                !TriangleWireEdgeOk(b, d, maxEdge) ||
+                !TriangleWireEdgeOk(c, d, maxEdge))
+            {
+                continue;
+            }
+
+            bool diagonalAD = (a - d).sqrMagnitude <= (b - c).sqrMagnitude;
+            lines += AddTerrainTriangleWireEdge(aKey, bKey, a, b, displayTransform, camForward, halfWidth, drawnEdges);
+            lines += AddTerrainTriangleWireEdge(bKey, dKey, b, d, displayTransform, camForward, halfWidth, drawnEdges);
+            lines += AddTerrainTriangleWireEdge(cKey, dKey, c, d, displayTransform, camForward, halfWidth, drawnEdges);
+            lines += AddTerrainTriangleWireEdge(aKey, cKey, a, c, displayTransform, camForward, halfWidth, drawnEdges);
+
+            if (diagonalAD)
+            {
+                if (TriangleWireEdgeOk(a, d, maxEdge))
+                    lines += AddTerrainTriangleWireEdge(aKey, dKey, a, d, displayTransform, camForward, halfWidth, drawnEdges);
+            }
+            else if (TriangleWireEdgeOk(b, c, maxEdge))
+            {
+                lines += AddTerrainTriangleWireEdge(bKey, cKey, b, c, displayTransform, camForward, halfWidth, drawnEdges);
+            }
+        }
+
+        if (terrainTriangleWireConnectLooseEdges)
+            lines += AddTerrainTriangleWireLooseEdges(representativeByCell, displayTransform, camForward, halfWidth, drawnEdges, maxEdge);
+
+        return lines;
+    }
+
+    private int AddTerrainTriangleWireLooseEdges(
+        Dictionary<Vector2Int, Vector3> representativeByCell,
+        Transform displayTransform,
+        Vector3 camForward,
+        float halfWidth,
+        HashSet<string> drawnEdges,
+        float maxEdge)
+    {
+        if (representativeByCell == null || representativeByCell.Count < 2)
+            return 0;
+
+        Vector2Int[] neighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(1, 1),
+            new Vector2Int(1, -1)
+        };
+
+        int lines = 0;
+        foreach (KeyValuePair<Vector2Int, Vector3> pair in representativeByCell)
+        {
+            for (int i = 0; i < neighbors.Length; i++)
+            {
+                Vector2Int nextKey = pair.Key + neighbors[i];
+                if (!representativeByCell.TryGetValue(nextKey, out Vector3 next))
+                    continue;
+
+                if (!TriangleWireEdgeOk(pair.Value, next, maxEdge))
+                    continue;
+
+                lines += AddTerrainTriangleWireEdge(
+                    pair.Key,
+                    nextKey,
+                    pair.Value,
+                    next,
+                    displayTransform,
+                    camForward,
+                    halfWidth,
+                    drawnEdges);
+            }
+        }
+
+        return lines;
+    }
+
+    private void StabilizeTerrainTriangleWireRepresentatives(
+        Dictionary<Vector2Int, TerrainCell> cells,
+        Dictionary<Vector2Int, Vector3> representativeByCell)
+    {
+        if (cells == null || representativeByCell == null || representativeByCell.Count < 3)
+            return;
+
+        int iterations = Mathf.Max(0, terrainTriangleWireStabilizationIterations);
+        float maxNeighborDistance = Mathf.Max(terrainTriangleWireMaxEdgeMeters, terrainCellSizeMeters * 2.5f) * 1.5f;
+        Vector2Int[] neighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(-1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(0, -1),
+            new Vector2Int(1, 1),
+            new Vector2Int(1, -1),
+            new Vector2Int(-1, 1),
+            new Vector2Int(-1, -1)
+        };
+
+        for (int iteration = 0; iteration < iterations; iteration++)
+        {
+            var next = new Dictionary<Vector2Int, Vector3>(representativeByCell);
+            foreach (KeyValuePair<Vector2Int, Vector3> pair in representativeByCell)
+            {
+                if (!cells.TryGetValue(pair.Key, out TerrainCell cell) || cell.indices.Count == 0)
+                    continue;
+
+                Vector3 sum = Vector3.zero;
+                int count = 0;
+                for (int i = 0; i < neighbors.Length; i++)
+                {
+                    Vector2Int neighborKey = pair.Key + neighbors[i];
+                    if (!representativeByCell.TryGetValue(neighborKey, out Vector3 neighborPoint))
+                        continue;
+
+                    if ((neighborPoint - pair.Value).sqrMagnitude > maxNeighborDistance * maxNeighborDistance)
+                        continue;
+
+                    sum += neighborPoint;
+                    count++;
+                }
+
+                if (count < 2)
+                    continue;
+
+                Vector3 consensus = sum / count;
+                float blend = Mathf.Clamp01(terrainTriangleWireStabilizationBlend);
+                next[pair.Key] = Vector3.Lerp(pair.Value, consensus, blend);
+            }
+
+            representativeByCell.Clear();
+            foreach (KeyValuePair<Vector2Int, Vector3> pair in next)
+                representativeByCell[pair.Key] = pair.Value;
+        }
+    }
+
+    private int AddTerrainTriangleWireEdge(
+        Vector2Int aKey,
+        Vector2Int bKey,
+        Vector3 aWorld,
+        Vector3 bWorld,
+        Transform displayTransform,
+        Vector3 camForward,
+        float halfWidth,
+        HashSet<string> drawnEdges)
+    {
+        string key = OrderedCellEdgeKey(aKey, bKey);
+        if (!drawnEdges.Add(key))
+            return 0;
+
+        Vector3 a = displayTransform.InverseTransformPoint(aWorld);
+        Vector3 b = displayTransform.InverseTransformPoint(bWorld);
+        Vector3 dir = b - a;
+        if (dir.sqrMagnitude < 1e-8f)
+            return 0;
+
+        Vector3 localForward = displayTransform.InverseTransformDirection(camForward);
+        Vector3 side = Vector3.Cross(dir.normalized, localForward.normalized);
+        if (side.sqrMagnitude < 1e-8f)
+            side = Vector3.Cross(dir.normalized, Vector3.up);
+        if (side.sqrMagnitude < 1e-8f)
+            side = Vector3.right;
+        side = side.normalized * halfWidth;
+
+        int start = _meshVertices.Count;
+        _meshVertices.Add(a - side);
+        _meshVertices.Add(a + side);
+        _meshVertices.Add(b + side);
+        _meshVertices.Add(b - side);
+
+        _meshColors.Add(terrainTriangleWireColor);
+        _meshColors.Add(terrainTriangleWireColor);
+        _meshColors.Add(terrainTriangleWireColor);
+        _meshColors.Add(terrainTriangleWireColor);
+
+        _meshIndices.Add(start);
+        _meshIndices.Add(start + 1);
+        _meshIndices.Add(start + 2);
+        _meshIndices.Add(start);
+        _meshIndices.Add(start + 2);
+        _meshIndices.Add(start + 3);
+        return 1;
+    }
+
+    private bool IsTerrainTriangleWireCell(TerrainCell cell)
+    {
+        if (cell == null)
+            return false;
+
+        if (!terrainTriangleWireUseDepthBreaksAsBorders)
+            return cell.indices.Count > 0;
+
+        if (cell.classification == TerrainCellClassification.StableSingleLayer)
+            return true;
+
+        return terrainTriangleWireIncludeBoundaryCells &&
+               cell.classification == TerrainCellClassification.BoundaryDepthJump;
+    }
+
+    private static bool TriangleWireEdgeOk(Vector3 a, Vector3 b, float maxEdge)
+    {
+        return IsFinite(a) &&
+               IsFinite(b) &&
+               (a - b).sqrMagnitude <= maxEdge * maxEdge;
+    }
+
+    private static string OrderedCellEdgeKey(Vector2Int a, Vector2Int b)
+    {
+        if (a.x > b.x || (a.x == b.x && a.y > b.y))
+        {
+            Vector2Int tmp = a;
+            a = b;
+            b = tmp;
+        }
+
+        return a.x.ToString(CultureInfo.InvariantCulture) + "," +
+               a.y.ToString(CultureInfo.InvariantCulture) + "-" +
+               b.x.ToString(CultureInfo.InvariantCulture) + "," +
+               b.y.ToString(CultureInfo.InvariantCulture);
     }
 
     private int AddPlanarizedTerrainPreview(
@@ -1588,11 +2053,16 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             cell.worldSum += sample.worldPosition;
             if (sample.status == SampleStatus.DepthEdge || sample.status == SampleStatus.EdgeEvidence)
                 cell.depthEdgeSamples++;
+            if (sample.status == SampleStatus.TrustedPlane || sample.status == SampleStatus.CandidatePlane)
+                cell.primaryPlaneSamples++;
+            else if (sample.status == SampleStatus.SecondaryTrustedPlane || sample.status == SampleStatus.SecondaryCandidatePlane)
+                cell.secondaryPlaneSamples++;
         }
 
         foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
         {
             ClassifyTerrainCell(pair.Value);
+            AssignTerrainCellPlaneLabel(pair.Value);
         }
 
         MarkNeighborDepthJumpCells(cells);
@@ -1753,7 +2223,23 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private bool IsStableTerrainPlaneCell(TerrainCell cell)
     {
-        return cell != null && cell.classification == TerrainCellClassification.StableSingleLayer;
+        if (cell == null)
+            return false;
+
+        if (cell.classification == TerrainCellClassification.StableSingleLayer)
+            return true;
+
+        if (!terrainPlaneAllowBoundaryStableCells ||
+            cell.classification != TerrainCellClassification.BoundaryDepthJump)
+        {
+            return false;
+        }
+
+        // A neighbor depth jump is useful boundary evidence, but a thin, repeatedly observed cell can
+        // still be a valid member of one of the two adjacent planes.
+        return cell.indices.Count >= Mathf.Max(1, terrainStableMinSamplesPerCell) &&
+               cell.supportFrames.Count >= Mathf.Max(1, terrainStableMinSupportFrames) &&
+               cell.thickness <= Mathf.Max(0.001f, terrainStableMaxThicknessMeters);
     }
 
     private bool AreTerrainStableCellsPlaneCompatible(TerrainCell a, TerrainCell b)
@@ -1761,8 +2247,43 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (a == null || b == null)
             return false;
 
+        if (a.planeLabel != 0 && b.planeLabel != 0)
+            return a.planeLabel == b.planeLabel;
+
+        if ((a.planeLabel != 0 || b.planeLabel != 0) &&
+            IsThinSupportedTerrainCell(a) &&
+            IsThinSupportedTerrainCell(b))
+        {
+            float worldGapLimit = Mathf.Max(terrainCellSizeMeters * 3f, terrainPlaneMeshMaxEdgeMeters);
+            return (a.MeanWorld - b.MeanWorld).sqrMagnitude <= worldGapLimit * worldGapLimit;
+        }
+
         float jumpLimit = Mathf.Max(terrainNeighborDepthJumpMeters, terrainMultiLayerMinDepthGapMeters, minDepthEdgeJumpMeters);
         return Mathf.Abs(a.depthMedian - b.depthMedian) <= jumpLimit;
+    }
+
+    private bool IsThinSupportedTerrainCell(TerrainCell cell)
+    {
+        return cell != null &&
+               cell.indices.Count >= Mathf.Max(1, terrainStableMinSamplesPerCell) &&
+               cell.supportFrames.Count >= Mathf.Max(1, terrainStableMinSupportFrames) &&
+               cell.thickness <= Mathf.Max(0.001f, terrainStableMaxThicknessMeters);
+    }
+
+    private static void AssignTerrainCellPlaneLabel(TerrainCell cell)
+    {
+        if (cell == null || cell.indices.Count == 0)
+            return;
+
+        int minVotes = Mathf.Max(2, Mathf.CeilToInt(cell.indices.Count * 0.35f));
+        if (cell.primaryPlaneSamples >= minVotes && cell.primaryPlaneSamples >= cell.secondaryPlaneSamples)
+        {
+            cell.planeLabel = 1;
+            return;
+        }
+
+        if (cell.secondaryPlaneSamples >= minVotes)
+            cell.planeLabel = 2;
     }
 
     private void EvaluateTerrainPlaneIsland(TerrainPlaneIsland island, Camera cam)
@@ -3076,6 +3597,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                $"  \"stratifiedJitter\": {stratifiedJitter.ToString().ToLowerInvariant()},\n" +
                $"  \"effectiveStratifiedJitter\": {EffectiveStratifiedJitter.ToString().ToLowerInvariant()},\n" +
                $"  \"pointCloudTerrainDiagnosticsOnly\": {pointCloudTerrainDiagnosticsOnly.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainDiagnosticsUseDepthImagePatchSampling\": {terrainDiagnosticsUseDepthImagePatchSampling.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainDiagnosticsPatchPixels\": {terrainDiagnosticsPatchPixels},\n" +
                $"  \"terrainDiagnosticsDisplayAggregatedCells\": {terrainDiagnosticsDisplayAggregatedCells.ToString().ToLowerInvariant()},\n" +
                $"  \"terrainCellSizeMeters\": {terrainCellSizeMeters.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"terrainStableMinSamplesPerCell\": {terrainStableMinSamplesPerCell},\n" +
@@ -3092,6 +3615,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                $"  \"terrainPlaneMaxResidualP95Meters\": {terrainPlaneMaxResidualP95Meters.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"terrainPlaneMinInlierRatio\": {terrainPlaneMinInlierRatio.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"terrainPlaneMaxProjectionOffsetMeters\": {terrainPlaneMaxProjectionOffsetMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneAllowBoundaryStableCells\": {terrainPlaneAllowBoundaryStableCells.ToString().ToLowerInvariant()},\n" +
                $"  \"terrainPlaneIslandCount\": {terrainPlaneSummary.islandCount},\n" +
                $"  \"terrainAcceptedPlaneIslandCount\": {terrainPlaneSummary.acceptedIslandCount},\n" +
                $"  \"terrainRejectedPlaneIslandCount\": {terrainPlaneSummary.rejectedIslandCount},\n" +
