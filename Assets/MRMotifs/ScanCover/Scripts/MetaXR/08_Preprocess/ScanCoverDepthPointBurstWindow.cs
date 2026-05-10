@@ -7,15 +7,17 @@ using Meta.XR.EnvironmentDepth;
 using MyProject.XR;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 
 [DisallowMultipleComponent]
 public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 {
     private enum PointBurstDisplayMode
     {
-        Points,
-        TrustedLattice,
-        None
+        Points = 0,
+        TrustedLattice = 1,
+        None = 2,
+        TrustedThinBox = 3
     }
 
     private enum SampleStatus
@@ -23,9 +25,19 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         Valid,
         TrustedPlane,
         CandidatePlane,
+        SecondaryTrustedPlane,
+        SecondaryCandidatePlane,
         DepthEdge,
         EdgeEvidence,
         InvalidDepth
+    }
+
+    private enum TerrainCellClassification
+    {
+        StableSingleLayer,
+        BoundaryDepthJump,
+        MultiLayer,
+        Unstable
     }
 
     [Header("Refs")]
@@ -63,8 +75,55 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private bool saveWhenBurstCompletes = true;
     [SerializeField] private string desktopFolderName = "ScanCoverDepthPointBurst";
 
+    [Header("Point Cloud Terrain Diagnostics")]
+    [SerializeField] private bool pointCloudTerrainDiagnosticsOnly = true;
+    [SerializeField, Min(0.03f)] private float terrainDiagnosticsWindowSizeMeters = 0.35f;
+    [SerializeField, Min(1)] private int terrainDiagnosticsSamplesPerFrame = 512;
+    [SerializeField, Min(1)] private int terrainDiagnosticsFramesPerBurst = 45;
+    [SerializeField, Min(1000)] private int terrainDiagnosticsMaxAccumulatedPoints = 30000;
+    [SerializeField] private bool terrainDiagnosticsUsePureRandomSampling = false;
+    [SerializeField] private bool terrainDiagnosticsKeepPointClassification = true;
+    [SerializeField] private bool terrainDiagnosticsShowSamplingWindow = true;
+
+    [Header("Terrain Cell Classification")]
+    [SerializeField] private bool terrainDiagnosticsDisplayAggregatedCells = true;
+    [SerializeField] private bool terrainDiagnosticsShowRawOverlay = false;
+    [SerializeField, Min(0.005f)] private float terrainCellSizeMeters = 0.02f;
+    [SerializeField, Min(1)] private int terrainStableMinSamplesPerCell = 4;
+    [SerializeField, Min(1)] private int terrainStableMinSupportFrames = 3;
+    [SerializeField, Min(0.001f)] private float terrainStableMaxThicknessMeters = 0.025f;
+    [SerializeField, Min(0.001f)] private float terrainMultiLayerMinDepthGapMeters = 0.045f;
+    [SerializeField, Min(0.001f)] private float terrainNeighborDepthJumpMeters = 0.055f;
+    [SerializeField, Range(0.05f, 0.45f)] private float terrainMultiLayerMinFraction = 0.2f;
+    [SerializeField, Range(0f, 1f)] private float terrainBoundaryMinDepthEdgeFraction = 0.25f;
+    [SerializeField, Min(0.001f)] private float terrainRepresentativePointSizeMeters = 0.012f;
+    [SerializeField] private Color terrainStableCellColor = new Color(0.1f, 1f, 0.45f, 0.95f);
+    [SerializeField] private Color terrainBoundaryCellColor = new Color(1f, 0.48f, 0.05f, 0.95f);
+    [SerializeField] private Color terrainMultiLayerNearColor = new Color(0.65f, 0.2f, 1f, 0.95f);
+    [SerializeField] private Color terrainMultiLayerFarColor = new Color(1f, 0.78f, 0.05f, 0.95f);
+    [SerializeField] private Color terrainUnstableCellColor = new Color(0.45f, 0.45f, 0.45f, 0.55f);
+
+    [Header("Planarized Terrain Preview")]
+    [SerializeField] private bool terrainDiagnosticsShowPlanarizedPreview = true;
+    [SerializeField] private bool terrainDiagnosticsShowRejectedPlaneIslands = true;
+    [SerializeField, Min(3)] private int terrainPlaneMinCells = 12;
+    [SerializeField, Range(0.5f, 1f)] private float terrainPlaneTrimKeepRatio = 0.82f;
+    [SerializeField, Min(0)] private int terrainPlaneRefineIterations = 2;
+    [SerializeField, Min(0.001f)] private float terrainPlaneMaxResidualP95Meters = 0.035f;
+    [SerializeField, Range(0.1f, 1f)] private float terrainPlaneMinInlierRatio = 0.75f;
+    [SerializeField, Min(0.001f)] private float terrainPlaneInlierResidualMeters = 0.025f;
+    [SerializeField, Min(0.001f)] private float terrainPlaneMaxProjectionOffsetMeters = 0.045f;
+    [SerializeField] private bool terrainDiagnosticsShowPlanarizedMeshPreview = true;
+    [SerializeField] private bool terrainDiagnosticsUsePlanarizedCellTiles = true;
+    [SerializeField] private bool terrainDiagnosticsShowPlanarizedPointFallback = true;
+    [SerializeField, Min(0.001f)] private float terrainPlaneMeshMaxEdgeMeters = 0.08f;
+    [SerializeField, Range(0.5f, 1f)] private float terrainPlanarizedTileFillRatio = 1f;
+    [SerializeField] private Color terrainPlanarizedAcceptedColor = new Color(0.15f, 0.75f, 1f, 0.98f);
+    [SerializeField] private Color terrainPlanarizedMeshColor = new Color(0.05f, 0.55f, 1f, 0.38f);
+    [SerializeField] private Color terrainPlanarizedRejectedColor = new Color(1f, 0.12f, 0.12f, 0.85f);
+
     [Header("Point Display")]
-    [SerializeField] private PointBurstDisplayMode displayMode = PointBurstDisplayMode.Points;
+    [SerializeField] private PointBurstDisplayMode displayMode = PointBurstDisplayMode.TrustedThinBox;
     [SerializeField] private bool showPoints = true;
     [SerializeField] private bool renderAsBillboardQuads = true;
     [SerializeField, Min(0.001f)] private float pointVisualSizeMeters = 0.008f;
@@ -75,6 +134,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private bool colorizeValidPointsByPlaneResidual = true;
     [SerializeField] private Color candidatePointColor = new Color(1f, 0.85f, 0f, 0.95f);
     [SerializeField] private Color trustedPointColor = new Color(0.2f, 1f, 0.55f, 0.95f);
+    [SerializeField] private Color secondaryTrustedPointColor = new Color(0.2f, 0.65f, 1f, 0.95f);
+    [SerializeField] private Color secondaryCandidatePointColor = new Color(0.55f, 0.25f, 1f, 0.95f);
     [SerializeField] private Color depthEdgePointColor = new Color(1f, 0.05f, 0.05f, 0.95f);
     [SerializeField] private Color edgeEvidenceColor = new Color(1f, 0.45f, 0f, 0.95f);
     [SerializeField] private Color rejectedPointColor = new Color(1f, 0.1f, 0.1f, 0.9f);
@@ -82,12 +143,28 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(0.001f)] private float trustedResidualBaseMeters = 0.012f;
     [SerializeField, Min(0.001f)] private float candidateResidualBaseMeters = 0.03f;
 
+    [Header("Secondary Plane Candidate")]
+    [SerializeField] private bool enableSecondaryPlaneCandidate = true;
+    [SerializeField, Min(8)] private int minSecondaryPlaneSamples = 32;
+    [SerializeField, Min(0.001f)] private float secondaryPlaneTrustedResidualMeters = 0.025f;
+    [SerializeField, Min(0.001f)] private float secondaryPlaneCandidateResidualMeters = 0.05f;
+    [SerializeField, Range(5f, 90f)] private float minSecondaryPlaneNormalAngleDegrees = 20f;
+    [SerializeField, Min(0.001f)] private float minSecondaryPlaneDistanceFromPrimaryMeters = 0.025f;
+    [SerializeField, Min(1)] private int secondaryPlaneMaxThinBoxGroups = 4;
+    [SerializeField] private Color secondaryThinBoxColor = new Color(0.15f, 0.55f, 1f, 0.55f);
+
     [Header("Depth Edge Detection")]
     [SerializeField] private bool enableDepthEdgeDetection = true;
     [SerializeField] private bool excludeDepthEdgeSamplesFromPlaneFit = true;
     [SerializeField, Min(1)] private int depthEdgeProbeRadiusPixels = 1;
     [SerializeField, Min(0.001f)] private float minDepthEdgeJumpMeters = 0.035f;
     [SerializeField, Min(0f)] private float depthEdgeJumpDistanceScale = 0.018f;
+    [SerializeField] private bool depthEdgeUseLocalPlaneReject = true;
+    [SerializeField, Min(0.001f)] private float localPlaneResidualBaseMeters = 0.012f;
+    [SerializeField, Min(0f)] private float localPlaneResidualDistanceScale = 0.006f;
+    [SerializeField, Range(0.1f, 1f)] private float localPlaneMinInlierRatio = 0.65f;
+    [SerializeField, Min(3)] private int localPlaneMinNeighborPoints = 5;
+    [SerializeField, Range(0.1f, 0.9f)] private float depthEdgeTwoClusterMinFraction = 0.25f;
 
     [Header("Trusted Lattice")]
     [SerializeField] private bool showTrustedLattice = false;
@@ -98,6 +175,32 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(0.005f)] private float latticeCellSizeMeters = 0.03f;
     [SerializeField, Min(1)] private int minInliersPerLatticeCell = 2;
     [SerializeField] private Color latticeColor = new Color(1f, 1f, 1f, 0.92f);
+
+    [Header("Trusted Thin Box")]
+    [FormerlySerializedAs("showTrustedSurfaceMesh")]
+    [SerializeField] private bool showTrustedThinBox = true;
+    [FormerlySerializedAs("trustedSurfaceCellSizeMeters")]
+    [SerializeField, Min(0.005f)] private float trustedThinBoxMinSpanMeters = 0.03f;
+    [SerializeField, Min(0.005f)] private float trustedThinBoxGroupCellSizeMeters = 0.015f;
+    [SerializeField, Min(1)] private int trustedThinBoxMinSamplesPerGroupCell = 2;
+    [SerializeField, Min(0.005f)] private float trustedThinBoxMaxNeighborDepthJumpMeters = 0.04f;
+    [SerializeField, Min(0.005f)] private float trustedThinBoxMaxNeighborLinearDepthJumpMeters = 0.05f;
+    [SerializeField, Min(0.01f)] private float trustedThinBoxMaxNeighborWorldGapMeters = 0.08f;
+    [SerializeField, Min(3)] private int trustedThinBoxMinGroupSamples = 24;
+    [SerializeField, Min(1)] private int trustedThinBoxMaxGroups = 8;
+    [SerializeField, Min(0.01f)] private float trustedThinBoxMaxGroupResidualP95Meters = 0.035f;
+    [SerializeField, Min(1f)] private float trustedThinBoxMaxAspectRatio = 5f;
+    [SerializeField, Min(0.05f)] private float trustedThinBoxMaxSpanMeters = 0.35f;
+    [SerializeField] private bool trustedThinBoxUseTrimmedPlaneFit = true;
+    [SerializeField, Range(0.5f, 0.98f)] private float trustedThinBoxPlaneTrimKeepRatio = 0.8f;
+    [SerializeField, Min(1)] private int trustedThinBoxPlaneRefineIterations = 2;
+    [SerializeField, Min(0.001f)] private float trustedThinBoxExtentInlierResidualMultiplier = 1.25f;
+    [SerializeField, Min(0.001f)] private float trustedThinBoxLineWidthMeters = 0.006f;
+    [SerializeField, Min(0f)] private float trustedThinBoxPaddingMeters = 0.01f;
+    [SerializeField, Min(0.001f)] private float trustedThinBoxMinThicknessMeters = 0.012f;
+    [FormerlySerializedAs("trustedSurfaceColor")]
+    [SerializeField] private Color trustedThinBoxColor = new Color(0.1f, 1f, 0.65f, 0.55f);
+    [HideInInspector, SerializeField, Min(1)] private int minTrustedSamplesPerSurfaceCell = 2;
     [SerializeField] private bool debugLog = false;
 
     private readonly List<SampleRecord> _samples = new List<SampleRecord>(4096);
@@ -155,6 +258,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         public float centerLinearDepth;
     }
 
+    private struct LocalDepthProbe
+    {
+        public Vector2Int texCoord;
+        public Vector3 worldPosition;
+        public float linearDepth;
+    }
+
     private struct PlaneFitResult
     {
         public bool valid;
@@ -166,6 +276,69 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         public float residualP80;
         public float residualP95;
         public float inlierRatio;
+    }
+
+    private struct IndexResidual
+    {
+        public int index;
+        public float residual;
+    }
+
+    private sealed class TrustedThinBoxCell
+    {
+        public readonly List<int> indices = new List<int>();
+        public Vector3 worldSum;
+        public float windowNormalOffsetSum;
+        public float linearDepthSum;
+
+        public Vector3 MeanWorld => indices.Count > 0 ? worldSum / indices.Count : Vector3.zero;
+        public float MeanWindowNormalOffset => indices.Count > 0 ? windowNormalOffsetSum / indices.Count : 0f;
+        public float MeanLinearDepth => indices.Count > 0 ? linearDepthSum / indices.Count : 0f;
+    }
+
+    private sealed class TerrainCell
+    {
+        public readonly List<int> indices = new List<int>();
+        public readonly List<float> depths = new List<float>();
+        public readonly HashSet<int> supportFrames = new HashSet<int>();
+        public Vector3 worldSum;
+        public int depthEdgeSamples;
+        public float depthP10;
+        public float depthMedian;
+        public float depthP90;
+        public float thickness;
+        public float largestDepthGap;
+        public int splitIndex;
+        public TerrainCellClassification classification;
+
+        public Vector3 MeanWorld => indices.Count > 0 ? worldSum / indices.Count : Vector3.zero;
+    }
+
+    private struct TerrainCellSummary
+    {
+        public int cellCount;
+        public int stableSingleLayerCount;
+        public int boundaryDepthJumpCount;
+        public int multiLayerCount;
+        public int unstableCount;
+    }
+
+    private sealed class TerrainPlaneIsland
+    {
+        public readonly List<Vector2Int> cellKeys = new List<Vector2Int>();
+        public readonly List<int> representativeIndices = new List<int>();
+        public readonly Dictionary<Vector2Int, int> representativeIndexByCell = new Dictionary<Vector2Int, int>();
+        public PlaneFitResult plane;
+        public bool accepted;
+        public float maxProjectionOffset;
+    }
+
+    private struct TerrainPlaneSummary
+    {
+        public int islandCount;
+        public int acceptedIslandCount;
+        public int rejectedIslandCount;
+        public int acceptedCellCount;
     }
 
     private void Awake()
@@ -194,7 +367,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (_burstActive)
         {
             _framesCollectedThisBurst++;
-            if (_framesCollectedThisBurst >= Mathf.Max(1, framesPerBurst))
+            if (_framesCollectedThisBurst >= Mathf.Max(1, EffectiveFramesPerBurst))
                 CompleteBurst();
         }
     }
@@ -223,7 +396,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             : new System.Random(deterministicSeed + _burstId);
 
         if (debugLog)
-            Debug.Log($"[ScanCoverDepthPointBurstWindow] Begin burst {_burstId}, physicalWindow={useCameraCenterHitPhysicalWindow}, window={windowPixels}px/{physicalWindowSizeMeters:F3}m samplesPerFrame={samplesPerFrame} stratifiedJitter={stratifiedJitter}");
+            Debug.Log($"[ScanCoverDepthPointBurstWindow] Begin burst {_burstId}, physicalWindow={useCameraCenterHitPhysicalWindow}, window={windowPixels}px/{EffectivePhysicalWindowSizeMeters:F3}m samplesPerFrame={EffectiveSamplesPerFrame} stratifiedJitter={EffectiveStratifiedJitter}");
     }
 
     [ContextMenu("Stop Point Burst Capture")]
@@ -248,6 +421,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     public bool IsCapturing => _burstActive || collectContinuously;
     public int AccumulatedPointCount => _samples.Count;
     public int FramesCollectedThisBurst => _framesCollectedThisBurst;
+    private float EffectivePhysicalWindowSizeMeters => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsWindowSizeMeters : physicalWindowSizeMeters;
+    private int EffectiveSamplesPerFrame => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsSamplesPerFrame : samplesPerFrame;
+    private int EffectiveFramesPerBurst => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsFramesPerBurst : framesPerBurst;
+    private int EffectiveMaxAccumulatedPoints => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsMaxAccumulatedPoints : maxAccumulatedPoints;
+    private bool EffectiveStratifiedJitter => pointCloudTerrainDiagnosticsOnly ? !terrainDiagnosticsUsePureRandomSampling : stratifiedJitter;
+    private bool EffectiveShowSamplingWindow => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsShowSamplingWindow : showSamplingWindow;
+    private bool EffectivePlanePointClassification => !pointCloudTerrainDiagnosticsOnly || terrainDiagnosticsKeepPointClassification;
 
     private void CollectOneFrame()
     {
@@ -271,8 +451,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             }
 
             int physicalGlobalFrame = _totalFramesCollected++;
-            int physicalTargetSamples = Mathf.Max(1, samplesPerFrame);
-            if (stratifiedJitter)
+            int physicalTargetSamples = Mathf.Max(1, EffectiveSamplesPerFrame);
+            if (EffectiveStratifiedJitter)
                 CollectPhysicalWindowStratifiedFrame(window, physicalTargetSamples, physicalGlobalFrame);
             else
                 CollectPhysicalWindowRandomFrame(window, physicalTargetSamples, physicalGlobalFrame);
@@ -291,9 +471,9 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         int maxY = Mathf.Min(textureSize - 1, center + half);
 
         int globalFrame = _totalFramesCollected++;
-        int targetSamples = Mathf.Max(1, samplesPerFrame);
+        int targetSamples = Mathf.Max(1, EffectiveSamplesPerFrame);
 
-        if (stratifiedJitter)
+        if (EffectiveStratifiedJitter)
             CollectStratifiedJitteredFrame(minX, maxX, minY, maxY, center, targetSamples, globalFrame);
         else
             CollectUniformRandomFrame(minX, maxX, minY, maxY, center, targetSamples, globalFrame);
@@ -361,7 +541,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             axisU = axisU,
             axisV = axisV,
             normal = cam.transform.forward,
-            sizeMeters = Mathf.Max(0.005f, physicalWindowSizeMeters * Mathf.Max(0.1f, samplingWindowScale)),
+            sizeMeters = Mathf.Max(0.005f, EffectivePhysicalWindowSizeMeters * Mathf.Max(0.1f, samplingWindowScale)),
             centerTextureX = centerTexCoord.x,
             centerTextureY = centerTexCoord.y,
             centerLinearDepth = linearDepth
@@ -398,7 +578,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private bool TryAddPhysicalWindowSample(WorldSamplingWindow window, float localU, float localV, int sampleIndex, int globalFrame)
     {
-        if (_samples.Count >= Mathf.Max(1, maxAccumulatedPoints))
+        if (_samples.Count >= Mathf.Max(1, EffectiveMaxAccumulatedPoints))
             return false;
 
         Vector3 targetWorld = window.center + window.axisU * localU + window.axisV * localV;
@@ -442,7 +622,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private bool AddInvalidPhysicalWindowSample(WorldSamplingWindow window, float localU, float localV, Vector3 targetWorld, Vector2Int texCoord, int sampleIndex, int globalFrame)
     {
-        if (!recordInvalidSamples || _samples.Count >= Mathf.Max(1, maxAccumulatedPoints))
+        if (!recordInvalidSamples || _samples.Count >= Mathf.Max(1, EffectiveMaxAccumulatedPoints))
             return false;
 
         _samples.Add(new SampleRecord
@@ -473,7 +653,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private void ClassifyValidSamplesForDisplay()
     {
-        if (!colorizeValidPointsByPlaneResidual)
+        if (!colorizeValidPointsByPlaneResidual || !EffectivePlanePointClassification)
         {
             for (int i = 0; i < _samples.Count; i++)
             {
@@ -511,6 +691,88 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
             _samples[sampleIndex] = sample;
         }
+
+        ClassifySecondaryPlaneCandidate(plane, validIndices);
+    }
+
+    private void ClassifySecondaryPlaneCandidate(PlaneFitResult primaryPlane, List<int> validIndices)
+    {
+        if (!enableSecondaryPlaneCandidate || validIndices == null)
+            return;
+
+        float minPrimaryDistance = Mathf.Max(0.001f, minSecondaryPlaneDistanceFromPrimaryMeters);
+        var candidateIndices = new List<int>(validIndices.Count);
+        for (int i = 0; i < validIndices.Count; i++)
+        {
+            int sampleIndex = validIndices[i];
+            SampleRecord sample = _samples[sampleIndex];
+            if (!sample.valid ||
+                sample.status == SampleStatus.DepthEdge ||
+                sample.status == SampleStatus.TrustedPlane ||
+                !IsFinite(sample.worldPosition))
+            {
+                continue;
+            }
+
+            float primaryResidual = Mathf.Abs(Vector3.Dot(sample.worldPosition - primaryPlane.center, primaryPlane.normal));
+            if (primaryResidual < minPrimaryDistance)
+                continue;
+
+            candidateIndices.Add(sampleIndex);
+        }
+
+        if (candidateIndices.Count < Mathf.Max(8, minSecondaryPlaneSamples))
+            return;
+
+        Camera cam = centerCamera != null ? centerCamera : Camera.main;
+        if (!TryFitTrimmedSamplePlaneFromIndices(
+                candidateIndices,
+                cam,
+                trustedThinBoxPlaneTrimKeepRatio,
+                trustedThinBoxPlaneRefineIterations,
+                out PlaneFitResult secondaryPlane,
+                out List<int> secondaryInliers))
+        {
+            return;
+        }
+
+        if (secondaryInliers == null || secondaryInliers.Count < Mathf.Max(8, minSecondaryPlaneSamples))
+            return;
+
+        float residualLimit = Mathf.Max(secondaryPlaneCandidateResidualMeters, trustedThinBoxMaxGroupResidualP95Meters);
+        if (secondaryPlane.residualP95 > residualLimit)
+            return;
+
+        float normalAngle = Vector3.Angle(primaryPlane.normal, secondaryPlane.normal);
+        normalAngle = Mathf.Min(normalAngle, 180f - normalAngle);
+        float planeOffset = Mathf.Abs(Vector3.Dot(secondaryPlane.center - primaryPlane.center, primaryPlane.normal));
+        bool sufficientlyDifferent =
+            normalAngle >= minSecondaryPlaneNormalAngleDegrees ||
+            planeOffset >= minPrimaryDistance * 2f;
+        if (!sufficientlyDifferent)
+            return;
+
+        float trustedLimit = Mathf.Max(0.001f, secondaryPlaneTrustedResidualMeters);
+        float candidateLimit = Mathf.Max(trustedLimit, secondaryPlaneCandidateResidualMeters);
+        for (int i = 0; i < candidateIndices.Count; i++)
+        {
+            int sampleIndex = candidateIndices[i];
+            SampleRecord sample = _samples[sampleIndex];
+            if (!sample.valid ||
+                sample.status == SampleStatus.DepthEdge ||
+                sample.status == SampleStatus.TrustedPlane)
+            {
+                continue;
+            }
+
+            float residual = Mathf.Abs(Vector3.Dot(sample.worldPosition - secondaryPlane.center, secondaryPlane.normal));
+            if (residual <= trustedLimit)
+                sample.status = SampleStatus.SecondaryTrustedPlane;
+            else if (residual <= candidateLimit)
+                sample.status = SampleStatus.SecondaryCandidatePlane;
+
+            _samples[sampleIndex] = sample;
+        }
     }
 
     private void CollectStratifiedJitteredFrame(int minX, int maxX, int minY, int maxY, int center, int targetSamples, int globalFrame)
@@ -544,7 +806,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private bool TryAddSample(int x, int y, int center, int sampleIndex, int globalFrame)
     {
-        if (_samples.Count >= Mathf.Max(1, maxAccumulatedPoints))
+        if (_samples.Count >= Mathf.Max(1, EffectiveMaxAccumulatedPoints))
             return false;
 
         if (!TryReadWorldPoint(x, y, out Vector3 worldPoint, out float linearDepth) &&
@@ -648,7 +910,20 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         int textureSize = CustomEnvironmentDepthRaycaster.TextureSize;
         float minDepth = centerLinearDepth;
         float maxDepth = centerLinearDepth;
-        int validNeighborCount = 0;
+        var probes = new List<LocalDepthProbe>((radius * 2 + 1) * (radius * 2 + 1));
+
+        if (TryReadWorldPointAtDepthTexCoord(centerTexCoord, out Vector3 centerWorld, out float readCenterDepth))
+        {
+            centerLinearDepth = readCenterDepth;
+            minDepth = centerLinearDepth;
+            maxDepth = centerLinearDepth;
+            probes.Add(new LocalDepthProbe
+            {
+                texCoord = centerTexCoord,
+                worldPosition = centerWorld,
+                linearDepth = centerLinearDepth
+            });
+        }
 
         for (int dy = -radius; dy <= radius; dy++)
         {
@@ -662,10 +937,17 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                 if (x < 0 || y < 0 || x >= textureSize || y >= textureSize)
                     continue;
 
-                if (!TryReadWorldPointAtDepthTexCoord(new Vector2Int(x, y), out _, out float neighborDepth))
+                Vector2Int texCoord = new Vector2Int(x, y);
+                if (!TryReadWorldPointAtDepthTexCoord(texCoord, out Vector3 neighborWorld, out float neighborDepth))
                     continue;
 
-                validNeighborCount++;
+                probes.Add(new LocalDepthProbe
+                {
+                    texCoord = texCoord,
+                    worldPosition = neighborWorld,
+                    linearDepth = neighborDepth
+                });
+
                 if (neighborDepth < minDepth)
                     minDepth = neighborDepth;
                 if (neighborDepth > maxDepth)
@@ -673,11 +955,136 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             }
         }
 
-        if (validNeighborCount < 2)
+        if (probes.Count < 3)
             return false;
 
         float jumpLimit = Mathf.Max(minDepthEdgeJumpMeters, centerLinearDepth * depthEdgeJumpDistanceScale);
-        return maxDepth - minDepth > jumpLimit;
+        if (maxDepth - minDepth <= jumpLimit)
+            return false;
+
+        if (depthEdgeUseLocalPlaneReject && probes.Count >= Mathf.Max(3, localPlaneMinNeighborPoints))
+        {
+            Camera cam = centerCamera != null ? centerCamera : Camera.main;
+            float residualLimit = Mathf.Max(localPlaneResidualBaseMeters, centerLinearDepth * localPlaneResidualDistanceScale);
+            if (TryFitLocalProbePlane(probes, cam, residualLimit, out PlaneFitResult localPlane) &&
+                localPlane.inlierRatio >= localPlaneMinInlierRatio &&
+                localPlane.residualP95 <= residualLimit)
+            {
+                return false;
+            }
+        }
+
+        if (!depthEdgeUseLocalPlaneReject)
+            return true;
+
+        return HasTwoClusterDepthJump(probes, jumpLimit);
+    }
+
+    private bool TryFitLocalProbePlane(List<LocalDepthProbe> probes, Camera cam, float inlierLimit, out PlaneFitResult result)
+    {
+        result = default;
+        int count = probes != null ? probes.Count : 0;
+        if (count < 3)
+            return false;
+
+        Vector3 center = Vector3.zero;
+        for (int i = 0; i < count; i++)
+            center += probes[i].worldPosition;
+        center /= count;
+
+        float xx = 0f;
+        float xy = 0f;
+        float xz = 0f;
+        float yy = 0f;
+        float yz = 0f;
+        float zz = 0f;
+
+        for (int i = 0; i < count; i++)
+        {
+            Vector3 d = probes[i].worldPosition - center;
+            xx += d.x * d.x;
+            xy += d.x * d.y;
+            xz += d.x * d.z;
+            yy += d.y * d.y;
+            yz += d.y * d.z;
+            zz += d.z * d.z;
+        }
+
+        float inv = 1f / count;
+        xx *= inv;
+        xy *= inv;
+        xz *= inv;
+        yy *= inv;
+        yz *= inv;
+        zz *= inv;
+
+        if (!TrySmallestEigenVectorSymmetric(xx, xy, xz, yy, yz, zz, out Vector3 normal))
+            return false;
+
+        if (cam != null && Vector3.Dot(normal, cam.transform.position - center) < 0f)
+            normal = -normal;
+
+        Vector3 axisU = BuildPlaneAxisU(normal, cam);
+        Vector3 axisV = Vector3.Cross(normal, axisU).normalized;
+
+        var residuals = new List<float>(count);
+        int inliers = 0;
+        float limit = Mathf.Max(0.001f, inlierLimit);
+        for (int i = 0; i < count; i++)
+        {
+            float residual = Mathf.Abs(Vector3.Dot(probes[i].worldPosition - center, normal));
+            residuals.Add(residual);
+            if (residual <= limit)
+                inliers++;
+        }
+
+        residuals.Sort();
+        result = new PlaneFitResult
+        {
+            valid = true,
+            center = center,
+            normal = normal,
+            axisU = axisU,
+            axisV = axisV,
+            residualMedian = QuantileSorted(residuals, 0.5f),
+            residualP80 = QuantileSorted(residuals, 0.8f),
+            residualP95 = QuantileSorted(residuals, 0.95f),
+            inlierRatio = inliers / (float)count
+        };
+
+        return true;
+    }
+
+    private bool HasTwoClusterDepthJump(List<LocalDepthProbe> probes, float jumpLimit)
+    {
+        int count = probes != null ? probes.Count : 0;
+        if (count < 4)
+            return false;
+
+        var depths = new List<float>(count);
+        for (int i = 0; i < count; i++)
+            depths.Add(probes[i].linearDepth);
+        depths.Sort();
+
+        float largestGap = 0f;
+        int splitIndex = -1;
+        for (int i = 0; i < depths.Count - 1; i++)
+        {
+            float gap = depths[i + 1] - depths[i];
+            if (gap > largestGap)
+            {
+                largestGap = gap;
+                splitIndex = i + 1;
+            }
+        }
+
+        if (splitIndex <= 0 || splitIndex >= count)
+            return false;
+
+        float minFraction = Mathf.Clamp01(depthEdgeTwoClusterMinFraction);
+        float nearFraction = splitIndex / (float)count;
+        float farFraction = (count - splitIndex) / (float)count;
+        return largestGap > jumpLimit && nearFraction >= minFraction && farFraction >= minFraction;
     }
 
     private bool TryReadNeighborWorldPoint(int centerX, int centerY, out Vector3 worldPoint, out float linearDepthMeters)
@@ -715,9 +1122,19 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (_displayMesh == null)
             return;
 
-        bool drawPoints = displayMode == PointBurstDisplayMode.Points && showPoints;
-        bool drawLattice = displayMode == PointBurstDisplayMode.TrustedLattice && showTrustedLattice;
-        if (!drawPoints && !drawLattice)
+        bool drawTerrainCells = pointCloudTerrainDiagnosticsOnly && terrainDiagnosticsDisplayAggregatedCells;
+        bool drawPoints = showPoints &&
+                          (displayMode == PointBurstDisplayMode.Points ||
+                           displayMode == PointBurstDisplayMode.TrustedThinBox);
+        if (drawTerrainCells)
+            drawPoints = terrainDiagnosticsShowRawOverlay && showPoints;
+
+        bool drawLattice = !drawTerrainCells && displayMode == PointBurstDisplayMode.TrustedLattice && showTrustedLattice;
+        bool drawTrustedThinBox = showTrustedThinBox &&
+                                  !drawTerrainCells &&
+                                  (displayMode == PointBurstDisplayMode.TrustedThinBox ||
+                                   displayMode == PointBurstDisplayMode.Points);
+        if (!drawPoints && !drawLattice && !drawTrustedThinBox && !drawTerrainCells)
         {
             ClearMesh();
             return;
@@ -730,7 +1147,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         Camera cam = ResolveCenterCamera();
         Transform displayTransform = _displayObject != null ? _displayObject.transform : transform;
 
-        MeshTopology topology;
+        MeshTopology topology = MeshTopology.Triangles;
         if (drawLattice)
         {
             if (!TryAddTrustedLattice(displayTransform, cam))
@@ -743,33 +1160,52 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         }
         else
         {
-            Vector3 camRight = cam != null ? cam.transform.right : Vector3.right;
-            Vector3 camUp = cam != null ? cam.transform.up : Vector3.up;
-            Vector3 camPos = cam != null ? cam.transform.position : transform.position;
-            Vector3 localRight = displayTransform.InverseTransformDirection(camRight).normalized;
-            Vector3 localUp = displayTransform.InverseTransformDirection(camUp).normalized;
-            float halfSize = Mathf.Max(0.001f, pointVisualSizeMeters) * 0.5f;
+            if (drawTerrainCells)
+                TryAddTerrainCellDiagnostics(displayTransform, cam);
 
-            for (int i = 0; i < _samples.Count; i++)
+            bool trustedThinBoxAdded = false;
+            if (drawTrustedThinBox)
             {
-                SampleRecord sample = _samples[i];
-                Vector3 p = sample.worldPosition;
-                Color sampleColor = ResolveSampleColor(sample);
-                if (sample.valid && surfaceOffsetTowardCameraMeters > 0f)
+                trustedThinBoxAdded = TryAddTrustedThinBox(displayTransform, cam);
+                if (!trustedThinBoxAdded && !drawPoints)
                 {
-                    Vector3 towardCamera = camPos - p;
-                    if (towardCamera.sqrMagnitude > 1e-8f)
-                        p += towardCamera.normalized * surfaceOffsetTowardCameraMeters;
+                    ClearMesh();
+                    return;
                 }
-
-                p = displayTransform.InverseTransformPoint(p);
-                if (renderAsBillboardQuads)
-                    AddBillboardQuad(p, localRight, localUp, halfSize, sampleColor);
-                else
-                    AddMeshPoint(p, sampleColor);
             }
 
-            topology = renderAsBillboardQuads ? MeshTopology.Triangles : MeshTopology.Points;
+            if (drawPoints)
+            {
+                Vector3 camRight = cam != null ? cam.transform.right : Vector3.right;
+                Vector3 camUp = cam != null ? cam.transform.up : Vector3.up;
+                Vector3 camPos = cam != null ? cam.transform.position : transform.position;
+                Vector3 localRight = displayTransform.InverseTransformDirection(camRight).normalized;
+                Vector3 localUp = displayTransform.InverseTransformDirection(camUp).normalized;
+                float halfSize = Mathf.Max(0.001f, pointVisualSizeMeters) * 0.5f;
+                bool drawPointQuads = drawTrustedThinBox || renderAsBillboardQuads;
+
+                for (int i = 0; i < _samples.Count; i++)
+                {
+                    SampleRecord sample = _samples[i];
+
+                    Vector3 p = sample.worldPosition;
+                    Color sampleColor = ResolveSampleColor(sample);
+                    if (sample.valid && surfaceOffsetTowardCameraMeters > 0f)
+                    {
+                        Vector3 towardCamera = camPos - p;
+                        if (towardCamera.sqrMagnitude > 1e-8f)
+                            p += towardCamera.normalized * surfaceOffsetTowardCameraMeters;
+                    }
+
+                    p = displayTransform.InverseTransformPoint(p);
+                    if (drawPointQuads)
+                        AddBillboardQuad(p, localRight, localUp, halfSize, sampleColor);
+                    else
+                        AddMeshPoint(p, sampleColor);
+                }
+
+                topology = drawPointQuads ? MeshTopology.Triangles : MeshTopology.Points;
+            }
         }
 
         _displayMesh.Clear();
@@ -789,6 +1225,10 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                 return trustedPointColor;
             case SampleStatus.CandidatePlane:
                 return candidatePointColor;
+            case SampleStatus.SecondaryTrustedPlane:
+                return secondaryTrustedPointColor;
+            case SampleStatus.SecondaryCandidatePlane:
+                return secondaryCandidatePointColor;
             case SampleStatus.DepthEdge:
                 return depthEdgePointColor;
             case SampleStatus.EdgeEvidence:
@@ -799,6 +1239,694 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             default:
                 return sample.valid ? pointColor : unknownPointColor;
         }
+    }
+
+    private bool TryAddTerrainCellDiagnostics(Transform displayTransform, Camera cam)
+    {
+        if (!TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> cells, out _))
+            return false;
+
+        Vector3 camRight = cam != null ? cam.transform.right : Vector3.right;
+        Vector3 camUp = cam != null ? cam.transform.up : Vector3.up;
+        Vector3 localRight = displayTransform.InverseTransformDirection(camRight).normalized;
+        Vector3 localUp = displayTransform.InverseTransformDirection(camUp).normalized;
+        float halfSize = Mathf.Max(0.001f, terrainRepresentativePointSizeMeters) * 0.5f;
+
+        int drawn = 0;
+        var planarizedCells = new HashSet<Vector2Int>();
+        if (terrainDiagnosticsShowPlanarizedPreview)
+        {
+            drawn += AddPlanarizedTerrainPreview(cells, planarizedCells, displayTransform, cam, localRight, localUp, halfSize);
+        }
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            if (planarizedCells.Contains(pair.Key))
+                continue;
+
+            TerrainCell cell = pair.Value;
+            if (cell.indices.Count == 0)
+                continue;
+
+            if (cell.classification == TerrainCellClassification.MultiLayer &&
+                TryGetTerrainLayerRepresentatives(cell, out int nearIndex, out int farIndex))
+            {
+                AddTerrainRepresentative(_samples[nearIndex], terrainMultiLayerNearColor, displayTransform, localRight, localUp, halfSize);
+                AddTerrainRepresentative(_samples[farIndex], terrainMultiLayerFarColor, displayTransform, localRight, localUp, halfSize);
+                drawn += 2;
+                continue;
+            }
+
+            int representativeIndex = FindSampleClosestToDepth(cell, cell.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
+            if (representativeIndex < 0)
+                continue;
+
+            AddTerrainRepresentative(
+                _samples[representativeIndex],
+                ResolveTerrainCellColor(cell.classification),
+                displayTransform,
+                localRight,
+                localUp,
+                halfSize);
+            drawn++;
+        }
+
+        return drawn > 0;
+    }
+
+    private int AddPlanarizedTerrainPreview(
+        Dictionary<Vector2Int, TerrainCell> cells,
+        HashSet<Vector2Int> planarizedCells,
+        Transform displayTransform,
+        Camera cam,
+        Vector3 localRight,
+        Vector3 localUp,
+        float halfSize)
+    {
+        if (!TryBuildTerrainPlaneIslands(cells, cam, out List<TerrainPlaneIsland> islands, out _))
+            return 0;
+
+        int drawn = 0;
+        for (int i = 0; i < islands.Count; i++)
+        {
+            TerrainPlaneIsland island = islands[i];
+            if (island.accepted)
+            {
+                int meshTriangles = terrainDiagnosticsShowPlanarizedMeshPreview
+                    ? AddPlanarizedTerrainIslandMesh(island, displayTransform)
+                    : 0;
+                drawn += meshTriangles;
+
+                bool drawPointFallback = !terrainDiagnosticsShowPlanarizedMeshPreview ||
+                                         (meshTriangles == 0 && terrainDiagnosticsShowPlanarizedPointFallback);
+                if (drawPointFallback)
+                {
+                    for (int j = 0; j < island.representativeIndices.Count; j++)
+                    {
+                        int sampleIndex = island.representativeIndices[j];
+                        if (sampleIndex < 0 || sampleIndex >= _samples.Count)
+                            continue;
+
+                        SampleRecord sample = _samples[sampleIndex];
+                        Vector3 projected = ProjectPointToPlane(sample.worldPosition, island.plane);
+                        AddTerrainRepresentative(projected, terrainPlanarizedAcceptedColor, displayTransform, localRight, localUp, halfSize);
+                        drawn++;
+                    }
+                }
+
+                for (int j = 0; j < island.cellKeys.Count; j++)
+                    planarizedCells.Add(island.cellKeys[j]);
+
+                continue;
+            }
+
+            if (!terrainDiagnosticsShowRejectedPlaneIslands)
+                continue;
+
+            for (int j = 0; j < island.representativeIndices.Count; j++)
+            {
+                int sampleIndex = island.representativeIndices[j];
+                if (sampleIndex < 0 || sampleIndex >= _samples.Count)
+                    continue;
+
+                AddTerrainRepresentative(_samples[sampleIndex], terrainPlanarizedRejectedColor, displayTransform, localRight, localUp, halfSize);
+                drawn++;
+            }
+        }
+
+        return drawn;
+    }
+
+    private int AddPlanarizedTerrainIslandMesh(TerrainPlaneIsland island, Transform displayTransform)
+    {
+        if (island == null || !island.accepted || island.cellKeys.Count < 4)
+            return 0;
+
+        if (terrainDiagnosticsUsePlanarizedCellTiles)
+            return AddPlanarizedTerrainIslandTileMesh(island, displayTransform);
+
+        var vertexByCell = new Dictionary<Vector2Int, int>(island.cellKeys.Count);
+        float maxProjectionOffset = Mathf.Max(0.001f, terrainPlaneMaxProjectionOffsetMeters);
+        for (int i = 0; i < island.cellKeys.Count; i++)
+        {
+            Vector2Int cellKey = island.cellKeys[i];
+            if (!island.representativeIndexByCell.TryGetValue(cellKey, out int sampleIndex))
+                continue;
+
+            if (sampleIndex < 0 || sampleIndex >= _samples.Count)
+                continue;
+
+            SampleRecord sample = _samples[sampleIndex];
+            float projectionOffset = Mathf.Abs(Vector3.Dot(sample.worldPosition - island.plane.center, island.plane.normal));
+            if (projectionOffset > maxProjectionOffset)
+                continue;
+
+            Vector3 projectedWorld = ProjectPointToPlane(sample.worldPosition, island.plane);
+            int vertexIndex = _meshVertices.Count;
+            vertexByCell[cellKey] = vertexIndex;
+            _meshVertices.Add(displayTransform.InverseTransformPoint(projectedWorld));
+            _meshColors.Add(terrainPlanarizedMeshColor);
+        }
+
+        if (vertexByCell.Count < 4)
+            return 0;
+
+        int triangles = 0;
+        foreach (KeyValuePair<Vector2Int, int> pair in vertexByCell)
+        {
+            Vector2Int aKey = pair.Key;
+            Vector2Int bKey = aKey + new Vector2Int(1, 0);
+            Vector2Int cKey = aKey + new Vector2Int(0, 1);
+            Vector2Int dKey = aKey + new Vector2Int(1, 1);
+
+            if (!vertexByCell.TryGetValue(bKey, out int b) ||
+                !vertexByCell.TryGetValue(cKey, out int c) ||
+                !vertexByCell.TryGetValue(dKey, out int d))
+            {
+                continue;
+            }
+
+            int a = pair.Value;
+            if (!PlanarizedMeshEdgeOk(a, b) ||
+                !PlanarizedMeshEdgeOk(a, c) ||
+                !PlanarizedMeshEdgeOk(b, d) ||
+                !PlanarizedMeshEdgeOk(c, d))
+            {
+                continue;
+            }
+
+            bool diagonalAC = (_meshVertices[a] - _meshVertices[d]).sqrMagnitude <=
+                              (_meshVertices[b] - _meshVertices[c]).sqrMagnitude;
+            if (diagonalAC && PlanarizedMeshEdgeOk(a, d))
+            {
+                AddTriangle(a, b, d);
+                AddTriangle(a, d, c);
+                triangles += 2;
+            }
+            else if (!diagonalAC && PlanarizedMeshEdgeOk(b, c))
+            {
+                AddTriangle(a, b, c);
+                AddTriangle(b, d, c);
+                triangles += 2;
+            }
+        }
+
+        return triangles;
+    }
+
+    private int AddPlanarizedTerrainIslandTileMesh(TerrainPlaneIsland island, Transform displayTransform)
+    {
+        float maxProjectionOffset = Mathf.Max(0.001f, terrainPlaneMaxProjectionOffsetMeters);
+        float fillRatio = Mathf.Clamp01(terrainPlanarizedTileFillRatio);
+        float cellSize = Mathf.Max(0.001f, terrainCellSizeMeters);
+        var vertexByCorner = new Dictionary<Vector2Int, int>(island.cellKeys.Count * 4);
+        int triangles = 0;
+
+        for (int i = 0; i < island.cellKeys.Count; i++)
+        {
+            Vector2Int cellKey = island.cellKeys[i];
+            if (!island.representativeIndexByCell.TryGetValue(cellKey, out int sampleIndex) ||
+                sampleIndex < 0 ||
+                sampleIndex >= _samples.Count)
+            {
+                continue;
+            }
+
+            SampleRecord sample = _samples[sampleIndex];
+            float projectionOffset = Mathf.Abs(Vector3.Dot(sample.worldPosition - island.plane.center, island.plane.normal));
+            if (projectionOffset > maxProjectionOffset)
+                continue;
+
+            int a = GetOrAddPlanarizedGridCornerVertex(vertexByCorner, cellKey, 0, 0, sample, island.plane, displayTransform, cellSize, fillRatio);
+            int b = GetOrAddPlanarizedGridCornerVertex(vertexByCorner, cellKey, 1, 0, sample, island.plane, displayTransform, cellSize, fillRatio);
+            int c = GetOrAddPlanarizedGridCornerVertex(vertexByCorner, cellKey, 1, 1, sample, island.plane, displayTransform, cellSize, fillRatio);
+            int d = GetOrAddPlanarizedGridCornerVertex(vertexByCorner, cellKey, 0, 1, sample, island.plane, displayTransform, cellSize, fillRatio);
+            if (a < 0 || b < 0 || c < 0 || d < 0)
+                continue;
+
+            AddTriangle(a, b, c);
+            AddTriangle(a, c, d);
+            triangles += 2;
+        }
+
+        return triangles;
+    }
+
+    private int GetOrAddPlanarizedGridCornerVertex(
+        Dictionary<Vector2Int, int> vertexByCorner,
+        Vector2Int cellKey,
+        int cornerX,
+        int cornerY,
+        SampleRecord referenceSample,
+        PlaneFitResult plane,
+        Transform displayTransform,
+        float cellSize,
+        float fillRatio)
+    {
+        Vector2Int cornerKey = new Vector2Int(cellKey.x + cornerX, cellKey.y + cornerY);
+        bool useSharedCorner = fillRatio >= 0.999f;
+        if (useSharedCorner && vertexByCorner.TryGetValue(cornerKey, out int existing))
+            return existing;
+
+        float shrink = Mathf.Clamp01(fillRatio);
+        float localX = cellKey.x + (cornerX == 0 ? (1f - shrink) * 0.5f : 1f - (1f - shrink) * 0.5f);
+        float localY = cellKey.y + (cornerY == 0 ? (1f - shrink) * 0.5f : 1f - (1f - shrink) * 0.5f);
+        float u = localX * cellSize;
+        float v = localY * cellSize;
+        Vector3 rawWorld = referenceSample.windowCenter +
+                           referenceSample.windowAxisU * u +
+                           referenceSample.windowAxisV * v;
+        Vector3 projectedWorld = ProjectPointToPlane(rawWorld, plane);
+
+        int index = _meshVertices.Count;
+        _meshVertices.Add(displayTransform.InverseTransformPoint(projectedWorld));
+        _meshColors.Add(terrainPlanarizedMeshColor);
+
+        if (useSharedCorner)
+            vertexByCorner[cornerKey] = index;
+
+        return index;
+    }
+
+    private bool PlanarizedMeshEdgeOk(int a, int b)
+    {
+        float maxEdge = Mathf.Max(terrainPlaneMeshMaxEdgeMeters, terrainCellSizeMeters * 2.5f);
+        return (_meshVertices[a] - _meshVertices[b]).sqrMagnitude <= maxEdge * maxEdge;
+    }
+
+    private void AddTriangle(int a, int b, int c)
+    {
+        _meshIndices.Add(a);
+        _meshIndices.Add(b);
+        _meshIndices.Add(c);
+        _meshIndices.Add(c);
+        _meshIndices.Add(b);
+        _meshIndices.Add(a);
+    }
+
+    private void AddTerrainRepresentative(
+        Vector3 worldPosition,
+        Color color,
+        Transform displayTransform,
+        Vector3 localRight,
+        Vector3 localUp,
+        float halfSize)
+    {
+        Vector3 localPoint = displayTransform.InverseTransformPoint(worldPosition);
+        AddBillboardQuad(localPoint, localRight, localUp, halfSize, color);
+    }
+
+    private void AddTerrainRepresentative(
+        SampleRecord sample,
+        Color color,
+        Transform displayTransform,
+        Vector3 localRight,
+        Vector3 localUp,
+        float halfSize)
+    {
+        Vector3 localPoint = displayTransform.InverseTransformPoint(sample.worldPosition);
+        AddBillboardQuad(localPoint, localRight, localUp, halfSize, color);
+    }
+
+    private Color ResolveTerrainCellColor(TerrainCellClassification classification)
+    {
+        switch (classification)
+        {
+            case TerrainCellClassification.StableSingleLayer:
+                return terrainStableCellColor;
+            case TerrainCellClassification.BoundaryDepthJump:
+                return terrainBoundaryCellColor;
+            case TerrainCellClassification.MultiLayer:
+                return terrainMultiLayerNearColor;
+            case TerrainCellClassification.Unstable:
+            default:
+                return terrainUnstableCellColor;
+        }
+    }
+
+    private bool TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> cells, out TerrainCellSummary summary)
+    {
+        cells = new Dictionary<Vector2Int, TerrainCell>();
+        summary = default;
+        float cellSize = Mathf.Max(0.005f, terrainCellSizeMeters);
+
+        for (int i = 0; i < _samples.Count; i++)
+        {
+            SampleRecord sample = _samples[i];
+            if (!sample.valid || !IsFinite(sample.worldPosition) || !TryGetTerrainCell(sample, cellSize, out Vector2Int key))
+                continue;
+
+            if (!cells.TryGetValue(key, out TerrainCell cell))
+            {
+                cell = new TerrainCell();
+                cells.Add(key, cell);
+            }
+
+            cell.indices.Add(i);
+            cell.depths.Add(sample.linearDepth);
+            cell.supportFrames.Add(sample.globalFrame);
+            cell.worldSum += sample.worldPosition;
+            if (sample.status == SampleStatus.DepthEdge || sample.status == SampleStatus.EdgeEvidence)
+                cell.depthEdgeSamples++;
+        }
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            ClassifyTerrainCell(pair.Value);
+        }
+
+        MarkNeighborDepthJumpCells(cells);
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            summary.cellCount++;
+            switch (pair.Value.classification)
+            {
+                case TerrainCellClassification.StableSingleLayer:
+                    summary.stableSingleLayerCount++;
+                    break;
+                case TerrainCellClassification.BoundaryDepthJump:
+                    summary.boundaryDepthJumpCount++;
+                    break;
+                case TerrainCellClassification.MultiLayer:
+                    summary.multiLayerCount++;
+                    break;
+                case TerrainCellClassification.Unstable:
+                    summary.unstableCount++;
+                    break;
+            }
+        }
+
+        return cells.Count > 0;
+    }
+
+    private void MarkNeighborDepthJumpCells(Dictionary<Vector2Int, TerrainCell> cells)
+    {
+        if (cells == null || cells.Count == 0)
+            return;
+
+        float jumpLimit = Mathf.Max(
+            terrainNeighborDepthJumpMeters,
+            terrainMultiLayerMinDepthGapMeters,
+            minDepthEdgeJumpMeters);
+        Vector2Int[] neighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(0, 1)
+        };
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            TerrainCell current = pair.Value;
+            if (!CanPromoteToNeighborBoundary(current))
+                continue;
+
+            for (int i = 0; i < neighbors.Length; i++)
+            {
+                Vector2Int nextKey = pair.Key + neighbors[i];
+                if (!cells.TryGetValue(nextKey, out TerrainCell next) ||
+                    !CanPromoteToNeighborBoundary(next))
+                {
+                    continue;
+                }
+
+                if (Mathf.Abs(current.depthMedian - next.depthMedian) <= jumpLimit)
+                    continue;
+
+                current.classification = TerrainCellClassification.BoundaryDepthJump;
+                next.classification = TerrainCellClassification.BoundaryDepthJump;
+            }
+        }
+    }
+
+    private static bool CanPromoteToNeighborBoundary(TerrainCell cell)
+    {
+        return cell != null &&
+               cell.classification != TerrainCellClassification.MultiLayer &&
+               cell.classification != TerrainCellClassification.Unstable;
+    }
+
+    private bool TryBuildTerrainPlaneIslands(
+        Dictionary<Vector2Int, TerrainCell> cells,
+        Camera cam,
+        out List<TerrainPlaneIsland> islands,
+        out TerrainPlaneSummary summary)
+    {
+        islands = new List<TerrainPlaneIsland>();
+        summary = default;
+        if (cells == null || cells.Count == 0)
+            return false;
+
+        var visited = new HashSet<Vector2Int>();
+        var queue = new Queue<Vector2Int>();
+        Vector2Int[] neighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(-1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(0, -1)
+        };
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            if (!IsStableTerrainPlaneCell(pair.Value) || !visited.Add(pair.Key))
+                continue;
+
+            var island = new TerrainPlaneIsland();
+            queue.Enqueue(pair.Key);
+            while (queue.Count > 0)
+            {
+                Vector2Int currentKey = queue.Dequeue();
+                TerrainCell current = cells[currentKey];
+                island.cellKeys.Add(currentKey);
+
+                int representativeIndex = FindSampleClosestToDepth(current, current.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
+                if (representativeIndex >= 0)
+                {
+                    island.representativeIndices.Add(representativeIndex);
+                    island.representativeIndexByCell[currentKey] = representativeIndex;
+                }
+
+                for (int i = 0; i < neighbors.Length; i++)
+                {
+                    Vector2Int nextKey = currentKey + neighbors[i];
+                    if (!cells.TryGetValue(nextKey, out TerrainCell next) ||
+                        !IsStableTerrainPlaneCell(next) ||
+                        !AreTerrainStableCellsPlaneCompatible(current, next) ||
+                        !visited.Add(nextKey))
+                    {
+                        continue;
+                    }
+
+                    queue.Enqueue(nextKey);
+                }
+            }
+
+            if (island.cellKeys.Count < Mathf.Max(3, terrainPlaneMinCells) ||
+                island.representativeIndices.Count < Mathf.Max(3, terrainPlaneMinCells))
+            {
+                island.accepted = false;
+                islands.Add(island);
+                continue;
+            }
+
+            EvaluateTerrainPlaneIsland(island, cam);
+            islands.Add(island);
+        }
+
+        for (int i = 0; i < islands.Count; i++)
+        {
+            summary.islandCount++;
+            if (islands[i].accepted)
+            {
+                summary.acceptedIslandCount++;
+                summary.acceptedCellCount += islands[i].cellKeys.Count;
+            }
+            else
+            {
+                summary.rejectedIslandCount++;
+            }
+        }
+
+        return islands.Count > 0;
+    }
+
+    private bool IsStableTerrainPlaneCell(TerrainCell cell)
+    {
+        return cell != null && cell.classification == TerrainCellClassification.StableSingleLayer;
+    }
+
+    private bool AreTerrainStableCellsPlaneCompatible(TerrainCell a, TerrainCell b)
+    {
+        if (a == null || b == null)
+            return false;
+
+        float jumpLimit = Mathf.Max(terrainNeighborDepthJumpMeters, terrainMultiLayerMinDepthGapMeters, minDepthEdgeJumpMeters);
+        return Mathf.Abs(a.depthMedian - b.depthMedian) <= jumpLimit;
+    }
+
+    private void EvaluateTerrainPlaneIsland(TerrainPlaneIsland island, Camera cam)
+    {
+        if (island == null || island.representativeIndices.Count < 3)
+            return;
+
+        if (!TryFitTrimmedSamplePlaneFromIndices(
+                island.representativeIndices,
+                cam,
+                terrainPlaneTrimKeepRatio,
+                terrainPlaneRefineIterations,
+                out PlaneFitResult plane,
+                out List<int> inlierIndices))
+        {
+            island.accepted = false;
+            return;
+        }
+
+        island.plane = plane;
+        var inlierSet = new HashSet<int>(inlierIndices);
+        float residualLimit = Mathf.Max(0.001f, terrainPlaneInlierResidualMeters);
+        int inlierCount = 0;
+        float maxOffset = 0f;
+
+        for (int i = 0; i < island.representativeIndices.Count; i++)
+        {
+            int sampleIndex = island.representativeIndices[i];
+            if (sampleIndex < 0 || sampleIndex >= _samples.Count)
+                continue;
+
+            float residual = Mathf.Abs(Vector3.Dot(_samples[sampleIndex].worldPosition - plane.center, plane.normal));
+            if (residual <= residualLimit || inlierSet.Contains(sampleIndex))
+                inlierCount++;
+            if (residual > maxOffset)
+                maxOffset = residual;
+        }
+
+        island.maxProjectionOffset = maxOffset;
+        float inlierRatio = island.representativeIndices.Count > 0
+            ? inlierCount / (float)island.representativeIndices.Count
+            : 0f;
+
+        island.accepted =
+            plane.valid &&
+            plane.residualP95 <= Mathf.Max(0.001f, terrainPlaneMaxResidualP95Meters) &&
+            inlierRatio >= terrainPlaneMinInlierRatio &&
+            maxOffset <= Mathf.Max(0.001f, terrainPlaneMaxProjectionOffsetMeters);
+    }
+
+    private static Vector3 ProjectPointToPlane(Vector3 point, PlaneFitResult plane)
+    {
+        return point - plane.normal * Vector3.Dot(point - plane.center, plane.normal);
+    }
+
+    private void ClassifyTerrainCell(TerrainCell cell)
+    {
+        int count = cell.depths.Count;
+        if (count == 0)
+        {
+            cell.classification = TerrainCellClassification.Unstable;
+            return;
+        }
+
+        cell.depths.Sort();
+        cell.depthP10 = QuantileSorted(cell.depths, 0.1f);
+        cell.depthMedian = QuantileSorted(cell.depths, 0.5f);
+        cell.depthP90 = QuantileSorted(cell.depths, 0.9f);
+        cell.thickness = cell.depthP90 - cell.depthP10;
+        cell.largestDepthGap = 0f;
+        cell.splitIndex = -1;
+
+        for (int i = 0; i < cell.depths.Count - 1; i++)
+        {
+            float gap = cell.depths[i + 1] - cell.depths[i];
+            if (gap > cell.largestDepthGap)
+            {
+                cell.largestDepthGap = gap;
+                cell.splitIndex = i + 1;
+            }
+        }
+
+        if (count < Mathf.Max(1, terrainStableMinSamplesPerCell) ||
+            cell.supportFrames.Count < Mathf.Max(1, terrainStableMinSupportFrames))
+        {
+            cell.classification = TerrainCellClassification.Unstable;
+            return;
+        }
+
+        float minLayerFraction = Mathf.Clamp01(terrainMultiLayerMinFraction);
+        bool hasLayerSplit = cell.splitIndex > 0 &&
+                             cell.splitIndex < count &&
+                             cell.largestDepthGap >= Mathf.Max(0.001f, terrainMultiLayerMinDepthGapMeters) &&
+                             cell.splitIndex / (float)count >= minLayerFraction &&
+                             (count - cell.splitIndex) / (float)count >= minLayerFraction;
+        if (hasLayerSplit)
+        {
+            cell.classification = TerrainCellClassification.MultiLayer;
+            return;
+        }
+
+        float edgeFraction = count > 0 ? cell.depthEdgeSamples / (float)count : 0f;
+        if (cell.thickness > Mathf.Max(0.001f, terrainStableMaxThicknessMeters) ||
+            edgeFraction >= terrainBoundaryMinDepthEdgeFraction)
+        {
+            cell.classification = TerrainCellClassification.BoundaryDepthJump;
+            return;
+        }
+
+        cell.classification = TerrainCellClassification.StableSingleLayer;
+    }
+
+    private bool TryGetTerrainCell(SampleRecord sample, float cellSize, out Vector2Int cell)
+    {
+        if (sample.fromPhysicalWindow)
+        {
+            cell = new Vector2Int(
+                Mathf.FloorToInt(sample.windowLocalU / cellSize),
+                Mathf.FloorToInt(sample.windowLocalV / cellSize));
+            return true;
+        }
+
+        cell = new Vector2Int(
+            Mathf.FloorToInt(sample.windowX / Mathf.Max(1f, cellSize * 1000f)),
+            Mathf.FloorToInt(sample.windowY / Mathf.Max(1f, cellSize * 1000f)));
+        return true;
+    }
+
+    private bool TryGetTerrainLayerRepresentatives(TerrainCell cell, out int nearIndex, out int farIndex)
+    {
+        nearIndex = -1;
+        farIndex = -1;
+        if (cell.splitIndex <= 0 || cell.splitIndex >= cell.depths.Count)
+            return false;
+
+        float splitDepth = (cell.depths[cell.splitIndex - 1] + cell.depths[cell.splitIndex]) * 0.5f;
+        float nearDepth = cell.depths[Mathf.Clamp(cell.splitIndex / 2, 0, cell.splitIndex - 1)];
+        float farDepth = cell.depths[Mathf.Clamp(cell.splitIndex + (cell.depths.Count - cell.splitIndex) / 2, cell.splitIndex, cell.depths.Count - 1)];
+        nearIndex = FindSampleClosestToDepth(cell, nearDepth, float.NegativeInfinity, splitDepth);
+        farIndex = FindSampleClosestToDepth(cell, farDepth, splitDepth, float.PositiveInfinity);
+        return nearIndex >= 0 && farIndex >= 0;
+    }
+
+    private int FindSampleClosestToDepth(TerrainCell cell, float targetDepth, float minDepthInclusive, float maxDepthExclusive)
+    {
+        int bestIndex = -1;
+        float bestDelta = float.PositiveInfinity;
+
+        for (int i = 0; i < cell.indices.Count; i++)
+        {
+            int sampleIndex = cell.indices[i];
+            float depth = _samples[sampleIndex].linearDepth;
+            if (depth < minDepthInclusive || depth >= maxDepthExclusive)
+                continue;
+
+            float delta = Mathf.Abs(depth - targetDepth);
+            if (delta < bestDelta)
+            {
+                bestDelta = delta;
+                bestIndex = sampleIndex;
+            }
+        }
+
+        return bestIndex;
     }
 
     private void AddMeshPoint(Vector3 point, Color color)
@@ -908,6 +2036,360 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         return cellsDrawn > 0;
     }
 
+    private bool TryAddTrustedThinBox(Transform displayTransform, Camera cam)
+    {
+        bool drew = TryAddTrustedThinBoxForStatus(
+            displayTransform,
+            cam,
+            SampleStatus.TrustedPlane,
+            trustedThinBoxColor,
+            Mathf.Max(1, trustedThinBoxMaxGroups),
+            Mathf.Max(3, trustedThinBoxMinGroupSamples));
+
+        if (enableSecondaryPlaneCandidate)
+        {
+            int secondaryMinGroupSamples = Mathf.Max(3, Mathf.Min(trustedThinBoxMinGroupSamples, minSecondaryPlaneSamples));
+            drew |= TryAddTrustedThinBoxForStatus(
+                displayTransform,
+                cam,
+                SampleStatus.SecondaryTrustedPlane,
+                secondaryThinBoxColor,
+                Mathf.Max(1, secondaryPlaneMaxThinBoxGroups),
+                secondaryMinGroupSamples);
+        }
+
+        return drew;
+    }
+
+    private bool TryAddTrustedThinBoxForStatus(
+        Transform displayTransform,
+        Camera cam,
+        SampleStatus trustedStatus,
+        Color boxColor,
+        int maxGroups,
+        int minGroupSamples)
+    {
+        float cellSize = Mathf.Max(0.005f, trustedThinBoxGroupCellSizeMeters);
+        int minCellSamples = Mathf.Max(1, trustedThinBoxMinSamplesPerGroupCell);
+        var cells = new Dictionary<Vector2Int, TrustedThinBoxCell>();
+
+        for (int i = 0; i < _samples.Count; i++)
+        {
+            SampleRecord sample = _samples[i];
+            if (!sample.valid ||
+                sample.status != trustedStatus ||
+                !IsFinite(sample.worldPosition) ||
+                !TryGetTrustedThinBoxCell(sample, cellSize, out Vector2Int cell))
+            {
+                continue;
+            }
+
+            if (!cells.TryGetValue(cell, out TrustedThinBoxCell cellStats))
+            {
+                cellStats = new TrustedThinBoxCell();
+                cells.Add(cell, cellStats);
+            }
+
+            cellStats.indices.Add(i);
+            cellStats.worldSum += sample.worldPosition;
+            cellStats.windowNormalOffsetSum += GetSampleWindowNormalOffset(sample);
+            cellStats.linearDepthSum += sample.linearDepth;
+        }
+
+        if (cells.Count == 0)
+            return false;
+
+        var usableCells = new Dictionary<Vector2Int, TrustedThinBoxCell>();
+        foreach (KeyValuePair<Vector2Int, TrustedThinBoxCell> pair in cells)
+        {
+            if (pair.Value.indices.Count >= minCellSamples)
+                usableCells.Add(pair.Key, pair.Value);
+        }
+
+        if (usableCells.Count == 0)
+            return false;
+
+        var visited = new HashSet<Vector2Int>();
+        var components = new List<List<int>>();
+        var queue = new Queue<Vector2Int>();
+        Vector2Int[] neighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(-1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(0, -1)
+        };
+
+        foreach (KeyValuePair<Vector2Int, TrustedThinBoxCell> pair in usableCells)
+        {
+            if (!visited.Add(pair.Key))
+                continue;
+
+            var component = new List<int>();
+            queue.Enqueue(pair.Key);
+            while (queue.Count > 0)
+            {
+                Vector2Int current = queue.Dequeue();
+                TrustedThinBoxCell currentStats = usableCells[current];
+                component.AddRange(currentStats.indices);
+
+                for (int i = 0; i < neighbors.Length; i++)
+                {
+                    Vector2Int next = current + neighbors[i];
+                    if (!usableCells.TryGetValue(next, out TrustedThinBoxCell nextStats) ||
+                        !AreTrustedThinBoxCellsCompatible(currentStats, nextStats) ||
+                        !visited.Add(next))
+                    {
+                        continue;
+                    }
+
+                    queue.Enqueue(next);
+                }
+            }
+
+            components.Add(component);
+        }
+
+        components.Sort((a, b) => b.Count.CompareTo(a.Count));
+
+        int groupsDrawn = 0;
+        for (int i = 0; i < components.Count && groupsDrawn < maxGroups; i++)
+        {
+            List<int> component = components[i];
+            if (component.Count < minGroupSamples)
+                continue;
+
+            if (TryAddTrustedThinBoxForGroup(displayTransform, cam, component, boxColor))
+                groupsDrawn++;
+        }
+
+        return groupsDrawn > 0;
+    }
+
+    private bool AreTrustedThinBoxCellsCompatible(TrustedThinBoxCell a, TrustedThinBoxCell b)
+    {
+        float depthJumpLimit = Mathf.Max(0.001f, trustedThinBoxMaxNeighborDepthJumpMeters);
+        float normalOffsetJump = Mathf.Abs(a.MeanWindowNormalOffset - b.MeanWindowNormalOffset);
+        if (normalOffsetJump > depthJumpLimit)
+            return false;
+
+        float linearDepthJumpLimit = Mathf.Max(0.001f, trustedThinBoxMaxNeighborLinearDepthJumpMeters);
+        if (Mathf.Abs(a.MeanLinearDepth - b.MeanLinearDepth) > linearDepthJumpLimit)
+            return false;
+
+        float worldGapLimit = Mathf.Max(trustedThinBoxGroupCellSizeMeters * 2f, trustedThinBoxMaxNeighborWorldGapMeters);
+        if ((a.MeanWorld - b.MeanWorld).sqrMagnitude > worldGapLimit * worldGapLimit)
+            return false;
+
+        return true;
+    }
+
+    private static float GetSampleWindowNormalOffset(SampleRecord sample)
+    {
+        Vector3 normal = Vector3.Cross(sample.windowAxisU, sample.windowAxisV);
+        if (normal.sqrMagnitude < 1e-8f)
+            return sample.linearDepth;
+
+        return Vector3.Dot(sample.worldPosition - sample.windowCenter, normal.normalized);
+    }
+
+    private bool TryGetTrustedThinBoxCell(SampleRecord sample, float cellSize, out Vector2Int cell)
+    {
+        if (sample.fromPhysicalWindow)
+        {
+            cell = new Vector2Int(
+                Mathf.FloorToInt(sample.windowLocalU / cellSize),
+                Mathf.FloorToInt(sample.windowLocalV / cellSize));
+            return true;
+        }
+
+        cell = new Vector2Int(
+            Mathf.FloorToInt(sample.windowX / 4f),
+            Mathf.FloorToInt(sample.windowY / 4f));
+        return true;
+    }
+
+    private bool TryAddTrustedThinBoxForGroup(Transform displayTransform, Camera cam, List<int> trustedIndices, Color boxColor)
+    {
+        PlaneFitResult plane;
+        List<int> boxIndices;
+        bool fitOk;
+        if (trustedThinBoxUseTrimmedPlaneFit)
+        {
+            fitOk = TryFitTrimmedSamplePlaneFromIndices(
+                trustedIndices,
+                cam,
+                trustedThinBoxPlaneTrimKeepRatio,
+                trustedThinBoxPlaneRefineIterations,
+                out plane,
+                out boxIndices);
+        }
+        else
+        {
+            fitOk = TryFitSamplePlaneFromIndices(trustedIndices, cam, out plane);
+            boxIndices = trustedIndices;
+        }
+
+        if (!fitOk || boxIndices == null)
+            return false;
+
+        if (plane.residualP95 > Mathf.Max(0.001f, trustedThinBoxMaxGroupResidualP95Meters))
+            return false;
+
+        int count = boxIndices.Count;
+        if (count < Mathf.Max(3, minTrustedSamplesPerSurfaceCell * 2))
+            return false;
+
+        float extentResidualLimit = Mathf.Max(
+            trustedThinBoxMaxGroupResidualP95Meters,
+            plane.residualP95 * Mathf.Max(1f, trustedThinBoxExtentInlierResidualMultiplier));
+        float minU = float.PositiveInfinity;
+        float minV = float.PositiveInfinity;
+        float maxU = float.NegativeInfinity;
+        float maxV = float.NegativeInfinity;
+        var normalOffsets = new List<float>(count);
+
+        for (int i = 0; i < count; i++)
+        {
+            SampleRecord sample = _samples[boxIndices[i]];
+            Vector3 delta = sample.worldPosition - plane.center;
+            float residual = Mathf.Abs(Vector3.Dot(delta, plane.normal));
+            if (residual > extentResidualLimit)
+                continue;
+
+            float u = Vector3.Dot(delta, plane.axisU);
+            float v = Vector3.Dot(delta, plane.axisV);
+            float n = Vector3.Dot(delta, plane.normal);
+
+            minU = Mathf.Min(minU, u);
+            minV = Mathf.Min(minV, v);
+            maxU = Mathf.Max(maxU, u);
+            maxV = Mathf.Max(maxV, v);
+            normalOffsets.Add(n);
+        }
+
+        if (normalOffsets.Count < Mathf.Max(3, minTrustedSamplesPerSurfaceCell * 2))
+            return false;
+
+        if (!float.IsFinite(minU) || !float.IsFinite(minV) ||
+            !float.IsFinite(maxU) || !float.IsFinite(maxV))
+        {
+            return false;
+        }
+
+        float rawSpanU = maxU - minU;
+        float rawSpanV = maxV - minV;
+        float maxSpan = Mathf.Max(rawSpanU, rawSpanV);
+        float minSpanForRatio = Mathf.Max(0.005f, Mathf.Min(rawSpanU, rawSpanV));
+        if (maxSpan > Mathf.Max(0.05f, trustedThinBoxMaxSpanMeters))
+            return false;
+        if (maxSpan / minSpanForRatio > Mathf.Max(1f, trustedThinBoxMaxAspectRatio))
+            return false;
+
+        float padding = Mathf.Max(0f, trustedThinBoxPaddingMeters);
+        float minSpan = Mathf.Max(0.01f, trustedThinBoxMinSpanMeters);
+        if (maxU - minU < minSpan)
+        {
+            float centerU = (minU + maxU) * 0.5f;
+            minU = centerU - minSpan * 0.5f;
+            maxU = centerU + minSpan * 0.5f;
+        }
+
+        if (maxV - minV < minSpan)
+        {
+            float centerV = (minV + maxV) * 0.5f;
+            minV = centerV - minSpan * 0.5f;
+            maxV = centerV + minSpan * 0.5f;
+        }
+
+        minU -= padding;
+        minV -= padding;
+        maxU += padding;
+        maxV += padding;
+
+        normalOffsets.Sort();
+        float lowN = QuantileSorted(normalOffsets, 0.05f);
+        float highN = QuantileSorted(normalOffsets, 0.95f);
+        float centerN = (lowN + highN) * 0.5f;
+        float halfThickness = Mathf.Max(
+            Mathf.Max(trustedThinBoxMinThicknessMeters * 0.5f, (highN - lowN) * 0.5f),
+            plane.residualP95);
+        lowN = centerN - halfThickness;
+        highN = centerN + halfThickness;
+
+        Vector3 p000 = OrientedBoxPoint(plane, minU, minV, lowN);
+        Vector3 p100 = OrientedBoxPoint(plane, maxU, minV, lowN);
+        Vector3 p110 = OrientedBoxPoint(plane, maxU, maxV, lowN);
+        Vector3 p010 = OrientedBoxPoint(plane, minU, maxV, lowN);
+        Vector3 p001 = OrientedBoxPoint(plane, minU, minV, highN);
+        Vector3 p101 = OrientedBoxPoint(plane, maxU, minV, highN);
+        Vector3 p111 = OrientedBoxPoint(plane, maxU, maxV, highN);
+        Vector3 p011 = OrientedBoxPoint(plane, minU, maxV, highN);
+
+        float width = Mathf.Max(0.001f, trustedThinBoxLineWidthMeters);
+        Color color = boxColor;
+        AddWorldLineQuad(p000, p100, width, color, cam, displayTransform);
+        AddWorldLineQuad(p100, p110, width, color, cam, displayTransform);
+        AddWorldLineQuad(p110, p010, width, color, cam, displayTransform);
+        AddWorldLineQuad(p010, p000, width, color, cam, displayTransform);
+
+        AddWorldLineQuad(p001, p101, width, color, cam, displayTransform);
+        AddWorldLineQuad(p101, p111, width, color, cam, displayTransform);
+        AddWorldLineQuad(p111, p011, width, color, cam, displayTransform);
+        AddWorldLineQuad(p011, p001, width, color, cam, displayTransform);
+
+        AddWorldLineQuad(p000, p001, width, color, cam, displayTransform);
+        AddWorldLineQuad(p100, p101, width, color, cam, displayTransform);
+        AddWorldLineQuad(p110, p111, width, color, cam, displayTransform);
+        AddWorldLineQuad(p010, p011, width, color, cam, displayTransform);
+        return true;
+    }
+
+    private static Vector3 OrientedBoxPoint(PlaneFitResult plane, float u, float v, float n)
+    {
+        return plane.center + plane.axisU * u + plane.axisV * v + plane.normal * n;
+    }
+
+    private void AddWorldLineQuad(Vector3 worldA, Vector3 worldB, float width, Color color, Camera cam, Transform displayTransform)
+    {
+        Vector3 line = worldB - worldA;
+        if (line.sqrMagnitude < 1e-8f)
+            return;
+
+        Vector3 lineDir = line.normalized;
+        Vector3 mid = (worldA + worldB) * 0.5f;
+        Vector3 toCamera = cam != null ? cam.transform.position - mid : Vector3.up;
+        Vector3 side = Vector3.Cross(lineDir, toCamera.sqrMagnitude > 1e-8f ? toCamera.normalized : Vector3.up);
+        if (side.sqrMagnitude < 1e-8f)
+            side = Vector3.Cross(lineDir, Vector3.up);
+        if (side.sqrMagnitude < 1e-8f)
+            side = Vector3.Cross(lineDir, Vector3.right);
+        if (side.sqrMagnitude < 1e-8f)
+            return;
+
+        Vector3 localA = displayTransform.InverseTransformPoint(worldA);
+        Vector3 localB = displayTransform.InverseTransformPoint(worldB);
+        Vector3 localOffset = displayTransform.InverseTransformDirection(side.normalized * (width * 0.5f));
+
+        int start = _meshVertices.Count;
+        _meshVertices.Add(localA - localOffset);
+        _meshVertices.Add(localA + localOffset);
+        _meshVertices.Add(localB + localOffset);
+        _meshVertices.Add(localB - localOffset);
+
+        _meshColors.Add(color);
+        _meshColors.Add(color);
+        _meshColors.Add(color);
+        _meshColors.Add(color);
+
+        _meshIndices.Add(start);
+        _meshIndices.Add(start + 1);
+        _meshIndices.Add(start + 2);
+        _meshIndices.Add(start);
+        _meshIndices.Add(start + 2);
+        _meshIndices.Add(start + 3);
+    }
+
     private bool TryFitValidSamplePlane(out PlaneFitResult result, out List<int> validIndices)
     {
         result = default;
@@ -923,13 +2405,38 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             }
         }
 
-        int count = validIndices.Count;
+        Camera cam = centerCamera != null ? centerCamera : Camera.main;
+        return TryFitSamplePlaneFromIndices(validIndices, cam, out result);
+    }
+
+    private bool TryFitTrustedSamplePlane(Camera cam, out PlaneFitResult result, out List<int> trustedIndices)
+    {
+        result = default;
+        trustedIndices = new List<int>(_samples.Count);
+
+        for (int i = 0; i < _samples.Count; i++)
+        {
+            if (_samples[i].valid &&
+                _samples[i].status == SampleStatus.TrustedPlane &&
+                IsFinite(_samples[i].worldPosition))
+            {
+                trustedIndices.Add(i);
+            }
+        }
+
+        return TryFitSamplePlaneFromIndices(trustedIndices, cam, out result);
+    }
+
+    private bool TryFitSamplePlaneFromIndices(List<int> indices, Camera cam, out PlaneFitResult result)
+    {
+        result = default;
+        int count = indices != null ? indices.Count : 0;
         if (count < 3)
             return false;
 
         Vector3 center = Vector3.zero;
         for (int i = 0; i < count; i++)
-            center += _samples[validIndices[i]].worldPosition;
+            center += _samples[indices[i]].worldPosition;
         center /= count;
 
         float xx = 0f;
@@ -941,7 +2448,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
         for (int i = 0; i < count; i++)
         {
-            Vector3 d = _samples[validIndices[i]].worldPosition - center;
+            Vector3 d = _samples[indices[i]].worldPosition - center;
             xx += d.x * d.x;
             xy += d.x * d.y;
             xz += d.x * d.z;
@@ -961,7 +2468,6 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (!TrySmallestEigenVectorSymmetric(xx, xy, xz, yy, yz, zz, out Vector3 normal))
             return false;
 
-        Camera cam = centerCamera != null ? centerCamera : Camera.main;
         if (cam != null && Vector3.Dot(normal, cam.transform.position - center) < 0f)
             normal = -normal;
 
@@ -973,7 +2479,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         float inlierLimit = Mathf.Max(0.001f, latticeInlierResidualMeters);
         for (int i = 0; i < count; i++)
         {
-            float residual = Mathf.Abs(Vector3.Dot(_samples[validIndices[i]].worldPosition - center, normal));
+            float residual = Mathf.Abs(Vector3.Dot(_samples[indices[i]].worldPosition - center, normal));
             residuals.Add(residual);
             if (residual <= inlierLimit)
                 inliers++;
@@ -994,6 +2500,86 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         };
 
         return result.valid;
+    }
+
+    private bool TryFitTrimmedSamplePlaneFromIndices(
+        List<int> indices,
+        Camera cam,
+        float keepRatio,
+        int iterations,
+        out PlaneFitResult result,
+        out List<int> inlierIndices)
+    {
+        result = default;
+        inlierIndices = null;
+
+        int count = indices != null ? indices.Count : 0;
+        if (count < 3)
+            return false;
+
+        var sourceIndices = new List<int>(count);
+        for (int i = 0; i < count; i++)
+        {
+            int sampleIndex = indices[i];
+            if (sampleIndex < 0 ||
+                sampleIndex >= _samples.Count ||
+                !_samples[sampleIndex].valid ||
+                !IsFinite(_samples[sampleIndex].worldPosition))
+            {
+                continue;
+            }
+
+            sourceIndices.Add(sampleIndex);
+        }
+
+        if (sourceIndices.Count < 3)
+            return false;
+
+        var workingIndices = new List<int>(sourceIndices);
+        if (!TryFitSamplePlaneFromIndices(workingIndices, cam, out result))
+            return false;
+
+        float clampedKeepRatio = Mathf.Clamp(keepRatio, 0.5f, 1f);
+        int keepCount = Mathf.Clamp(Mathf.CeilToInt(sourceIndices.Count * clampedKeepRatio), 3, sourceIndices.Count);
+        int refineIterations = Mathf.Max(0, iterations);
+        var residuals = new List<IndexResidual>(sourceIndices.Count);
+
+        for (int iteration = 0; iteration < refineIterations; iteration++)
+        {
+            residuals.Clear();
+            for (int i = 0; i < sourceIndices.Count; i++)
+            {
+                int sampleIndex = sourceIndices[i];
+                float residual = Mathf.Abs(Vector3.Dot(_samples[sampleIndex].worldPosition - result.center, result.normal));
+                if (!float.IsFinite(residual))
+                    continue;
+
+                residuals.Add(new IndexResidual
+                {
+                    index = sampleIndex,
+                    residual = residual
+                });
+            }
+
+            if (residuals.Count < 3)
+                return false;
+
+            residuals.Sort((a, b) => a.residual.CompareTo(b.residual));
+
+            int currentKeepCount = Mathf.Min(keepCount, residuals.Count);
+            workingIndices.Clear();
+            for (int i = 0; i < currentKeepCount; i++)
+                workingIndices.Add(residuals[i].index);
+
+            if (workingIndices.Count < 3 ||
+                !TryFitSamplePlaneFromIndices(workingIndices, cam, out result))
+            {
+                return false;
+            }
+        }
+
+        inlierIndices = workingIndices;
+        return result.valid && inlierIndices.Count >= 3;
     }
 
     private bool TryFitPlane(out PlaneFitResult result, Camera cam)
@@ -1257,7 +2843,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private void UpdateSamplingWindowDisplay()
     {
-        if (!showSamplingWindow)
+        if (!EffectiveShowSamplingWindow)
         {
             if (_windowMesh != null)
                 _windowMesh.Clear();
@@ -1357,9 +2943,11 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
             string csvPath = Path.Combine(folder, $"point_burst_{stamp}.csv");
+            string terrainCsvPath = Path.Combine(folder, $"point_burst_{stamp}_terrain_cells.csv");
             string summaryPath = Path.Combine(folder, $"point_burst_{stamp}_summary.json");
 
             File.WriteAllText(csvPath, BuildCsv(), Encoding.UTF8);
+            File.WriteAllText(terrainCsvPath, BuildTerrainCellsCsv(), Encoding.UTF8);
             File.WriteAllText(summaryPath, BuildSummaryJson(), Encoding.UTF8);
 
             if (debugLog)
@@ -1410,6 +2998,37 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         return sb.ToString();
     }
 
+    private string BuildTerrainCellsCsv()
+    {
+        if (!TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> cells, out _))
+            return "cellX,cellY,sampleCount,supportFrames,depthP10,depthMedian,depthP90,thickness,largestDepthGap,depthEdgeFraction,classification,worldX,worldY,worldZ\n";
+
+        var sb = new StringBuilder(256 + cells.Count * 128);
+        sb.AppendLine("cellX,cellY,sampleCount,supportFrames,depthP10,depthMedian,depthP90,thickness,largestDepthGap,depthEdgeFraction,classification,worldX,worldY,worldZ");
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            TerrainCell cell = pair.Value;
+            float edgeFraction = cell.indices.Count > 0 ? cell.depthEdgeSamples / (float)cell.indices.Count : 0f;
+            Append(sb, pair.Key.x).Append(',');
+            Append(sb, pair.Key.y).Append(',');
+            Append(sb, cell.indices.Count).Append(',');
+            Append(sb, cell.supportFrames.Count).Append(',');
+            Append(sb, cell.depthP10).Append(',');
+            Append(sb, cell.depthMedian).Append(',');
+            Append(sb, cell.depthP90).Append(',');
+            Append(sb, cell.thickness).Append(',');
+            Append(sb, cell.largestDepthGap).Append(',');
+            Append(sb, edgeFraction).Append(',');
+            sb.Append(cell.classification).Append(',');
+            Vector3 mean = cell.MeanWorld;
+            Append(sb, mean.x).Append(',');
+            Append(sb, mean.y).Append(',');
+            Append(sb, mean.z).AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
     private string BuildSummaryJson()
     {
         int validCount = 0;
@@ -1422,6 +3041,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                 invalidCount++;
         }
 
+        TerrainPlaneSummary terrainPlaneSummary = default;
+        if (TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> terrainCells, out TerrainCellSummary terrainSummary))
+        {
+            Camera cam = ResolveCenterCamera();
+            TryBuildTerrainPlaneIslands(terrainCells, cam, out _, out terrainPlaneSummary);
+        }
+
         return "{\n" +
                $"  \"burstId\": {_burstId},\n" +
                $"  \"framesCollected\": {_framesCollectedThisBurst},\n" +
@@ -1432,6 +3058,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                $"  \"textureSize\": {CustomEnvironmentDepthRaycaster.TextureSize},\n" +
                $"  \"useCameraCenterHitPhysicalWindow\": {useCameraCenterHitPhysicalWindow.ToString().ToLowerInvariant()},\n" +
                $"  \"physicalWindowSizeMeters\": {physicalWindowSizeMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"effectivePhysicalWindowSizeMeters\": {EffectivePhysicalWindowSizeMeters.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"hasActiveWorldWindow\": {_hasActiveWorldWindow.ToString().ToLowerInvariant()},\n" +
                $"  \"activeWindowCenter\": [{_activeWorldWindow.center.x.ToString(CultureInfo.InvariantCulture)}, {_activeWorldWindow.center.y.ToString(CultureInfo.InvariantCulture)}, {_activeWorldWindow.center.z.ToString(CultureInfo.InvariantCulture)}],\n" +
                $"  \"activeWindowAxisU\": [{_activeWorldWindow.axisU.x.ToString(CultureInfo.InvariantCulture)}, {_activeWorldWindow.axisU.y.ToString(CultureInfo.InvariantCulture)}, {_activeWorldWindow.axisU.z.ToString(CultureInfo.InvariantCulture)}],\n" +
@@ -1443,7 +3070,37 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                $"  \"samplingWindowDistanceMeters\": {samplingWindowDistanceMeters.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"samplingWindowScale\": {samplingWindowScale.ToString(CultureInfo.InvariantCulture)},\n" +
                $"  \"samplesPerFrame\": {samplesPerFrame},\n" +
+               $"  \"effectiveSamplesPerFrame\": {EffectiveSamplesPerFrame},\n" +
+               $"  \"effectiveFramesPerBurst\": {EffectiveFramesPerBurst},\n" +
+               $"  \"effectiveMaxAccumulatedPoints\": {EffectiveMaxAccumulatedPoints},\n" +
                $"  \"stratifiedJitter\": {stratifiedJitter.ToString().ToLowerInvariant()},\n" +
+               $"  \"effectiveStratifiedJitter\": {EffectiveStratifiedJitter.ToString().ToLowerInvariant()},\n" +
+               $"  \"pointCloudTerrainDiagnosticsOnly\": {pointCloudTerrainDiagnosticsOnly.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainDiagnosticsDisplayAggregatedCells\": {terrainDiagnosticsDisplayAggregatedCells.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainCellSizeMeters\": {terrainCellSizeMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainStableMinSamplesPerCell\": {terrainStableMinSamplesPerCell},\n" +
+               $"  \"terrainStableMinSupportFrames\": {terrainStableMinSupportFrames},\n" +
+               $"  \"terrainStableMaxThicknessMeters\": {terrainStableMaxThicknessMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainMultiLayerMinDepthGapMeters\": {terrainMultiLayerMinDepthGapMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainNeighborDepthJumpMeters\": {terrainNeighborDepthJumpMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainDiagnosticsShowPlanarizedPreview\": {terrainDiagnosticsShowPlanarizedPreview.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainDiagnosticsShowPlanarizedMeshPreview\": {terrainDiagnosticsShowPlanarizedMeshPreview.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainDiagnosticsUsePlanarizedCellTiles\": {terrainDiagnosticsUsePlanarizedCellTiles.ToString().ToLowerInvariant()},\n" +
+               $"  \"terrainPlanarizedTileFillRatio\": {terrainPlanarizedTileFillRatio.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneMeshMaxEdgeMeters\": {terrainPlaneMeshMaxEdgeMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneMinCells\": {terrainPlaneMinCells},\n" +
+               $"  \"terrainPlaneMaxResidualP95Meters\": {terrainPlaneMaxResidualP95Meters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneMinInlierRatio\": {terrainPlaneMinInlierRatio.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneMaxProjectionOffsetMeters\": {terrainPlaneMaxProjectionOffsetMeters.ToString(CultureInfo.InvariantCulture)},\n" +
+               $"  \"terrainPlaneIslandCount\": {terrainPlaneSummary.islandCount},\n" +
+               $"  \"terrainAcceptedPlaneIslandCount\": {terrainPlaneSummary.acceptedIslandCount},\n" +
+               $"  \"terrainRejectedPlaneIslandCount\": {terrainPlaneSummary.rejectedIslandCount},\n" +
+               $"  \"terrainAcceptedPlaneCellCount\": {terrainPlaneSummary.acceptedCellCount},\n" +
+               $"  \"terrainCellCount\": {terrainSummary.cellCount},\n" +
+               $"  \"terrainStableSingleLayerCellCount\": {terrainSummary.stableSingleLayerCount},\n" +
+               $"  \"terrainBoundaryDepthJumpCellCount\": {terrainSummary.boundaryDepthJumpCount},\n" +
+               $"  \"terrainMultiLayerCellCount\": {terrainSummary.multiLayerCount},\n" +
+               $"  \"terrainUnstableCellCount\": {terrainSummary.unstableCount},\n" +
                $"  \"randomizeBurstSeed\": {randomizeBurstSeed.ToString().ToLowerInvariant()},\n" +
                $"  \"eye\": \"{eye}\",\n" +
                $"  \"displayMode\": \"{displayMode}\",\n" +
