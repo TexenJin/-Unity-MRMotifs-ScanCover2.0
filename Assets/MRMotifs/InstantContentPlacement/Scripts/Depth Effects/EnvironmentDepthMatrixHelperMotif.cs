@@ -20,6 +20,8 @@ namespace MRMotifs.InstantContentPlacement.DepthEffects
         {
             s_displayMatrices.Clear();
             Shader.GetGlobalMatrixArray(s_reprojectionMatricesID, s_displayMatrices);
+            if (s_displayMatrices.Count < s_envDepthDisplayInverseMatrices.Length)
+                return;
 
             for (var i = 0; i < s_envDepthDisplayInverseMatrices.Length; i++)
             {

@@ -2,6 +2,7 @@
 
 using UnityEngine;
 using Meta.XR;
+using Meta.XR.EnvironmentDepth;
 using Meta.XR.Samples;
 
 namespace MRMotifs.InstantContentPlacement.Placement
@@ -69,6 +70,16 @@ namespace MRMotifs.InstantContentPlacement.Placement
 
         private void UpdateGroundingShadow()
         {
+            if (m_raycastManager == null ||
+                !m_raycastManager.enabled ||
+                !m_raycastManager.gameObject.activeInHierarchy ||
+                !EnvironmentDepthManager.IsSupported)
+            {
+                if (m_groundingShadowRenderer != null)
+                    m_groundingShadowRenderer.enabled = false;
+                return;
+            }
+
             var downwardRay = new Ray(m_trackedObject.position, Vector3.down);
             if (!m_raycastManager.Raycast(downwardRay, out var shadowHitInfo)) return;
 

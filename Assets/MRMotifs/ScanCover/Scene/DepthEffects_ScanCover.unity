@@ -8839,6 +8839,7 @@ MonoBehaviour:
   depthGridPointCloud: {fileID: 920710000000000003}
   depthGridSnapshot64: {fileID: 920710000000000004}
   seedConfidencePatch: {fileID: 920710000000000106}
+  depthPointBurstWindow: {fileID: 920710000000000120}
   depthProbeRows: []
   autoStartOnEnable: 1
   clearOnAutoStart: 1
@@ -8864,9 +8865,12 @@ MonoBehaviour:
   ignoreInputWhileCaptureBurstRunning: 1
   usePureDepthGridSnapshot64Route: 0
   clearPureSnapshotOnClearAll: 1
-  useSeedConfidencePatchRoute: 1
+  useDepthPointBurstWindowRoute: 1
+  clearDepthPointBurstOnClearAll: 1
+  disableLegacyRoutesWhenPointBurstRoute: 1
+  useSeedConfidencePatchRoute: 0
   clearSeedConfidenceOnClearAll: 1
-  disableLegacyRoutesWhenSeedRoute: 1
+  disableLegacyRoutesWhenSeedRoute: 0
   useCaptureBurst: 0
   captureBurstRefreshCount: 1
   captureBurstTimeoutSeconds: 0.6
@@ -8927,6 +8931,8 @@ GameObject:
   - component: {fileID: 920710000000000004}
   - component: {fileID: 920710000000000099}
   - component: {fileID: 920710000000000106}
+  - component: {fileID: 920710000000000120}
+  - component: {fileID: 920710000000000130}
   m_Layer: 0
   m_Name: DepthGridPointCloud_Right
   m_TagString: Untagged
@@ -9223,57 +9229,6 @@ MonoBehaviour:
   useWorldRuleRenet: 0
   worldRuleCoverage: 1
   debugLog: 0
---- !u!114 &920710000000000106
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 0c7ad9035f3d4a6b90e6d22e6aaf4107, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  depthRaycaster: {fileID: 0}
-  environmentDepthManager: {fileID: 1177598827}
-  sessionController: {fileID: 910400000000000003}
-  displayParent: {fileID: 0}
-  centerCamera: {fileID: 2140226224}
-  collectOnFreeze: 0
-  collectContinuously: 0
-  eye: 1
-  samplingCenterMode: 1
-  roiPixels: 24
-  sampleStridePixels: 2
-  requiredFrames: 8
-  maxStoredFrames: 20
-  depthPixelVFlip: 1
-  neighborFill: 1
-  neighborRadiusPixels: 1
-  minLinearDepthMeters: 0.05
-  maxLinearDepthMeters: 8
-  baseResidualMeters: 0.01
-  residualPerMeter: 0.02
-  candidateFrames: 3
-  trustedFrames: 8
-  stableFrames: 15
-  maxNormalChangeDegrees: 15
-  maxCenterDriftMeters: 0.03
-  minValidRatio: 0.55
-  minInlierRatio: 0.7
-  showDiagnostics: 1
-  diagnosticScaleMeters: 0.025
-  candidateColor: {r: 0, g: 1, b: 1, a: 1}
-  trustedColor: {r: 0.1, g: 1, b: 0.25, a: 1}
-  stableColor: {r: 1, g: 1, b: 1, a: 1}
-  failedColor: {r: 1, g: 0.25, b: 0.9, a: 1}
-  debugLog: 1
-  saveCaptureToDesktop: 1
-  desktopFolderName: ScanCoverSeedConfidence
-  exportFolderOverride:
-  saveSummaryJson: 1
-  saveFrameCsv: 1
 --- !u!114 &920710000000000099
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9386,6 +9341,127 @@ MonoBehaviour:
   motionFreezeAngleDegrees: 2.5
   poseStableDelaySeconds: 0.2
   debugLog: 0
+--- !u!114 &920710000000000106
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0c7ad9035f3d4a6b90e6d22e6aaf4107, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  depthRaycaster: {fileID: 0}
+  environmentDepthManager: {fileID: 1177598827}
+  sessionController: {fileID: 910400000000000003}
+  displayParent: {fileID: 0}
+  centerCamera: {fileID: 2140226224}
+  collectOnFreeze: 0
+  collectContinuously: 0
+  eye: 1
+  samplingCenterMode: 1
+  roiPixels: 24
+  sampleStridePixels: 2
+  requiredFrames: 8
+  maxStoredFrames: 20
+  depthPixelVFlip: 1
+  neighborFill: 1
+  neighborRadiusPixels: 1
+  minLinearDepthMeters: 0.05
+  maxLinearDepthMeters: 8
+  baseResidualMeters: 0.01
+  residualPerMeter: 0.02
+  candidateFrames: 3
+  trustedFrames: 8
+  stableFrames: 15
+  maxNormalChangeDegrees: 15
+  maxCenterDriftMeters: 0.03
+  minValidRatio: 0.55
+  minInlierRatio: 0.7
+  showDiagnostics: 1
+  diagnosticScaleMeters: 0.025
+  candidateColor: {r: 0, g: 1, b: 1, a: 1}
+  trustedColor: {r: 0.1, g: 1, b: 0.25, a: 1}
+  stableColor: {r: 1, g: 1, b: 1, a: 1}
+  failedColor: {r: 1, g: 0.25, b: 0.9, a: 1}
+  debugLog: 1
+  saveCaptureToDesktop: 1
+  desktopFolderName: ScanCoverSeedConfidence
+  exportFolderOverride: 
+  saveSummaryJson: 1
+  saveFrameCsv: 1
+--- !u!114 &920710000000000120
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3e689863c1ad4612804e4c0266adb8e7, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  depthRaycaster: {fileID: 0}
+  environmentDepthManager: {fileID: 1177598827}
+  displayParent: {fileID: 0}
+  centerCamera: {fileID: 2140226224}
+  useWorldSpaceDisplayRoot: 1
+  showSamplingWindow: 1
+  samplingWindowDistanceMeters: 0.75
+  samplingWindowScale: 1
+  physicalWindowCenterSearchRadiusPixels: 10
+  minLinearDepthMeters: 0.35
+  neighborRadiusPixels: 1
+  collectContinuously: 0
+  saveWhenBurstCompletes: 1
+  logSamplingWindowDiagnostics: 1
+  pointCloudTerrainDiagnosticsOnly: 1
+  terrainDiagnosticsDisplayAggregatedCells: 1
+  terrainStableMinSamplesPerCell: 4
+  terrainStableMinSupportFrames: 3
+  terrainStableMaxThicknessMeters: 0.025
+  terrainDiagnosticsShowRawOverlay: 0
+  terrainDiagnosticsShowPlanarizedPreview: 1
+  terrainDiagnosticsShowPlanarizedMeshPreview: 1
+  terrainDiagnosticsShowTriangleWirePreview: 1
+  terrainTriangleWireIncludeBoundaryCells: 1
+  terrainTriangleWireConnectLooseEdges: 1
+  terrainTriangleWireStabilizeRepresentatives: 1
+  displayMode: 3
+  showPoints: 1
+  recordInvalidSamples: 0
+  renderAsBillboardQuads: 1
+--- !u!114 &920710000000000130
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4f845869e45842a6a6ff66bb73a9860a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  targetWindow: {fileID: 920710000000000120}
+  depthRaycaster: {fileID: 0}
+  environmentDepthManager: {fileID: 1177598827}
+  centerCamera: {fileID: 2140226224}
+  logOnStart: 1
+  continuousLogging: 1
+  logEverySeconds: 1.25
+  includeDepthTextureScan: 1
+  includeRawEnvironmentDepthProbe: 1
+  includeHierarchyScan: 1
+  rawDepthProbeShader: {fileID: 7200000, guid: 7b2e48fd68c44d36919dfcdbad722459, type: 3}
+  sampleRadiusPixels: 12
+  expectedMinWindowDistanceMeters: 0.35
+  expectedNominalWindowDistanceMeters: 0.75
+  maxDepthMeters: 8
+  nearStuckDistanceMeters: 0.18
 --- !u!1 &921511106590967570
 GameObject:
   m_ObjectHideFlags: 0

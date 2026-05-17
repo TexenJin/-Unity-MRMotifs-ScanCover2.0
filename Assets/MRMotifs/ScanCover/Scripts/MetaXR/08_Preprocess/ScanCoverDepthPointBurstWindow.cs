@@ -45,10 +45,14 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private EnvironmentDepthManager environmentDepthManager;
     [SerializeField] private Transform displayParent;
     [SerializeField] private Camera centerCamera;
+    [SerializeField] private bool useWorldSpaceDisplayRoot = true;
 
     [Header("Sampling Window")]
     [SerializeField] private Eye eye = Eye.Right;
     [SerializeField] private bool useCameraCenterHitPhysicalWindow = true;
+    [SerializeField] private bool useDepthCenterTexCoordForPhysicalWindow = true;
+    [SerializeField, Min(0.05f)] private float physicalWindowMinCenterDistanceMeters = 0.75f;
+    [SerializeField, Min(0)] private int physicalWindowCenterSearchRadiusPixels = 10;
     [SerializeField, Min(0.005f)] private float physicalWindowSizeMeters = 0.08f;
     [SerializeField, Min(2)] private int windowPixels = 24;
     [SerializeField, Min(1)] private int samplesPerFrame = 256;
@@ -58,7 +62,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private bool depthPixelVFlip = true;
     [SerializeField] private bool neighborFill = true;
     [SerializeField, Min(0)] private int neighborRadiusPixels = 1;
-    [SerializeField, Min(0f)] private float minLinearDepthMeters = 0.05f;
+    [SerializeField, Min(0f)] private float minLinearDepthMeters = 0.35f;
     [SerializeField, Min(0.1f)] private float maxLinearDepthMeters = 8f;
 
     [Header("Sampling Window Display")]
@@ -74,6 +78,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private bool collectContinuously = false;
     [SerializeField] private bool saveWhenBurstCompletes = true;
     [SerializeField] private string desktopFolderName = "ScanCoverDepthPointBurst";
+    [SerializeField] private bool logSamplingWindowDiagnostics = true;
 
     [Header("Point Cloud Terrain Diagnostics")]
     [SerializeField] private bool pointCloudTerrainDiagnosticsOnly = true;
@@ -144,7 +149,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(0.001f)] private float pointVisualSizeMeters = 0.008f;
     [SerializeField, Min(0f)] private float surfaceOffsetTowardCameraMeters = 0.004f;
     [SerializeField] private Color pointColor = new Color(1f, 1f, 1f, 0.95f);
-    [SerializeField] private bool recordInvalidSamples = true;
+    [SerializeField] private bool recordInvalidSamples = false;
     [SerializeField] private Color invalidPointColor = new Color(0.45f, 0.45f, 0.45f, 0.45f);
     [SerializeField] private bool colorizeValidPointsByPlaneResidual = true;
     [SerializeField] private Color candidatePointColor = new Color(1f, 0.85f, 0f, 0.95f);
@@ -229,6 +234,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     private GameObject _windowDisplayObject;
     private Mesh _windowMesh;
     private Material _windowMaterial;
+    private static Transform s_worldSpaceDisplayRoot;
     private bool _burstActive;
     private int _framesCollectedThisBurst;
     private int _burstId;
@@ -236,6 +242,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     private System.Random _random = new System.Random();
     private bool _hasActiveWorldWindow;
     private WorldSamplingWindow _activeWorldWindow;
+    private float _nextSamplingWindowDiagnosticTime;
+    private float _nextTerrainCellSummaryTime;
 
     private struct SampleRecord
     {
@@ -528,17 +536,27 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         Vector3 centerWorld;
         Vector2Int centerTexCoord;
         float linearDepth;
-        Ray centerRay = new Ray(cam.transform.position, cam.transform.forward);
-        var centerHit = depthRaycaster.Raycast02(centerRay, maxLinearDepthMeters, eye, true);
-        if (centerHit.status == DepthRaycastResult.Success && IsFinite(centerHit.position))
+        if (useDepthCenterTexCoordForPhysicalWindow)
         {
-            centerWorld = centerHit.position;
-            centerTexCoord = depthRaycaster.WorldPosToNonNormalizedTextureCoords02(centerWorld);
+            Vector3 forwardPoint = cam.transform.position + cam.transform.forward * Mathf.Max(0.25f, samplingWindowDistanceMeters);
+            centerTexCoord = depthRaycaster.WorldPosToNonNormalizedTextureCoords02(forwardPoint);
+            if (!TryFindPhysicalWindowCenterDepth(centerTexCoord, cam, out centerWorld, out centerTexCoord))
+                centerWorld = depthRaycaster.WorldPosAtDepthTexCoord02(centerTexCoord);
         }
         else
         {
-            centerTexCoord = new Vector2Int(textureSize / 2, textureSize / 2);
-            centerWorld = depthRaycaster.WorldPosAtDepthTexCoord02(centerTexCoord);
+            Ray centerRay = new Ray(cam.transform.position, cam.transform.forward);
+            var centerHit = depthRaycaster.Raycast02(centerRay, maxLinearDepthMeters, eye, true);
+            if (centerHit.status == DepthRaycastResult.Success && IsFinite(centerHit.position))
+            {
+                centerWorld = centerHit.position;
+                centerTexCoord = depthRaycaster.WorldPosToNonNormalizedTextureCoords02(centerWorld);
+            }
+            else
+            {
+                centerTexCoord = new Vector2Int(textureSize / 2, textureSize / 2);
+                centerWorld = depthRaycaster.WorldPosAtDepthTexCoord02(centerTexCoord);
+            }
         }
 
         if (!IsFinite(centerWorld))
@@ -574,6 +592,55 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             centerLinearDepth = linearDepth
         };
         return true;
+    }
+
+    private bool TryFindPhysicalWindowCenterDepth(
+        Vector2Int preferredTexCoord,
+        Camera cam,
+        out Vector3 centerWorld,
+        out Vector2Int centerTexCoord)
+    {
+        centerWorld = default;
+        centerTexCoord = preferredTexCoord;
+
+        int textureSize = CustomEnvironmentDepthRaycaster.TextureSize;
+        int radius = Mathf.Max(0, physicalWindowCenterSearchRadiusPixels);
+        float minDistance = Mathf.Max(minLinearDepthMeters, physicalWindowMinCenterDistanceMeters);
+        float maxDistance = Mathf.Max(minDistance, maxLinearDepthMeters);
+        Vector3 camPos = cam != null ? cam.transform.position : Vector3.zero;
+
+        float bestScore = float.PositiveInfinity;
+        for (int dy = -radius; dy <= radius; dy++)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                int x = preferredTexCoord.x + dx;
+                int y = preferredTexCoord.y + dy;
+                if (x < 0 || y < 0 || x >= textureSize || y >= textureSize)
+                    continue;
+
+                Vector2Int tc = new Vector2Int(x, y);
+                Vector3 world = depthRaycaster.WorldPosAtDepthTexCoord02(tc);
+                if (!IsFinite(world))
+                    continue;
+
+                float distance = Vector3.Distance(camPos, world);
+                if (distance < minDistance || distance > maxDistance)
+                    continue;
+
+                float texelScore = dx * dx + dy * dy;
+                float distanceScore = Mathf.Abs(distance - Mathf.Max(minDistance, samplingWindowDistanceMeters)) * 0.1f;
+                float score = texelScore + distanceScore;
+                if (score >= bestScore)
+                    continue;
+
+                bestScore = score;
+                centerWorld = world;
+                centerTexCoord = tc;
+            }
+        }
+
+        return bestScore < float.PositiveInfinity;
     }
 
     private void CollectPhysicalWindowStratifiedFrame(WorldSamplingWindow window, int targetSamples, int globalFrame)
@@ -1413,8 +1480,19 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private bool TryAddTerrainCellDiagnostics(Transform displayTransform, Camera cam)
     {
-        if (!TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> cells, out _))
+        if (!TryBuildTerrainCells(out Dictionary<Vector2Int, TerrainCell> cells, out TerrainCellSummary summary))
             return false;
+
+        if (logSamplingWindowDiagnostics && Time.unscaledTime >= _nextTerrainCellSummaryTime)
+        {
+            _nextTerrainCellSummaryTime = Time.unscaledTime + 1f;
+            Debug.Log(
+                $"[ScanCoverDepthPointBurstWindow] FL cells total={summary.cellCount} " +
+                $"stable={summary.stableSingleLayerCount} boundary={summary.boundaryDepthJumpCount} " +
+                $"multi={summary.multiLayerCount} unstable={summary.unstableCount} " +
+                $"samples={_samples.Count} cellSize={terrainCellSizeMeters:F3}m " +
+                $"stableThickness={terrainStableMaxThicknessMeters:F3}m");
+        }
 
         Vector3 camRight = cam != null ? cam.transform.right : Vector3.right;
         Vector3 camUp = cam != null ? cam.transform.up : Vector3.up;
@@ -3382,37 +3460,38 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (useCameraCenterHitPhysicalWindow)
         {
             WorldSamplingWindow window;
+            string windowSource;
             if (_hasActiveWorldWindow)
             {
                 window = _activeWorldWindow;
+                windowSource = "active";
             }
             else if (!TryBuildWorldSamplingWindow(out window))
             {
                 _windowMesh.Clear();
+                LogSamplingWindowDiagnostic("physical-window build failed", cam, default, false);
                 return;
             }
+            else
+            {
+                windowSource = "live";
+            }
 
-            Transform parent = displayParent != null ? displayParent : transform;
+            Transform parent = ResolveDisplayParent();
             if (_windowDisplayObject.transform.parent != parent)
                 _windowDisplayObject.transform.SetParent(parent, false);
 
-            _windowDisplayObject.transform.localPosition = Vector3.zero;
-            _windowDisplayObject.transform.localRotation = Quaternion.identity;
+            _windowDisplayObject.transform.position = window.center;
+            _windowDisplayObject.transform.rotation = Quaternion.LookRotation(window.normal, window.axisV);
             _windowDisplayObject.transform.localScale = Vector3.one;
 
             float half = window.sizeMeters * 0.5f;
-            Vector3 aWorld = window.center - window.axisU * half - window.axisV * half;
-            Vector3 bWorld = window.center - window.axisU * half + window.axisV * half;
-            Vector3 cWorld = window.center + window.axisU * half + window.axisV * half;
-            Vector3 dWorld = window.center + window.axisU * half - window.axisV * half;
-
-            Transform displayTransform = _windowDisplayObject.transform;
             var windowVertices = new List<Vector3>(4)
             {
-                displayTransform.InverseTransformPoint(aWorld),
-                displayTransform.InverseTransformPoint(bWorld),
-                displayTransform.InverseTransformPoint(cWorld),
-                displayTransform.InverseTransformPoint(dWorld)
+                new Vector3(-half, -half, 0f),
+                new Vector3(-half, half, 0f),
+                new Vector3(half, half, 0f),
+                new Vector3(half, -half, 0f)
             };
             var windowColors = new List<Color>(4) { samplingWindowColor, samplingWindowColor, samplingWindowColor, samplingWindowColor };
             var windowIndices = new List<int>(8) { 0, 1, 1, 2, 2, 3, 3, 0 };
@@ -3422,6 +3501,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             _windowMesh.SetColors(windowColors);
             _windowMesh.SetIndices(windowIndices, MeshTopology.Lines, 0, true);
             _windowMesh.RecalculateBounds();
+            LogSamplingWindowDiagnostic($"physical-window {windowSource}", cam, window, true);
             return;
         }
 
@@ -3452,6 +3532,27 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         _windowMesh.SetColors(colors);
         _windowMesh.SetIndices(indices, MeshTopology.Lines, 0, true);
         _windowMesh.RecalculateBounds();
+        LogSamplingWindowDiagnostic("camera-local fallback", cam, default, false);
+    }
+
+    private void LogSamplingWindowDiagnostic(string mode, Camera cam, WorldSamplingWindow window, bool hasWindow)
+    {
+        if (!logSamplingWindowDiagnostics || Time.unscaledTime < _nextSamplingWindowDiagnosticTime)
+            return;
+
+        _nextSamplingWindowDiagnosticTime = Time.unscaledTime + 1f;
+        Vector3 camPos = cam != null ? cam.transform.position : Vector3.zero;
+        Vector3 objectPos = _windowDisplayObject != null ? _windowDisplayObject.transform.position : Vector3.zero;
+        float objectDistance = cam != null ? Vector3.Distance(camPos, objectPos) : -1f;
+        float windowDistance = hasWindow && cam != null ? Vector3.Distance(camPos, window.center) : -1f;
+        string parentName = _windowDisplayObject != null && _windowDisplayObject.transform.parent != null
+            ? _windowDisplayObject.transform.parent.name
+            : "null";
+
+        Debug.Log(
+            $"[ScanCoverDepthPointBurstWindow] SamplingWindow mode={mode} parent={parentName} " +
+            $"objectDistance={objectDistance:F3}m windowDistance={windowDistance:F3}m " +
+            $"objectPos={objectPos.ToString("F3")} windowCenter={(hasWindow ? window.center.ToString("F3") : "n/a")}");
     }
 
     private void SaveCaptureToDesktop()
@@ -3651,9 +3752,9 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
     private void EnsureDisplayObject()
     {
+        Transform parent = ResolveDisplayParent();
         if (_displayObject == null)
         {
-            Transform parent = displayParent != null ? displayParent : transform;
             _displayObject = new GameObject("Depth Point Burst Window Samples");
             _displayObject.transform.SetParent(parent, false);
             _displayObject.transform.localPosition = Vector3.zero;
@@ -3661,6 +3762,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             _displayObject.transform.localScale = Vector3.one;
             _displayObject.AddComponent<MeshFilter>();
             _displayObject.AddComponent<MeshRenderer>();
+        }
+        else if (_displayObject.transform.parent != parent)
+        {
+            _displayObject.transform.SetParent(parent, false);
+            _displayObject.transform.localPosition = Vector3.zero;
+            _displayObject.transform.localRotation = Quaternion.identity;
+            _displayObject.transform.localScale = Vector3.one;
         }
 
         MeshFilter filter = _displayObject.GetComponent<MeshFilter>();
@@ -3692,7 +3800,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     {
         Camera cam = ResolveCenterCamera();
         Transform parent = useCameraCenterHitPhysicalWindow
-            ? (displayParent != null ? displayParent : transform)
+            ? ResolveDisplayParent()
             : (cam != null ? cam.transform : transform);
 
         if (_windowDisplayObject == null)
@@ -3704,6 +3812,13 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             _windowDisplayObject.transform.localScale = Vector3.one;
             _windowDisplayObject.AddComponent<MeshFilter>();
             _windowDisplayObject.AddComponent<MeshRenderer>();
+        }
+        else if (_windowDisplayObject.transform.parent != parent)
+        {
+            _windowDisplayObject.transform.SetParent(parent, false);
+            _windowDisplayObject.transform.localPosition = Vector3.zero;
+            _windowDisplayObject.transform.localRotation = Quaternion.identity;
+            _windowDisplayObject.transform.localScale = Vector3.one;
         }
 
         MeshFilter filter = _windowDisplayObject.GetComponent<MeshFilter>();
@@ -3737,16 +3852,67 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             depthRaycaster = GetComponentInChildren<CustomEnvironmentDepthRaycaster>(true);
         if (depthRaycaster == null)
             depthRaycaster = FindAnyObjectByType<CustomEnvironmentDepthRaycaster>(FindObjectsInactive.Include);
+        if (depthRaycaster == null)
+            depthRaycaster = CreateRuntimeRaycaster();
 
         if (environmentDepthManager == null && depthRaycaster != null)
             environmentDepthManager = depthRaycaster.depthManager;
         if (environmentDepthManager == null)
             environmentDepthManager = FindAnyObjectByType<EnvironmentDepthManager>(FindObjectsInactive.Include);
+        if (depthRaycaster != null)
+        {
+            if (environmentDepthManager != null && depthRaycaster.depthManager == null)
+                depthRaycaster.depthManager = environmentDepthManager;
+            if (!depthRaycaster.gameObject.activeSelf)
+                depthRaycaster.gameObject.SetActive(true);
+            if (!depthRaycaster.enabled)
+                depthRaycaster.enabled = true;
+        }
 
         if (centerCamera == null)
             centerCamera = Camera.main;
         if (displayParent == null)
-            displayParent = transform;
+            displayParent = ResolveDisplayParent();
+    }
+
+    private CustomEnvironmentDepthRaycaster CreateRuntimeRaycaster()
+    {
+        if (environmentDepthManager == null)
+            environmentDepthManager = FindAnyObjectByType<EnvironmentDepthManager>(FindObjectsInactive.Include);
+
+        GameObject raycasterObject = new GameObject("ScanCover Runtime Depth Raycaster");
+        raycasterObject.SetActive(false);
+        raycasterObject.transform.SetParent(transform, false);
+        CustomEnvironmentDepthRaycaster raycaster = raycasterObject.AddComponent<CustomEnvironmentDepthRaycaster>();
+        raycaster.depthManager = environmentDepthManager;
+        raycasterObject.SetActive(true);
+        return raycaster;
+    }
+
+    private Transform ResolveDisplayParent()
+    {
+        if (!useWorldSpaceDisplayRoot)
+            return displayParent != null ? displayParent : transform;
+
+        if (s_worldSpaceDisplayRoot == null)
+        {
+            GameObject existing = GameObject.Find("[ScanCover] Depth Burst World Display");
+            if (existing != null)
+            {
+                s_worldSpaceDisplayRoot = existing.transform;
+            }
+            else
+            {
+                GameObject root = new GameObject("[ScanCover] Depth Burst World Display");
+                root.transform.SetParent(null, false);
+                root.transform.position = Vector3.zero;
+                root.transform.rotation = Quaternion.identity;
+                root.transform.localScale = Vector3.one;
+                s_worldSpaceDisplayRoot = root.transform;
+            }
+        }
+
+        return s_worldSpaceDisplayRoot;
     }
 
     private Camera ResolveCenterCamera()
