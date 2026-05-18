@@ -8865,13 +8865,13 @@ MonoBehaviour:
   ignoreInputWhileCaptureBurstRunning: 1
   usePureDepthGridSnapshot64Route: 0
   clearPureSnapshotOnClearAll: 1
-  useDepthPointBurstWindowRoute: 1
+  useDepthPointBurstWindowRoute: 0
   clearDepthPointBurstOnClearAll: 1
-  disableLegacyRoutesWhenPointBurstRoute: 1
+  disableLegacyRoutesWhenPointBurstRoute: 0
   useSeedConfidencePatchRoute: 0
   clearSeedConfidenceOnClearAll: 1
   disableLegacyRoutesWhenSeedRoute: 0
-  useCaptureBurst: 0
+  useCaptureBurst: 1
   captureBurstRefreshCount: 1
   captureBurstTimeoutSeconds: 0.6
   captureSurfaceSnapshotOnManualCapture: 0
@@ -8887,7 +8887,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1961903629088574029}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: a7a9d303a1224c04b97c7d7a1ca17b32, type: 3}
   m_Name: 
@@ -8962,7 +8962,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 9ca0fc213af84db28e0bd5469b31718d, type: 3}
   m_Name: 
@@ -9072,7 +9072,7 @@ MonoBehaviour:
   rectilinearRennetMaxEdgeSpanMultiplier: 3
   showGridTriangulation: 0
   rectifyGridLinesAfterDepthWrap: 0
-  gridLineRequireContinuousSurface: 1
+  gridLineRequireContinuousSurface: 0
   rectifiedGridLineMaxSpanMultiplier: 2.35
   rectifiedGridLineMinValidRatio: 0.18
   gridLineMinNeighborNormalDot: 0.2
@@ -9088,7 +9088,7 @@ MonoBehaviour:
   focusedGridExpandMeters: 0.06
   showGridInteriorMesh: 0
   gridInteriorDisplayMode: 0
-  showSurfaceMesh: 1
+  showSurfaceMesh: 0
   keepSurfaceMeshAvailableWhenHidden: 0
   useIndexConnectivity: 1
   surfaceMaterialOverride: {fileID: 2100000, guid: 88525e94ba60b634e8281cd32171859e, type: 2}
@@ -9236,7 +9236,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7d2db57f5f9640d3b2b3419a47c8d6d2, type: 3}
   m_Name: 
@@ -9399,7 +9399,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 3e689863c1ad4612804e4c0266adb8e7, type: 3}
   m_Name: 
@@ -9444,7 +9444,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 4f845869e45842a6a6ff66bb73a9860a, type: 3}
   m_Name: 
