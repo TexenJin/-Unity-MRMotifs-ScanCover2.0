@@ -98,9 +98,11 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(0.005f)] private float terrainCellSizeMeters = 0.02f;
     [SerializeField, Min(1)] private int terrainStableMinSamplesPerCell = 4;
     [SerializeField, Min(1)] private int terrainStableMinSupportFrames = 3;
-    [SerializeField, Min(0.001f)] private float terrainStableMaxThicknessMeters = 0.025f;
+    [SerializeField, Min(0.001f)] private float terrainStableMaxThicknessMeters = 0.045f;
     [SerializeField, Min(0.001f)] private float terrainMultiLayerMinDepthGapMeters = 0.045f;
-    [SerializeField, Min(0.001f)] private float terrainNeighborDepthJumpMeters = 0.055f;
+    [SerializeField, Min(0.001f)] private float terrainNeighborDepthJumpMeters = 0.075f;
+    [SerializeField] private bool terrainFillSmallStableHoles = true;
+    [SerializeField, Range(3, 4)] private int terrainFillSmallHoleMinStableNeighbors = 3;
     [SerializeField, Range(0.05f, 0.45f)] private float terrainMultiLayerMinFraction = 0.2f;
     [SerializeField, Range(0f, 1f)] private float terrainBoundaryMinDepthEdgeFraction = 0.25f;
     [SerializeField, Min(0.001f)] private float terrainRepresentativePointSizeMeters = 0.012f;
@@ -336,8 +338,11 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         public float largestDepthGap;
         public int splitIndex;
         public TerrainCellClassification classification;
+        public bool holeFilled;
+        public Vector3 holeFilledWorld;
 
         public Vector3 MeanWorld => indices.Count > 0 ? worldSum / indices.Count : Vector3.zero;
+        public Vector3 RepresentativeWorld => holeFilled ? holeFilledWorld : MeanWorld;
     }
 
     private struct TerrainCellSummary
@@ -1519,7 +1524,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                 continue;
 
             TerrainCell cell = pair.Value;
-            if (cell.indices.Count == 0)
+            if (cell.indices.Count == 0 && !cell.holeFilled)
                 continue;
 
             if (cell.classification == TerrainCellClassification.MultiLayer &&
@@ -1531,14 +1536,21 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
                 continue;
             }
 
-            int representativeIndex = FindSampleClosestToDepth(cell, cell.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
-            if (representativeIndex < 0)
-                continue;
-
             Vector3 representativeWorld = triangleWireRepresentatives != null &&
                                           triangleWireRepresentatives.TryGetValue(pair.Key, out Vector3 stabilizedRepresentative)
                 ? stabilizedRepresentative
-                : _samples[representativeIndex].worldPosition;
+                : cell.holeFilled
+                    ? cell.holeFilledWorld
+                    : Vector3.zero;
+
+            if (!cell.holeFilled && (triangleWireRepresentatives == null || !triangleWireRepresentatives.ContainsKey(pair.Key)))
+            {
+                int representativeIndex = FindSampleClosestToDepth(cell, cell.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
+                if (representativeIndex < 0)
+                    continue;
+
+                representativeWorld = _samples[representativeIndex].worldPosition;
+            }
 
             AddTerrainRepresentative(
                 representativeWorld,
@@ -1562,11 +1574,18 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
         {
             TerrainCell cell = pair.Value;
-            if (cell == null || cell.indices.Count == 0)
+            if (cell == null || (cell.indices.Count == 0 && !cell.holeFilled))
                 continue;
 
             if (!IsTerrainTriangleWireCell(cell))
                 continue;
+
+            if (cell.holeFilled)
+            {
+                if (IsFinite(cell.holeFilledWorld))
+                    representativeByCell[pair.Key] = cell.holeFilledWorld;
+                continue;
+            }
 
             int representativeIndex = FindSampleClosestToDepth(cell, cell.depthMedian, float.NegativeInfinity, float.PositiveInfinity);
             if (representativeIndex < 0 || representativeIndex >= _samples.Count)
@@ -2144,6 +2163,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         }
 
         MarkNeighborDepthJumpCells(cells);
+        FillSmallStableTerrainHoles(cells);
 
         foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
         {
@@ -2166,6 +2186,102 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         }
 
         return cells.Count > 0;
+    }
+
+    private void FillSmallStableTerrainHoles(Dictionary<Vector2Int, TerrainCell> cells)
+    {
+        if (!terrainFillSmallStableHoles || cells == null || cells.Count == 0)
+            return;
+
+        var candidates = new HashSet<Vector2Int>();
+        Vector2Int[] cardinalNeighbors =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(-1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(0, -1)
+        };
+
+        foreach (KeyValuePair<Vector2Int, TerrainCell> pair in cells)
+        {
+            for (int i = 0; i < cardinalNeighbors.Length; i++)
+                candidates.Add(pair.Key + cardinalNeighbors[i]);
+
+            if (pair.Value.classification == TerrainCellClassification.Unstable)
+                candidates.Add(pair.Key);
+        }
+
+        var fills = new List<KeyValuePair<Vector2Int, TerrainCell>>();
+        foreach (Vector2Int key in candidates)
+        {
+            if (cells.TryGetValue(key, out TerrainCell existing) &&
+                existing.classification != TerrainCellClassification.Unstable)
+            {
+                continue;
+            }
+
+            if (!TryCreateStableHoleFillCell(key, cells, cardinalNeighbors, out TerrainCell fillCell))
+                continue;
+
+            fills.Add(new KeyValuePair<Vector2Int, TerrainCell>(key, fillCell));
+        }
+
+        for (int i = 0; i < fills.Count; i++)
+            cells[fills[i].Key] = fills[i].Value;
+    }
+
+    private bool TryCreateStableHoleFillCell(
+        Vector2Int key,
+        Dictionary<Vector2Int, TerrainCell> cells,
+        Vector2Int[] cardinalNeighbors,
+        out TerrainCell fillCell)
+    {
+        fillCell = null;
+        int minNeighbors = Mathf.Clamp(terrainFillSmallHoleMinStableNeighbors, 3, 4);
+        float depthTolerance = Mathf.Min(
+            Mathf.Max(0.001f, terrainNeighborDepthJumpMeters * 0.5f),
+            Mathf.Max(0.001f, terrainMultiLayerMinDepthGapMeters * 0.9f));
+
+        int neighborCount = 0;
+        float depthSum = 0f;
+        float minDepth = float.PositiveInfinity;
+        float maxDepth = float.NegativeInfinity;
+        Vector3 worldSum = Vector3.zero;
+
+        for (int i = 0; i < cardinalNeighbors.Length; i++)
+        {
+            if (!cells.TryGetValue(key + cardinalNeighbors[i], out TerrainCell neighbor) ||
+                neighbor == null ||
+                neighbor.classification != TerrainCellClassification.StableSingleLayer ||
+                !IsFinite(neighbor.RepresentativeWorld))
+            {
+                continue;
+            }
+
+            neighborCount++;
+            depthSum += neighbor.depthMedian;
+            minDepth = Mathf.Min(minDepth, neighbor.depthMedian);
+            maxDepth = Mathf.Max(maxDepth, neighbor.depthMedian);
+            worldSum += neighbor.RepresentativeWorld;
+        }
+
+        if (neighborCount < minNeighbors || maxDepth - minDepth > depthTolerance)
+            return false;
+
+        float depth = depthSum / neighborCount;
+        fillCell = new TerrainCell
+        {
+            classification = TerrainCellClassification.StableSingleLayer,
+            depthP10 = depth,
+            depthMedian = depth,
+            depthP90 = depth,
+            thickness = 0f,
+            largestDepthGap = 0f,
+            splitIndex = -1,
+            holeFilled = true,
+            holeFilledWorld = worldSum / neighborCount
+        };
+        return true;
     }
 
     private void MarkNeighborDepthJumpCells(Dictionary<Vector2Int, TerrainCell> cells)

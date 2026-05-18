@@ -9422,7 +9422,10 @@ MonoBehaviour:
   terrainDiagnosticsDisplayAggregatedCells: 1
   terrainStableMinSamplesPerCell: 4
   terrainStableMinSupportFrames: 3
-  terrainStableMaxThicknessMeters: 0.025
+  terrainStableMaxThicknessMeters: 0.045
+  terrainNeighborDepthJumpMeters: 0.075
+  terrainFillSmallStableHoles: 1
+  terrainFillSmallHoleMinStableNeighbors: 3
   terrainDiagnosticsShowRawOverlay: 0
   terrainDiagnosticsShowPlanarizedPreview: 1
   terrainDiagnosticsShowPlanarizedMeshPreview: 1
