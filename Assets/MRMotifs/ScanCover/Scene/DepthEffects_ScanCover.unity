@@ -9246,7 +9246,7 @@ MonoBehaviour:
   followTarget: {fileID: 0}
   rawDepthPreviewShader: {fileID: 4800000, guid: 43ac0191cb2d41849b7f920dd2157de3, type: 3}
   sourceEye: 1
-  rawDepthDisplayScale: 0.5555556
+  rawDepthDisplayScale: 0.25
   previewAlpha: 1
   showWindow: 1
   localPosition: {x: 0, y: -0.22, z: 0.72}

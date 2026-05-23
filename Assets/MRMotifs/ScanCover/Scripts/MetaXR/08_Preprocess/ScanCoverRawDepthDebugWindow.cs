@@ -237,7 +237,7 @@ public sealed class ScanCoverRawDepthDebugWindow : MonoBehaviour
         float avgRaw = positive > 0 ? (float)(sumRaw / positive) : 0f;
         float centerLinear = RawDepthToLinearMeters(centerRaw, zBufferParams);
         float avgLinear = positiveLinear > 0 ? (float)(sumLinear / positiveLinear) : 0f;
-        float centerMapped = centerLinear > 0f ? Mathf.Sqrt(Mathf.Clamp01(centerLinear * Mathf.Max(0.001f, rawDepthDisplayScale))) : 0f;
+        float centerMapped = centerLinear > 0f ? Mathf.Pow(Mathf.Clamp01(centerLinear * Mathf.Max(0.001f, rawDepthDisplayScale)), 1.25f) : 0f;
 
         Debug.Log(
             $"[ScanCoverRawDepthDebugWindow] stats eye={sourceEye} {textureSize}x{textureSize} " +

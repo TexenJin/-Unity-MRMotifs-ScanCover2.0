@@ -71,7 +71,7 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
 
                 float linearMeters = (_EnvironmentDepthZBufferParams.x / (raw + _EnvironmentDepthZBufferParams.y));
                 float value = saturate(linearMeters * max(0.001, _RawDepthDisplayScale));
-                value = sqrt(value);
+                value = pow(value, 1.25);
 
                 float3 color;
                 if (value < 0.25)
@@ -90,7 +90,11 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
                 {
                     color = lerp(float3(1.0, 0.9, 0.0), float3(1.0, 0.05, 0.0), (value - 0.75) / 0.25);
                 }
-                return float4(saturate(color * 1.2), 1.0);
+                float bandPhase = abs(frac(linearMeters / 0.5) - 0.5) * 2.0;
+                float bandLine = 1.0 - smoothstep(0.0, 0.08, bandPhase);
+                color = lerp(color, color * 0.28, bandLine);
+
+                return float4(saturate(color), 1.0);
             }
             ENDHLSL
         }
