@@ -8928,6 +8928,8 @@ GameObject:
   m_Component:
   - component: {fileID: 920710000000000002}
   - component: {fileID: 920710000000000003}
+  - component: {fileID: 920710000000000140}
+  - component: {fileID: 920710000000000141}
   - component: {fileID: 920710000000000004}
   - component: {fileID: 920710000000000099}
   - component: {fileID: 920710000000000106}
@@ -9086,15 +9088,15 @@ MonoBehaviour:
   syncGridLinesToFocusedCandidate: 0
   focusedGridPlaneToleranceMeters: 0.08
   focusedGridExpandMeters: 0.06
-  showGridInteriorMesh: 0
-  gridInteriorDisplayMode: 0
-  showSurfaceMesh: 0
-  keepSurfaceMeshAvailableWhenHidden: 0
+  showGridInteriorMesh: 1
+  gridInteriorDisplayMode: 1
+  showSurfaceMesh: 1
+  keepSurfaceMeshAvailableWhenHidden: 1
   useIndexConnectivity: 1
   surfaceMaterialOverride: {fileID: 2100000, guid: 88525e94ba60b634e8281cd32171859e, type: 2}
   maxEdgeLengthMeters: 0.2
   minNeighborNormalDot: 0.35
-  surfaceColor: {r: 0.18, g: 0.95, b: 0.98, a: 1}
+  surfaceColor: {r: 1, g: 1, b: 1, a: 1}
   surfaceDoubleSided: 1
   showHeightSliceContour: 0
   heightSliceUseFrozenScreenCenterHeight: 1
@@ -9190,6 +9192,67 @@ MonoBehaviour:
   logBounds: 0
   dumpRosterOnceOnPlay: 0
   dumpOnlyValidCellsInRoster: 0
+--- !u!114 &920710000000000140
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0f3df9a1c1049f7a1c6a77f56c8c201, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sourceGrid: {fileID: 920710000000000003}
+  sourceCamera: {fileID: 2140226224}
+  linearDepthShader: {fileID: 4800000, guid: b2c5b6ef15e9447ca4ee3f3de0d45f15, type: 3}
+  previewShader: {fileID: 4800000, guid: 7c6a61b3f07f4f9db9d518fe42069d44, type: 3}
+  previewLineShader: {fileID: 4800000, guid: e21cb34ef41042d384e9ff5f38a77e90, type: 3}
+  viewSourceMode: 0
+  useSourceFacingBoundsCamera: 1
+  useDiagnosticBoundsCamera: 0
+  boundsCameraPadding: 1.08
+  textureWidth: 64
+  textureHeight: 64
+  nearClipMeters: 0.03
+  farClipMeters: 8
+  captureEveryFrame: 1
+  captureFrameInterval: 5
+  requestReadbackStats: 1
+  statsLogFrameInterval: 30
+  logCameraAndBoundsDiagnostics: 1
+  debugLog: 1
+  showPatchPreview: 1
+  previewLocalPosition: {x: 0.34, y: -0.22, z: 0.72}
+  previewSizeMeters: 0.22
+  previewDepthScaleMeters: 1.2
+  previewAlpha: 0.82
+  showProjectedMeshOutline: 1
+  projectedMeshOutlineColor: {r: 1, g: 1, b: 1, a: 0.95}
+--- !u!114 &920710000000000141
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f20d9e1ec4b445c3b711765eaf328210, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sourceCamera: {fileID: 2140226224}
+  followTarget: {fileID: 0}
+  rawDepthPreviewShader: {fileID: 4800000, guid: 43ac0191cb2d41849b7f920dd2157de3, type: 3}
+  sourceEye: 1
+  rawDepthDisplayScale: 0.5555556
+  previewAlpha: 1
+  showWindow: 1
+  localPosition: {x: 0, y: -0.22, z: 0.72}
+  sizeMeters: 0.22
+  faceSourceCamera: 1
+  debugLog: 1
 --- !u!114 &920710000000000004
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9408,7 +9471,12 @@ MonoBehaviour:
   environmentDepthManager: {fileID: 1177598827}
   displayParent: {fileID: 0}
   centerCamera: {fileID: 2140226224}
+  blGridSource: {fileID: 920710000000000003}
   useWorldSpaceDisplayRoot: 1
+  sampleSourceMode: 1
+  blSingleColumnSpacingMeters: 0.04
+  blSingleColumnMaxSamples: 400
+  blSingleColumnUseHeadsetWindow: 1
   showSamplingWindow: 1
   samplingWindowDistanceMeters: 0.75
   samplingWindowScale: 1
@@ -9426,7 +9494,7 @@ MonoBehaviour:
   terrainNeighborDepthJumpMeters: 0.075
   terrainFillSmallStableHoles: 1
   terrainFillSmallHoleMinStableNeighbors: 3
-  terrainDiagnosticsShowRawOverlay: 0
+  terrainDiagnosticsShowRawOverlay: 1
   terrainDiagnosticsShowPlanarizedPreview: 1
   terrainDiagnosticsShowPlanarizedMeshPreview: 1
   terrainDiagnosticsShowTriangleWirePreview: 1
