@@ -20,6 +20,12 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         TrustedThinBox = 3
     }
 
+    private enum SampleSourceMode
+    {
+        DepthTexture = 0,
+        BLSingleColumn = 1
+    }
+
     private enum SampleStatus
     {
         Valid,
@@ -45,7 +51,14 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField] private EnvironmentDepthManager environmentDepthManager;
     [SerializeField] private Transform displayParent;
     [SerializeField] private Camera centerCamera;
+    [SerializeField] private ScanCoverDepthGridPointCloud blGridSource;
     [SerializeField] private bool useWorldSpaceDisplayRoot = true;
+
+    [Header("BL Mesh Sampling")]
+    [SerializeField] private SampleSourceMode sampleSourceMode = SampleSourceMode.DepthTexture;
+    [SerializeField, Min(0.005f)] private float blSingleColumnSpacingMeters = 0.04f;
+    [SerializeField, Min(1)] private int blSingleColumnMaxSamples = 96;
+    [SerializeField] private bool blSingleColumnUseHeadsetWindow = true;
 
     [Header("Sampling Window")]
     [SerializeField] private Eye eye = Eye.Right;
@@ -290,6 +303,18 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         public float linearDepth;
     }
 
+    private struct BlSurfaceHit
+    {
+        public bool direct;
+        public bool valid;
+        public Vector3 point;
+        public Vector3 normal;
+        public float linearDepth;
+        public float edgeDistanceMeters;
+        public float localNormalMinDot;
+        public float windowEdgeFraction;
+    }
+
     private struct PlaneFitResult
     {
         public bool valid;
@@ -390,6 +415,12 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     {
         UpdateSamplingWindowDisplay();
 
+        if (UseBlSingleColumnSampling)
+        {
+            CollectBlSingleColumnFrame();
+            return;
+        }
+
         if (!_burstActive && !collectContinuously)
             return;
 
@@ -460,9 +491,18 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     private bool EffectiveShowSamplingWindow => pointCloudTerrainDiagnosticsOnly ? terrainDiagnosticsShowSamplingWindow : showSamplingWindow;
     private bool EffectivePlanePointClassification => !pointCloudTerrainDiagnosticsOnly || terrainDiagnosticsKeepPointClassification;
     private bool UseDepthImagePatchTerrainSampling => pointCloudTerrainDiagnosticsOnly && terrainDiagnosticsUseDepthImagePatchSampling;
+    private bool UseBlSingleColumnSampling => sampleSourceMode == SampleSourceMode.BLSingleColumn;
+    private int EffectiveTerrainStableMinSamplesPerCell => UseBlSingleColumnSampling ? 1 : Mathf.Max(1, terrainStableMinSamplesPerCell);
+    private int EffectiveTerrainStableMinSupportFrames => UseBlSingleColumnSampling ? 1 : Mathf.Max(1, terrainStableMinSupportFrames);
 
     private void CollectOneFrame()
     {
+        if (UseBlSingleColumnSampling)
+        {
+            CollectBlSingleColumnFrame();
+            return;
+        }
+
         if (depthRaycaster == null)
             ResolveRefs();
         if (depthRaycaster == null || !depthRaycaster.IsDepthTextureAvailable)
@@ -520,6 +560,448 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
         ClassifyValidSamplesForDisplay();
         RebuildPointDisplay();
+    }
+
+    private void CollectBlSingleColumnFrame()
+    {
+        if (blGridSource == null)
+            ResolveRefs();
+        if (blGridSource == null || !blGridSource.TryGetPreviewSurfaceData(out Mesh blMesh, out Transform blSurfaceTransform))
+        {
+            ClearMesh();
+            return;
+        }
+
+        if (!TryBuildHeadsetSamplingWindow(out WorldSamplingWindow window))
+        {
+            ClearMesh();
+            return;
+        }
+
+        _samples.Clear();
+        int globalFrame = _totalFramesCollected++;
+        float half = Mathf.Max(0.0025f, window.sizeMeters * 0.5f);
+        float spacing = Mathf.Max(0.005f, blSingleColumnSpacingMeters);
+        int maxSamples = Mathf.Max(1, blSingleColumnMaxSamples);
+        Camera cam = ResolveCenterCamera();
+        Vector3 camPos = cam != null ? cam.transform.position : window.center - window.normal * Mathf.Max(0.05f, samplingWindowDistanceMeters);
+        int naturalSamplesPerAxis = Mathf.Max(1, Mathf.FloorToInt(window.sizeMeters / spacing) + 1);
+        int samplesPerAxis = naturalSamplesPerAxis;
+        if (samplesPerAxis * samplesPerAxis > maxSamples)
+            samplesPerAxis = Mathf.Max(1, Mathf.FloorToInt(Mathf.Sqrt(maxSamples)));
+
+        float startU = samplesPerAxis > 1 ? -spacing * (samplesPerAxis - 1) * 0.5f : 0f;
+        float startV = startU;
+        int emitted = 0;
+
+        for (int y = 0; y < samplesPerAxis; y++)
+        {
+            float targetV = Mathf.Clamp(startV + y * spacing, -half, half);
+            for (int x = 0; x < samplesPerAxis; x++)
+            {
+                if (emitted >= maxSamples)
+                    break;
+
+                float targetU = Mathf.Clamp(startU + x * spacing, -half, half);
+                Vector3 aimPoint = window.center + window.axisU * targetU + window.axisV * targetV;
+                Vector3 rayDirection = aimPoint - camPos;
+                if (!IsFinite(rayDirection) || rayDirection.sqrMagnitude < 1e-8f)
+                    continue;
+                rayDirection.Normalize();
+
+                bool directMeshHit = TryRaycastBlSurfaceMesh(
+                    blMesh,
+                    blSurfaceTransform,
+                    camPos,
+                    rayDirection,
+                    maxLinearDepthMeters,
+                    out BlSurfaceHit hit);
+                if (!directMeshHit &&
+                    !TryFindNearestBlSurfacePoint(blMesh, blSurfaceTransform, aimPoint, half * 1.5f, camPos, out hit))
+                {
+                    continue;
+                }
+
+                float localU = targetU;
+                float localV = targetV;
+                hit.windowEdgeFraction = half > 1e-6f
+                    ? Mathf.Clamp01(Mathf.Max(Mathf.Abs(localU), Mathf.Abs(localV)) / half)
+                    : 0f;
+                SampleStatus blStatus = ClassifyBlSurfaceHit(hit);
+
+                _samples.Add(new SampleRecord
+                {
+                    burstId = _burstId,
+                    burstFrame = 0,
+                    globalFrame = globalFrame,
+                    sampleIndexInFrame = _samples.Count,
+                    textureX = x,
+                    textureY = y,
+                    windowX = Mathf.RoundToInt(localU / spacing),
+                    windowY = Mathf.RoundToInt(localV / spacing),
+                    linearDepth = hit.linearDepth,
+                    worldPosition = hit.point,
+                    windowLocalU = localU,
+                    windowLocalV = localV,
+                    windowCenter = window.center,
+                    windowAxisU = window.axisU,
+                    windowAxisV = window.axisV,
+                    windowSizeMeters = window.sizeMeters,
+                    fromPhysicalWindow = true,
+                    valid = true,
+                    status = blStatus
+                });
+                emitted++;
+            }
+        }
+
+        if (_samples.Count == 0)
+        {
+            ClearMesh();
+            return;
+        }
+
+        if (!UseBlSingleColumnSampling)
+            ClassifyValidSamplesForDisplay();
+        RebuildPointDisplay();
+    }
+
+    private bool TryRaycastBlSurfaceMesh(
+        Mesh mesh,
+        Transform meshTransform,
+        Vector3 rayOrigin,
+        Vector3 rayDirection,
+        float maxDistance,
+        out BlSurfaceHit hit)
+    {
+        hit = default;
+        if (mesh == null || meshTransform == null || !IsFinite(rayOrigin) || !IsFinite(rayDirection) || rayDirection.sqrMagnitude < 1e-8f)
+            return false;
+
+        Vector3[] vertices = mesh.vertices;
+        int[] triangles = mesh.triangles;
+        Vector3[] normals = mesh.normals;
+        if (vertices == null || triangles == null || vertices.Length == 0 || triangles.Length < 3)
+            return false;
+
+        float bestDistance = Mathf.Max(0.001f, maxDistance);
+        bool found = false;
+        Vector3 bestPoint = default;
+        Vector3 bestNormal = default;
+        float bestEdgeDistance = 0f;
+        float bestLocalNormalMinDot = 1f;
+
+        for (int i = 0; i < triangles.Length - 2; i += 3)
+        {
+            int ia = triangles[i];
+            int ib = triangles[i + 1];
+            int ic = triangles[i + 2];
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= vertices.Length || ib >= vertices.Length || ic >= vertices.Length)
+                continue;
+
+            Vector3 a = meshTransform.TransformPoint(vertices[ia]);
+            Vector3 b = meshTransform.TransformPoint(vertices[ib]);
+            Vector3 c = meshTransform.TransformPoint(vertices[ic]);
+            if (!RayTriangle(rayOrigin, rayDirection, a, b, c, out float distance) || distance <= 0.001f || distance >= bestDistance)
+                continue;
+
+            found = true;
+            bestDistance = distance;
+            bestPoint = rayOrigin + rayDirection * distance;
+            bestNormal = ResolveTriangleWorldNormal(meshTransform, normals, ia, ib, ic, a, b, c, rayDirection);
+            bestEdgeDistance = DistanceToTriangleEdge(bestPoint, a, b, c);
+            bestLocalNormalMinDot = ResolveTriangleLocalNormalMinDot(meshTransform, normals, ia, ib, ic, bestNormal);
+        }
+
+        if (!found)
+            return false;
+
+        hit = new BlSurfaceHit
+        {
+            direct = true,
+            valid = true,
+            point = bestPoint,
+            normal = bestNormal,
+            linearDepth = Mathf.Max(0.001f, bestDistance),
+            edgeDistanceMeters = bestEdgeDistance,
+            localNormalMinDot = bestLocalNormalMinDot
+        };
+        return true;
+    }
+
+    private bool TryFindNearestBlSurfacePoint(
+        Mesh mesh,
+        Transform meshTransform,
+        Vector3 targetPoint,
+        float maxDistance,
+        Vector3 cameraPosition,
+        out BlSurfaceHit hit)
+    {
+        hit = default;
+        if (mesh == null || meshTransform == null || !IsFinite(targetPoint))
+            return false;
+
+        Vector3[] vertices = mesh.vertices;
+        int[] triangles = mesh.triangles;
+        Vector3[] normals = mesh.normals;
+        if (vertices == null || triangles == null || vertices.Length == 0 || triangles.Length < 3)
+            return false;
+
+        float limit = Mathf.Max(0.005f, maxDistance);
+        float bestSqrDistance = limit * limit;
+        bool found = false;
+        Vector3 bestPoint = default;
+        Vector3 bestNormal = default;
+        float bestEdgeDistance = 0f;
+        float bestLocalNormalMinDot = 1f;
+
+        for (int i = 0; i < triangles.Length - 2; i += 3)
+        {
+            int ia = triangles[i];
+            int ib = triangles[i + 1];
+            int ic = triangles[i + 2];
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= vertices.Length || ib >= vertices.Length || ic >= vertices.Length)
+                continue;
+
+            Vector3 a = meshTransform.TransformPoint(vertices[ia]);
+            Vector3 b = meshTransform.TransformPoint(vertices[ib]);
+            Vector3 c = meshTransform.TransformPoint(vertices[ic]);
+            Vector3 candidate = ClosestPointOnTriangle(targetPoint, a, b, c);
+            float sqrDistance = (candidate - targetPoint).sqrMagnitude;
+            if (sqrDistance >= bestSqrDistance)
+                continue;
+
+            found = true;
+            bestSqrDistance = sqrDistance;
+            bestPoint = candidate;
+            Vector3 rayDirection = candidate - cameraPosition;
+            bestNormal = ResolveTriangleWorldNormal(meshTransform, normals, ia, ib, ic, a, b, c, rayDirection.sqrMagnitude > 1e-8f ? rayDirection.normalized : Vector3.forward);
+            bestEdgeDistance = DistanceToTriangleEdge(candidate, a, b, c);
+            bestLocalNormalMinDot = ResolveTriangleLocalNormalMinDot(meshTransform, normals, ia, ib, ic, bestNormal);
+        }
+
+        if (!found)
+            return false;
+
+        hit = new BlSurfaceHit
+        {
+            direct = false,
+            valid = true,
+            point = bestPoint,
+            normal = bestNormal,
+            linearDepth = Mathf.Max(0.001f, Vector3.Distance(cameraPosition, bestPoint)),
+            edgeDistanceMeters = bestEdgeDistance,
+            localNormalMinDot = bestLocalNormalMinDot
+        };
+        return true;
+    }
+
+    private SampleStatus ClassifyBlSurfaceHit(BlSurfaceHit hit)
+    {
+        if (!hit.valid || !IsFinite(hit.point))
+            return SampleStatus.InvalidDepth;
+
+        float normalDot = Mathf.Clamp(hit.localNormalMinDot, -1f, 1f);
+
+        if (!hit.direct)
+        {
+            if (normalDot < 0.82f)
+                return SampleStatus.EdgeEvidence;
+            return SampleStatus.CandidatePlane;
+        }
+
+        if (normalDot < 0.65f)
+            return SampleStatus.EdgeEvidence;
+
+        if (normalDot < 0.84f || hit.windowEdgeFraction > 0.92f)
+            return SampleStatus.CandidatePlane;
+
+        return SampleStatus.TrustedPlane;
+    }
+
+    private static float DistanceToTriangleEdge(Vector3 point, Vector3 a, Vector3 b, Vector3 c)
+    {
+        float ab = DistanceToSegment(point, a, b);
+        float bc = DistanceToSegment(point, b, c);
+        float ca = DistanceToSegment(point, c, a);
+        return Mathf.Min(ab, Mathf.Min(bc, ca));
+    }
+
+    private static float DistanceToSegment(Vector3 point, Vector3 a, Vector3 b)
+    {
+        Vector3 ab = b - a;
+        float denom = ab.sqrMagnitude;
+        if (denom < 1e-8f)
+            return Vector3.Distance(point, a);
+
+        float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / denom);
+        return Vector3.Distance(point, a + ab * t);
+    }
+
+    private static bool RayTriangle(Vector3 origin, Vector3 direction, Vector3 a, Vector3 b, Vector3 c, out float distance)
+    {
+        distance = 0f;
+        Vector3 edge1 = b - a;
+        Vector3 edge2 = c - a;
+        Vector3 h = Vector3.Cross(direction, edge2);
+        float det = Vector3.Dot(edge1, h);
+        if (Mathf.Abs(det) < 1e-7f)
+            return false;
+
+        float invDet = 1f / det;
+        Vector3 s = origin - a;
+        float u = invDet * Vector3.Dot(s, h);
+        if (u < 0f || u > 1f)
+            return false;
+
+        Vector3 q = Vector3.Cross(s, edge1);
+        float v = invDet * Vector3.Dot(direction, q);
+        if (v < 0f || u + v > 1f)
+            return false;
+
+        distance = invDet * Vector3.Dot(edge2, q);
+        return distance > 0f;
+    }
+
+    private static Vector3 ClosestPointOnTriangle(Vector3 point, Vector3 a, Vector3 b, Vector3 c)
+    {
+        Vector3 ab = b - a;
+        Vector3 ac = c - a;
+        Vector3 ap = point - a;
+        float d1 = Vector3.Dot(ab, ap);
+        float d2 = Vector3.Dot(ac, ap);
+        if (d1 <= 0f && d2 <= 0f)
+            return a;
+
+        Vector3 bp = point - b;
+        float d3 = Vector3.Dot(ab, bp);
+        float d4 = Vector3.Dot(ac, bp);
+        if (d3 >= 0f && d4 <= d3)
+            return b;
+
+        float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0f && d1 >= 0f && d3 <= 0f)
+        {
+            float v = d1 / (d1 - d3);
+            return a + ab * v;
+        }
+
+        Vector3 cp = point - c;
+        float d5 = Vector3.Dot(ab, cp);
+        float d6 = Vector3.Dot(ac, cp);
+        if (d6 >= 0f && d5 <= d6)
+            return c;
+
+        float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0f && d2 >= 0f && d6 <= 0f)
+        {
+            float w = d2 / (d2 - d6);
+            return a + ac * w;
+        }
+
+        float va = d3 * d6 - d5 * d4;
+        if (va <= 0f && (d4 - d3) >= 0f && (d5 - d6) >= 0f)
+        {
+            float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            return b + (c - b) * w;
+        }
+
+        float denom = 1f / (va + vb + vc);
+        float vInside = vb * denom;
+        float wInside = vc * denom;
+        return a + ab * vInside + ac * wInside;
+    }
+
+    private static float ResolveTriangleLocalNormalMinDot(
+        Transform meshTransform,
+        Vector3[] normals,
+        int ia,
+        int ib,
+        int ic,
+        Vector3 faceNormal)
+    {
+        if (meshTransform == null || normals == null || normals.Length <= ia || normals.Length <= ib || normals.Length <= ic || faceNormal.sqrMagnitude < 1e-8f)
+            return 1f;
+
+        Vector3 n0 = meshTransform.TransformDirection(normals[ia]);
+        Vector3 n1 = meshTransform.TransformDirection(normals[ib]);
+        Vector3 n2 = meshTransform.TransformDirection(normals[ic]);
+        if (n0.sqrMagnitude < 1e-8f || n1.sqrMagnitude < 1e-8f || n2.sqrMagnitude < 1e-8f)
+            return 1f;
+
+        n0.Normalize();
+        n1.Normalize();
+        n2.Normalize();
+        faceNormal.Normalize();
+        return Mathf.Min(
+            Vector3.Dot(faceNormal, n0),
+            Mathf.Min(Vector3.Dot(faceNormal, n1), Vector3.Dot(faceNormal, n2)));
+    }
+
+    private static Vector3 ResolveTriangleWorldNormal(
+        Transform meshTransform,
+        Vector3[] normals,
+        int ia,
+        int ib,
+        int ic,
+        Vector3 a,
+        Vector3 b,
+        Vector3 c,
+        Vector3 rayDirection)
+    {
+        Vector3 normal = Vector3.zero;
+        if (normals != null && normals.Length > ia && normals.Length > ib && normals.Length > ic)
+            normal = meshTransform.TransformDirection(normals[ia] + normals[ib] + normals[ic]);
+
+        if (normal.sqrMagnitude < 1e-8f)
+            normal = Vector3.Cross(b - a, c - a);
+        if (normal.sqrMagnitude < 1e-8f)
+            normal = -rayDirection;
+
+        normal.Normalize();
+        if (Vector3.Dot(normal, rayDirection) > 0f)
+            normal = -normal;
+        return normal;
+    }
+
+    private bool TryBuildHeadsetSamplingWindow(out WorldSamplingWindow window)
+    {
+        window = default;
+        Camera cam = ResolveCenterCamera();
+        if (cam == null)
+            return false;
+
+        Vector3 axisU = cam.transform.right;
+        Vector3 axisV = cam.transform.up;
+        Vector3 normal = cam.transform.forward;
+        if (!IsFinite(axisU) || axisU.sqrMagnitude < 1e-6f)
+            axisU = Vector3.right;
+        if (!IsFinite(axisV) || axisV.sqrMagnitude < 1e-6f)
+            axisV = Vector3.up;
+        if (!IsFinite(normal) || normal.sqrMagnitude < 1e-6f)
+            normal = Vector3.forward;
+
+        axisU.Normalize();
+        axisV = Vector3.ProjectOnPlane(axisV, axisU);
+        if (axisV.sqrMagnitude < 1e-6f)
+            axisV = Vector3.up;
+        axisV.Normalize();
+        normal.Normalize();
+
+        float distance = Mathf.Max(0.05f, samplingWindowDistanceMeters);
+        window = new WorldSamplingWindow
+        {
+            valid = true,
+            center = cam.transform.position + normal * distance,
+            axisU = axisU,
+            axisV = axisV,
+            normal = normal,
+            sizeMeters = Mathf.Max(0.005f, EffectivePhysicalWindowSizeMeters * Mathf.Max(0.1f, samplingWindowScale)),
+            centerTextureX = -1,
+            centerTextureY = -1,
+            centerLinearDepth = distance
+        };
+        return true;
     }
 
     private bool TryBuildWorldSamplingWindow(out WorldSamplingWindow window)
@@ -2431,8 +2913,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
         // A neighbor depth jump is useful boundary evidence, but a thin, repeatedly observed cell can
         // still be a valid member of one of the two adjacent planes.
-        return cell.indices.Count >= Mathf.Max(1, terrainStableMinSamplesPerCell) &&
-               cell.supportFrames.Count >= Mathf.Max(1, terrainStableMinSupportFrames) &&
+        return cell.indices.Count >= EffectiveTerrainStableMinSamplesPerCell &&
+               cell.supportFrames.Count >= EffectiveTerrainStableMinSupportFrames &&
                cell.thickness <= Mathf.Max(0.001f, terrainStableMaxThicknessMeters);
     }
 
@@ -2459,8 +2941,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     private bool IsThinSupportedTerrainCell(TerrainCell cell)
     {
         return cell != null &&
-               cell.indices.Count >= Mathf.Max(1, terrainStableMinSamplesPerCell) &&
-               cell.supportFrames.Count >= Mathf.Max(1, terrainStableMinSupportFrames) &&
+               cell.indices.Count >= EffectiveTerrainStableMinSamplesPerCell &&
+               cell.supportFrames.Count >= EffectiveTerrainStableMinSupportFrames &&
                cell.thickness <= Mathf.Max(0.001f, terrainStableMaxThicknessMeters);
     }
 
@@ -2560,8 +3042,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             }
         }
 
-        if (count < Mathf.Max(1, terrainStableMinSamplesPerCell) ||
-            cell.supportFrames.Count < Mathf.Max(1, terrainStableMinSupportFrames))
+        if (count < EffectiveTerrainStableMinSamplesPerCell ||
+            cell.supportFrames.Count < EffectiveTerrainStableMinSupportFrames)
         {
             cell.classification = TerrainCellClassification.Unstable;
             return;
@@ -3573,6 +4055,27 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         if (_windowDisplayObject == null || _windowMesh == null)
             return;
 
+        if (UseBlSingleColumnSampling)
+        {
+            if (!TryBuildHeadsetSamplingWindow(out WorldSamplingWindow headsetWindow))
+            {
+                _windowMesh.Clear();
+                return;
+            }
+
+            if (_windowDisplayObject.transform.parent != cam.transform)
+                _windowDisplayObject.transform.SetParent(cam.transform, false);
+
+            float blWindowDistance = Mathf.Max(0.05f, samplingWindowDistanceMeters);
+            _windowDisplayObject.transform.localPosition = Vector3.forward * blWindowDistance;
+            _windowDisplayObject.transform.localRotation = Quaternion.identity;
+            _windowDisplayObject.transform.localScale = Vector3.one;
+
+            DrawSamplingWindowMesh(headsetWindow.sizeMeters);
+            LogSamplingWindowDiagnostic("bl-headset-window", cam, headsetWindow, true);
+            return;
+        }
+
         if (useCameraCenterHitPhysicalWindow)
         {
             WorldSamplingWindow window;
@@ -3601,22 +4104,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
             _windowDisplayObject.transform.rotation = Quaternion.LookRotation(window.normal, window.axisV);
             _windowDisplayObject.transform.localScale = Vector3.one;
 
-            float half = window.sizeMeters * 0.5f;
-            var windowVertices = new List<Vector3>(4)
-            {
-                new Vector3(-half, -half, 0f),
-                new Vector3(-half, half, 0f),
-                new Vector3(half, half, 0f),
-                new Vector3(half, -half, 0f)
-            };
-            var windowColors = new List<Color>(4) { samplingWindowColor, samplingWindowColor, samplingWindowColor, samplingWindowColor };
-            var windowIndices = new List<int>(8) { 0, 1, 1, 2, 2, 3, 3, 0 };
-
-            _windowMesh.Clear();
-            _windowMesh.SetVertices(windowVertices);
-            _windowMesh.SetColors(windowColors);
-            _windowMesh.SetIndices(windowIndices, MeshTopology.Lines, 0, true);
-            _windowMesh.RecalculateBounds();
+            DrawSamplingWindowMesh(window.sizeMeters);
             LogSamplingWindowDiagnostic($"physical-window {windowSource}", cam, window, true);
             return;
         }
@@ -3649,6 +4137,26 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
         _windowMesh.SetIndices(indices, MeshTopology.Lines, 0, true);
         _windowMesh.RecalculateBounds();
         LogSamplingWindowDiagnostic("camera-local fallback", cam, default, false);
+    }
+
+    private void DrawSamplingWindowMesh(float sizeMeters)
+    {
+        float half = Mathf.Max(0.0025f, sizeMeters * 0.5f);
+        var vertices = new List<Vector3>(4)
+        {
+            new Vector3(-half, -half, 0f),
+            new Vector3(-half, half, 0f),
+            new Vector3(half, half, 0f),
+            new Vector3(half, -half, 0f)
+        };
+        var colors = new List<Color>(4) { samplingWindowColor, samplingWindowColor, samplingWindowColor, samplingWindowColor };
+        var indices = new List<int>(8) { 0, 1, 1, 2, 2, 3, 3, 0 };
+
+        _windowMesh.Clear();
+        _windowMesh.SetVertices(vertices);
+        _windowMesh.SetColors(colors);
+        _windowMesh.SetIndices(indices, MeshTopology.Lines, 0, true);
+        _windowMesh.RecalculateBounds();
     }
 
     private void LogSamplingWindowDiagnostic(string mode, Camera cam, WorldSamplingWindow window, bool hasWindow)
@@ -3987,6 +4495,8 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
 
         if (centerCamera == null)
             centerCamera = Camera.main;
+        if (blGridSource == null)
+            blGridSource = FindAnyObjectByType<ScanCoverDepthGridPointCloud>(FindObjectsInactive.Include);
         if (displayParent == null)
             displayParent = ResolveDisplayParent();
     }

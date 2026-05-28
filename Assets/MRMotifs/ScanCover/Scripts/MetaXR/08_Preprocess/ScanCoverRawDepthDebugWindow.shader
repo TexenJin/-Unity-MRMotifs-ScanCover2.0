@@ -5,6 +5,10 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
         _EyeIndex ("Eye Index", Float) = 1
         _RawDepthDisplayScale ("Linear Depth Display Scale", Float) = 1
         _Alpha ("Alpha", Range(0, 1)) = 0.86
+        _ShowPixelCenterDots ("Show Pixel Center Dots", Float) = 0
+        _PixelCenterDotRadius ("Pixel Center Dot Radius", Range(0.02, 0.48)) = 0.18
+        _PixelCenterDotAlpha ("Pixel Center Dot Alpha", Range(0, 1)) = 0.85
+        _PixelCenterDotColor ("Pixel Center Dot Color", Color) = (1, 1, 1, 1)
     }
 
     SubShader
@@ -30,6 +34,11 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
             float _EyeIndex;
             float _RawDepthDisplayScale;
             float _Alpha;
+            float4 _RawDepthTextureSize;
+            float _ShowPixelCenterDots;
+            float _PixelCenterDotRadius;
+            float _PixelCenterDotAlpha;
+            float4 _PixelCenterDotColor;
 
             struct Attributes
             {
@@ -66,7 +75,8 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
                     float3(saturate(input.uv), eye),
                     0).r;
 
-                if (raw <= 0.00001)
+                bool validDepth = raw > 0.00001;
+                if (!validDepth)
                     return float4(0.08, 0.0, 0.0, 1.0);
 
                 float linearMeters = (_EnvironmentDepthZBufferParams.x / (raw + _EnvironmentDepthZBufferParams.y));
@@ -90,9 +100,17 @@ Shader "Hidden/ScanCover/RawDepthDebugWindow"
                 {
                     color = lerp(float3(1.0, 0.9, 0.0), float3(1.0, 0.05, 0.0), (value - 0.75) / 0.25);
                 }
-                float bandPhase = abs(frac(linearMeters / 0.5) - 0.5) * 2.0;
-                float bandLine = 1.0 - smoothstep(0.0, 0.08, bandPhase);
-                color = lerp(color, color * 0.28, bandLine);
+                if (_ShowPixelCenterDots > 0.5 && _RawDepthTextureSize.x > 1.0 && _RawDepthTextureSize.y > 1.0)
+                {
+                    float2 pixelCoord = saturate(input.uv) * _RawDepthTextureSize.xy;
+                    float2 cell = frac(pixelCoord) - 0.5;
+                    float dotDistance = length(cell);
+                    float dotMask = 1.0 - smoothstep(
+                        _PixelCenterDotRadius,
+                        min(0.5, _PixelCenterDotRadius + 0.08),
+                        dotDistance);
+                    color = lerp(color, _PixelCenterDotColor.rgb, saturate(dotMask * _PixelCenterDotAlpha));
+                }
 
                 return float4(saturate(color), 1.0);
             }

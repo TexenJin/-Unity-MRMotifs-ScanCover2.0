@@ -57,13 +57,33 @@ Shader "Hidden/ScanCover/BLDepthPatchPreview"
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
                 float depth = tex2D(_DepthTex, input.uv).r;
                 if (depth <= 0.0001)
-                    return float4(0.0, 0.0, 0.0, 0.18 * _Alpha);
+                    return float4(0.08, 0.0, 0.0, _Alpha);
 
-                float normalizedDepth = saturate(depth / max(0.0001, _DepthScaleMeters));
-                float value = 1.0 - normalizedDepth;
-                float3 nearColor = float3(0.08, 1.0, 0.78);
-                float3 farColor = float3(0.12, 0.25, 1.0);
-                float3 color = lerp(farColor, nearColor, value);
+                float value = saturate(depth / max(0.0001, _DepthScaleMeters));
+                value = pow(value, 1.25);
+
+                float3 color;
+                if (value < 0.25)
+                {
+                    color = lerp(float3(0.0, 0.08, 0.85), float3(0.0, 0.9, 1.0), value / 0.25);
+                }
+                else if (value < 0.5)
+                {
+                    color = lerp(float3(0.0, 0.9, 1.0), float3(0.0, 1.0, 0.22), (value - 0.25) / 0.25);
+                }
+                else if (value < 0.75)
+                {
+                    color = lerp(float3(0.0, 1.0, 0.22), float3(1.0, 0.9, 0.0), (value - 0.5) / 0.25);
+                }
+                else
+                {
+                    color = lerp(float3(1.0, 0.9, 0.0), float3(1.0, 0.05, 0.0), (value - 0.75) / 0.25);
+                }
+
+                float bandPhase = abs(frac(depth / 0.5) - 0.5) * 2.0;
+                float bandLine = 1.0 - smoothstep(0.0, 0.08, bandPhase);
+                color = lerp(color, color * 0.28, bandLine);
+
                 return float4(color, _Alpha);
             }
             ENDHLSL

@@ -8930,6 +8930,7 @@ GameObject:
   - component: {fileID: 920710000000000003}
   - component: {fileID: 920710000000000140}
   - component: {fileID: 920710000000000141}
+  - component: {fileID: 920710000000000143}
   - component: {fileID: 920710000000000004}
   - component: {fileID: 920710000000000099}
   - component: {fileID: 920710000000000106}
@@ -9066,7 +9067,7 @@ MonoBehaviour:
   runtimeAxisCubeSize: 0.12
   runtimeAxisLength: 0.4
   runtimeAxisThickness: 0.03
-  showGridLines: 1
+  showGridLines: 0
   showGridOuterContourOnly: 0
   showRectilinearFillInsideContour: 0
   rectilinearRennetStride: 2
@@ -9088,9 +9089,9 @@ MonoBehaviour:
   syncGridLinesToFocusedCandidate: 0
   focusedGridPlaneToleranceMeters: 0.08
   focusedGridExpandMeters: 0.06
-  showGridInteriorMesh: 1
+  showGridInteriorMesh: 0
   gridInteriorDisplayMode: 1
-  showSurfaceMesh: 1
+  showSurfaceMesh: 0
   keepSurfaceMeshAvailableWhenHidden: 1
   useIndexConnectivity: 1
   surfaceMaterialOverride: {fileID: 2100000, guid: 88525e94ba60b634e8281cd32171859e, type: 2}
@@ -9223,12 +9224,12 @@ MonoBehaviour:
   statsLogFrameInterval: 30
   logCameraAndBoundsDiagnostics: 1
   debugLog: 1
-  showPatchPreview: 1
-  previewLocalPosition: {x: 0.34, y: -0.22, z: 0.72}
+  showPatchPreview: 0
+  previewLocalPosition: {x: 0.13, y: -0.22, z: 0.72}
   previewSizeMeters: 0.22
-  previewDepthScaleMeters: 1.2
-  previewAlpha: 0.82
-  showProjectedMeshOutline: 1
+  previewDepthScaleMeters: 4
+  previewAlpha: 1
+  showProjectedMeshOutline: 0
   projectedMeshOutlineColor: {r: 1, g: 1, b: 1, a: 0.95}
 --- !u!114 &920710000000000141
 MonoBehaviour:
@@ -9248,11 +9249,71 @@ MonoBehaviour:
   sourceEye: 1
   rawDepthDisplayScale: 0.25
   previewAlpha: 1
-  showWindow: 1
-  localPosition: {x: 0, y: -0.22, z: 0.72}
-  sizeMeters: 0.22
+  showPixelCenterDots: 1
+  pixelCenterDotRadius: 0.18
+  pixelCenterDotAlpha: 0.9
+  pixelCenterDotColor: {r: 1, g: 1, b: 1, a: 1}
+  showWindow: 0
+  localPosition: {x: -0.25, y: -0.22, z: 0.72}
+  sizeMeters: 0.42
   faceSourceCamera: 1
   debugLog: 1
+--- !u!114 &920710000000000143
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0cb8e7c9343140dfb3cfdbe23d1928df, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  preprocessor: {fileID: 8442838744600988204}
+  sessionController: {fileID: 910400000000000003}
+  pointShader: {fileID: 4800000, guid: 64119f34cd124919a4c7d3e0f58e4db3, type: 3}
+  showPointCloud: 1
+  updateUntilSnapshot: 0
+  captureKey: 32
+  captureWhenSessionFrozen: 1
+  pixelStride: 1
+  maxPoints: 120000
+  minConfidence: 0.01
+  pointSizePixels: 18
+  pointSizeMeters: 0.006
+  pointAlpha: 1
+  pointBrightness: 1.8
+  colorMode: 0
+  colorDepthScaleMeters: 4
+  pointColor: {r: 0, g: 1, b: 1, a: 1}
+  stableDepthDeltaMeters: 0.015
+  edgeDepthDeltaMeters: 0.06
+  stableWorldDistanceMeters: 0.025
+  edgeWorldDistanceMeters: 0.08
+  stablePointColor: {r: 0, g: 0.95, b: 1, a: 1}
+  transitionPointColor: {r: 1, g: 0.85, b: 0, a: 1}
+  edgePointColor: {r: 1, g: 0, b: 0.05, a: 1}
+  isolatedPointColor: {r: 0.45, g: 0.45, b: 0.45, a: 1}
+  showLocalPatchGrid: 0
+  localPatchMaxChunks: 6
+  localPatchMinStablePoints: 90
+  localPatchRadiusMeters: 0.5
+  localPatchMaxPlaneDistanceMeters: 0.035
+  localPatchGridSpacingMeters: 0.06
+  localPatchMinPointsPerCell: 2
+  localPatchLineThicknessMeters: 0.008
+  localPatchMaxNeighborDistanceMeters: 0.055
+  localPatchGridColor: {r: 1, g: 1, b: 1, a: 0.82}
+  showOuterBoundaryRing: 0
+  outerBoundaryLineThicknessMeters: 0.006
+  outerBoundaryMaxLinkDistanceMeters: 0.08
+  outerBoundaryLinkSearchPixels: 3
+  outerBoundaryColor: {r: 1, g: 1, b: 1, a: 0.95}
+  exportOuterBoundaryCsvToDesktop: 1
+  debugLog: 1
+  exportSnapshotCsvToDesktop: 1
+  csvFilePrefix: ScanCover_RawDepthProjectedPoints
 --- !u!114 &920710000000000004
 MonoBehaviour:
   m_ObjectHideFlags: 0

@@ -43,7 +43,7 @@ public sealed class ScanCoverBLDepthTextureCapture : MonoBehaviour
     [SerializeField, Min(0.03f)] private float previewSizeMeters = 0.22f;
     [SerializeField, Min(0.01f)] private float previewDepthScaleMeters = 1.2f;
     [SerializeField, Range(0f, 1f)] private float previewAlpha = 0.82f;
-    [SerializeField] private bool showProjectedMeshOutline = true;
+    [SerializeField] private bool showProjectedMeshOutline = false;
     [SerializeField] private Color projectedMeshOutlineColor = new Color(1f, 1f, 1f, 0.95f);
 
     private Material _depthMaterial;

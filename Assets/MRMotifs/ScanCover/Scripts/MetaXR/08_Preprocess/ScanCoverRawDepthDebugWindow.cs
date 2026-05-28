@@ -20,6 +20,10 @@ public sealed class ScanCoverRawDepthDebugWindow : MonoBehaviour
     [SerializeField] private SourceEye sourceEye = SourceEye.Right;
     [SerializeField, Min(0.001f)] private float rawDepthDisplayScale = 1f;
     [SerializeField, Range(0f, 1f)] private float previewAlpha = 0.86f;
+    [SerializeField] private bool showPixelCenterDots = false;
+    [SerializeField, Range(0.02f, 0.48f)] private float pixelCenterDotRadius = 0.18f;
+    [SerializeField, Range(0f, 1f)] private float pixelCenterDotAlpha = 0.85f;
+    [SerializeField] private Color pixelCenterDotColor = Color.white;
 
     [Header("Window")]
     [SerializeField] private bool showWindow = true;
@@ -35,6 +39,11 @@ public sealed class ScanCoverRawDepthDebugWindow : MonoBehaviour
     private static readonly int EyeIndexId = Shader.PropertyToID("_EyeIndex");
     private static readonly int RawDepthDisplayScaleId = Shader.PropertyToID("_RawDepthDisplayScale");
     private static readonly int AlphaId = Shader.PropertyToID("_Alpha");
+    private static readonly int RawDepthTextureSizeId = Shader.PropertyToID("_RawDepthTextureSize");
+    private static readonly int ShowPixelCenterDotsId = Shader.PropertyToID("_ShowPixelCenterDots");
+    private static readonly int PixelCenterDotRadiusId = Shader.PropertyToID("_PixelCenterDotRadius");
+    private static readonly int PixelCenterDotAlphaId = Shader.PropertyToID("_PixelCenterDotAlpha");
+    private static readonly int PixelCenterDotColorId = Shader.PropertyToID("_PixelCenterDotColor");
 
     private GameObject _root;
     private MeshFilter _meshFilter;
@@ -133,6 +142,11 @@ public sealed class ScanCoverRawDepthDebugWindow : MonoBehaviour
             _material.SetFloat(EyeIndexId, (float)sourceEye);
             _material.SetFloat(RawDepthDisplayScaleId, Mathf.Max(0.001f, rawDepthDisplayScale));
             _material.SetFloat(AlphaId, previewAlpha);
+            _material.SetVector(RawDepthTextureSizeId, rawDepth != null ? new Vector4(rawDepth.width, rawDepth.height, 0f, 0f) : Vector4.zero);
+            _material.SetFloat(ShowPixelCenterDotsId, showPixelCenterDots ? 1f : 0f);
+            _material.SetFloat(PixelCenterDotRadiusId, pixelCenterDotRadius);
+            _material.SetFloat(PixelCenterDotAlphaId, pixelCenterDotAlpha);
+            _material.SetColor(PixelCenterDotColorId, pixelCenterDotColor);
         }
 
         if (debugLog && Time.frameCount - _lastLoggedFrame > 60)
