@@ -26,11 +26,14 @@
 /_analysis_frames/
 /_baselines/
 /ScanCoverExports/
+/codex会话备份/
 /Assets/_Recovery/
 /Assets/_Recovery.meta
 *.bak_before_disabled_cleanup
 *.baseline_*
 *.before_*
+__pycache__/
+*.pyc
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
 !/[Aa]ssets/**/*.meta

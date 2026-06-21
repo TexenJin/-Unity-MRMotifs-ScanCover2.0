@@ -8879,6 +8879,8 @@ MonoBehaviour:
   exportSnapshotObjOnFreeze: 0
   exportAllSnapshotsAsSingleObjOnFreeze: 0
   exportIncrementalReferenceShellOnFreeze: 0
+  exportBlSurfaceMeshObjOnFreeze: 1
+  exportGridNodeCsvOnFreeze: 1
   exportGridStateJsonOnFreeze: 0
 --- !u!114 &910400000000000008
 MonoBehaviour:
@@ -8936,6 +8938,7 @@ GameObject:
   - component: {fileID: 920710000000000106}
   - component: {fileID: 920710000000000120}
   - component: {fileID: 920710000000000130}
+  - component: {fileID: 920710000000000151}
   m_Layer: 0
   m_Name: DepthGridPointCloud_Right
   m_TagString: Untagged
@@ -9017,7 +9020,7 @@ MonoBehaviour:
   volumePlaneBlendMeters: 0.03
   minConfidence: 0.2
   minLinearDepthMeters: 0.35
-  maxLinearDepthMeters: 6
+  maxLinearDepthMeters: 5
   requireValidNormal: 0
   neighborFill: 1
   neighborRadiusPixels: 1
@@ -9026,40 +9029,11 @@ MonoBehaviour:
   orientToNormal: 0
   surfaceBiasMeters: 0.0015
   fallbackMarkerScaleMeters: 0.012
-  confidenceGradient:
-    serializedVersion: 2
-    key0: {r: 1, g: 0, b: 0, a: 1}
-    key1: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}
-    key2: {r: 0, g: 1, b: 1, a: 1}
-    key3: {r: 0, g: 0, b: 0, a: 0}
-    key4: {r: 0, g: 0, b: 0, a: 0}
-    key5: {r: 0, g: 0, b: 0, a: 0}
-    key6: {r: 0, g: 0, b: 0, a: 0}
-    key7: {r: 0, g: 0, b: 0, a: 0}
-    ctime0: 0
-    ctime1: 32768
-    ctime2: 65535
-    ctime3: 0
-    ctime4: 0
-    ctime5: 0
-    ctime6: 0
-    ctime7: 0
-    atime0: 0
-    atime1: 65535
-    atime2: 0
-    atime3: 0
-    atime4: 0
-    atime5: 0
-    atime6: 0
-    atime7: 0
-    m_Mode: 0
-    m_ColorSpace: -1
-    m_NumColorKeys: 3
-    m_NumAlphaKeys: 2
-  previewDisplayVisible: 1
+  snapshotGridUniformColor: {r: 0.55, g: 0.55, b: 0.55, a: 1}
+  previewDisplayVisible: 0
   useWorldSpaceDisplayRoots: 1
   lockUnfrozenDisplayRoll: 1
-  lockUnfrozenDisplayPitch: 0
+  lockUnfrozenDisplayPitch: 1
   lockUnfrozenDisplayYaw: 0
   compensateRegularGridRollSampling: 1
   showRuntimeAxisDebug: 0
@@ -9078,7 +9052,7 @@ MonoBehaviour:
   gridLineRequireContinuousSurface: 0
   rectifiedGridLineMaxSpanMultiplier: 2.35
   rectifiedGridLineMinValidRatio: 0.18
-  gridLineMinNeighborNormalDot: 0.2
+  gridLineMinNeighborNormalDot: -1
   gridLineRequireCompleteCellSupport: 0
   gridLineMinCompleteCellIslandCount: 8
   gridLineKeepLargestCompleteCellIslands: 1
@@ -9090,7 +9064,7 @@ MonoBehaviour:
   focusedGridPlaneToleranceMeters: 0.08
   focusedGridExpandMeters: 0.06
   showGridInteriorMesh: 0
-  gridInteriorDisplayMode: 1
+  gridInteriorDisplayMode: 0
   showSurfaceMesh: 0
   keepSurfaceMeshAvailableWhenHidden: 1
   useIndexConnectivity: 1
@@ -9099,6 +9073,42 @@ MonoBehaviour:
   minNeighborNormalDot: 0.35
   surfaceColor: {r: 1, g: 1, b: 1, a: 1}
   surfaceDoubleSided: 1
+  showGeometricSurfaceGrid: 0
+  geometricSurfaceGridUseRansacPatches: 1
+  geometricSurfaceGridSpacingMeters: 0.12
+  geometricSurfaceGridLineWidthMeters: 0.0035
+  geometricSurfaceGridSurfaceOffsetMeters: 0.008
+  geometricSurfaceGridColor: {r: 1, g: 1, b: 1, a: 0.92}
+  ransacPatchMaxSamples: 768
+  ransacPatchIterations: 48
+  ransacPatchPlanesPerBucket: 2
+  ransacPatchInlierDistanceMeters: 0.035
+  ransacPatchNormalDot: 0.72
+  ransacPatchMinInliers: 28
+  ransacPatchGridCellMeters: 0.18
+  ransacPatchMaxGridCellsPerAxis: 24
+  showProbeRowExperiment: 0
+  probeRowUseCurrentMeshHorizontalExtent: 1
+  probeRowPointCount: 13
+  probeRowMaxPointCount: 128
+  probeRowSpacingMeters: 0.06
+  probeRowHorizontalPaddingMeters: 0.12
+  probeRowTargetDistanceMeters: 1.2
+  probeRowMaxRayDistanceMeters: 6
+  probeRowMarkerScaleMeters: 0.025
+  probeRowLineWidthMeters: 0.006
+  probeRowSurfaceOffsetMeters: 0.012
+  probeRowRecognitionRadiusMeters: 0.09
+  probeRowMinNeighborhoodSamples: 3
+  probeRowStableNormalDot: 0.82
+  probeRowRefineNormalDot: 0.45
+  probeRowStablePlaneDeviationMeters: 0.025
+  probeRowStableDistanceMultiplier: 1.8
+  probeRowRefineDistanceMultiplier: 3
+  probeRowPointColor: {r: 0, g: 1, b: 1, a: 1}
+  probeRowStableLineColor: {r: 0.1, g: 1, b: 0.3, a: 1}
+  probeRowRefineLineColor: {r: 1, g: 0.85, b: 0.05, a: 1}
+  probeRowBreakLineColor: {r: 1, g: 0.08, b: 0.08, a: 1}
   showHeightSliceContour: 0
   heightSliceUseFrozenScreenCenterHeight: 1
   heightSliceRowCount: 32
@@ -9112,8 +9122,41 @@ MonoBehaviour:
   heightSliceLineWidthMeters: 0.006
   heightSliceContourColor: {r: 1, g: 1, b: 1, a: 0.95}
   heightSlicePlaneFrameColor: {r: 1, g: 1, b: 1, a: 0.35}
-  colorizeSurfaceRegions: 1
-  showIrregularSurfaceBucket: 1
+  showPlaneFamilyClassification: 0
+  planeFamilyDisplayAsPointQuads: 0
+  planeFamilyPointSizeMeters: 0.014
+  planeFamilyMaxSamples: 4096
+  planeFamilyRansacIterations: 96
+  planeFamilyMaxFamilies: 10
+  planeFamilyMinInliers: 96
+  planeFamilyFitDistanceMeters: 0.055
+  planeFamilyClassifyDistanceMeters: 0.09
+  planeFamilyClassifyNormalDegrees: 48
+  planeFamilyMergeNormalDegrees: 16
+  planeFamilyMergeDistanceMeters: 0.18
+  planeFamilyUseSpatialConsistency: 1
+  planeFamilySpatialSmoothingPasses: 2
+  planeFamilyMinIslandPoints: 18
+  planeFamilyNeighborVoteThreshold: 3
+  planeFamilyWeakIslandMaxPoints: 260
+  planeFamilyWeakIslandMaxRatio: 0.08
+  planeFamilyWeakIslandBorderRatio: 0.55
+  planeFamilyWeakIslandRelaxNormalDegrees: 68
+  planeFamilyWeakIslandRelaxDistanceMultiplier: 1.25
+  planeFamilySurfaceAlpha: 1
+  planeFamilyOutlierColor: {r: 1, g: 0.05, b: 0.05, a: 1}
+  planeFamilyUseStructuralConsensus: 1
+  planeFamilyStrongDistanceRatio: 0.45
+  planeFamilyProjectionPaddingMeters: 0.22
+  planeFamilyNormalScoreWeight: 0.03
+  planeFamilyStructuralNeighborMinSame: 4
+  planeFamilyStructuralNeighborMinRatio: 0.45
+  planeFamilyDiagnostics: 1
+  planeFamilyDiagnosticsExportCsv: 1
+  planeFamilyDiagnosticsLogSummary: 1
+  planeFamilyDiagnosticsMinIntervalSeconds: 2
+  colorizeSurfaceRegions: 0
+  showIrregularSurfaceBucket: 0
   irregularSurfaceBucketAlpha: 0.35
   surfaceRegionCreaseAngleDegrees: 8
   surfaceRegionMinQuadCount: 12
@@ -9124,8 +9167,8 @@ MonoBehaviour:
   surfaceLargeComponentKeepRatio: 0.22
   surfaceRegionMaxNeighborDistanceMeters: 0.12
   surfaceRegionMaxPlaneOffsetMeters: 0.015
-  surfaceRegionColorSaturation: 0.62
-  surfaceRegionColorValue: 0.95
+  surfaceRegionColorSaturation: 1
+  surfaceRegionColorValue: 1
   isolateTopCandidateSurfaces: 0
   topCandidateSurfaceCount: 0
   topCandidateSurfaceMinTriangleCount: 24
@@ -9179,141 +9222,20 @@ MonoBehaviour:
   screenCenterDebugColor: {r: 1, g: 0.2, b: 0.2, a: 0.95}
   gridCenterDebugColor: {r: 1, g: 0.9, b: 0.2, a: 0.95}
   patchCenterDebugColor: {r: 0.2, g: 1, b: 1, a: 0.95}
-  showHeadsetScreenCenterMarker: 1
+  showHeadsetScreenCenterMarker: 0
   headsetScreenCenterMarkerDistanceMeters: 1
   headsetScreenCenterMarkerScaleMeters: 0.025
   headsetScreenCenterMarkerColor: {r: 1, g: 0.05, b: 0.05, a: 1}
   showRawDepthScreenCenterMarker: 0
   rawDepthScreenCenterMarkerScaleMeters: 0.03
   rawDepthScreenCenterMarkerColor: {r: 1, g: 0.05, b: 0.05, a: 1}
-  showOriginalGridCenterMarker: 1
+  showOriginalGridCenterMarker: 0
   originalGridCenterMarkerScaleMeters: 0.035
   originalGridCenterMarkerColor: {r: 1, g: 0, b: 1, a: 1}
   debugLog: 0
   logBounds: 0
   dumpRosterOnceOnPlay: 0
   dumpOnlyValidCellsInRoster: 0
---- !u!114 &920710000000000140
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: a0f3df9a1c1049f7a1c6a77f56c8c201, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  sourceGrid: {fileID: 920710000000000003}
-  sourceCamera: {fileID: 2140226224}
-  linearDepthShader: {fileID: 4800000, guid: b2c5b6ef15e9447ca4ee3f3de0d45f15, type: 3}
-  previewShader: {fileID: 4800000, guid: 7c6a61b3f07f4f9db9d518fe42069d44, type: 3}
-  previewLineShader: {fileID: 4800000, guid: e21cb34ef41042d384e9ff5f38a77e90, type: 3}
-  viewSourceMode: 0
-  useSourceFacingBoundsCamera: 1
-  useDiagnosticBoundsCamera: 0
-  boundsCameraPadding: 1.08
-  textureWidth: 64
-  textureHeight: 64
-  nearClipMeters: 0.03
-  farClipMeters: 8
-  captureEveryFrame: 1
-  captureFrameInterval: 5
-  requestReadbackStats: 1
-  statsLogFrameInterval: 30
-  logCameraAndBoundsDiagnostics: 1
-  debugLog: 1
-  showPatchPreview: 0
-  previewLocalPosition: {x: 0.13, y: -0.22, z: 0.72}
-  previewSizeMeters: 0.22
-  previewDepthScaleMeters: 4
-  previewAlpha: 1
-  showProjectedMeshOutline: 0
-  projectedMeshOutlineColor: {r: 1, g: 1, b: 1, a: 0.95}
---- !u!114 &920710000000000141
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: f20d9e1ec4b445c3b711765eaf328210, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  sourceCamera: {fileID: 2140226224}
-  followTarget: {fileID: 0}
-  rawDepthPreviewShader: {fileID: 4800000, guid: 43ac0191cb2d41849b7f920dd2157de3, type: 3}
-  sourceEye: 1
-  rawDepthDisplayScale: 0.25
-  previewAlpha: 1
-  showPixelCenterDots: 1
-  pixelCenterDotRadius: 0.18
-  pixelCenterDotAlpha: 0.9
-  pixelCenterDotColor: {r: 1, g: 1, b: 1, a: 1}
-  showWindow: 0
-  localPosition: {x: -0.25, y: -0.22, z: 0.72}
-  sizeMeters: 0.42
-  faceSourceCamera: 1
-  debugLog: 1
---- !u!114 &920710000000000143
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 0cb8e7c9343140dfb3cfdbe23d1928df, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  preprocessor: {fileID: 8442838744600988204}
-  sessionController: {fileID: 910400000000000003}
-  pointShader: {fileID: 4800000, guid: 64119f34cd124919a4c7d3e0f58e4db3, type: 3}
-  showPointCloud: 1
-  updateUntilSnapshot: 0
-  captureKey: 32
-  captureWhenSessionFrozen: 1
-  pixelStride: 1
-  maxPoints: 120000
-  minConfidence: 0.01
-  pointSizePixels: 18
-  pointSizeMeters: 0.006
-  pointAlpha: 1
-  pointBrightness: 1.8
-  colorMode: 0
-  colorDepthScaleMeters: 4
-  pointColor: {r: 0, g: 1, b: 1, a: 1}
-  stableDepthDeltaMeters: 0.015
-  edgeDepthDeltaMeters: 0.06
-  stableWorldDistanceMeters: 0.025
-  edgeWorldDistanceMeters: 0.08
-  stablePointColor: {r: 0, g: 0.95, b: 1, a: 1}
-  transitionPointColor: {r: 1, g: 0.85, b: 0, a: 1}
-  edgePointColor: {r: 1, g: 0, b: 0.05, a: 1}
-  isolatedPointColor: {r: 0.45, g: 0.45, b: 0.45, a: 1}
-  showLocalPatchGrid: 0
-  localPatchMaxChunks: 6
-  localPatchMinStablePoints: 90
-  localPatchRadiusMeters: 0.5
-  localPatchMaxPlaneDistanceMeters: 0.035
-  localPatchGridSpacingMeters: 0.06
-  localPatchMinPointsPerCell: 2
-  localPatchLineThicknessMeters: 0.008
-  localPatchMaxNeighborDistanceMeters: 0.055
-  localPatchGridColor: {r: 1, g: 1, b: 1, a: 0.82}
-  showOuterBoundaryRing: 0
-  outerBoundaryLineThicknessMeters: 0.006
-  outerBoundaryMaxLinkDistanceMeters: 0.08
-  outerBoundaryLinkSearchPixels: 3
-  outerBoundaryColor: {r: 1, g: 1, b: 1, a: 0.95}
-  exportOuterBoundaryCsvToDesktop: 1
-  debugLog: 1
-  exportSnapshotCsvToDesktop: 1
-  csvFilePrefix: ScanCover_RawDepthProjectedPoints
 --- !u!114 &920710000000000004
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9360,7 +9282,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 920710000000000001}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7d2db57f5f9640d3b2b3419a47c8d6d2, type: 3}
   m_Name: 
@@ -9374,7 +9296,7 @@ MonoBehaviour:
   sampleIntervalSeconds: 0.04
   useDepthSnapshot: 1
   useScanCoverSnapshot: 1
-  showScanCoverDepthGridSnapshot: 1
+  showScanCoverDepthGridSnapshot: 0
   showDepthProbeRowPreview: 0
   showDepthProbeRowNodes: 0
   syncVisibilityToScanCoverPreview: 1
@@ -9538,34 +9460,157 @@ MonoBehaviour:
   blSingleColumnSpacingMeters: 0.04
   blSingleColumnMaxSamples: 400
   blSingleColumnUseHeadsetWindow: 1
-  showSamplingWindow: 1
+  eye: 1
+  useCameraCenterHitPhysicalWindow: 1
+  useDepthCenterTexCoordForPhysicalWindow: 1
+  physicalWindowMinCenterDistanceMeters: 0.75
+  physicalWindowCenterSearchRadiusPixels: 10
+  physicalWindowSizeMeters: 0.08
+  windowPixels: 24
+  samplesPerFrame: 256
+  stratifiedJitter: 1
+  randomizeBurstSeed: 1
+  deterministicSeed: 20260506
+  depthPixelVFlip: 1
+  neighborFill: 1
+  neighborRadiusPixels: 1
+  minLinearDepthMeters: 0.35
+  maxLinearDepthMeters: 8
+  showSamplingWindow: 0
   samplingWindowDistanceMeters: 0.75
   samplingWindowScale: 1
-  physicalWindowCenterSearchRadiusPixels: 10
-  minLinearDepthMeters: 0.35
-  neighborRadiusPixels: 1
+  samplingWindowColor: {r: 0, g: 1, b: 1, a: 0.9}
+  framesPerBurst: 30
+  maxAccumulatedPoints: 20000
+  clearOnBeginCapture: 1
   collectContinuously: 0
   saveWhenBurstCompletes: 1
+  desktopFolderName: ScanCoverDepthPointBurst
   logSamplingWindowDiagnostics: 1
   pointCloudTerrainDiagnosticsOnly: 1
+  terrainDiagnosticsWindowSizeMeters: 0.35
+  terrainDiagnosticsSamplesPerFrame: 512
+  terrainDiagnosticsFramesPerBurst: 45
+  terrainDiagnosticsMaxAccumulatedPoints: 30000
+  terrainDiagnosticsUseDepthImagePatchSampling: 1
+  terrainDiagnosticsPatchPixels: 96
+  terrainDiagnosticsUsePureRandomSampling: 0
+  terrainDiagnosticsKeepPointClassification: 1
+  terrainDiagnosticsShowSamplingWindow: 0
   terrainDiagnosticsDisplayAggregatedCells: 1
+  terrainDiagnosticsShowRawOverlay: 1
+  terrainCellSizeMeters: 0.02
   terrainStableMinSamplesPerCell: 4
   terrainStableMinSupportFrames: 3
   terrainStableMaxThicknessMeters: 0.045
+  terrainMultiLayerMinDepthGapMeters: 0.045
   terrainNeighborDepthJumpMeters: 0.075
   terrainFillSmallStableHoles: 1
   terrainFillSmallHoleMinStableNeighbors: 3
-  terrainDiagnosticsShowRawOverlay: 1
+  terrainMultiLayerMinFraction: 0.2
+  terrainBoundaryMinDepthEdgeFraction: 0.25
+  terrainRepresentativePointSizeMeters: 0.012
+  terrainStableCellColor: {r: 0.1, g: 1, b: 0.45, a: 0.95}
+  terrainBoundaryCellColor: {r: 1, g: 0.48, b: 0.05, a: 0.95}
+  terrainMultiLayerNearColor: {r: 0.65, g: 0.2, b: 1, a: 0.95}
+  terrainMultiLayerFarColor: {r: 1, g: 0.78, b: 0.05, a: 0.95}
+  terrainUnstableCellColor: {r: 0.45, g: 0.45, b: 0.45, a: 0.55}
   terrainDiagnosticsShowPlanarizedPreview: 1
+  terrainDiagnosticsShowRejectedPlaneIslands: 1
+  terrainPlaneMinCells: 12
+  terrainPlaneTrimKeepRatio: 0.82
+  terrainPlaneRefineIterations: 2
+  terrainPlaneMaxResidualP95Meters: 0.035
+  terrainPlaneMinInlierRatio: 0.75
+  terrainPlaneInlierResidualMeters: 0.025
+  terrainPlaneMaxProjectionOffsetMeters: 0.045
+  terrainPlaneAllowBoundaryStableCells: 1
   terrainDiagnosticsShowPlanarizedMeshPreview: 1
+  terrainDiagnosticsUsePlanarizedCellTiles: 1
+  terrainDiagnosticsShowPlanarizedPointFallback: 1
+  terrainPlaneMeshMaxEdgeMeters: 0.08
+  terrainPlanarizedTileFillRatio: 1
+  terrainPlanarizedAcceptedColor: {r: 0.15, g: 0.75, b: 1, a: 0.98}
+  terrainPlanarizedMeshColor: {r: 0.05, g: 0.55, b: 1, a: 0.38}
+  terrainPlanarizedRejectedColor: {r: 1, g: 0.12, b: 0.12, a: 0.85}
   terrainDiagnosticsShowTriangleWirePreview: 1
+  terrainTriangleWireUseDepthBreaksAsBorders: 1
   terrainTriangleWireIncludeBoundaryCells: 1
   terrainTriangleWireConnectLooseEdges: 1
   terrainTriangleWireStabilizeRepresentatives: 1
+  terrainTriangleWireStabilizationIterations: 2
+  terrainTriangleWireStabilizationBlend: 0.65
+  terrainTriangleWireWidthMeters: 0.004
+  terrainTriangleWireMaxEdgeMeters: 0.09
+  terrainTriangleWireColor: {r: 0.05, g: 0.55, b: 1, a: 0.92}
   displayMode: 3
   showPoints: 1
-  recordInvalidSamples: 0
   renderAsBillboardQuads: 1
+  pointVisualSizeMeters: 0.008
+  surfaceOffsetTowardCameraMeters: 0.004
+  pointColor: {r: 1, g: 1, b: 1, a: 0.95}
+  recordInvalidSamples: 0
+  invalidPointColor: {r: 0.45, g: 0.45, b: 0.45, a: 0.45}
+  colorizeValidPointsByPlaneResidual: 1
+  candidatePointColor: {r: 1, g: 0.85, b: 0, a: 0.95}
+  trustedPointColor: {r: 0.2, g: 1, b: 0.55, a: 0.95}
+  secondaryTrustedPointColor: {r: 0.2, g: 0.65, b: 1, a: 0.95}
+  secondaryCandidatePointColor: {r: 0.55, g: 0.25, b: 1, a: 0.95}
+  depthEdgePointColor: {r: 1, g: 0.05, b: 0.05, a: 0.95}
+  edgeEvidenceColor: {r: 1, g: 0.45, b: 0, a: 0.95}
+  rejectedPointColor: {r: 1, g: 0.1, b: 0.1, a: 0.9}
+  unknownPointColor: {r: 0.8, g: 0, b: 1, a: 0.9}
+  trustedResidualBaseMeters: 0.012
+  candidateResidualBaseMeters: 0.03
+  enableSecondaryPlaneCandidate: 1
+  minSecondaryPlaneSamples: 32
+  secondaryPlaneTrustedResidualMeters: 0.025
+  secondaryPlaneCandidateResidualMeters: 0.05
+  minSecondaryPlaneNormalAngleDegrees: 20
+  minSecondaryPlaneDistanceFromPrimaryMeters: 0.025
+  secondaryPlaneMaxThinBoxGroups: 4
+  secondaryThinBoxColor: {r: 0.15, g: 0.55, b: 1, a: 0.55}
+  enableDepthEdgeDetection: 1
+  excludeDepthEdgeSamplesFromPlaneFit: 1
+  depthEdgeProbeRadiusPixels: 1
+  minDepthEdgeJumpMeters: 0.035
+  depthEdgeJumpDistanceScale: 0.018
+  depthEdgeUseLocalPlaneReject: 1
+  localPlaneResidualBaseMeters: 0.012
+  localPlaneResidualDistanceScale: 0.006
+  localPlaneMinInlierRatio: 0.65
+  localPlaneMinNeighborPoints: 5
+  depthEdgeTwoClusterMinFraction: 0.25
+  showTrustedLattice: 0
+  minLatticeSamples: 256
+  minTrustedInlierRatio: 0.8
+  maxTrustedResidualP95Meters: 0.03
+  latticeInlierResidualMeters: 0.02
+  latticeCellSizeMeters: 0.03
+  minInliersPerLatticeCell: 2
+  latticeColor: {r: 1, g: 1, b: 1, a: 0.92}
+  showTrustedThinBox: 1
+  trustedThinBoxMinSpanMeters: 0.03
+  trustedThinBoxGroupCellSizeMeters: 0.015
+  trustedThinBoxMinSamplesPerGroupCell: 2
+  trustedThinBoxMaxNeighborDepthJumpMeters: 0.04
+  trustedThinBoxMaxNeighborLinearDepthJumpMeters: 0.05
+  trustedThinBoxMaxNeighborWorldGapMeters: 0.08
+  trustedThinBoxMinGroupSamples: 24
+  trustedThinBoxMaxGroups: 8
+  trustedThinBoxMaxGroupResidualP95Meters: 0.035
+  trustedThinBoxMaxAspectRatio: 5
+  trustedThinBoxMaxSpanMeters: 0.35
+  trustedThinBoxUseTrimmedPlaneFit: 1
+  trustedThinBoxPlaneTrimKeepRatio: 0.8
+  trustedThinBoxPlaneRefineIterations: 2
+  trustedThinBoxExtentInlierResidualMultiplier: 1.25
+  trustedThinBoxLineWidthMeters: 0.006
+  trustedThinBoxPaddingMeters: 0.01
+  trustedThinBoxMinThicknessMeters: 0.012
+  trustedThinBoxColor: {r: 0.1, g: 1, b: 0.65, a: 0.55}
+  minTrustedSamplesPerSurfaceCell: 2
+  debugLog: 0
 --- !u!114 &920710000000000130
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9594,6 +9639,384 @@ MonoBehaviour:
   expectedNominalWindowDistanceMeters: 0.75
   maxDepthMeters: 8
   nearStuckDistanceMeters: 0.18
+--- !u!114 &920710000000000140
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0f3df9a1c1049f7a1c6a77f56c8c201, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sourceGrid: {fileID: 920710000000000003}
+  sourceCamera: {fileID: 2140226224}
+  linearDepthShader: {fileID: 4800000, guid: b2c5b6ef15e9447ca4ee3f3de0d45f15, type: 3}
+  previewShader: {fileID: 4800000, guid: 7c6a61b3f07f4f9db9d518fe42069d44, type: 3}
+  previewLineShader: {fileID: 4800000, guid: e21cb34ef41042d384e9ff5f38a77e90, type: 3}
+  viewSourceMode: 0
+  useSourceFacingBoundsCamera: 1
+  useDiagnosticBoundsCamera: 0
+  boundsCameraPadding: 1.08
+  textureWidth: 64
+  textureHeight: 64
+  nearClipMeters: 0.03
+  farClipMeters: 8
+  captureEveryFrame: 1
+  captureFrameInterval: 5
+  requestReadbackStats: 1
+  statsLogFrameInterval: 30
+  logCameraAndBoundsDiagnostics: 1
+  debugLog: 1
+  showPatchPreview: 0
+  previewLocalPosition: {x: 0.13, y: -0.22, z: 0.72}
+  previewSizeMeters: 0.22
+  previewDepthScaleMeters: 4
+  previewAlpha: 1
+  showProjectedMeshOutline: 0
+  projectedMeshOutlineColor: {r: 1, g: 1, b: 1, a: 0.95}
+--- !u!114 &920710000000000141
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f20d9e1ec4b445c3b711765eaf328210, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sourceCamera: {fileID: 2140226224}
+  followTarget: {fileID: 0}
+  rawDepthPreviewShader: {fileID: 4800000, guid: 43ac0191cb2d41849b7f920dd2157de3, type: 3}
+  sourceEye: 1
+  rawDepthDisplayScale: 0.25
+  previewAlpha: 1
+  showPixelCenterDots: 1
+  pixelCenterDotRadius: 0.18
+  pixelCenterDotAlpha: 0.9
+  pixelCenterDotColor: {r: 1, g: 1, b: 1, a: 1}
+  showWindow: 0
+  localPosition: {x: -0.25, y: -0.22, z: 0.72}
+  sizeMeters: 0.42
+  faceSourceCamera: 1
+  debugLog: 1
+--- !u!114 &920710000000000143
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0cb8e7c9343140dfb3cfdbe23d1928df, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  preprocessor: {fileID: 8442838744600988204}
+  sessionController: {fileID: 910400000000000003}
+  pointShader: {fileID: 4800000, guid: 64119f34cd124919a4c7d3e0f58e4db3, type: 3}
+  showPointCloud: 0
+  updateUntilSnapshot: 0
+  captureKey: 32
+  captureWhenSessionFrozen: 1
+  pixelStride: 1
+  maxPoints: 120000
+  minConfidence: 0.01
+  pointSizePixels: 18
+  pointSizeMeters: 0.006
+  pointAlpha: 1
+  pointBrightness: 1.8
+  colorMode: 0
+  colorDepthScaleMeters: 4
+  pointColor: {r: 0, g: 1, b: 1, a: 1}
+  stableDepthDeltaMeters: 0.015
+  edgeDepthDeltaMeters: 0.06
+  stableWorldDistanceMeters: 0.025
+  edgeWorldDistanceMeters: 0.08
+  stablePointColor: {r: 0, g: 0.95, b: 1, a: 1}
+  transitionPointColor: {r: 1, g: 0.85, b: 0, a: 1}
+  edgePointColor: {r: 1, g: 0, b: 0.05, a: 1}
+  isolatedPointColor: {r: 0.45, g: 0.45, b: 0.45, a: 1}
+  useNewBLCandidateView: 1
+  blStableAlpha: 0.42
+  blTransitionAlpha: 0.78
+  blEdgeAlpha: 1
+  blIsolatedAlpha: 0
+  blStableSizeScale: 0.45
+  blTransitionSizeScale: 0.7
+  blEdgeSizeScale: 1.2
+  blIsolatedSizeScale: 0.3
+  useNewBLDisplayDecimation: 1
+  blStableDisplayStep: 4
+  blTransitionDisplayStep: 2
+  blEdgeDisplayStep: 1
+  showLocalPatchGrid: 0
+  localPatchMaxChunks: 6
+  localPatchMinStablePoints: 90
+  localPatchRadiusMeters: 0.5
+  localPatchMaxPlaneDistanceMeters: 0.035
+  localPatchGridSpacingMeters: 0.06
+  localPatchMinPointsPerCell: 2
+  localPatchLineThicknessMeters: 0.008
+  localPatchMaxNeighborDistanceMeters: 0.055
+  localPatchGridColor: {r: 1, g: 1, b: 1, a: 0.82}
+  showOuterBoundaryRing: 0
+  outerBoundaryLineThicknessMeters: 0.006
+  outerBoundaryMaxLinkDistanceMeters: 0.08
+  outerBoundaryLinkSearchPixels: 3
+  outerBoundaryColor: {r: 1, g: 1, b: 1, a: 0.95}
+  exportOuterBoundaryCsvToDesktop: 0
+  debugLog: 1
+  exportSnapshotCsvToDesktop: 0
+  csvFilePrefix: ScanCover_RawDepthProjectedPoints
+--- !u!114 &920710000000000151
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920710000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a4d18fd0f47e4d68a7bc6d7e5a9b2461, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  depthGridPointCloud: {fileID: 920710000000000003}
+  captureCamera: {fileID: 0}
+  poseSource: {fileID: 0}
+  autoResolveRefs: 1
+  sessionGroupDirectoryName: RepeatCoverageSessions
+  sessionNamePrefix: ScanCover_RepeatCoverage
+  startSessionOnEnable: 0
+  captureFirstFrameOnStart: 1
+  captureWhileSessionActive: 1
+  maxFramesPerSession: 1800
+  minCaptureIntervalSeconds: 0.2
+  minMoveMeters: 0.04
+  minRotateDegrees: 6
+  requestFreshDepthGridBeforeCapture: 1
+  refreshWaitTimeoutSeconds: 0.35
+  exportGridStateCsv: 1
+  exportRawDepthProbe: 0
+  exportObservationStats: 1
+  exportQuest3ObservationBadnessStats: 0
+  rawDepthProbeShader: {fileID: 7200000, guid: 7b2e48fd68c44d36919dfcdbad722459, type: 3}
+  stabilityVoxelSizeMeters: 0.02
+  meshCreaseRiskAngleDegrees: 28
+  rawDepthHoleMinPixels: 8
+  rawDepthEdgeDepthJumpMeters: 0.08
+  gateFramesByRepeatCoverage: 0
+  repeatCoverageVoxelSizeMeters: 0.04
+  repeatCoverageMinDistinctHits: 3
+  repeatCoverageTargetStableVoxels: 12000
+  repeatCoverageMinCandidateVoxels: 600
+  repeatCoverageMinNewStableVoxelsPerFrame: 60
+  repeatCoverageMinNewOrRehitVoxelsPerFrame: 220
+  repeatCoverageMinParallaxMeters: 0.025
+  repeatCoverageMaxViewAngleDegrees: 72
+  trackRoomRawCoverage: 1
+  useLegacyFullViewRoomRawCapture: 1
+  roomRawCoverageHudOnlyCapture: 0
+  hideDepthGridPreviewWhileRecording: 1
+  lockRoomRawCoverageToStartView: 0
+  allowSameViewStableRoomRawHits: 1
+  roomRawCoverageVoxelSizeMeters: 0.08
+  roomRawCoverageTargetVoxels: 25000
+  roomRawCoverageTargetStableVoxels: 12000
+  roomRawCoverageTargetHighVoxels: 2500
+  roomRawCoverageTargetHighStableVoxels: 1200
+  roomRawCoverageTargetLowVoxels: 2500
+  roomRawCoverageTargetLowStableVoxels: 1200
+  roomRawCoverageStableHitTarget: 3
+  roomRawCoverageTargetPoseCells: 80
+  roomRawCoverageTargetValidSamples: 750000
+  roomRawCoverageTargetFrames: 180
+  roomRawCoverageLocalTargetVoxels: 6500
+  roomRawCoverageLocalTargetStableVoxels: 4200
+  roomRawCoverageLocalTargetValidSamples: 180000
+  roomRawCoverageLocalTargetFrames: 45
+  roomRawCoverageStableParallaxMeters: 0.03
+  roomRawCoveragePoseCellSizeMeters: 0.25
+  roomRawCoverageRiskViewAngleDegrees: 72
+  roomRawCoverageHighPointMinDeltaYMeters: 0.75
+  roomRawCoverageLowPointMinDeltaYMeters: 0.45
+  roomRawCoverageNeighborDepthJumpMeters: 0.08
+  roomRawCoverageTargetRiskRatio: 0.08
+  gateRoomRawCoverageFrames: 0
+  roomRawCoverageFocusMargin: 0.18
+  roomRawCoverageUseFallbackTolerance: 1
+  roomRawCoverageCoreMargin: 0.24
+  roomRawCoverageEdgeBufferMargin: 0.08
+  roomRawCoverageAnchorAngleFallbackDegrees: 8
+  roomRawCoverageAnchorMoveFallbackMeters: 0.12
+  roomRawCoverageMaxAnchorAngleDegrees: 14
+  roomRawCoverageMaxAnchorMoveMeters: 0.25
+  roomRawCoverageMinDepthMeters: 0.15
+  roomRawCoverageMaxDepthMeters: 5
+  roomRawCoverageMaxDepthProjectionErrorMeters: 0.45
+  roomRawCoverageMinFocusVoxels: 160
+  roomRawCoverageMinNewVoxelsPerFrame: 90
+  roomRawCoverageMinOverlapNewVoxelsPerFrame: 20
+  roomRawCoverageMinNewStableVoxelsPerFrame: 18
+  roomRawCoverageMinNewHighLowVoxelsPerFrame: 16
+  roomRawCoverageMinParallaxRehitVoxelsPerFrame: 30
+  roomRawCoverageMinOverlapRehitVoxelsPerFrame: 80
+  roomRawCoverageMinCoreVoxels: 80
+  roomRawCoverageMinEdgeBufferVoxels: 80
+  roomRawCoverageMinHistoryRehitVoxelsPerFrame: 120
+  roomRawCoverageMinRiskSamplesPerFrame: 80
+  loadPreviousRoomRawCoverageOnStart: 1
+  maxPreviousRoomRawCoverageSessionsToLoad: 1
+  previousRoomRawCoverageOverrideDirectory: 
+  autoStopLegacyRoomRawCoverageWhenTargetsComplete: 1
+  autoStopLegacyRoomRawCoverageOnPlateau: 1
+  legacyRoomRawCoverageMinFramesBeforePlateau: 24
+  legacyRoomRawCoveragePlateauSeconds: 8
+  legacyRoomRawCoveragePlateauMinCoveredVoxels: 140
+  legacyRoomRawCoveragePlateauMinStableVoxels: 28
+  enforceObservationOrderScoreGate: 1
+  autoStopLegacyRoomRawCoverageOnDisorder: 1
+  legacyRoomRawCoverageDisorderMinFrames: 3
+  legacyRoomRawCoverageDisorderConsecutiveFrames: 1
+  legacyRoomRawCoverageDisorderMinValidSamples: 96
+  legacyRoomRawCoverageDisorderRiskRatio: 0.18
+  legacyRoomRawCoverageDisorderMinUsefulVoxels: 12
+  legacyRoomRawCoverageDisorderLowUsefulRiskRatio: 0.16
+  useRawObservationOrderScore: 1
+  rawObservationOrderWarnRatio: 0.68
+  rawObservationOrderFuseRatio: 0.45
+  rawObservationOrderWarnBadEdgeRatio: 0.02
+  rawObservationOrderFuseBadEdgeRatio: 0.045
+  rawObservationOrderWarnCenterBadEdgeRatio: 0.015
+  rawObservationOrderFuseCenterBadEdgeRatio: 0.035
+  rawObservationOrderFuseBadQuadRatio: 0.06
+  rawObservationOrderMinEdges: 32
+  rawObservationOrderPixelStride: 1
+  rawObservationOrderMaxNeighborDistanceMeters: 0.18
+  rawObservationOrderDepthJumpMeters: 0.08
+  rawObservationOrderMinNormalDot: 0.15
+  rawObservationOrderQuadMaxDiagonalSkewMeters: 0.12
+  exportRoomRawDepthFrames: 1
+  exportRoomRawDepthOnlyAcceptedFrames: 0
+  roomRawDepthFrameStride: 1
+  roomRawDepthFocusOnly: 0
+  roomRawDepthMaxSamplesPerFrame: 0
+  showRoomRawDepthCompletionOverlay: 1
+  roomRawDepthCompletionOnlyWhileRecording: 0
+  roomRawDepthCompletionVoxelSizeMeters: 0.08
+  roomRawDepthCompletionMinHits: 3
+  roomRawDepthCompletionStableHits: 8
+  roomRawDepthCompletionMinAngleSpanDegrees: 12
+  roomRawDepthCompletionStableDepthStdMeters: 0.08
+  roomRawDepthCompletionHardDepthStdMeters: 0.2
+  roomRawDepthCompletionWarnRiskRatio: 0.25
+  roomRawDepthCompletionBadRiskRatio: 0.65
+  roomRawDepthCompletionUseVoxelCenterPresentation: 0
+  roomRawDepthCompletionUseGpuInstancing: 0
+  roomRawDepthCompletionPointSize: 0.025
+  roomRawDepthCompletionMaxVisualPoints: 1200
+  roomRawDepthCompletionRefreshSeconds: 0.25
+  useSnapshotGridCaptureMask: 1
+  snapshotGridMaskRequiredForRawDepthExport: 0
+  snapshotGridCaptureRadiusMeters: 0.08
+  snapshotGridSeenHits: 2
+  snapshotGridStableHits: 6
+  snapshotGridRiskRatio: 0.35
+  snapshotGridPendingColor: {r: 0.35, g: 0.35, b: 0.35, a: 1}
+  snapshotGridSeenColor: {r: 1, g: 0.82, b: 0.16, a: 1}
+  snapshotGridStableColor: {r: 0.2, g: 0.86, b: 0.38, a: 1}
+  snapshotGridRiskColor: {r: 1, g: 0.16, b: 0.12, a: 1}
+  targetBadnessFrames: 120
+  targetBadnessInvalidFrames: 20
+  targetBadnessLargeHoleFrames: 12
+  targetBadnessEdgeJumpFrames: 60
+  targetBadnessPersistentInvalidFrames: 12
+  minBadnessInvalidPixelsPerEye: 1
+  minBadnessEdgeRiskPixelsPerEye: 500
+  gateFramesByObservationTargets: 0
+  observationCaptureMode: 0
+  targetFramesPerObservationBucket: 60
+  useMultiCoreObservationTargets: 1
+  targetFramesPerCoreMetric: 45
+  targetNearEdgeSupplementFrames: 45
+  minStableMainPointsPerFrame: 450
+  minCoverageBandPointsPerFrame: 450
+  minTypeBucketPointsPerFrame: 260
+  minRiskLayerPointsPerFrame: 120
+  minFarSurfacePointsPerFrame: 300
+  minHighAngleRiskPointsPerFrame: 80
+  minNearEdgeRiskPointsPerFrame: 80
+  minNearEdgeSupplementRiskPointsPerFrame: 80
+  minNearEdgeSupplementCreasePointsPerFrame: 60
+  minNearEdgeSupplementBoundaryPointsPerFrame: 40
+  minDirectedMainPointsPerFrame: 180
+  minDirectionalBoundaryPointsPerFrame: 60
+  minCornerJunctionPointsPerFrame: 60
+  farSurfaceDistanceRangeMeters: {x: 3, y: 5}
+  midSurfaceDistanceRangeMeters: {x: 1, y: 3}
+  nearEdgeDistanceRangeMeters: {x: 0.3, y: 1}
+  nearSurfaceDistanceRangeMeters: {x: 0.3, y: 1}
+  stableMainMaxAngleDegrees: 45
+  frontViewMaxAngleDegrees: 40
+  obliqueViewMinAngleDegrees: 40
+  obliqueViewMaxAngleDegrees: 75
+  highAngleThresholdDegrees: 60
+  nearEdgeSupplementObliqueMinAngleDegrees: 35
+  nearEdgeSupplementExtremeMinAngleDegrees: 60
+  verticalCoverageBandRatio: 0.28
+  directionalSideThreshold: 0.22
+  enableKeyboardInput: 1
+  keyboardStartStopKey: 66
+  keyboardCaptureNowKey: 67
+  enableOvrInput: 1
+  enableOvrCaptureNowInput: 0
+  ovrStartStopButton: 2
+  ovrCaptureNowButton: 1
+  showHud: 1
+  hudLocalPosition: {x: 0, y: -0.12, z: 0.95}
+  hudLocalEuler: {x: 0, y: 0, z: 0}
+  hudLocalScale: {x: 0.00135, y: 0.00135, z: 0.00135}
+  hudPanelWidth: 820
+  hudPanelHeight: 420
+  hudRefreshIntervalSeconds: 0.15
+  hudIdleColor: {r: 0.78, g: 0.9, b: 1, a: 1}
+  hudRecordingColor: {r: 0.45, g: 1, b: 0.62, a: 1}
+  hudPendingColor: {r: 1, g: 0.86, b: 0.28, a: 1}
+  showRoomRawCoverageViewFrame: 0
+  roomRawCoverageViewFrameLocalPosition: {x: 0, y: 0, z: 1.05}
+  roomRawCoverageViewFrameWidth: 0.72
+  roomRawCoverageViewFrameHeight: 0.46
+  roomRawCoverageViewFrameLineWidth: 0.006
+  roomRawCoverageViewFrameIdleColor: {r: 0, g: 0.85, b: 1, a: 0.9}
+  roomRawCoverageViewFrameRecordingColor: {r: 0.25, g: 1, b: 0.35, a: 1}
+  roomRawCoverageViewFrameOutOfAnchorColor: {r: 1, g: 0.25, b: 0.15, a: 1}
+  freezeRoomRawCoverageViewFrameWhileRecording: 0
+  roomRawCoverageViewFrameLeaveMargin: 0.08
+  roomRawCoverageViewFrameVerticalLeaveMargin: 0.22
+  roomRawCoverageViewFrameTopExtraLeaveMargin: 0.18
+  showRoomRawCoverageTileHints: 0
+  roomRawCoverageTileColumns: 5
+  roomRawCoverageTileRows: 3
+  roomRawCoverageTileTargetCoveredVoxels: 28
+  roomRawCoverageTileTargetStableVoxels: 10
+  roomRawCoverageTileLineWidth: 0.003
+  roomRawCoverageTileMissingColor: {r: 1, g: 0.08, b: 0.04, a: 0.95}
+  roomRawCoverageTilePartialColor: {r: 1, g: 0.82, b: 0.05, a: 0.95}
+  roomRawCoverageTileCompleteColor: {r: 0.08, g: 1, b: 0.32, a: 0.95}
+  showRoomRawCoverageReticle: 0
+  roomRawCoverageReticleSize: 0.055
+  roomRawCoverageReticleLineWidth: 0.006
+  roomRawCoverageReticleColor: {r: 0, g: 1, b: 1, a: 1}
+  roomRawCoverageAimTileLineWidthMultiplier: 2.4
+  showRoomRawCoveragePreviewPoints: 0
+  roomRawCoveragePreviewMaxPoints: 700
+  roomRawCoveragePreviewPointSize: 0.008
+  roomRawCoveragePreviewRefreshSeconds: 0.18
+  roomRawCoveragePreviewUniformColor: {r: 0.55, g: 0.55, b: 0.55, a: 1}
 --- !u!1 &921511106590967570
 GameObject:
   m_ObjectHideFlags: 0

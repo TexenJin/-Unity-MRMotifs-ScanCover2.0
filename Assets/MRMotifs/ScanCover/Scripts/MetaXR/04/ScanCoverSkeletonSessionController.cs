@@ -98,6 +98,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public bool exportSnapshotObjOnFreeze = false;
     public bool exportAllSnapshotsAsSingleObjOnFreeze = false;
     public bool exportIncrementalReferenceShellOnFreeze = false;
+    public bool exportBlSurfaceMeshObjOnFreeze = true;
+    public bool exportGridNodeCsvOnFreeze = true;
     public bool exportGridStateJsonOnFreeze = false;
 
     public SessionState State { get; private set; } = SessionState.Idle;
@@ -200,6 +202,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void CaptureSnapshotNow()
     {
         ResolveRefs();
+        if (exportBlSurfaceMeshObjOnFreeze && depthGridPointCloud != null)
+            depthGridPointCloud.RequestExportSurfaceMeshObjAfterNextBuild();
 
         if (useDepthPointBurstWindowRoute)
         {
@@ -264,6 +268,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public void FreezeAndBuild()
     {
         ResolveRefs();
+        if (exportBlSurfaceMeshObjOnFreeze && depthGridPointCloud != null)
+            depthGridPointCloud.RequestExportSurfaceMeshObjAfterNextBuild();
 
         if (useDepthPointBurstWindowRoute)
         {
@@ -313,6 +319,9 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             if (exportIncrementalReferenceShellOnFreeze)
                 surfaceSnapshotManager.ExportIncrementalReferenceShellAsObj();
         }
+
+        if (exportGridNodeCsvOnFreeze && depthGridPointCloud != null)
+            depthGridPointCloud.ExportCurrentGridNodesAsCsv(out _);
 
         if (exportGridStateJsonOnFreeze && depthGridPointCloud != null)
             depthGridPointCloud.ExportCurrentGridStateAsJson(out _);
@@ -458,6 +467,9 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
 
         if (runFreezeExports)
             RunFreezeExports();
+
+        if (exportGridNodeCsvOnFreeze && runFreezeExports && depthGridPointCloud != null)
+            depthGridPointCloud.ExportCurrentGridNodesAsCsv(out _);
 
         if (exportGridStateJsonOnFreeze && runFreezeExports && depthGridPointCloud != null)
             depthGridPointCloud.ExportCurrentGridStateAsJson(out _);

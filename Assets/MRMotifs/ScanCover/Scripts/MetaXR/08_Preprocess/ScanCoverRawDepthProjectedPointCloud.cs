@@ -47,6 +47,21 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
     [SerializeField] private Color edgePointColor = new Color(1f, 0f, 0.05f, 1f);
     [SerializeField] private Color isolatedPointColor = new Color(0.45f, 0.45f, 0.45f, 1f);
 
+    [Header("New BL Candidate")]
+    [SerializeField] private bool useNewBLCandidateView = true;
+    [SerializeField, Range(0f, 1f)] private float blStableAlpha = 0.42f;
+    [SerializeField, Range(0f, 1f)] private float blTransitionAlpha = 0.78f;
+    [SerializeField, Range(0f, 1f)] private float blEdgeAlpha = 1f;
+    [SerializeField, Range(0f, 1f)] private float blIsolatedAlpha = 0f;
+    [SerializeField, Min(0.05f)] private float blStableSizeScale = 0.45f;
+    [SerializeField, Min(0.05f)] private float blTransitionSizeScale = 0.7f;
+    [SerializeField, Min(0.05f)] private float blEdgeSizeScale = 1.2f;
+    [SerializeField, Min(0.05f)] private float blIsolatedSizeScale = 0.3f;
+    [SerializeField] private bool useNewBLDisplayDecimation = true;
+    [SerializeField, Min(1)] private int blStableDisplayStep = 4;
+    [SerializeField, Min(1)] private int blTransitionDisplayStep = 2;
+    [SerializeField, Min(1)] private int blEdgeDisplayStep = 1;
+
     [Header("Local Patch Grid")]
     [SerializeField] private bool showLocalPatchGrid = false;
     [SerializeField, Min(1)] private int localPatchMaxChunks = 6;
@@ -94,6 +109,7 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
     private ScanCoverSkeletonSessionController.SessionState _lastSessionState;
     private readonly List<Vector3> _vertices = new List<Vector3>(65536);
     private readonly List<Color> _colors = new List<Color>(65536);
+    private readonly List<float> _pointSizeScales = new List<float>(65536);
     private readonly List<int> _indices = new List<int>(65536);
     private readonly List<Vector3> _renderVertices = new List<Vector3>(262144);
     private readonly List<Color> _renderColors = new List<Color>(262144);
@@ -227,6 +243,7 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
     {
         _vertices.Clear();
         _colors.Clear();
+        _pointSizeScales.Clear();
         _indices.Clear();
         _renderVertices.Clear();
         _renderColors.Clear();
@@ -299,6 +316,7 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
 
         _vertices.Clear();
         _colors.Clear();
+        _pointSizeScales.Clear();
         _indices.Clear();
         _renderVertices.Clear();
         _renderColors.Clear();
@@ -340,6 +358,7 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
                 int vertexIndex = _vertices.Count;
                 _vertices.Add(point);
                 _colors.Add(pointColor);
+                _pointSizeScales.Add(1f);
                 _indices.Add(vertexIndex);
                 vertexByPixel[index] = vertexIndex;
                 _records.Add(new PointRecord
@@ -400,11 +419,19 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
         {
             Vector3 point = _vertices[i];
             Color color = _colors[i];
+            if (color.a <= 0.001f)
+                continue;
+            if (i < _records.Count && !PointDiagnosticVisible(_records[i]))
+                continue;
+
+            float sizeScale = i < _pointSizeScales.Count ? Mathf.Max(0.05f, _pointSizeScales[i]) : 1f;
+            Vector3 scaledXOffset = xOffset * sizeScale;
+            Vector3 scaledYOffset = yOffset * sizeScale;
             int start = _renderVertices.Count;
-            _renderVertices.Add(point - xOffset - yOffset);
-            _renderVertices.Add(point - xOffset + yOffset);
-            _renderVertices.Add(point + xOffset + yOffset);
-            _renderVertices.Add(point + xOffset - yOffset);
+            _renderVertices.Add(point - scaledXOffset - scaledYOffset);
+            _renderVertices.Add(point - scaledXOffset + scaledYOffset);
+            _renderVertices.Add(point + scaledXOffset + scaledYOffset);
+            _renderVertices.Add(point + scaledXOffset - scaledYOffset);
             _renderColors.Add(color);
             _renderColors.Add(color);
             _renderColors.Add(color);
@@ -1229,6 +1256,7 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
 
             _records[i] = record;
             _colors[vertexIndex] = PointDiagnosticColor(record);
+            _pointSizeScales[vertexIndex] = PointDiagnosticSizeScale(record);
         }
     }
 
@@ -1301,8 +1329,64 @@ public sealed class ScanCoverRawDepthProjectedPointCloud : MonoBehaviour
             EdgeClass.Edge => edgePointColor,
             _ => isolatedPointColor
         };
-        color.a = pointAlpha;
+        color.a = pointAlpha * PointDiagnosticAlpha(record);
         return color;
+    }
+
+    private float PointDiagnosticAlpha(PointRecord record)
+    {
+        if (!useNewBLCandidateView)
+            return 1f;
+
+        return record.EdgeClass switch
+        {
+            EdgeClass.Stable => blStableAlpha,
+            EdgeClass.Transition => blTransitionAlpha,
+            EdgeClass.Edge => blEdgeAlpha,
+            _ => blIsolatedAlpha
+        };
+    }
+
+    private float PointDiagnosticSizeScale(PointRecord record)
+    {
+        if (!useNewBLCandidateView)
+            return 1f;
+
+        return record.EdgeClass switch
+        {
+            EdgeClass.Stable => blStableSizeScale,
+            EdgeClass.Transition => blTransitionSizeScale,
+            EdgeClass.Edge => blEdgeSizeScale,
+            _ => blIsolatedSizeScale
+        };
+    }
+
+    private bool PointDiagnosticVisible(PointRecord record)
+    {
+        if (!useNewBLCandidateView || !useNewBLDisplayDecimation)
+            return true;
+
+        int step = record.EdgeClass switch
+        {
+            EdgeClass.Stable => blStableDisplayStep,
+            EdgeClass.Transition => blTransitionDisplayStep,
+            EdgeClass.Edge => blEdgeDisplayStep,
+            _ => int.MaxValue
+        };
+        if (step <= 1)
+            return true;
+        if (step == int.MaxValue)
+            return false;
+
+        int sampleStep = Mathf.Max(1, pixelStride) * step;
+        return PositiveModulo(record.PixelX, sampleStep) == 0
+            && PositiveModulo(record.PixelY, sampleStep) == 0;
+    }
+
+    private static int PositiveModulo(int value, int divisor)
+    {
+        int result = value % divisor;
+        return result < 0 ? result + divisor : result;
     }
 
     private static void WriteOptionalFloat(StreamWriter writer, float value)

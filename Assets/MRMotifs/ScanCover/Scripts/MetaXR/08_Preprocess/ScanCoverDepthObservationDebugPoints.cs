@@ -17,7 +17,7 @@ public sealed class ScanCoverDepthObservationDebugPoints : MonoBehaviour
     [SerializeField, Min(0f)] private float surfaceBiasMeters = 0.0015f;
     [SerializeField] private bool orientToNormal = false;
     [SerializeField, Min(0.001f)] private float fallbackMarkerScaleMeters = 0.05f;
-    [SerializeField] private Gradient confidenceGradient;
+    [SerializeField] private Color debugPointUniformColor = new Color(0.55f, 0.55f, 0.55f, 1f);
 
     [Header("Sanity")]
     [SerializeField] private bool forceCameraRelativePreview;
@@ -36,23 +36,7 @@ public sealed class ScanCoverDepthObservationDebugPoints : MonoBehaviour
 
     private void Reset()
     {
-        if (confidenceGradient == null || confidenceGradient.colorKeys == null || confidenceGradient.colorKeys.Length == 0)
-        {
-            confidenceGradient = new Gradient
-            {
-                colorKeys = new[]
-                {
-                    new GradientColorKey(Color.red, 0f),
-                    new GradientColorKey(Color.yellow, 0.5f),
-                    new GradientColorKey(Color.cyan, 1f),
-                },
-                alphaKeys = new[]
-                {
-                    new GradientAlphaKey(1f, 0f),
-                    new GradientAlphaKey(1f, 1f),
-                }
-            };
-        }
+        debugPointUniformColor = new Color(0.55f, 0.55f, 0.55f, 1f);
     }
 
     private void Awake()
@@ -142,7 +126,7 @@ public sealed class ScanCoverDepthObservationDebugPoints : MonoBehaviour
             if (orientToNormal && observation.worldNormal.sqrMagnitude > 1e-6f)
                 marker.transform.rotation = Quaternion.LookRotation(observation.worldNormal.normalized, Vector3.up);
 
-            ApplyColor(i, confidenceGradient.Evaluate(Mathf.Clamp01(observation.confidence)));
+            ApplyColor(i, debugPointUniformColor);
             if (!marker.activeSelf)
                 marker.SetActive(true);
         }

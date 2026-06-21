@@ -79,7 +79,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(0.1f)] private float maxLinearDepthMeters = 8f;
 
     [Header("Sampling Window Display")]
-    [SerializeField] private bool showSamplingWindow = true;
+    [SerializeField] private bool showSamplingWindow = false;
     [SerializeField, Min(0.05f)] private float samplingWindowDistanceMeters = 0.75f;
     [SerializeField, Min(0.1f)] private float samplingWindowScale = 1f;
     [SerializeField] private Color samplingWindowColor = new Color(0f, 1f, 1f, 0.9f);
@@ -103,7 +103,7 @@ public sealed class ScanCoverDepthPointBurstWindow : MonoBehaviour
     [SerializeField, Min(4)] private int terrainDiagnosticsPatchPixels = 96;
     [SerializeField] private bool terrainDiagnosticsUsePureRandomSampling = false;
     [SerializeField] private bool terrainDiagnosticsKeepPointClassification = true;
-    [SerializeField] private bool terrainDiagnosticsShowSamplingWindow = true;
+    [SerializeField] private bool terrainDiagnosticsShowSamplingWindow = false;
 
     [Header("Terrain Cell Classification")]
     [SerializeField] private bool terrainDiagnosticsDisplayAggregatedCells = true;

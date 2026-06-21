@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -37,6 +37,18 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         public GridStateEntry[] entries;
     }
 
+    [Serializable]
+    public sealed class RawDepthFrameSnapshot
+    {
+        public string componentName;
+        public int frameIndex;
+        public int resolutionWidth;
+        public int resolutionHeight;
+        public Vector3[] worldPositions;
+        public Vector3[] worldNormals;
+        public Color[] observationMeta;
+    }
+
     private enum SamplingMode { RegularGrid, AdaptiveTiles, ViewLockedVolume }
     private enum VolumeFace { Front, Left, Right, Top, Bottom }
     private enum GridInteriorDisplayMode { Hidden, Mesh }
@@ -44,29 +56,37 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private struct GridGroup { public int startIndex, columns, rows, group; public VolumeFace face; }
     private struct VolumeBin { public bool hasValue; public int sampleCount; public float weightSum, confidenceSum, bestPlaneDistance; public Vector3 weightedPosition, weightedNormal; }
     private struct DirectGridPlaneCandidate { public int group, startRow, endRow, startCol, endCol, pointCount; public float score, halfWidth, halfHeight; public Vector3 center, normal, right, up; }
+    private struct PlaneFamilySample { public Vector3 point, normal; public bool active; }
+    private struct PlaneFamilyModel { public Vector3 center, normal; public float d; public int inlierCount; }
+    private struct PlaneFamilyProjection { public bool valid; public Vector3 right, up; public float minU, maxU, minV, maxV; }
 
     [Header("Refs")] [SerializeField] private ScanCoverDepthPreprocessor preprocessor; [SerializeField] private GameObject markerPrefab; [SerializeField] private Transform markerParent;
 [Header("Sampling")] [SerializeField] private SamplingMode samplingMode = SamplingMode.RegularGrid; [SerializeField, Min(1)] private int stridePixels = 4; [SerializeField, Min(0)] private int stridePixelsX = 0; [SerializeField, Min(0)] private int stridePixelsY = 0; [SerializeField, Min(0)] private int regularGridMaxColumns = 30; [SerializeField, Min(0)] private int regularGridMaxRows = 40; [SerializeField] private bool centerRegularGridWindow = true; [SerializeField] private bool centerRegularGridWindowOnHeadsetForward = true; [SerializeField] private bool regularGridUseViewportCoverage = true; [SerializeField, Range(0.25f, 1.25f)] private float regularGridViewportCoverageScale = 1f; [SerializeField] private bool regularGridUseFixedWorldSize = false; [SerializeField] private bool regularGridUseDepthHitPlaneOnly = false; [SerializeField] private bool regularGridUseVerticalDepthPlaneExperiment = false; [SerializeField] private bool regularGridUseSurfacePlaneAxesForVerticalDepthGrid = false; [SerializeField, Range(0f, 1f)] private float verticalDepthGridSurfaceAxisMinFacingDot = 0.18f; [SerializeField, Range(0f, 1f)] private float verticalDepthGridSurfaceAxisMaxWorldUpDot = 0.82f; [SerializeField, Range(0.25f, 2f)] private float verticalDepthGridSampleRadiusMultiplier = 0.85f; [SerializeField, Min(0.02f)] private float verticalDepthGridMaxForwardOffsetMeters = 2.5f; [SerializeField, Min(0.005f)] private float regularGridWorldCellSizeMeters = 0.04f; [SerializeField, Range(0.25f, 1.5f)] private float regularGridFixedWorldWindowScale = 0.5f; [SerializeField] private bool regularGridUseSmoothDistanceScale = true; [SerializeField, Range(0.01f, 4f)] private float regularGridFarMinStepPixels = 0.05f; [SerializeField, Range(0.01f, 4f)] private float regularGridStepSoftFloorPixels = 0.1f; [SerializeField, Min(1)] private int regularGridFixedWorldDepthFillRadiusPixels = 4; [SerializeField] private bool depthPixelVFlip = false;
     [Header("Adaptive Tiles")] [SerializeField, Min(2)] private int adaptiveTileSizePixels = 8; [SerializeField, Min(1)] private int adaptiveTileSampleStride = 1; [SerializeField, Range(0f, 1f)] private float adaptiveMinTileValidRatio = 0.25f; [SerializeField, Range(-1f, 1f)] private float adaptiveMinNormalDot = 0.72f; [SerializeField, Min(0f)] private float adaptiveMaxPlaneDeviationMeters = 0.03f;
     [Header("View Locked Volume")] [SerializeField] private Transform viewLockedOrigin; [SerializeField] private bool volumeLockPitch = true; [SerializeField] private bool volumeLockRoll = true; [SerializeField, Min(0.05f)] private float volumeForwardOffsetMeters = 1.2f; [SerializeField] private Vector3 volumeHalfExtents = new Vector3(1.2f, 0.9f, 0.8f); [SerializeField, Min(0.02f)] private float volumeFaceSampleMeters = 0.04f; [SerializeField, Min(0f)] private float volumeCapturePaddingMeters = 0.08f; [SerializeField] private bool volumeUseSideFaces = true; [SerializeField] private bool volumeUseTopBottomFaces = true; [SerializeField, Range(0f, 1f)] private float volumeMinBinCoverage = 0.2f; [SerializeField, Range(-1f, 1f)] private float volumeMinFaceNormalDot = -1f; [SerializeField, Min(0f)] private float volumePlaneBlendMeters = 0.06f;
-    [Header("Filter")] [SerializeField, Range(0f, 1f)] private float minConfidence = 0.2f; [SerializeField, Min(0f)] private float minLinearDepthMeters = 0.35f; [SerializeField, Min(0f)] private float maxLinearDepthMeters = 6f; [SerializeField] private bool requireValidNormal = false; [SerializeField] private bool neighborFill = true; [SerializeField, Min(1)] private int neighborRadiusPixels = 1;
-    [Header("Markers")] [SerializeField] private bool showMarkers = false; [SerializeField] private bool updateEveryFrame = true; [SerializeField] private bool orientToNormal = false; [SerializeField, Min(0f)] private float surfaceBiasMeters = 0.0015f; [SerializeField, Min(0.001f)] private float fallbackMarkerScaleMeters = 0.012f; [SerializeField] private Gradient confidenceGradient;
+    [Header("Filter")] [SerializeField, Range(0f, 1f)] private float minConfidence = 0.2f; [SerializeField, Min(0f)] private float minLinearDepthMeters = 0.35f; [SerializeField, Min(0f)] private float maxLinearDepthMeters = 5f; [SerializeField] private bool requireValidNormal = false; [SerializeField] private bool neighborFill = true; [SerializeField, Min(1)] private int neighborRadiusPixels = 1;
+    [Header("Markers")] [SerializeField] private bool showMarkers = false; [SerializeField] private bool updateEveryFrame = true; [SerializeField] private bool orientToNormal = false; [SerializeField, Min(0f)] private float surfaceBiasMeters = 0.0015f; [SerializeField, Min(0.001f)] private float fallbackMarkerScaleMeters = 0.012f; [SerializeField] private Color snapshotGridUniformColor = new Color(0.55f, 0.55f, 0.55f, 1f);
     [Header("Preview Visibility")] [SerializeField] private bool previewDisplayVisible = true;
     [Header("Display Frame")] [SerializeField] private bool useWorldSpaceDisplayRoots = false; [SerializeField] private bool lockUnfrozenDisplayRoll = false; [SerializeField] private bool lockUnfrozenDisplayPitch = false; [SerializeField] private bool lockUnfrozenDisplayYaw = false; [SerializeField] private bool compensateRegularGridRollSampling = false; [SerializeField] private bool showRuntimeAxisDebug = false; [SerializeField] private Vector3 runtimeAxisOffset = new Vector3(0f, 0f, 0.8f); [SerializeField, Min(0.01f)] private float runtimeAxisCubeSize = 0.12f; [SerializeField, Min(0.02f)] private float runtimeAxisLength = 0.4f; [SerializeField, Min(0.002f)] private float runtimeAxisThickness = 0.03f;
     [Header("Grid Lines")] [SerializeField] private bool showGridLines = false; [SerializeField] private bool showGridOuterContourOnly = true; [SerializeField] private bool showRectilinearFillInsideContour = false; [SerializeField, Range(1, 4)] private int rectilinearRennetStride = 2; [SerializeField, Range(0f, 1f)] private float rectilinearRennetMinNormalDot = 0.45f; [SerializeField, Range(1f, 8f)] private float rectilinearRennetMaxEdgeSpanMultiplier = 3f; [SerializeField] private bool showGridTriangulation = false; [SerializeField] private bool rectifyGridLinesAfterDepthWrap = false; [SerializeField] private bool gridLineRequireContinuousSurface = true; [SerializeField, Range(1.05f, 6f)] private float rectifiedGridLineMaxSpanMultiplier = 2.35f; [SerializeField, Range(0f, 1f)] private float rectifiedGridLineMinValidRatio = 0.18f; [SerializeField, Range(-1f, 1f)] private float gridLineMinNeighborNormalDot = 0.2f; [SerializeField] private bool gridLineRequireCompleteCellSupport = false; [SerializeField, Min(1)] private int gridLineMinCompleteCellIslandCount = 8; [SerializeField, Min(1)] private int gridLineKeepLargestCompleteCellIslands = 1; [SerializeField] private Material gridLineMaterialOverride; [SerializeField] private Color gridLineColor = Color.white; [SerializeField, Min(0f)] private float gridLineSurfaceOffsetMeters = 0.004f; [SerializeField] private bool gridLinesRenderBehindCandidatePatch = false; [SerializeField] private bool syncGridLinesToFocusedCandidate = false; [SerializeField, Min(0f)] private float focusedGridPlaneToleranceMeters = 0.08f; [SerializeField, Min(0f)] private float focusedGridExpandMeters = 0.06f;
     [Header("Grid Interior Display")] [SerializeField] private bool showGridInteriorMesh = false; [SerializeField] private GridInteriorDisplayMode gridInteriorDisplayMode = GridInteriorDisplayMode.Hidden;
     [Header("Surface Mesh")] [SerializeField] private bool showSurfaceMesh = false; [SerializeField] private bool keepSurfaceMeshAvailableWhenHidden = false; [SerializeField] private bool useIndexConnectivity = true; [SerializeField] private Material surfaceMaterialOverride; [SerializeField, Min(0.01f)] private float maxEdgeLengthMeters = 0.20f; [SerializeField, Range(-1f, 1f)] private float minNeighborNormalDot = 0.35f; [SerializeField] private Color surfaceColor = new Color(0.18f, 0.95f, 0.98f, 1f); [SerializeField] private bool surfaceDoubleSided = true;
+    [Header("Geometric Surface Grid")] [SerializeField] private bool showGeometricSurfaceGrid = true; [SerializeField] private bool geometricSurfaceGridUseRansacPatches = true; [SerializeField, Min(0.01f)] private float geometricSurfaceGridSpacingMeters = 0.12f; [SerializeField, Min(0.0005f)] private float geometricSurfaceGridLineWidthMeters = 0.0035f; [SerializeField, Min(0f)] private float geometricSurfaceGridSurfaceOffsetMeters = 0.008f; [SerializeField] private Color geometricSurfaceGridColor = new Color(1f, 1f, 1f, 0.92f); [SerializeField, Range(128, 2048)] private int ransacPatchMaxSamples = 768; [SerializeField, Range(8, 128)] private int ransacPatchIterations = 48; [SerializeField, Range(1, 4)] private int ransacPatchPlanesPerBucket = 2; [SerializeField, Range(0.005f, 0.12f)] private float ransacPatchInlierDistanceMeters = 0.035f; [SerializeField, Range(0.25f, 0.98f)] private float ransacPatchNormalDot = 0.72f; [SerializeField, Min(8)] private int ransacPatchMinInliers = 28; [SerializeField, Min(0.04f)] private float ransacPatchGridCellMeters = 0.18f; [SerializeField, Range(4, 48)] private int ransacPatchMaxGridCellsPerAxis = 24;
+    [Header("Probe Row Experiment")] [SerializeField] private bool showProbeRowExperiment = false; [SerializeField] private bool probeRowUseCurrentMeshHorizontalExtent = true; [SerializeField, Min(2)] private int probeRowPointCount = 13; [SerializeField, Min(2)] private int probeRowMaxPointCount = 128; [SerializeField, Min(0.005f)] private float probeRowSpacingMeters = 0.06f; [SerializeField, Min(0f)] private float probeRowHorizontalPaddingMeters = 0.12f; [SerializeField, Min(0.05f)] private float probeRowTargetDistanceMeters = 1.2f; [SerializeField, Min(0.1f)] private float probeRowMaxRayDistanceMeters = 6f; [SerializeField, Min(0.005f)] private float probeRowMarkerScaleMeters = 0.025f; [SerializeField, Min(0.0005f)] private float probeRowLineWidthMeters = 0.006f; [SerializeField, Min(0f)] private float probeRowSurfaceOffsetMeters = 0.012f; [SerializeField, Min(0.005f)] private float probeRowRecognitionRadiusMeters = 0.09f; [SerializeField, Min(1)] private int probeRowMinNeighborhoodSamples = 3; [SerializeField, Range(-1f, 1f)] private float probeRowStableNormalDot = 0.82f; [SerializeField, Range(-1f, 1f)] private float probeRowRefineNormalDot = 0.45f; [SerializeField, Min(0.001f)] private float probeRowStablePlaneDeviationMeters = 0.025f; [SerializeField, Range(1f, 5f)] private float probeRowStableDistanceMultiplier = 1.8f; [SerializeField, Range(1f, 8f)] private float probeRowRefineDistanceMultiplier = 3.0f; [SerializeField] private Color probeRowPointColor = new Color(0f, 1f, 1f, 1f); [SerializeField] private Color probeRowStableLineColor = new Color(0.1f, 1f, 0.3f, 1f); [SerializeField] private Color probeRowRefineLineColor = new Color(1f, 0.85f, 0.05f, 1f); [SerializeField] private Color probeRowBreakLineColor = new Color(1f, 0.08f, 0.08f, 1f);
     [Header("Height Slice Contour")] [SerializeField] private bool showHeightSliceContour = false; [SerializeField] private bool heightSliceUseFrozenScreenCenterHeight = true; [SerializeField, Min(1)] private int heightSliceRowCount = 32; [SerializeField] private bool heightSliceShowPerpendicularColumns = true; [SerializeField, Min(1)] private int heightSliceColumnCount = 32; [SerializeField] private bool showHeightSlicePlaneFrame = true; [SerializeField] private bool heightSliceShowSampleColumnPlaneFrames = false; [SerializeField, Range(1, 16)] private int heightSliceSampleColumnPlaneFrameCount = 5; [SerializeField, Min(0.001f)] private float heightSliceEpsilonMeters = 0.01f; [SerializeField, Min(0.01f)] private float heightSliceMaxSegmentMeters = 0.28f; [SerializeField, Min(0.0005f)] private float heightSliceLineWidthMeters = 0.006f; [SerializeField] private Color heightSliceContourColor = new Color(0.08f, 0.85f, 1f, 0.95f); [SerializeField] private Color heightSlicePlaneFrameColor = new Color(1f, 1f, 1f, 0.35f);
-    [Header("Surface Regions")] [SerializeField] private bool colorizeSurfaceRegions = true; [SerializeField] private bool showIrregularSurfaceBucket = true; [SerializeField, Range(0f, 1f)] private float irregularSurfaceBucketAlpha = 0.18f; [SerializeField, Range(1f, 89f)] private float surfaceRegionCreaseAngleDegrees = 12f; [SerializeField, Min(1)] private int surfaceRegionMinQuadCount = 12; [SerializeField, Range(1f, 45f)] private float surfaceNormalPatchMergeAngleDegrees = 10f; [SerializeField, Range(1f, 45f)] private float surfaceNormalFamilyAngleDegrees = 18f; [SerializeField, Range(0.5f, 0.999f)] private float surfaceNormalAxisBucketMinDot = 0.82f; [SerializeField, Min(1)] private int surfaceLargeComponentMinTriangleCount = 48; [SerializeField, Range(0.05f, 1f)] private float surfaceLargeComponentKeepRatio = 0.22f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxNeighborDistanceMeters = 0.12f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxPlaneOffsetMeters = 0.03f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorSaturation = 0.62f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorValue = 0.95f;
+    [Header("Plane Family Classification")] [SerializeField] private bool showPlaneFamilyClassification = false; [SerializeField] private bool planeFamilyDisplayAsPointQuads = false; [SerializeField, Min(0.002f)] private float planeFamilyPointSizeMeters = 0.014f; [SerializeField, Range(128, 4096)] private int planeFamilyMaxSamples = 4096; [SerializeField, Range(8, 256)] private int planeFamilyRansacIterations = 96; [SerializeField, Range(1, 16)] private int planeFamilyMaxFamilies = 10; [SerializeField, Min(12)] private int planeFamilyMinInliers = 96; [SerializeField, Range(0.005f, 0.15f)] private float planeFamilyFitDistanceMeters = 0.055f; [SerializeField, Range(0.02f, 0.18f)] private float planeFamilyClassifyDistanceMeters = 0.09f; [SerializeField, Range(0f, 60f)] private float planeFamilyClassifyNormalDegrees = 48f; [SerializeField, Range(0f, 20f)] private float planeFamilyMergeNormalDegrees = 16f; [SerializeField, Range(0.02f, 0.25f)] private float planeFamilyMergeDistanceMeters = 0.18f; [SerializeField] private bool planeFamilyUseSpatialConsistency = true; [SerializeField, Range(0, 4)] private int planeFamilySpatialSmoothingPasses = 2; [SerializeField, Min(1)] private int planeFamilyMinIslandPoints = 18; [SerializeField, Range(1, 8)] private int planeFamilyNeighborVoteThreshold = 3; [SerializeField, Min(1)] private int planeFamilyWeakIslandMaxPoints = 260; [SerializeField, Range(0f, 0.5f)] private float planeFamilyWeakIslandMaxRatio = 0.08f; [SerializeField, Range(0f, 1f)] private float planeFamilyWeakIslandBorderRatio = 0.55f; [SerializeField, Range(0f, 89f)] private float planeFamilyWeakIslandRelaxNormalDegrees = 68f; [SerializeField, Range(1f, 3f)] private float planeFamilyWeakIslandRelaxDistanceMultiplier = 1.25f; [SerializeField, Range(0.02f, 1f)] private float planeFamilySurfaceAlpha = 1f; [SerializeField] private Color planeFamilyOutlierColor = new Color(0.55f, 0.55f, 0.55f, 1f);
+    [Header("Plane Family Structural Consensus")] [SerializeField] private bool planeFamilyUseStructuralConsensus = true; [SerializeField, Range(0.1f, 1f)] private float planeFamilyStrongDistanceRatio = 0.45f; [SerializeField, Min(0f)] private float planeFamilyProjectionPaddingMeters = 0.22f; [SerializeField, Range(0f, 0.25f)] private float planeFamilyNormalScoreWeight = 0.03f; [SerializeField, Min(1)] private int planeFamilyStructuralNeighborMinSame = 4; [SerializeField, Range(0f, 1f)] private float planeFamilyStructuralNeighborMinRatio = 0.45f;
+    [Header("Plane Family Diagnostics")] [SerializeField] private bool planeFamilyDiagnostics = true; [SerializeField] private bool planeFamilyDiagnosticsExportCsv = true; [SerializeField] private bool planeFamilyDiagnosticsLogSummary = true; [SerializeField, Min(0.1f)] private float planeFamilyDiagnosticsMinIntervalSeconds = 2f;
+    [Header("Surface Regions")] [SerializeField] private bool colorizeSurfaceRegions = false; [SerializeField] private bool showIrregularSurfaceBucket = true; [SerializeField, Range(0f, 1f)] private float irregularSurfaceBucketAlpha = 0.18f; [SerializeField, Range(1f, 89f)] private float surfaceRegionCreaseAngleDegrees = 12f; [SerializeField, Min(1)] private int surfaceRegionMinQuadCount = 12; [SerializeField, Range(1f, 45f)] private float surfaceNormalPatchMergeAngleDegrees = 10f; [SerializeField, Range(1f, 45f)] private float surfaceNormalFamilyAngleDegrees = 18f; [SerializeField, Range(0.5f, 0.999f)] private float surfaceNormalAxisBucketMinDot = 0.82f; [SerializeField, Min(1)] private int surfaceLargeComponentMinTriangleCount = 48; [SerializeField, Range(0.05f, 1f)] private float surfaceLargeComponentKeepRatio = 0.22f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxNeighborDistanceMeters = 0.12f; [SerializeField, Min(0.001f)] private float surfaceRegionMaxPlaneOffsetMeters = 0.03f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorSaturation = 0.62f; [SerializeField, Range(0f, 1f)] private float surfaceRegionColorValue = 0.95f;
     [Header("Candidate Surface Display")] [SerializeField] private bool isolateTopCandidateSurfaces = false; [SerializeField, Min(0)] private int topCandidateSurfaceCount = 4; [SerializeField, Min(0)] private int topCandidateSurfaceMinTriangleCount = 48; [SerializeField] private bool candidatePreferViewCenter = true; [SerializeField, Range(0.05f, 0.75f)] private float candidateViewCenterRadius = 0.28f; [SerializeField, Range(0f, 8f)] private float candidateViewCenterScoreWeight = 1.25f; [SerializeField, Range(0f, 2f)] private float candidateFaceCountScoreWeight = 0.35f; [SerializeField, Range(0f, 8f)] private float candidateFacingScoreWeight = 0.9f; [SerializeField, Range(0f, 1f)] private float candidateMinFacingScore = 0.55f; [SerializeField, Range(0f, 1f)] private float candidateCenterFacingRelaxation = 0.12f; [SerializeField, Range(1f, 45f)] private float candidateSurfaceMergeAngleDegrees = 14f; [SerializeField, Min(0.001f)] private float candidateSurfaceMergePlaneOffsetMeters = 0.05f; [SerializeField, Min(1)] private int candidateSurfaceMergeMinSharedEdges = 2; [SerializeField] private bool rebuildLargestCandidateAsRegularGrid = true; [SerializeField] private bool largestCandidateUseTriangularLattice = true; [SerializeField] private bool largestCandidateUseOriginalGridTerrain = true; [SerializeField] private bool largestCandidateProjectRegularGridToMeshTerrain = true; [SerializeField] private bool largestCandidateShowFill = false; [SerializeField, Min(0.01f)] private float largestCandidateGridCellSizeMeters = 0.08f; [SerializeField, Min(4)] private int largestCandidateGridMaxColumns = 64; [SerializeField, Min(4)] private int largestCandidateGridMaxRows = 64; [SerializeField, Range(0.05f, 1f)] private float largestCandidateGridFillAlpha = 0.28f; [SerializeField] private Color largestCandidateGridLineColor = new Color(1f, 1f, 1f, 0.92f); [SerializeField, Min(0.0005f)] private float largestCandidateGridLineWidthMeters = 0.006f; [SerializeField] private bool largestCandidateGridShowCellDiagonals = false; [SerializeField, Range(0, 8)] private int largestCandidateGridMinNeighborCount = 2; [SerializeField, Min(0)] private int largestCandidateGridMinIslandCellCount = 3; [SerializeField, Min(0)] private int largestCandidateGridMinCellCount = 12; [SerializeField, Min(0)] private int largestCandidateGridMinIslandSpanCells = 3; [SerializeField, Min(0)] private int largestCandidateGridKeepTopIslandCount = 2; [SerializeField] private bool largestCandidateGridUseViewportFilter = true; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportMaxSpan = 0.10f; [SerializeField, Range(0f, 1f)] private float largestCandidateGridMinViewportArea = 0.008f;
     [Header("Candidate Plane Objects")] [SerializeField] private bool showCandidatePlaneObjects = true; [SerializeField, Min(1)] private int candidatePlaneObjectCount = 4; [SerializeField, Min(0.01f)] private float candidatePlaneMinSizeMeters = 0.08f; [SerializeField, Min(0f)] private float candidatePlanePaddingMeters = 0.01f; [SerializeField, Min(0f)] private float candidatePlaneSurfaceOffsetMeters = 0.004f; [SerializeField, Range(0.05f, 1f)] private float candidatePlaneAlpha = 0.32f; [SerializeField] private Color candidatePlaneColor = new Color(1f, 0.18f, 0.12f, 0.32f);
     [NonSerialized] private float surfacePlaneClusterNormalDot = 0.965f;
     [NonSerialized] private float surfacePlaneClusterOffsetMeters = 0.08f;
     [Header("Surface Normal Indicators")] [SerializeField] private bool showSurfaceNormalIndicators = false; [SerializeField, Min(0.002f)] private float surfaceNormalIndicatorLengthMeters = 0.035f; [SerializeField, Min(0.0005f)] private float surfaceNormalIndicatorThicknessMeters = 0.0025f; [SerializeField] private Color surfaceNormalIndicatorColor = new Color(1f, 0.95f, 0.2f, 0.95f);
-    [Header("Center Debug")] [SerializeField] private bool showCenterDebugMarkers = true; [SerializeField] private bool showScreenCenterDebugMarker = true; [SerializeField] private bool showFocusedGridCenterDebugMarker = true; [SerializeField] private bool showPatchCenterDebugMarker = true; [SerializeField, Min(0.002f)] private float centerDebugMarkerScaleMeters = 0.025f; [SerializeField, Min(0f)] private float centerDebugSurfaceOffsetMeters = 0.01f; [SerializeField] private Color screenCenterDebugColor = new Color(1f, 0.2f, 0.2f, 0.95f); [SerializeField] private Color gridCenterDebugColor = new Color(1f, 0.9f, 0.2f, 0.95f); [SerializeField] private Color patchCenterDebugColor = new Color(0.2f, 1f, 1f, 0.95f);
-    [Header("Headset Screen Center Debug")] [SerializeField] private bool showHeadsetScreenCenterMarker = true; [SerializeField, Min(0.05f)] private float headsetScreenCenterMarkerDistanceMeters = 1f; [SerializeField, Min(0.002f)] private float headsetScreenCenterMarkerScaleMeters = 0.025f; [SerializeField] private Color headsetScreenCenterMarkerColor = new Color(1f, 0.05f, 0.05f, 1f);
+    [Header("Center Debug")] [SerializeField] private bool showCenterDebugMarkers = false; [SerializeField] private bool showScreenCenterDebugMarker = false; [SerializeField] private bool showFocusedGridCenterDebugMarker = false; [SerializeField] private bool showPatchCenterDebugMarker = false; [SerializeField, Min(0.002f)] private float centerDebugMarkerScaleMeters = 0.025f; [SerializeField, Min(0f)] private float centerDebugSurfaceOffsetMeters = 0.01f; [SerializeField] private Color screenCenterDebugColor = new Color(1f, 0.2f, 0.2f, 0.95f); [SerializeField] private Color gridCenterDebugColor = new Color(1f, 0.9f, 0.2f, 0.95f); [SerializeField] private Color patchCenterDebugColor = new Color(0.2f, 1f, 1f, 0.95f);
+    [Header("Headset Screen Center Debug")] [SerializeField] private bool showHeadsetScreenCenterMarker = false; [SerializeField, Min(0.05f)] private float headsetScreenCenterMarkerDistanceMeters = 1f; [SerializeField, Min(0.002f)] private float headsetScreenCenterMarkerScaleMeters = 0.025f; [SerializeField] private Color headsetScreenCenterMarkerColor = new Color(1f, 0.05f, 0.05f, 1f);
     [Header("Raw Depth Screen Center Debug")] [SerializeField] private bool showRawDepthScreenCenterMarker = true; [SerializeField, Min(0.002f)] private float rawDepthScreenCenterMarkerScaleMeters = 0.03f; [SerializeField] private Color rawDepthScreenCenterMarkerColor = new Color(1f, 0.05f, 0.05f, 1f);
-    [Header("Original Grid Center Debug")] [SerializeField] private bool showOriginalGridCenterMarker = true; [SerializeField, Min(0.002f)] private float originalGridCenterMarkerScaleMeters = 0.035f; [SerializeField] private Color originalGridCenterMarkerColor = new Color(1f, 0f, 1f, 1f);
+    [Header("Original Grid Center Debug")] [SerializeField] private bool showOriginalGridCenterMarker = false; [SerializeField, Min(0.002f)] private float originalGridCenterMarkerScaleMeters = 0.035f; [SerializeField] private Color originalGridCenterMarkerColor = new Color(1f, 0f, 1f, 1f);
     [Header("Debug")] [SerializeField] private bool debugLog; [SerializeField] private bool logBounds; [SerializeField] private bool dumpRosterOnceOnPlay = false; [SerializeField] private bool dumpOnlyValidCellsInRoster = false;
 
     public int VisibleCount => _visibleCount; public int SurfaceTriangleCount => _surfaceMesh != null ? _surfaceMesh.triangles.Length / 3 : 0; public int FrameIndex => _frameIndex; public bool HasPendingReadback => _hasPendingReadback; public string LastIssue { get; private set; }
@@ -77,6 +97,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     public float SurfaceMinNeighborNormalDot => minNeighborNormalDot;
     public bool PreviewVisible => _previewVisible;
     public bool PreviewDisplayVisible => previewDisplayVisible;
+    public string LastPlaneFamilyDiagnosticsPath => _lastPlaneFamilyDiagnosticsPath;
     public Transform SnapshotCaptureRoot => useWorldSpaceDisplayRoots ? (_displayRoot != null ? _displayRoot.transform : null) : transform;
     public Vector3 CurrentObservationOrigin
     {
@@ -88,10 +109,19 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     }
 
     private readonly List<Cell> _cells = new List<Cell>(4096); private readonly List<GridGroup> _groups = new List<GridGroup>(8); private readonly List<GameObject> _pool = new List<GameObject>(4096); private readonly List<Renderer[]> _rendererCache = new List<Renderer[]>(4096); private readonly List<bool> _validScratch = new List<bool>(4096); private readonly List<bool> _gridLineValidScratch = new List<bool>(4096); private readonly List<Vector3> _verts = new List<Vector3>(4096); private readonly List<Vector3> _normals = new List<Vector3>(4096); private readonly List<int> _tris = new List<int>(8192); private readonly List<int> _lineIndices = new List<int>(8192);
-    private MaterialPropertyBlock _propertyBlock; private Material _fallbackMaterial; private GameObject _displayRoot; private Transform _runtimeMarkerRoot; private GameObject _lineRoot; private MeshFilter _lineFilter; private MeshRenderer _lineRenderer; private Mesh _lineMesh; private Material _lineMaterial; private GameObject _remeshLineRoot; private MeshFilter _remeshLineFilter; private MeshRenderer _remeshLineRenderer; private Mesh _remeshLineMesh; private Material _remeshLineMaterial; private GameObject _candidatePlaneRoot; private readonly List<MeshFilter> _candidatePlaneFilters = new List<MeshFilter>(8); private readonly List<MeshRenderer> _candidatePlaneRenderers = new List<MeshRenderer>(8); private readonly List<Mesh> _candidatePlaneMeshes = new List<Mesh>(8); private Material _candidatePlaneMaterial; private GameObject _surfaceRoot; private MeshFilter _surfaceFilter; private MeshRenderer _surfaceRenderer; private Mesh _surfaceMesh; private Material _surfaceMaterial; private readonly List<Material> _surfaceRegionMaterials = new List<Material>(16); private GameObject _surfaceNormalRoot; private MeshFilter _surfaceNormalFilter; private MeshRenderer _surfaceNormalRenderer; private Mesh _surfaceNormalMesh; private Material _surfaceNormalMaterial; private GameObject _runtimeAxisRoot; private readonly List<Material> _runtimeAxisMaterials = new List<Material>(4); private GameObject _centerDebugRoot; private readonly GameObject[] _centerDebugMarkers = new GameObject[3]; private readonly Material[] _centerDebugMaterials = new Material[3]; private GameObject _headsetScreenCenterMarker; private Material _headsetScreenCenterMarkerMaterial; private GameObject _rawDepthScreenCenterMarker; private Material _rawDepthScreenCenterMarkerMaterial; private GameObject _originalGridCenterMarker; private Material _originalGridCenterMarkerMaterial; private FocusedGridOverlayState _focusedGridOverlayState;
+    private MaterialPropertyBlock _propertyBlock; private Material _fallbackMaterial; private GameObject _displayRoot; private Transform _runtimeMarkerRoot; private GameObject _lineRoot; private MeshFilter _lineFilter; private MeshRenderer _lineRenderer; private Mesh _lineMesh; private Material _lineMaterial; private GameObject _remeshLineRoot; private MeshFilter _remeshLineFilter; private MeshRenderer _remeshLineRenderer; private Mesh _remeshLineMesh; private Material _remeshLineMaterial; private GameObject _geometricSurfaceGridRoot; private MeshFilter _geometricSurfaceGridFilter; private MeshRenderer _geometricSurfaceGridRenderer; private Mesh _geometricSurfaceGridMesh; private Material _geometricSurfaceGridMaterial; private GameObject _candidatePlaneRoot; private readonly List<MeshFilter> _candidatePlaneFilters = new List<MeshFilter>(8); private readonly List<MeshRenderer> _candidatePlaneRenderers = new List<MeshRenderer>(8); private readonly List<Mesh> _candidatePlaneMeshes = new List<Mesh>(8); private Material _candidatePlaneMaterial; private GameObject _surfaceRoot; private MeshFilter _surfaceFilter; private MeshRenderer _surfaceRenderer; private Mesh _surfaceMesh; private Material _surfaceMaterial; private readonly List<Material> _surfaceRegionMaterials = new List<Material>(16); private GameObject _surfaceNormalRoot; private MeshFilter _surfaceNormalFilter; private MeshRenderer _surfaceNormalRenderer; private Mesh _surfaceNormalMesh; private Material _surfaceNormalMaterial; private GameObject _probeRowRoot; private Material _probeRowPointMaterial; private Material _probeRowStableLineMaterial; private Material _probeRowRefineLineMaterial; private Material _probeRowBreakLineMaterial; private readonly List<GameObject> _probeRowMarkers = new List<GameObject>(32); private readonly List<LineRenderer> _probeRowLines = new List<LineRenderer>(32); private readonly List<int> _probeTriangleIndices = new List<int>(8192); private GameObject _runtimeAxisRoot; private readonly List<Material> _runtimeAxisMaterials = new List<Material>(4); private GameObject _centerDebugRoot; private readonly GameObject[] _centerDebugMarkers = new GameObject[3]; private readonly Material[] _centerDebugMaterials = new Material[3]; private GameObject _headsetScreenCenterMarker; private Material _headsetScreenCenterMarkerMaterial; private GameObject _rawDepthScreenCenterMarker; private Material _rawDepthScreenCenterMarkerMaterial; private GameObject _originalGridCenterMarker; private Material _originalGridCenterMarkerMaterial; private FocusedGridOverlayState _focusedGridOverlayState;
+    private Vector3[] _rawSurfaceExportVertices = Array.Empty<Vector3>();
+    private Vector3[] _rawSurfaceExportNormals = Array.Empty<Vector3>();
+    private int[] _rawSurfaceExportTriangles = Array.Empty<int>();
     private AsyncGPUReadbackRequest _worldPositionRequest, _worldNormalRequest, _observationMetaRequest; private bool _hasPendingReadback; private Vector2Int _pendingResolution; private int _visibleCount; private int _frameIndex; private bool _hasDumpedRoster;
-    private bool[] _currentValid = Array.Empty<bool>(); private Vector3[] _currentPositions = Array.Empty<Vector3>(); private Vector3[] _currentNormals = Array.Empty<Vector3>(); private float[] _currentConfidences = Array.Empty<float>(); private Vector2Int _currentResolution;
+    private RawDepthFrameSnapshot _latestRawDepthFrameSnapshot;
+    private int _rawDepthSnapshotFrameIndex;
+    private bool[] _currentValid = Array.Empty<bool>(); private bool[] _currentLineValid = Array.Empty<bool>(); private Vector3[] _currentPositions = Array.Empty<Vector3>(); private Vector3[] _currentNormals = Array.Empty<Vector3>(); private float[] _currentConfidences = Array.Empty<float>(); private Vector2Int _currentResolution;
     private bool _previewVisible = true;
+    private bool _captureOnlySnapshotMode;
+    private bool _snapshotGridExternalControlActive;
+    private bool _snapshotGridExternalSavedUpdateEveryFrame;
+    private bool _snapshotGridExternalSavedCaptureOnlySnapshotMode;
     private bool _hasFrozenHeadsetScreenCenterPoint;
     private Vector3 _frozenHeadsetScreenCenterPoint;
     private Vector3 _frozenHeadsetScreenCenterNormal;
@@ -99,12 +129,16 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private bool _hasFrozenHeightSliceFrame;
     private Vector3 _frozenHeightSliceRightWorld = Vector3.right;
     private Vector3 _frozenHeightSliceForwardWorld = Vector3.forward;
+    private bool _exportSurfaceMeshObjAfterNextBuild;
+    private int _planeFamilyOutlierSubmeshIndex = -1;
+    private float _lastPlaneFamilyDiagnosticsTime = -999f;
+    private string _lastPlaneFamilyDiagnosticsPath;
 
-    private void Reset() => EnsureGradient();
-    private void Awake() { ResolveRefs(); EnsureGradient(); EnsurePropertyBlock(); EnsureDisplayRoots(); if (updateEveryFrame) RefreshNow(); }
-    private void OnEnable() { _hasDumpedRoster = false; ResolveRefs(); EnsureGradient(); EnsurePropertyBlock(); EnsureDisplayRoots(); if (updateEveryFrame) RefreshNow(); }
-    private void Update() { UpdateDisplayRootsTransform(); if (_hasPendingReadback) { UpdatePendingReadback(); return; } if (updateEveryFrame) RefreshNow(); }
-    private void OnDestroy() { if (_lineMesh != null) Destroy(_lineMesh); if (_lineMaterial != null) Destroy(_lineMaterial); if (_lineRoot != null) Destroy(_lineRoot); if (_remeshLineMesh != null) Destroy(_remeshLineMesh); if (_remeshLineMaterial != null) Destroy(_remeshLineMaterial); if (_remeshLineRoot != null) Destroy(_remeshLineRoot); if (_surfaceMesh != null) Destroy(_surfaceMesh); if (_surfaceMaterial != null) Destroy(_surfaceMaterial); ClearSurfaceRegionMaterials(); if (_surfaceNormalMesh != null) Destroy(_surfaceNormalMesh); if (_surfaceNormalMaterial != null) Destroy(_surfaceNormalMaterial); if (_surfaceNormalRoot != null) Destroy(_surfaceNormalRoot); if (_fallbackMaterial != null) Destroy(_fallbackMaterial); if (_surfaceRoot != null) Destroy(_surfaceRoot); if (_runtimeAxisRoot != null) Destroy(_runtimeAxisRoot); if (_centerDebugRoot != null) Destroy(_centerDebugRoot); if (_headsetScreenCenterMarker != null) Destroy(_headsetScreenCenterMarker); if (_headsetScreenCenterMarkerMaterial != null) Destroy(_headsetScreenCenterMarkerMaterial); if (_rawDepthScreenCenterMarker != null) Destroy(_rawDepthScreenCenterMarker); if (_rawDepthScreenCenterMarkerMaterial != null) Destroy(_rawDepthScreenCenterMarkerMaterial); if (_originalGridCenterMarker != null) Destroy(_originalGridCenterMarker); if (_originalGridCenterMarkerMaterial != null) Destroy(_originalGridCenterMarkerMaterial); for (int i = 0; i < _runtimeAxisMaterials.Count; i++) if (_runtimeAxisMaterials[i] != null) Destroy(_runtimeAxisMaterials[i]); for (int i = 0; i < _centerDebugMaterials.Length; i++) if (_centerDebugMaterials[i] != null) Destroy(_centerDebugMaterials[i]); if (_displayRoot != null) Destroy(_displayRoot); }
+    private void Reset() { }
+    private void Awake() { ResolveRefs(); EnsurePropertyBlock(); EnsureDisplayRoots(); if (updateEveryFrame && !_snapshotGridExternalControlActive) RefreshNow(); }
+    private void OnEnable() { _hasDumpedRoster = false; ResolveRefs(); EnsurePropertyBlock(); EnsureDisplayRoots(); if (updateEveryFrame && !_snapshotGridExternalControlActive) RefreshNow(); }
+    private void Update() { if (!_snapshotGridExternalControlActive) UpdateDisplayRootsTransform(); if (_hasPendingReadback) { UpdatePendingReadback(); return; } if (updateEveryFrame && !_snapshotGridExternalControlActive) RefreshNow(); }
+    private void OnDestroy() { if (_lineMesh != null) Destroy(_lineMesh); if (_lineMaterial != null) Destroy(_lineMaterial); if (_lineRoot != null) Destroy(_lineRoot); if (_remeshLineMesh != null) Destroy(_remeshLineMesh); if (_remeshLineMaterial != null) Destroy(_remeshLineMaterial); if (_remeshLineRoot != null) Destroy(_remeshLineRoot); if (_geometricSurfaceGridMesh != null) Destroy(_geometricSurfaceGridMesh); if (_geometricSurfaceGridMaterial != null) Destroy(_geometricSurfaceGridMaterial); if (_geometricSurfaceGridRoot != null) Destroy(_geometricSurfaceGridRoot); if (_surfaceMesh != null) Destroy(_surfaceMesh); if (_surfaceMaterial != null) Destroy(_surfaceMaterial); ClearSurfaceRegionMaterials(); if (_surfaceNormalMesh != null) Destroy(_surfaceNormalMesh); if (_surfaceNormalMaterial != null) Destroy(_surfaceNormalMaterial); if (_surfaceNormalRoot != null) Destroy(_surfaceNormalRoot); if (_fallbackMaterial != null) Destroy(_fallbackMaterial); if (_surfaceRoot != null) Destroy(_surfaceRoot); if (_probeRowRoot != null) Destroy(_probeRowRoot); if (_probeRowPointMaterial != null) Destroy(_probeRowPointMaterial); if (_probeRowStableLineMaterial != null) Destroy(_probeRowStableLineMaterial); if (_probeRowRefineLineMaterial != null) Destroy(_probeRowRefineLineMaterial); if (_probeRowBreakLineMaterial != null) Destroy(_probeRowBreakLineMaterial); if (_runtimeAxisRoot != null) Destroy(_runtimeAxisRoot); if (_centerDebugRoot != null) Destroy(_centerDebugRoot); if (_headsetScreenCenterMarker != null) Destroy(_headsetScreenCenterMarker); if (_headsetScreenCenterMarkerMaterial != null) Destroy(_headsetScreenCenterMarkerMaterial); if (_rawDepthScreenCenterMarker != null) Destroy(_rawDepthScreenCenterMarker); if (_rawDepthScreenCenterMarkerMaterial != null) Destroy(_rawDepthScreenCenterMarkerMaterial); if (_originalGridCenterMarker != null) Destroy(_originalGridCenterMarker); if (_originalGridCenterMarkerMaterial != null) Destroy(_originalGridCenterMarkerMaterial); for (int i = 0; i < _runtimeAxisMaterials.Count; i++) if (_runtimeAxisMaterials[i] != null) Destroy(_runtimeAxisMaterials[i]); for (int i = 0; i < _centerDebugMaterials.Length; i++) if (_centerDebugMaterials[i] != null) Destroy(_centerDebugMaterials[i]); if (_displayRoot != null) Destroy(_displayRoot); }
 
     [ContextMenu("Refresh Depth Grid Point Cloud")]
     public bool RefreshNow()
@@ -114,7 +148,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     public bool RefreshNow(bool forcePreprocessorRefresh)
     {
-        ResolveRefs(); EnsureGradient(); EnsurePropertyBlock();
+        if (_snapshotGridExternalControlActive)
+            return false;
+
+        ResolveRefs(); EnsurePropertyBlock();
         if (preprocessor == null) return SetIssue("ScanCoverDepthPreprocessor is missing.");
         if (_hasPendingReadback) return false;
         if (!TryPrepareOutputs(preprocessor, forcePreprocessorRefresh, out RenderTexture worldPosTex, out RenderTexture worldNormalTex, out RenderTexture metaTex, out Vector2Int primaryResolution))
@@ -141,17 +178,25 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             SetSurfaceVisible(false);
             SetCandidatePlaneObjectsVisible(false);
             SetSurfaceNormalIndicatorsVisible(false);
+            SetGeometricSurfaceGridVisible(false);
             SetHeadsetScreenCenterMarkerVisible(false);
             SetRawDepthScreenCenterMarkerVisible(false);
+            SetProbeRowExperimentVisible(false);
             return;
         }
 
-        if (updateEveryFrame)
+        if (updateEveryFrame && !_snapshotGridExternalControlActive)
             RefreshNow();
     }
 
     public void SetUpdateEveryFrame(bool enabled)
     {
+        if (_snapshotGridExternalControlActive)
+        {
+            _snapshotGridExternalSavedUpdateEveryFrame = enabled;
+            return;
+        }
+
         updateEveryFrame = enabled;
     }
 
@@ -172,6 +217,84 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         return _previewVisible && previewDisplayVisible && (showSurfaceMesh || ShouldShowGridInteriorMesh());
     }
 
+    public void RequestExportSurfaceMeshObjAfterNextBuild()
+    {
+        _exportSurfaceMeshObjAfterNextBuild = true;
+    }
+
+    [ContextMenu("Export Plane Family Diagnostics Now")]
+    public void ExportPlaneFamilyDiagnosticsNow()
+    {
+        if (_verts == null || _normals == null || _verts.Count < planeFamilyMinInliers || _normals.Count != _verts.Count)
+        {
+            Debug.LogWarning("[ScanCoverPlaneFamilyDiagnostics] No current BL surface vertices are available.", this);
+            return;
+        }
+
+        if (!TryExtractPlaneFamilyModels(_verts, _normals, out List<PlaneFamilyModel> families) || families.Count <= 0)
+        {
+            Debug.LogWarning("[ScanCoverPlaneFamilyDiagnostics] No plane family candidates were extracted.", this);
+            return;
+        }
+
+        float maxDistance = Mathf.Max(0.005f, planeFamilyClassifyDistanceMeters);
+        float normalDotThreshold = Mathf.Cos(planeFamilyClassifyNormalDegrees * Mathf.Deg2Rad);
+        int[] assignments = BuildPlaneFamilyAssignments(_verts, _normals, families, maxDistance, normalDotThreshold);
+        WritePlaneFamilyDiagnostics(_verts, _normals, families, assignments, maxDistance, normalDotThreshold, force: true);
+    }
+
+    [ContextMenu("Apply Rule Hardening v01")]
+    public void ApplyRuleHardeningProfileV01()
+    {
+        previewDisplayVisible = false;
+        showSurfaceMesh = false;
+        keepSurfaceMeshAvailableWhenHidden = true;
+        colorizeSurfaceRegions = false;
+        showIrregularSurfaceBucket = false;
+        showGeometricSurfaceGrid = false;
+        showGridLines = false;
+        showGridTriangulation = false;
+        showGridInteriorMesh = false;
+        showHeightSliceContour = false;
+        showHeightSlicePlaneFrame = false;
+        showCandidatePlaneObjects = false;
+        showRawDepthScreenCenterMarker = false;
+        showHeadsetScreenCenterMarker = false;
+        showOriginalGridCenterMarker = false;
+        maxLinearDepthMeters = 5f;
+
+        showPlaneFamilyClassification = false;
+        planeFamilyDisplayAsPointQuads = false;
+        planeFamilyPointSizeMeters = 0.014f;
+        planeFamilyMaxSamples = 4096;
+        planeFamilyRansacIterations = 96;
+        planeFamilyMaxFamilies = 10;
+        planeFamilyMinInliers = 96;
+        planeFamilyFitDistanceMeters = 0.055f;
+        planeFamilyClassifyDistanceMeters = 0.09f;
+        planeFamilyClassifyNormalDegrees = 48f;
+        planeFamilyMergeNormalDegrees = 16f;
+        planeFamilyMergeDistanceMeters = 0.18f;
+        planeFamilyUseSpatialConsistency = true;
+        planeFamilySpatialSmoothingPasses = 2;
+        planeFamilyMinIslandPoints = 18;
+        planeFamilyNeighborVoteThreshold = 3;
+        planeFamilyWeakIslandMaxPoints = 260;
+        planeFamilyWeakIslandMaxRatio = 0.08f;
+        planeFamilyWeakIslandBorderRatio = 0.55f;
+        planeFamilyWeakIslandRelaxNormalDegrees = 68f;
+        planeFamilyWeakIslandRelaxDistanceMultiplier = 1.25f;
+        planeFamilySurfaceAlpha = 1f;
+        planeFamilyOutlierColor = snapshotGridUniformColor;
+
+        planeFamilyUseStructuralConsensus = true;
+        planeFamilyStrongDistanceRatio = 0.45f;
+        planeFamilyProjectionPaddingMeters = 0.22f;
+        planeFamilyNormalScoreWeight = 0.03f;
+        planeFamilyStructuralNeighborMinSame = 4;
+        planeFamilyStructuralNeighborMinRatio = 0.45f;
+    }
+
     private bool ShouldShowGridInteriorMesh()
     {
         return showGridInteriorMesh && gridInteriorDisplayMode == GridInteriorDisplayMode.Mesh;
@@ -190,14 +313,73 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             SetSurfaceVisible(false);
             SetCandidatePlaneObjectsVisible(false);
             SetSurfaceNormalIndicatorsVisible(false);
+            SetGeometricSurfaceGridVisible(false);
             SetCenterDebugMarkersVisible(false);
             SetHeadsetScreenCenterMarkerVisible(false);
             SetRawDepthScreenCenterMarkerVisible(false);
+            SetProbeRowExperimentVisible(false);
             return;
         }
 
-        if (_previewVisible && updateEveryFrame)
+        if (_previewVisible && updateEveryFrame && !_snapshotGridExternalControlActive)
             RefreshNow();
+    }
+
+    public void SetCaptureOnlySnapshotMode(bool enabled)
+    {
+        if (_snapshotGridExternalControlActive)
+        {
+            _snapshotGridExternalSavedCaptureOnlySnapshotMode = enabled;
+            return;
+        }
+
+        if (_captureOnlySnapshotMode == enabled)
+            return;
+
+        _captureOnlySnapshotMode = enabled;
+        if (_captureOnlySnapshotMode)
+        {
+            HideAllMarkers();
+            SetGridLinesVisible(false);
+            SetSurfaceVisible(false);
+            SetCandidatePlaneObjectsVisible(false);
+            SetSurfaceNormalIndicatorsVisible(false);
+            SetGeometricSurfaceGridVisible(false);
+            SetCenterDebugMarkersVisible(false);
+            SetHeadsetScreenCenterMarkerVisible(false);
+            SetRawDepthScreenCenterMarkerVisible(false);
+            SetProbeRowExperimentVisible(false);
+            if (_lineMesh != null)
+                _lineMesh.Clear();
+            if (_surfaceMesh != null)
+                _surfaceMesh.Clear();
+            if (_surfaceNormalMesh != null)
+                _surfaceNormalMesh.Clear();
+            if (_geometricSurfaceGridMesh != null)
+                _geometricSurfaceGridMesh.Clear();
+        }
+    }
+
+    public void SetSnapshotGridExternalControlActive(bool active)
+    {
+        if (_snapshotGridExternalControlActive == active)
+            return;
+
+        if (active)
+        {
+            _snapshotGridExternalSavedUpdateEveryFrame = updateEveryFrame;
+            _snapshotGridExternalSavedCaptureOnlySnapshotMode = _captureOnlySnapshotMode;
+            _snapshotGridExternalControlActive = true;
+            updateEveryFrame = false;
+            _captureOnlySnapshotMode = false;
+            previewDisplayVisible = true;
+            _previewVisible = true;
+            return;
+        }
+
+        _snapshotGridExternalControlActive = false;
+        updateEveryFrame = _snapshotGridExternalSavedUpdateEveryFrame;
+        _captureOnlySnapshotMode = _snapshotGridExternalSavedCaptureOnlySnapshotMode;
     }
 
     [ContextMenu("Clear Depth Grid Runtime State")]
@@ -242,21 +424,27 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         SetSurfaceVisible(false);
         SetCandidatePlaneObjectsVisible(false);
         SetSurfaceNormalIndicatorsVisible(false);
+        SetGeometricSurfaceGridVisible(false);
         SetCenterDebugMarkersVisible(false);
         SetHeadsetScreenCenterMarkerVisible(false);
         SetRawDepthScreenCenterMarkerVisible(false);
+        SetProbeRowExperimentVisible(false);
         if (_lineMesh != null)
             _lineMesh.Clear();
         if (_surfaceMesh != null)
             _surfaceMesh.Clear();
         if (_surfaceNormalMesh != null)
             _surfaceNormalMesh.Clear();
+        if (_geometricSurfaceGridMesh != null)
+            _geometricSurfaceGridMesh.Clear();
     }
 
     private void UpdatePendingReadback()
     {
         if (!_worldPositionRequest.done || !_worldNormalRequest.done || !_observationMetaRequest.done) return;
         _hasPendingReadback = false;
+        if (_snapshotGridExternalControlActive)
+            return;
         if (_worldPositionRequest.hasError || _worldNormalRequest.hasError || _observationMetaRequest.hasError) { SetIssue("AsyncGPUReadback failed for depth grid point cloud."); return; }
         NativeArray<Color> worldPositions = _worldPositionRequest.GetData<Color>();
         NativeArray<Color> worldNormals = _worldNormalRequest.GetData<Color>();
@@ -274,7 +462,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 rectifiedWorldNormals = new NativeArray<Color>(pixelCount, Allocator.Temp);
                 rectifiedObservationMeta = new NativeArray<Color>(pixelCount, Allocator.Temp);
                 RectifyRegularGridBuffers(worldPositions, worldNormals, observationMeta, _pendingResolution, rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta);
-                BuildVisualization(rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta, _pendingResolution);
+                StoreLatestRawDepthFrameSnapshot(rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta, _pendingResolution);
+                if (!_captureOnlySnapshotMode)
+                    BuildVisualization(rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta, _pendingResolution);
             }
             finally
             {
@@ -286,7 +476,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             return;
         }
 
-        BuildVisualization(worldPositions, worldNormals, observationMeta, _pendingResolution);
+        StoreLatestRawDepthFrameSnapshot(worldPositions, worldNormals, observationMeta, _pendingResolution);
+        if (!_captureOnlySnapshotMode)
+            BuildVisualization(worldPositions, worldNormals, observationMeta, _pendingResolution);
     }
 
     private void BuildCells(Vector2Int resolution)
@@ -761,11 +953,16 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         else
         {
             SetCandidatePlaneObjectsVisible(false);
-            if (ShouldMaintainSurfaceMesh()) BuildSurfaceMesh(valid, positions, normals, confidences, ShouldShowSurfaceMesh());
-            else { SetSurfaceVisible(false); SetCenterDebugMarkersVisible(false); }
+            if (ShouldMaintainSurfaceMesh())
+            {
+                BuildSurfaceMesh(valid, positions, normals, confidences, ShouldShowSurfaceMesh());
+                ExportSurfaceMeshObjIfRequested();
+            }
+            else { SetSurfaceVisible(false); SetGeometricSurfaceGridVisible(false); SetCenterDebugMarkersVisible(false); }
         }
-        StoreCurrentGridState(valid, positions, normals, confidences, resolution);
-        DumpRosterIfNeeded(valid, positions, normals, confidences, resolution);
+        StoreCurrentGridState(valid, lineValid, positions, normals, confidences, resolution);
+        UpdateProbeRowExperiment(valid, positions, normals);
+        DumpRosterIfNeeded(valid, lineValid, positions, normals, confidences, resolution);
         LastIssue = _visibleCount > 0 ? null : "Grid sampling produced no visible points.";
         if (debugLog)
         {
@@ -964,11 +1161,16 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         else
         {
             SetCandidatePlaneObjectsVisible(false);
-            if (ShouldMaintainSurfaceMesh()) BuildSurfaceMesh(valid, positions, normals, confidences, ShouldShowSurfaceMesh());
-            else { SetSurfaceVisible(false); SetCenterDebugMarkersVisible(false); }
+            if (ShouldMaintainSurfaceMesh())
+            {
+                BuildSurfaceMesh(valid, positions, normals, confidences, ShouldShowSurfaceMesh());
+                ExportSurfaceMeshObjIfRequested();
+            }
+            else { SetSurfaceVisible(false); SetGeometricSurfaceGridVisible(false); SetCenterDebugMarkersVisible(false); }
         }
-        StoreCurrentGridState(valid, positions, normals, confidences, resolution);
-        DumpRosterIfNeeded(valid, positions, normals, confidences, resolution);
+        StoreCurrentGridState(valid, valid, positions, normals, confidences, resolution);
+        UpdateProbeRowExperiment(valid, positions, normals);
+        DumpRosterIfNeeded(valid, valid, positions, normals, confidences, resolution);
         LastIssue = _visibleCount > 0 ? null : "View-locked volume sampling produced no visible points.";
         if (debugLog)
         {
@@ -1017,6 +1219,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     }
 
     private bool TryGetCellSample(Cell cell, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, out Vector3 pos, out Vector3 normal, out float confidence)
+        => TryGetCellSample(cell, width, height, worldPositions, worldNormals, observationMeta, validScratch, neighborFill, out pos, out normal, out confidence);
+
+    private bool TryGetCellSample(Cell cell, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, bool allowNeighborFill, out Vector3 pos, out Vector3 normal, out float confidence)
     {
         if (samplingMode != SamplingMode.RegularGrid)
             return TryGetAdaptiveSample(cell, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence);
@@ -1024,7 +1229,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         if (cell.hasSubpixelCenter && TryGetRegularSampleBilinear(cell.centerXF, cell.centerYF, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence))
             return true;
 
-        return TryGetRegularSample(cell.centerX, cell.centerY, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence);
+        return TryGetRegularSample(cell.centerX, cell.centerY, width, height, worldPositions, worldNormals, observationMeta, validScratch, allowNeighborFill, out pos, out normal, out confidence);
     }
 
     private bool TryGetDepthHitPlaneSample(Cell cell, Vector3 center, Transform origin, out Vector3 pos, out Vector3 normal, out float confidence)
@@ -1059,10 +1264,18 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private bool TryGetRegularSample(int x, int y, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, out Vector3 pos, out Vector3 normal, out float confidence)
     {
-        return TryGetRegularSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence, out _);
+        return TryGetRegularSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, neighborFill, out pos, out normal, out confidence, out _);
+    }
+
+    private bool TryGetRegularSample(int x, int y, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, bool allowNeighborFill, out Vector3 pos, out Vector3 normal, out float confidence)
+    {
+        return TryGetRegularSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, allowNeighborFill, out pos, out normal, out confidence, out _);
     }
 
     private bool TryGetRegularSample(int x, int y, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, out Vector3 pos, out Vector3 normal, out float confidence, out bool normalValid)
+        => TryGetRegularSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, neighborFill, out pos, out normal, out confidence, out normalValid);
+
+    private bool TryGetRegularSample(int x, int y, int width, int height, NativeArray<Color> worldPositions, NativeArray<Color> worldNormals, NativeArray<Color> observationMeta, List<bool> validScratch, bool allowNeighborFill, out Vector3 pos, out Vector3 normal, out float confidence, out bool normalValid)
     {
         normalValid = false;
         if ((uint)x >= (uint)width || (uint)y >= (uint)height) { pos = default; normal = default; confidence = 0f; return false; }
@@ -1077,7 +1290,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             confidence = hasMeta ? Confidence(observationMeta[index]) : 0f;
             return true;
         }
-        if (neighborFill) return TryGetNeighborSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence);
+        if (allowNeighborFill) return TryGetNeighborSample(x, y, width, height, worldPositions, worldNormals, observationMeta, validScratch, out pos, out normal, out confidence);
         pos = default; normal = default; confidence = 0f; return false;
     }
 
@@ -1237,7 +1450,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         ApplySurfaceMaterialSettings();
         if (_tris.Count <= 0)
         {
+            ClearRawSurfaceExportCache();
             SetSurfaceVisible(false);
+            SetGeometricSurfaceGridVisible(false);
             SetSurfaceNormalIndicatorsVisible(false);
             if (showHeightSliceContour)
                 BuildLargestCandidateGridLineMesh(new List<Vector3>(), new List<Vector3>(), new List<int>(), false);
@@ -1245,6 +1460,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         }
         _surfaceMesh.SetVertices(_verts);
         _surfaceMesh.SetNormals(_normals);
+        CacheRawSurfaceMeshForExport(_verts, _normals, _tris);
         if (showHeightSliceContour)
         {
             BuildHeightSliceContourDisplay(_verts, _normals, _tris, visibleAfterBuild);
@@ -1260,19 +1476,92 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         {
             _surfaceMesh.SetTriangles(_tris, 0, true);
             _surfaceMesh.RecalculateBounds();
+            _planeFamilyOutlierSubmeshIndex = -1;
             SetSurfaceRendererMaterials(1);
             SetSurfaceVisible(visibleAfterBuild);
+            BuildGeometricSurfaceGridOverlay(_verts, _normals, _tris, visibleAfterBuild);
             SetSurfaceNormalIndicatorsVisible(false);
             SetCenterDebugMarkersVisible(false);
             return;
         }
 
+        if (showPlaneFamilyClassification &&
+            planeFamilyDisplayAsPointQuads &&
+            TryBuildPlaneFamilyPointCloudMesh(_verts, _normals, out List<Vector3> guidancePointVertices, out List<Vector3> guidancePointNormals, out List<List<int>> guidancePointSubMeshes, out int guidanceOutlierSubmeshIndex))
+        {
+            _surfaceMesh.Clear();
+            _surfaceMesh.SetVertices(guidancePointVertices);
+            _surfaceMesh.SetNormals(guidancePointNormals);
+            _surfaceMesh.subMeshCount = guidancePointSubMeshes.Count;
+            for (int i = 0; i < guidancePointSubMeshes.Count; i++)
+                _surfaceMesh.SetTriangles(guidancePointSubMeshes[i], i, true);
+            _surfaceMesh.RecalculateBounds();
+            _planeFamilyOutlierSubmeshIndex = guidanceOutlierSubmeshIndex;
+            SetSurfaceRendererMaterials(guidancePointSubMeshes.Count);
+            SetSurfaceVisible(visibleAfterBuild);
+            SetGeometricSurfaceGridVisible(false);
+            SetSurfaceNormalIndicatorsVisible(false);
+            SetCenterDebugMarkersVisible(false);
+            SetCandidatePlaneObjectsVisible(false);
+            return;
+        }
+
+        if (showPlaneFamilyClassification && TryBuildPlaneFamilyClassificationSubMeshes(_verts, _normals, _tris, out List<List<int>> planeFamilySubMeshes, out int outlierSubmeshIndex))
+        {
+            if (planeFamilyDisplayAsPointQuads &&
+                TryBuildPlaneFamilyPointQuadMesh(_verts, _normals, planeFamilySubMeshes, out List<Vector3> pointVertices, out List<Vector3> pointNormals, out List<List<int>> pointSubMeshes))
+            {
+                _surfaceMesh.Clear();
+                _surfaceMesh.SetVertices(pointVertices);
+                _surfaceMesh.SetNormals(pointNormals);
+                _surfaceMesh.subMeshCount = pointSubMeshes.Count;
+                for (int i = 0; i < pointSubMeshes.Count; i++)
+                    _surfaceMesh.SetTriangles(pointSubMeshes[i], i, true);
+                _surfaceMesh.RecalculateBounds();
+                _planeFamilyOutlierSubmeshIndex = outlierSubmeshIndex;
+                SetSurfaceRendererMaterials(pointSubMeshes.Count);
+                SetSurfaceVisible(visibleAfterBuild);
+                SetGeometricSurfaceGridVisible(false);
+                SetSurfaceNormalIndicatorsVisible(false);
+                SetCenterDebugMarkersVisible(false);
+                SetCandidatePlaneObjectsVisible(false);
+                return;
+            }
+
+            _surfaceMesh.subMeshCount = planeFamilySubMeshes.Count;
+            for (int i = 0; i < planeFamilySubMeshes.Count; i++)
+                _surfaceMesh.SetTriangles(planeFamilySubMeshes[i], i, true);
+            _surfaceMesh.RecalculateBounds();
+            _planeFamilyOutlierSubmeshIndex = outlierSubmeshIndex;
+            SetSurfaceRendererMaterials(planeFamilySubMeshes.Count);
+            SetSurfaceVisible(visibleAfterBuild);
+            SetGeometricSurfaceGridVisible(false);
+            SetSurfaceNormalIndicatorsVisible(false);
+            SetCenterDebugMarkersVisible(false);
+            SetCandidatePlaneObjectsVisible(false);
+            return;
+        }
+
+        if (showPlaneFamilyClassification && planeFamilyDisplayAsPointQuads)
+        {
+            _surfaceMesh.Clear();
+            _planeFamilyOutlierSubmeshIndex = -1;
+            SetSurfaceVisible(false);
+            SetGeometricSurfaceGridVisible(false);
+            SetSurfaceNormalIndicatorsVisible(false);
+            SetCenterDebugMarkersVisible(false);
+            SetCandidatePlaneObjectsVisible(false);
+            return;
+        }
+
+        _planeFamilyOutlierSubmeshIndex = -1;
         if (!colorizeSurfaceRegions)
         {
             _surfaceMesh.SetTriangles(_tris, 0, true);
             _surfaceMesh.RecalculateBounds();
             SetSurfaceRendererMaterials(1);
             SetSurfaceVisible(visibleAfterBuild);
+            BuildGeometricSurfaceGridOverlay(_verts, _normals, _tris, visibleAfterBuild);
             BuildSurfaceNormalIndicatorMesh(_verts, _tris, visibleAfterBuild);
             return;
         }
@@ -1287,6 +1576,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 bool hasPlanes = BuildCandidatePlaneObjects(candidateSurfaces, _verts, _tris, visibleAfterBuild);
                 _surfaceMesh.Clear();
                 SetSurfaceVisible(false);
+                SetGeometricSurfaceGridVisible(false);
                 SetSurfaceNormalIndicatorsVisible(false);
                 BuildLargestCandidateGridLineMesh(new List<Vector3>(), new List<Vector3>(), new List<int>(), false);
                 UpdateCenterDebugMarkers(hasFocusedCandidate, focusedCandidate, hasFocusedCandidate, focusedCandidate.averageCenter, focusedCandidate.averageNormal);
@@ -1336,6 +1626,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                             }
                         }
                         SetSurfaceVisible(visibleAfterBuild);
+                        BuildGeometricSurfaceGridOverlay(remeshVertices, remeshNormals, remeshVisibleTriangles, visibleAfterBuild);
                     }
                     else
                     {
@@ -1366,6 +1657,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 _surfaceMesh.RecalculateBounds();
                 SetSurfaceRendererMaterials(1);
                 SetSurfaceVisible(visibleAfterBuild);
+                BuildGeometricSurfaceGridOverlay(_verts, _normals, _tris, visibleAfterBuild);
                 Vector3 patchDebugCenter = Vector3.zero;
                 Vector3 patchDebugNormal = Vector3.up;
                 bool hasPatchDebugCenter = TryComputeDisplayedPatchCenter(_verts, _tris, out patchDebugCenter, out patchDebugNormal);
@@ -1385,6 +1677,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             _surfaceMesh.RecalculateBounds();
             SetSurfaceRendererMaterials(candidateSurfaceSubMeshes.Count);
             SetSurfaceVisible(visibleAfterBuild);
+            BuildGeometricSurfaceGridOverlay(_verts, _normals, visibleTriangles, visibleAfterBuild);
             Vector3 candidatePatchDebugCenter = Vector3.zero;
             Vector3 candidatePatchDebugNormal = Vector3.up;
             bool hasCandidatePatchDebugCenter = TryComputeDisplayedPatchCenter(_verts, visibleTriangles, out candidatePatchDebugCenter, out candidatePatchDebugNormal);
@@ -1412,6 +1705,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             _surfaceMesh.RecalculateBounds();
             SetSurfaceRendererMaterials(1);
             SetSurfaceVisible(visibleAfterBuild);
+            BuildGeometricSurfaceGridOverlay(_verts, _normals, _tris, visibleAfterBuild);
             BuildSurfaceNormalIndicatorMesh(_verts, _tris, visibleAfterBuild);
             return;
         }
@@ -1430,7 +1724,1213 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         _surfaceMesh.RecalculateBounds();
         SetSurfaceRendererMaterials(activeBucketCount);
         SetSurfaceVisible(visibleAfterBuild);
+        BuildGeometricSurfaceGridOverlay(_verts, _normals, _tris, visibleAfterBuild);
         BuildSurfaceNormalIndicatorMesh(_verts, _tris, visibleAfterBuild);
+    }
+
+    private bool TryBuildPlaneFamilyClassificationSubMeshes(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<int> triangles,
+        out List<List<int>> subMeshes,
+        out int outlierSubmeshIndex)
+    {
+        subMeshes = new List<List<int>>();
+        outlierSubmeshIndex = -1;
+        if (vertices == null || normals == null || triangles == null ||
+            vertices.Count < planeFamilyMinInliers || normals.Count != vertices.Count || triangles.Count < 3)
+            return false;
+
+        if (!TryExtractPlaneFamilyModels(vertices, normals, out List<PlaneFamilyModel> families) || families.Count <= 0)
+            return false;
+
+        for (int i = 0; i < families.Count; i++)
+            subMeshes.Add(new List<int>(Mathf.Max(64, triangles.Count / Mathf.Max(1, families.Count))));
+        List<int> outliers = new List<int>(Mathf.Max(64, triangles.Count / 8));
+
+        float maxDistance = Mathf.Max(0.005f, planeFamilyClassifyDistanceMeters);
+        float normalDotThreshold = Mathf.Cos(planeFamilyClassifyNormalDegrees * Mathf.Deg2Rad);
+        int[] assignments = BuildPlaneFamilyAssignments(vertices, normals, families, maxDistance, normalDotThreshold);
+        WritePlaneFamilyDiagnostics(vertices, normals, families, assignments, maxDistance, normalDotThreshold, force: false);
+        for (int i = 0; i + 2 < triangles.Count; i += 3)
+        {
+            int ia = triangles[i];
+            int ib = triangles[i + 1];
+            int ic = triangles[i + 2];
+            if ((uint)ia >= (uint)vertices.Count || (uint)ib >= (uint)vertices.Count || (uint)ic >= (uint)vertices.Count)
+                continue;
+
+            int bestFamily = ChooseTrianglePlaneFamily(assignments, ia, ib, ic);
+            List<int> target = bestFamily >= 0 ? subMeshes[bestFamily] : outliers;
+            target.Add(ia);
+            target.Add(ib);
+            target.Add(ic);
+        }
+
+        for (int i = subMeshes.Count - 1; i >= 0; i--)
+        {
+            if (subMeshes[i].Count <= 0)
+                subMeshes.RemoveAt(i);
+        }
+
+        if (outliers.Count > 0)
+        {
+            outlierSubmeshIndex = subMeshes.Count;
+            subMeshes.Add(outliers);
+        }
+
+        return subMeshes.Count > 0;
+    }
+
+    private bool TryBuildPlaneFamilyPointCloudMesh(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        out List<Vector3> pointVertices,
+        out List<Vector3> pointNormals,
+        out List<List<int>> pointSubMeshes,
+        out int outlierSubmeshIndex)
+    {
+        pointVertices = new List<Vector3>(vertices != null ? vertices.Count * 4 : 0);
+        pointNormals = new List<Vector3>(vertices != null ? vertices.Count * 4 : 0);
+        pointSubMeshes = new List<List<int>>();
+        outlierSubmeshIndex = -1;
+        if (vertices == null || normals == null ||
+            vertices.Count < planeFamilyMinInliers || normals.Count != vertices.Count)
+            return false;
+
+        if (!TryExtractPlaneFamilyModels(vertices, normals, out List<PlaneFamilyModel> families) || families.Count <= 0)
+            return false;
+
+        float maxDistance = Mathf.Max(0.005f, planeFamilyClassifyDistanceMeters);
+        float normalDotThreshold = Mathf.Cos(planeFamilyClassifyNormalDegrees * Mathf.Deg2Rad);
+        float halfSize = Mathf.Max(0.001f, planeFamilyPointSizeMeters * 0.5f);
+        int[] assignments = BuildPlaneFamilyAssignments(vertices, normals, families, maxDistance, normalDotThreshold);
+        WritePlaneFamilyDiagnostics(vertices, normals, families, assignments, maxDistance, normalDotThreshold, force: false);
+
+        for (int i = 0; i < families.Count; i++)
+            pointSubMeshes.Add(new List<int>(Mathf.Max(64, vertices.Count / Mathf.Max(1, families.Count))));
+
+        List<int> outliers = new List<int>(Mathf.Max(64, vertices.Count / 8));
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 point = vertices[i];
+            Vector3 normal = normals[i];
+            if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                continue;
+            normal.Normalize();
+            int bestFamily = assignments[i];
+            List<int> target = bestFamily >= 0 ? pointSubMeshes[bestFamily] : outliers;
+            AppendPlaneFamilyPointQuad(point, normal, halfSize, pointVertices, pointNormals, target);
+        }
+
+        for (int i = pointSubMeshes.Count - 1; i >= 0; i--)
+        {
+            if (pointSubMeshes[i].Count <= 0)
+                pointSubMeshes.RemoveAt(i);
+        }
+
+        if (outliers.Count > 0)
+        {
+            outlierSubmeshIndex = pointSubMeshes.Count;
+            pointSubMeshes.Add(outliers);
+        }
+
+        return pointVertices.Count > 0 && pointSubMeshes.Count > 0;
+    }
+
+    private int[] BuildPlaneFamilyAssignments(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<PlaneFamilyModel> families,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        int[] assignments = new int[vertices != null ? vertices.Count : 0];
+        for (int i = 0; i < assignments.Length; i++)
+            assignments[i] = -1;
+
+        if (vertices == null || normals == null || families == null ||
+            vertices.Count <= 0 || normals.Count != vertices.Count || families.Count <= 0)
+            return assignments;
+
+        if (!planeFamilyUseStructuralConsensus)
+        {
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                Vector3 point = vertices[i];
+                Vector3 normal = normals[i];
+                if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                    continue;
+
+                normal.Normalize();
+                assignments[i] = ClassifyPointToPlaneFamily(point, normal, families, maxDistance, normalDotThreshold);
+            }
+
+            if (planeFamilyUseSpatialConsistency && _tris.Count >= 3)
+                SmoothPlaneFamilyAssignments(vertices, normals, families, assignments, maxDistance, normalDotThreshold);
+            return assignments;
+        }
+
+        PlaneFamilyProjection[] projections = BuildPlaneFamilyProjections(vertices, normals, families, maxDistance, normalDotThreshold);
+        int[] candidates = new int[vertices.Count];
+        bool[] strong = new bool[vertices.Count];
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            candidates[i] = -1;
+            Vector3 point = vertices[i];
+            Vector3 normal = normals[i];
+            if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                continue;
+
+            normal.Normalize();
+            candidates[i] = ClassifyPointToPlaneFamilyStructural(point, normal, families, projections, maxDistance, out float bestDistance);
+            if (candidates[i] >= 0 && bestDistance <= maxDistance * Mathf.Clamp01(planeFamilyStrongDistanceRatio))
+            {
+                assignments[i] = candidates[i];
+                strong[i] = true;
+            }
+        }
+
+        ApplyStructuralConsensusAssignments(vertices.Count, candidates, strong, assignments);
+
+        if (planeFamilyUseSpatialConsistency && _tris.Count >= 3)
+            SmoothPlaneFamilyAssignments(vertices, normals, families, assignments, maxDistance, -1f);
+
+        return assignments;
+    }
+
+    private PlaneFamilyProjection[] BuildPlaneFamilyProjections(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<PlaneFamilyModel> families,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        PlaneFamilyProjection[] projections = new PlaneFamilyProjection[families.Count];
+        int[] counts = new int[families.Count];
+        float looseNormalDot = Mathf.Min(normalDotThreshold, Mathf.Cos(70f * Mathf.Deg2Rad));
+        for (int familyIndex = 0; familyIndex < families.Count; familyIndex++)
+        {
+            PlaneFamilyModel family = families[familyIndex];
+            Vector3 up = Vector3.ProjectOnPlane(Vector3.up, family.normal);
+            if (up.sqrMagnitude <= 1e-8f)
+                up = Vector3.ProjectOnPlane(Vector3.forward, family.normal);
+            if (up.sqrMagnitude <= 1e-8f)
+                up = Vector3.ProjectOnPlane(Vector3.right, family.normal);
+            if (up.sqrMagnitude <= 1e-8f)
+                up = Vector3.up;
+            up.Normalize();
+
+            Vector3 right = Vector3.Cross(up, family.normal);
+            if (right.sqrMagnitude <= 1e-8f)
+                right = Vector3.Cross(Vector3.right, family.normal);
+            right = right.sqrMagnitude > 1e-8f ? right.normalized : Vector3.right;
+            up = Vector3.Cross(family.normal, right).normalized;
+
+            projections[familyIndex] = new PlaneFamilyProjection
+            {
+                valid = false,
+                right = right,
+                up = up,
+                minU = float.PositiveInfinity,
+                maxU = float.NegativeInfinity,
+                minV = float.PositiveInfinity,
+                maxV = float.NegativeInfinity
+            };
+        }
+
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 point = vertices[i];
+            Vector3 normal = normals[i];
+            if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                continue;
+            normal.Normalize();
+
+            for (int familyIndex = 0; familyIndex < families.Count; familyIndex++)
+            {
+                PlaneFamilyModel family = families[familyIndex];
+                float distance = Mathf.Abs(Vector3.Dot(family.normal, point) + family.d);
+                if (distance > maxDistance)
+                    continue;
+                if (Mathf.Abs(Vector3.Dot(normal, family.normal)) < looseNormalDot)
+                    continue;
+
+                PlaneFamilyProjection projection = projections[familyIndex];
+                Vector3 delta = point - family.center;
+                float u = Vector3.Dot(delta, projection.right);
+                float v = Vector3.Dot(delta, projection.up);
+                projection.minU = Mathf.Min(projection.minU, u);
+                projection.maxU = Mathf.Max(projection.maxU, u);
+                projection.minV = Mathf.Min(projection.minV, v);
+                projection.maxV = Mathf.Max(projection.maxV, v);
+                projections[familyIndex] = projection;
+                counts[familyIndex]++;
+            }
+        }
+
+        int minCoverageSamples = Mathf.Max(6, planeFamilyMinInliers / 2);
+        for (int familyIndex = 0; familyIndex < projections.Length; familyIndex++)
+        {
+            PlaneFamilyProjection projection = projections[familyIndex];
+            projection.valid = counts[familyIndex] >= minCoverageSamples &&
+                               projection.minU <= projection.maxU &&
+                               projection.minV <= projection.maxV;
+            projections[familyIndex] = projection;
+        }
+
+        return projections;
+    }
+
+    private int ClassifyPointToPlaneFamilyStructural(
+        Vector3 point,
+        Vector3 normal,
+        List<PlaneFamilyModel> families,
+        PlaneFamilyProjection[] projections,
+        float maxDistance,
+        out float bestDistance)
+    {
+        int bestFamily = -1;
+        bestDistance = float.PositiveInfinity;
+        float bestScore = float.PositiveInfinity;
+        float normalScoreWeight = Mathf.Max(0f, planeFamilyNormalScoreWeight);
+        for (int familyIndex = 0; familyIndex < families.Count; familyIndex++)
+        {
+            PlaneFamilyModel family = families[familyIndex];
+            float distance = Mathf.Abs(Vector3.Dot(family.normal, point) + family.d);
+            if (distance > maxDistance)
+                continue;
+            if (projections != null &&
+                familyIndex < projections.Length &&
+                projections[familyIndex].valid &&
+                !PointWithinPlaneFamilyProjection(point, family, projections[familyIndex]))
+                continue;
+
+            float normalDot = Mathf.Abs(Vector3.Dot(normal, family.normal));
+            float score = distance - normalDot * maxDistance * normalScoreWeight;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestDistance = distance;
+                bestFamily = familyIndex;
+            }
+        }
+
+        return bestFamily;
+    }
+
+    private bool PointWithinPlaneFamilyProjection(Vector3 point, PlaneFamilyModel family, PlaneFamilyProjection projection)
+    {
+        Vector3 delta = point - family.center;
+        float padding = Mathf.Max(0f, planeFamilyProjectionPaddingMeters);
+        float u = Vector3.Dot(delta, projection.right);
+        float v = Vector3.Dot(delta, projection.up);
+        return u >= projection.minU - padding &&
+               u <= projection.maxU + padding &&
+               v >= projection.minV - padding &&
+               v <= projection.maxV + padding;
+    }
+
+    private void ApplyStructuralConsensusAssignments(int vertexCount, int[] candidates, bool[] strong, int[] assignments)
+    {
+        if (vertexCount <= 0 || candidates == null || strong == null || assignments == null ||
+            candidates.Length != vertexCount || strong.Length != vertexCount || assignments.Length != vertexCount)
+            return;
+
+        List<int>[] neighbors = BuildPlaneFamilyVertexNeighbors(vertexCount);
+        if (neighbors == null)
+            return;
+
+        int minSame = Mathf.Max(1, planeFamilyStructuralNeighborMinSame);
+        float minRatio = Mathf.Clamp01(planeFamilyStructuralNeighborMinRatio);
+        for (int i = 0; i < vertexCount; i++)
+        {
+            if (assignments[i] >= 0 || strong[i] || candidates[i] < 0)
+                continue;
+
+            List<int> localNeighbors = neighbors[i];
+            if (localNeighbors == null || localNeighbors.Count <= 0)
+                continue;
+
+            int same = 0;
+            int candidateNeighborCount = 0;
+            for (int n = 0; n < localNeighbors.Count; n++)
+            {
+                int neighbor = localNeighbors[n];
+                if ((uint)neighbor >= (uint)candidates.Length || candidates[neighbor] < 0)
+                    continue;
+                candidateNeighborCount++;
+                if (candidates[neighbor] == candidates[i])
+                    same++;
+            }
+
+            float ratio = candidateNeighborCount > 0 ? same / (float)candidateNeighborCount : 0f;
+            if (same >= minSame && ratio >= minRatio)
+                assignments[i] = candidates[i];
+        }
+    }
+
+    private static int ChooseTrianglePlaneFamily(int[] assignments, int ia, int ib, int ic)
+    {
+        if (assignments == null ||
+            (uint)ia >= (uint)assignments.Length ||
+            (uint)ib >= (uint)assignments.Length ||
+            (uint)ic >= (uint)assignments.Length)
+            return -1;
+
+        int a = assignments[ia];
+        int b = assignments[ib];
+        int c = assignments[ic];
+        if (a >= 0 && (a == b || a == c))
+            return a;
+        if (b >= 0 && b == c)
+            return b;
+        if (a >= 0)
+            return a;
+        if (b >= 0)
+            return b;
+        return c >= 0 ? c : -1;
+    }
+
+    private int ClassifyPointToPlaneFamily(
+        Vector3 point,
+        Vector3 normal,
+        List<PlaneFamilyModel> families,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        int bestFamily = -1;
+        float bestDistance = maxDistance;
+        for (int familyIndex = 0; familyIndex < families.Count; familyIndex++)
+        {
+            PlaneFamilyModel family = families[familyIndex];
+            float normalDot = Mathf.Abs(Vector3.Dot(normal, family.normal));
+            if (normalDot < normalDotThreshold)
+                continue;
+
+            float distance = Mathf.Abs(Vector3.Dot(family.normal, point) + family.d);
+            if (distance <= bestDistance)
+            {
+                bestDistance = distance;
+                bestFamily = familyIndex;
+            }
+        }
+
+        return bestFamily;
+    }
+
+    private void SmoothPlaneFamilyAssignments(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<PlaneFamilyModel> families,
+        int[] assignments,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        if (vertices == null || normals == null || families == null || assignments == null ||
+            vertices.Count <= 0 || normals.Count != vertices.Count || assignments.Length != vertices.Count)
+            return;
+
+        List<int>[] neighbors = BuildPlaneFamilyVertexNeighbors(vertices.Count);
+        if (neighbors == null)
+            return;
+
+        int passCount = Mathf.Clamp(planeFamilySpatialSmoothingPasses, 0, 4);
+        int[] counts = new int[Mathf.Max(1, families.Count)];
+        for (int pass = 0; pass < passCount; pass++)
+        {
+            int[] next = new int[assignments.Length];
+            Array.Copy(assignments, next, assignments.Length);
+            for (int i = 0; i < assignments.Length; i++)
+            {
+                List<int> localNeighbors = neighbors[i];
+                if (localNeighbors == null || localNeighbors.Count <= 0)
+                    continue;
+
+                Array.Clear(counts, 0, counts.Length);
+                for (int n = 0; n < localNeighbors.Count; n++)
+                {
+                    int label = assignments[localNeighbors[n]];
+                    if ((uint)label < (uint)counts.Length)
+                        counts[label]++;
+                }
+
+                int bestLabel = assignments[i];
+                int bestVotes = 0;
+                for (int label = 0; label < counts.Length; label++)
+                {
+                    if (counts[label] > bestVotes)
+                    {
+                        bestVotes = counts[label];
+                        bestLabel = label;
+                    }
+                }
+
+                if (bestLabel >= 0 &&
+                    bestLabel != assignments[i] &&
+                    bestVotes >= Mathf.Max(1, planeFamilyNeighborVoteThreshold) &&
+                    PointFitsPlaneFamily(vertices[i], normals[i], families[bestLabel], maxDistance, normalDotThreshold))
+                {
+                    next[i] = bestLabel;
+                }
+            }
+
+            Array.Copy(next, assignments, assignments.Length);
+        }
+
+        MergeSmallPlaneFamilyIslands(vertices, normals, families, assignments, neighbors, maxDistance, normalDotThreshold);
+    }
+
+    private List<int>[] BuildPlaneFamilyVertexNeighbors(int vertexCount)
+    {
+        if (vertexCount <= 0 || _tris.Count < 3)
+            return null;
+
+        List<int>[] neighbors = new List<int>[vertexCount];
+        for (int i = 0; i + 2 < _tris.Count; i += 3)
+        {
+            int a = _tris[i];
+            int b = _tris[i + 1];
+            int c = _tris[i + 2];
+            if ((uint)a >= (uint)vertexCount || (uint)b >= (uint)vertexCount || (uint)c >= (uint)vertexCount)
+                continue;
+            AddPlaneFamilyNeighbor(neighbors, a, b);
+            AddPlaneFamilyNeighbor(neighbors, b, a);
+            AddPlaneFamilyNeighbor(neighbors, b, c);
+            AddPlaneFamilyNeighbor(neighbors, c, b);
+            AddPlaneFamilyNeighbor(neighbors, c, a);
+            AddPlaneFamilyNeighbor(neighbors, a, c);
+        }
+
+        return neighbors;
+    }
+
+    private static void AddPlaneFamilyNeighbor(List<int>[] neighbors, int index, int neighbor)
+    {
+        List<int> list = neighbors[index];
+        if (list == null)
+        {
+            list = new List<int>(6);
+            neighbors[index] = list;
+        }
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            if (list[i] == neighbor)
+                return;
+        }
+
+        list.Add(neighbor);
+    }
+
+    private void WritePlaneFamilyDiagnostics(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<PlaneFamilyModel> families,
+        int[] assignments,
+        float maxDistance,
+        float normalDotThreshold,
+        bool force)
+    {
+        if (!planeFamilyDiagnostics || vertices == null || normals == null || families == null || assignments == null ||
+            vertices.Count <= 0 || normals.Count != vertices.Count || assignments.Length != vertices.Count)
+            return;
+
+        float now = Application.isPlaying ? Time.realtimeSinceStartup : 0f;
+        if (!force && Application.isPlaying &&
+            now - _lastPlaneFamilyDiagnosticsTime < Mathf.Max(0.1f, planeFamilyDiagnosticsMinIntervalSeconds))
+            return;
+
+        _lastPlaneFamilyDiagnosticsTime = now;
+        List<int>[] neighbors = BuildPlaneFamilyVertexNeighbors(vertices.Count);
+        int familyCount = families.Count;
+        int[] counts = new int[familyCount];
+        int[] componentCounts = new int[familyCount];
+        int[] largestComponents = new int[familyCount];
+        int[] smallComponents = new int[familyCount];
+        int[] familyEdges = new int[familyCount];
+        int[] familySameEdges = new int[familyCount];
+        float[] distanceSums = new float[familyCount];
+        float[] maxDistances = new float[familyCount];
+        float[] angleSums = new float[familyCount];
+        float[] maxAngles = new float[familyCount];
+
+        int assignedCount = 0;
+        int outlierCount = 0;
+        for (int i = 0; i < assignments.Length; i++)
+        {
+            int label = assignments[i];
+            if ((uint)label >= (uint)familyCount)
+            {
+                outlierCount++;
+                continue;
+            }
+
+            assignedCount++;
+            counts[label]++;
+            PlaneFamilyModel family = families[label];
+            float distance = Mathf.Abs(Vector3.Dot(family.normal, vertices[i]) + family.d);
+            distanceSums[label] += distance;
+            maxDistances[label] = Mathf.Max(maxDistances[label], distance);
+            float angle = 0f;
+            Vector3 normal = normals[i];
+            if (Finite(normal) && normal.sqrMagnitude > 1e-8f)
+            {
+                normal.Normalize();
+                angle = Mathf.Acos(Mathf.Clamp(Mathf.Abs(Vector3.Dot(normal, family.normal)), -1f, 1f)) * Mathf.Rad2Deg;
+            }
+
+            angleSums[label] += angle;
+            maxAngles[label] = Mathf.Max(maxAngles[label], angle);
+        }
+
+        int labeledEdges = 0;
+        int sameEdges = 0;
+        int mixedEdges = 0;
+        if (neighbors != null)
+        {
+            for (int i = 0; i < neighbors.Length; i++)
+            {
+                List<int> localNeighbors = neighbors[i];
+                if (localNeighbors == null)
+                    continue;
+
+                int a = assignments[i];
+                for (int n = 0; n < localNeighbors.Count; n++)
+                {
+                    int j = localNeighbors[n];
+                    if (j <= i || (uint)j >= (uint)assignments.Length)
+                        continue;
+
+                    int b = assignments[j];
+                    if ((uint)a >= (uint)familyCount || (uint)b >= (uint)familyCount)
+                        continue;
+
+                    labeledEdges++;
+                    if (a == b)
+                    {
+                        sameEdges++;
+                        familyEdges[a]++;
+                        familySameEdges[a]++;
+                    }
+                    else
+                    {
+                        mixedEdges++;
+                        familyEdges[a]++;
+                        familyEdges[b]++;
+                    }
+                }
+            }
+
+            for (int label = 0; label < familyCount; label++)
+                CountPlaneFamilyComponents(assignments, neighbors, label, out componentCounts[label], out largestComponents[label], out smallComponents[label]);
+        }
+
+        float outlierRatio = outlierCount / (float)Mathf.Max(1, vertices.Count);
+        float sameEdgeRatio = sameEdges / (float)Mathf.Max(1, labeledEdges);
+        float mixedEdgeRatio = mixedEdges / (float)Mathf.Max(1, labeledEdges);
+        string diagnosis = BuildPlaneFamilyDiagnosticSummary(familyCount, outlierRatio, sameEdgeRatio, mixedEdgeRatio, componentCounts, counts);
+        string path = null;
+        if (planeFamilyDiagnosticsExportCsv)
+            path = ExportPlaneFamilyDiagnosticsCsv(vertices.Count, assignedCount, outlierCount, labeledEdges, sameEdges, mixedEdges, maxDistance, normalDotThreshold, families, counts, componentCounts, largestComponents, smallComponents, familyEdges, familySameEdges, distanceSums, maxDistances, angleSums, maxAngles, diagnosis);
+
+        if (!string.IsNullOrEmpty(path))
+            _lastPlaneFamilyDiagnosticsPath = path;
+
+        if (planeFamilyDiagnosticsLogSummary)
+        {
+            string pathSuffix = string.IsNullOrEmpty(path) ? string.Empty : $" path={path}";
+            Debug.Log($"[ScanCoverPlaneFamilyDiagnostics] families={familyCount} assigned={assignedCount}/{vertices.Count} outlier={outlierRatio:0.0%} sameEdge={sameEdgeRatio:0.0%} mixedEdge={mixedEdgeRatio:0.0%} diagnosis={diagnosis}{pathSuffix}", this);
+        }
+    }
+
+    private static void CountPlaneFamilyComponents(
+        int[] assignments,
+        List<int>[] neighbors,
+        int targetLabel,
+        out int componentCount,
+        out int largestComponent,
+        out int smallComponentCount)
+    {
+        componentCount = 0;
+        largestComponent = 0;
+        smallComponentCount = 0;
+        if (assignments == null || neighbors == null || assignments.Length != neighbors.Length)
+            return;
+
+        bool[] visited = new bool[assignments.Length];
+        List<int> stack = new List<int>(64);
+        for (int start = 0; start < assignments.Length; start++)
+        {
+            if (visited[start] || assignments[start] != targetLabel)
+                continue;
+
+            int size = 0;
+            componentCount++;
+            stack.Clear();
+            stack.Add(start);
+            visited[start] = true;
+            while (stack.Count > 0)
+            {
+                int current = stack[stack.Count - 1];
+                stack.RemoveAt(stack.Count - 1);
+                size++;
+                List<int> localNeighbors = neighbors[current];
+                if (localNeighbors == null)
+                    continue;
+
+                for (int i = 0; i < localNeighbors.Count; i++)
+                {
+                    int neighbor = localNeighbors[i];
+                    if ((uint)neighbor >= (uint)assignments.Length || visited[neighbor] || assignments[neighbor] != targetLabel)
+                        continue;
+                    visited[neighbor] = true;
+                    stack.Add(neighbor);
+                }
+            }
+
+            largestComponent = Mathf.Max(largestComponent, size);
+            if (size < 18)
+                smallComponentCount++;
+        }
+    }
+
+    private string BuildPlaneFamilyDiagnosticSummary(
+        int familyCount,
+        float outlierRatio,
+        float sameEdgeRatio,
+        float mixedEdgeRatio,
+        int[] componentCounts,
+        int[] counts)
+    {
+        int activeFamilies = 0;
+        int fragmentedFamilies = 0;
+        for (int i = 0; i < counts.Length; i++)
+        {
+            if (counts[i] <= 0)
+                continue;
+            activeFamilies++;
+            if (i < componentCounts.Length && componentCounts[i] >= 3)
+                fragmentedFamilies++;
+        }
+
+        if (familyCount >= Mathf.Max(1, planeFamilyMaxFamilies) && mixedEdgeRatio > 0.18f)
+            return "候选主面数量打满且邻接混色偏高：同一物理面很可能被拆成多个 family。";
+        if (sameEdgeRatio < 0.55f || mixedEdgeRatio > 0.35f)
+            return "邻域一致率低：分类标签在网格邻接层已经碎，不是单纯显示问题。";
+        if (outlierRatio > 0.25f)
+            return "未归类点偏多：深度/法线/投影范围或阈值造成大量风险点。";
+        if (fragmentedFamilies >= Mathf.Max(1, activeFamilies / 2))
+            return "连通块碎片偏多：邻域合并没有覆盖到这些小岛。";
+        return "整体指标未显示严重碎片，需看每个 family 的距离/法线统计定位。";
+    }
+
+    private string ExportPlaneFamilyDiagnosticsCsv(
+        int vertexCount,
+        int assignedCount,
+        int outlierCount,
+        int labeledEdges,
+        int sameEdges,
+        int mixedEdges,
+        float classifyDistance,
+        float normalDotThreshold,
+        List<PlaneFamilyModel> families,
+        int[] counts,
+        int[] componentCounts,
+        int[] largestComponents,
+        int[] smallComponents,
+        int[] familyEdges,
+        int[] familySameEdges,
+        float[] distanceSums,
+        float[] maxDistances,
+        float[] angleSums,
+        float[] maxAngles,
+        string diagnosis)
+    {
+        try
+        {
+            string root = Path.Combine(Application.dataPath, "..", "ScanCoverExports", "PlaneFamilyDiagnostics");
+            Directory.CreateDirectory(root);
+            string path = Path.Combine(root, $"ScanCover_PlaneFamilyDiagnostics_{DateTime.Now:yyyyMMdd_HHmmss_fff}.csv");
+            StringBuilder sb = new StringBuilder(4096);
+            sb.AppendLine("section,key,value");
+            AppendCsvRow(sb, "summary", "vertexCount", vertexCount.ToString(CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "familyCount", families.Count.ToString(CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "assignedCount", assignedCount.ToString(CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "outlierCount", outlierCount.ToString(CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "outlierRatio", (outlierCount / (float)Mathf.Max(1, vertexCount)).ToString("0.######", CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "labeledEdges", labeledEdges.ToString(CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "sameEdgeRatio", (sameEdges / (float)Mathf.Max(1, labeledEdges)).ToString("0.######", CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "mixedEdgeRatio", (mixedEdges / (float)Mathf.Max(1, labeledEdges)).ToString("0.######", CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "classifyDistanceMeters", classifyDistance.ToString("0.######", CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "classifyNormalDegrees", (Mathf.Acos(Mathf.Clamp(normalDotThreshold, -1f, 1f)) * Mathf.Rad2Deg).ToString("0.###", CultureInfo.InvariantCulture));
+            AppendCsvRow(sb, "summary", "diagnosis", diagnosis);
+            sb.AppendLine();
+            sb.AppendLine("family,count,inlierCount,components,largestComponent,smallComponents,sameNeighborRatio,avgPlaneDistance,maxPlaneDistance,avgNormalAngle,maxNormalAngle,normalX,normalY,normalZ,centerX,centerY,centerZ,d");
+            for (int i = 0; i < families.Count; i++)
+            {
+                int count = counts[i];
+                float sameRatio = familySameEdges[i] / (float)Mathf.Max(1, familyEdges[i]);
+                float avgDistance = distanceSums[i] / Mathf.Max(1, count);
+                float avgAngle = angleSums[i] / Mathf.Max(1, count);
+                PlaneFamilyModel family = families[i];
+                sb.Append(i.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(count.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.inlierCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(componentCounts[i].ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(largestComponents[i].ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(smallComponents[i].ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(sameRatio.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(avgDistance.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(maxDistances[i].ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(avgAngle.ToString("0.###", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(maxAngles[i].ToString("0.###", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.normal.x.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.normal.y.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.normal.z.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.center.x.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.center.y.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.center.z.ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(family.d.ToString("0.######", CultureInfo.InvariantCulture)).AppendLine();
+            }
+
+            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[ScanCoverPlaneFamilyDiagnostics] Failed to export diagnostics: {ex.Message}", this);
+            return null;
+        }
+    }
+
+    private static void AppendCsvRow(StringBuilder sb, string section, string key, string value)
+    {
+        sb.Append(section).Append(',').Append(key).Append(',').Append(EscapeCsv(value)).AppendLine();
+    }
+
+    private static string EscapeCsv(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+        return value.IndexOfAny(new[] { ',', '"', '\r', '\n' }) >= 0
+            ? "\"" + value.Replace("\"", "\"\"") + "\""
+            : value;
+    }
+
+    private void MergeSmallPlaneFamilyIslands(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<PlaneFamilyModel> families,
+        int[] assignments,
+        List<int>[] neighbors,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        int minIslandPoints = Mathf.Max(1, planeFamilyMinIslandPoints);
+        if (minIslandPoints <= 1 || assignments.Length <= 0)
+            return;
+
+        int assignedCount = 0;
+        for (int i = 0; i < assignments.Length; i++)
+        {
+            if (assignments[i] >= 0)
+                assignedCount++;
+        }
+
+        int weakLimitByRatio = planeFamilyWeakIslandMaxRatio > 0f
+            ? Mathf.CeilToInt(assignedCount * planeFamilyWeakIslandMaxRatio)
+            : int.MaxValue;
+        int weakComponentLimit = Mathf.Max(
+            minIslandPoints,
+            Mathf.Min(Mathf.Max(minIslandPoints, planeFamilyWeakIslandMaxPoints), weakLimitByRatio));
+        float weakBorderRatio = Mathf.Clamp01(planeFamilyWeakIslandBorderRatio);
+        int weakMinVotes = Mathf.Max(planeFamilyNeighborVoteThreshold, 4);
+        bool[] visited = new bool[assignments.Length];
+        List<int> stack = new List<int>(64);
+        List<int> component = new List<int>(64);
+        int[] borderCounts = new int[Mathf.Max(1, families.Count)];
+        for (int start = 0; start < assignments.Length; start++)
+        {
+            if (visited[start] || assignments[start] < 0)
+                continue;
+
+            int sourceLabel = assignments[start];
+            stack.Clear();
+            component.Clear();
+            stack.Add(start);
+            visited[start] = true;
+            while (stack.Count > 0)
+            {
+                int current = stack[stack.Count - 1];
+                stack.RemoveAt(stack.Count - 1);
+                component.Add(current);
+
+                List<int> localNeighbors = neighbors[current];
+                if (localNeighbors == null)
+                    continue;
+
+                for (int i = 0; i < localNeighbors.Count; i++)
+                {
+                    int neighbor = localNeighbors[i];
+                    if ((uint)neighbor >= (uint)assignments.Length || visited[neighbor] || assignments[neighbor] != sourceLabel)
+                        continue;
+                    visited[neighbor] = true;
+                    stack.Add(neighbor);
+                }
+            }
+
+            bool tinyIsland = component.Count < minIslandPoints;
+            bool weakIsland = component.Count <= weakComponentLimit;
+            if (!tinyIsland && !weakIsland)
+                continue;
+
+            Array.Clear(borderCounts, 0, borderCounts.Length);
+            int borderTotal = 0;
+            for (int i = 0; i < component.Count; i++)
+            {
+                List<int> localNeighbors = neighbors[component[i]];
+                if (localNeighbors == null)
+                    continue;
+
+                for (int n = 0; n < localNeighbors.Count; n++)
+                {
+                    int label = assignments[localNeighbors[n]];
+                    if (label >= 0 && label != sourceLabel && label < borderCounts.Length)
+                    {
+                        borderCounts[label]++;
+                        borderTotal++;
+                    }
+                }
+            }
+
+            int targetLabel = -1;
+            int targetVotes = 0;
+            for (int label = 0; label < borderCounts.Length; label++)
+            {
+                if (borderCounts[label] > targetVotes)
+                {
+                    targetVotes = borderCounts[label];
+                    targetLabel = label;
+                }
+            }
+
+            if (targetLabel < 0 || targetVotes <= 0)
+                continue;
+
+            float targetBorderRatio = borderTotal > 0 ? targetVotes / (float)borderTotal : 0f;
+            if (!tinyIsland && (targetVotes < weakMinVotes || targetBorderRatio < weakBorderRatio))
+                continue;
+
+            for (int i = 0; i < component.Count; i++)
+            {
+                int vertexIndex = component[i];
+                bool fits = tinyIsland
+                    ? PointFitsPlaneFamily(vertices[vertexIndex], normals[vertexIndex], families[targetLabel], maxDistance, normalDotThreshold)
+                    : PointFitsPlaneFamilyRelaxed(vertices[vertexIndex], normals[vertexIndex], families[targetLabel], maxDistance, normalDotThreshold);
+                if (fits)
+                    assignments[vertexIndex] = targetLabel;
+            }
+        }
+    }
+
+    private bool PointFitsPlaneFamilyRelaxed(
+        Vector3 point,
+        Vector3 normal,
+        PlaneFamilyModel family,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        if (!Finite(point))
+            return false;
+
+        float distanceLimit = Mathf.Max(0.005f, maxDistance) * Mathf.Max(1f, planeFamilyWeakIslandRelaxDistanceMultiplier);
+        if (Mathf.Abs(Vector3.Dot(family.normal, point) + family.d) > distanceLimit)
+            return false;
+
+        if (!Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+            return true;
+
+        normal.Normalize();
+        float relaxedDot = Mathf.Cos(Mathf.Clamp(planeFamilyWeakIslandRelaxNormalDegrees, 0f, 89f) * Mathf.Deg2Rad);
+        if (normalDotThreshold >= 0f)
+            relaxedDot = Mathf.Min(normalDotThreshold, relaxedDot);
+        return Mathf.Abs(Vector3.Dot(normal, family.normal)) >= relaxedDot;
+    }
+
+    private static bool PointFitsPlaneFamily(
+        Vector3 point,
+        Vector3 normal,
+        PlaneFamilyModel family,
+        float maxDistance,
+        float normalDotThreshold)
+    {
+        if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+            return false;
+        normal.Normalize();
+        return Mathf.Abs(Vector3.Dot(normal, family.normal)) >= normalDotThreshold &&
+               Mathf.Abs(Vector3.Dot(family.normal, point) + family.d) <= maxDistance;
+    }
+
+    private bool TryBuildPlaneFamilyPointQuadMesh(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<List<int>> triangleSubMeshes,
+        out List<Vector3> pointVertices,
+        out List<Vector3> pointNormals,
+        out List<List<int>> pointSubMeshes)
+    {
+        pointVertices = new List<Vector3>(vertices != null ? vertices.Count * 4 : 0);
+        pointNormals = new List<Vector3>(vertices != null ? vertices.Count * 4 : 0);
+        pointSubMeshes = new List<List<int>>();
+        if (vertices == null || normals == null || triangleSubMeshes == null || vertices.Count <= 0 || normals.Count != vertices.Count)
+            return false;
+
+        float halfSize = Mathf.Max(0.001f, planeFamilyPointSizeMeters * 0.5f);
+        bool[] emitted = new bool[vertices.Count];
+        for (int subMeshIndex = 0; subMeshIndex < triangleSubMeshes.Count; subMeshIndex++)
+        {
+            List<int> source = triangleSubMeshes[subMeshIndex];
+            List<int> target = new List<int>(source != null ? source.Count * 2 : 0);
+            pointSubMeshes.Add(target);
+            if (source == null)
+                continue;
+
+            Array.Clear(emitted, 0, emitted.Length);
+            for (int i = 0; i < source.Count; i++)
+            {
+                int vertexIndex = source[i];
+                if ((uint)vertexIndex >= (uint)vertices.Count || emitted[vertexIndex])
+                    continue;
+
+                emitted[vertexIndex] = true;
+                AppendPlaneFamilyPointQuad(vertices[vertexIndex], normals[vertexIndex], halfSize, pointVertices, pointNormals, target);
+            }
+        }
+
+        for (int i = pointSubMeshes.Count - 1; i >= 0; i--)
+        {
+            if (pointSubMeshes[i].Count <= 0)
+                pointSubMeshes.RemoveAt(i);
+        }
+
+        return pointVertices.Count > 0 && pointSubMeshes.Count > 0;
+    }
+
+    private static void AppendPlaneFamilyPointQuad(
+        Vector3 center,
+        Vector3 normal,
+        float halfSize,
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<int> triangles)
+    {
+        Vector3 n = normal.sqrMagnitude > 1e-8f && Finite(normal) ? normal.normalized : Vector3.forward;
+        Vector3 right = Vector3.Cross(Vector3.up, n);
+        if (right.sqrMagnitude <= 1e-8f)
+            right = Vector3.Cross(Vector3.right, n);
+        right = SafeNormalized(right, Vector3.right);
+        Vector3 up = SafeNormalized(Vector3.Cross(n, right), Vector3.up);
+        Vector3 bias = n * Mathf.Max(0.0005f, halfSize * 0.25f);
+
+        int start = vertices.Count;
+        vertices.Add(center - right * halfSize - up * halfSize + bias);
+        vertices.Add(center + right * halfSize - up * halfSize + bias);
+        vertices.Add(center + right * halfSize + up * halfSize + bias);
+        vertices.Add(center - right * halfSize + up * halfSize + bias);
+        normals.Add(n);
+        normals.Add(n);
+        normals.Add(n);
+        normals.Add(n);
+        triangles.Add(start);
+        triangles.Add(start + 1);
+        triangles.Add(start + 2);
+        triangles.Add(start);
+        triangles.Add(start + 2);
+        triangles.Add(start + 3);
+    }
+
+    private bool TryExtractPlaneFamilyModels(List<Vector3> vertices, List<Vector3> normals, out List<PlaneFamilyModel> families)
+    {
+        families = new List<PlaneFamilyModel>(Mathf.Max(1, planeFamilyMaxFamilies));
+        List<PlaneFamilySample> samples = BuildPlaneFamilySamples(vertices, normals);
+        if (samples.Count < planeFamilyMinInliers)
+            return false;
+
+        List<PlaneFamilyModel> extracted = new List<PlaneFamilyModel>(Mathf.Max(1, planeFamilyMaxFamilies));
+        int maxFamilies = Mathf.Max(1, planeFamilyMaxFamilies);
+        for (int i = 0; i < maxFamilies; i++)
+        {
+            if (!TryExtractPlaneFamilyModel(samples, i, out PlaneFamilyModel model))
+                break;
+            extracted.Add(model);
+        }
+
+        if (extracted.Count <= 0)
+            return false;
+
+        families = MergePlaneFamilyModels(extracted);
+        return families.Count > 0;
+    }
+
+    private List<PlaneFamilySample> BuildPlaneFamilySamples(List<Vector3> vertices, List<Vector3> normals)
+    {
+        int maxSamples = Mathf.Max(128, planeFamilyMaxSamples);
+        int step = Mathf.Max(1, Mathf.CeilToInt(vertices.Count / (float)maxSamples));
+        List<PlaneFamilySample> samples = new List<PlaneFamilySample>(Mathf.Min(vertices.Count, maxSamples));
+        for (int i = 0; i < vertices.Count; i += step)
+        {
+            Vector3 point = vertices[i];
+            Vector3 normal = normals[i];
+            if (!Finite(point) || !Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                continue;
+
+            samples.Add(new PlaneFamilySample
+            {
+                point = point,
+                normal = normal.normalized,
+                active = true
+            });
+        }
+
+        return samples;
+    }
+
+    private bool TryExtractPlaneFamilyModel(List<PlaneFamilySample> samples, int planeIndex, out PlaneFamilyModel model)
+    {
+        model = default;
+        List<int> activeIndices = new List<int>(samples.Count);
+        for (int i = 0; i < samples.Count; i++)
+        {
+            if (samples[i].active)
+                activeIndices.Add(i);
+        }
+
+        int minInliers = Mathf.Max(12, planeFamilyMinInliers);
+        if (activeIndices.Count < minInliers)
+            return false;
+
+        float fitDistance = Mathf.Max(0.005f, planeFamilyFitDistanceMeters);
+        float normalDotThreshold = Mathf.Cos(planeFamilyClassifyNormalDegrees * Mathf.Deg2Rad);
+        System.Random rng = new System.Random(1469598101 ^ samples.Count * 73856093 ^ (planeIndex + 17) * 19349663);
+        int bestInliers = 0;
+        Vector3 bestPoint = Vector3.zero;
+        Vector3 bestNormal = Vector3.zero;
+        for (int iteration = 0; iteration < planeFamilyRansacIterations; iteration++)
+        {
+            int ia = activeIndices[rng.Next(activeIndices.Count)];
+            int ib = activeIndices[rng.Next(activeIndices.Count)];
+            int ic = activeIndices[rng.Next(activeIndices.Count)];
+            if (ia == ib || ia == ic || ib == ic)
+                continue;
+
+            Vector3 a = samples[ia].point;
+            Vector3 b = samples[ib].point;
+            Vector3 c = samples[ic].point;
+            Vector3 candidateNormal = Vector3.Cross(b - a, c - a);
+            if (!Finite(candidateNormal) || candidateNormal.sqrMagnitude <= 1e-8f)
+                continue;
+            candidateNormal.Normalize();
+
+            int inliers = 0;
+            for (int i = 0; i < activeIndices.Count; i++)
+            {
+                PlaneFamilySample sample = samples[activeIndices[i]];
+                float distance = Mathf.Abs(Vector3.Dot(candidateNormal, sample.point - a));
+                float normalDot = Mathf.Abs(Vector3.Dot(candidateNormal, sample.normal));
+                if (distance <= fitDistance && normalDot >= normalDotThreshold)
+                    inliers++;
+            }
+
+            if (inliers > bestInliers)
+            {
+                bestInliers = inliers;
+                bestPoint = a;
+                bestNormal = candidateNormal;
+            }
+        }
+
+        if (bestInliers < minInliers || bestNormal.sqrMagnitude <= 1e-8f)
+            return false;
+
+        Vector3 center = Vector3.zero;
+        Vector3 normalSum = Vector3.zero;
+        int refinedInliers = 0;
+        for (int i = 0; i < activeIndices.Count; i++)
+        {
+            int sampleIndex = activeIndices[i];
+            PlaneFamilySample sample = samples[sampleIndex];
+            float distance = Mathf.Abs(Vector3.Dot(bestNormal, sample.point - bestPoint));
+            float normalDot = Mathf.Abs(Vector3.Dot(bestNormal, sample.normal));
+            if (distance > fitDistance || normalDot < normalDotThreshold)
+                continue;
+
+            center += sample.point;
+            normalSum += Vector3.Dot(sample.normal, bestNormal) >= 0f ? sample.normal : -sample.normal;
+            refinedInliers++;
+            PlaneFamilySample updated = sample;
+            updated.active = false;
+            samples[sampleIndex] = updated;
+        }
+
+        if (refinedInliers < minInliers)
+            return false;
+
+        center /= refinedInliers;
+        Vector3 normal = normalSum.sqrMagnitude > 1e-8f ? normalSum.normalized : bestNormal;
+        float d = -Vector3.Dot(normal, center);
+        model = new PlaneFamilyModel
+        {
+            center = center,
+            normal = normal,
+            d = d,
+            inlierCount = refinedInliers
+        };
+        return true;
+    }
+
+    private List<PlaneFamilyModel> MergePlaneFamilyModels(List<PlaneFamilyModel> planes)
+    {
+        List<PlaneFamilyModel> families = new List<PlaneFamilyModel>(planes.Count);
+        float mergeDot = Mathf.Cos(planeFamilyMergeNormalDegrees * Mathf.Deg2Rad);
+        float mergeDistance = Mathf.Max(0.005f, planeFamilyMergeDistanceMeters);
+        for (int i = 0; i < planes.Count; i++)
+        {
+            PlaneFamilyModel plane = planes[i];
+            int target = -1;
+            for (int familyIndex = 0; familyIndex < families.Count; familyIndex++)
+            {
+                PlaneFamilyModel family = families[familyIndex];
+                float dot = Vector3.Dot(plane.normal, family.normal);
+                float signedD = plane.d;
+                Vector3 signedNormal = plane.normal;
+                if (dot < 0f)
+                {
+                    dot = -dot;
+                    signedD = -signedD;
+                    signedNormal = -signedNormal;
+                }
+
+                if (dot >= mergeDot && Mathf.Abs(signedD - family.d) <= mergeDistance)
+                {
+                    int total = family.inlierCount + plane.inlierCount;
+                    family.center = (family.center * family.inlierCount + plane.center * plane.inlierCount) / Mathf.Max(1, total);
+                    Vector3 mergedNormal = family.normal * family.inlierCount + signedNormal * plane.inlierCount;
+                    family.normal = mergedNormal.sqrMagnitude > 1e-8f ? mergedNormal.normalized : family.normal;
+                    family.d = (family.d * family.inlierCount + signedD * plane.inlierCount) / Mathf.Max(1, total);
+                    family.inlierCount = total;
+                    families[familyIndex] = family;
+                    target = familyIndex;
+                    break;
+                }
+            }
+
+            if (target < 0)
+                families.Add(plane);
+        }
+
+        families.Sort((a, b) => b.inlierCount.CompareTo(a.inlierCount));
+        return families;
     }
 
     private bool BuildCandidatePlaneObjects(List<CandidateSurfaceInfo> candidateSurfaces, List<Vector3> vertices, List<int> triangles, bool visibleAfterBuild)
@@ -1546,6 +3046,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private bool BuildCandidatePlaneObjectsFromGrid(bool[] valid, Vector3[] positions, Vector3[] normals, bool visibleAfterBuild)
     {
         SetSurfaceVisible(false);
+        SetGeometricSurfaceGridVisible(false);
         SetSurfaceNormalIndicatorsVisible(false);
         SetRemeshGridLinesVisible(false);
         SetCenterDebugMarkersVisible(false);
@@ -2630,6 +4131,606 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         SetRemeshGridLinesVisible(contourVisible);
     }
 
+    private void BuildGeometricSurfaceGridOverlay(List<Vector3> vertices, List<Vector3> normals, List<int> triangles, bool visibleAfterBuild)
+    {
+        bool overlayVisible = _previewVisible && previewDisplayVisible && showGeometricSurfaceGrid;
+        if (!overlayVisible || vertices == null || triangles == null || vertices.Count <= 0 || triangles.Count < 3)
+        {
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        EnsureGeometricSurfaceGridObjects();
+        if (_geometricSurfaceGridMesh == null)
+        {
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        if (geometricSurfaceGridUseRansacPatches &&
+            TryBuildRansacPatchGridOverlay(vertices, normals, out List<Vector3> ransacLineVertices, out List<Vector3> ransacLineNormals, out List<int> ransacLineIndices))
+        {
+            _geometricSurfaceGridMesh.Clear();
+            if (TryBuildCandidateLineRibbonMesh(ransacLineVertices, ransacLineNormals, ransacLineIndices, geometricSurfaceGridLineWidthMeters, out List<Vector3> ransacRibbonVertices, out List<int> ransacRibbonTriangles))
+            {
+                _geometricSurfaceGridMesh.SetVertices(ransacRibbonVertices);
+                _geometricSurfaceGridMesh.SetTriangles(ransacRibbonTriangles, 0, true);
+                _geometricSurfaceGridMesh.RecalculateBounds();
+                ApplyGeometricSurfaceGridRendererColor(geometricSurfaceGridColor);
+                SetGeometricSurfaceGridVisible(true);
+                return;
+            }
+        }
+
+        if (geometricSurfaceGridUseRansacPatches)
+        {
+            _geometricSurfaceGridMesh.Clear();
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        List<Vector3> lineVertices = new List<Vector3>(triangles.Count);
+        List<Vector3> lineNormals = new List<Vector3>(triangles.Count);
+        List<int> lineIndices = new List<int>(triangles.Count);
+        Vector3 planeNormal = ResolveDisplayLocalTransform() != null
+            ? ResolveDisplayLocalTransform().InverseTransformDirection(Vector3.up)
+            : Vector3.up;
+        if (planeNormal.sqrMagnitude <= 1e-8f || !Finite(planeNormal))
+        {
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        planeNormal.Normalize();
+        float minDistance = float.PositiveInfinity;
+        float maxDistance = float.NegativeInfinity;
+        Vector3 center = Vector3.zero;
+        int finiteCount = 0;
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 vertex = vertices[i];
+            if (!Finite(vertex))
+                continue;
+            float distance = Vector3.Dot(vertex, planeNormal);
+            minDistance = Mathf.Min(minDistance, distance);
+            maxDistance = Mathf.Max(maxDistance, distance);
+            center += vertex;
+            finiteCount++;
+        }
+
+        if (finiteCount <= 0 || !float.IsFinite(minDistance) || !float.IsFinite(maxDistance) || maxDistance <= minDistance)
+        {
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        center /= finiteCount;
+        float spacing = Mathf.Max(0.01f, geometricSurfaceGridSpacingMeters);
+        int sliceCount = Mathf.Clamp(Mathf.FloorToInt((maxDistance - minDistance) / spacing) + 1, 1, 160);
+        float epsilon = Mathf.Max(0.0005f, spacing * 0.01f);
+        float maxSegmentLength = Mathf.Max(spacing * 4f, 0.35f);
+        AppendHeightSliceIntersectionRows(vertices, triangles, center, planeNormal, sliceCount, epsilon, maxSegmentLength, lineVertices, lineNormals, lineIndices);
+
+        _geometricSurfaceGridMesh.Clear();
+        if (lineIndices.Count <= 0 ||
+            !TryBuildCandidateLineRibbonMesh(lineVertices, lineNormals, lineIndices, geometricSurfaceGridLineWidthMeters, out List<Vector3> ribbonVertices, out List<int> ribbonTriangles))
+        {
+            SetGeometricSurfaceGridVisible(false);
+            return;
+        }
+
+        _geometricSurfaceGridMesh.SetVertices(ribbonVertices);
+        _geometricSurfaceGridMesh.SetTriangles(ribbonTriangles, 0, true);
+        _geometricSurfaceGridMesh.RecalculateBounds();
+        ApplyGeometricSurfaceGridRendererColor(geometricSurfaceGridColor);
+        SetGeometricSurfaceGridVisible(true);
+    }
+
+    private bool TryBuildRansacPatchGridOverlay(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        out List<Vector3> lineVertices,
+        out List<Vector3> lineNormals,
+        out List<int> lineIndices)
+    {
+        lineVertices = new List<Vector3>(1024);
+        lineNormals = new List<Vector3>(1024);
+        lineIndices = new List<int>(2048);
+        if (vertices == null || vertices.Count < ransacPatchMinInliers)
+            return false;
+
+        Vector3[] axes = GetRansacLocalAxes();
+        List<RansacPatchSample>[] buckets = new List<RansacPatchSample>[axes.Length];
+        for (int i = 0; i < buckets.Length; i++)
+            buckets[i] = new List<RansacPatchSample>(Mathf.Max(16, ransacPatchMaxSamples / buckets.Length));
+
+        int maxSamples = Mathf.Max(128, ransacPatchMaxSamples);
+        int step = Mathf.Max(1, Mathf.CeilToInt(vertices.Count / (float)maxSamples));
+        float looseNormalDot = Mathf.Clamp(ransacPatchNormalDot * 0.65f, 0.25f, 0.85f);
+        for (int i = 0; i < vertices.Count; i += step)
+        {
+            Vector3 point = vertices[i];
+            if (!Finite(point))
+                continue;
+
+            Vector3 normal = Vector3.zero;
+            if (normals != null && i < normals.Count && Finite(normals[i]) && normals[i].sqrMagnitude > 1e-8f)
+                normal = normals[i].normalized;
+            else
+                continue;
+
+            int bestBucket = -1;
+            float bestDot = looseNormalDot;
+            for (int axisIndex = 0; axisIndex < axes.Length; axisIndex++)
+            {
+                float dot = Vector3.Dot(normal, axes[axisIndex]);
+                if (dot > bestDot)
+                {
+                    bestDot = dot;
+                    bestBucket = axisIndex;
+                }
+            }
+
+            if (bestBucket < 0)
+                continue;
+
+            buckets[bestBucket].Add(new RansacPatchSample
+            {
+                point = point,
+                normal = normal,
+                active = true
+            });
+        }
+
+        bool appendedAny = false;
+        for (int bucketIndex = 0; bucketIndex < buckets.Length; bucketIndex++)
+        {
+            List<RansacPatchSample> bucket = buckets[bucketIndex];
+            if (bucket.Count < ransacPatchMinInliers)
+                continue;
+
+            for (int planeIndex = 0; planeIndex < ransacPatchPlanesPerBucket; planeIndex++)
+            {
+                if (!TryExtractRansacPatchPlane(bucket, axes[bucketIndex], bucketIndex, planeIndex, out RansacPatchPlane plane))
+                    break;
+
+                int before = lineIndices.Count;
+                AppendRansacPatchGrid(bucket, plane, axes[bucketIndex], lineVertices, lineNormals, lineIndices);
+                appendedAny |= lineIndices.Count > before;
+            }
+        }
+
+        return appendedAny && lineIndices.Count > 0;
+    }
+
+    private Vector3[] GetRansacLocalAxes()
+    {
+        Transform localTransform = ResolveDisplayLocalTransform();
+        Vector3 right = localTransform != null ? localTransform.InverseTransformDirection(Vector3.right) : Vector3.right;
+        Vector3 up = localTransform != null ? localTransform.InverseTransformDirection(Vector3.up) : Vector3.up;
+        Vector3 forward = localTransform != null ? localTransform.InverseTransformDirection(Vector3.forward) : Vector3.forward;
+        right = SafeNormalized(right, Vector3.right);
+        up = SafeNormalized(up, Vector3.up);
+        forward = SafeNormalized(forward, Vector3.forward);
+        return new[]
+        {
+            right,
+            -right,
+            up,
+            -up,
+            forward,
+            -forward
+        };
+    }
+
+    private bool TryExtractRansacPatchPlane(
+        List<RansacPatchSample> samples,
+        Vector3 preferredNormal,
+        int bucketIndex,
+        int planeIndex,
+        out RansacPatchPlane plane)
+    {
+        plane = default;
+        List<int> activeIndices = new List<int>(samples.Count);
+        for (int i = 0; i < samples.Count; i++)
+        {
+            if (samples[i].active)
+                activeIndices.Add(i);
+        }
+
+        if (activeIndices.Count < ransacPatchMinInliers)
+            return false;
+
+        System.Random rng = new System.Random((_frameIndex + 1) * 73856093 ^ (bucketIndex + 3) * 19349663 ^ (planeIndex + 5) * 83492791);
+        int bestInlierCount = 0;
+        Vector3 bestPoint = Vector3.zero;
+        Vector3 bestNormal = Vector3.zero;
+        float normalDotThreshold = Mathf.Clamp01(ransacPatchNormalDot);
+        float distanceThreshold = Mathf.Max(0.002f, ransacPatchInlierDistanceMeters);
+
+        for (int iteration = 0; iteration < ransacPatchIterations; iteration++)
+        {
+            int ia = activeIndices[rng.Next(activeIndices.Count)];
+            int ib = activeIndices[rng.Next(activeIndices.Count)];
+            int ic = activeIndices[rng.Next(activeIndices.Count)];
+            if (ia == ib || ia == ic || ib == ic)
+                continue;
+
+            Vector3 a = samples[ia].point;
+            Vector3 b = samples[ib].point;
+            Vector3 c = samples[ic].point;
+            Vector3 candidateNormal = Vector3.Cross(b - a, c - a);
+            if (candidateNormal.sqrMagnitude <= 1e-8f || !Finite(candidateNormal))
+                continue;
+
+            candidateNormal.Normalize();
+            if (Vector3.Dot(candidateNormal, preferredNormal) < 0f)
+                candidateNormal = -candidateNormal;
+            if (Vector3.Dot(candidateNormal, preferredNormal) < normalDotThreshold * 0.75f)
+                continue;
+
+            int inlierCount = 0;
+            for (int active = 0; active < activeIndices.Count; active++)
+            {
+                RansacPatchSample sample = samples[activeIndices[active]];
+                float distance = Mathf.Abs(Vector3.Dot(sample.point - a, candidateNormal));
+                if (distance <= distanceThreshold && Vector3.Dot(sample.normal, candidateNormal) >= normalDotThreshold)
+                    inlierCount++;
+            }
+
+            if (inlierCount > bestInlierCount)
+            {
+                bestInlierCount = inlierCount;
+                bestPoint = a;
+                bestNormal = candidateNormal;
+            }
+        }
+
+        if (bestInlierCount < ransacPatchMinInliers || bestNormal.sqrMagnitude <= 1e-8f)
+            return false;
+
+        Vector3 center = Vector3.zero;
+        Vector3 normalSum = Vector3.zero;
+        int refinedCount = 0;
+        for (int active = 0; active < activeIndices.Count; active++)
+        {
+            int sampleIndex = activeIndices[active];
+            RansacPatchSample sample = samples[sampleIndex];
+            float distance = Mathf.Abs(Vector3.Dot(sample.point - bestPoint, bestNormal));
+            if (distance > distanceThreshold || Vector3.Dot(sample.normal, bestNormal) < normalDotThreshold)
+                continue;
+
+            center += sample.point;
+            normalSum += sample.normal;
+            refinedCount++;
+
+            RansacPatchSample updated = sample;
+            updated.active = false;
+            samples[sampleIndex] = updated;
+        }
+
+        if (refinedCount < ransacPatchMinInliers)
+            return false;
+
+        center /= refinedCount;
+        Vector3 refinedNormal = normalSum.sqrMagnitude > 1e-8f ? normalSum.normalized : bestNormal;
+        if (Vector3.Dot(refinedNormal, preferredNormal) < 0f)
+            refinedNormal = -refinedNormal;
+
+        plane = new RansacPatchPlane
+        {
+            center = center,
+            normal = refinedNormal,
+            inlierCount = refinedCount
+        };
+        return true;
+    }
+
+    private void AppendRansacPatchGrid(
+        List<RansacPatchSample> samples,
+        RansacPatchPlane plane,
+        Vector3 preferredAxis,
+        List<Vector3> lineVertices,
+        List<Vector3> lineNormals,
+        List<int> lineIndices)
+    {
+        Vector3 axisU = BuildPlaneTangent(plane.normal, preferredAxis);
+        Vector3 axisV = Vector3.Cross(plane.normal, axisU);
+        if (axisV.sqrMagnitude <= 1e-8f)
+            return;
+        axisV.Normalize();
+
+        float distanceThreshold = Mathf.Max(0.002f, ransacPatchInlierDistanceMeters);
+        float normalDotThreshold = Mathf.Clamp01(ransacPatchNormalDot);
+        List<Vector2> support = new List<Vector2>(samples.Count);
+        float minU = float.PositiveInfinity;
+        float maxU = float.NegativeInfinity;
+        float minV = float.PositiveInfinity;
+        float maxV = float.NegativeInfinity;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            RansacPatchSample sample = samples[i];
+            float distance = Mathf.Abs(Vector3.Dot(sample.point - plane.center, plane.normal));
+            if (distance > distanceThreshold || Vector3.Dot(sample.normal, plane.normal) < normalDotThreshold)
+                continue;
+
+            Vector3 offset = sample.point - plane.center;
+            float u = Vector3.Dot(offset, axisU);
+            float v = Vector3.Dot(offset, axisV);
+            support.Add(new Vector2(u, v));
+            minU = Mathf.Min(minU, u);
+            maxU = Mathf.Max(maxU, u);
+            minV = Mathf.Min(minV, v);
+            maxV = Mathf.Max(maxV, v);
+        }
+
+        if (support.Count < ransacPatchMinInliers ||
+            !float.IsFinite(minU) || !float.IsFinite(maxU) || !float.IsFinite(minV) || !float.IsFinite(maxV))
+            return;
+
+        float baseCell = Mathf.Max(0.04f, ransacPatchGridCellMeters);
+        float extentU = maxU - minU;
+        float extentV = maxV - minV;
+        if (extentU < baseCell * 0.75f || extentV < baseCell * 0.75f)
+            return;
+
+        int maxCells = Mathf.Max(4, ransacPatchMaxGridCellsPerAxis);
+        float cellU = Mathf.Max(baseCell, extentU / maxCells);
+        float cellV = Mathf.Max(baseCell, extentV / maxCells);
+        int countU = Mathf.Clamp(Mathf.FloorToInt(extentU / cellU) + 1, 2, maxCells + 1);
+        int countV = Mathf.Clamp(Mathf.FloorToInt(extentV / cellV) + 1, 2, maxCells + 1);
+        if (countU < 2 || countV < 2)
+            return;
+
+        int[,] gridIndices = new int[countU, countV];
+        for (int uIndex = 0; uIndex < countU; uIndex++)
+        {
+            for (int vIndex = 0; vIndex < countV; vIndex++)
+                gridIndices[uIndex, vIndex] = -1;
+        }
+
+        float supportRadius = Mathf.Max(cellU, cellV) * 1.45f;
+        Vector3 displayNormal = plane.normal;
+        Vector3 surfaceBias = displayNormal * Mathf.Max(0f, geometricSurfaceGridSurfaceOffsetMeters);
+        for (int uIndex = 0; uIndex < countU; uIndex++)
+        {
+            float tu = countU <= 1 ? 0.5f : uIndex / (float)(countU - 1);
+            float u = Mathf.Lerp(minU, maxU, tu);
+            for (int vIndex = 0; vIndex < countV; vIndex++)
+            {
+                float tv = countV <= 1 ? 0.5f : vIndex / (float)(countV - 1);
+                float v = Mathf.Lerp(minV, maxV, tv);
+                if (!HasRansacPatchSupport(support, u, v, supportRadius))
+                    continue;
+
+                int lineVertex = lineVertices.Count;
+                lineVertices.Add(plane.center + axisU * u + axisV * v + surfaceBias);
+                lineNormals.Add(displayNormal);
+                gridIndices[uIndex, vIndex] = lineVertex;
+            }
+        }
+
+        for (int uIndex = 0; uIndex < countU; uIndex++)
+        {
+            for (int vIndex = 0; vIndex < countV; vIndex++)
+            {
+                int current = gridIndices[uIndex, vIndex];
+                if (current < 0)
+                    continue;
+                AddRansacGridEdge(current, uIndex + 1 < countU ? gridIndices[uIndex + 1, vIndex] : -1, lineIndices);
+                AddRansacGridEdge(current, vIndex + 1 < countV ? gridIndices[uIndex, vIndex + 1] : -1, lineIndices);
+                AddRansacGridEdge(current, uIndex + 1 < countU && vIndex + 1 < countV ? gridIndices[uIndex + 1, vIndex + 1] : -1, lineIndices);
+            }
+        }
+    }
+
+    private static bool HasRansacPatchSupport(List<Vector2> support, float u, float v, float radius)
+    {
+        float radiusSqr = radius * radius;
+        Vector2 candidate = new Vector2(u, v);
+        for (int i = 0; i < support.Count; i++)
+        {
+            if ((support[i] - candidate).sqrMagnitude <= radiusSqr)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static void AddRansacGridEdge(int a, int b, List<int> lineIndices)
+    {
+        if (a < 0 || b < 0 || a == b)
+            return;
+        lineIndices.Add(a);
+        lineIndices.Add(b);
+    }
+
+    private static Vector3 BuildPlaneTangent(Vector3 normal, Vector3 preferredAxis)
+    {
+        Vector3 tangent = Vector3.ProjectOnPlane(preferredAxis, normal);
+        if (tangent.sqrMagnitude <= 1e-8f)
+            tangent = Vector3.ProjectOnPlane(Vector3.up, normal);
+        if (tangent.sqrMagnitude <= 1e-8f)
+            tangent = Vector3.ProjectOnPlane(Vector3.right, normal);
+        if (tangent.sqrMagnitude <= 1e-8f)
+            tangent = Vector3.Cross(normal, Vector3.forward);
+        return SafeNormalized(tangent, Vector3.right);
+    }
+
+    private static Vector3 SafeNormalized(Vector3 value, Vector3 fallback)
+    {
+        if (!Finite(value) || value.sqrMagnitude <= 1e-8f)
+            return fallback;
+        return value.normalized;
+    }
+
+    private void AppendProjectedGeometricGridForAxis(
+        int normalAxis,
+        Vector3 min,
+        Vector3 max,
+        float spacing,
+        float castDistance,
+        int maxSamplesPerLine,
+        List<Vector3> meshVertices,
+        List<int> meshTriangles,
+        List<Vector3> lineVertices,
+        List<Vector3> lineNormals,
+        List<int> lineIndices)
+    {
+        int axisU = (normalAxis + 1) % 3;
+        int axisV = (normalAxis + 2) % 3;
+        AppendProjectedGeometricGridLines(normalAxis, axisU, axisV, min, max, spacing, castDistance, maxSamplesPerLine, meshVertices, meshTriangles, lineVertices, lineNormals, lineIndices);
+        AppendProjectedGeometricGridLines(normalAxis, axisV, axisU, min, max, spacing, castDistance, maxSamplesPerLine, meshVertices, meshTriangles, lineVertices, lineNormals, lineIndices);
+    }
+
+    private void AppendProjectedGeometricGridLines(
+        int normalAxis,
+        int lineAxis,
+        int fixedAxis,
+        Vector3 min,
+        Vector3 max,
+        float spacing,
+        float castDistance,
+        int maxSamplesPerLine,
+        List<Vector3> meshVertices,
+        List<int> meshTriangles,
+        List<Vector3> lineVertices,
+        List<Vector3> lineNormals,
+        List<int> lineIndices)
+    {
+        float fixedMin = Component(min, fixedAxis);
+        float fixedMax = Component(max, fixedAxis);
+        float lineMin = Component(min, lineAxis);
+        float lineMax = Component(max, lineAxis);
+        float normalMin = Component(min, normalAxis);
+        float normalMax = Component(max, normalAxis);
+        if (fixedMax <= fixedMin || lineMax <= lineMin || normalMax <= normalMin)
+            return;
+
+        int lineCount = Mathf.Clamp(Mathf.FloorToInt((fixedMax - fixedMin) / spacing) + 1, 1, 128);
+        int sampleCount = Mathf.Clamp(Mathf.FloorToInt((lineMax - lineMin) / spacing) + 1, 2, maxSamplesPerLine);
+        Vector3 direction = AxisVector(normalAxis);
+        float normalCenter = (normalMin + normalMax) * 0.5f;
+        float halfCast = castDistance * 0.5f;
+
+        for (int lineIndex = 0; lineIndex < lineCount; lineIndex++)
+        {
+            float fixedValue = lineCount <= 1 ? (fixedMin + fixedMax) * 0.5f : Mathf.Lerp(fixedMin, fixedMax, lineIndex / (float)(lineCount - 1));
+            int previousVertex = -1;
+            Vector3 previousPoint = Vector3.zero;
+            Vector3 previousNormal = Vector3.zero;
+
+            for (int sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+            {
+                float lineValue = sampleCount <= 1 ? (lineMin + lineMax) * 0.5f : Mathf.Lerp(lineMin, lineMax, sampleIndex / (float)(sampleCount - 1));
+                Vector3 gridPoint = Vector3.zero;
+                SetComponent(ref gridPoint, normalAxis, normalCenter + halfCast);
+                SetComponent(ref gridPoint, lineAxis, lineValue);
+                SetComponent(ref gridPoint, fixedAxis, fixedValue);
+
+                Ray ray = new Ray(gridPoint, -direction);
+                if (!TryRaycastLocalTriangleMesh(ray, meshVertices, meshTriangles, castDistance, out Vector3 hitPoint, out Vector3 hitNormal))
+                {
+                    previousVertex = -1;
+                    continue;
+                }
+
+                Vector3 displayPoint = hitPoint + hitNormal * Mathf.Max(0f, geometricSurfaceGridSurfaceOffsetMeters);
+                int currentVertex = lineVertices.Count;
+                lineVertices.Add(displayPoint);
+                lineNormals.Add(hitNormal);
+                if (previousVertex >= 0 &&
+                    Vector3.Distance(previousPoint, displayPoint) <= spacing * 2.25f &&
+                    Vector3.Dot(previousNormal, hitNormal) >= 0.45f)
+                {
+                    lineIndices.Add(previousVertex);
+                    lineIndices.Add(currentVertex);
+                }
+
+                previousVertex = currentVertex;
+                previousPoint = displayPoint;
+                previousNormal = hitNormal;
+            }
+        }
+    }
+
+    private bool TryRaycastLocalTriangleMesh(Ray ray, List<Vector3> vertices, List<int> triangles, float maxDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+        float bestDistance = maxDistance;
+        bool hasHit = false;
+        for (int i = 0; i + 2 < triangles.Count; i += 3)
+        {
+            int ia = triangles[i];
+            int ib = triangles[i + 1];
+            int ic = triangles[i + 2];
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= vertices.Count || ib >= vertices.Count || ic >= vertices.Count)
+                continue;
+
+            Vector3 a = vertices[ia];
+            Vector3 b = vertices[ib];
+            Vector3 c = vertices[ic];
+            if (!Finite(a) || !Finite(b) || !Finite(c))
+                continue;
+
+            if (!TryIntersectRayTriangle(ray, a, b, c, bestDistance, out float distance, out _, out _))
+                continue;
+
+            bestDistance = distance;
+            hitPoint = ray.origin + ray.direction * distance;
+            Vector3 normal = Vector3.Cross(b - a, c - a);
+            hitNormal = normal.sqrMagnitude > 1e-8f ? normal.normalized : -ray.direction;
+            if (Vector3.Dot(hitNormal, ray.direction) > 0f)
+                hitNormal = -hitNormal;
+            hasHit = true;
+        }
+
+        return hasHit;
+    }
+
+    private static float Component(Vector3 vector, int axis)
+    {
+        switch (axis)
+        {
+            case 0:
+                return vector.x;
+            case 1:
+                return vector.y;
+            default:
+                return vector.z;
+        }
+    }
+
+    private static void SetComponent(ref Vector3 vector, int axis, float value)
+    {
+        switch (axis)
+        {
+            case 0:
+                vector.x = value;
+                break;
+            case 1:
+                vector.y = value;
+                break;
+            default:
+                vector.z = value;
+                break;
+        }
+    }
+
+    private static Vector3 AxisVector(int axis)
+    {
+        switch (axis)
+        {
+            case 0:
+                return Vector3.right;
+            case 1:
+                return Vector3.up;
+            default:
+                return Vector3.forward;
+        }
+    }
+
     private void AddHeightSliceSamplePlaneFrames(List<Vector3> vertices, Vector3 baseOrigin, Vector3 sliceNormal, Vector3 planeAxisA, Vector3 planeAxisB, int sampleCount, List<Vector3> lineVertices, List<Vector3> lineNormals, List<int> lineIndices)
     {
         if (vertices == null || vertices.Count <= 0 || sliceNormal.sqrMagnitude <= 1e-8f || planeAxisA.sqrMagnitude <= 1e-8f || planeAxisB.sqrMagnitude <= 1e-8f)
@@ -3044,6 +5145,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         if (!TryResolveGridAxisCoordinates(rowCoords, rowCounts, group.rows))
             return false;
 
+        float[] terrainHeights = new float[groupCellCount];
+        bool[] heightValid = new bool[groupCellCount];
         for (int row = 0; row < group.rows; row++)
         {
             int rowStart = group.startIndex + row * group.columns;
@@ -3054,8 +5157,23 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                     continue;
 
                 Vector3 regularPosition = center + right * colCoords[col] + up * rowCoords[row];
-                float terrainHeight = Vector3.Dot(sourcePositions[index] - regularPosition, planeNormal);
-                displayPositions[index] = regularPosition + planeNormal * terrainHeight;
+                terrainHeights[row * group.columns + col] = Vector3.Dot(sourcePositions[index] - regularPosition, planeNormal);
+                heightValid[row * group.columns + col] = true;
+            }
+        }
+
+        for (int row = 0; row < group.rows; row++)
+        {
+            int rowStart = group.startIndex + row * group.columns;
+            for (int col = 0; col < group.columns; col++)
+            {
+                int index = rowStart + col;
+                int localIndex = row * group.columns + col;
+                if (index < 0 || index >= valid.Length || index >= displayPositions.Length || !valid[index] || !heightValid[localIndex])
+                    continue;
+
+                Vector3 regularPosition = center + right * colCoords[col] + up * rowCoords[row];
+                displayPositions[index] = regularPosition + planeNormal * terrainHeights[localIndex];
             }
         }
 
@@ -6914,14 +9032,14 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             markerTransform.position = position;
             if (orientToNormal && normal.sqrMagnitude > 1e-6f) markerTransform.rotation = Quaternion.LookRotation(normal, Vector3.up);
         }
-        ApplyColor(index, confidenceGradient.Evaluate(Mathf.Clamp01(confidence)));
+        ApplyColor(index, snapshotGridUniformColor);
         if (!go.activeSelf) go.SetActive(true);
     }
 
     private void DisableMarker(int index) { if (index < 0 || index >= _pool.Count) return; GameObject go = _pool[index]; if (go != null && go.activeSelf) go.SetActive(false); }
     private void HideAllMarkers() { for (int i = 0; i < _pool.Count; i++) DisableMarker(i); }
 
-    private void DumpRosterIfNeeded(bool[] valid, Vector3[] positions, Vector3[] normals, float[] confidences, Vector2Int resolution)
+    private void DumpRosterIfNeeded(bool[] valid, bool[] lineValid, Vector3[] positions, Vector3[] normals, float[] confidences, Vector2Int resolution)
     {
         if (!dumpRosterOnceOnPlay || _hasDumpedRoster || !Application.isPlaying || _cells.Count <= 0)
             return;
@@ -6932,7 +9050,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         builder.Append("preprocessorOutput=").Append(resolution.x).Append('x').Append(resolution.y).AppendLine();
         builder.Append("cellCount=").Append(_cells.Count).AppendLine();
         builder.Append("visibleCount=").Append(_visibleCount).AppendLine();
-        builder.AppendLine("index,row,col,group,face,centerX,centerY,valid,confidence,posX,posY,posZ,normX,normY,normZ");
+        builder.AppendLine("index,row,col,group,face,centerX,centerY,meshValid,lineValid,confidence,posX,posY,posZ,normX,normY,normZ");
 
         for (int i = 0; i < _cells.Count; i++)
         {
@@ -6941,6 +9059,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
             Cell cell = _cells[i];
             bool isValid = valid != null && i < valid.Length && valid[i];
+            bool isLineValid = lineValid != null && i < lineValid.Length && lineValid[i];
             Vector3 pos = isValid && positions != null && i < positions.Length ? positions[i] : Vector3.zero;
             Vector3 normal = isValid && normals != null && i < normals.Length ? normals[i] : Vector3.zero;
             float confidence = isValid && confidences != null && i < confidences.Length ? confidences[i] : 0f;
@@ -6953,6 +9072,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 .Append(cell.centerX).Append(',')
                 .Append(cell.centerY).Append(',')
                 .Append(isValid ? 1 : 0).Append(',')
+                .Append(isLineValid ? 1 : 0).Append(',')
                 .Append(confidence.ToString("F4", CultureInfo.InvariantCulture)).Append(',')
                 .Append(pos.x.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
                 .Append(pos.y.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
@@ -6990,6 +9110,391 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         if (debugLog)
             Debug.Log($"[ScanCoverDepthGridPointCloud] Grid state exported => {exportPath}");
         return true;
+    }
+
+    [ContextMenu("Export Current Grid Nodes As CSV")]
+    public void ExportCurrentGridNodesAsCsvFromContextMenu() => ExportCurrentGridNodesAsCsv(out _);
+
+    public bool ExportCurrentGridNodesAsCsv(out string exportPath)
+    {
+        exportPath = null;
+        if (_cells.Count <= 0 || _currentPositions == null || _currentPositions.Length != _cells.Count)
+            return SetIssue("Grid node state is not ready.");
+
+        string exportDirectory = ResolveDebugExportDirectory();
+        Directory.CreateDirectory(exportDirectory);
+        exportPath = Path.Combine(exportDirectory, $"ScanCover_DepthGridNodes_{System.DateTime.Now:yyyyMMdd_HHmmss_fff}.csv");
+
+        Transform localTransform = ResolveDisplayLocalTransform();
+        StringBuilder builder = new StringBuilder(Mathf.Max(1024, _cells.Count * 240));
+        builder.AppendLine("# ScanCover Depth Grid Nodes");
+        builder.Append("component=").Append(name).AppendLine();
+        builder.Append("samplingMode=").Append(samplingMode).AppendLine();
+        builder.Append("frameIndex=").Append(_frameIndex).AppendLine();
+        builder.Append("preprocessorOutput=").Append(_currentResolution.x).Append('x').Append(_currentResolution.y).AppendLine();
+        builder.Append("cellCount=").Append(_cells.Count).AppendLine();
+        builder.Append("visibleCount=").Append(_visibleCount).AppendLine();
+        builder.AppendLine("index,group,row,col,face,minPixelX,maxPixelX,minPixelY,maxPixelY,centerPixelX,centerPixelY,centerPixelXF,centerPixelYF,hasSubpixelCenter,meshValid,lineValid,hasPosition,confidence,worldX,worldY,worldZ,localX,localY,localZ,normalX,normalY,normalZ,leftDistance,rightDistance,downDistance,upDistance,leftNormalDelta,rightNormalDelta,downNormalDelta,upNormalDelta,leftVerticalDelta,rightVerticalDelta,downVerticalDelta,upVerticalDelta");
+
+        for (int i = 0; i < _cells.Count; i++)
+        {
+            Cell cell = _cells[i];
+            bool meshValid = _currentValid != null && i < _currentValid.Length && _currentValid[i];
+            bool lineValid = _currentLineValid != null && i < _currentLineValid.Length ? _currentLineValid[i] : meshValid;
+            bool hasPosition = lineValid && i < _currentPositions.Length && Finite(_currentPositions[i]);
+            Vector3 world = hasPosition ? _currentPositions[i] : Vector3.zero;
+            Vector3 local = hasPosition && localTransform != null ? localTransform.InverseTransformPoint(world) : world;
+            Vector3 normal = hasPosition && i < _currentNormals.Length && Finite(_currentNormals[i]) ? _currentNormals[i] : Vector3.zero;
+            float confidence = hasPosition && i < _currentConfidences.Length ? _currentConfidences[i] : 0f;
+
+            TryGetNeighborMetrics(i, 0, -1, out float leftDistance, out float leftNormalDelta, out float leftVerticalDelta);
+            TryGetNeighborMetrics(i, 0, 1, out float rightDistance, out float rightNormalDelta, out float rightVerticalDelta);
+            TryGetNeighborMetrics(i, -1, 0, out float downDistance, out float downNormalDelta, out float downVerticalDelta);
+            TryGetNeighborMetrics(i, 1, 0, out float upDistance, out float upNormalDelta, out float upVerticalDelta);
+
+            builder.Append(i).Append(',')
+                .Append(cell.group).Append(',')
+                .Append(cell.row).Append(',')
+                .Append(cell.col).Append(',')
+                .Append(cell.face).Append(',')
+                .Append(cell.minX).Append(',')
+                .Append(cell.maxX).Append(',')
+                .Append(cell.minY).Append(',')
+                .Append(cell.maxY).Append(',')
+                .Append(cell.centerX).Append(',')
+                .Append(cell.centerY).Append(',')
+                .Append(FormatFloat(cell.hasSubpixelCenter ? cell.centerXF : cell.centerX)).Append(',')
+                .Append(FormatFloat(cell.hasSubpixelCenter ? cell.centerYF : cell.centerY)).Append(',')
+                .Append(cell.hasSubpixelCenter ? 1 : 0).Append(',')
+                .Append(meshValid ? 1 : 0).Append(',')
+                .Append(lineValid ? 1 : 0).Append(',')
+                .Append(hasPosition ? 1 : 0).Append(',')
+                .Append(FormatFloat(confidence)).Append(',')
+                .Append(FormatVector(world)).Append(',')
+                .Append(FormatVector(local)).Append(',')
+                .Append(FormatVector(normal)).Append(',')
+                .Append(FormatNullableFloat(leftDistance)).Append(',')
+                .Append(FormatNullableFloat(rightDistance)).Append(',')
+                .Append(FormatNullableFloat(downDistance)).Append(',')
+                .Append(FormatNullableFloat(upDistance)).Append(',')
+                .Append(FormatNullableFloat(leftNormalDelta)).Append(',')
+                .Append(FormatNullableFloat(rightNormalDelta)).Append(',')
+                .Append(FormatNullableFloat(downNormalDelta)).Append(',')
+                .Append(FormatNullableFloat(upNormalDelta)).Append(',')
+                .Append(FormatNullableFloat(leftVerticalDelta)).Append(',')
+                .Append(FormatNullableFloat(rightVerticalDelta)).Append(',')
+                .Append(FormatNullableFloat(downVerticalDelta)).Append(',')
+                .Append(FormatNullableFloat(upVerticalDelta)).AppendLine();
+        }
+
+        File.WriteAllText(exportPath, builder.ToString(), Encoding.UTF8);
+        LastIssue = null;
+        Debug.Log($"[ScanCoverDepthGridPointCloud] Grid node CSV exported => {exportPath}");
+        return true;
+    }
+
+    [ContextMenu("Export Current BL Surface Mesh As OBJ")]
+    public void ExportCurrentSurfaceMeshAsObjFromContextMenu() => ExportCurrentSurfaceMeshAsObj(out _);
+
+    private void CacheRawSurfaceMeshForExport(List<Vector3> vertices, List<Vector3> normals, List<int> triangles)
+    {
+        if (vertices == null || vertices.Count <= 0 || triangles == null || triangles.Count < 3)
+        {
+            ClearRawSurfaceExportCache();
+            return;
+        }
+
+        _rawSurfaceExportVertices = vertices.ToArray();
+        _rawSurfaceExportNormals = normals != null && normals.Count == vertices.Count ? normals.ToArray() : Array.Empty<Vector3>();
+        _rawSurfaceExportTriangles = triangles.ToArray();
+    }
+
+    private void ClearRawSurfaceExportCache()
+    {
+        _rawSurfaceExportVertices = Array.Empty<Vector3>();
+        _rawSurfaceExportNormals = Array.Empty<Vector3>();
+        _rawSurfaceExportTriangles = Array.Empty<int>();
+    }
+
+    public int CurrentSurfaceMeshFrameIndex => _frameIndex;
+
+    public bool TryGetLatestRawDepthFrameSnapshot(out RawDepthFrameSnapshot snapshot)
+    {
+        snapshot = null;
+        if (_latestRawDepthFrameSnapshot == null ||
+            _latestRawDepthFrameSnapshot.worldPositions == null ||
+            _latestRawDepthFrameSnapshot.worldPositions.Length <= 0)
+            return false;
+
+        snapshot = new RawDepthFrameSnapshot
+        {
+            componentName = _latestRawDepthFrameSnapshot.componentName,
+            frameIndex = _latestRawDepthFrameSnapshot.frameIndex,
+            resolutionWidth = _latestRawDepthFrameSnapshot.resolutionWidth,
+            resolutionHeight = _latestRawDepthFrameSnapshot.resolutionHeight,
+            worldPositions = (Vector3[])_latestRawDepthFrameSnapshot.worldPositions.Clone(),
+            worldNormals = (Vector3[])_latestRawDepthFrameSnapshot.worldNormals.Clone(),
+            observationMeta = (Color[])_latestRawDepthFrameSnapshot.observationMeta.Clone()
+        };
+        return true;
+    }
+
+    public bool ExportCurrentSurfaceMeshFramePackage(
+        string frameDirectory,
+        string frameName,
+        Camera captureCamera,
+        Transform poseSource,
+        out string objPath,
+        out string verticesCsvPath,
+        out string trianglesCsvPath,
+        out string cameraJsonPath)
+    {
+        objPath = null;
+        verticesCsvPath = null;
+        trianglesCsvPath = null;
+        cameraJsonPath = null;
+
+        if (string.IsNullOrWhiteSpace(frameDirectory))
+            return SetIssue("Frame export directory is empty.");
+        if (string.IsNullOrWhiteSpace(frameName))
+            frameName = $"frame_{_frameIndex:000000}";
+
+        if (!TryGetSurfaceMeshExportData(out Vector3[] vertices, out Vector3[] normals, out int[] triangles, out Transform surfaceTransform, out string sourceLabel))
+            return false;
+
+        Directory.CreateDirectory(frameDirectory);
+        objPath = Path.Combine(frameDirectory, frameName + ".obj");
+        verticesCsvPath = Path.Combine(frameDirectory, frameName + "_vertices.csv");
+        trianglesCsvPath = Path.Combine(frameDirectory, frameName + "_triangles.csv");
+        cameraJsonPath = Path.Combine(frameDirectory, frameName + "_camera.json");
+
+        WriteSurfaceMeshObj(objPath, frameName, vertices, normals, triangles, surfaceTransform, sourceLabel);
+        WriteSurfaceVerticesCsv(verticesCsvPath, vertices, normals, surfaceTransform);
+        WriteSurfaceTrianglesCsv(trianglesCsvPath, vertices, normals, triangles, surfaceTransform);
+        WriteCaptureCameraJson(cameraJsonPath, frameName, captureCamera, poseSource, surfaceTransform, sourceLabel, vertices.Length, triangles.Length / 3);
+
+        LastIssue = null;
+        if (debugLog)
+            Debug.Log($"[ScanCoverDepthGridPointCloud] Surface frame package exported => {frameDirectory}");
+        return true;
+    }
+
+    private bool TryGetSurfaceMeshExportData(out Vector3[] vertices, out Vector3[] normals, out int[] triangles, out Transform surfaceTransform, out string sourceLabel)
+    {
+        vertices = null;
+        normals = null;
+        triangles = null;
+        surfaceTransform = null;
+        sourceLabel = null;
+
+        bool hasRawExportCache = _rawSurfaceExportVertices != null && _rawSurfaceExportVertices.Length > 0 &&
+                                 _rawSurfaceExportTriangles != null && _rawSurfaceExportTriangles.Length >= 3;
+        if (!hasRawExportCache && (_surfaceMesh == null || _surfaceMesh.vertexCount <= 0))
+            return SetIssue("BL surface mesh is not ready.");
+
+        vertices = hasRawExportCache ? (Vector3[])_rawSurfaceExportVertices.Clone() : _surfaceMesh.vertices;
+        triangles = hasRawExportCache ? (int[])_rawSurfaceExportTriangles.Clone() : _surfaceMesh.triangles;
+        if (vertices == null || vertices.Length <= 0 || triangles == null || triangles.Length < 3)
+            return SetIssue("BL surface mesh has no exportable triangles.");
+
+        Vector3[] sourceNormals = hasRawExportCache ? _rawSurfaceExportNormals : _surfaceMesh.normals;
+        normals = BuildSurfaceMeshExportNormals(vertices, triangles, sourceNormals);
+        surfaceTransform = _surfaceRoot != null ? _surfaceRoot.transform : ResolveDisplayLocalTransform();
+        sourceLabel = hasRawExportCache ? "raw-bl-surface-cache" : "display-surface-mesh-fallback";
+        return true;
+    }
+
+    public bool ExportCurrentSurfaceMeshAsObj(out string exportPath)
+    {
+        exportPath = null;
+        if (!TryGetSurfaceMeshExportData(out Vector3[] vertices, out Vector3[] normals, out int[] triangles, out Transform surfaceTransform, out string sourceLabel))
+            return false;
+
+        string exportDirectory = ResolveDebugExportDirectory();
+        Directory.CreateDirectory(exportDirectory);
+        string timestamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+        exportPath = Path.Combine(exportDirectory, $"ScanCover_BLSurfaceMesh_{timestamp}.obj");
+        string manifestPath = Path.ChangeExtension(exportPath, ".txt");
+
+        WriteSurfaceMeshObj(exportPath, "ScanCover_BLSurfaceMesh", vertices, normals, triangles, surfaceTransform, sourceLabel);
+
+        StringBuilder manifest = new StringBuilder(512);
+        manifest.AppendLine("ScanCover BL Surface Mesh Export");
+        manifest.Append("obj=").Append(exportPath).AppendLine();
+        manifest.Append("component=").Append(name).AppendLine();
+        manifest.Append("frameIndex=").Append(_frameIndex).AppendLine();
+        manifest.Append("vertexCount=").Append(vertices.Length).AppendLine();
+        manifest.Append("triangleCount=").Append(triangles.Length / 3).AppendLine();
+        manifest.Append("source=").Append(sourceLabel).AppendLine();
+        manifest.Append("coordinateSpace=").Append(surfaceTransform != null ? "world" : "mesh-local").AppendLine();
+        manifest.Append("showSurfaceMesh=").Append(showSurfaceMesh).AppendLine();
+        manifest.Append("keepSurfaceMeshAvailableWhenHidden=").Append(keepSurfaceMeshAvailableWhenHidden).AppendLine();
+        manifest.Append("useIndexConnectivity=").Append(useIndexConnectivity).AppendLine();
+        manifest.Append("maxEdgeLengthMeters=").Append(FormatFloat(maxEdgeLengthMeters)).AppendLine();
+        manifest.Append("minNeighborNormalDot=").Append(FormatFloat(minNeighborNormalDot)).AppendLine();
+        File.WriteAllText(manifestPath, manifest.ToString(), Encoding.UTF8);
+
+        LastIssue = null;
+        Debug.Log($"[ScanCoverDepthGridPointCloud] BL surface mesh OBJ exported => {exportPath}");
+        return true;
+    }
+
+    private void WriteSurfaceMeshObj(string path, string objectName, Vector3[] vertices, Vector3[] normals, int[] triangles, Transform surfaceTransform, string sourceLabel)
+    {
+        StringBuilder obj = new StringBuilder(Mathf.Max(4096, vertices.Length * 96 + triangles.Length * 24));
+        obj.AppendLine("# ScanCover BL Surface Mesh OBJ");
+        obj.Append("# component=").Append(name).AppendLine();
+        obj.Append("# frameIndex=").Append(_frameIndex).AppendLine();
+        obj.Append("# vertexCount=").Append(vertices.Length).AppendLine();
+        obj.Append("# triangleCount=").Append(triangles.Length / 3).AppendLine();
+        obj.Append("# source=").Append(sourceLabel).AppendLine();
+        obj.Append("o ").Append(SanitizeObjName(objectName)).AppendLine();
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 p = surfaceTransform != null ? surfaceTransform.TransformPoint(vertices[i]) : vertices[i];
+            obj.Append("v ")
+                .Append(FormatObjFloat(p.x)).Append(' ')
+                .Append(FormatObjFloat(p.y)).Append(' ')
+                .Append(FormatObjFloat(p.z)).AppendLine();
+        }
+
+        for (int i = 0; i < normals.Length; i++)
+        {
+            Vector3 n = normals[i];
+            if (surfaceTransform != null)
+                n = surfaceTransform.TransformDirection(n);
+            n = SafeNormalized(n, Vector3.up);
+            obj.Append("vn ")
+                .Append(FormatObjFloat(n.x)).Append(' ')
+                .Append(FormatObjFloat(n.y)).Append(' ')
+                .Append(FormatObjFloat(n.z)).AppendLine();
+        }
+
+        for (int i = 0; i + 2 < triangles.Length; i += 3)
+        {
+            int a = triangles[i] + 1;
+            int b = triangles[i + 1] + 1;
+            int c = triangles[i + 2] + 1;
+            if (a <= 0 || b <= 0 || c <= 0 || a > vertices.Length || b > vertices.Length || c > vertices.Length)
+                continue;
+            obj.Append("f ")
+                .Append(a).Append("//").Append(a).Append(' ')
+                .Append(b).Append("//").Append(b).Append(' ')
+                .Append(c).Append("//").Append(c).AppendLine();
+        }
+
+        File.WriteAllText(path, obj.ToString(), Encoding.UTF8);
+    }
+
+    private void WriteSurfaceVerticesCsv(string path, Vector3[] vertices, Vector3[] normals, Transform surfaceTransform)
+    {
+        StringBuilder builder = new StringBuilder(Mathf.Max(1024, vertices.Length * 160));
+        builder.AppendLine("# ScanCover BL Surface Mesh Vertices");
+        builder.Append("component=").Append(name).AppendLine();
+        builder.Append("frameIndex=").Append(_frameIndex).AppendLine();
+        builder.AppendLine("index,localX,localY,localZ,worldX,worldY,worldZ,normalLocalX,normalLocalY,normalLocalZ,normalWorldX,normalWorldY,normalWorldZ");
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 local = vertices[i];
+            Vector3 world = surfaceTransform != null ? surfaceTransform.TransformPoint(local) : local;
+            Vector3 normalLocal = i < normals.Length ? SafeNormalized(normals[i], Vector3.up) : Vector3.up;
+            Vector3 normalWorld = surfaceTransform != null ? SafeNormalized(surfaceTransform.TransformDirection(normalLocal), Vector3.up) : normalLocal;
+            builder.Append(i).Append(',')
+                .Append(FormatVector(local)).Append(',')
+                .Append(FormatVector(world)).Append(',')
+                .Append(FormatVector(normalLocal)).Append(',')
+                .Append(FormatVector(normalWorld)).AppendLine();
+        }
+
+        File.WriteAllText(path, builder.ToString(), Encoding.UTF8);
+    }
+
+    private void WriteSurfaceTrianglesCsv(string path, Vector3[] vertices, Vector3[] normals, int[] triangles, Transform surfaceTransform)
+    {
+        StringBuilder builder = new StringBuilder(Mathf.Max(1024, triangles.Length * 96));
+        builder.AppendLine("# ScanCover BL Surface Mesh Triangles");
+        builder.Append("component=").Append(name).AppendLine();
+        builder.Append("frameIndex=").Append(_frameIndex).AppendLine();
+        builder.AppendLine("triangle,index0,index1,index2,centerX,centerY,centerZ,normalX,normalY,normalZ,area,edge01,edge12,edge20");
+
+        int triangleIndex = 0;
+        for (int i = 0; i + 2 < triangles.Length; i += 3)
+        {
+            int ia = triangles[i];
+            int ib = triangles[i + 1];
+            int ic = triangles[i + 2];
+            if ((uint)ia >= (uint)vertices.Length || (uint)ib >= (uint)vertices.Length || (uint)ic >= (uint)vertices.Length)
+                continue;
+
+            Vector3 a = surfaceTransform != null ? surfaceTransform.TransformPoint(vertices[ia]) : vertices[ia];
+            Vector3 b = surfaceTransform != null ? surfaceTransform.TransformPoint(vertices[ib]) : vertices[ib];
+            Vector3 c = surfaceTransform != null ? surfaceTransform.TransformPoint(vertices[ic]) : vertices[ic];
+            Vector3 center = (a + b + c) / 3f;
+            Vector3 normal = SafeNormalized(Vector3.Cross(b - a, c - a), Vector3.up);
+            float area = Vector3.Cross(b - a, c - a).magnitude * 0.5f;
+            builder.Append(triangleIndex).Append(',')
+                .Append(ia).Append(',').Append(ib).Append(',').Append(ic).Append(',')
+                .Append(FormatVector(center)).Append(',')
+                .Append(FormatVector(normal)).Append(',')
+                .Append(FormatFloat(area)).Append(',')
+                .Append(FormatFloat(Vector3.Distance(a, b))).Append(',')
+                .Append(FormatFloat(Vector3.Distance(b, c))).Append(',')
+                .Append(FormatFloat(Vector3.Distance(c, a))).AppendLine();
+            triangleIndex++;
+        }
+
+        File.WriteAllText(path, builder.ToString(), Encoding.UTF8);
+    }
+
+    private void WriteCaptureCameraJson(
+        string path,
+        string frameName,
+        Camera captureCamera,
+        Transform poseSource,
+        Transform surfaceTransform,
+        string sourceLabel,
+        int vertexCount,
+        int triangleCount)
+    {
+        Transform pose = poseSource != null ? poseSource : captureCamera != null ? captureCamera.transform : null;
+        StringBuilder builder = new StringBuilder(2048);
+        builder.AppendLine("{");
+        AppendJsonString(builder, "component", name, 1, true);
+        AppendJsonString(builder, "frameName", frameName, 1, true);
+        AppendJsonNumber(builder, "depthGridFrameIndex", _frameIndex, 1, true);
+        AppendJsonNumber(builder, "unityFrameCount", Time.frameCount, 1, true);
+        AppendJsonNumber(builder, "time", Time.time, 1, true);
+        AppendJsonNumber(builder, "unscaledTime", Time.unscaledTime, 1, true);
+        AppendJsonString(builder, "source", sourceLabel, 1, true);
+        AppendJsonNumber(builder, "vertexCount", vertexCount, 1, true);
+        AppendJsonNumber(builder, "triangleCount", triangleCount, 1, true);
+        AppendJsonString(builder, "cameraName", captureCamera != null ? captureCamera.name : "", 1, true);
+        AppendJsonString(builder, "poseSourceName", pose != null ? pose.name : "", 1, true);
+
+        builder.Append("  \"pose\": ");
+        AppendTransformJson(builder, pose);
+        builder.AppendLine(",");
+
+        builder.Append("  \"surfaceTransform\": ");
+        AppendTransformJson(builder, surfaceTransform);
+        builder.AppendLine(",");
+
+        builder.Append("  \"camera\": ");
+        AppendCameraJson(builder, captureCamera);
+        builder.AppendLine();
+        builder.AppendLine("}");
+        File.WriteAllText(path, builder.ToString(), Encoding.UTF8);
+    }
+
+    private void ExportSurfaceMeshObjIfRequested()
+    {
+        if (!_exportSurfaceMeshObjAfterNextBuild)
+            return;
+
+        if (ExportCurrentSurfaceMeshAsObj(out _))
+            _exportSurfaceMeshObjAfterNextBuild = false;
     }
 
     public bool TryGetCurrentGridState(out GridStateSnapshot snapshot)
@@ -7104,13 +9609,294 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         for (int i = 0; i < pixelCount; i++) target.Add(IsSampleUsableForGridLine(i, worldPositions, worldNormals, observationMeta));
     }
 
-    private void StoreCurrentGridState(bool[] valid, Vector3[] positions, Vector3[] normals, float[] confidences, Vector2Int resolution)
+    private void StoreCurrentGridState(bool[] valid, bool[] lineValid, Vector3[] positions, Vector3[] normals, float[] confidences, Vector2Int resolution)
     {
         _currentResolution = resolution;
         _currentValid = valid != null ? (bool[])valid.Clone() : Array.Empty<bool>();
+        _currentLineValid = lineValid != null ? (bool[])lineValid.Clone() : Array.Empty<bool>();
         _currentPositions = positions != null ? (Vector3[])positions.Clone() : Array.Empty<Vector3>();
         _currentNormals = normals != null ? (Vector3[])normals.Clone() : Array.Empty<Vector3>();
         _currentConfidences = confidences != null ? (float[])confidences.Clone() : Array.Empty<float>();
+    }
+
+    private void StoreLatestRawDepthFrameSnapshot(
+        NativeArray<Color> worldPositions,
+        NativeArray<Color> worldNormals,
+        NativeArray<Color> observationMeta,
+        Vector2Int resolution)
+    {
+        int count = Mathf.Min(worldPositions.Length, Mathf.Min(worldNormals.Length, observationMeta.Length));
+        if (count <= 0)
+        {
+            _latestRawDepthFrameSnapshot = null;
+            return;
+        }
+
+        Vector3[] positions = new Vector3[count];
+        Vector3[] normals = new Vector3[count];
+        Color[] meta = new Color[count];
+        for (int i = 0; i < count; i++)
+        {
+            positions[i] = WorldPos(worldPositions[i]);
+            normals[i] = WorldNormal(worldNormals[i], observationMeta[i].a >= 0.5f);
+            meta[i] = observationMeta[i];
+        }
+        _rawDepthSnapshotFrameIndex++;
+
+        _latestRawDepthFrameSnapshot = new RawDepthFrameSnapshot
+        {
+            componentName = name,
+            frameIndex = _rawDepthSnapshotFrameIndex,
+            resolutionWidth = resolution.x,
+            resolutionHeight = resolution.y,
+            worldPositions = positions,
+            worldNormals = normals,
+            observationMeta = meta
+        };
+    }
+
+    private bool TryGetNeighborMetrics(int index, int rowDelta, int colDelta, out float distance, out float normalDelta, out float verticalDelta)
+    {
+        distance = float.NaN;
+        normalDelta = float.NaN;
+        verticalDelta = float.NaN;
+        if (!TryGetGridNeighborIndex(index, rowDelta, colDelta, out int neighborIndex))
+            return false;
+        if (!TryGetStoredNodePosition(index, out Vector3 point) || !TryGetStoredNodePosition(neighborIndex, out Vector3 neighborPoint))
+            return false;
+
+        Vector3 offset = neighborPoint - point;
+        distance = offset.magnitude;
+        Vector3 normal = index < _currentNormals.Length && Finite(_currentNormals[index]) && _currentNormals[index].sqrMagnitude > 1e-8f
+            ? _currentNormals[index].normalized
+            : Vector3.zero;
+        Vector3 neighborNormal = neighborIndex < _currentNormals.Length && Finite(_currentNormals[neighborIndex]) && _currentNormals[neighborIndex].sqrMagnitude > 1e-8f
+            ? _currentNormals[neighborIndex].normalized
+            : Vector3.zero;
+        normalDelta = normal.sqrMagnitude > 0f && neighborNormal.sqrMagnitude > 0f
+            ? 1f - Mathf.Clamp(Vector3.Dot(normal, neighborNormal), -1f, 1f)
+            : float.NaN;
+        verticalDelta = normal.sqrMagnitude > 0f ? Vector3.Dot(offset, normal) : float.NaN;
+        return true;
+    }
+
+    private bool TryGetGridNeighborIndex(int index, int rowDelta, int colDelta, out int neighborIndex)
+    {
+        neighborIndex = -1;
+        if (index < 0 || index >= _cells.Count)
+            return false;
+
+        Cell cell = _cells[index];
+        for (int i = 0; i < _groups.Count; i++)
+        {
+            GridGroup group = _groups[i];
+            int count = group.columns * group.rows;
+            if (index < group.startIndex || index >= group.startIndex + count)
+                continue;
+
+            int row = cell.row + rowDelta;
+            int col = cell.col + colDelta;
+            if (row < 0 || row >= group.rows || col < 0 || col >= group.columns)
+                return false;
+
+            neighborIndex = group.startIndex + row * group.columns + col;
+            return neighborIndex >= 0 && neighborIndex < _cells.Count;
+        }
+
+        return false;
+    }
+
+    private bool TryGetStoredNodePosition(int index, out Vector3 position)
+    {
+        position = Vector3.zero;
+        if (index < 0 || _currentPositions == null || index >= _currentPositions.Length)
+            return false;
+
+        bool hasLinePosition = _currentLineValid != null && index < _currentLineValid.Length && _currentLineValid[index];
+        bool hasMeshPosition = _currentValid != null && index < _currentValid.Length && _currentValid[index];
+        if (!hasLinePosition && !hasMeshPosition)
+            return false;
+
+        position = _currentPositions[index];
+        return Finite(position);
+    }
+
+    private static Vector3[] BuildSurfaceMeshExportNormals(Vector3[] vertices, int[] triangles, Vector3[] meshNormals)
+    {
+        if (meshNormals != null && meshNormals.Length == vertices.Length)
+        {
+            Vector3[] copiedNormals = new Vector3[meshNormals.Length];
+            for (int i = 0; i < meshNormals.Length; i++)
+                copiedNormals[i] = SafeNormalized(meshNormals[i], Vector3.up);
+            return copiedNormals;
+        }
+
+        Vector3[] normals = new Vector3[vertices.Length];
+        if (triangles != null)
+        {
+            for (int i = 0; i + 2 < triangles.Length; i += 3)
+            {
+                int ia = triangles[i];
+                int ib = triangles[i + 1];
+                int ic = triangles[i + 2];
+                if ((uint)ia >= (uint)vertices.Length || (uint)ib >= (uint)vertices.Length || (uint)ic >= (uint)vertices.Length)
+                    continue;
+
+                Vector3 a = vertices[ia];
+                Vector3 b = vertices[ib];
+                Vector3 c = vertices[ic];
+                Vector3 normal = Vector3.Cross(b - a, c - a);
+                if (!Finite(normal) || normal.sqrMagnitude <= 1e-8f)
+                    continue;
+
+                normal.Normalize();
+                normals[ia] += normal;
+                normals[ib] += normal;
+                normals[ic] += normal;
+            }
+        }
+
+        for (int i = 0; i < normals.Length; i++)
+            normals[i] = SafeNormalized(normals[i], Vector3.up);
+        return normals;
+    }
+
+    private static string FormatVector(Vector3 value)
+        => string.Concat(FormatFloat(value.x), ",", FormatFloat(value.y), ",", FormatFloat(value.z));
+
+    private static string FormatFloat(float value)
+        => value.ToString("F6", CultureInfo.InvariantCulture);
+
+    private static string FormatObjFloat(float value)
+        => value.ToString("G9", CultureInfo.InvariantCulture);
+
+    private static string FormatNullableFloat(float value)
+        => float.IsNaN(value) || float.IsInfinity(value) ? string.Empty : value.ToString("F6", CultureInfo.InvariantCulture);
+
+    private static string SanitizeObjName(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "ScanCover_Object";
+        StringBuilder builder = new StringBuilder(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            builder.Append(char.IsLetterOrDigit(c) || c == '_' || c == '-' ? c : '_');
+        }
+        return builder.ToString();
+    }
+
+    private static string EscapeJson(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "";
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+
+    private static void AppendJsonString(StringBuilder builder, string key, string value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": \"").Append(EscapeJson(value)).Append('"');
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
+    private static void AppendJsonNumber(StringBuilder builder, string key, float value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": ").Append(FormatFloat(value));
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
+    private static void AppendJsonNumber(StringBuilder builder, string key, int value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": ").Append(value.ToString(CultureInfo.InvariantCulture));
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
+    private static void AppendTransformJson(StringBuilder builder, Transform transform)
+    {
+        if (transform == null)
+        {
+            builder.Append("null");
+            return;
+        }
+
+        builder.Append("{");
+        builder.Append("\"position\":");
+        AppendVectorJson(builder, transform.position);
+        builder.Append(",\"rotationEuler\":");
+        AppendVectorJson(builder, transform.rotation.eulerAngles);
+        builder.Append(",\"forward\":");
+        AppendVectorJson(builder, transform.forward);
+        builder.Append(",\"right\":");
+        AppendVectorJson(builder, transform.right);
+        builder.Append(",\"up\":");
+        AppendVectorJson(builder, transform.up);
+        builder.Append(",\"localToWorld\":");
+        AppendMatrixJson(builder, transform.localToWorldMatrix);
+        builder.Append(",\"worldToLocal\":");
+        AppendMatrixJson(builder, transform.worldToLocalMatrix);
+        builder.Append("}");
+    }
+
+    private static void AppendCameraJson(StringBuilder builder, Camera camera)
+    {
+        if (camera == null)
+        {
+            builder.Append("null");
+            return;
+        }
+
+        builder.Append("{");
+        builder.Append("\"nearClipPlane\":").Append(FormatFloat(camera.nearClipPlane));
+        builder.Append(",\"farClipPlane\":").Append(FormatFloat(camera.farClipPlane));
+        builder.Append(",\"fieldOfView\":").Append(FormatFloat(camera.fieldOfView));
+        builder.Append(",\"aspect\":").Append(FormatFloat(camera.aspect));
+        builder.Append(",\"worldToCamera\":");
+        AppendMatrixJson(builder, camera.worldToCameraMatrix);
+        builder.Append(",\"projection\":");
+        AppendMatrixJson(builder, camera.projectionMatrix);
+        builder.Append("}");
+    }
+
+    private static void AppendVectorJson(StringBuilder builder, Vector3 value)
+    {
+        builder.Append('[')
+            .Append(FormatFloat(value.x)).Append(',')
+            .Append(FormatFloat(value.y)).Append(',')
+            .Append(FormatFloat(value.z)).Append(']');
+    }
+
+    private static void AppendMatrixJson(StringBuilder builder, Matrix4x4 matrix)
+    {
+        builder.Append('[');
+        for (int row = 0; row < 4; row++)
+        {
+            if (row > 0)
+                builder.Append(',');
+            builder.Append('[');
+            for (int col = 0; col < 4; col++)
+            {
+                if (col > 0)
+                    builder.Append(',');
+                builder.Append(FormatFloat(matrix[row, col]));
+            }
+            builder.Append(']');
+        }
+        builder.Append(']');
+    }
+
+    private static void AppendIndent(StringBuilder builder, int indent)
+    {
+        for (int i = 0; i < indent; i++)
+            builder.Append("  ");
     }
 
     private GameObject CreateFallbackMarker()
@@ -7719,6 +10505,1117 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         }
     }
 
+    private void EnsureGeometricSurfaceGridObjects()
+    {
+        EnsureDisplayRoots();
+        Transform parent = ResolveSurfaceParent();
+        if (_geometricSurfaceGridRoot == null)
+        {
+            _geometricSurfaceGridRoot = new GameObject("[ScanCover] Geometric Surface Grid");
+            _geometricSurfaceGridRoot.transform.SetParent(parent, false);
+            _geometricSurfaceGridFilter = _geometricSurfaceGridRoot.AddComponent<MeshFilter>();
+            _geometricSurfaceGridRenderer = _geometricSurfaceGridRoot.AddComponent<MeshRenderer>();
+        }
+        else if (_geometricSurfaceGridRoot.transform.parent != parent)
+        {
+            _geometricSurfaceGridRoot.transform.SetParent(parent, false);
+        }
+
+        UpdateDisplayRootsTransform();
+        if (_geometricSurfaceGridMesh == null)
+        {
+            _geometricSurfaceGridMesh = new Mesh { name = "ScanCover_GeometricSurfaceGrid" };
+            _geometricSurfaceGridMesh.MarkDynamic();
+        }
+
+        if (_geometricSurfaceGridMaterial == null)
+        {
+            Shader shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+                shader = Shader.Find("Unlit/Color");
+            if (shader != null)
+                _geometricSurfaceGridMaterial = new Material(shader) { name = "ScanCover_GeometricSurfaceGrid_Mat" };
+        }
+
+        if (_geometricSurfaceGridMaterial != null)
+        {
+            if (_geometricSurfaceGridMaterial.HasProperty("_Surface")) _geometricSurfaceGridMaterial.SetFloat("_Surface", 1f);
+            if (_geometricSurfaceGridMaterial.HasProperty("_Blend")) _geometricSurfaceGridMaterial.SetFloat("_Blend", 0f);
+            if (_geometricSurfaceGridMaterial.HasProperty("_ZWrite")) _geometricSurfaceGridMaterial.SetFloat("_ZWrite", 0f);
+            if (_geometricSurfaceGridMaterial.HasProperty("_SrcBlend")) _geometricSurfaceGridMaterial.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+            if (_geometricSurfaceGridMaterial.HasProperty("_DstBlend")) _geometricSurfaceGridMaterial.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+            if (_geometricSurfaceGridMaterial.HasProperty("_Cull")) _geometricSurfaceGridMaterial.SetFloat("_Cull", (float)CullMode.Off);
+            if (_geometricSurfaceGridMaterial.HasProperty("_CullMode")) _geometricSurfaceGridMaterial.SetFloat("_CullMode", (float)CullMode.Off);
+            if (_geometricSurfaceGridMaterial.HasProperty("_ZTest")) _geometricSurfaceGridMaterial.SetFloat("_ZTest", 8f);
+            _geometricSurfaceGridMaterial.renderQueue = (int)RenderQueue.Overlay;
+        }
+
+        if (_geometricSurfaceGridFilter != null)
+            _geometricSurfaceGridFilter.sharedMesh = _geometricSurfaceGridMesh;
+        if (_geometricSurfaceGridRenderer != null)
+        {
+            _geometricSurfaceGridRenderer.sharedMaterial = _geometricSurfaceGridMaterial;
+            _geometricSurfaceGridRenderer.shadowCastingMode = ShadowCastingMode.Off;
+            _geometricSurfaceGridRenderer.receiveShadows = false;
+        }
+    }
+
+    private enum ProbeRowLinkKind
+    {
+        Stable,
+        Refine,
+        Break
+    }
+
+    private struct ProbeRowHit
+    {
+        public bool valid;
+        public Vector3 point;
+        public Vector3 normal;
+        public int neighborhoodCount;
+        public float planeDeviation;
+    }
+
+    private struct ProbeSliceSegment
+    {
+        public Vector3 a;
+        public Vector3 b;
+    }
+
+    private struct RansacPatchSample
+    {
+        public Vector3 point;
+        public Vector3 normal;
+        public bool active;
+    }
+
+    private struct RansacPatchPlane
+    {
+        public Vector3 center;
+        public Vector3 normal;
+        public int inlierCount;
+    }
+
+    private struct ProbeRowLink
+    {
+        public int a;
+        public int b;
+    }
+
+    private void UpdateProbeRowExperiment(bool[] valid, Vector3[] positions, Vector3[] normals)
+    {
+        if (!showProbeRowExperiment || !_previewVisible || !previewDisplayVisible)
+        {
+            SetProbeRowExperimentVisible(false);
+            return;
+        }
+
+        if (valid == null || positions == null || normals == null || valid.Length == 0 || positions.Length != valid.Length)
+        {
+            SetProbeRowExperimentVisible(false);
+            return;
+        }
+
+        Transform origin = ResolveViewLockedOrigin();
+        if (origin == null)
+        {
+            SetProbeRowExperimentVisible(false);
+            return;
+        }
+
+        BuildProbeTriangleIndexCache(valid);
+        if (_probeTriangleIndices.Count <= 0)
+        {
+            SetProbeRowExperimentVisible(false);
+            return;
+        }
+
+        Vector3 originPos = origin.position;
+        Vector3 forward = origin.forward.sqrMagnitude > 1e-8f ? origin.forward.normalized : Vector3.forward;
+        float spacing = Mathf.Max(0.005f, probeRowSpacingMeters);
+        float targetDistance = Mathf.Max(0.05f, probeRowTargetDistanceMeters);
+        Ray centerRay = new Ray(originPos, forward);
+        if (!TryRaycastProbeMesh(centerRay, positions, normals, Mathf.Max(targetDistance + 0.1f, probeRowMaxRayDistanceMeters), out Vector3 anchorPoint, out Vector3 anchorNormal))
+        {
+            SetProbeRowExperimentVisible(false);
+            return;
+        }
+
+        anchorNormal = anchorNormal.sqrMagnitude > 1e-8f ? anchorNormal.normalized : -forward;
+        int maxPointCount = Mathf.Max(2, probeRowMaxPointCount, 768);
+        float maxDistance = Mathf.Max(targetDistance + 0.1f, probeRowMaxRayDistanceMeters);
+        float surfaceOffset = Mathf.Max(0f, probeRowSurfaceOffsetMeters);
+        List<ProbeRowHit> hits = new List<ProbeRowHit>(maxPointCount);
+        List<ProbeRowLink> links = new List<ProbeRowLink>(maxPointCount);
+        Vector3 horizontalForward = Vector3.ProjectOnPlane(forward, Vector3.up);
+        if (horizontalForward.sqrMagnitude <= 1e-8f)
+            horizontalForward = Vector3.forward;
+        horizontalForward.Normalize();
+        Vector3 horizontalRight = Vector3.Cross(Vector3.up, horizontalForward);
+        if (horizontalRight.sqrMagnitude <= 1e-8f)
+            horizontalRight = Vector3.right;
+        horizontalRight.Normalize();
+
+        AddProbeSurfaceGridOverlay(anchorPoint, anchorNormal, horizontalRight, spacing, maxDistance, maxPointCount, positions, normals, valid, hits, links);
+
+        int pointCount = hits.Count;
+        EnsureProbeRowObjects();
+        EnsureProbeMarkerPool(pointCount);
+        EnsureProbeLinePool(links.Count);
+
+        int visiblePoints = 0;
+        for (int i = 0; i < pointCount; i++)
+        {
+            if (!hits[i].valid)
+            {
+                SetProbeMarkerVisible(i, false);
+                continue;
+            }
+
+            GameObject marker = _probeRowMarkers[i];
+            ProbeRowHit hit = hits[i];
+            marker.transform.position = hit.point + hit.normal * surfaceOffset;
+            marker.transform.localScale = Vector3.one * Mathf.Max(0.002f, probeRowMarkerScaleMeters);
+            SetProbeMarkerVisible(i, true);
+            visiblePoints++;
+        }
+
+        for (int i = pointCount; i < _probeRowMarkers.Count; i++)
+            SetProbeMarkerVisible(i, false);
+
+        for (int i = 0; i < links.Count; i++)
+        {
+            LineRenderer line = _probeRowLines[i];
+            int a = links[i].a;
+            int b = links[i].b;
+            if ((uint)a >= (uint)hits.Count || (uint)b >= (uint)hits.Count || !hits[a].valid || !hits[b].valid)
+            {
+                SetProbeLineVisible(line, false);
+                continue;
+            }
+
+            ProbeRowLinkKind kind = ClassifyProbeLink(hits[a], hits[b], spacing);
+            line.sharedMaterial = ResolveProbeLineMaterial(kind);
+            line.startWidth = Mathf.Max(0.0005f, probeRowLineWidthMeters);
+            line.endWidth = line.startWidth;
+            line.positionCount = 2;
+            line.useWorldSpace = true;
+            line.SetPosition(0, hits[a].point + hits[a].normal * surfaceOffset);
+            line.SetPosition(1, hits[b].point + hits[b].normal * surfaceOffset);
+            SetProbeLineVisible(line, true);
+        }
+
+        for (int i = links.Count; i < _probeRowLines.Count; i++)
+            SetProbeLineVisible(_probeRowLines[i], false);
+
+        SetProbeRowExperimentVisible(visiblePoints > 0);
+    }
+
+    private void AddProbeSurfaceGridOverlay(Vector3 anchorPoint, Vector3 anchorNormal, Vector3 preferredRight, float spacing, float maxDistance, int maxPointCount, Vector3[] positions, Vector3[] normals, bool[] valid, List<ProbeRowHit> hits, List<ProbeRowLink> links)
+    {
+        Vector3 normal = anchorNormal.sqrMagnitude > 1e-8f ? anchorNormal.normalized : Vector3.up;
+        Vector3 axisU = Vector3.ProjectOnPlane(preferredRight, normal);
+        if (axisU.sqrMagnitude <= 1e-8f)
+            axisU = Vector3.Cross(Vector3.up, normal);
+        if (axisU.sqrMagnitude <= 1e-8f)
+            axisU = Vector3.Cross(Vector3.right, normal);
+        if (axisU.sqrMagnitude <= 1e-8f)
+            return;
+        axisU.Normalize();
+
+        Vector3 axisV = Vector3.Cross(normal, axisU);
+        if (Vector3.Dot(axisV, Vector3.up) < 0f)
+            axisV = -axisV;
+        if (axisV.sqrMagnitude <= 1e-8f)
+            return;
+        axisV.Normalize();
+
+        if (!TryResolveProbeGridRanges(valid, positions, anchorPoint, normal, axisU, axisV, spacing, maxDistance, out float minU, out float maxU, out float minV, out float maxV))
+            return;
+
+        float gridSpacing = Mathf.Max(0.005f, spacing);
+        int estimatedU = Mathf.Max(2, Mathf.FloorToInt((maxU - minU) / gridSpacing) + 1);
+        int estimatedV = Mathf.Max(2, Mathf.FloorToInt((maxV - minV) / gridSpacing) + 1);
+        int estimatedPoints = estimatedU * estimatedV * 2;
+        if (estimatedPoints > maxPointCount)
+        {
+            float scale = Mathf.Sqrt(estimatedPoints / (float)Mathf.Max(1, maxPointCount));
+            gridSpacing *= Mathf.Max(1f, scale);
+            estimatedU = Mathf.Max(2, Mathf.FloorToInt((maxU - minU) / gridSpacing) + 1);
+            estimatedV = Mathf.Max(2, Mathf.FloorToInt((maxV - minV) / gridSpacing) + 1);
+        }
+
+        AddProbeSurfaceGridFamily(anchorPoint, normal, axisU, axisV, minU, maxU, minV, maxV, gridSpacing, maxDistance, maxPointCount, positions, normals, valid, hits, links, linesAlongU: true);
+        AddProbeSurfaceGridFamily(anchorPoint, normal, axisU, axisV, minU, maxU, minV, maxV, gridSpacing, maxDistance, maxPointCount, positions, normals, valid, hits, links, linesAlongU: false);
+    }
+
+    private bool TryResolveProbeGridRanges(bool[] valid, Vector3[] positions, Vector3 anchorPoint, Vector3 normal, Vector3 axisU, Vector3 axisV, float spacing, float maxDistance, out float minU, out float maxU, out float minV, out float maxV)
+    {
+        minU = float.PositiveInfinity;
+        maxU = float.NegativeInfinity;
+        minV = float.PositiveInfinity;
+        maxV = float.NegativeInfinity;
+        if (valid == null || positions == null)
+            return false;
+
+        float halfSpanLimit = Mathf.Max(spacing * 4f, Mathf.Min(Mathf.Max(0.3f, maxDistance), spacing * 32f));
+        float normalRange = Mathf.Max(spacing * 6f, probeRowRecognitionRadiusMeters * 4f);
+        int count = Mathf.Min(valid.Length, positions.Length);
+        int accepted = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!valid[i] || !Finite(positions[i]))
+                continue;
+
+            Vector3 delta = positions[i] - anchorPoint;
+            float normalOffset = Mathf.Abs(Vector3.Dot(delta, normal));
+            if (normalOffset > normalRange)
+                continue;
+
+            float u = Mathf.Clamp(Vector3.Dot(delta, axisU), -halfSpanLimit, halfSpanLimit);
+            float v = Mathf.Clamp(Vector3.Dot(delta, axisV), -halfSpanLimit, halfSpanLimit);
+            minU = Mathf.Min(minU, u);
+            maxU = Mathf.Max(maxU, u);
+            minV = Mathf.Min(minV, v);
+            maxV = Mathf.Max(maxV, v);
+            accepted++;
+        }
+
+        if (accepted < 4 || !float.IsFinite(minU) || !float.IsFinite(maxU) || !float.IsFinite(minV) || !float.IsFinite(maxV))
+        {
+            float fallbackHalfSpan = Mathf.Max(spacing * 4f, Mathf.Min(0.9f, halfSpanLimit));
+            minU = -fallbackHalfSpan;
+            maxU = fallbackHalfSpan;
+            minV = -fallbackHalfSpan;
+            maxV = fallbackHalfSpan;
+            return true;
+        }
+
+        minU = Mathf.Max(minU, -halfSpanLimit);
+        maxU = Mathf.Min(maxU, halfSpanLimit);
+        minV = Mathf.Max(minV, -halfSpanLimit);
+        maxV = Mathf.Min(maxV, halfSpanLimit);
+        return maxU > minU + spacing && maxV > minV + spacing;
+    }
+
+    private void AddProbeSurfaceGridFamily(Vector3 anchorPoint, Vector3 normal, Vector3 axisU, Vector3 axisV, float minU, float maxU, float minV, float maxV, float spacing, float maxDistance, int maxPointCount, Vector3[] positions, Vector3[] normals, bool[] valid, List<ProbeRowHit> hits, List<ProbeRowLink> links, bool linesAlongU)
+    {
+        float lineMin = linesAlongU ? minV : minU;
+        float lineMax = linesAlongU ? maxV : maxU;
+        float sampleMin = linesAlongU ? minU : minV;
+        float sampleMax = linesAlongU ? maxU : maxV;
+        int lineCount = Mathf.Max(1, Mathf.FloorToInt((lineMax - lineMin) / spacing) + 1);
+        int sampleCount = Mathf.Max(2, Mathf.FloorToInt((sampleMax - sampleMin) / spacing) + 1);
+
+        for (int lineIndex = 0; lineIndex < lineCount && hits.Count < maxPointCount; lineIndex++)
+        {
+            float lineT = lineCount > 1 ? lineIndex / (float)(lineCount - 1) : 0.5f;
+            float lineOffset = Mathf.Lerp(lineMin, lineMax, lineT);
+            int previousIndex = -1;
+            for (int sampleIndex = 0; sampleIndex < sampleCount && hits.Count < maxPointCount; sampleIndex++)
+            {
+                float sampleT = sampleCount > 1 ? sampleIndex / (float)(sampleCount - 1) : 0.5f;
+                float sampleOffset = Mathf.Lerp(sampleMin, sampleMax, sampleT);
+                float u = linesAlongU ? sampleOffset : lineOffset;
+                float v = linesAlongU ? lineOffset : sampleOffset;
+                Vector3 planePoint = anchorPoint + axisU * u + axisV * v;
+                if (!TryProjectProbeSurfacePoint(planePoint, normal, positions, normals, maxDistance, out Vector3 projectedPoint, out Vector3 projectedNormal))
+                {
+                    previousIndex = -1;
+                    continue;
+                }
+
+                Vector3 sampleNormal = projectedNormal.sqrMagnitude > 1e-8f ? projectedNormal.normalized : normal;
+                ProbeRowHit hit = new ProbeRowHit
+                {
+                    valid = true,
+                    point = projectedPoint,
+                    normal = sampleNormal
+                };
+                EvaluateProbeNeighborhood(hit.point, hit.normal, valid, positions, normals, out hit.neighborhoodCount, out hit.planeDeviation);
+                int currentIndex = hits.Count;
+                hits.Add(hit);
+                if (previousIndex >= 0)
+                    links.Add(new ProbeRowLink { a = previousIndex, b = currentIndex });
+                previousIndex = currentIndex;
+            }
+        }
+    }
+
+    private void AddProbeCenterSliceLine(Vector3 planeNormal, Vector3 anchorPoint, Vector3 fallbackNormal, float spacing, float maxDistance, int maxPointCount, Vector3[] positions, Vector3[] normals, bool[] valid, List<ProbeRowHit> hits, List<ProbeRowLink> links, List<ProbeSliceSegment> sliceSegments, List<Vector3> slicePolyline)
+    {
+        if (planeNormal.sqrMagnitude <= 1e-8f || hits.Count >= maxPointCount)
+            return;
+
+        Vector3 n = planeNormal.normalized;
+        BuildProbeSliceSegments(anchorPoint, n, positions, sliceSegments);
+        if (sliceSegments.Count <= 0)
+            return;
+
+        slicePolyline.Clear();
+        if (!TryBuildProbeSlicePolyline(sliceSegments, anchorPoint, spacing, slicePolyline) || slicePolyline.Count < 2)
+            return;
+
+        float[] cumulative = BuildProbePolylineDistances(slicePolyline);
+        float totalLength = cumulative.Length > 0 ? cumulative[cumulative.Length - 1] : 0f;
+        if (totalLength <= spacing * 0.5f)
+            return;
+
+        int lineStart = hits.Count;
+        int availablePoints = Mathf.Max(0, maxPointCount - hits.Count);
+        int sampleCount = Mathf.Min(availablePoints, Mathf.Max(2, Mathf.FloorToInt(totalLength / spacing) + 1));
+        if (sampleCount < 2)
+            return;
+
+        for (int i = 0; i < sampleCount && hits.Count < maxPointCount; i++)
+        {
+            float sampleDistance = sampleCount > 1
+                ? Mathf.Lerp(0f, totalLength, i / (float)(sampleCount - 1))
+                : 0f;
+            if (sampleDistance < -1e-4f || sampleDistance > totalLength + 1e-4f ||
+                !TrySampleProbePolyline(slicePolyline, cumulative, sampleDistance, out Vector3 samplePoint))
+                continue;
+
+            Vector3 sampleNormal = ResolveNearestProbeNormal(samplePoint, valid, positions, normals, fallbackNormal, maxDistance);
+            ProbeRowHit hit = new ProbeRowHit
+            {
+                valid = true,
+                point = samplePoint,
+                normal = sampleNormal
+            };
+            EvaluateProbeNeighborhood(hit.point, hit.normal, valid, positions, normals, out hit.neighborhoodCount, out hit.planeDeviation);
+            int index = hits.Count;
+            hits.Add(hit);
+            if (index > lineStart)
+                links.Add(new ProbeRowLink { a = index - 1, b = index });
+        }
+    }
+
+    private bool TryResolveProbeBounds(bool[] valid, Vector3[] positions, out Bounds bounds)
+    {
+        bounds = default;
+        if (valid == null || positions == null)
+            return false;
+
+        bool hasValue = false;
+        int count = Mathf.Min(valid.Length, positions.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (!valid[i] || !Finite(positions[i]))
+                continue;
+
+            if (!hasValue)
+            {
+                bounds = new Bounds(positions[i], Vector3.zero);
+                hasValue = true;
+            }
+            else
+            {
+                bounds.Encapsulate(positions[i]);
+            }
+        }
+
+        return hasValue;
+    }
+
+    private static void GetProbeBoundsAxisRange(Bounds bounds, Vector3 axis, out float minOffset, out float maxOffset)
+    {
+        minOffset = float.PositiveInfinity;
+        maxOffset = float.NegativeInfinity;
+        Vector3 center = bounds.center;
+        Vector3 extents = bounds.extents;
+        for (int x = -1; x <= 1; x += 2)
+        {
+            for (int y = -1; y <= 1; y += 2)
+            {
+                for (int z = -1; z <= 1; z += 2)
+                {
+                    Vector3 corner = center + new Vector3(extents.x * x, extents.y * y, extents.z * z);
+                    float offset = Vector3.Dot(corner, axis);
+                    minOffset = Mathf.Min(minOffset, offset);
+                    maxOffset = Mathf.Max(maxOffset, offset);
+                }
+            }
+        }
+    }
+
+    private void BuildProbeSliceSegments(Vector3 planePoint, Vector3 planeNormal, Vector3[] positions, List<ProbeSliceSegment> segments)
+    {
+        segments.Clear();
+        if (positions == null || planeNormal.sqrMagnitude <= 1e-8f)
+            return;
+
+        Vector3 n = planeNormal.normalized;
+        const float epsilon = 0.0005f;
+        List<Vector3> crossings = new List<Vector3>(3);
+        for (int i = 0; i + 2 < _probeTriangleIndices.Count; i += 3)
+        {
+            int ia = _probeTriangleIndices[i];
+            int ib = _probeTriangleIndices[i + 1];
+            int ic = _probeTriangleIndices[i + 2];
+            if ((uint)ia >= (uint)positions.Length || (uint)ib >= (uint)positions.Length || (uint)ic >= (uint)positions.Length)
+                continue;
+
+            Vector3 a = positions[ia];
+            Vector3 b = positions[ib];
+            Vector3 c = positions[ic];
+            if (!Finite(a) || !Finite(b) || !Finite(c))
+                continue;
+
+            float da = Vector3.Dot(a - planePoint, n);
+            float db = Vector3.Dot(b - planePoint, n);
+            float dc = Vector3.Dot(c - planePoint, n);
+            if ((da > epsilon && db > epsilon && dc > epsilon) || (da < -epsilon && db < -epsilon && dc < -epsilon))
+                continue;
+
+            crossings.Clear();
+            AddProbeSliceEdgeCrossing(a, da, b, db, epsilon, crossings);
+            AddProbeSliceEdgeCrossing(b, db, c, dc, epsilon, crossings);
+            AddProbeSliceEdgeCrossing(c, dc, a, da, epsilon, crossings);
+            RemoveDuplicateProbeSlicePoints(crossings, epsilon * 4f);
+            if (crossings.Count < 2)
+                continue;
+
+            Vector3 p0 = crossings[0];
+            Vector3 p1 = crossings[1];
+            float bestSqr = (p1 - p0).sqrMagnitude;
+            for (int p = 0; p < crossings.Count; p++)
+            {
+                for (int q = p + 1; q < crossings.Count; q++)
+                {
+                    float sqr = (crossings[q] - crossings[p]).sqrMagnitude;
+                    if (sqr > bestSqr)
+                    {
+                        bestSqr = sqr;
+                        p0 = crossings[p];
+                        p1 = crossings[q];
+                    }
+                }
+            }
+
+            if (bestSqr > 1e-8f)
+                segments.Add(new ProbeSliceSegment { a = p0, b = p1 });
+        }
+    }
+
+    private static void AddProbeSliceEdgeCrossing(Vector3 a, float da, Vector3 b, float db, float epsilon, List<Vector3> crossings)
+    {
+        bool aOn = Mathf.Abs(da) <= epsilon;
+        bool bOn = Mathf.Abs(db) <= epsilon;
+        if (aOn)
+            crossings.Add(a);
+        if (bOn)
+            crossings.Add(b);
+        if (aOn || bOn || da * db > 0f)
+            return;
+
+        float t = da / (da - db);
+        if (t >= 0f && t <= 1f)
+            crossings.Add(Vector3.LerpUnclamped(a, b, t));
+    }
+
+    private static void RemoveDuplicateProbeSlicePoints(List<Vector3> points, float tolerance)
+    {
+        float toleranceSqr = tolerance * tolerance;
+        for (int i = points.Count - 1; i >= 0; i--)
+        {
+            for (int j = 0; j < i; j++)
+            {
+                if ((points[i] - points[j]).sqrMagnitude <= toleranceSqr)
+                {
+                    points.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    private bool TryBuildProbeSlicePolyline(List<ProbeSliceSegment> segments, Vector3 anchorPoint, float spacing, List<Vector3> polyline)
+    {
+        polyline.Clear();
+        if (segments == null || segments.Count <= 0)
+            return false;
+
+        int seed = -1;
+        float bestSqr = float.PositiveInfinity;
+        for (int i = 0; i < segments.Count; i++)
+        {
+            float sqr = DistancePointSegmentSqr(anchorPoint, segments[i].a, segments[i].b);
+            if (sqr < bestSqr)
+            {
+                bestSqr = sqr;
+                seed = i;
+            }
+        }
+
+        if (seed < 0)
+            return false;
+
+        bool[] used = new bool[segments.Count];
+        used[seed] = true;
+        Vector3 seedA = segments[seed].a;
+        Vector3 seedB = segments[seed].b;
+        if ((seedA - anchorPoint).sqrMagnitude < (seedB - anchorPoint).sqrMagnitude)
+        {
+            polyline.Add(seedB);
+            polyline.Add(seedA);
+        }
+        else
+        {
+            polyline.Add(seedA);
+            polyline.Add(seedB);
+        }
+
+        float connectTolerance = Mathf.Max(0.01f, Mathf.Min(0.08f, spacing * 1.25f));
+        ExtendProbeSlicePolyline(polyline, segments, used, connectTolerance, appendToEnd: true);
+        ExtendProbeSlicePolyline(polyline, segments, used, connectTolerance, appendToEnd: false);
+        return polyline.Count >= 2;
+    }
+
+    private static void ExtendProbeSlicePolyline(List<Vector3> polyline, List<ProbeSliceSegment> segments, bool[] used, float connectTolerance, bool appendToEnd)
+    {
+        float toleranceSqr = connectTolerance * connectTolerance;
+        bool added = true;
+        while (added)
+        {
+            added = false;
+            Vector3 end = appendToEnd ? polyline[polyline.Count - 1] : polyline[0];
+            int bestIndex = -1;
+            bool useA = true;
+            float bestSqr = toleranceSqr;
+            for (int i = 0; i < segments.Count; i++)
+            {
+                if (used[i])
+                    continue;
+
+                float aSqr = (segments[i].a - end).sqrMagnitude;
+                if (aSqr <= bestSqr)
+                {
+                    bestSqr = aSqr;
+                    bestIndex = i;
+                    useA = true;
+                }
+
+                float bSqr = (segments[i].b - end).sqrMagnitude;
+                if (bSqr <= bestSqr)
+                {
+                    bestSqr = bSqr;
+                    bestIndex = i;
+                    useA = false;
+                }
+            }
+
+            if (bestIndex < 0)
+                continue;
+
+            used[bestIndex] = true;
+            Vector3 next = useA ? segments[bestIndex].b : segments[bestIndex].a;
+            if (appendToEnd)
+                polyline.Add(next);
+            else
+                polyline.Insert(0, next);
+            added = true;
+        }
+    }
+
+    private static float[] BuildProbePolylineDistances(List<Vector3> polyline)
+    {
+        float[] distances = new float[polyline != null ? polyline.Count : 0];
+        if (polyline == null || polyline.Count <= 0)
+            return distances;
+
+        distances[0] = 0f;
+        for (int i = 1; i < polyline.Count; i++)
+            distances[i] = distances[i - 1] + Vector3.Distance(polyline[i - 1], polyline[i]);
+        return distances;
+    }
+
+    private static float FindClosestDistanceOnProbePolyline(List<Vector3> polyline, float[] cumulative, Vector3 point)
+    {
+        if (polyline == null || cumulative == null || polyline.Count < 2 || cumulative.Length != polyline.Count)
+            return 0f;
+
+        float bestSqr = float.PositiveInfinity;
+        float bestDistance = 0f;
+        for (int i = 0; i < polyline.Count - 1; i++)
+        {
+            Vector3 a = polyline[i];
+            Vector3 b = polyline[i + 1];
+            Vector3 ab = b - a;
+            float abSqr = ab.sqrMagnitude;
+            if (abSqr <= 1e-8f)
+                continue;
+
+            float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / abSqr);
+            Vector3 closest = a + ab * t;
+            float sqr = (point - closest).sqrMagnitude;
+            if (sqr < bestSqr)
+            {
+                bestSqr = sqr;
+                bestDistance = cumulative[i] + Mathf.Sqrt(abSqr) * t;
+            }
+        }
+
+        return bestDistance;
+    }
+
+    private static bool TrySampleProbePolyline(List<Vector3> polyline, float[] cumulative, float distance, out Vector3 point)
+    {
+        point = Vector3.zero;
+        if (polyline == null || cumulative == null || polyline.Count < 2 || cumulative.Length != polyline.Count)
+            return false;
+
+        float total = cumulative[cumulative.Length - 1];
+        if (distance < -1e-4f || distance > total + 1e-4f)
+            return false;
+
+        distance = Mathf.Clamp(distance, 0f, total);
+        for (int i = 0; i < cumulative.Length - 1; i++)
+        {
+            float a = cumulative[i];
+            float b = cumulative[i + 1];
+            if (distance > b && i < cumulative.Length - 2)
+                continue;
+
+            float span = b - a;
+            float t = span > 1e-8f ? (distance - a) / span : 0f;
+            point = Vector3.LerpUnclamped(polyline[i], polyline[i + 1], t);
+            return true;
+        }
+
+        point = polyline[polyline.Count - 1];
+        return true;
+    }
+
+    private Vector3 ResolveNearestProbeNormal(Vector3 point, bool[] valid, Vector3[] positions, Vector3[] normals, Vector3 fallbackNormal, float maxDistance)
+    {
+        Vector3 bestNormal = fallbackNormal.sqrMagnitude > 1e-8f ? fallbackNormal.normalized : Vector3.up;
+        if (valid == null || positions == null || normals == null)
+            return bestNormal;
+
+        float bestSqr = Mathf.Max(0.0025f, maxDistance * maxDistance);
+        int count = Mathf.Min(valid.Length, Mathf.Min(positions.Length, normals.Length));
+        for (int i = 0; i < count; i++)
+        {
+            if (!valid[i] || !Finite(positions[i]) || !Finite(normals[i]) || normals[i].sqrMagnitude <= 1e-8f)
+                continue;
+
+            float sqr = (positions[i] - point).sqrMagnitude;
+            if (sqr >= bestSqr)
+                continue;
+
+            bestSqr = sqr;
+            bestNormal = normals[i].normalized;
+        }
+
+        return bestNormal;
+    }
+
+    private static float DistancePointSegmentSqr(Vector3 point, Vector3 a, Vector3 b)
+    {
+        Vector3 ab = b - a;
+        float abSqr = ab.sqrMagnitude;
+        if (abSqr <= 1e-8f)
+            return (point - a).sqrMagnitude;
+
+        float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / abSqr);
+        Vector3 closest = a + ab * t;
+        return (point - closest).sqrMagnitude;
+    }
+
+    private bool TryStepProbeSurface(ProbeRowHit from, Vector3 preferredDirection, float spacing, float projectDistance, Vector3[] positions, Vector3[] normals, bool[] valid, out ProbeRowHit hit)
+    {
+        hit = default;
+        if (!from.valid || preferredDirection.sqrMagnitude <= 1e-8f)
+            return false;
+
+        Vector3 normal = from.normal.sqrMagnitude > 1e-8f ? from.normal.normalized : Vector3.up;
+        Vector3 tangent = Vector3.ProjectOnPlane(preferredDirection, normal);
+        if (tangent.sqrMagnitude <= 1e-8f)
+            tangent = preferredDirection;
+        if (tangent.sqrMagnitude <= 1e-8f)
+            return false;
+
+        tangent.Normalize();
+        Vector3 surfaceTarget = from.point + tangent * Mathf.Max(0.005f, spacing);
+        if (!TryProjectProbeSurfacePoint(surfaceTarget, normal, positions, normals, projectDistance, out Vector3 hitPoint, out Vector3 hitNormal))
+            return false;
+
+        Vector3 resolvedNormal = hitNormal.sqrMagnitude > 1e-8f ? hitNormal.normalized : normal;
+        hit = new ProbeRowHit
+        {
+            valid = true,
+            point = hitPoint,
+            normal = resolvedNormal
+        };
+        EvaluateProbeNeighborhood(hit.point, hit.normal, valid, positions, normals, out hit.neighborhoodCount, out hit.planeDeviation);
+        return true;
+    }
+
+    private bool TryResolveProbeHorizontalExtent(bool[] valid, Vector3[] positions, Vector3 originPos, Vector3 forward, Vector3 right, float targetDistance, out float minOffset, out float maxOffset)
+    {
+        minOffset = float.PositiveInfinity;
+        maxOffset = float.NegativeInfinity;
+        if (valid == null || positions == null || forward.sqrMagnitude <= 1e-8f || right.sqrMagnitude <= 1e-8f)
+            return false;
+
+        Vector3 fwd = forward.normalized;
+        Vector3 axis = right.normalized;
+        float planeDistance = Mathf.Max(0.05f, targetDistance);
+        int count = Mathf.Min(valid.Length, positions.Length);
+        int validCount = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!valid[i] || !Finite(positions[i]))
+                continue;
+
+            Vector3 toPoint = positions[i] - originPos;
+            float depth = Vector3.Dot(toPoint, fwd);
+            if (depth <= 0.02f)
+                continue;
+
+            float offset = Vector3.Dot(toPoint, axis) * (planeDistance / depth);
+            if (!float.IsFinite(offset))
+                continue;
+
+            minOffset = Mathf.Min(minOffset, offset);
+            maxOffset = Mathf.Max(maxOffset, offset);
+            validCount++;
+        }
+
+        return validCount >= 2 && float.IsFinite(minOffset) && float.IsFinite(maxOffset) && maxOffset > minOffset + 0.01f;
+    }
+
+    private bool TryResolveProbeSurfaceHorizontalExtent(bool[] valid, Vector3[] positions, Vector3[] normals, Vector3 anchorPoint, Vector3 anchorNormal, Vector3 surfaceRight, out float minOffset, out float maxOffset)
+    {
+        minOffset = float.PositiveInfinity;
+        maxOffset = float.NegativeInfinity;
+        if (valid == null || positions == null || surfaceRight.sqrMagnitude <= 1e-8f)
+            return false;
+
+        Vector3 axis = surfaceRight.normalized;
+        Vector3 normal = anchorNormal.sqrMagnitude > 1e-8f ? anchorNormal.normalized : Vector3.up;
+        int count = Mathf.Min(valid.Length, positions.Length);
+        int validCount = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!valid[i] || !Finite(positions[i]))
+                continue;
+
+            if (normals != null && i < normals.Length && Finite(normals[i]) && normals[i].sqrMagnitude > 1e-8f &&
+                Vector3.Dot(normal, normals[i].normalized) < probeRowRefineNormalDot)
+                continue;
+
+            float offset = Vector3.Dot(positions[i] - anchorPoint, axis);
+            if (!float.IsFinite(offset))
+                continue;
+
+            minOffset = Mathf.Min(minOffset, offset);
+            maxOffset = Mathf.Max(maxOffset, offset);
+            validCount++;
+        }
+
+        return validCount >= 2 && float.IsFinite(minOffset) && float.IsFinite(maxOffset) && maxOffset > minOffset + 0.01f;
+    }
+
+    private bool TryProjectProbeSurfacePoint(Vector3 surfaceTarget, Vector3 anchorNormal, Vector3[] positions, Vector3[] normals, float maxDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+        Vector3 normal = anchorNormal.sqrMagnitude > 1e-8f ? anchorNormal.normalized : Vector3.up;
+        float castDistance = Mathf.Max(0.1f, maxDistance);
+        Vector3 start = surfaceTarget + normal * (castDistance * 0.5f);
+        Ray ray = new Ray(start, -normal);
+        if (TryRaycastProbeMesh(ray, positions, normals, castDistance, out hitPoint, out hitNormal))
+            return true;
+
+        start = surfaceTarget - normal * (castDistance * 0.5f);
+        ray = new Ray(start, normal);
+        return TryRaycastProbeMesh(ray, positions, normals, castDistance, out hitPoint, out hitNormal);
+    }
+
+    private void BuildProbeTriangleIndexCache(bool[] valid)
+    {
+        _probeTriangleIndices.Clear();
+        if (valid == null || valid.Length < _cells.Count || _groups.Count <= 0)
+            return;
+
+        for (int g = 0; g < _groups.Count; g++)
+        {
+            GridGroup group = _groups[g];
+            if (group.columns <= 1 || group.rows <= 1)
+                continue;
+
+            for (int row = 0; row < group.rows - 1; row++)
+            {
+                int rowStart = group.startIndex + row * group.columns;
+                int nextRowStart = group.startIndex + (row + 1) * group.columns;
+                for (int col = 0; col < group.columns - 1; col++)
+                {
+                    int i00 = rowStart + col;
+                    int i10 = rowStart + col + 1;
+                    int i01 = nextRowStart + col;
+                    int i11 = nextRowStart + col + 1;
+                    if ((uint)i00 >= (uint)valid.Length || (uint)i10 >= (uint)valid.Length ||
+                        (uint)i01 >= (uint)valid.Length || (uint)i11 >= (uint)valid.Length)
+                        continue;
+
+                    if (valid[i00] && valid[i10] && valid[i11])
+                        AddProbeTriangle(i00, i10, i11);
+                    if (valid[i00] && valid[i11] && valid[i01])
+                        AddProbeTriangle(i00, i11, i01);
+                    if (!valid[i11] && valid[i00] && valid[i10] && valid[i01])
+                        AddProbeTriangle(i00, i10, i01);
+                    if (!valid[i00] && valid[i10] && valid[i11] && valid[i01])
+                        AddProbeTriangle(i10, i11, i01);
+                }
+            }
+        }
+    }
+
+    private void AddProbeTriangle(int a, int b, int c)
+    {
+        _probeTriangleIndices.Add(a);
+        _probeTriangleIndices.Add(b);
+        _probeTriangleIndices.Add(c);
+    }
+
+    private bool TryRaycastProbeMesh(Ray ray, Vector3[] positions, Vector3[] normals, float maxDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+        float bestDistance = maxDistance;
+        bool hasHit = false;
+
+        for (int i = 0; i + 2 < _probeTriangleIndices.Count; i += 3)
+        {
+            int ia = _probeTriangleIndices[i];
+            int ib = _probeTriangleIndices[i + 1];
+            int ic = _probeTriangleIndices[i + 2];
+            if ((uint)ia >= (uint)positions.Length || (uint)ib >= (uint)positions.Length || (uint)ic >= (uint)positions.Length)
+                continue;
+
+            Vector3 a = positions[ia];
+            Vector3 b = positions[ib];
+            Vector3 c = positions[ic];
+            if (!Finite(a) || !Finite(b) || !Finite(c))
+                continue;
+
+            if (!TryIntersectRayTriangle(ray, a, b, c, bestDistance, out float distance, out _, out _))
+                continue;
+
+            bestDistance = distance;
+            hitPoint = ray.origin + ray.direction * distance;
+            Vector3 normal = Vector3.zero;
+            if ((uint)ia < (uint)normals.Length && Finite(normals[ia])) normal += normals[ia];
+            if ((uint)ib < (uint)normals.Length && Finite(normals[ib])) normal += normals[ib];
+            if ((uint)ic < (uint)normals.Length && Finite(normals[ic])) normal += normals[ic];
+            if (normal.sqrMagnitude <= 1e-8f)
+                normal = Vector3.Cross(b - a, c - a);
+            hitNormal = normal.sqrMagnitude > 1e-8f ? normal.normalized : -ray.direction;
+            if (Vector3.Dot(hitNormal, ray.direction) > 0f)
+                hitNormal = -hitNormal;
+            hasHit = true;
+        }
+
+        return hasHit;
+    }
+
+    private static bool TryIntersectRayTriangle(Ray ray, Vector3 a, Vector3 b, Vector3 c, float maxDistance, out float distance, out float u, out float v)
+    {
+        distance = 0f;
+        u = 0f;
+        v = 0f;
+        Vector3 edge1 = b - a;
+        Vector3 edge2 = c - a;
+        Vector3 p = Vector3.Cross(ray.direction, edge2);
+        float det = Vector3.Dot(edge1, p);
+        if (Mathf.Abs(det) < 1e-7f)
+            return false;
+
+        float invDet = 1f / det;
+        Vector3 t = ray.origin - a;
+        u = Vector3.Dot(t, p) * invDet;
+        if (u < 0f || u > 1f)
+            return false;
+
+        Vector3 q = Vector3.Cross(t, edge1);
+        v = Vector3.Dot(ray.direction, q) * invDet;
+        if (v < 0f || u + v > 1f)
+            return false;
+
+        distance = Vector3.Dot(edge2, q) * invDet;
+        return distance > 1e-5f && distance <= maxDistance;
+    }
+
+    private void EvaluateProbeNeighborhood(Vector3 point, Vector3 normal, bool[] valid, Vector3[] positions, Vector3[] normals, out int count, out float planeDeviation)
+    {
+        count = 0;
+        planeDeviation = float.PositiveInfinity;
+        if (valid == null || positions == null)
+            return;
+
+        float radius = Mathf.Max(0.005f, probeRowRecognitionRadiusMeters);
+        float radiusSqr = radius * radius;
+        float totalAbsPlaneDistance = 0f;
+        Vector3 n = normal.sqrMagnitude > 1e-8f ? normal.normalized : Vector3.up;
+        for (int i = 0; i < valid.Length && i < positions.Length; i++)
+        {
+            if (!valid[i])
+                continue;
+            Vector3 sample = positions[i];
+            if (!Finite(sample) || (sample - point).sqrMagnitude > radiusSqr)
+                continue;
+
+            if (i < normals.Length && Finite(normals[i]) && normals[i].sqrMagnitude > 1e-8f &&
+                Vector3.Dot(n, normals[i].normalized) < probeRowRefineNormalDot)
+                continue;
+
+            totalAbsPlaneDistance += Mathf.Abs(Vector3.Dot(sample - point, n));
+            count++;
+        }
+
+        if (count > 0)
+            planeDeviation = totalAbsPlaneDistance / count;
+    }
+
+    private ProbeRowLinkKind ClassifyProbeLink(ProbeRowHit a, ProbeRowHit b, float spacing)
+    {
+        float distance = Vector3.Distance(a.point, b.point);
+        float normalDot = a.normal.sqrMagnitude > 1e-8f && b.normal.sqrMagnitude > 1e-8f
+            ? Vector3.Dot(a.normal.normalized, b.normal.normalized)
+            : -1f;
+        bool enoughSamples = a.neighborhoodCount >= probeRowMinNeighborhoodSamples &&
+                             b.neighborhoodCount >= probeRowMinNeighborhoodSamples;
+        float maxDeviation = Mathf.Max(a.planeDeviation, b.planeDeviation);
+        float stableDistance = spacing * Mathf.Max(1f, probeRowStableDistanceMultiplier);
+        float refineDistance = spacing * Mathf.Max(probeRowStableDistanceMultiplier, probeRowRefineDistanceMultiplier);
+
+        if (enoughSamples &&
+            distance <= stableDistance &&
+            normalDot >= probeRowStableNormalDot &&
+            maxDeviation <= probeRowStablePlaneDeviationMeters)
+            return ProbeRowLinkKind.Stable;
+
+        if (distance <= refineDistance && normalDot >= probeRowRefineNormalDot)
+            return ProbeRowLinkKind.Refine;
+
+        return ProbeRowLinkKind.Break;
+    }
+
+    private void EnsureProbeRowObjects()
+    {
+        if (_probeRowRoot == null)
+        {
+            _probeRowRoot = new GameObject("[ScanCover] Probe Row Experiment");
+            _probeRowRoot.transform.SetParent(null, false);
+        }
+
+        EnsureProbeMaterials();
+    }
+
+    private void EnsureProbeMaterials()
+    {
+        _probeRowPointMaterial = EnsureProbeMaterial(_probeRowPointMaterial, "ScanCover_ProbeRow_Point", probeRowPointColor);
+        _probeRowStableLineMaterial = EnsureProbeMaterial(_probeRowStableLineMaterial, "ScanCover_ProbeRow_StableLine", probeRowStableLineColor);
+        _probeRowRefineLineMaterial = EnsureProbeMaterial(_probeRowRefineLineMaterial, "ScanCover_ProbeRow_RefineLine", probeRowRefineLineColor);
+        _probeRowBreakLineMaterial = EnsureProbeMaterial(_probeRowBreakLineMaterial, "ScanCover_ProbeRow_BreakLine", probeRowBreakLineColor);
+    }
+
+    private Material EnsureProbeMaterial(Material material, string materialName, Color color)
+    {
+        if (material == null)
+        {
+            Shader shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+                shader = Shader.Find("Unlit/Color");
+            material = new Material(shader) { name = materialName };
+        }
+
+        if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
+        if (material.HasProperty("_Color")) material.SetColor("_Color", color);
+        material.renderQueue = 3100;
+        return material;
+    }
+
+    private void EnsureProbeMarkerPool(int count)
+    {
+        while (_probeRowMarkers.Count < count)
+        {
+            GameObject marker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            marker.name = $"ProbePoint_{_probeRowMarkers.Count:00}";
+            marker.transform.SetParent(_probeRowRoot.transform, false);
+            Collider markerCollider = marker.GetComponent<Collider>();
+            if (markerCollider != null)
+                Destroy(markerCollider);
+            Renderer renderer = marker.GetComponent<Renderer>();
+            if (renderer != null)
+            {
+                renderer.sharedMaterial = _probeRowPointMaterial;
+                renderer.shadowCastingMode = ShadowCastingMode.Off;
+                renderer.receiveShadows = false;
+            }
+            marker.SetActive(false);
+            _probeRowMarkers.Add(marker);
+        }
+    }
+
+    private void EnsureProbeLinePool(int count)
+    {
+        while (_probeRowLines.Count < count)
+        {
+            GameObject lineObject = new GameObject($"ProbeLink_{_probeRowLines.Count:00}");
+            lineObject.transform.SetParent(_probeRowRoot.transform, false);
+            LineRenderer line = lineObject.AddComponent<LineRenderer>();
+            line.useWorldSpace = true;
+            line.positionCount = 0;
+            line.numCornerVertices = 2;
+            line.numCapVertices = 2;
+            line.shadowCastingMode = ShadowCastingMode.Off;
+            line.receiveShadows = false;
+            line.sharedMaterial = _probeRowStableLineMaterial;
+            lineObject.SetActive(false);
+            _probeRowLines.Add(line);
+        }
+    }
+
+    private Material ResolveProbeLineMaterial(ProbeRowLinkKind kind)
+    {
+        switch (kind)
+        {
+            case ProbeRowLinkKind.Stable:
+                return _probeRowStableLineMaterial;
+            case ProbeRowLinkKind.Refine:
+                return _probeRowRefineLineMaterial;
+            default:
+                return _probeRowBreakLineMaterial;
+        }
+    }
+
+    private void SetProbeMarkerVisible(int index, bool visible)
+    {
+        if (index < 0 || index >= _probeRowMarkers.Count || _probeRowMarkers[index] == null)
+            return;
+        if (_probeRowMarkers[index].activeSelf != visible)
+            _probeRowMarkers[index].SetActive(visible);
+    }
+
+    private static void SetProbeLineVisible(LineRenderer line, bool visible)
+    {
+        if (line == null)
+            return;
+        if (line.gameObject.activeSelf != visible)
+            line.gameObject.SetActive(visible);
+        if (!visible)
+            line.positionCount = 0;
+    }
+
+    private void SetProbeRowExperimentVisible(bool visible)
+    {
+        if (_probeRowRoot != null && _probeRowRoot.activeSelf != visible)
+            _probeRowRoot.SetActive(visible);
+    }
+
     private void EnsureSurfaceObjects()
     {
         EnsureDisplayRoots();
@@ -7907,12 +11804,23 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         _remeshLineRenderer.SetPropertyBlock(_propertyBlock);
     }
 
+    private void ApplyGeometricSurfaceGridRendererColor(Color color)
+    {
+        if (_geometricSurfaceGridRenderer == null || _propertyBlock == null)
+            return;
+        _propertyBlock.Clear();
+        _propertyBlock.SetColor("_BaseColor", color);
+        _propertyBlock.SetColor("_Color", color);
+        _geometricSurfaceGridRenderer.SetPropertyBlock(_propertyBlock);
+    }
+
     private void SetSurfaceRendererMaterials(int regionCount)
     {
         if (_surfaceRenderer == null)
             return;
 
-        if (!colorizeSurfaceRegions || regionCount <= 1)
+        bool useRegionMaterials = colorizeSurfaceRegions;
+        if (!useRegionMaterials || regionCount <= 1)
         {
             Material targetMaterial = surfaceMaterialOverride != null ? surfaceMaterialOverride : _surfaceMaterial;
             if (_surfaceRenderer.sharedMaterial != targetMaterial)
@@ -7939,7 +11847,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             {
                 name = $"ScanCover_DepthGridSurface_Region_{_surfaceRegionMaterials.Count}"
             };
-            ApplySurfaceMaterialSettings(material, GetSurfaceRegionColor(_surfaceRegionMaterials.Count), false);
+            int materialIndex = _surfaceRegionMaterials.Count;
+            bool transparent = !showPlaneFamilyClassification && materialIndex == _planeFamilyOutlierSubmeshIndex;
+            ApplySurfaceMaterialSettings(material, GetSurfaceRegionColor(materialIndex), transparent);
             _surfaceRegionMaterials.Add(material);
         }
 
@@ -7947,7 +11857,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         {
             if (_surfaceRegionMaterials[i] == null)
                 continue;
-            ApplySurfaceMaterialSettings(_surfaceRegionMaterials[i], GetSurfaceRegionColor(i), false);
+            bool transparent = !showPlaneFamilyClassification && i == _planeFamilyOutlierSubmeshIndex;
+            ApplySurfaceMaterialSettings(_surfaceRegionMaterials[i], GetSurfaceRegionColor(i), transparent);
         }
     }
 
@@ -7963,19 +11874,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private Color GetSurfaceRegionColor(int regionIndex)
     {
-        Color[] palette =
-        {
-            new Color(1f, 0.1f, 0.1f, 1f), // +X
-            new Color(0.05f, 0.95f, 1f, 1f), // -X
-            new Color(0.1f, 1f, 0.1f, 1f), // +Y
-            new Color(0.75f, 0.1f, 1f, 1f), // -Y
-            new Color(1f, 0.95f, 0.1f, 1f), // +Z
-            new Color(0.1f, 0.2f, 1f, 1f), // -Z
-            new Color(1f, 0.55f, 0.08f, 1f), // irregular
-        };
-
-        int index = Mathf.Clamp(regionIndex, 0, palette.Length - 1);
-        return palette[index];
+        return snapshotGridUniformColor;
     }
 
     private void SetGridLinesVisible(bool visible)
@@ -7993,6 +11892,14 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     {
         if (_remeshLineRoot != null && _remeshLineRoot.activeSelf != visible) _remeshLineRoot.SetActive(visible);
         if (_remeshLineMesh != null && !visible) _remeshLineMesh.Clear();
+    }
+
+    private void SetGeometricSurfaceGridVisible(bool visible)
+    {
+        if (_geometricSurfaceGridRoot != null && _geometricSurfaceGridRoot.activeSelf != visible)
+            _geometricSurfaceGridRoot.SetActive(visible);
+        if (_geometricSurfaceGridMesh != null && !visible)
+            _geometricSurfaceGridMesh.Clear();
     }
 
     private void SetSurfaceVisible(bool visible) { if (_surfaceRoot != null && _surfaceRoot.activeSelf != visible) _surfaceRoot.SetActive(visible); }
@@ -8013,19 +11920,52 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private bool ShouldMaintainSurfaceMesh()
     {
-        return !showCandidatePlaneObjects && (showSurfaceMesh || ShouldShowGridInteriorMesh() || keepSurfaceMeshAvailableWhenHidden || showHeightSliceContour);
+        return !showCandidatePlaneObjects &&
+               (showSurfaceMesh ||
+                ShouldShowGridInteriorMesh() ||
+                keepSurfaceMeshAvailableWhenHidden ||
+                showHeightSliceContour ||
+                showPlaneFamilyClassification);
     }
 
     private void ApplyColor(int index, Color color)
     {
         if (_propertyBlock == null || index < 0 || index >= _rendererCache.Count) return;
         Renderer[] renderers = _rendererCache[index]; if (renderers == null) return;
-        _propertyBlock.Clear(); _propertyBlock.SetColor("_BaseColor", color); _propertyBlock.SetColor("_Color", color);
+        _propertyBlock.Clear(); _propertyBlock.SetColor("_BaseColor", color); _propertyBlock.SetColor("_Color", color); _propertyBlock.SetColor("_EmissionColor", Color.black);
         for (int i = 0; i < renderers.Length; i++) if (renderers[i] != null) renderers[i].SetPropertyBlock(_propertyBlock);
     }
 
+    public bool TrySetSnapshotGridPointColor(int index, Color color)
+    {
+        EnsurePropertyBlock();
+        if (index < 0 || index >= _rendererCache.Count)
+            return false;
+
+        ApplyColor(index, color);
+        return true;
+    }
+
+    public void RestoreSnapshotGridPointColors()
+    {
+        if (_snapshotGridExternalControlActive)
+            return;
+
+        EnsurePropertyBlock();
+        if (_currentValid == null)
+            return;
+
+        int count = Mathf.Min(_currentValid.Length, _rendererCache.Count);
+        for (int i = 0; i < count; i++)
+        {
+            if (!_currentValid[i])
+                continue;
+
+            ApplyColor(i, snapshotGridUniformColor);
+        }
+    }
+
     private void EnsurePropertyBlock() { if (_propertyBlock == null) _propertyBlock = new MaterialPropertyBlock(); }
-    private void EnsureGradient() { if (confidenceGradient != null && confidenceGradient.colorKeys != null && confidenceGradient.colorKeys.Length > 0) return; confidenceGradient = new Gradient { colorKeys = new[] { new GradientColorKey(Color.red, 0f), new GradientColorKey(Color.yellow, 0.5f), new GradientColorKey(Color.cyan, 1f) }, alphaKeys = new[] { new GradientAlphaKey(1f, 0f), new GradientAlphaKey(1f, 1f) } }; }
     private bool SetIssue(string issue) { LastIssue = issue; if (debugLog && !string.IsNullOrEmpty(issue)) Debug.LogWarning($"[ScanCoverDepthGridPointCloud] {issue}"); return false; }
 
     private void EnsureDisplayRoots()
@@ -8057,6 +11997,8 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private void UpdateDisplayRootsTransform(bool force = false)
     {
         if (!useWorldSpaceDisplayRoots || _displayRoot == null)
+            return;
+        if (_snapshotGridExternalControlActive)
             return;
         if (!force && !updateEveryFrame)
             return;

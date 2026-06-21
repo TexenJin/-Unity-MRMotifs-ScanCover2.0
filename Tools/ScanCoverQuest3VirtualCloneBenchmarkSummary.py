@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Summarize multiple Quest3 virtual-clone experiment reports."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+from typing import Any
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "reports",
+        type=Path,
+        nargs="*",
+        help="virtual_clone_similarity_report.json files. If omitted, scans the default output folder.",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(
+            r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports\Quest3VirtualCloneExperiments"
+        ),
+    )
+    parser.add_argument("--out", type=Path, default=None)
+    return parser.parse_args()
+
+
+def status(distance_delta: float, angle_delta: float) -> str:
+    if distance_delta <= 0.05 and angle_delta <= 0.03:
+        return "pass"
+    if distance_delta <= 0.10 and angle_delta <= 0.04:
+        return "usable-with-calibration"
+    return "needs-path-calibration"
+
+
+def read_report(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def main() -> int:
+    args = parse_args()
+    reports = args.reports
+    if not reports:
+        reports = sorted(args.root.glob("replica_auto-scan_*/virtual_clone_similarity_report.json"))
+    if not reports:
+        raise FileNotFoundError(f"No reports found under {args.root}")
+
+    rows = []
+    for path in reports:
+        report = read_report(path)
+        similarity = report["similarity"]
+        distance_delta = float(similarity["distanceMeanAbsShareDelta"])
+        angle_delta = float(similarity["angleMeanAbsShareDelta"])
+        rows.append(
+            {
+                "experiment": path.parent.name,
+                "truthMesh": report["truthMesh"],
+                "poseSource": report.get("poseSource", ""),
+                "frames": report["framesReplayed"],
+                "hitRatio": report["hitRatio"],
+                "acceptedRatio": report["acceptedRatio"],
+                "riskRatio": report["riskRatio"],
+                "distanceMeanAbsShareDelta": distance_delta,
+                "angleMeanAbsShareDelta": angle_delta,
+                "status": status(distance_delta, angle_delta),
+            }
+        )
+
+    out_dir = args.out or args.root / "BenchmarkSummary"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "virtual_clone_benchmark_summary.csv"
+    json_path = out_dir / "virtual_clone_benchmark_summary.json"
+    md_path = out_dir / "virtual_clone_benchmark_summary.md"
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    pass_count = sum(1 for row in rows if row["status"] == "pass")
+    usable_count = sum(1 for row in rows if row["status"] in ("pass", "usable-with-calibration"))
+    summary = {
+        "reportCount": len(rows),
+        "passCount": pass_count,
+        "usableWithCalibrationCount": usable_count,
+        "rows": rows,
+        "verdict": {
+            "pipelineReusable": usable_count == len(rows),
+            "fullyCalibrated": pass_count == len(rows),
+            "note": (
+                "The virtual-clone route is reusable across tested rooms, but rooms marked usable-with-calibration "
+                "still need distance/path calibration before being used as strong training evidence."
+            ),
+        },
+    }
+    json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    lines = [
+        "# Quest3 Virtual Clone Benchmark Summary",
+        "",
+        f"- Reports: {len(rows)}",
+        f"- Pass: {pass_count}",
+        f"- Usable with calibration: {usable_count}",
+        f"- Pipeline reusable: {summary['verdict']['pipelineReusable']}",
+        f"- Fully calibrated: {summary['verdict']['fullyCalibrated']}",
+        f"- Note: {summary['verdict']['note']}",
+        "",
+        "| Experiment | Hit | Accepted | Risk | Distance delta | Angle delta | Status |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['experiment']} | {row['hitRatio']:.4f} | {row['acceptedRatio']:.4f} | "
+            f"{row['riskRatio']:.4f} | {row['distanceMeanAbsShareDelta']:.4f} | "
+            f"{row['angleMeanAbsShareDelta']:.4f} | {row['status']} |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"\nWrote: {csv_path}")
+    print(f"Wrote: {json_path}")
+    print(f"Wrote: {md_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

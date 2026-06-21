@@ -7,6 +7,7 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
 {
     private static bool showDisplayAdvanced;
     private static bool showSurfaceAdvanced;
+    private static bool showPlaneFamilyAdvanced;
     private static bool showDebugAdvanced;
 
     public override void OnInspectorGUI()
@@ -54,6 +55,8 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
             EditorGUILayout.LabelField("Surface Triangles", component.SurfaceTriangleCount.ToString());
             EditorGUILayout.LabelField("Frame", component.FrameIndex.ToString());
             EditorGUILayout.LabelField("Pending Readback", component.HasPendingReadback ? "Yes" : "No");
+            if (!string.IsNullOrEmpty(component.LastPlaneFamilyDiagnosticsPath))
+                EditorGUILayout.LabelField("Plane Diagnostics", component.LastPlaneFamilyDiagnosticsPath);
             if (!string.IsNullOrEmpty(component.LastIssue))
                 EditorGUILayout.HelpBox(component.LastIssue, MessageType.Warning);
         }
@@ -76,7 +79,26 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
                     foreach (Object item in targets)
                         ((ScanCoverDepthGridPointCloud)item).ClearRuntimeState();
                 }
+
+                if (GUILayout.Button("Export Plane Family Diagnostics"))
+                {
+                    foreach (Object item in targets)
+                        ((ScanCoverDepthGridPointCloud)item).ExportPlaneFamilyDiagnosticsNow();
+                }
             }
+        }
+
+        if (GUILayout.Button("Apply Rule Hardening v01"))
+        {
+            foreach (Object item in targets)
+            {
+                ScanCoverDepthGridPointCloud component = (ScanCoverDepthGridPointCloud)item;
+                Undo.RecordObject(component, "Apply ScanCover Rule Hardening v01");
+                component.ApplyRuleHardeningProfileV01();
+                EditorUtility.SetDirty(component);
+            }
+
+            serializedObject.Update();
         }
     }
 
@@ -115,6 +137,9 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
         Draw("showGridInteriorMesh");
         Draw("gridInteriorDisplayMode");
         Draw("showSurfaceMesh");
+        Draw("showPlaneFamilyClassification");
+        Draw("planeFamilyDisplayAsPointQuads");
+        Draw("planeFamilyPointSizeMeters", "Plane Family Point Size");
         Draw("showHeightSliceContour");
         Draw("heightSliceUseFrozenScreenCenterHeight");
         Draw("heightSliceRowCount");
@@ -230,6 +255,49 @@ public sealed class ScanCoverDepthGridPointCloudEditor : Editor
                 Draw("largestCandidateGridCellSizeMeters");
                 Draw("largestCandidateGridMaxColumns");
                 Draw("largestCandidateGridMaxRows");
+            }
+        }
+
+        showPlaneFamilyAdvanced = DrawFoldout(showPlaneFamilyAdvanced, "Plane Family Classification");
+        if (showPlaneFamilyAdvanced)
+        {
+            using (new EditorGUI.IndentLevelScope())
+            {
+                Draw("planeFamilyPointSizeMeters", "Point Size");
+                Draw("planeFamilyMaxSamples", "Max Samples");
+                Draw("planeFamilyRansacIterations", "RANSAC Iterations");
+                Draw("planeFamilyMaxFamilies", "Max Families");
+                Draw("planeFamilyMinInliers", "Min Inliers");
+                Draw("planeFamilyFitDistanceMeters", "Fit Distance");
+                Draw("planeFamilyClassifyDistanceMeters", "Classify Distance");
+                Draw("planeFamilyClassifyNormalDegrees", "Classify Normal Degrees");
+                Draw("planeFamilyMergeNormalDegrees", "Merge Normal Degrees");
+                Draw("planeFamilyMergeDistanceMeters", "Merge Distance");
+                EditorGUILayout.Space(3f);
+                Draw("planeFamilyUseStructuralConsensus", "Use Structural Consensus");
+                Draw("planeFamilyStrongDistanceRatio", "Strong Distance Ratio");
+                Draw("planeFamilyProjectionPaddingMeters", "Projection Padding");
+                Draw("planeFamilyNormalScoreWeight", "Normal Score Weight");
+                Draw("planeFamilyStructuralNeighborMinSame", "Structural Neighbor Min Same");
+                Draw("planeFamilyStructuralNeighborMinRatio", "Structural Neighbor Min Ratio");
+                EditorGUILayout.Space(3f);
+                Draw("planeFamilyUseSpatialConsistency", "Use Spatial Consistency");
+                Draw("planeFamilySpatialSmoothingPasses", "Smoothing Passes");
+                Draw("planeFamilyMinIslandPoints", "Min Island Points");
+                Draw("planeFamilyNeighborVoteThreshold", "Neighbor Vote Threshold");
+                Draw("planeFamilyWeakIslandMaxPoints", "Weak Island Max Points");
+                Draw("planeFamilyWeakIslandMaxRatio", "Weak Island Max Ratio");
+                Draw("planeFamilyWeakIslandBorderRatio", "Weak Island Border Ratio");
+                Draw("planeFamilyWeakIslandRelaxNormalDegrees", "Weak Island Relax Normal");
+                Draw("planeFamilyWeakIslandRelaxDistanceMultiplier", "Weak Island Relax Distance");
+                EditorGUILayout.Space(3f);
+                Draw("planeFamilyDiagnostics", "Diagnostics");
+                Draw("planeFamilyDiagnosticsExportCsv", "Export Diagnostics CSV");
+                Draw("planeFamilyDiagnosticsLogSummary", "Log Diagnostics Summary");
+                Draw("planeFamilyDiagnosticsMinIntervalSeconds", "Diagnostics Min Interval");
+                EditorGUILayout.Space(3f);
+                Draw("planeFamilySurfaceAlpha", "Surface Alpha");
+                Draw("planeFamilyOutlierColor", "Outlier Color");
             }
         }
 
