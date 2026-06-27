@@ -3,10 +3,14 @@
 Run the corrected ScanCover mapping pipeline with explicit output semantics.
 
 Important naming contract:
+- 00_snapshot_shell/snapshot_shell_mesh.ply is the current snapshot-first room shell.
+  It does not use stable/candidate coverage labels; each 160x160 Raw Depth snapshot
+  is treated as a topology-preserving local surface patch and stitched by world pose.
 - 02_raw_mapping_input_unconstrained/mapping_input_candidate.ply is RAW-ONLY diagnostic.
   It is allowed to look fuzzy/thick/broken and must not be judged as final mapping.
-- 03_meta_constrained_trusted_raw/trusted_raw_surface.ply is the current intended
-  mapping seed: Meta structure sampled onto stable Raw-depth evidence.
+- 03_meta_constrained_trusted_raw/layered_evidence_surface.ply is the current
+  evidence view. trusted_raw_surface.ply is strict green only; evidence_supported_surface.ply
+  is the relaxed green+cyan+yellow mapping seed.
 - 04_scan_wanted_from_meta_gap/missing_scan_* are true rescan targets when a Meta
   reference exists. bad_observation_* are diagnostics, not direct rescan commands.
 """
@@ -52,6 +56,17 @@ RAW_MAPPING_ARGS = [
     "--neighbor-depth-delta", "0.20",
     "--neighbor-rescue-depth-std", "0.18",
     "--write-csv",
+]
+
+SNAPSHOT_SHELL_ARGS = [
+    "--pixel-step", "1",
+    "--min-depth", "0.20",
+    "--max-depth", "5.00",
+    "--min-confidence", "0.0",
+    "--max-edge", "0.18",
+    "--max-depth-jump", "0.18",
+    "--max-normal-angle", "70",
+    "--preview-voxel", "0.08",
 ]
 
 WANTED_ARGS = [
@@ -115,16 +130,29 @@ def write_readme(out: Path, input_root: Path, meta: Optional[Path], trusted_sess
         f"Meta reference: {meta if meta else 'NOT FOUND'}",
         f"Trusted Raw session used for Meta correction: {trusted_session if trusted_session else 'NONE'}",
         "",
+        "00_snapshot_shell/",
+        "  Main snapshot-first shell path. It reads room_raw_depth_snapshots, not room_raw_coverage stable labels.",
+        "  snapshot_shell_mesh.ply preserves per-frame 160x160 pixel topology and stitches frames by exported world-space pose.",
+        "  snapshot_shell_points.ply is the full valid Raw snapshot point set.",
+        "  snapshot_shell_merged_preview.ply is an 8cm merged point preview for quick room-shell inspection.",
+        "  This is now the first output to inspect when evaluating room shell capture.",
+        "",
         "01_coverage_preview_raw_only/",
-        "  Quick raw coverage preview. Use it only to check whether data exists and roughly where it is.",
+        "  Legacy raw coverage preview. Use it only as a diagnostic; grey/red does not mean snapshot shell evidence is unusable.",
+        "",
+        "01b_raw_shell_extractor/",
+        "  Optional Raw-only shell extraction. This does not use Meta; it separates shell candidates, objects, boundaries, sparse tails, and rejected noise.",
         "",
         "02_raw_mapping_input_unconstrained/",
-        "  Raw-only mapping diagnostics. mapping_input_candidate.ply is NOT the final mapping seed.",
+        "  Legacy Raw-only mapping diagnostics. mapping_input_candidate.ply is NOT the final snapshot shell seed.",
         "  If it looks thick, fuzzy, or broken, that is expected for unconstrained multi-frame Raw depth.",
         "",
         "03_meta_constrained_trusted_raw/",
         "  Main output to inspect first. trusted_raw_surface.ply means Meta structure landed onto stable Raw evidence.",
         "  This is the closest current artifact to: Meta gives structure, Raw gives true depth.",
+        "  layered_evidence_surface.ply separates evidence grades: green trusted, cyan probable, yellow candidate, blue weak, red rejected.",
+        "  evidence_supported_surface.ply contains green+cyan+yellow only; it is the practical relaxed evidence layer.",
+        "  probable/candidate layers can guide meshing/training, but they do not replace the strict trusted_raw_surface contract.",
         "",
         "04_scan_wanted_from_meta_gap/",
         "  missing_scan_*: Meta says geometry exists but Raw coverage is absent nearby. These are real rescan hints.",
@@ -132,7 +160,7 @@ def write_readme(out: Path, input_root: Path, meta: Optional[Path], trusted_sess
         "  bad_observation_*: Raw saw it, but it was unstable/risky. This is diagnostic, not automatically a rescan target.",
         "",
         "05_mesh_from_trusted_raw/",
-        "  Optional mesh attempt from trusted_raw_surface.ply. Do not mesh 02/mapping_input_candidate.ply as final.",
+        "  Optional mesh attempt. Default source is trusted_raw_surface.ply; --mesh-source evidence uses green+cyan+yellow evidence_supported_surface.ply.",
         "",
     ]
     (out / "README_OUTPUTS.txt").write_text("\n".join(lines), encoding="utf-8")
@@ -145,6 +173,9 @@ def main() -> int:
     ap.add_argument("--meta", type=Path, default=None, help="Meta reference sample ply. Auto-detects known reference paths when omitted.")
     ap.add_argument("--trusted-session", type=Path, default=None, help="Specific RepeatCoverage session for Meta correction. Default: latest session with room_raw_coverage_voxels.csv")
     ap.add_argument("--run-mesh", action="store_true", help="Also generate a mesh from trusted_raw_surface.ply")
+    ap.add_argument("--mesh-source", choices=("trusted", "evidence"), default="trusted", help="Mesh source: strict trusted green or relaxed green+cyan+yellow evidence.")
+    ap.add_argument("--run-raw-shell", action="store_true", help="Also run Raw-only shell extraction from room_raw_coverage_voxels.csv")
+    ap.add_argument("--skip-snapshot-shell", action="store_true", help="Skip the snapshot-first room shell output.")
     ap.add_argument("--skip-raw-preview", action="store_true")
     ap.add_argument("--skip-raw-mapping", action="store_true")
     ap.add_argument("--skip-meta-correction", action="store_true")
@@ -167,10 +198,28 @@ def main() -> int:
 
     log: List[str] = []
 
+    snapshot_shell = out / "00_snapshot_shell"
+    if not args.skip_snapshot_shell:
+        snapshot_shell.mkdir(parents=True, exist_ok=True)
+        snapshot_dirs = list(input_root.rglob("room_raw_depth_snapshots")) if input_root.is_dir() else []
+        if input_root.name == "room_raw_depth_snapshots" or (input_root / "room_raw_depth_snapshots").exists() or snapshot_dirs:
+            run([sys.executable, str(TOOLS / "ScanCoverRawDepthSnapshotsToShell.py"), str(input_root), "--out", str(snapshot_shell), *SNAPSHOT_SHELL_ARGS], log)
+        else:
+            (snapshot_shell / "README_SKIPPED.txt").write_text(
+                "Snapshot shell skipped because no room_raw_depth_snapshots folder was found.\n",
+                encoding="utf-8",
+            )
+
     if not args.skip_raw_preview:
         raw_preview = out / "01_coverage_preview_raw_only"
         raw_preview.mkdir(parents=True, exist_ok=True)
         run([sys.executable, str(TOOLS / "ScanCoverCoverageToPly.py"), str(input_root), "--out", str(raw_preview)], log)
+
+    if args.run_raw_shell:
+        shell_out = out / "01b_raw_shell_extractor"
+        shell_out.mkdir(parents=True, exist_ok=True)
+        shell_source = trusted_session if trusted_session else input_root
+        run([sys.executable, str(TOOLS / "ScanCoverRawShellExtractor.py"), str(shell_source), "--out", str(shell_out)], log)
 
     raw_mapping = out / "02_raw_mapping_input_unconstrained"
     if not args.skip_raw_mapping:
@@ -217,12 +266,12 @@ def main() -> int:
     if args.run_mesh:
         mesh_out = out / "05_mesh_from_trusted_raw"
         mesh_out.mkdir(parents=True, exist_ok=True)
-        trusted_ply = trusted_out / "trusted_raw_surface.ply"
-        if trusted_ply.exists():
-            run([sys.executable, str(TOOLS / "ScanCoverTrustedSurfaceMeshing.py"), str(trusted_ply), "--out", str(mesh_out), *MESH_ARGS], log)
+        mesh_ply = trusted_out / ("evidence_supported_surface.ply" if args.mesh_source == "evidence" else "trusted_raw_surface.ply")
+        if mesh_ply.exists():
+            run([sys.executable, str(TOOLS / "ScanCoverTrustedSurfaceMeshing.py"), str(mesh_ply), "--out", str(mesh_out), *MESH_ARGS], log)
         else:
             (mesh_out / "README_SKIPPED.txt").write_text(
-                "Mesh skipped because 03_meta_constrained_trusted_raw/trusted_raw_surface.ply does not exist.\n",
+                f"Mesh skipped because 03_meta_constrained_trusted_raw/{mesh_ply.name} does not exist.\n",
                 encoding="utf-8",
             )
 
@@ -231,7 +280,11 @@ def main() -> int:
 
     print("\nDone.")
     print(f"Output: {out}")
-    print("Inspect first: 03_meta_constrained_trusted_raw/trusted_raw_surface.ply")
+    print("Inspect first: 00_snapshot_shell/snapshot_shell_mesh.ply")
+    print("Snapshot merged preview: 00_snapshot_shell/snapshot_shell_merged_preview.ply")
+    print("Legacy evidence diagnostic: 03_meta_constrained_trusted_raw/layered_evidence_surface.ply")
+    print("Strict green only: 03_meta_constrained_trusted_raw/trusted_raw_surface.ply")
+    print("Relaxed green+cyan+yellow: 03_meta_constrained_trusted_raw/evidence_supported_surface.ply")
     print("Do not judge final mapping by: 02_raw_mapping_input_unconstrained/mapping_input_candidate.ply")
     return 0
 

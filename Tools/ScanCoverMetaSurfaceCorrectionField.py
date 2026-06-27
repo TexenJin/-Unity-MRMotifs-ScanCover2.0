@@ -20,6 +20,13 @@ Diagnostic outputs for CloudCompare:
 - meta_structure_candidate_unlanded.ply
 - meta_landing_confidence_field.ply
 - trusted_raw_surface.ply
+- probable_raw_surface.ply
+- candidate_supported_surface.ply
+- evidence_supported_surface.ply
+- evidence_observed_surface.ply
+- weak_raw_support.ply
+- rejected_raw_surface.ply
+- layered_evidence_surface.ply
 - meta_correctable_surface.ply
 - unconfirmed_candidate_surface.ply
 - trusted_region_report.json
@@ -72,6 +79,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--landing-min-support", type=int, default=4)
     parser.add_argument("--landing-max-risk-ratio", type=float, default=0.65)
     parser.add_argument("--landing-max-offset-std", type=float, default=0.10)
+    parser.add_argument("--probable-score", type=float, default=0.60)
+    parser.add_argument("--candidate-score", type=float, default=0.35)
+    parser.add_argument("--weak-score", type=float, default=0.10)
+    parser.add_argument("--probable-to-trusted-radius", type=float, default=0.15)
+    parser.add_argument("--candidate-to-strong-radius", type=float, default=0.12)
+    parser.add_argument("--weak-to-strong-radius", type=float, default=0.08)
+    parser.add_argument("--evidence-distance-radius-mult", type=float, default=2.0)
     parser.add_argument("--max-correction", type=float, default=0.12)
     parser.add_argument("--smooth-radius", type=float, default=0.12)
     parser.add_argument("--smooth-min-neighbors", type=int, default=4)
@@ -224,6 +238,221 @@ def landing_confidence_colors(
     # White means this sample is accepted into the Raw-position landing layer.
     colors[landed] = (1.0, 1.0, 1.0)
     return colors
+
+
+def clamp01(values: np.ndarray | float) -> np.ndarray:
+    return np.clip(values, 0.0, 1.0)
+
+
+def nearest_distance_to_mask(points: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    distances = np.full((len(points),), np.inf, dtype=np.float64)
+    if len(points) == 0 or np.count_nonzero(mask) == 0:
+        return distances
+
+    reference = o3d.geometry.PointCloud()
+    reference.points = o3d.utility.Vector3dVector(points[mask])
+    tree = o3d.geometry.KDTreeFlann(reference)
+    for i, point in enumerate(points):
+        _, _, d2 = tree.search_knn_vector_3d(point, 1)
+        distances[i] = math.sqrt(float(d2[0]))
+    return distances
+
+
+def evidence_colors(
+    trusted: np.ndarray,
+    probable: np.ndarray,
+    candidate: np.ndarray,
+    weak: np.ndarray,
+    rejected: np.ndarray,
+) -> np.ndarray:
+    colors = np.full((len(trusted), 3), (0.16, 0.16, 0.16), dtype=np.float64)
+    colors[weak] = (0.10, 0.35, 1.0)
+    colors[candidate] = (1.0, 0.78, 0.05)
+    colors[probable] = (0.0, 0.88, 1.0)
+    colors[trusted] = (0.05, 1.0, 0.20)
+    colors[rejected] = (1.0, 0.05, 0.05)
+    return colors
+
+
+def build_layered_evidence(
+    meta_points: np.ndarray,
+    raw_landed: np.ndarray,
+    supported: np.ndarray,
+    unsupported: np.ndarray,
+    hard_risk: np.ndarray,
+    vote_risk: np.ndarray,
+    support_count: np.ndarray,
+    stable_count: np.ndarray,
+    stable_ratio: np.ndarray,
+    risk_ratio: np.ndarray,
+    offset_mean: np.ndarray,
+    offset_std: np.ndarray,
+    nearest_distance: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    """Score Meta samples with layered Raw evidence instead of a binary gate.
+
+    Green/trusted keeps the existing strict landing rule. The other layers are
+    evidence grades: they can guide alignment, meshing, and rescan decisions,
+    but they do not overwrite the strict trusted surface.
+    """
+    min_support = max(1, int(args.min_support))
+    landing_support = max(min_support, int(args.landing_min_support))
+    support_score = clamp01(support_count / max(1.0, landing_support * 2.0))
+    stable_count_score = clamp01(stable_count / max(1.0, args.good_min_stable * 3.0))
+    stable_score = np.maximum(stable_ratio, stable_count_score)
+    risk_score = clamp01(1.0 - risk_ratio)
+    distance_radius = max(1e-4, args.support_radius * max(1.0, args.evidence_distance_radius_mult))
+    distance_score = clamp01(1.0 - nearest_distance / distance_radius)
+    offset_score = clamp01(1.0 - np.abs(offset_mean) / max(1e-4, args.risk_max_abs_offset))
+    variance_score = clamp01(1.0 - offset_std / max(1e-4, args.landing_max_offset_std))
+
+    evidence_score = (
+        0.24 * stable_score
+        + 0.20 * support_score
+        + 0.20 * distance_score
+        + 0.16 * offset_score
+        + 0.10 * variance_score
+        + 0.10 * risk_score
+    )
+    evidence_score = clamp01(evidence_score)
+    evidence_score[unsupported] *= 0.55
+    evidence_score[vote_risk] *= 0.70
+    evidence_score[hard_risk] = 0.0
+    evidence_score[raw_landed] = np.maximum(evidence_score[raw_landed], 0.90)
+
+    trusted = raw_landed.copy()
+    rejected = hard_risk | (vote_risk & (evidence_score < args.candidate_score))
+
+    dist_to_trusted = nearest_distance_to_mask(meta_points, trusted)
+    probable_seed = (
+        ~trusted
+        & ~rejected
+        & supported
+        & (evidence_score >= args.probable_score)
+    )
+    probable = probable_seed & (dist_to_trusted <= args.probable_to_trusted_radius)
+
+    strong = trusted | probable
+    dist_to_strong = nearest_distance_to_mask(meta_points, strong)
+    candidate_seed = (
+        ~trusted
+        & ~probable
+        & ~rejected
+        & (evidence_score >= args.candidate_score)
+    )
+    candidate = candidate_seed & (dist_to_strong <= args.candidate_to_strong_radius)
+
+    stronger = trusted | probable | candidate
+    dist_to_evidence = nearest_distance_to_mask(meta_points, stronger)
+    weak_seed = (
+        ~trusted
+        & ~probable
+        & ~candidate
+        & ~rejected
+        & (evidence_score > args.weak_score)
+    )
+    weak = weak_seed & (dist_to_evidence <= args.weak_to_strong_radius)
+
+    blocked = ~(trusted | probable | candidate | weak | rejected)
+    return {
+        "score": evidence_score,
+        "supportScore": support_score,
+        "stableScore": stable_score,
+        "riskScore": risk_score,
+        "distanceScore": distance_score,
+        "offsetScore": offset_score,
+        "varianceScore": variance_score,
+        "trusted": trusted,
+        "probable": probable,
+        "candidate": candidate,
+        "weak": weak,
+        "rejected": rejected,
+        "blocked": blocked,
+        "distToTrusted": dist_to_trusted,
+        "distToStrong": dist_to_strong,
+        "distToEvidence": dist_to_evidence,
+    }
+
+
+def write_layered_evidence_outputs(
+    out_dir: Path,
+    meta_points: np.ndarray,
+    meta_normals: np.ndarray,
+    raw_landed_points: np.ndarray,
+    layers: dict[str, np.ndarray],
+) -> dict[str, object]:
+    trusted = layers["trusted"]
+    probable = layers["probable"]
+    candidate = layers["candidate"]
+    weak = layers["weak"]
+    rejected = layers["rejected"]
+    blocked = layers["blocked"]
+    score = layers["score"]
+
+    display_points = meta_points.copy()
+    display_points[trusted | probable | candidate] = raw_landed_points[trusted | probable | candidate]
+    colors = evidence_colors(trusted, probable, candidate, weak, rejected)
+    supported_evidence = trusted | probable | candidate
+    observed_evidence = supported_evidence | weak
+
+    write_cloud(out_dir / "layered_evidence_surface.ply", display_points, colors, meta_normals)
+    write_cloud(out_dir / "evidence_supported_surface.ply", display_points[supported_evidence], colors[supported_evidence], meta_normals[supported_evidence])
+    write_cloud(out_dir / "evidence_observed_surface.ply", display_points[observed_evidence], colors[observed_evidence], meta_normals[observed_evidence])
+    write_cloud(out_dir / "probable_raw_surface.ply", display_points[probable], np.tile((0.0, 0.88, 1.0), (np.count_nonzero(probable), 1)), meta_normals[probable])
+    write_cloud(out_dir / "candidate_supported_surface.ply", display_points[candidate], np.tile((1.0, 0.78, 0.05), (np.count_nonzero(candidate), 1)), meta_normals[candidate])
+    write_cloud(out_dir / "weak_raw_support.ply", meta_points[weak], np.tile((0.10, 0.35, 1.0), (np.count_nonzero(weak), 1)), meta_normals[weak])
+    write_cloud(out_dir / "rejected_raw_surface.ply", meta_points[rejected], np.tile((1.0, 0.05, 0.05), (np.count_nonzero(rejected), 1)), meta_normals[rejected])
+
+    total = max(1, len(meta_points))
+    report = {
+        "meaning": {
+            "trusted": "Green. Strict Raw-landed surface; this keeps the previous trusted_raw_surface contract.",
+            "probable": "Cyan. Non-red evidence with enough score and proximity to trusted green support.",
+            "candidate": "Yellow. Weaker evidence that is close to green/cyan support; useful for voting and scan guidance.",
+            "weak": "Blue. Observed Raw support with low confidence; cannot prove structure by itself.",
+            "rejected": "Red. Hard risk, or vote-risk evidence too weak to pass.",
+            "blocked": "Not colored as evidence. Too far from stronger evidence or too low scoring.",
+        },
+        "counts": {
+            "trusted": int(np.count_nonzero(trusted)),
+            "probable": int(np.count_nonzero(probable)),
+            "candidate": int(np.count_nonzero(candidate)),
+            "weak": int(np.count_nonzero(weak)),
+            "rejected": int(np.count_nonzero(rejected)),
+            "blocked": int(np.count_nonzero(blocked)),
+            "supportedEvidence": int(np.count_nonzero(supported_evidence)),
+            "observedEvidence": int(np.count_nonzero(observed_evidence)),
+        },
+        "ratios": {
+            "trusted": float(np.count_nonzero(trusted) / total),
+            "probable": float(np.count_nonzero(probable) / total),
+            "candidate": float(np.count_nonzero(candidate) / total),
+            "weak": float(np.count_nonzero(weak) / total),
+            "rejected": float(np.count_nonzero(rejected) / total),
+            "blocked": float(np.count_nonzero(blocked) / total),
+            "supportedEvidence": float(np.count_nonzero(supported_evidence) / total),
+            "observedEvidence": float(np.count_nonzero(observed_evidence) / total),
+        },
+        "scoreDistributions": {
+            "all": distribution(score),
+            "trusted": distribution(score[trusted]),
+            "probable": distribution(score[probable]),
+            "candidate": distribution(score[candidate]),
+            "weak": distribution(score[weak]),
+            "rejected": distribution(score[rejected]),
+            "blocked": distribution(score[blocked]),
+        },
+        "voteRule": [
+            "Red rejects first.",
+            "Green trusted keeps the strict raw_landed gate and can anchor other evidence.",
+            "Cyan probable must score high and stay near green.",
+            "Yellow candidate must stay near green/cyan; yellow does not prove yellow.",
+            "Blue weak must stay near stronger evidence and cannot prove structure alone.",
+        ],
+    }
+    (out_dir / "layered_evidence_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
 
 
 def write_trusted_region_outputs(
@@ -541,6 +770,22 @@ def main() -> int:
     raw_landed_points = patch_corrected_points.copy()
     raw_landed_points[~patch_applied] = corrected_points[~patch_applied]
     unlanded = ~raw_landed
+    layered_evidence = build_layered_evidence(
+        meta_points,
+        raw_landed,
+        supported,
+        unsupported,
+        hard_risk,
+        vote_risk,
+        support_count,
+        stable_count,
+        stable_ratio,
+        risk_ratio,
+        offset_mean,
+        offset_std,
+        nearest_distance,
+        args,
+    )
 
     colors = support_colors(good, corrected, unsupported, risk)
     patch_colors = colors.copy()
@@ -563,6 +808,13 @@ def main() -> int:
     write_cloud(out_dir / "meta_structure_candidate_unlanded.ply", meta_points[unlanded], landing_colors[unlanded], meta_normals[unlanded])
     write_cloud(out_dir / "meta_unsupported.ply", meta_points[unsupported], np.tile((0.9, 0.9, 0.9), (np.count_nonzero(unsupported), 1)), meta_normals[unsupported])
     write_cloud(out_dir / "meta_risk_boundary.ply", meta_points[risk], np.tile((1.0, 0.05, 0.05), (np.count_nonzero(risk), 1)), meta_normals[risk])
+    layered_evidence_report = write_layered_evidence_outputs(
+        out_dir,
+        meta_points,
+        meta_normals,
+        raw_landed_points,
+        layered_evidence,
+    )
     trusted_region_report = write_trusted_region_outputs(
         out_dir,
         meta_points,
@@ -606,6 +858,13 @@ def main() -> int:
             "landingMaxRiskRatio": args.landing_max_risk_ratio,
             "landingMaxOffsetStd": args.landing_max_offset_std,
             "landingMinStableRatio": args.landing_min_stable_ratio,
+            "probableScore": args.probable_score,
+            "candidateScore": args.candidate_score,
+            "weakScore": args.weak_score,
+            "probableToTrustedRadius": args.probable_to_trusted_radius,
+            "candidateToStrongRadius": args.candidate_to_strong_radius,
+            "weakToStrongRadius": args.weak_to_strong_radius,
+            "evidenceDistanceRadiusMult": args.evidence_distance_radius_mult,
             "maxCorrection": args.max_correction,
             "smoothRadius": args.smooth_radius,
             "patchSize": args.patch_size,
@@ -625,6 +884,11 @@ def main() -> int:
             "patchApplied": int(np.count_nonzero(patch_applied)),
             "rawLanded": int(np.count_nonzero(raw_landed)),
             "structureCandidateUnlanded": int(np.count_nonzero(unlanded)),
+            "evidenceTrusted": int(np.count_nonzero(layered_evidence["trusted"])),
+            "evidenceProbable": int(np.count_nonzero(layered_evidence["probable"])),
+            "evidenceCandidate": int(np.count_nonzero(layered_evidence["candidate"])),
+            "evidenceWeak": int(np.count_nonzero(layered_evidence["weak"])),
+            "evidenceRejected": int(np.count_nonzero(layered_evidence["rejected"])),
         },
         "ratios": {
             "supported": float(np.count_nonzero(supported) / max(1, len(meta_points))),
@@ -637,6 +901,11 @@ def main() -> int:
             "patchApplied": float(np.count_nonzero(patch_applied) / max(1, len(meta_points))),
             "rawLanded": float(np.count_nonzero(raw_landed) / max(1, len(meta_points))),
             "structureCandidateUnlanded": float(np.count_nonzero(unlanded) / max(1, len(meta_points))),
+            "evidenceTrusted": float(np.count_nonzero(layered_evidence["trusted"]) / max(1, len(meta_points))),
+            "evidenceProbable": float(np.count_nonzero(layered_evidence["probable"]) / max(1, len(meta_points))),
+            "evidenceCandidate": float(np.count_nonzero(layered_evidence["candidate"]) / max(1, len(meta_points))),
+            "evidenceWeak": float(np.count_nonzero(layered_evidence["weak"]) / max(1, len(meta_points))),
+            "evidenceRejected": float(np.count_nonzero(layered_evidence["rejected"]) / max(1, len(meta_points))),
         },
         "landingDecision": {
             "meaning": "Meta provides the full structure. A Meta sample lands only when nearby Raw coverage is stable, low-risk, close enough, and has bounded local offset variance.",
@@ -656,11 +925,13 @@ def main() -> int:
             "structureCandidateUnlandedRatio": float(np.count_nonzero(unlanded) / max(1, len(meta_points))),
         },
         "trustedRegion": trusted_region_report,
+        "layeredEvidence": layered_evidence_report,
         "patchCorrection": patch_report,
         "supportCount": distribution(support_count),
         "stableCount": distribution(stable_count),
         "stableRatio": distribution(stable_ratio),
         "riskRatio": distribution(risk_ratio),
+        "rawEvidenceScore": distribution(layered_evidence["score"]),
         "offsetMeanMeters": distribution(offset_mean[supported]),
         "offsetStdMeters": distribution(offset_std[supported]),
         "nearestRawDistanceMeters": distribution(nearest_distance),
@@ -680,6 +951,7 @@ def main() -> int:
             "unconfirmed_candidate_surface.ply shows Meta structure that remains useful but not yet Raw-confirmed.",
             "meta_unsupported.ply is Meta-only completion: visually complete but not directly confirmed by Raw coverage.",
             "meta_risk_boundary.ply marks areas where Raw support is noisy, risky, or too far from Meta.",
+            "layered_evidence_surface.ply keeps green trusted, cyan probable, yellow candidate, blue weak, and red rejected evidence separate instead of collapsing everything into trusted/unconfirmed.",
         ],
     }
     (out_dir / "meta_surface_correction_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

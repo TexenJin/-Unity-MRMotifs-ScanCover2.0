@@ -9792,7 +9792,7 @@ MonoBehaviour:
   sessionGroupDirectoryName: RepeatCoverageSessions
   sessionNamePrefix: ScanCover_RepeatCoverage
   startSessionOnEnable: 0
-  captureFirstFrameOnStart: 1
+  captureFirstFrameOnStart: 0
   captureWhileSessionActive: 1
   maxFramesPerSession: 1800
   minCaptureIntervalSeconds: 0.2
@@ -9800,6 +9800,8 @@ MonoBehaviour:
   minRotateDegrees: 6
   requestFreshDepthGridBeforeCapture: 1
   refreshWaitTimeoutSeconds: 0.35
+  enableEditorLocalSessionExport: 1
+  editorLocalSessionExportRoot: D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports
   exportGridStateCsv: 1
   exportRawDepthProbe: 0
   exportObservationStats: 1
@@ -9869,6 +9871,12 @@ MonoBehaviour:
   roomRawCoverageMinEdgeBufferVoxels: 80
   roomRawCoverageMinHistoryRehitVoxelsPerFrame: 120
   roomRawCoverageMinRiskSamplesPerFrame: 80
+  roomRawCoverageIdealOverlapMinRatio: 0.2
+  roomRawCoverageIdealOverlapMaxRatio: 0.4
+  roomRawCoverageMinHistoryAgreementRatio: 0.7
+  roomRawCoverageViewMeterHalfAngleDegrees: 34
+  roomRawCoverageViewMeterFarDepthMeters: 1.5
+  roomRawCoverageViewMeterMinVoxels: 80
   loadPreviousRoomRawCoverageOnStart: 1
   maxPreviousRoomRawCoverageSessionsToLoad: 1
   previousRoomRawCoverageOverrideDirectory: 
@@ -9878,14 +9886,19 @@ MonoBehaviour:
   legacyRoomRawCoveragePlateauSeconds: 8
   legacyRoomRawCoveragePlateauMinCoveredVoxels: 140
   legacyRoomRawCoveragePlateauMinStableVoxels: 28
+  roomRawCoverageDisorderFuseMode: 1
   enforceObservationOrderScoreGate: 1
   autoStopLegacyRoomRawCoverageOnDisorder: 1
   legacyRoomRawCoverageDisorderMinFrames: 3
-  legacyRoomRawCoverageDisorderConsecutiveFrames: 1
+  legacyRoomRawCoverageDisorderConsecutiveFrames: 4
   legacyRoomRawCoverageDisorderMinValidSamples: 96
   legacyRoomRawCoverageDisorderRiskRatio: 0.18
   legacyRoomRawCoverageDisorderMinUsefulVoxels: 12
   legacyRoomRawCoverageDisorderLowUsefulRiskRatio: 0.16
+  legacyRoomRawCoverageHardFuseBadEdgeRatio: 0.055
+  legacyRoomRawCoverageHardFuseCenterBadEdgeRatio: 0.055
+  legacyRoomRawCoverageHardFuseBadQuadRatio: 0.04
+  legacyRoomRawCoverageHardFuseRiskRatio: 0.22
   useRawObservationOrderScore: 1
   rawObservationOrderWarnRatio: 0.68
   rawObservationOrderFuseRatio: 0.45
@@ -9905,22 +9918,40 @@ MonoBehaviour:
   roomRawDepthFrameStride: 1
   roomRawDepthFocusOnly: 0
   roomRawDepthMaxSamplesPerFrame: 0
-  showRoomRawDepthCompletionOverlay: 1
+  exportRoomRawDepthSnapshots: 1
+  showRoomRawDepthSnapshotOverlay: 1
+  captureNowUsesIndependentSnapshotLine: 1
+  independentSnapshotDirectoryName: SnapshotCaptures
+  independentSnapshotNamePrefix: ScanCover_BinocularSnapshot
+  useBinocularRoomRawDepthSnapshots: 1
+  binocularRoomRawDepthSnapshotsManualOnly: 1
+  binocularRoomRawDepthSnapshotTimeoutSeconds: 0.8
+  roomRawDepthSnapshotPointSize: 0.008
+  roomRawDepthSnapshotMaxVisualPoints: 51200
+  roomRawDepthSnapshotColor: {r: 0.12, g: 0.85, b: 1, a: 1}
+  showRoomRawDepthCompletionOverlay: 0
   roomRawDepthCompletionOnlyWhileRecording: 0
   roomRawDepthCompletionVoxelSizeMeters: 0.08
   roomRawDepthCompletionMinHits: 3
   roomRawDepthCompletionStableHits: 8
+  roomRawDepthCompletionCandidateStableHits: 14
+  roomRawDepthCompletionSameViewStableHits: 24
   roomRawDepthCompletionMinAngleSpanDegrees: 12
   roomRawDepthCompletionStableDepthStdMeters: 0.08
   roomRawDepthCompletionHardDepthStdMeters: 0.2
   roomRawDepthCompletionWarnRiskRatio: 0.25
+  roomRawDepthCompletionRecoverableRiskRatio: 0.45
   roomRawDepthCompletionBadRiskRatio: 0.65
+  roomRawDepthCompletionNeighborStableSupport: 4
+  roomRawDepthCompletionNeighborDepthDeltaMeters: 0.12
+  roomRawDepthCompletionNeighborStableDepthStdMeters: 0.12
+  roomRawDepthCompletionNeighborRiskRatio: 0.5
   roomRawDepthCompletionUseVoxelCenterPresentation: 0
-  roomRawDepthCompletionUseGpuInstancing: 0
+  roomRawDepthCompletionUseGpuInstancing: 1
   roomRawDepthCompletionPointSize: 0.025
-  roomRawDepthCompletionMaxVisualPoints: 1200
+  roomRawDepthCompletionMaxVisualPoints: 24000
   roomRawDepthCompletionRefreshSeconds: 0.25
-  useSnapshotGridCaptureMask: 1
+  useSnapshotGridCaptureMask: 0
   snapshotGridMaskRequiredForRawDepthExport: 0
   snapshotGridCaptureRadiusMeters: 0.08
   snapshotGridSeenHits: 2
@@ -9969,11 +10000,13 @@ MonoBehaviour:
   nearEdgeSupplementExtremeMinAngleDegrees: 60
   verticalCoverageBandRatio: 0.28
   directionalSideThreshold: 0.22
-  enableKeyboardInput: 1
+  enableKeyboardInput: 0
   keyboardStartStopKey: 66
   keyboardCaptureNowKey: 67
   enableOvrInput: 1
-  enableOvrCaptureNowInput: 0
+  enableOvrStartStopInput: 0
+  enableOvrCaptureNowInput: 1
+  useRightIndexTriggerForCaptureNow: 1
   ovrStartStopButton: 2
   ovrCaptureNowButton: 1
   showHud: 1
@@ -9986,6 +10019,11 @@ MonoBehaviour:
   hudIdleColor: {r: 0.78, g: 0.9, b: 1, a: 1}
   hudRecordingColor: {r: 0.45, g: 1, b: 0.62, a: 1}
   hudPendingColor: {r: 1, g: 0.86, b: 0.28, a: 1}
+  hudTextColor: {r: 1, g: 1, b: 1, a: 1}
+  hudIdleTextColor: {r: 0.68, g: 0.72, b: 0.76, a: 1}
+  hudRecordingTextColor: {r: 1, g: 1, b: 1, a: 1}
+  hudSamplingTextColor: {r: 1, g: 0.86, b: 0.35, a: 1}
+  hudPanelColor: {r: 0, g: 0, b: 0, a: 0.78}
   showRoomRawCoverageViewFrame: 0
   roomRawCoverageViewFrameLocalPosition: {x: 0, y: 0, z: 1.05}
   roomRawCoverageViewFrameWidth: 0.72

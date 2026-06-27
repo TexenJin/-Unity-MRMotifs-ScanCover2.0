@@ -38,6 +38,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField] private bool requestFreshDepthGridBeforeCapture = true;
     [SerializeField, Range(0.02f, 1f)] private float refreshWaitTimeoutSeconds = 0.35f;
 
+    [Header("Editor Local Session Export")]
+    [SerializeField] private bool enableEditorLocalSessionExport = false;
+    [SerializeField] private string editorLocalSessionExportRoot = "ScanCoverExports";
+
     [Header("Quest3 Clone Data")]
     [SerializeField] private bool exportGridStateCsv = true;
         [SerializeField] private bool exportRawDepthProbe = false;
@@ -112,6 +116,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField, Min(1)] private int roomRawCoverageMinEdgeBufferVoxels = 80;
     [SerializeField, Min(1)] private int roomRawCoverageMinHistoryRehitVoxelsPerFrame = 120;
     [SerializeField, Min(1)] private int roomRawCoverageMinRiskSamplesPerFrame = 80;
+    [SerializeField, Range(0f, 1f)] private float roomRawCoverageIdealOverlapMinRatio = 0.20f;
+    [SerializeField, Range(0f, 1f)] private float roomRawCoverageIdealOverlapMaxRatio = 0.40f;
+    [SerializeField, Range(0f, 1f)] private float roomRawCoverageMinHistoryAgreementRatio = 0.70f;
+    [SerializeField, Range(5f, 90f)] private float roomRawCoverageViewMeterHalfAngleDegrees = 34f;
+    [SerializeField, Min(0.1f)] private float roomRawCoverageViewMeterFarDepthMeters = 1.5f;
+    [SerializeField, Min(1)] private int roomRawCoverageViewMeterMinVoxels = 80;
     [SerializeField] private bool loadPreviousRoomRawCoverageOnStart = true;
     [SerializeField, Min(1)] private int maxPreviousRoomRawCoverageSessionsToLoad = 1;
     [SerializeField] private string previousRoomRawCoverageOverrideDirectory = "";
@@ -122,7 +132,23 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField, Min(0)] private int legacyRoomRawCoveragePlateauMinCoveredVoxels = 140;
     [SerializeField, Min(0)] private int legacyRoomRawCoveragePlateauMinStableVoxels = 28;
 
+    private enum RoomRawCoverageDisorderFuseMode
+    {
+        Strict,
+        RejectOnly,
+        Off
+    }
+
+    private enum BinocularRoomRawDepthSnapshotStage
+    {
+        None,
+        RightRequested,
+        LeftRequested,
+        Ready
+    }
+
     [Header("Room Raw Coverage Disorder Fuse")]
+    [SerializeField] private RoomRawCoverageDisorderFuseMode roomRawCoverageDisorderFuseMode = RoomRawCoverageDisorderFuseMode.Strict;
     [SerializeField] private bool enforceObservationOrderScoreGate = true;
     [SerializeField] private bool autoStopLegacyRoomRawCoverageOnDisorder = true;
     [SerializeField, Min(1)] private int legacyRoomRawCoverageDisorderMinFrames = 1;
@@ -131,6 +157,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageDisorderRiskRatio = 0.06f;
     [SerializeField, Min(0)] private int legacyRoomRawCoverageDisorderMinUsefulVoxels = 32;
     [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageDisorderLowUsefulRiskRatio = 0.05f;
+    [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageHardFuseBadEdgeRatio = 0.055f;
+    [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageHardFuseCenterBadEdgeRatio = 0.055f;
+    [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageHardFuseBadQuadRatio = 0.040f;
+    [SerializeField, Range(0f, 1f)] private float legacyRoomRawCoverageHardFuseRiskRatio = 0.22f;
     [SerializeField] private bool useRawObservationOrderScore = true;
     [SerializeField, Range(0f, 1f)] private float rawObservationOrderWarnRatio = 0.68f;
     [SerializeField, Range(0f, 1f)] private float rawObservationOrderFuseRatio = 0.45f;
@@ -153,17 +183,37 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField] private bool roomRawDepthFocusOnly = false;
     [SerializeField, Min(0)] private int roomRawDepthMaxSamplesPerFrame = 0;
 
+    [Header("Room Raw Depth Snapshot")]
+    [SerializeField] private bool exportRoomRawDepthSnapshots = true;
+    [SerializeField] private bool showRoomRawDepthSnapshotOverlay = true;
+    [SerializeField] private bool captureNowUsesIndependentSnapshotLine = true;
+    [SerializeField] private string independentSnapshotDirectoryName = "SnapshotCaptures";
+    [SerializeField] private string independentSnapshotNamePrefix = "ScanCover_BinocularSnapshot";
+    [SerializeField] private bool useBinocularRoomRawDepthSnapshots = true;
+    [SerializeField] private bool binocularRoomRawDepthSnapshotsManualOnly = true;
+    [SerializeField, Min(0.05f)] private float binocularRoomRawDepthSnapshotTimeoutSeconds = 0.80f;
+    [SerializeField, Min(0.002f)] private float roomRawDepthSnapshotPointSize = 0.008f;
+    [SerializeField, Min(1024)] private int roomRawDepthSnapshotMaxVisualPoints = 25600;
+    [SerializeField] private Color roomRawDepthSnapshotColor = new Color(0.12f, 0.85f, 1f, 1f);
+
     [Header("Room Raw Depth Completion Overlay")]
-    [SerializeField] private bool showRoomRawDepthCompletionOverlay = true;
+    [SerializeField] private bool showRoomRawDepthCompletionOverlay = false;
     [SerializeField] private bool roomRawDepthCompletionOnlyWhileRecording = false;
     [SerializeField, Min(0.02f)] private float roomRawDepthCompletionVoxelSizeMeters = 0.08f;
     [SerializeField, Min(1)] private int roomRawDepthCompletionMinHits = 3;
     [SerializeField, Min(1)] private int roomRawDepthCompletionStableHits = 8;
+    [SerializeField, Min(1)] private int roomRawDepthCompletionCandidateStableHits = 14;
+    [SerializeField, Min(1)] private int roomRawDepthCompletionSameViewStableHits = 24;
     [SerializeField, Range(0f, 90f)] private float roomRawDepthCompletionMinAngleSpanDegrees = 12f;
     [SerializeField, Min(0.001f)] private float roomRawDepthCompletionStableDepthStdMeters = 0.08f;
     [SerializeField, Min(0.001f)] private float roomRawDepthCompletionHardDepthStdMeters = 0.20f;
     [SerializeField, Range(0f, 1f)] private float roomRawDepthCompletionWarnRiskRatio = 0.25f;
+    [SerializeField, Range(0f, 1f)] private float roomRawDepthCompletionRecoverableRiskRatio = 0.45f;
     [SerializeField, Range(0f, 1f)] private float roomRawDepthCompletionBadRiskRatio = 0.65f;
+    [SerializeField, Min(0)] private int roomRawDepthCompletionNeighborStableSupport = 4;
+    [SerializeField, Min(0.001f)] private float roomRawDepthCompletionNeighborDepthDeltaMeters = 0.12f;
+    [SerializeField, Min(0.001f)] private float roomRawDepthCompletionNeighborStableDepthStdMeters = 0.12f;
+    [SerializeField, Range(0f, 1f)] private float roomRawDepthCompletionNeighborRiskRatio = 0.50f;
     [SerializeField] private bool roomRawDepthCompletionUseVoxelCenterPresentation = false;
     [SerializeField] private bool roomRawDepthCompletionUseGpuInstancing = false;
     [SerializeField, Min(0.005f)] private float roomRawDepthCompletionPointSize = 0.025f;
@@ -230,7 +280,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField] private Key keyboardStartStopKey = Key.F9;
     [SerializeField] private Key keyboardCaptureNowKey = Key.F10;
     [SerializeField] private bool enableOvrInput = true;
+    [SerializeField] private bool enableOvrStartStopInput = true;
     [SerializeField] private bool enableOvrCaptureNowInput = false;
+    [SerializeField] private bool useRightIndexTriggerForCaptureNow = false;
     [SerializeField] private OVRInput.RawButton ovrStartStopButton = OVRInput.RawButton.B;
     [SerializeField] private OVRInput.RawButton ovrCaptureNowButton = OVRInput.RawButton.A;
 
@@ -245,6 +297,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField] private Color hudIdleColor = new Color(0.78f, 0.9f, 1f, 1f);
     [SerializeField] private Color hudRecordingColor = new Color(0.45f, 1f, 0.62f, 1f);
     [SerializeField] private Color hudPendingColor = new Color(1f, 0.86f, 0.28f, 1f);
+    [SerializeField] private Color hudTextColor = new Color(1f, 1f, 1f, 1f);
+    [SerializeField] private Color hudIdleTextColor = new Color(0.68f, 0.72f, 0.76f, 1f);
+    [SerializeField] private Color hudRecordingTextColor = new Color(1f, 1f, 1f, 1f);
+    [SerializeField] private Color hudSamplingTextColor = new Color(1f, 0.86f, 0.35f, 1f);
+    [SerializeField] private Color hudPanelColor = new Color(0f, 0f, 0f, 0.78f);
 
     [Header("Room Raw Coverage View Frame")]
     [SerializeField] private bool showRoomRawCoverageViewFrame = false;
@@ -288,11 +345,14 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private bool _isRecording;
     private bool _pendingCapture;
     private bool _pendingRefreshRequested;
+    private bool _stopAfterPendingManualCapture;
+    private bool _independentSnapshotCaptureActive;
     private int _pendingStartDepthFrame = -1;
     private float _pendingStartTime;
     private string _pendingReason;
     private bool _restoreDepthGridPreviewDisplay;
     private bool _hasDepthGridPreviewDisplayRestoreState;
+    private bool _sessionFileExportEnabled;
     private string _sessionDirectory;
     private string _framesDirectory;
     private string _manifestPath;
@@ -316,10 +376,15 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private string _roomRawDepthDirectory;
     private string _roomRawDepthManifestPath;
     private string _roomRawDepthSummaryPath;
+    private string _roomRawDepthSnapshotDirectory;
+    private string _roomRawDepthSnapshotManifestPath;
     private int _capturedFrameCount;
     private int _roomRawDepthExportedFrames;
     private int _roomRawDepthExportedSamples;
     private int _roomRawDepthSkippedFrames;
+    private int _roomRawDepthSnapshotExportedFrames;
+    private int _roomRawDepthSnapshotTotalPixels;
+    private int _roomRawDepthSnapshotValidPixels;
     private readonly Dictionary<Vector3Int, List<int>> _snapshotGridMaskCells = new Dictionary<Vector3Int, List<int>>(4096);
     private Vector3[] _snapshotGridMaskPositions = new Vector3[0];
     private int[] _snapshotGridMaskEntryIndices = new int[0];
@@ -407,6 +472,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private int _lastRoomRawFocusNewVoxels;
     private int _lastRoomRawNewVoxels;
     private int _lastRoomRawRehitVoxels;
+    private int _lastRoomRawHistoryRehitVoxels;
+    private int _lastRoomRawHistoryAgreementVoxels;
+    private int _lastRoomRawHistoryConflictVoxels;
     private int _lastRoomRawParallaxRehitVoxels;
     private int _lastRoomRawStableNewVoxels;
     private int _lastRoomRawHighFrameVoxels;
@@ -416,6 +484,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private int _lastRoomRawNewLowVoxels;
     private int _lastRoomRawNewLowStableVoxels;
     private float _lastRoomRawRiskRatio;
+    private float _lastRoomRawOverlapRatio;
+    private float _lastRoomRawHistoryAgreementRatio;
     private bool _roomRawCoverageWindowActive;
     private int _roomRawCoverageWindowStartFrames;
     private int _roomRawCoverageWindowStartValidSamples;
@@ -472,6 +542,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private Mesh _roomRawDepthCompletionMesh;
     private Material _roomRawDepthCompletionMaterial;
     private readonly Material[] _roomRawDepthCompletionInstancedMaterials = new Material[5];
+    private Material _roomRawDepthSnapshotMaterial;
     private MaterialPropertyBlock _roomRawDepthCompletionPropertyBlock;
     private readonly List<GameObject> _roomRawDepthCompletionPointObjects = new List<GameObject>(2048);
     private readonly List<Matrix4x4>[] _roomRawDepthCompletionMatrices =
@@ -483,6 +554,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         new List<Matrix4x4>(256)
     };
     private readonly Matrix4x4[] _roomRawDepthCompletionDrawBatch = new Matrix4x4[1023];
+    private readonly List<Matrix4x4> _roomRawDepthSnapshotMatrices = new List<Matrix4x4>(25600);
     private readonly Dictionary<Vector3Int, RoomRawDepthCompletionVoxel> _roomRawDepthCompletionVoxels = new Dictionary<Vector3Int, RoomRawDepthCompletionVoxel>(32768);
     private float _nextRoomRawDepthCompletionRefreshTime;
     private int _roomRawDepthCompletionGrayCount;
@@ -491,6 +563,18 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private int _roomRawDepthCompletionYellowCount;
     private int _roomRawDepthCompletionRedCount;
     private string _roomRawDepthCompletionHint = "Waiting";
+    private BinocularRoomRawDepthSnapshotStage _binocularRoomRawDepthSnapshotStage;
+    private ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot _binocularRoomRawDepthRightSnapshot;
+    private ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot _binocularRoomRawDepthLeftSnapshot;
+    private ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot _binocularRoomRawDepthFusedSnapshot;
+    private ScanCoverDepthPreprocessor.SourceEye _binocularRoomRawDepthOriginalEye = ScanCoverDepthPreprocessor.SourceEye.Right;
+    private int _binocularRoomRawDepthStartSnapshotIndex = -1;
+    private float _binocularRoomRawDepthStartTime;
+    private string _binocularRoomRawDepthStatus = "idle";
+    private int _roomRawDepthSnapshotVisiblePoints;
+    private int _roomRawDepthSnapshotLastTotalPixels;
+    private int _roomRawDepthSnapshotLastValidPixels;
+    private string _roomRawDepthSnapshotLastFrame = "none";
     private string _lastExportedFrameName = "";
     private string _lastGateStatus = "none";
     private ComputeBuffer _rawDepthProbeBuffer;
@@ -616,6 +700,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         }
 
         public Vector3 AveragePosition => hits > 0 ? positionSum / hits : Vector3.zero;
+        public float MeanDepth => hits > 0 ? sumDepth / hits : 0f;
 
         public float DepthStd
         {
@@ -690,6 +775,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         public int newVoxels;
         public int rehitVoxels;
         public int historyRehitVoxels;
+        public int historyAgreementVoxels;
+        public int historyConflictVoxels;
         public int parallaxRehitVoxels;
         public int newStableVoxels;
         public int highFrameVoxels;
@@ -702,12 +789,38 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         public int focusRiskSamples;
         public int riskVoxels;
         public float riskRatio;
+        public float overlapRatio;
+        public float historyAgreementRatio;
         public float anchorAngle;
         public float anchorMove;
         public bool anchorFallback;
         public RawObservationOrderResult rawObservationOrder;
         public ObservationOrderScore observationOrderScore;
         public string status;
+    }
+
+    private struct RoomRawCoverageViewMeter
+    {
+        public int covered;
+        public int stable;
+        public int singleHit;
+        public int needsRevisit;
+        public int farCovered;
+        public int farStable;
+        public int completionCandidates;
+        public int completionStable;
+        public int completionRisk;
+
+        public float StableRatio => covered > 0 ? stable / (float)covered : 0f;
+        public float FarStableRatio => farCovered > 0 ? farStable / (float)farCovered : 0f;
+        public float CompletionRiskRatio
+        {
+            get
+            {
+                int total = completionStable + completionCandidates + completionRisk;
+                return total > 0 ? completionRisk / (float)total : 0f;
+            }
+        }
     }
 
     private struct RawObservationOrderResult
@@ -928,6 +1041,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         UpdateRoomRawCoveragePreviewPoints();
         UpdateRoomRawDepthCompletionOverlay();
         DrawRoomRawDepthCompletionOverlay();
+        DrawRoomRawDepthSnapshotOverlay();
         UpdateHud();
 
         if (!_isRecording || !captureWhileSessionActive || _pendingCapture || _capturedFrameCount >= maxFramesPerSession)
@@ -940,6 +1054,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private void OnDisable()
     {
         SaveActiveSessionForAppExit();
+        ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+        _independentSnapshotCaptureActive = false;
         ApplyRecordingDepthGridDisplayMode(false);
         ClearSnapshotGridCaptureMask(true);
         SetHudVisible(false);
@@ -954,6 +1070,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         DestroyRoomRawCoverageViewFrame();
         DestroyRoomRawCoveragePreview();
         DestroyRoomRawDepthCompletionOverlay();
+        DestroyRoomRawDepthSnapshotOverlay();
         if (_hudRoot == null)
             return;
         if (Application.isPlaying)
@@ -994,52 +1111,69 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
         string exportRoot = ResolveSessionExportRoot();
-        _sessionDirectory = Path.Combine(exportRoot, sessionGroupDirectoryName, $"{sessionNamePrefix}_{timestamp}");
-        _framesDirectory = Path.Combine(_sessionDirectory, "frames");
-        _observationDirectory = Path.Combine(_sessionDirectory, "observation_stats");
-        _quest3BadnessDirectory = Path.Combine(_sessionDirectory, "quest3_observation_badness");
-        _repeatCoverageDirectory = Path.Combine(_sessionDirectory, "repeat_coverage");
-        _roomRawCoverageDirectory = Path.Combine(_sessionDirectory, "room_raw_coverage");
-        _roomRawDepthDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_frames");
-        Directory.CreateDirectory(_framesDirectory);
-        Directory.CreateDirectory(_observationDirectory);
-        if (exportQuest3ObservationBadnessStats)
-            Directory.CreateDirectory(_quest3BadnessDirectory);
-        if (gateFramesByRepeatCoverage)
-            Directory.CreateDirectory(_repeatCoverageDirectory);
-        if (trackRoomRawCoverage)
-            Directory.CreateDirectory(_roomRawCoverageDirectory);
-        if (ShouldExportRoomRawDepthFrames())
-            Directory.CreateDirectory(_roomRawDepthDirectory);
-        _manifestPath = Path.Combine(_sessionDirectory, "session_manifest.csv");
-        _frameObservationStatsPath = Path.Combine(_observationDirectory, "frame_observation_stats.csv");
-        _distanceBinsPath = Path.Combine(_observationDirectory, "distance_bins.csv");
-        _angleBinsPath = Path.Combine(_observationDirectory, "angle_bins.csv");
-        _edgeRiskStatsPath = Path.Combine(_observationDirectory, "edge_risk_stats.csv");
-        _targetGatePath = Path.Combine(_observationDirectory, "target_gate.csv");
-        _repeatCoverageGatePath = Path.Combine(_repeatCoverageDirectory, "repeat_coverage_gate.csv");
-        _repeatCoverageVoxelsPath = Path.Combine(_repeatCoverageDirectory, "repeat_coverage_voxels.csv");
-        _roomRawCoverageFramesPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_frames.csv");
-        _roomRawCoverageVoxelsPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_voxels.csv");
-        _roomRawCoverageSummaryPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_summary.json");
-        _roomRawDepthManifestPath = Path.Combine(_roomRawDepthDirectory, "room_raw_depth_manifest.csv");
-        _roomRawDepthSummaryPath = Path.Combine(_roomRawDepthDirectory, "room_raw_depth_summary.json");
-        _rawDepthBadnessFramesPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_frames.csv");
-        _rawDepthHoleComponentsPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_hole_components.csv");
-        _rawDepthBadnessSummaryPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_summary.json");
-        WriteManifestHeader();
-        WriteObservationStatsHeaders();
-        WriteQuest3BadnessHeaders();
-        WriteRepeatCoverageHeaders();
-        WriteRoomRawCoverageHeaders();
-        WriteRoomRawDepthHeaders();
-        WriteSessionInfo(timestamp);
+        _sessionFileExportEnabled = ShouldEnableSessionFileExport();
+        if (_sessionFileExportEnabled)
+        {
+            _sessionDirectory = Path.Combine(exportRoot, sessionGroupDirectoryName, $"{sessionNamePrefix}_{timestamp}");
+            _framesDirectory = Path.Combine(_sessionDirectory, "frames");
+            _observationDirectory = Path.Combine(_sessionDirectory, "observation_stats");
+            _quest3BadnessDirectory = Path.Combine(_sessionDirectory, "quest3_observation_badness");
+            _repeatCoverageDirectory = Path.Combine(_sessionDirectory, "repeat_coverage");
+            _roomRawCoverageDirectory = Path.Combine(_sessionDirectory, "room_raw_coverage");
+            _roomRawDepthDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_frames");
+            _roomRawDepthSnapshotDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_snapshots");
+            Directory.CreateDirectory(_framesDirectory);
+            Directory.CreateDirectory(_observationDirectory);
+            if (exportQuest3ObservationBadnessStats)
+                Directory.CreateDirectory(_quest3BadnessDirectory);
+            if (gateFramesByRepeatCoverage)
+                Directory.CreateDirectory(_repeatCoverageDirectory);
+            if (trackRoomRawCoverage)
+                Directory.CreateDirectory(_roomRawCoverageDirectory);
+            if (ShouldExportRoomRawDepthFrames())
+                Directory.CreateDirectory(_roomRawDepthDirectory);
+            if (ShouldExportRoomRawDepthSnapshots())
+                Directory.CreateDirectory(_roomRawDepthSnapshotDirectory);
+            _manifestPath = Path.Combine(_sessionDirectory, "session_manifest.csv");
+            _frameObservationStatsPath = Path.Combine(_observationDirectory, "frame_observation_stats.csv");
+            _distanceBinsPath = Path.Combine(_observationDirectory, "distance_bins.csv");
+            _angleBinsPath = Path.Combine(_observationDirectory, "angle_bins.csv");
+            _edgeRiskStatsPath = Path.Combine(_observationDirectory, "edge_risk_stats.csv");
+            _targetGatePath = Path.Combine(_observationDirectory, "target_gate.csv");
+            _repeatCoverageGatePath = Path.Combine(_repeatCoverageDirectory, "repeat_coverage_gate.csv");
+            _repeatCoverageVoxelsPath = Path.Combine(_repeatCoverageDirectory, "repeat_coverage_voxels.csv");
+            _roomRawCoverageFramesPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_frames.csv");
+            _roomRawCoverageVoxelsPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_voxels.csv");
+            _roomRawCoverageSummaryPath = Path.Combine(_roomRawCoverageDirectory, "room_raw_coverage_summary.json");
+            _roomRawDepthManifestPath = Path.Combine(_roomRawDepthDirectory, "room_raw_depth_manifest.csv");
+            _roomRawDepthSummaryPath = Path.Combine(_roomRawDepthDirectory, "room_raw_depth_summary.json");
+            _roomRawDepthSnapshotManifestPath = Path.Combine(_roomRawDepthSnapshotDirectory, "room_raw_depth_snapshot_manifest.csv");
+            _rawDepthBadnessFramesPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_frames.csv");
+            _rawDepthHoleComponentsPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_hole_components.csv");
+            _rawDepthBadnessSummaryPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_summary.json");
+            WriteManifestHeader();
+            WriteObservationStatsHeaders();
+            WriteQuest3BadnessHeaders();
+            WriteRepeatCoverageHeaders();
+            WriteRoomRawCoverageHeaders();
+            WriteRoomRawDepthHeaders();
+            WriteRoomRawDepthSnapshotHeaders();
+            WriteSessionInfo(timestamp);
+        }
+        else
+        {
+            ClearSessionExportPaths();
+        }
 
         _capturedFrameCount = 0;
         _roomRawDepthExportedFrames = 0;
         _roomRawDepthExportedSamples = 0;
         _roomRawDepthSkippedFrames = 0;
+        _roomRawDepthSnapshotExportedFrames = 0;
+        _roomRawDepthSnapshotTotalPixels = 0;
+        _roomRawDepthSnapshotValidPixels = 0;
         ResetRoomRawDepthCompletionOverlay();
+        ClearRoomRawDepthSnapshotOverlay();
         PrepareSnapshotGridCaptureMaskForSession(!_snapshotGridMaskActive);
         _targetFarSurfaceFrames = 0;
         _targetHighAngleRiskFrames = 0;
@@ -1099,6 +1233,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _lastRoomRawFocusNewVoxels = 0;
         _lastRoomRawNewVoxels = 0;
         _lastRoomRawRehitVoxels = 0;
+        _lastRoomRawHistoryRehitVoxels = 0;
+        _lastRoomRawHistoryAgreementVoxels = 0;
+        _lastRoomRawHistoryConflictVoxels = 0;
         _lastRoomRawParallaxRehitVoxels = 0;
         _lastRoomRawStableNewVoxels = 0;
         _lastRoomRawHighFrameVoxels = 0;
@@ -1108,6 +1245,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _lastRoomRawNewLowVoxels = 0;
         _lastRoomRawNewLowStableVoxels = 0;
         _lastRoomRawRiskRatio = 0f;
+        _lastRoomRawOverlapRatio = 0f;
+        _lastRoomRawHistoryAgreementRatio = 1f;
         _lastRoomRawStatus = "none";
         _roomRawCoverageWindowActive = false;
         _roomRawCoverageWindowStartFrames = 0;
@@ -1148,6 +1287,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _hasLastCapturePose = false;
         _pendingCapture = false;
         _pendingRefreshRequested = false;
+        ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+        _independentSnapshotCaptureActive = false;
+        _binocularRoomRawDepthStatus = "idle";
         _stabilityVoxels.Clear();
         _repeatCoverageVoxels.Clear();
         _roomRawCoverageVoxels.Clear();
@@ -1156,7 +1298,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _roomRawCoverageWindowStableKeys.Clear();
         _roomRawCoveragePosePositionCells.Clear();
         _roomRawCoveragePoseOrientationCells.Clear();
-        LoadPreviousRoomRawCoverageIfNeeded(exportRoot);
+        if (_sessionFileExportEnabled)
+            LoadPreviousRoomRawCoverageIfNeeded(exportRoot);
         InitializeRoomRawCoverageAnchor();
         ResetLegacyRoomRawCoverageProgressWatch();
         if (ShouldUseRoomRawCoverageHudOnlyCapture())
@@ -1181,11 +1324,15 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _isRecording = false;
         _pendingCapture = false;
         _pendingRefreshRequested = false;
+        _stopAfterPendingManualCapture = false;
+        ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+        _independentSnapshotCaptureActive = false;
         _roomRawCoverageWindowActive = false;
         _roomRawCoverageViewFrameLocked = false;
         _roomRawCoverageAnchorSet = false;
         ApplyRecordingDepthGridDisplayMode(false);
         HideSnapshotGridCaptureMask();
+        ClearSnapshotGridCaptureMask(false);
         WriteStabilityOutputs();
         WriteRepeatCoverageOutputs();
         WriteRoomRawCoverageOutputs();
@@ -1199,9 +1346,77 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [ContextMenu("Capture Frame Now")]
     public void CaptureFrameNow()
     {
+        if (ShouldUseIndependentSnapshotLine())
+        {
+            CaptureIndependentSnapshotNow();
+            return;
+        }
+
+        bool startOneShotSession = !_isRecording;
+        if (startOneShotSession)
+            _stopAfterPendingManualCapture = true;
         if (!_isRecording)
             StartSession();
         RequestCapture("manual");
+        StopOneShotManualSessionIfReady();
+    }
+
+    private bool ShouldUseIndependentSnapshotLine()
+    {
+        return captureNowUsesIndependentSnapshotLine &&
+            exportRoomRawDepthSnapshots &&
+            useBinocularRoomRawDepthSnapshots;
+    }
+
+    private void CaptureIndependentSnapshotNow()
+    {
+        ResolveRefs();
+        if (depthGridPointCloud == null)
+        {
+            Debug.LogWarning("[ScanCoverMultiFrameSessionExporter] Cannot capture snapshot: depth grid source is missing.", this);
+            return;
+        }
+
+        if (_pendingCapture)
+            return;
+
+        BeginIndependentSnapshotExportFolder();
+        RequestCapture("manual");
+    }
+
+    private void BeginIndependentSnapshotExportFolder()
+    {
+        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+        string exportRoot = ResolveSessionExportRoot();
+        _sessionFileExportEnabled = ShouldEnableSessionFileExport();
+        _independentSnapshotCaptureActive = true;
+        _capturedFrameCount = 0;
+        _roomRawDepthSnapshotExportedFrames = 0;
+        _roomRawDepthSnapshotTotalPixels = 0;
+        _roomRawDepthSnapshotValidPixels = 0;
+        ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+        ClearRoomRawDepthSnapshotOverlay();
+
+        if (!_sessionFileExportEnabled)
+        {
+            ClearSessionExportPaths();
+            _binocularRoomRawDepthStatus = "independent snapshot: file export disabled";
+            return;
+        }
+
+        string groupName = string.IsNullOrWhiteSpace(independentSnapshotDirectoryName)
+            ? "SnapshotCaptures"
+            : independentSnapshotDirectoryName.Trim();
+        string prefix = string.IsNullOrWhiteSpace(independentSnapshotNamePrefix)
+            ? "ScanCover_BinocularSnapshot"
+            : independentSnapshotNamePrefix.Trim();
+
+        _sessionDirectory = Path.Combine(exportRoot, groupName, $"{prefix}_{timestamp}");
+        _roomRawDepthSnapshotDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_snapshots");
+        Directory.CreateDirectory(_roomRawDepthSnapshotDirectory);
+        _roomRawDepthSnapshotManifestPath = Path.Combine(_roomRawDepthSnapshotDirectory, "room_raw_depth_snapshot_manifest.csv");
+        WriteRoomRawDepthSnapshotHeaders();
+        _binocularRoomRawDepthStatus = "独立快照已准备";
     }
 
     private void ToggleRoomRawCoverageWindow()
@@ -1268,7 +1483,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         if (enableOvrInput)
         {
-            if (OVRInput.GetDown(ovrStartStopButton))
+            if (enableOvrStartStopInput && OVRInput.GetDown(ovrStartStopButton))
             {
                 if (ShouldUseRoomRawCoverageHudOnlyCapture())
                     ToggleRoomRawCoverageWindow();
@@ -1278,9 +1493,17 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                     StartSession();
             }
 
-            if (enableOvrCaptureNowInput && OVRInput.GetDown(ovrCaptureNowButton))
+            if (enableOvrCaptureNowInput && WasOvrCaptureNowPressed())
                 CaptureFrameNow();
         }
+    }
+
+    private bool WasOvrCaptureNowPressed()
+    {
+        if (useRightIndexTriggerForCaptureNow)
+            return OVRInput.GetDown(OVRInput.RawButton.RIndexTrigger);
+
+        return OVRInput.GetDown(ovrCaptureNowButton);
     }
 
     private bool ShouldCaptureKeyframe()
@@ -1328,6 +1551,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _pendingStartTime = Time.unscaledTime;
         _pendingRefreshRequested = false;
 
+        if (ShouldUseBinocularRoomRawDepthSnapshotCapture())
+        {
+            BeginBinocularRoomRawDepthSnapshotCapture();
+            return;
+        }
+
         if (_snapshotGridMaskActive)
         {
             TryExportPendingCapture(force: true);
@@ -1348,19 +1577,63 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (!_pendingCapture)
             return;
 
+        if (_binocularRoomRawDepthSnapshotStage != BinocularRoomRawDepthSnapshotStage.None)
+        {
+            UpdateBinocularRoomRawDepthSnapshotCapture();
+            StopOneShotManualSessionIfReady();
+            return;
+        }
+
         bool frameAdvanced = depthGridPointCloud != null && depthGridPointCloud.CurrentSurfaceMeshFrameIndex != _pendingStartDepthFrame;
         bool timedOut = Time.unscaledTime - _pendingStartTime >= refreshWaitTimeoutSeconds;
         if (frameAdvanced || timedOut)
+        {
             TryExportPendingCapture(force: true);
+            StopOneShotManualSessionIfReady();
+        }
+    }
+
+    private void StopOneShotManualSessionIfReady()
+    {
+        if (!_stopAfterPendingManualCapture || _pendingCapture)
+            return;
+
+        _stopAfterPendingManualCapture = false;
+        if (_isRecording)
+            StopSession();
     }
 
     private void TryExportPendingCapture(bool force)
     {
-        if (!_pendingCapture || depthGridPointCloud == null || string.IsNullOrEmpty(_framesDirectory))
+        if (!_pendingCapture || depthGridPointCloud == null)
             return;
 
         string frameName = $"frame_{_capturedFrameCount:0000}";
         Transform pose = ResolvePoseTransform();
+        if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.Ready)
+        {
+            if (_binocularRoomRawDepthFusedSnapshot != null)
+                MaybeExportRoomRawDepthSnapshot(frameName, _binocularRoomRawDepthFusedSnapshot, pose);
+
+            bool wasIndependentSnapshot = _independentSnapshotCaptureActive;
+            _lastExportedFrameName = frameName;
+            _capturedFrameCount++;
+            MarkCaptureAttemptPose(pose);
+            _pendingCapture = false;
+            _pendingRefreshRequested = false;
+            ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+            if (wasIndependentSnapshot)
+            {
+                _independentSnapshotCaptureActive = false;
+                _binocularRoomRawDepthStatus = "独立双眼快照完成";
+                return;
+            }
+
+            if (_capturedFrameCount >= maxFramesPerSession)
+                StopSession();
+            return;
+        }
+
         if (ShouldUseRoomRawCoverageHudOnlyCapture())
         {
             if (!UpdateRoomRawCoverage(frameName, pose, _capturedFrameCount))
@@ -1384,10 +1657,40 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             return;
         }
 
-        string frameDirectory = Path.Combine(_framesDirectory, frameName);
-        string rawDepthCsvPath = exportRawDepthProbe ? Path.Combine(frameDirectory, frameName + "_raw_depth_probe.csv") : "";
-        string rawDepthJsonPath = exportRawDepthProbe ? Path.Combine(frameDirectory, frameName + "_raw_depth_probe.json") : "";
-        string gridStateCsvPath = exportGridStateCsv ? Path.Combine(frameDirectory, frameName + "_grid_state.csv") : "";
+        string frameDirectory = _sessionFileExportEnabled ? Path.Combine(_framesDirectory, frameName) : "";
+        string rawDepthCsvPath = _sessionFileExportEnabled && exportRawDepthProbe ? Path.Combine(frameDirectory, frameName + "_raw_depth_probe.csv") : "";
+        string rawDepthJsonPath = _sessionFileExportEnabled && exportRawDepthProbe ? Path.Combine(frameDirectory, frameName + "_raw_depth_probe.json") : "";
+        string gridStateCsvPath = _sessionFileExportEnabled && exportGridStateCsv ? Path.Combine(frameDirectory, frameName + "_grid_state.csv") : "";
+        bool rawCoverageUpdatedBeforeMeshExport = false;
+        bool rawCoverageAcceptedBeforeMeshExport = false;
+        if (ShouldUseLegacyFullViewRoomRawCoverage())
+        {
+            rawCoverageAcceptedBeforeMeshExport = UpdateRoomRawCoverage(frameName, pose, _capturedFrameCount);
+            rawCoverageUpdatedBeforeMeshExport = !string.Equals(_lastRoomRawStatus, "raw snapshot unavailable", StringComparison.Ordinal);
+        }
+        else
+        {
+            TryExportLatestRoomRawDepthSnapshot(frameName, pose);
+        }
+
+        if (!_sessionFileExportEnabled)
+        {
+            if (rawCoverageAcceptedBeforeMeshExport)
+            {
+                _lastExportedFrameName = frameName;
+                _capturedFrameCount++;
+            }
+            MarkCaptureAttemptPose(pose);
+            _pendingCapture = false;
+            _pendingRefreshRequested = false;
+
+            if (ShouldUseLegacyFullViewRoomRawCoverage() && AreRoomRawCoverageTargetsComplete())
+                StopSession();
+            else if (_capturedFrameCount >= maxFramesPerSession)
+                StopSession();
+            return;
+        }
+
         if (!depthGridPointCloud.ExportCurrentSurfaceMeshFramePackage(
                 frameDirectory,
                 frameName,
@@ -1400,7 +1703,22 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         {
             if (force)
                 Debug.LogWarning($"[ScanCoverMultiFrameSessionExporter] Frame export failed: {depthGridPointCloud.LastIssue}", this);
+
+            if (rawCoverageAcceptedBeforeMeshExport)
+            {
+                AppendManifestRow(frameName, _pendingReason, "", "", "", "", rawDepthCsvPath, rawDepthJsonPath, gridStateCsvPath, pose);
+                _lastExportedFrameName = frameName;
+                _capturedFrameCount++;
+                MarkCaptureAttemptPose(pose);
+
+                if (AreRoomRawCoverageTargetsComplete())
+                    StopSession();
+                else if (_capturedFrameCount >= maxFramesPerSession)
+                    StopSession();
+            }
+
             _pendingCapture = false;
+            _pendingRefreshRequested = false;
             return;
         }
 
@@ -1573,7 +1891,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (exportRawDepthProbe)
             RequestRawDepthProbeExport(rawDepthCsvPath, rawDepthJsonPath, frameName);
         UpdateStabilityFromVerticesCsv(verticesCsvPath, _capturedFrameCount);
-        UpdateRoomRawCoverage(frameName, pose, _capturedFrameCount);
+        if (!rawCoverageUpdatedBeforeMeshExport)
+            UpdateRoomRawCoverage(frameName, pose, _capturedFrameCount);
 
         AppendManifestRow(frameName, _pendingReason, objPath, verticesCsvPath, trianglesCsvPath, cameraJsonPath, rawDepthCsvPath, rawDepthJsonPath, gridStateCsvPath, pose);
         _lastExportedFrameName = frameName;
@@ -1582,7 +1901,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _pendingCapture = false;
         _pendingRefreshRequested = false;
 
-        if (AreObservationTargetsComplete())
+        if (ShouldUseLegacyFullViewRoomRawCoverage() && AreRoomRawCoverageTargetsComplete())
+            StopSession();
+        else if (AreObservationTargetsComplete())
             StopSession();
         else if (_capturedFrameCount >= maxFramesPerSession)
             StopSession();
@@ -2035,7 +2356,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private bool TryAutoStopLegacyRoomRawCoverageOnDisorder()
     {
-        if (!autoStopLegacyRoomRawCoverageOnDisorder || !_isRecording || !ShouldUseRoomRawCoverageSessionMode())
+        if (roomRawCoverageDisorderFuseMode != RoomRawCoverageDisorderFuseMode.Strict ||
+            !autoStopLegacyRoomRawCoverageOnDisorder ||
+            !_isRecording ||
+            !ShouldUseRoomRawCoverageSessionMode())
             return false;
 
         int minFrames = Mathf.Max(1, legacyRoomRawCoverageDisorderMinFrames);
@@ -2053,17 +2377,33 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         float disorderRiskThreshold = Mathf.Clamp01(legacyRoomRawCoverageDisorderRiskRatio);
         bool disordered = score.hasData && score.shouldFuse;
+        bool seamConsistent = _lastRoomRawHistoryRehitVoxels >= Mathf.Max(1, roomRawCoverageMinHistoryRehitVoxelsPerFrame) &&
+            _lastRoomRawHistoryAgreementRatio >= Mathf.Clamp01(roomRawCoverageMinHistoryAgreementRatio);
+        bool lowOverlapTurn = _loadedRoomRawCoverageSessions > 0 &&
+            _lastRoomRawOverlapRatio < Mathf.Clamp01(roomRawCoverageIdealOverlapMinRatio);
+        bool hardDisorder = IsHardRoomRawCoverageDisorder(score);
 
         if (!disordered)
         {
             _legacyRoomRawCoverageDisorderFrames = 0;
-            _lastRoomRawFuseStatus = $"\u7194\u65ad\u76d1\u6d4b\uff1aOrderScore {score.score01:0.00}\uff0c\u98ce\u9669 {score.riskRatio:0.00}/{disorderRiskThreshold:0.00}\uff0c\u652f\u6491 {score.support}\uff0c\u6709\u6548\u65b0\u589e {score.useful}";
+            _lastRoomRawFuseStatus = $"熔断监测：OrderScore {score.score01:0.00}，风险 {score.riskRatio:0.00}/{disorderRiskThreshold:0.00}，新增 {score.useful}，接缝 {FormatFloat(_lastRoomRawHistoryAgreementRatio)}";
+            return false;
+        }
+
+        if (!hardDisorder && (seamConsistent || lowOverlapTurn))
+        {
+            _legacyRoomRawCoverageDisorderFrames = Mathf.Max(0, _legacyRoomRawCoverageDisorderFrames - 1);
+            string toleranceReason = seamConsistent
+                ? "接缝一致，坏帧仅拒绝不终止"
+                : "重叠偏低疑似换视角，坏帧仅拒绝不终止";
+            _lastRoomRawFuseStatus = $"软熔断容错：{toleranceReason}，OrderScore {score.score01:0.00}，overlap {FormatFloat(_lastRoomRawOverlapRatio)}，seam {FormatFloat(_lastRoomRawHistoryAgreementRatio)}";
             return false;
         }
 
         _legacyRoomRawCoverageDisorderFrames++;
-        _lastRoomRawFuseStatus = $"\u7194\u65ad\u5012\u8ba1\u65f6\uff1a{_legacyRoomRawCoverageDisorderFrames}/{requiredFrames}\uff0cOrderScore {score.score01:0.00}\uff0c{score.reason}";
-        if (_legacyRoomRawCoverageDisorderFrames < requiredFrames)
+        int requiredNow = hardDisorder ? 1 : requiredFrames;
+        _lastRoomRawFuseStatus = $"熔断倒计时：{_legacyRoomRawCoverageDisorderFrames}/{requiredNow}，{(hardDisorder ? "硬坏帧" : "连续软坏帧")}，OrderScore {score.score01:0.00}，{score.reason}";
+        if (_legacyRoomRawCoverageDisorderFrames < requiredNow)
             return false;
 
         string reason = focusLost
@@ -2074,6 +2414,23 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         Debug.LogWarning("[ScanCover] " + reason, this);
         StopSession();
         return true;
+    }
+
+    private bool IsHardRoomRawCoverageDisorder(ObservationOrderScore score)
+    {
+        if (!score.hasData)
+            return false;
+
+        float centerBadRatio = score.rawCenterOrderRatio > 0f ? Mathf.Clamp01(1f - score.rawCenterOrderRatio) : 0f;
+        if (score.rawBadEdgeRatio >= Mathf.Clamp01(legacyRoomRawCoverageHardFuseBadEdgeRatio))
+            return true;
+        if (centerBadRatio >= Mathf.Clamp01(legacyRoomRawCoverageHardFuseCenterBadEdgeRatio))
+            return true;
+        if (score.rawBadQuadRatio >= Mathf.Clamp01(legacyRoomRawCoverageHardFuseBadQuadRatio))
+            return true;
+        if (score.riskRatio >= Mathf.Clamp01(legacyRoomRawCoverageHardFuseRiskRatio))
+            return true;
+        return false;
     }
 
     private void UpdateLegacyRoomRawCoverageCompletion()
@@ -2122,6 +2479,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (_lastRoomRawRiskRatio > Mathf.Clamp01(roomRawCoverageTargetRiskRatio) &&
             _lastRoomRawValidSamples >= roomRawCoverageMinRiskSamplesPerFrame)
             return "\u6362\u89d2\u5ea6\uff1a\u8fb9\u7f18/\u659c\u89c6\u98ce\u9669\u504f\u9ad8\u3002";
+
+        if (_lastRoomRawHistoryRehitVoxels >= Mathf.Max(1, roomRawCoverageMinHistoryRehitVoxelsPerFrame) &&
+            _lastRoomRawHistoryAgreementRatio < Mathf.Clamp01(roomRawCoverageMinHistoryAgreementRatio))
+            return "接缝冲突：当前 Raw 和历史重叠区对不上，请退回或换角度。";
+
+        if (_lastRoomRawOverlapRatio > Mathf.Clamp01(roomRawCoverageIdealOverlapMaxRatio) &&
+            _lastRoomRawNewVoxels < Mathf.Max(1, roomRawCoverageMinOverlapNewVoxelsPerFrame))
+            return "重叠过高：主要在重复旧区域，向未扫区域平移。";
+
+        if (_lastRoomRawOverlapRatio < Mathf.Clamp01(roomRawCoverageIdealOverlapMinRatio) &&
+            _roomRawCoverageFrames > 1 &&
+            _loadedRoomRawCoverageSessions > 0)
+            return "重叠偏低：保留一点已扫区域作为接缝。";
 
         if (_lastRoomRawNewVoxels >= Mathf.Max(1, roomRawCoverageMinNewVoxelsPerFrame))
             return "\u7ee7\u7eed\u4fdd\u6301\uff1a\u65b0\u8986\u76d6\u4ecd\u5728\u589e\u957f\u3002";
@@ -2450,6 +2820,81 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         return Mathf.Clamp01(Mathf.Min(Mathf.Min(frames, samples), Mathf.Min(cover, stable)));
     }
 
+    private RoomRawCoverageViewMeter BuildRoomRawCoverageViewMeter()
+    {
+        RoomRawCoverageViewMeter meter = default;
+        Transform pose = ResolvePoseTransform();
+        if (pose == null)
+            return meter;
+
+        float farDepth = Mathf.Max(roomRawCoverageMinDepthMeters + 0.1f, roomRawCoverageViewMeterFarDepthMeters);
+        foreach (KeyValuePair<Vector3Int, RoomRawCoverageVoxel> pair in _roomRawCoverageVoxels)
+        {
+            RoomRawCoverageVoxel voxel = pair.Value;
+            if (voxel.pointHits <= 0)
+                continue;
+
+            Vector3 center = GetRoomRawCoverageVoxelAverage(voxel);
+            if (!IsPointInsideRoomRawCoverageViewMeter(center, pose, out float depth))
+                continue;
+
+            meter.covered++;
+            if (voxel.stable)
+                meter.stable++;
+            if (voxel.frameHits <= 1)
+                meter.singleHit++;
+            if (!voxel.stable || voxel.frameHits < Mathf.Max(1, roomRawCoverageStableHitTarget))
+                meter.needsRevisit++;
+            if (depth >= farDepth)
+            {
+                meter.farCovered++;
+                if (voxel.stable)
+                    meter.farStable++;
+            }
+        }
+
+        foreach (KeyValuePair<Vector3Int, RoomRawDepthCompletionVoxel> pair in _roomRawDepthCompletionVoxels)
+        {
+            RoomRawDepthCompletionVoxel voxel = pair.Value;
+            if (voxel == null || voxel.hits <= 0)
+                continue;
+
+            Vector3 center = GetRoomRawDepthCompletionDisplayPosition(pair.Key, voxel);
+            if (!IsPointInsideRoomRawCoverageViewMeter(center, pose, out _))
+                continue;
+
+            RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(pair.Key, voxel);
+            if (state == RoomRawDepthCompletionState.Stable)
+                meter.completionStable++;
+            else if (state == RoomRawDepthCompletionState.Risk || state == RoomRawDepthCompletionState.Conflict)
+                meter.completionRisk++;
+            else if (state == RoomRawDepthCompletionState.Scanning || state == RoomRawDepthCompletionState.Supported)
+                meter.completionCandidates++;
+        }
+
+        return meter;
+    }
+
+    private bool IsPointInsideRoomRawCoverageViewMeter(Vector3 point, Transform pose, out float depth)
+    {
+        depth = 0f;
+        if (pose == null || !IsFinite(point))
+            return false;
+
+        Vector3 toPoint = point - pose.position;
+        depth = Vector3.Dot(toPoint, pose.forward);
+        float minDepth = Mathf.Max(0.01f, roomRawCoverageMinDepthMeters);
+        float maxDepth = Mathf.Max(minDepth + 0.01f, roomRawCoverageMaxDepthMeters);
+        if (!float.IsFinite(depth) || depth < minDepth || depth > maxDepth)
+            return false;
+
+        if (toPoint.sqrMagnitude <= 1e-8f)
+            return false;
+
+        float angle = Vector3.Angle(pose.forward, toPoint);
+        return angle <= Mathf.Clamp(roomRawCoverageViewMeterHalfAngleDegrees, 5f, 90f);
+    }
+
     private void UpdateHud()
     {
         if (!showHud)
@@ -2494,7 +2939,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         panel.anchorMax = new Vector2(0.5f, 0.5f);
         panel.pivot = new Vector2(0.5f, 0.5f);
         _hudPanelImage = panelObject.GetComponent<Image>();
-        _hudPanelImage.color = new Color(0f, 0f, 0f, 0.62f);
+        _hudPanelImage.color = hudPanelColor;
         _hudPanelImage.raycastTarget = false;
 
         GameObject textObject = new GameObject("Text", typeof(RectTransform), typeof(Text));
@@ -2513,9 +2958,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _hudText.alignment = TextAnchor.UpperLeft;
         _hudText.horizontalOverflow = HorizontalWrapMode.Wrap;
         _hudText.verticalOverflow = VerticalWrapMode.Overflow;
-        _hudText.color = hudIdleColor;
+        _hudText.color = GetHudTextColor();
         _hudText.raycastTarget = false;
-        _hudText.text = "濠㈣埖鑹鹃幎姘舵煂閸ヮ剚鑲?HUD";
+        _hudText.text = "ScanCover HUD";
 
         SetHudVisible(true);
     }
@@ -3228,18 +3673,24 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (ShouldUseRoomRawCoverageHudOnlyCapture() && _isRecording && !_roomRawCoverageWindowActive)
             state = "PAUSED: outside capture view";
 
-        _hudText.color = _pendingCapture ? hudPendingColor : _isRecording ? hudRecordingColor : hudIdleColor;
+        _hudText.color = GetHudTextColor();
+        if (_hudPanelImage != null)
+            _hudPanelImage.color = hudPanelColor;
 
         float nextInterval = Mathf.Max(0f, minCaptureIntervalSeconds - (Time.unscaledTime - _lastCaptureTime));
         string directory = string.IsNullOrEmpty(_sessionDirectory) ? "no session" : _sessionDirectory;
         if (directory.Length > 52)
             directory = "..." + directory.Substring(directory.Length - 49);
 
-        StringBuilder builder = new StringBuilder(1200);
+        RoomRawCoverageViewMeter viewMeter = BuildRoomRawCoverageViewMeter();
+        StringBuilder builder = new StringBuilder(1400);
         builder.Append("ScanCover Capture  ").Append(state).AppendLine();
-        builder.Append("B: start/stop capture");
+        if (enableOvrStartStopInput)
+            builder.Append("B: start/stop capture");
+        else
+            builder.Append("B: disabled");
         if (enableOvrCaptureNowInput)
-            builder.Append("  A: capture one frame");
+            builder.Append(useRightIndexTriggerForCaptureNow ? "  Trigger: snapshot" : "  A: capture one frame");
         builder.Append("  F9/F10: editor").AppendLine();
         builder.Append("Frames: ").Append(_capturedFrameCount).Append('/').Append(maxFramesPerSession)
             .Append("  DepthFrame: ").Append(depthGridPointCloud != null ? depthGridPointCloud.CurrentSurfaceMeshFrameIndex : -1).AppendLine();
@@ -3251,7 +3702,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 : "mesh export";
         builder.Append("Mode: ").Append(captureMode)
             .Append("  RawDepth: ").Append(exportRawDepthProbe ? "on" : "off")
-            .Append("  Stats: ").Append(exportObservationStats ? "on" : "off").AppendLine();
+            .Append("  Stats: ").Append(exportObservationStats ? "on" : "off")
+            .Append("  Fuse: ").Append(roomRawCoverageDisorderFuseMode.ToString()).AppendLine();
 
         if (trackRoomRawCoverage)
         {
@@ -3274,6 +3726,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 .Append(_lastRoomRawNewVoxels).Append('/')
                 .Append(_lastRoomRawStableNewVoxels).Append('/')
                 .Append(FormatFloat(_lastRoomRawRiskRatio)).AppendLine();
+            builder.Append("Overlap seam ratio/agree/conflict: ")
+                .Append(FormatFloat(_lastRoomRawOverlapRatio)).Append('/')
+                .Append(FormatFloat(_lastRoomRawHistoryAgreementRatio)).Append('/')
+                .Append(_lastRoomRawHistoryConflictVoxels).AppendLine();
+            AppendRoomRawCoverageViewMeterHudLine(builder, viewMeter);
 
             builder.Append("ObservationOrderScore: ")
                 .Append(FormatFloat(_lastObservationOrderScore.score01))
@@ -3301,6 +3758,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         }
 
         AppendSnapshotGridMaskHudLine(builder);
+        AppendRoomRawDepthSnapshotHudLine(builder);
+        AppendBinocularRoomRawDepthSnapshotHudLine(builder);
         AppendRoomRawDepthCompletionHudLine(builder);
 
         builder.Append("Next: ").Append(FormatFloat(nextInterval)).Append("s").AppendLine();
@@ -3310,12 +3769,48 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     }
 
 
+    private void AppendRoomRawCoverageViewMeterHudLine(StringBuilder builder, RoomRawCoverageViewMeter meter)
+    {
+        int minVoxels = Mathf.Max(1, roomRawCoverageViewMeterMinVoxels);
+        int stablePercent = Mathf.RoundToInt(meter.StableRatio * 100f);
+        int farStablePercent = Mathf.RoundToInt(meter.FarStableRatio * 100f);
+        int riskPercent = Mathf.RoundToInt(meter.CompletionRiskRatio * 100f);
+        bool enoughSamples = meter.covered >= minVoxels;
+        bool farEnough = meter.farCovered <= minVoxels / 3 || meter.FarStableRatio >= 0.50f;
+        bool areaComplete = enoughSamples && meter.StableRatio >= 0.75f && farEnough;
+        bool riskDominant = meter.completionRisk >= 16 &&
+            meter.CompletionRiskRatio >= 0.35f &&
+            meter.completionRisk > meter.completionStable;
+        string hint;
+        if (!enoughSamples)
+            hint = "样本偏少，慢扫当前方向";
+        else if (areaComplete)
+            hint = "当前区域基本完成，可转向";
+        else if (meter.farCovered > minVoxels / 3 && meter.FarStableRatio < 0.45f)
+            hint = $"远处需重访，侧移后再扫一次（远处{farStablePercent}%）";
+        else if (meter.needsRevisit > Mathf.Max(meter.stable, minVoxels / 2))
+            hint = "重访不足，当前方向再停留或侧移";
+        else if (meter.completionCandidates > Mathf.Max(meter.completionStable, minVoxels / 2))
+            hint = "候选偏多，继续停留到变绿";
+        else if (riskDominant)
+            hint = $"风险偏高，换一点角度（风险{riskPercent}%）";
+        else
+            hint = "当前区域可用，继续平滑扫过";
+
+        builder.Append("区域提示: ")
+            .Append(hint)
+            .Append("  稳定").Append(stablePercent).Append('%')
+            .AppendLine();
+    }
+
     private void RefreshCompactRoomRawCoverageHudText(string state)
     {
         if (_hudText == null)
             return;
 
-        _hudText.color = _pendingCapture ? hudPendingColor : _isRecording ? hudRecordingColor : hudIdleColor;
+        _hudText.color = GetHudTextColor();
+        if (_hudPanelImage != null)
+            _hudPanelImage.color = hudPanelColor;
 
         float nextInterval = Mathf.Max(0f, minCaptureIntervalSeconds - (Time.unscaledTime - _lastCaptureTime));
         string directory = string.IsNullOrEmpty(_sessionDirectory) ? "no session" : _sessionDirectory;
@@ -3330,9 +3825,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         int localProgress = Mathf.RoundToInt(GetRoomRawCoverageLocalProgress01() * 100f);
         int aimProgress = hasAimTile ? Mathf.RoundToInt(GetRoomRawCoverageTileProgress01(aimTile) * 100f) : 0;
 
-        StringBuilder builder = new StringBuilder(1200);
+        RoomRawCoverageViewMeter viewMeter = BuildRoomRawCoverageViewMeter();
+        StringBuilder builder = new StringBuilder(1400);
         builder.Append("ScanCover Raw Coverage  ").Append(state).AppendLine();
-        builder.Append("B: start/stop capture  App exit: auto save").AppendLine();
+        builder.Append("B: start/stop capture  App exit: auto save  Fuse: ")
+            .Append(roomRawCoverageDisorderFuseMode.ToString()).AppendLine();
         builder.Append("View: ")
             .Append(_roomRawCoverageViewFrameLocked ? "locked" : "head-follow")
             .Append("  Capture: ")
@@ -3360,10 +3857,21 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .Append("  Stable ")
             .Append(GetRoomRawCoverageWindowStableVoxels()).Append('/').Append(Mathf.Max(1, roomRawCoverageLocalTargetStableVoxels))
             .AppendLine();
-        builder.Append("Missing: ").Append(_roomRawCoverageMissingHint).AppendLine();
-        builder.Append("Global covered/stable: ")
+        builder.Append("Session ")
             .Append(_roomRawCoverageCoveredVoxels).Append('/')
-            .Append(_roomRawCoverageStableVoxels);
+            .Append(_roomRawCoverageStableVoxels)
+            .Append("  Overlap ")
+            .Append(FormatFloat(_lastRoomRawOverlapRatio))
+            .Append(" agree ")
+            .Append(FormatFloat(_lastRoomRawHistoryAgreementRatio))
+            .Append(" new ")
+            .Append(_lastRoomRawNewVoxels)
+            .AppendLine();
+        AppendRoomRawCoverageViewMeterHudLine(builder, viewMeter);
+        builder.Append("Missing: ").Append(_roomRawCoverageMissingHint).AppendLine();
+        builder.Append("Memory covered/stable: ")
+            .Append(_loadedRoomRawCoverageVoxels).Append('/')
+            .Append(_loadedRoomRawCoverageStableVoxels);
         if (_loadedRoomRawCoverageSessions > 0)
             builder.Append("  Memory: ").Append(_loadedRoomRawCoverageSessions).Append(" sessions");
         builder.AppendLine();
@@ -3372,6 +3880,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             builder.Append(_lastRoomRawFuseStatus).AppendLine();
 
         AppendSnapshotGridMaskHudLine(builder);
+        AppendRoomRawDepthSnapshotHudLine(builder);
+        AppendBinocularRoomRawDepthSnapshotHudLine(builder);
         AppendRoomRawDepthCompletionHudLine(builder);
         builder.Append("Dir: ").Append(directory);
         _hudText.text = builder.ToString();
@@ -3396,18 +3906,73 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             _hudRoot.SetActive(visible);
     }
 
-    private static string ResolveSessionExportRoot()
+    private Color GetHudTextColor()
+    {
+        if (_pendingCapture)
+            return hudSamplingTextColor;
+        if (ShouldUseRoomRawCoverageHudOnlyCapture() && _isRecording && !_roomRawCoverageWindowActive)
+            return hudIdleTextColor;
+        if (_isRecording)
+            return hudRecordingTextColor;
+        return hudIdleTextColor;
+    }
+
+    private bool ShouldEnableSessionFileExport()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        return false;
+#elif UNITY_EDITOR
+        return enableEditorLocalSessionExport;
+#else
+        return false;
+#endif
+    }
+
+    private string ResolveSessionExportRoot()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
         return Path.Combine(Application.persistentDataPath, "ScanCoverExports");
 #else
         string projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? Application.dataPath;
-        return Path.Combine(projectRoot, "ScanCoverExports");
+        string root = string.IsNullOrWhiteSpace(editorLocalSessionExportRoot) ? "ScanCoverExports" : editorLocalSessionExportRoot.Trim();
+        return Path.IsPathRooted(root) ? root : Path.Combine(projectRoot, root);
 #endif
+    }
+
+    private void ClearSessionExportPaths()
+    {
+        _sessionDirectory = string.Empty;
+        _framesDirectory = string.Empty;
+        _manifestPath = string.Empty;
+        _observationDirectory = string.Empty;
+        _frameObservationStatsPath = string.Empty;
+        _distanceBinsPath = string.Empty;
+        _angleBinsPath = string.Empty;
+        _edgeRiskStatsPath = string.Empty;
+        _targetGatePath = string.Empty;
+        _quest3BadnessDirectory = string.Empty;
+        _rawDepthBadnessFramesPath = string.Empty;
+        _rawDepthHoleComponentsPath = string.Empty;
+        _rawDepthBadnessSummaryPath = string.Empty;
+        _repeatCoverageDirectory = string.Empty;
+        _repeatCoverageGatePath = string.Empty;
+        _repeatCoverageVoxelsPath = string.Empty;
+        _roomRawCoverageDirectory = string.Empty;
+        _roomRawCoverageFramesPath = string.Empty;
+        _roomRawCoverageVoxelsPath = string.Empty;
+        _roomRawCoverageSummaryPath = string.Empty;
+        _roomRawDepthDirectory = string.Empty;
+        _roomRawDepthManifestPath = string.Empty;
+        _roomRawDepthSummaryPath = string.Empty;
+        _roomRawDepthSnapshotDirectory = string.Empty;
+        _roomRawDepthSnapshotManifestPath = string.Empty;
     }
 
     private void WriteManifestHeader()
     {
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_manifestPath))
+            return;
+
         StringBuilder builder = new StringBuilder(512);
         builder.AppendLine("# ScanCover Quest3 clone capture session");
         builder.AppendLine("# data groups: pose_camera, bl_mesh_raw_depth, multi_frame_stability, observation_stats");
@@ -3417,7 +3982,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteObservationStatsHeaders()
     {
-        if (!exportObservationStats || string.IsNullOrEmpty(_observationDirectory))
+        if (!_sessionFileExportEnabled || !exportObservationStats || string.IsNullOrEmpty(_observationDirectory))
             return;
 
         File.WriteAllText(_frameObservationStatsPath,
@@ -3448,7 +4013,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteQuest3BadnessHeaders()
     {
-        if (!exportQuest3ObservationBadnessStats || string.IsNullOrEmpty(_quest3BadnessDirectory))
+        if (!_sessionFileExportEnabled || !exportQuest3ObservationBadnessStats || string.IsNullOrEmpty(_quest3BadnessDirectory))
             return;
 
         File.WriteAllText(_rawDepthBadnessFramesPath,
@@ -3467,7 +4032,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteRepeatCoverageHeaders()
     {
-        if (!gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageDirectory))
+        if (!_sessionFileExportEnabled || !gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageDirectory))
             return;
 
         File.WriteAllText(_repeatCoverageGatePath,
@@ -3482,12 +4047,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteRoomRawCoverageHeaders()
     {
-        if (!trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageDirectory))
+        if (!_sessionFileExportEnabled || !trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageDirectory))
             return;
 
         File.WriteAllText(_roomRawCoverageFramesPath,
             "# ScanCover room-scale raw-depth coverage summary. This is HUD/data only; full pixels are not visualized.\n" +
-            "frame,rawDepthFrame,accepted,totalSamples,validSamples,frameVoxels,focusVoxels,coreVoxels,edgeBufferVoxels,focusNewVoxels,edgeBufferNewVoxels,newVoxels,rehitVoxels,historyRehitVoxels,parallaxRehitVoxels,newStableVoxels,highFrameVoxels,newHighVoxels,newHighStableVoxels,lowFrameVoxels,newLowVoxels,newLowStableVoxels,coveredVoxels,stableVoxels,highVoxels,highStableVoxels,lowVoxels,lowStableVoxels,riskSamples,focusRiskSamples,riskVoxels,riskRatio,orderScore,rawOrderRatio,rawCenterOrderRatio,rawBadEdgeRatio,rawBadQuadRatio,rawTestedEdges,rawBadEdges,rawTestedQuads,rawBadQuads,orderReason,poseCells,acceptedFrames,rejectedFrames,anchorAngleDeg,anchorMoveM,anchorFallback,status\n",
+            "frame,rawDepthFrame,accepted,totalSamples,validSamples,frameVoxels,focusVoxels,coreVoxels,edgeBufferVoxels,focusNewVoxels,edgeBufferNewVoxels,newVoxels,rehitVoxels,historyRehitVoxels,parallaxRehitVoxels,newStableVoxels,highFrameVoxels,newHighVoxels,newHighStableVoxels,lowFrameVoxels,newLowVoxels,newLowStableVoxels,coveredVoxels,stableVoxels,highVoxels,highStableVoxels,lowVoxels,lowStableVoxels,riskSamples,focusRiskSamples,riskVoxels,riskRatio,orderScore,rawOrderRatio,rawCenterOrderRatio,rawBadEdgeRatio,rawBadQuadRatio,rawTestedEdges,rawBadEdges,rawTestedQuads,rawBadQuads,orderReason,poseCells,acceptedFrames,rejectedFrames,anchorAngleDeg,anchorMoveM,anchorFallback,overlapRatio,historyAgreementVoxels,historyConflictVoxels,historyAgreementRatio,sessionNewCoveredVoxels,sessionNewStableVoxels,status\n",
             Encoding.UTF8);
 
         File.WriteAllText(_roomRawCoverageVoxelsPath,
@@ -3500,9 +4065,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private bool ShouldExportRoomRawDepthFrames()
         => exportRoomRawDepthFrames;
 
+    private bool ShouldExportRoomRawDepthSnapshots()
+        => exportRoomRawDepthSnapshots;
+
     private void WriteRoomRawDepthHeaders()
     {
-        if (!ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthDirectory))
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthDirectory))
             return;
 
         File.WriteAllText(_roomRawDepthManifestPath,
@@ -3513,8 +4081,22 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         File.WriteAllText(_roomRawDepthSummaryPath, "{\n  \"status\": \"session-active\"\n}\n", Encoding.UTF8);
     }
 
+    private void WriteRoomRawDepthSnapshotHeaders()
+    {
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthSnapshots() || string.IsNullOrEmpty(_roomRawDepthSnapshotDirectory))
+            return;
+
+        File.WriteAllText(_roomRawDepthSnapshotManifestPath,
+            "# ScanCover one-shot raw-depth snapshots. Each CSV keeps every raw 160x160 pixel row; invalid pixels remain rows with valid=0.\n" +
+            "frame,rawDepthFrame,totalPixels,validPixels,visiblePoints,width,height,cameraX,cameraY,cameraZ,rotX,rotY,rotZ,path,status\n",
+            Encoding.UTF8);
+    }
+
     private void AppendManifestRow(string frameName, string reason, string objPath, string verticesCsvPath, string trianglesCsvPath, string cameraJsonPath, string rawDepthCsvPath, string rawDepthJsonPath, string gridStateCsvPath, Transform pose)
     {
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_manifestPath))
+            return;
+
         Vector3 position = pose != null ? pose.position : Vector3.zero;
         Vector3 rotation = pose != null ? pose.rotation.eulerAngles : Vector3.zero;
         StringBuilder row = new StringBuilder(512);
@@ -3538,6 +4120,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteSessionInfo(string timestamp)
     {
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_sessionDirectory))
+            return;
+
         string path = Path.Combine(_sessionDirectory, "session_info.json");
         Transform pose = ResolvePoseTransform();
         StringBuilder builder = new StringBuilder(1024);
@@ -3582,12 +4167,22 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.Append("  \"loadPreviousRoomRawCoverageOnStart\": ").Append(loadPreviousRoomRawCoverageOnStart ? "true" : "false").AppendLine(",");
         builder.Append("  \"maxPreviousRoomRawCoverageSessionsToLoad\": ").Append(Mathf.Max(1, maxPreviousRoomRawCoverageSessionsToLoad).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"previousRoomRawCoverageOverrideDirectory\": \"").Append(EscapeJson(previousRoomRawCoverageOverrideDirectory ?? "")).AppendLine("\",");
+        builder.Append("  \"roomRawCoverageDisorderFuseMode\": \"").Append(roomRawCoverageDisorderFuseMode.ToString()).AppendLine("\",");
+        builder.Append("  \"legacyRoomRawCoverageDisorderConsecutiveFrames\": ").Append(Mathf.Max(1, legacyRoomRawCoverageDisorderConsecutiveFrames).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
+        builder.Append("  \"legacyRoomRawCoverageHardFuseBadEdgeRatio\": ").Append(FormatFloat(Mathf.Clamp01(legacyRoomRawCoverageHardFuseBadEdgeRatio))).AppendLine(",");
+        builder.Append("  \"legacyRoomRawCoverageHardFuseCenterBadEdgeRatio\": ").Append(FormatFloat(Mathf.Clamp01(legacyRoomRawCoverageHardFuseCenterBadEdgeRatio))).AppendLine(",");
+        builder.Append("  \"legacyRoomRawCoverageHardFuseBadQuadRatio\": ").Append(FormatFloat(Mathf.Clamp01(legacyRoomRawCoverageHardFuseBadQuadRatio))).AppendLine(",");
+        builder.Append("  \"legacyRoomRawCoverageHardFuseRiskRatio\": ").Append(FormatFloat(Mathf.Clamp01(legacyRoomRawCoverageHardFuseRiskRatio))).AppendLine(",");
         builder.Append("  \"hideDepthGridPreviewWhileRecording\": ").Append(hideDepthGridPreviewWhileRecording ? "true" : "false").AppendLine(",");
         builder.Append("  \"exportRoomRawDepthFrames\": ").Append(exportRoomRawDepthFrames ? "true" : "false").AppendLine(",");
         builder.Append("  \"exportRoomRawDepthOnlyAcceptedFrames\": ").Append(exportRoomRawDepthOnlyAcceptedFrames ? "true" : "false").AppendLine(",");
         builder.Append("  \"roomRawDepthFrameStride\": ").Append(Mathf.Max(1, roomRawDepthFrameStride).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"roomRawDepthFocusOnly\": ").Append(roomRawDepthFocusOnly ? "true" : "false").AppendLine(",");
         builder.Append("  \"roomRawDepthMaxSamplesPerFrame\": ").Append(Mathf.Max(0, roomRawDepthMaxSamplesPerFrame).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
+        builder.Append("  \"exportRoomRawDepthSnapshots\": ").Append(exportRoomRawDepthSnapshots ? "true" : "false").AppendLine(",");
+        builder.Append("  \"showRoomRawDepthSnapshotOverlay\": ").Append(showRoomRawDepthSnapshotOverlay ? "true" : "false").AppendLine(",");
+        builder.Append("  \"roomRawDepthSnapshotPointSize\": ").Append(FormatFloat(roomRawDepthSnapshotPointSize)).AppendLine(",");
+        builder.Append("  \"roomRawDepthSnapshotMaxVisualPoints\": ").Append(Mathf.Max(1024, roomRawDepthSnapshotMaxVisualPoints).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"roomRawCoverageVoxelSizeMeters\": ").Append(FormatFloat(roomRawCoverageVoxelSizeMeters)).AppendLine(",");
         builder.Append("  \"roomRawCoverageTargetVoxels\": ").Append(Mathf.Max(1, roomRawCoverageTargetVoxels).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"roomRawCoverageTargetStableVoxels\": ").Append(Mathf.Max(1, roomRawCoverageTargetStableVoxels).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
@@ -3630,6 +4225,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.Append("  \"roomRawCoverageMinOverlapRehitVoxelsPerFrame\": ").Append(Mathf.Max(1, roomRawCoverageMinOverlapRehitVoxelsPerFrame).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"roomRawCoverageMinHistoryRehitVoxelsPerFrame\": ").Append(Mathf.Max(1, roomRawCoverageMinHistoryRehitVoxelsPerFrame).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
         builder.Append("  \"roomRawCoverageMinRiskSamplesPerFrame\": ").Append(Mathf.Max(1, roomRawCoverageMinRiskSamplesPerFrame).ToString(CultureInfo.InvariantCulture)).AppendLine(",");
+        builder.Append("  \"roomRawCoverageIdealOverlapMinRatio\": ").Append(FormatFloat(Mathf.Clamp01(roomRawCoverageIdealOverlapMinRatio))).AppendLine(",");
+        builder.Append("  \"roomRawCoverageIdealOverlapMaxRatio\": ").Append(FormatFloat(Mathf.Clamp01(roomRawCoverageIdealOverlapMaxRatio))).AppendLine(",");
+        builder.Append("  \"roomRawCoverageMinHistoryAgreementRatio\": ").Append(FormatFloat(Mathf.Clamp01(roomRawCoverageMinHistoryAgreementRatio))).AppendLine(",");
         builder.Append("  \"exportObservationStats\": ").Append(exportObservationStats ? "true" : "false").AppendLine(",");
         builder.Append("  \"meshCreaseRiskAngleDegrees\": ").Append(FormatFloat(meshCreaseRiskAngleDegrees)).AppendLine(",");
         builder.Append("  \"gateFramesByObservationTargets\": ").Append(gateFramesByObservationTargets ? "true" : "false").AppendLine(",");
@@ -3670,7 +4268,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void ExportGridStateCsv(string path)
     {
-        if (string.IsNullOrEmpty(path) || depthGridPointCloud == null)
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(path) || depthGridPointCloud == null)
             return;
         if (!depthGridPointCloud.TryGetCurrentGridState(out ScanCoverDepthGridPointCloud.GridStateSnapshot snapshot) || snapshot == null)
             return;
@@ -3701,6 +4299,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private ObservationExportResult ExportObservationStats(string frameDirectory, string frameName, string verticesCsvPath, string trianglesCsvPath, Transform pose, bool writeOutputs)
     {
+        if (!_sessionFileExportEnabled)
+            return default;
+
         if (string.IsNullOrEmpty(frameDirectory) || string.IsNullOrEmpty(verticesCsvPath) || !File.Exists(verticesCsvPath))
             return default;
 
@@ -4038,6 +4639,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteObservationPointsCsv(string path, string frameName, List<VertexObservation> observations)
     {
+        if (!_sessionFileExportEnabled)
+            return;
+
         StringBuilder builder = new StringBuilder(Mathf.Max(1024, observations.Count * 180));
         builder.AppendLine("# ScanCover per-vertex observation labels");
         builder.Append("frame=").Append(frameName).AppendLine();
@@ -4068,7 +4672,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendObservationSummary(string frameName, List<VertexObservation> observations, int triangleCount, string pointsPath)
     {
-        if (observations.Count <= 0)
+        if (!_sessionFileExportEnabled || observations.Count <= 0)
             return;
 
         int boundaryRiskCount = 0;
@@ -4165,7 +4769,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendTargetGateRow(string frameName, bool accepted, ObservationExportResult result, bool countedFarSurface, bool countedHighAngleRisk, bool countedNearEdgeRisk, string reason)
     {
-        if (string.IsNullOrEmpty(_targetGatePath))
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_targetGatePath))
             return;
 
         StringBuilder row = new StringBuilder(256);
@@ -4317,6 +4921,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void RequestRawDepthProbeExport(string csvPath, string jsonPath, string frameName)
     {
+        if (!_sessionFileExportEnabled)
+            return;
+
         Texture rawDepth = Shader.GetGlobalTexture(EnvironmentDepthTextureId);
         if (rawDepth == null || string.IsNullOrEmpty(csvPath))
             return;
@@ -4352,6 +4959,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteRawDepthProbeFiles(string csvPath, string jsonPath, string frameName, Unity.Collections.NativeArray<float> rawValues, int textureSize, int rawWidth, int rawHeight, Vector4 zParams)
     {
+        if (!_sessionFileExportEnabled)
+            return;
+
         StringBuilder csv = new StringBuilder(textureSize * textureSize * 80);
         csv.AppendLine("# ScanCover raw environment depth probe");
         csv.Append("frame=").Append(frameName).AppendLine();
@@ -4439,7 +5049,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         double[] sumLinear,
         int[] positive)
     {
-        if (string.IsNullOrEmpty(_rawDepthBadnessFramesPath) || validMasks == null || linearMeters == null)
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_rawDepthBadnessFramesPath) || validMasks == null || linearMeters == null)
             return;
 
         _rawDepthBadnessFrameCount++;
@@ -4695,7 +5305,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteQuest3BadnessSummary()
     {
-        if (!exportQuest3ObservationBadnessStats || string.IsNullOrEmpty(_rawDepthBadnessSummaryPath))
+        if (!_sessionFileExportEnabled || !exportQuest3ObservationBadnessStats || string.IsNullOrEmpty(_rawDepthBadnessSummaryPath))
             return;
 
         int totalSamples = Mathf.Max(1, _rawDepthBadnessValidSamples + _rawDepthBadnessInvalidSamples);
@@ -4877,7 +5487,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendRepeatCoverageGateRow(string frameName, bool accepted, RepeatCoverageGateResult result)
     {
-        if (!gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageGatePath))
+        if (!_sessionFileExportEnabled || !gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageGatePath))
             return;
 
         StringBuilder row = new StringBuilder(256);
@@ -4898,7 +5508,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteRepeatCoverageOutputs()
     {
-        if (!gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageVoxelsPath))
+        if (!_sessionFileExportEnabled || !gateFramesByRepeatCoverage || string.IsNullOrEmpty(_repeatCoverageVoxelsPath))
             return;
 
         float voxelSize = Mathf.Max(0.005f, repeatCoverageVoxelSizeMeters);
@@ -4956,6 +5566,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _lastRoomRawFocusNewVoxels = result.focusNewVoxels;
         _lastRoomRawNewVoxels = result.newVoxels;
         _lastRoomRawRehitVoxels = result.rehitVoxels;
+        _lastRoomRawHistoryRehitVoxels = result.historyRehitVoxels;
+        _lastRoomRawHistoryAgreementVoxels = result.historyAgreementVoxels;
+        _lastRoomRawHistoryConflictVoxels = result.historyConflictVoxels;
         _lastRoomRawParallaxRehitVoxels = result.parallaxRehitVoxels;
         _lastRoomRawStableNewVoxels = result.newStableVoxels;
         _lastRoomRawHighFrameVoxels = result.highFrameVoxels;
@@ -4965,10 +5578,13 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _lastRoomRawNewLowVoxels = result.newLowVoxels;
         _lastRoomRawNewLowStableVoxels = result.newLowStableVoxels;
         _lastRoomRawRiskRatio = result.riskRatio;
+        _lastRoomRawOverlapRatio = result.overlapRatio;
+        _lastRoomRawHistoryAgreementRatio = result.historyAgreementRatio;
         _lastRoomRawAnchorAngle = result.anchorAngle;
         _lastRoomRawAnchorMove = result.anchorMove;
         _lastObservationOrderScore = result.observationOrderScore;
         _lastRoomRawStatus = result.status;
+        MaybeExportRoomRawDepthSnapshot(frameName, snapshot, pose);
         MaybeExportRoomRawDepthFrame(frameName, snapshot, pose, frameIndex, result);
         AppendRoomRawCoverageFrameRow(frameName, snapshot.frameIndex, result);
         return result.hasData && result.accepted;
@@ -5080,12 +5696,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 result.lowFrameVoxels++;
 
             bool hasPriorVoxel = _roomRawCoverageVoxels.TryGetValue(pair.Key, out RoomRawCoverageVoxel voxel) && voxel.frameHits > 0;
-            bool hasHistoryPriorVoxel = false;
-            if (!hasPriorVoxel && _roomRawCoverageHistoryVoxels.TryGetValue(pair.Key, out RoomRawCoverageVoxel historyVoxel) && historyVoxel.frameHits > 0)
+            bool hasHistoryVoxel = _roomRawCoverageHistoryVoxels.TryGetValue(pair.Key, out RoomRawCoverageVoxel historyVoxel) && historyVoxel.frameHits > 0;
+            if (hasHistoryVoxel)
             {
-                voxel = historyVoxel;
-                hasPriorVoxel = true;
-                hasHistoryPriorVoxel = true;
+                result.historyRehitVoxels++;
+                Vector3 candidateCenter = candidate.positionSum / Mathf.Max(1, candidate.pointHits);
+                Vector3 historyCenter = GetRoomRawCoverageVoxelAverage(historyVoxel);
+                float seamTolerance = Mathf.Max(
+                    Mathf.Max(0.005f, roomRawCoverageVoxelSizeMeters) * 1.5f,
+                    Mathf.Max(0.001f, roomRawCoverageNeighborDepthJumpMeters) * 2f);
+                if (Vector3.Distance(candidateCenter, historyCenter) <= seamTolerance)
+                    result.historyAgreementVoxels++;
+                else
+                    result.historyConflictVoxels++;
             }
 
             if (!hasPriorVoxel)
@@ -5103,8 +5726,6 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             }
 
             result.rehitVoxels++;
-            if (hasHistoryPriorVoxel || voxel.stable)
-                result.historyRehitVoxels++;
             bool hasParallax = parallaxMin <= 0f ||
                 Vector3.Distance(voxel.firstCameraPosition, cameraPosition) >= parallaxMin ||
                 Vector3.Distance(voxel.lastCameraPosition, cameraPosition) >= parallaxMin;
@@ -5126,6 +5747,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         result.riskVoxels = _roomRawCoverageRiskVoxels;
         result.riskRatio = result.validSamples > 0 ? result.riskSamples / (float)result.validSamples : 0f;
+        result.overlapRatio = result.frameVoxels > 0 ? result.historyRehitVoxels / (float)result.frameVoxels : 0f;
+        result.historyAgreementRatio = result.historyRehitVoxels > 0 ? result.historyAgreementVoxels / (float)result.historyRehitVoxels : 1f;
         int usefulVoxels = result.newVoxels + result.newStableVoxels + result.rehitVoxels + result.parallaxRehitVoxels;
         bool focusLost = _roomRawCoverageWindowActive && _roomRawCoverageFrames >= 2 && result.focusVoxels <= 0;
         result.observationOrderScore = BuildObservationOrderScore(
@@ -5147,16 +5770,18 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         result.status = result.validSamples <= 0
             ? "no valid raw depth"
             : result.accepted
-                ? $"accepted{anchorMode} order={result.observationOrderScore.score01:0.00} {result.validSamples}/{result.totalSamples} valid core={result.coreVoxels} edge={result.edgeBufferVoxels} history={result.historyRehitVoxels}"
+                ? $"accepted{anchorMode} order={result.observationOrderScore.score01:0.00} {result.validSamples}/{result.totalSamples} valid new={result.newVoxels} overlap={result.overlapRatio:0.00} seam={result.historyAgreementRatio:0.00}"
                 : result.observationOrderScore.disordered
                     ? $"rejected observation-order {result.observationOrderScore.reason}"
-                    : $"rejected duplicate/low contribution core={result.coreVoxels} focus={result.focusVoxels} edge={result.edgeBufferVoxels} new={result.focusNewVoxels} stable={result.newStableVoxels} history={result.historyRehitVoxels}";
+                    : $"rejected duplicate/low contribution core={result.coreVoxels} focus={result.focusVoxels} edge={result.edgeBufferVoxels} new={result.focusNewVoxels} stable={result.newStableVoxels} overlap={result.overlapRatio:0.00}";
         return result;
     }
 
     private bool ShouldAcceptRoomRawCoverageFrame(RoomRawCoverageFrameResult result)
     {
-        if (enforceObservationOrderScoreGate && result.observationOrderScore.hasData && result.observationOrderScore.disordered)
+        bool useObservationGate = roomRawCoverageDisorderFuseMode != RoomRawCoverageDisorderFuseMode.Off &&
+            enforceObservationOrderScoreGate;
+        if (useObservationGate && result.observationOrderScore.hasData && result.observationOrderScore.disordered)
             return false;
         if (!gateRoomRawCoverageFrames)
             return result.validSamples > 0;
@@ -5167,10 +5792,13 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         int minCoreVoxels = Mathf.Max(1, roomRawCoverageMinCoreVoxels);
         int minEdgeBufferVoxels = Mathf.Max(1, roomRawCoverageMinEdgeBufferVoxels);
         int minHistoryRehitVoxels = Mathf.Max(1, roomRawCoverageMinHistoryRehitVoxelsPerFrame);
+        float minHistoryAgreement = Mathf.Clamp01(roomRawCoverageMinHistoryAgreementRatio);
         bool hasNormalFocus = result.focusVoxels >= minFocusVoxels;
+        bool hasUsefulSeam = result.historyRehitVoxels >= minHistoryRehitVoxels &&
+            result.historyAgreementRatio >= minHistoryAgreement;
         bool hasLargeSurfaceFallback = roomRawCoverageUseFallbackTolerance &&
             result.coreVoxels >= minCoreVoxels &&
-            (result.edgeBufferVoxels >= minEdgeBufferVoxels || result.historyRehitVoxels >= Mathf.Max(1, minHistoryRehitVoxels / 2));
+            (result.edgeBufferVoxels >= minEdgeBufferVoxels || hasUsefulSeam);
         if (!hasNormalFocus && !hasLargeSurfaceFallback)
             return false;
         if (_roomRawCoverageFrames <= 0)
@@ -5183,11 +5811,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             (result.focusNewVoxels >= Mathf.Max(1, roomRawCoverageMinOverlapNewVoxelsPerFrame) ||
                 result.newStableVoxels >= Mathf.Max(1, roomRawCoverageMinNewStableVoxelsPerFrame / 2) ||
                 result.newHighVoxels + result.newLowVoxels >= Mathf.Max(1, roomRawCoverageMinNewHighLowVoxelsPerFrame / 2) ||
-                result.focusRiskSamples >= Mathf.Max(1, roomRawCoverageMinRiskSamplesPerFrame / 2) ||
-                result.historyRehitVoxels >= minHistoryRehitVoxels);
+                result.focusRiskSamples >= Mathf.Max(1, roomRawCoverageMinRiskSamplesPerFrame / 2));
         bool improvesStable = result.newStableVoxels >= Mathf.Max(1, roomRawCoverageMinNewStableVoxelsPerFrame) ||
-            result.parallaxRehitVoxels >= Mathf.Max(1, roomRawCoverageMinParallaxRehitVoxelsPerFrame) ||
-            (hasLargeSurfaceFallback && result.historyRehitVoxels >= minHistoryRehitVoxels);
+            result.parallaxRehitVoxels >= Mathf.Max(1, roomRawCoverageMinParallaxRehitVoxelsPerFrame);
         bool improvesHighLow = result.newHighVoxels + result.newLowVoxels >= Mathf.Max(1, roomRawCoverageMinNewHighLowVoxelsPerFrame) ||
             result.newHighStableVoxels + result.newLowStableVoxels >= Mathf.Max(1, roomRawCoverageMinNewStableVoxelsPerFrame);
         bool improvesRisk = result.coreVoxels >= minCoreVoxels &&
@@ -5244,11 +5870,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             Vector3Int key = WorldToVoxelKey(point, voxelSize);
             bool firstVoxelHitThisFrame = frameVoxels.Add(key);
             bool hasLocalVoxel = _roomRawCoverageVoxels.TryGetValue(key, out RoomRawCoverageVoxel voxel) && voxel.frameHits > 0;
-            if (!hasLocalVoxel && _roomRawCoverageHistoryVoxels.TryGetValue(key, out RoomRawCoverageVoxel historyVoxel) && historyVoxel.frameHits > 0)
-                voxel = historyVoxel;
 
-            if (voxel.frameHits <= 0)
+            if (!hasLocalVoxel || voxel.frameHits <= 0)
             {
+                voxel = default;
                 voxel.firstFrame = frameIndex;
                 voxel.firstCameraPosition = cameraPosition;
             }
@@ -5351,6 +5976,25 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         }
     }
 
+    private static Vector3 GetRoomRawCoverageVoxelAverage(RoomRawCoverageVoxel voxel)
+    {
+        return voxel.pointHits > 0 ? voxel.positionSum / voxel.pointHits : Vector3.zero;
+    }
+
+    private static int CountStableRoomRawCoverageVoxels(Dictionary<Vector3Int, RoomRawCoverageVoxel> voxels)
+    {
+        if (voxels == null || voxels.Count <= 0)
+            return 0;
+
+        int stable = 0;
+        foreach (RoomRawCoverageVoxel voxel in voxels.Values)
+        {
+            if (voxel.stable)
+                stable++;
+        }
+        return stable;
+    }
+
     private void LoadPreviousRoomRawCoverageIfNeeded(string exportRoot)
     {
         if (!trackRoomRawCoverage || !loadPreviousRoomRawCoverageOnStart)
@@ -5391,8 +6035,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (_loadedRoomRawCoverageSessions > 0)
         {
             RecalculateRoomRawCoverageCounters();
-            _loadedRoomRawCoverageVoxels = _roomRawCoverageVoxels.Count;
-            _loadedRoomRawCoverageStableVoxels = _roomRawCoverageStableVoxels;
+            _loadedRoomRawCoverageVoxels = _roomRawCoverageHistoryVoxels.Count;
+            _loadedRoomRawCoverageStableVoxels = CountStableRoomRawCoverageVoxels(_roomRawCoverageHistoryVoxels);
             Debug.Log($"[ScanCoverMultiFrameSessionExporter] Loaded previous room raw coverage sessions={_loadedRoomRawCoverageSessions} voxels={_loadedRoomRawCoverageVoxels} stable={_loadedRoomRawCoverageStableVoxels} source={_loadedRoomRawCoverageSource}", this);
         }
     }
@@ -5507,7 +6151,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void MergeLoadedRoomRawCoverageVoxel(Vector3Int key, RoomRawCoverageVoxel loadedVoxel)
     {
-        if (_roomRawCoverageVoxels.TryGetValue(key, out RoomRawCoverageVoxel existing) && existing.frameHits > 0)
+        if (_roomRawCoverageHistoryVoxels.TryGetValue(key, out RoomRawCoverageVoxel existing) && existing.frameHits > 0)
         {
             existing.frameHits += loadedVoxel.frameHits;
             existing.pointHits += loadedVoxel.pointHits;
@@ -5519,12 +6163,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             existing.lowStable |= loadedVoxel.lowStable;
             existing.positionSum += loadedVoxel.positionSum;
             existing.normalSum += loadedVoxel.normalSum;
-            _roomRawCoverageVoxels[key] = existing;
             _roomRawCoverageHistoryVoxels[key] = existing;
             return;
         }
 
-        _roomRawCoverageVoxels[key] = loadedVoxel;
         _roomRawCoverageHistoryVoxels[key] = loadedVoxel;
     }
 
@@ -5577,6 +6219,24 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             return false;
 
         return true;
+    }
+
+    private bool IsRawDepthSnapshotPixelValid(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, int index)
+    {
+        if (snapshot == null || snapshot.worldPositions == null || snapshot.observationMeta == null ||
+            index < 0 || index >= snapshot.worldPositions.Length || index >= snapshot.observationMeta.Length)
+            return false;
+
+        Color meta = snapshot.observationMeta[index];
+        if (meta.r < 0.5f || meta.b <= 0f || !float.IsFinite(meta.b))
+            return false;
+
+        float minDepth = Mathf.Max(0.01f, roomRawCoverageMinDepthMeters);
+        float maxDepth = Mathf.Max(minDepth + 0.01f, roomRawCoverageMaxDepthMeters);
+        if (meta.b < minDepth || meta.b > maxDepth)
+            return false;
+
+        return IsFinite(snapshot.worldPositions[index]);
     }
 
     private bool IsRawDepthNeighborJump(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, int index, int width, int height, float thresholdMeters, Vector3 cameraPosition, Vector3 cameraForward)
@@ -5771,7 +6431,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private bool ShouldUseSnapshotGridCaptureMask()
     {
-        return useSnapshotGridCaptureMask && depthGridPointCloud != null;
+        return useSnapshotGridCaptureMask && depthGridPointCloud != null && !ShouldUseLegacyFullViewRoomRawCoverage();
     }
 
     private void UpdateSnapshotGridCapturePreview()
@@ -6199,7 +6859,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         foreach (KeyValuePair<Vector3Int, RoomRawDepthCompletionVoxel> pair in _roomRawDepthCompletionVoxels)
         {
-            RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(pair.Value);
+            RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(pair.Key, pair.Value);
             CountRoomRawDepthCompletionState(state);
 
             if (sourceIndex % stride == 0)
@@ -6273,6 +6933,64 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 Graphics.DrawMeshInstanced(_roomRawDepthCompletionMesh, 0, material, _roomRawDepthCompletionDrawBatch, batchCount);
             }
         }
+    }
+
+    private void ClearRoomRawDepthSnapshotOverlay()
+    {
+        _roomRawDepthSnapshotMatrices.Clear();
+        _roomRawDepthSnapshotVisiblePoints = 0;
+        _roomRawDepthSnapshotLastTotalPixels = 0;
+        _roomRawDepthSnapshotLastValidPixels = 0;
+        _roomRawDepthSnapshotLastFrame = "none";
+    }
+
+    private void DrawRoomRawDepthSnapshotOverlay()
+    {
+        if (!showRoomRawDepthSnapshotOverlay || _roomRawDepthSnapshotMatrices.Count <= 0)
+            return;
+
+        EnsureRoomRawDepthCompletionMesh();
+        EnsureRoomRawDepthSnapshotMaterial();
+        if (_roomRawDepthCompletionMesh == null || _roomRawDepthSnapshotMaterial == null)
+            return;
+
+        for (int start = 0; start < _roomRawDepthSnapshotMatrices.Count; start += 1023)
+        {
+            int batchCount = Mathf.Min(1023, _roomRawDepthSnapshotMatrices.Count - start);
+            _roomRawDepthSnapshotMatrices.CopyTo(start, _roomRawDepthCompletionDrawBatch, 0, batchCount);
+            Graphics.DrawMeshInstanced(_roomRawDepthCompletionMesh, 0, _roomRawDepthSnapshotMaterial, _roomRawDepthCompletionDrawBatch, batchCount);
+        }
+    }
+
+    private void EnsureRoomRawDepthSnapshotMaterial()
+    {
+        if (_roomRawDepthSnapshotMaterial != null)
+            return;
+
+        Shader shader = Shader.Find("Universal Render Pipeline/Unlit");
+        if (shader == null)
+            shader = Shader.Find("Unlit/Color");
+        if (shader == null)
+            shader = Shader.Find("Standard");
+
+        _roomRawDepthSnapshotMaterial = new Material(shader);
+        _roomRawDepthSnapshotMaterial.hideFlags = HideFlags.DontSave;
+        _roomRawDepthSnapshotMaterial.enableInstancing = true;
+        _roomRawDepthSnapshotMaterial.SetColor("_BaseColor", roomRawDepthSnapshotColor);
+        _roomRawDepthSnapshotMaterial.SetColor("_Color", roomRawDepthSnapshotColor);
+    }
+
+    private void DestroyRoomRawDepthSnapshotOverlay()
+    {
+        ClearRoomRawDepthSnapshotOverlay();
+        if (_roomRawDepthSnapshotMaterial == null)
+            return;
+
+        if (Application.isPlaying)
+            Destroy(_roomRawDepthSnapshotMaterial);
+        else
+            DestroyImmediate(_roomRawDepthSnapshotMaterial);
+        _roomRawDepthSnapshotMaterial = null;
     }
 
     private void CountRoomRawDepthCompletionState(RoomRawDepthCompletionState state)
@@ -6466,7 +7184,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         ClearRoomRawDepthCompletionMatrices();
     }
 
-    private RoomRawDepthCompletionState ClassifyRoomRawDepthCompletionVoxel(RoomRawDepthCompletionVoxel voxel)
+    private RoomRawDepthCompletionState ClassifyRoomRawDepthCompletionVoxel(Vector3Int key, RoomRawDepthCompletionVoxel voxel)
     {
         if (voxel == null || voxel.hits <= 0)
             return RoomRawDepthCompletionState.Empty;
@@ -6479,13 +7197,72 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (depthStd >= roomRawDepthCompletionHardDepthStdMeters || riskRatio >= roomRawDepthCompletionBadRiskRatio)
             return RoomRawDepthCompletionState.Conflict;
 
+        if (IsRoomRawDepthCompletionStableCandidate(key, voxel, depthStd, riskRatio))
+            return RoomRawDepthCompletionState.Stable;
+
         if (depthStd >= roomRawDepthCompletionStableDepthStdMeters || riskRatio >= roomRawDepthCompletionWarnRiskRatio)
             return RoomRawDepthCompletionState.Risk;
 
-        if (voxel.hits >= roomRawDepthCompletionStableHits && voxel.AngleSpanDegrees >= roomRawDepthCompletionMinAngleSpanDegrees)
-            return RoomRawDepthCompletionState.Stable;
-
         return RoomRawDepthCompletionState.Supported;
+    }
+
+    private bool IsRoomRawDepthCompletionStableCandidate(Vector3Int key, RoomRawDepthCompletionVoxel voxel, float depthStd, float riskRatio)
+    {
+        int stableHits = Mathf.Max(1, roomRawDepthCompletionStableHits);
+        int candidateHits = Mathf.Max(stableHits, roomRawDepthCompletionCandidateStableHits);
+        int sameViewHits = Mathf.Max(candidateHits, roomRawDepthCompletionSameViewStableHits);
+        float minAngle = Mathf.Clamp(roomRawDepthCompletionMinAngleSpanDegrees, 0f, 90f);
+        bool hasAngleSupport = minAngle <= 0f || voxel.AngleSpanDegrees >= minAngle;
+        bool hasLongSameViewSupport = voxel.hits >= sameViewHits;
+        bool hasEnoughHits = voxel.hits >= stableHits && (hasAngleSupport || hasLongSameViewSupport);
+        if (!hasEnoughHits)
+            return false;
+
+        float stableDepthStd = Mathf.Max(0.001f, roomRawDepthCompletionStableDepthStdMeters);
+        bool cleanStable = depthStd <= stableDepthStd && riskRatio <= roomRawDepthCompletionWarnRiskRatio;
+        if (cleanStable)
+            return true;
+
+        bool recoverableRisk = voxel.hits >= candidateHits &&
+            depthStd <= Mathf.Max(stableDepthStd, roomRawDepthCompletionNeighborStableDepthStdMeters) &&
+            riskRatio <= Mathf.Max(roomRawDepthCompletionWarnRiskRatio, roomRawDepthCompletionRecoverableRiskRatio) &&
+            CountRoomRawDepthCompletionNeighborSupport(key, voxel) >= Mathf.Max(0, roomRawDepthCompletionNeighborStableSupport);
+        return recoverableRisk;
+    }
+
+    private int CountRoomRawDepthCompletionNeighborSupport(Vector3Int key, RoomRawDepthCompletionVoxel center)
+    {
+        int required = Mathf.Max(0, roomRawDepthCompletionNeighborStableSupport);
+        if (required <= 0 || center == null)
+            return required;
+
+        int support = 0;
+        float maxDepthDelta = Mathf.Max(0.001f, roomRawDepthCompletionNeighborDepthDeltaMeters);
+        float maxDepthStd = Mathf.Max(0.001f, roomRawDepthCompletionNeighborStableDepthStdMeters);
+        float maxRisk = Mathf.Clamp01(roomRawDepthCompletionNeighborRiskRatio);
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            if (dx == 0 && dy == 0 && dz == 0)
+                continue;
+
+            Vector3Int neighborKey = new Vector3Int(key.x + dx, key.y + dy, key.z + dz);
+            if (!_roomRawDepthCompletionVoxels.TryGetValue(neighborKey, out RoomRawDepthCompletionVoxel neighbor) || neighbor == null)
+                continue;
+            if (neighbor.hits < roomRawDepthCompletionMinHits)
+                continue;
+            if (Mathf.Abs(neighbor.MeanDepth - center.MeanDepth) > maxDepthDelta)
+                continue;
+            if (neighbor.DepthStd > maxDepthStd || neighbor.RiskRatio > maxRisk)
+                continue;
+
+            support++;
+            if (support >= required)
+                return support;
+        }
+
+        return support;
     }
 
     private Color GetRoomRawDepthCompletionColor(RoomRawDepthCompletionState state)
@@ -6549,9 +7326,354 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .AppendLine("%");
         builder.Append("Scan hint: ").AppendLine(_roomRawDepthCompletionHint);
     }
+
+    private void AppendRoomRawDepthSnapshotHudLine(StringBuilder builder)
+    {
+        if (!exportRoomRawDepthSnapshots && !showRoomRawDepthSnapshotOverlay)
+            return;
+
+        builder.Append("Raw快照: ")
+            .Append(_roomRawDepthSnapshotLastValidPixels).Append('/')
+            .Append(_roomRawDepthSnapshotLastTotalPixels)
+            .Append(" 显示")
+            .Append(_roomRawDepthSnapshotVisiblePoints)
+            .Append(" 帧 ")
+            .Append(_roomRawDepthSnapshotLastFrame ?? "none")
+            .AppendLine();
+    }
+
+    private void AppendBinocularRoomRawDepthSnapshotHudLine(StringBuilder builder)
+    {
+        if (!useBinocularRoomRawDepthSnapshots)
+            return;
+
+        builder.Append("双眼快照: ").AppendLine(_binocularRoomRawDepthStatus ?? "idle");
+    }
+
+    private bool ShouldUseBinocularRoomRawDepthSnapshotCapture()
+    {
+        if (!useBinocularRoomRawDepthSnapshots || !ShouldExportRoomRawDepthSnapshots() || depthGridPointCloud == null)
+            return false;
+
+        if (binocularRoomRawDepthSnapshotsManualOnly &&
+            !string.Equals(_pendingReason, "manual", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return depthGridPointCloud.Preprocessor != null;
+    }
+
+    private bool BeginBinocularRoomRawDepthSnapshotCapture()
+    {
+        ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: false);
+        ScanCoverDepthPreprocessor preprocessor = depthGridPointCloud != null ? depthGridPointCloud.Preprocessor : null;
+        if (preprocessor == null)
+        {
+            _binocularRoomRawDepthStatus = "missing preprocessor";
+            return false;
+        }
+
+        _binocularRoomRawDepthOriginalEye = preprocessor.CurrentSourceEye;
+        _binocularRoomRawDepthStatus = "右眼采集中";
+        return RequestBinocularRoomRawDepthEye(ScanCoverDepthPreprocessor.SourceEye.Right, BinocularRoomRawDepthSnapshotStage.RightRequested);
+    }
+
+    private bool RequestBinocularRoomRawDepthEye(ScanCoverDepthPreprocessor.SourceEye eye, BinocularRoomRawDepthSnapshotStage stage)
+    {
+        ScanCoverDepthPreprocessor preprocessor = depthGridPointCloud != null ? depthGridPointCloud.Preprocessor : null;
+        if (preprocessor == null || depthGridPointCloud == null)
+            return FailBinocularRoomRawDepthSnapshotCapture("missing depth source");
+
+        _binocularRoomRawDepthStartSnapshotIndex = GetLatestRawDepthSnapshotFrameIndex();
+        _binocularRoomRawDepthStartTime = Time.unscaledTime;
+        _binocularRoomRawDepthSnapshotStage = stage;
+        preprocessor.SetSourceEye(eye);
+
+        if (!depthGridPointCloud.RefreshNow(forcePreprocessorRefresh: true))
+            return FailBinocularRoomRawDepthSnapshotCapture(depthGridPointCloud.LastIssue ?? "depth refresh failed");
+
+        _pendingRefreshRequested = true;
+        return true;
+    }
+
+    private void UpdateBinocularRoomRawDepthSnapshotCapture()
+    {
+        if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.None ||
+            _binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.Ready)
+            return;
+
+        bool timedOut = Time.unscaledTime - _binocularRoomRawDepthStartTime >= Mathf.Max(0.05f, binocularRoomRawDepthSnapshotTimeoutSeconds);
+        int latestSnapshotFrame = GetLatestRawDepthSnapshotFrameIndex();
+        bool hasFreshSnapshot = latestSnapshotFrame > _binocularRoomRawDepthStartSnapshotIndex;
+
+        if (!hasFreshSnapshot)
+        {
+            if (timedOut)
+                FailBinocularRoomRawDepthSnapshotCapture("timeout");
+            return;
+        }
+
+        if (!depthGridPointCloud.TryGetLatestRawDepthFrameSnapshot(out ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot))
+        {
+            if (timedOut)
+                FailBinocularRoomRawDepthSnapshotCapture("snapshot unavailable");
+            return;
+        }
+
+        if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.RightRequested)
+        {
+            _binocularRoomRawDepthRightSnapshot = snapshot;
+            _binocularRoomRawDepthStatus = "左眼采集中";
+            RequestBinocularRoomRawDepthEye(ScanCoverDepthPreprocessor.SourceEye.Left, BinocularRoomRawDepthSnapshotStage.LeftRequested);
+            return;
+        }
+
+        if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.LeftRequested)
+        {
+            _binocularRoomRawDepthLeftSnapshot = snapshot;
+            _binocularRoomRawDepthFusedSnapshot = BuildBinocularRoomRawDepthSnapshot(
+                _binocularRoomRawDepthRightSnapshot,
+                _binocularRoomRawDepthLeftSnapshot);
+
+            if (_binocularRoomRawDepthFusedSnapshot == null)
+            {
+                FailBinocularRoomRawDepthSnapshotCapture("merge failed");
+                return;
+            }
+
+            RestoreBinocularRoomRawDepthOriginalEye();
+            _binocularRoomRawDepthSnapshotStage = BinocularRoomRawDepthSnapshotStage.Ready;
+            _binocularRoomRawDepthStatus = "双眼完成";
+            TryExportPendingCapture(force: true);
+        }
+    }
+
+    private ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot BuildBinocularRoomRawDepthSnapshot(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right,
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left)
+    {
+        if (right == null || left == null ||
+            right.worldPositions == null || right.worldNormals == null || right.observationMeta == null ||
+            left.worldPositions == null || left.worldNormals == null || left.observationMeta == null)
+            return null;
+
+        int rightCount = Mathf.Min(right.worldPositions.Length, Mathf.Min(right.worldNormals.Length, right.observationMeta.Length));
+        int leftCount = Mathf.Min(left.worldPositions.Length, Mathf.Min(left.worldNormals.Length, left.observationMeta.Length));
+        if (rightCount <= 0 || leftCount <= 0)
+            return null;
+
+        int total = rightCount + leftCount;
+        Vector3[] positions = new Vector3[total];
+        Vector3[] normals = new Vector3[total];
+        Color[] meta = new Color[total];
+        Array.Copy(right.worldPositions, 0, positions, 0, rightCount);
+        Array.Copy(right.worldNormals, 0, normals, 0, rightCount);
+        Array.Copy(right.observationMeta, 0, meta, 0, rightCount);
+        Array.Copy(left.worldPositions, 0, positions, rightCount, leftCount);
+        Array.Copy(left.worldNormals, 0, normals, rightCount, leftCount);
+        Array.Copy(left.observationMeta, 0, meta, rightCount, leftCount);
+
+        int width = right.resolutionWidth == left.resolutionWidth
+            ? Mathf.Max(1, right.resolutionWidth)
+            : Mathf.Max(1, Mathf.Max(right.resolutionWidth, left.resolutionWidth));
+        int height = right.resolutionWidth == left.resolutionWidth
+            ? Mathf.Max(1, right.resolutionHeight) + Mathf.Max(1, left.resolutionHeight)
+            : Mathf.Max(1, Mathf.CeilToInt(total / (float)width));
+
+        return new ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot
+        {
+            componentName = (right.componentName ?? "ScanCoverDepthGridPointCloud") + "+binocular",
+            frameIndex = Mathf.Max(right.frameIndex, left.frameIndex),
+            resolutionWidth = width,
+            resolutionHeight = height,
+            worldPositions = positions,
+            worldNormals = normals,
+            observationMeta = meta
+        };
+    }
+
+    private int GetLatestRawDepthSnapshotFrameIndex()
+    {
+        if (depthGridPointCloud == null ||
+            !depthGridPointCloud.TryGetLatestRawDepthFrameSnapshot(out ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot) ||
+            snapshot == null)
+            return -1;
+
+        return snapshot.frameIndex;
+    }
+
+    private bool FailBinocularRoomRawDepthSnapshotCapture(string reason)
+    {
+        _binocularRoomRawDepthStatus = "失败: " + (reason ?? "unknown");
+        RestoreBinocularRoomRawDepthOriginalEye();
+        _binocularRoomRawDepthSnapshotStage = BinocularRoomRawDepthSnapshotStage.None;
+        _binocularRoomRawDepthRightSnapshot = null;
+        _binocularRoomRawDepthLeftSnapshot = null;
+        _binocularRoomRawDepthFusedSnapshot = null;
+        _pendingCapture = false;
+        _pendingRefreshRequested = false;
+        _independentSnapshotCaptureActive = false;
+        return false;
+    }
+
+    private void ResetBinocularRoomRawDepthSnapshotCapture(bool restoreOriginalEye)
+    {
+        if (restoreOriginalEye)
+            RestoreBinocularRoomRawDepthOriginalEye();
+
+        _binocularRoomRawDepthSnapshotStage = BinocularRoomRawDepthSnapshotStage.None;
+        _binocularRoomRawDepthRightSnapshot = null;
+        _binocularRoomRawDepthLeftSnapshot = null;
+        _binocularRoomRawDepthFusedSnapshot = null;
+        _binocularRoomRawDepthStartSnapshotIndex = -1;
+        _binocularRoomRawDepthStartTime = 0f;
+    }
+
+    private void RestoreBinocularRoomRawDepthOriginalEye()
+    {
+        ScanCoverDepthPreprocessor preprocessor = depthGridPointCloud != null ? depthGridPointCloud.Preprocessor : null;
+        if (preprocessor != null)
+            preprocessor.SetSourceEye(_binocularRoomRawDepthOriginalEye);
+    }
+
+    private void TryExportLatestRoomRawDepthSnapshot(string frameName, Transform pose)
+    {
+        if (!ShouldExportRoomRawDepthSnapshots() || depthGridPointCloud == null)
+            return;
+
+        if (!depthGridPointCloud.TryGetLatestRawDepthFrameSnapshot(out ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot))
+            return;
+
+        MaybeExportRoomRawDepthSnapshot(frameName, snapshot, pose);
+    }
+
+    private void MaybeExportRoomRawDepthSnapshot(string frameName, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, Transform pose)
+    {
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthSnapshots() || snapshot == null || string.IsNullOrEmpty(_roomRawDepthSnapshotDirectory))
+            return;
+
+        Directory.CreateDirectory(_roomRawDepthSnapshotDirectory);
+        string safeFrameName = string.IsNullOrWhiteSpace(frameName) ? $"frame_{_capturedFrameCount:D4}" : frameName;
+        foreach (char invalid in Path.GetInvalidFileNameChars())
+            safeFrameName = safeFrameName.Replace(invalid, '_');
+        string path = Path.Combine(_roomRawDepthSnapshotDirectory, $"{safeFrameName}_raw{snapshot.frameIndex:D6}_raw_snapshot.csv");
+
+        int totalPixels = WriteRoomRawDepthSnapshotCsv(path, snapshot, pose, out int validPixels, out int visiblePoints);
+        if (totalPixels <= 0)
+        {
+            AppendRoomRawDepthSnapshotManifestRow(frameName, snapshot.frameIndex, 0, 0, 0, snapshot.resolutionWidth, "", "skipped-empty", pose);
+            return;
+        }
+
+        _roomRawDepthSnapshotExportedFrames++;
+        _roomRawDepthSnapshotTotalPixels += totalPixels;
+        _roomRawDepthSnapshotValidPixels += validPixels;
+        AppendRoomRawDepthSnapshotManifestRow(frameName, snapshot.frameIndex, totalPixels, validPixels, visiblePoints, snapshot.resolutionWidth, path, "exported", pose);
+    }
+
+    private int WriteRoomRawDepthSnapshotCsv(string path, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, Transform pose, out int validPixels, out int visiblePoints)
+    {
+        validPixels = 0;
+        visiblePoints = 0;
+        ClearRoomRawDepthSnapshotOverlay();
+
+        if (snapshot == null || snapshot.worldPositions == null || snapshot.observationMeta == null)
+            return 0;
+
+        int width = Mathf.Max(1, snapshot.resolutionWidth);
+        int height = Mathf.Max(1, snapshot.resolutionHeight);
+        int count = Mathf.Min(snapshot.worldPositions.Length, snapshot.observationMeta.Length);
+        if (count <= 0)
+            return 0;
+
+        Vector3 cameraPosition = pose != null ? pose.position : Vector3.zero;
+        Vector3 cameraForward = pose != null ? pose.forward : Vector3.forward;
+        if (!IsFinite(cameraForward) || cameraForward.sqrMagnitude <= 1e-8f)
+            cameraForward = Vector3.forward;
+        cameraForward.Normalize();
+
+        int maxVisual = Mathf.Max(1, roomRawDepthSnapshotMaxVisualPoints);
+        float pointSize = Mathf.Max(0.002f, roomRawDepthSnapshotPointSize);
+        StringBuilder rows = new StringBuilder(Mathf.Max(4096, count * 128));
+        rows.AppendLine("# ScanCover full raw-depth view snapshot");
+        rows.Append("resolution=").Append(width).Append('x').Append(height).AppendLine();
+        rows.Append("index,pixelX,pixelY,u,v,valid,depthM,forwardDepthM,worldX,worldY,worldZ,normalX,normalY,normalZ,confidence").AppendLine();
+
+        for (int i = 0; i < count; i++)
+        {
+            int x = i % width;
+            int y = i / width;
+            float u = width > 1 ? x / (float)(width - 1) : 0.5f;
+            float v = height > 1 ? y / (float)(height - 1) : 0.5f;
+            bool valid = IsRawDepthSnapshotPixelValid(snapshot, i);
+            Color meta = snapshot.observationMeta[i];
+
+            rows.Append(i).Append(',')
+                .Append(x).Append(',')
+                .Append(y).Append(',')
+                .Append(FormatFloat(u)).Append(',')
+                .Append(FormatFloat(v)).Append(',')
+                .Append(valid ? 1 : 0).Append(',');
+
+            if (valid)
+            {
+                Vector3 point = snapshot.worldPositions[i];
+                Vector3 normal = (snapshot.worldNormals != null && i < snapshot.worldNormals.Length && IsFinite(snapshot.worldNormals[i]) && snapshot.worldNormals[i].sqrMagnitude > 1e-8f)
+                    ? snapshot.worldNormals[i].normalized
+                    : Vector3.up;
+                float forwardDepth = Vector3.Dot(point - cameraPosition, cameraForward);
+                rows.Append(FormatFloat(meta.b)).Append(',')
+                    .Append(FormatFloat(forwardDepth)).Append(',')
+                    .Append(FormatVector(point)).Append(',')
+                    .Append(FormatVector(normal)).Append(',')
+                    .Append(FormatFloat(meta.g)).AppendLine();
+
+                validPixels++;
+                if (_roomRawDepthSnapshotMatrices.Count < maxVisual)
+                {
+                    _roomRawDepthSnapshotMatrices.Add(Matrix4x4.TRS(point, Quaternion.identity, Vector3.one * pointSize));
+                    visiblePoints++;
+                }
+            }
+            else
+            {
+                rows.Append(",,,,,,,,,").AppendLine();
+            }
+        }
+
+        _roomRawDepthSnapshotVisiblePoints = visiblePoints;
+        _roomRawDepthSnapshotLastTotalPixels = count;
+        _roomRawDepthSnapshotLastValidPixels = validPixels;
+        _roomRawDepthSnapshotLastFrame = Path.GetFileNameWithoutExtension(path);
+        File.WriteAllText(path, rows.ToString(), Encoding.UTF8);
+        return count;
+    }
+
+    private void AppendRoomRawDepthSnapshotManifestRow(string frameName, int rawDepthFrameIndex, int totalPixels, int validPixels, int visiblePoints, int width, string path, string status, Transform pose)
+    {
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthSnapshots() || string.IsNullOrEmpty(_roomRawDepthSnapshotManifestPath))
+            return;
+
+        Vector3 position = pose != null ? pose.position : Vector3.zero;
+        Vector3 rotation = pose != null ? pose.rotation.eulerAngles : Vector3.zero;
+        int height = totalPixels > 0 && width > 0 ? Mathf.Max(1, Mathf.CeilToInt(totalPixels / (float)width)) : 0;
+        StringBuilder row = new StringBuilder(384);
+        row.Append(EscapeCsv(frameName)).Append(',')
+            .Append(rawDepthFrameIndex).Append(',')
+            .Append(totalPixels).Append(',')
+            .Append(validPixels).Append(',')
+            .Append(visiblePoints).Append(',')
+            .Append(width).Append(',')
+            .Append(height).Append(',')
+            .Append(FormatVector(position)).Append(',')
+            .Append(FormatVector(rotation)).Append(',')
+            .Append(EscapeCsv(path)).Append(',')
+            .Append(EscapeCsv(status)).AppendLine();
+        File.AppendAllText(_roomRawDepthSnapshotManifestPath, row.ToString(), Encoding.UTF8);
+    }
+
     private void MaybeExportRoomRawDepthFrame(string frameName, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, Transform pose, int frameIndex, RoomRawCoverageFrameResult result)
     {
-        if (!ShouldExportRoomRawDepthFrames() || snapshot == null || string.IsNullOrEmpty(_roomRawDepthDirectory))
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthFrames() || snapshot == null || string.IsNullOrEmpty(_roomRawDepthDirectory))
             return;
 
         bool accepted = result.hasData && result.accepted;
@@ -6599,6 +7721,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private int WriteRoomRawDepthFrameCsv(string path, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, Transform pose, RoomRawCoverageFrameResult result)
     {
+        if (!_sessionFileExportEnabled)
+            return 0;
+
         if (snapshot == null || snapshot.worldPositions == null || snapshot.observationMeta == null)
             return 0;
 
@@ -6700,7 +7825,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendRoomRawDepthManifestRow(string frameName, int rawDepthFrameIndex, bool accepted, RoomRawCoverageFrameResult result, int exportedSamples, int width, string path, string status, Transform pose)
     {
-        if (!ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthManifestPath))
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthManifestPath))
             return;
 
         Vector3 position = pose != null ? pose.position : Vector3.zero;
@@ -6730,7 +7855,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendRoomRawCoverageFrameRow(string frameName, int rawDepthFrameIndex, RoomRawCoverageFrameResult result)
     {
-        if (!trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageFramesPath))
+        if (!_sessionFileExportEnabled || !trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageFramesPath))
             return;
 
         StringBuilder row = new StringBuilder(256);
@@ -6782,29 +7907,41 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .Append(FormatFloat(result.anchorAngle)).Append(',')
             .Append(FormatFloat(result.anchorMove)).Append(',')
             .Append(result.anchorFallback ? 1 : 0).Append(',')
+            .Append(FormatFloat(result.overlapRatio)).Append(',')
+            .Append(result.historyAgreementVoxels).Append(',')
+            .Append(result.historyConflictVoxels).Append(',')
+            .Append(FormatFloat(result.historyAgreementRatio)).Append(',')
+            .Append(_roomRawCoverageCoveredVoxels).Append(',')
+            .Append(_roomRawCoverageStableVoxels).Append(',')
             .Append(EscapeCsv(result.status)).AppendLine();
         File.AppendAllText(_roomRawCoverageFramesPath, row.ToString(), Encoding.UTF8);
     }
 
     private void WriteRoomRawCoverageOutputs()
     {
-        if (!trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageDirectory))
+        if (!_sessionFileExportEnabled || !trackRoomRawCoverage || string.IsNullOrEmpty(_roomRawCoverageDirectory))
             return;
 
         float voxelSize = Mathf.Max(0.005f, roomRawCoverageVoxelSizeMeters);
-        StringBuilder voxels = new StringBuilder(Mathf.Max(1024, _roomRawCoverageVoxels.Count * 128));
+        Dictionary<Vector3Int, RoomRawCoverageVoxel> memoryVoxels = _roomRawCoverageHistoryVoxels.Count > 0
+            ? _roomRawCoverageHistoryVoxels
+            : _roomRawCoverageVoxels;
+        int memoryStableVoxels = CountStableRoomRawCoverageVoxels(memoryVoxels);
+        StringBuilder voxels = new StringBuilder(Mathf.Max(1024, memoryVoxels.Count * 128));
         voxels.AppendLine("# ScanCover room raw coverage voxels");
         voxels.Append("voxelSizeMeters=").Append(FormatFloat(voxelSize)).AppendLine();
         voxels.Append("frames=").Append(_roomRawCoverageFrames).AppendLine();
-        voxels.Append("coveredVoxels=").Append(_roomRawCoverageCoveredVoxels).AppendLine();
-        voxels.Append("stableVoxels=").Append(_roomRawCoverageStableVoxels).AppendLine();
+        voxels.Append("coveredVoxels=").Append(memoryVoxels.Count).AppendLine();
+        voxels.Append("stableVoxels=").Append(memoryStableVoxels).AppendLine();
+        voxels.Append("sessionNewCoveredVoxels=").Append(_roomRawCoverageCoveredVoxels).AppendLine();
+        voxels.Append("sessionNewStableVoxels=").Append(_roomRawCoverageStableVoxels).AppendLine();
         voxels.Append("highVoxels=").Append(_roomRawCoverageHighVoxels).AppendLine();
         voxels.Append("highStableVoxels=").Append(_roomRawCoverageHighStableVoxels).AppendLine();
         voxels.Append("lowVoxels=").Append(_roomRawCoverageLowVoxels).AppendLine();
         voxels.Append("lowStableVoxels=").Append(_roomRawCoverageLowStableVoxels).AppendLine();
         voxels.Append("riskVoxels=").Append(_roomRawCoverageRiskVoxels).AppendLine();
         voxels.AppendLine("voxelX,voxelY,voxelZ,frameHits,pointHits,stable,risk,high,highStable,low,lowStable,avgX,avgY,avgZ,avgNormalX,avgNormalY,avgNormalZ");
-        foreach (KeyValuePair<Vector3Int, RoomRawCoverageVoxel> pair in _roomRawCoverageVoxels)
+        foreach (KeyValuePair<Vector3Int, RoomRawCoverageVoxel> pair in memoryVoxels)
         {
             RoomRawCoverageVoxel voxel = pair.Value;
             Vector3 avg = voxel.pointHits > 0 ? voxel.positionSum / voxel.pointHits : Vector3.zero;
@@ -6833,8 +7970,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         AppendJsonNumber(summary, "totalSamples", _roomRawCoverageTotalSamples, 1, true);
         AppendJsonNumber(summary, "validSamples", _roomRawCoverageValidSamples, 1, true);
         AppendJsonNumber(summary, "coveredVoxels", _roomRawCoverageCoveredVoxels, 1, true);
+        AppendJsonNumber(summary, "sessionNewCoveredVoxels", _roomRawCoverageCoveredVoxels, 1, true);
+        AppendJsonNumber(summary, "sessionNewStableVoxels", _roomRawCoverageStableVoxels, 1, true);
         AppendJsonNumber(summary, "targetCoveredVoxels", Mathf.Max(1, roomRawCoverageTargetVoxels), 1, true);
         AppendJsonNumber(summary, "historyCoveredVoxels", _roomRawCoverageHistoryVoxels.Count, 1, true);
+        AppendJsonNumber(summary, "historyStableVoxels", CountStableRoomRawCoverageVoxels(_roomRawCoverageHistoryVoxels), 1, true);
         AppendJsonNumber(summary, "loadedPreviousCoverageSessions", _loadedRoomRawCoverageSessions, 1, true);
         AppendJsonNumber(summary, "loadedPreviousCoverageVoxels", _loadedRoomRawCoverageVoxels, 1, true);
         AppendJsonNumber(summary, "loadedPreviousCoverageStableVoxels", _loadedRoomRawCoverageStableVoxels, 1, true);
@@ -6865,7 +8005,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteRoomRawDepthSummary()
     {
-        if (!ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthSummaryPath))
+        if (!_sessionFileExportEnabled || !ShouldExportRoomRawDepthFrames() || string.IsNullOrEmpty(_roomRawDepthSummaryPath))
             return;
 
         StringBuilder summary = new StringBuilder(512);
@@ -6939,7 +8079,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void WriteStabilityOutputs()
     {
-        if (string.IsNullOrEmpty(_sessionDirectory) || _stabilityVoxels.Count <= 0)
+        if (!_sessionFileExportEnabled || string.IsNullOrEmpty(_sessionDirectory) || _stabilityVoxels.Count <= 0)
             return;
 
         string path = Path.Combine(_sessionDirectory, "multi_frame_stability_voxels.csv");
