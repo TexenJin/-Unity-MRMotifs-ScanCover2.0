@@ -30,7 +30,7 @@ import open3d as o3d
 
 
 DEFAULT_META_SESSION = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+    r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
     r"\MetaSceneMeshAuditSessions\ScanCover_MetaSceneMeshAudit_20260611_180459_512"
 )
 

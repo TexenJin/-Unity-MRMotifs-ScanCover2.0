@@ -1,0 +1,36 @@
+{
+  "schema": "ScanCoverQuestSpatialScanMediumCompleteAsset/v1",
+  "sourceManifest": "C:\\Users\\ROG\\Desktop\\ReplicaRoomValidation_office0_v1\\growth_observer_view_medium_complete_s0p11\\office0_observer_view_growth_manifest.json",
+  "sourceEdgesObj": "C:\\Users\\ROG\\Desktop\\ReplicaRoomValidation_office0_v1\\medium_complete_s0p11\\office0_quad_edges_complete_s0p11.obj",
+  "unityResourcePath": "QuestSpatialScanDemo/office0_observer_scan_lite",
+  "outputBytes": "E:\\PCAII\\NEW-SCANCOVER\\Assets\\MRMotifs\\ScanCover\\Resources\\QuestSpatialScanDemo\\office0_observer_scan_lite.bytes",
+  "frames": 35,
+  "sourceEdges": 13906,
+  "liteEdges": 13906,
+  "maxEdges": 999999,
+  "observerSamples": 145,
+  "sourceBoundsReplica": {
+    "min": [
+      -2.00478,
+      -3.14531,
+      -1.15919
+    ],
+    "max": [
+      2.39011,
+      1.85812,
+      1.76432
+    ]
+  },
+  "unityTransform": {
+    "replicaX_to_unityX": true,
+    "replicaZ_to_unityY_height": true,
+    "replicaY_to_unityZ": true,
+    "centeredOnFloor": true
+  },
+  "notes": [
+    "This asset is intentionally light for Quest playback.",
+    "Runtime should only parse once and reveal static line meshes step by step."
+  ],
+  "lod": "medium_complete_s0p11",
+  "continuityPolicy": "all medium LOD quad edges retained; no edge thinning"
+}

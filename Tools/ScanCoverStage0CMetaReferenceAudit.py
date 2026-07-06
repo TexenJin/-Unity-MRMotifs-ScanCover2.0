@@ -461,8 +461,8 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage 0-C Meta reference audit for ScanCover observations.")
-    parser.add_argument("--exports-root", default=r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports")
-    parser.add_argument("--meta-session", default=r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports\MetaSceneMeshAuditSessions\ScanCover_MetaSceneMeshAudit_20260611_180459_512")
+    parser.add_argument("--exports-root", default=r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports")
+    parser.add_argument("--meta-session", default=r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports\MetaSceneMeshAuditSessions\ScanCover_MetaSceneMeshAudit_20260611_180459_512")
     parser.add_argument("--meta-welded-obj", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--max-bl", type=int, default=24)

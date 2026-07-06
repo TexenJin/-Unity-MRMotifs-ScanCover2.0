@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         "--root",
         type=Path,
         default=Path(
-            r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports\Quest3VirtualCloneExperiments"
+            r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports\Quest3VirtualCloneExperiments"
         ),
     )
     parser.add_argument("--out", type=Path, default=None)

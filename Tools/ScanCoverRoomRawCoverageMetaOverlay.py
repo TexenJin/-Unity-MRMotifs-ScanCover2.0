@@ -37,7 +37,7 @@ import numpy as np
 import open3d as o3d
 
 
-DEFAULT_PROJECT = Path(r"D:\PCA\Unity-MRMotifs-ScanCover-main")
+DEFAULT_PROJECT = Path(r"E:\PCAII\NEW-SCANCOVER")
 DEFAULT_META = (
     DEFAULT_PROJECT
     / "ScanCoverExports"

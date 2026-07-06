@@ -134,7 +134,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &57152243
 Transform:
   m_ObjectHideFlags: 0
@@ -328,7 +328,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &503451740
 Transform:
   m_ObjectHideFlags: 0
@@ -526,7 +526,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &649187970
 Transform:
   m_ObjectHideFlags: 0
@@ -614,7 +614,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!1 &734494110
 GameObject:
   m_ObjectHideFlags: 0
@@ -753,6 +753,118 @@ Transform:
   m_CorrespondingSourceObject: {fileID: 1507076114299739628, guid: 684eac13e59c29e4397410edd16a6af8, type: 3}
   m_PrefabInstance: {fileID: 3032407534603770301}
   m_PrefabAsset: {fileID: 0}
+--- !u!1 &1063485270
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1063485271}
+  - component: {fileID: 1063485274}
+  - component: {fileID: 1063485273}
+  - component: {fileID: 1063485272}
+  m_Layer: 0
+  m_Name: Sphere
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
+--- !u!4 &1063485271
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1063485270}
+  serializedVersion: 2
+  m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0.0673}
+  m_LocalScale: {x: 0.05, y: 0.05, z: 0.05}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 1168042863977618288}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!135 &1063485272
+SphereCollider:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1063485270}
+  m_Material: {fileID: 0}
+  m_IncludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ExcludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_LayerOverridePriority: 0
+  m_IsTrigger: 0
+  m_ProvidesContacts: 0
+  m_Enabled: 1
+  serializedVersion: 3
+  m_Radius: 0.5
+  m_Center: {x: 0, y: 0, z: 0}
+--- !u!23 &1063485273
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1063485270}
+  m_Enabled: 1
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 2100000, guid: 31321ba15b8f8eb4c954353edc038b1d, type: 2}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1063485274
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1063485270}
+  m_Mesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!1 &1100176340
 GameObject:
   m_ObjectHideFlags: 0
@@ -878,6 +990,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   _monoscopic: 0
   _sharpenType: 0
+  _disableRecording: 0
   _enableDynamicResolution: 1
   minDynamicResolutionScale: 1
   maxDynamicResolutionScale: 1
@@ -889,8 +1002,13 @@ MonoBehaviour:
   maxRenderScale: 1
   _headPoseRelativeOffsetRotation: {x: 0, y: 0, z: 0}
   _headPoseRelativeOffsetTranslation: {x: 0, y: 0, z: 0}
-  profilerTcpPort: 32419
-  expandMixedRealityCapturePropertySheet: 0
+  enableCoreMetricsRelease: 0
+  enableCoreMetricsDevelopment: 1
+  coreMetricVisibility:
+    visibleMemoryMetricStats: 0
+    visibleMemoryMetricGraphs: 0
+    visibleRenderMetricStats: 0
+    visibleRenderMetricGraphs: 0
   enableMixedReality: 0
   compositionMethod: 0
   extraHiddenLayers:
@@ -930,7 +1048,8 @@ MonoBehaviour:
   requestEyeTrackingPermissionOnStartup: 0
   requestScenePermissionOnStartup: 1
   requestRecordAudioPermissionOnStartup: 0
-  _localDimming: 1
+  requestPassthroughCameraAccessPermissionOnStartup: 0
+  _localDimming: 0
   _trackingOriginType: 1
   usePositionTracking: 1
   useRotationTracking: 1
@@ -943,6 +1062,8 @@ MonoBehaviour:
   SimultaneousHandsAndControllersEnabled: 0
   _readOnlyWideMotionModeHandPosesEnabled: 0
   wideMotionModeHandPosesEnabled: 0
+  _readOnlyFastMotionModeHandPosesEnabled: 0
+  fastMotionModeHandPosesEnabled: 0
   dynamicResolutionVersion: 1
 --- !u!114 &1149505068
 MonoBehaviour:
@@ -1040,6 +1161,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2d8affdff7ba47d892cc734baac9ac71, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  CustomTrackingSpace: {fileID: 0}
 --- !u!114 &1177598826
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1068,7 +1190,6 @@ MonoBehaviour:
   _removeHands: 0
   CustomTrackingSpace: {fileID: 0}
   <MaskMeshFilters>k__BackingField: []
-  _cameraRig: {fileID: 1149505068}
 --- !u!1 &1327307428
 GameObject:
   m_ObjectHideFlags: 0
@@ -1424,7 +1545,7 @@ MonoBehaviour:
   viewMode: 3
   refreshEveryFrame: 0
   hideWhenUnavailable: 1
-  debugLog: 0
+  debugLog: 1
 --- !u!64 &1757645493
 MeshCollider:
   m_ObjectHideFlags: 0
@@ -3064,7 +3185,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &291902015643956425
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -3705,8 +3826,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 03190b23f0f30f74dacc4ed3992541b6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _leftEyeAnchor: {fileID: 1677128358}
-  _rightEyeAnchor: {fileID: 604495874}
   _centerEyeCamera: {fileID: 2140226224}
   _meshFilter: {fileID: 2372025534664003069}
   _aimingDirection: {x: 0, y: 0, z: 1}
@@ -8323,6 +8442,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6f21528085b305345aa60f40f4a5a5d8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _rayInteractor: {fileID: 0}
+  _renderer: {fileID: 0}
+  _materialPropertyBlockEditor: {fileID: 0}
+  _minRayVisualStartOffset: 0
+  _minRayVisualEndOffset: 0.05
+  _maxRayVisualLength: 0.5
+  _hoverColor: {r: 1, g: 1, b: 1, a: 1}
+  _selectColor: {r: 0, g: 0, b: 1, a: 1}
+  _hideWhenNoInteractable: 0
 --- !u!114 &824676165482205106
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -8479,6 +8607,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6f21528085b305345aa60f40f4a5a5d8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _rayInteractor: {fileID: 0}
+  _renderer: {fileID: 0}
+  _materialPropertyBlockEditor: {fileID: 0}
+  _minRayVisualStartOffset: 0
+  _minRayVisualEndOffset: 0.05
+  _maxRayVisualLength: 0.5
+  _hoverColor: {r: 1, g: 1, b: 1, a: 1}
+  _selectColor: {r: 0, g: 0, b: 1, a: 1}
+  _hideWhenNoInteractable: 0
 --- !u!4 &853715643996069074
 Transform:
   m_ObjectHideFlags: 0
@@ -8838,6 +8975,8 @@ MonoBehaviour:
   surfaceSnapshotManager: {fileID: 0}
   depthGridPointCloud: {fileID: 920710000000000003}
   depthGridSnapshot64: {fileID: 920710000000000004}
+  rawSnapshotCompressedGrid: {fileID: 0}
+  tsdfSingleShell: {fileID: 910400000000000009}
   seedConfidencePatch: {fileID: 920710000000000106}
   depthPointBurstWindow: {fileID: 920710000000000120}
   depthProbeRows: []
@@ -8860,7 +8999,7 @@ MonoBehaviour:
   hideDepthPreviewOnClearAll: 0
   forceClearSurfaceSnapshotsOnClearAll: 1
   enableLegacyVisualChain: 0
-  debugLog: 0
+  debugLog: 1
   inputDebounceSeconds: 0.35
   ignoreInputWhileCaptureBurstRunning: 1
   usePureDepthGridSnapshot64Route: 0
@@ -8868,6 +9007,11 @@ MonoBehaviour:
   useDepthPointBurstWindowRoute: 0
   clearDepthPointBurstOnClearAll: 1
   disableLegacyRoutesWhenPointBurstRoute: 0
+  useRawSnapshotCompressedGridRoute: 1
+  clearRawSnapshotCompressedGridOnClearAll: 1
+  useTsdfSingleShellRoute: 1
+  clearTsdfSingleShellOnClearAll: 1
+  clearRawSnapshotGridWhenUsingTsdfRoute: 1
   useSeedConfidencePatchRoute: 0
   clearSeedConfidenceOnClearAll: 1
   disableLegacyRoutesWhenSeedRoute: 0
@@ -8879,9 +9023,51 @@ MonoBehaviour:
   exportSnapshotObjOnFreeze: 0
   exportAllSnapshotsAsSingleObjOnFreeze: 0
   exportIncrementalReferenceShellOnFreeze: 0
-  exportBlSurfaceMeshObjOnFreeze: 1
-  exportGridNodeCsvOnFreeze: 1
+  exportBlSurfaceMeshObjOnFreeze: 0
+  exportGridNodeCsvOnFreeze: 0
   exportGridStateJsonOnFreeze: 0
+--- !u!114 &910400000000000009
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1961903629088574029}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9b1f79875b765224a8ea118455f86690, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  rawDepthSource: {fileID: 920710000000000003}
+  volumeAnchor: {fileID: 0}
+  displayRoot: {fileID: 0}
+  forceWorldSpaceDisplay: 1
+  hideSourcePreview: 1
+  forceRawRefreshOnSnapshot: 1
+  waitForRawFrameTimeoutSeconds: 0.85
+  fusionBurstDurationSeconds: 2
+  maxFusionFramesPerTrigger: 24
+  rebuildMeshAfterFusionBurstOnly: 0
+  voxelSizeMeters: 0.065
+  truncationMeters: 0.195
+  volumeSizeMeters: {x: 6.5, y: 3.2, z: 6.5}
+  maxFusionWeight: 12
+  minSurfaceCornerWeight: 1
+  sampleStridePixels: 2
+  minDepthMeters: 0.35
+  maxDepthMeters: 5.5
+  minConfidence: 0
+  requireValidNormal: 0
+  minNormalFacingCameraDot: -0.25
+  rebuildMeshAfterEachCapture: 1
+  maxSurfaceVertices: 90000
+  doubleSidedTriangles: 1
+  showFallbackSurfaceSamples: 1
+  maxFallbackSurfaceSamples: 48000
+  fallbackSurfaceSampleSizeMeters: 0.018
+  shellColor: {r: 0.12, g: 0.9, b: 1, a: 1}
+  shellMaterialOverride: {fileID: 0}
+  debugLog: 1
 --- !u!114 &910400000000000008
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -8900,7 +9086,7 @@ MonoBehaviour:
   surfaceSnapshotManager: {fileID: 0}
   depthProbeRows: []
   scanEnabled: 1
-  showPreviewOnStart: 1
+  showPreviewOnStart: 0
   freezeRowsAfterManualCapture: 1
   disableEnvironmentDepthWhileIdle: 0
   debugLog: 0
@@ -9296,10 +9482,10 @@ MonoBehaviour:
   sampleIntervalSeconds: 0.04
   useDepthSnapshot: 1
   useScanCoverSnapshot: 1
-  showScanCoverDepthGridSnapshot: 0
+  showScanCoverDepthGridSnapshot: 1
   showDepthProbeRowPreview: 0
   showDepthProbeRowNodes: 0
-  syncVisibilityToScanCoverPreview: 1
+  syncVisibilityToScanCoverPreview: 0
   scanCoverPreprocessorComputeShader: {fileID: 7200000, guid: 24ba26f69dd65fe4781b4bcfadc35d5a, type: 3}
   scanCoverUseRowMatching: 1
   scanCoverRayMatchDistanceMeters: 0.18
@@ -9497,8 +9683,8 @@ MonoBehaviour:
   terrainDiagnosticsUsePureRandomSampling: 0
   terrainDiagnosticsKeepPointClassification: 1
   terrainDiagnosticsShowSamplingWindow: 0
-  terrainDiagnosticsDisplayAggregatedCells: 1
-  terrainDiagnosticsShowRawOverlay: 1
+  terrainDiagnosticsDisplayAggregatedCells: 0
+  terrainDiagnosticsShowRawOverlay: 0
   terrainCellSizeMeters: 0.02
   terrainStableMinSamplesPerCell: 4
   terrainStableMinSupportFrames: 3
@@ -9515,8 +9701,8 @@ MonoBehaviour:
   terrainMultiLayerNearColor: {r: 0.65, g: 0.2, b: 1, a: 0.95}
   terrainMultiLayerFarColor: {r: 1, g: 0.78, b: 0.05, a: 0.95}
   terrainUnstableCellColor: {r: 0.45, g: 0.45, b: 0.45, a: 0.55}
-  terrainDiagnosticsShowPlanarizedPreview: 1
-  terrainDiagnosticsShowRejectedPlaneIslands: 1
+  terrainDiagnosticsShowPlanarizedPreview: 0
+  terrainDiagnosticsShowRejectedPlaneIslands: 0
   terrainPlaneMinCells: 12
   terrainPlaneTrimKeepRatio: 0.82
   terrainPlaneRefineIterations: 2
@@ -9525,15 +9711,15 @@ MonoBehaviour:
   terrainPlaneInlierResidualMeters: 0.025
   terrainPlaneMaxProjectionOffsetMeters: 0.045
   terrainPlaneAllowBoundaryStableCells: 1
-  terrainDiagnosticsShowPlanarizedMeshPreview: 1
+  terrainDiagnosticsShowPlanarizedMeshPreview: 0
   terrainDiagnosticsUsePlanarizedCellTiles: 1
-  terrainDiagnosticsShowPlanarizedPointFallback: 1
+  terrainDiagnosticsShowPlanarizedPointFallback: 0
   terrainPlaneMeshMaxEdgeMeters: 0.08
   terrainPlanarizedTileFillRatio: 1
   terrainPlanarizedAcceptedColor: {r: 0.15, g: 0.75, b: 1, a: 0.98}
   terrainPlanarizedMeshColor: {r: 0.05, g: 0.55, b: 1, a: 0.38}
   terrainPlanarizedRejectedColor: {r: 1, g: 0.12, b: 0.12, a: 0.85}
-  terrainDiagnosticsShowTriangleWirePreview: 1
+  terrainDiagnosticsShowTriangleWirePreview: 0
   terrainTriangleWireUseDepthBreaksAsBorders: 1
   terrainTriangleWireIncludeBoundaryCells: 1
   terrainTriangleWireConnectLooseEdges: 1
@@ -9543,8 +9729,8 @@ MonoBehaviour:
   terrainTriangleWireWidthMeters: 0.004
   terrainTriangleWireMaxEdgeMeters: 0.09
   terrainTriangleWireColor: {r: 0.05, g: 0.55, b: 1, a: 0.92}
-  displayMode: 3
-  showPoints: 1
+  displayMode: 2
+  showPoints: 0
   renderAsBillboardQuads: 1
   pointVisualSizeMeters: 0.008
   surfaceOffsetTowardCameraMeters: 0.004
@@ -9722,22 +9908,22 @@ MonoBehaviour:
   showPointCloud: 0
   updateUntilSnapshot: 0
   captureKey: 32
-  captureWhenSessionFrozen: 1
+  captureWhenSessionFrozen: 0
   pixelStride: 1
   maxPoints: 120000
   minConfidence: 0.01
-  pointSizePixels: 18
-  pointSizeMeters: 0.006
-  pointAlpha: 1
-  pointBrightness: 1.8
+  pointSizePixels: 1
+  pointSizeMeters: 0.002
+  pointAlpha: 0
+  pointBrightness: 0.1
   colorMode: 0
   colorDepthScaleMeters: 4
-  pointColor: {r: 0, g: 1, b: 1, a: 1}
+  pointColor: {r: 0, g: 1, b: 1, a: 0}
   stableDepthDeltaMeters: 0.015
   edgeDepthDeltaMeters: 0.06
   stableWorldDistanceMeters: 0.025
   edgeWorldDistanceMeters: 0.08
-  stablePointColor: {r: 0, g: 0.95, b: 1, a: 1}
+  stablePointColor: {r: 0, g: 0.95, b: 1, a: 0}
   transitionPointColor: {r: 1, g: 0.85, b: 0, a: 1}
   edgePointColor: {r: 1, g: 0, b: 0.05, a: 1}
   isolatedPointColor: {r: 0.45, g: 0.45, b: 0.45, a: 1}
@@ -9801,7 +9987,7 @@ MonoBehaviour:
   requestFreshDepthGridBeforeCapture: 1
   refreshWaitTimeoutSeconds: 0.35
   enableEditorLocalSessionExport: 1
-  editorLocalSessionExportRoot: D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports
+  editorLocalSessionExportRoot: E:\PCAII\NEW-SCANCOVER\ScanCoverExports
   exportGridStateCsv: 1
   exportRawDepthProbe: 0
   exportObservationStats: 1
@@ -9919,16 +10105,22 @@ MonoBehaviour:
   roomRawDepthFocusOnly: 0
   roomRawDepthMaxSamplesPerFrame: 0
   exportRoomRawDepthSnapshots: 1
-  showRoomRawDepthSnapshotOverlay: 1
+  showRoomRawDepthSnapshotOverlay: 0
   captureNowUsesIndependentSnapshotLine: 1
   independentSnapshotDirectoryName: SnapshotCaptures
   independentSnapshotNamePrefix: ScanCover_BinocularSnapshot
   useBinocularRoomRawDepthSnapshots: 1
   binocularRoomRawDepthSnapshotsManualOnly: 1
   binocularRoomRawDepthSnapshotTimeoutSeconds: 0.8
-  roomRawDepthSnapshotPointSize: 0.008
-  roomRawDepthSnapshotMaxVisualPoints: 51200
-  roomRawDepthSnapshotColor: {r: 0.12, g: 0.85, b: 1, a: 1}
+  exportVirtualCloneInputMetadata: 1
+  virtualCloneInputDirectoryName: virtual_clone_input
+  virtualCloneEyeBaselineMeters: 0.063
+  virtualCloneFallbackFieldOfViewDegrees: 100.2439
+  roomRawDepthSnapshotPointSize: 0.014
+  roomRawDepthSnapshotMaxVisualPoints: 1024
+  roomRawDepthSnapshotColor: {r: 0.12, g: 0.85, b: 1, a: 0}
+  fuseRoomRawDepthSnapshotOverlayOnly: 1
+  roomRawDepthSnapshotOverlayFuseVoxelMeters: 0.015
   showRoomRawDepthCompletionOverlay: 0
   roomRawDepthCompletionOnlyWhileRecording: 0
   roomRawDepthCompletionVoxelSizeMeters: 0.08
@@ -10005,11 +10197,11 @@ MonoBehaviour:
   keyboardCaptureNowKey: 67
   enableOvrInput: 1
   enableOvrStartStopInput: 0
-  enableOvrCaptureNowInput: 1
+  enableOvrCaptureNowInput: 0
   useRightIndexTriggerForCaptureNow: 1
   ovrStartStopButton: 2
   ovrCaptureNowButton: 1
-  showHud: 1
+  showHud: 0
   hudLocalPosition: {x: 0, y: -0.12, z: 0.95}
   hudLocalEuler: {x: 0, y: 0, z: 0}
   hudLocalScale: {x: 0.00135, y: 0.00135, z: 0.00135}
@@ -10260,7 +10452,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &967637578846115331
 GameObject:
   m_ObjectHideFlags: 0
@@ -10276,7 +10468,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &967637578846115333
 GameObject:
   m_ObjectHideFlags: 0
@@ -10292,7 +10484,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &967637578846115335
 GameObject:
   m_ObjectHideFlags: 0
@@ -10342,7 +10534,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &967637578846115349
 GameObject:
   m_ObjectHideFlags: 0
@@ -11059,7 +11251,6 @@ MonoBehaviour:
   _gripCollider: {fileID: 6057420186179606060}
   _pinchPoint: {fileID: 7461159010069860055}
   _pinchCollider: {fileID: 772441392126002932}
-  _velocityCalculator: {fileID: 0}
 --- !u!4 &1016491084954833953
 Transform:
   m_ObjectHideFlags: 0
@@ -14570,6 +14761,7 @@ Transform:
   m_ConstrainProportionsScale: 0
   m_Children:
   - {fileID: 1168042864203857610}
+  - {fileID: 1063485271}
   m_Father: {fileID: 4397664626383135639}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1168042863977618289
@@ -14653,7 +14845,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1168042864203676350}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: aed62bf3ae2456c408f247f96808ce96, type: 3}
   m_Name: 
@@ -15044,9 +15236,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 4812058095361193944}
   _rigidbody: {fileID: 5805659807696151001}
-  _grabCenter: {fileID: 0}
   _grabTarget: {fileID: 73911183571644904}
-  _velocityCalculator: {fileID: 0}
 --- !u!1 &1234589112495832270
 GameObject:
   m_ObjectHideFlags: 0
@@ -20925,7 +21115,6 @@ MonoBehaviour:
   _grabOrigin: {fileID: 8658843910127384110}
   _gripPoint: {fileID: 8086765662880328808}
   _pinchPoint: {fileID: 1832475296940633399}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 93071075543709555}
@@ -21620,6 +21809,7 @@ GameObject:
   - component: {fileID: 3685480553099562219}
   - component: {fileID: 910400000000000008}
   - component: {fileID: 910400000000000003}
+  - component: {fileID: 910400000000000009}
   m_Layer: 0
   m_Name: ScanCoverSkeleton
   m_TagString: Untagged
@@ -21916,6 +22106,8 @@ MonoBehaviour:
   _hoverColor: {r: 1, g: 1, b: 1, a: 0.6313726}
   _selectColor: {r: 1, g: 1, b: 1, a: 0.9098039}
   _outlineColor: {r: 0.18823531, g: 0.2392157, b: 0.3254902, a: 0.8745098}
+  _hoverSize: 0.48
+  _selectSize: 0.4
   _offsetAlongNormal: 0.005
   _playerHead: {fileID: 5174769608808082787}
 --- !u!23 &2033332425732987408
@@ -23031,7 +23223,6 @@ MonoBehaviour:
   _gripCollider: {fileID: 5086336972090577225}
   _pinchPoint: {fileID: 8434493890543372722}
   _pinchCollider: {fileID: 1746913202536153489}
-  _velocityCalculator: {fileID: 0}
 --- !u!114 &2254349713019644492
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -23893,8 +24084,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 03190b23f0f30f74dacc4ed3992541b6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _leftEyeAnchor: {fileID: 1677128358}
-  _rightEyeAnchor: {fileID: 604495874}
   _centerEyeCamera: {fileID: 2140226224}
   _meshFilter: {fileID: 472165728909717035}
   _aimingDirection: {x: 0, y: 0, z: 1}
@@ -24267,7 +24456,6 @@ MonoBehaviour:
   _grabOrigin: {fileID: 4733971043789417538}
   _gripPoint: {fileID: 5305772230791214596}
   _pinchPoint: {fileID: 2375182262941316955}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 4094531392742534431}
@@ -25944,6 +26132,8 @@ MonoBehaviour:
   _hoverColor: {r: 1, g: 1, b: 1, a: 0.6313726}
   _selectColor: {r: 1, g: 1, b: 1, a: 0.9098039}
   _outlineColor: {r: 0.18823531, g: 0.2392157, b: 0.3254902, a: 0.8745098}
+  _hoverSize: 0.48
+  _selectSize: 0.4
   _offsetAlongNormal: 0.005
   _playerHead: {fileID: 9099642580500608783}
 --- !u!33 &2721684236432275830
@@ -26388,7 +26578,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &2734129240716749264
 GameObject:
   m_ObjectHideFlags: 0
@@ -26451,7 +26641,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &2749283072501746102
 GameObject:
   m_ObjectHideFlags: 0
@@ -27131,7 +27321,6 @@ MonoBehaviour:
   _gripCollider: {fileID: 9155353751175482149}
   _pinchPoint: {fileID: 5518390296329950174}
   _pinchCollider: {fileID: 2424728187488721917}
-  _velocityCalculator: {fileID: 0}
 --- !u!1 &2808941217185656805
 GameObject:
   m_ObjectHideFlags: 0
@@ -27676,9 +27865,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 8890044548826541492}
   _rigidbody: {fileID: 7568807045403655093}
-  _grabCenter: {fileID: 0}
   _grabTarget: {fileID: 4079840053864999812}
-  _velocityCalculator: {fileID: 0}
 --- !u!114 &2921036987925228432
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -31053,7 +31240,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &3497063246560307470
 GameObject:
   m_ObjectHideFlags: 0
@@ -31516,6 +31703,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6f21528085b305345aa60f40f4a5a5d8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _rayInteractor: {fileID: 0}
+  _renderer: {fileID: 0}
+  _materialPropertyBlockEditor: {fileID: 0}
+  _minRayVisualStartOffset: 0
+  _minRayVisualEndOffset: 0.05
+  _maxRayVisualLength: 0.5
+  _hoverColor: {r: 1, g: 1, b: 1, a: 1}
+  _selectColor: {r: 0, g: 0, b: 1, a: 1}
+  _hideWhenNoInteractable: 0
 --- !u!1 &3615468304359521253
 GameObject:
   m_ObjectHideFlags: 0
@@ -31982,6 +32178,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6f21528085b305345aa60f40f4a5a5d8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _rayInteractor: {fileID: 0}
+  _renderer: {fileID: 0}
+  _materialPropertyBlockEditor: {fileID: 0}
+  _minRayVisualStartOffset: 0
+  _minRayVisualEndOffset: 0.05
+  _maxRayVisualLength: 0.5
+  _hoverColor: {r: 1, g: 1, b: 1, a: 1}
+  _selectColor: {r: 0, g: 0, b: 1, a: 1}
+  _hideWhenNoInteractable: 0
 --- !u!4 &3674128692233616274
 Transform:
   m_ObjectHideFlags: 0
@@ -32738,7 +32943,6 @@ MonoBehaviour:
   _gripCollider: {fileID: 7892649250389740608}
   _pinchPoint: {fileID: 6778842864946549947}
   _pinchCollider: {fileID: 3684039496875465880}
-  _velocityCalculator: {fileID: 0}
 --- !u!1 &3780444958455423445
 GameObject:
   m_ObjectHideFlags: 0
@@ -33504,8 +33708,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 8293239549961829043}
   _teleportArc: {fileID: 3903482226499283584}
-  _equalDistanceThreshold: 0.1
-  _hmd: {fileID: 0}
+  _context: {fileID: 0}
 --- !u!1 &3903482226499283596
 GameObject:
   m_ObjectHideFlags: 0
@@ -34229,7 +34432,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &3942239838545131000
 GameObject:
   m_ObjectHideFlags: 0
@@ -34245,7 +34448,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &3942239838545131002
 GameObject:
   m_ObjectHideFlags: 0
@@ -34261,7 +34464,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &3942239838545131004
 GameObject:
   m_ObjectHideFlags: 0
@@ -34293,7 +34496,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &3942239838545619392
 Transform:
   m_ObjectHideFlags: 0
@@ -35231,7 +35434,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &4156531247063584913
 GameObject:
   m_ObjectHideFlags: 0
@@ -36394,7 +36597,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &4241966486563126407
 GameObject:
   m_ObjectHideFlags: 0
@@ -41837,9 +42040,7 @@ MonoBehaviour:
   _maxIterationsPerFrame: 3
   _data: {fileID: 0}
   _selector: {fileID: 6228455687487965012}
-  _grabCenter: {fileID: 0}
   _grabTarget: {fileID: 251930944411785380}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 3555981209922638248}
@@ -44209,8 +44410,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 2357639521402221103}
   _teleportArc: {fileID: 5188436381906290251}
-  _equalDistanceThreshold: 0.1
-  _hmd: {fileID: 7637457519348280}
+  _context: {fileID: 0}
 --- !u!114 &5188436381906290248
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -45072,7 +45272,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 08f7cfb1f9629da4494ac0840f3a3cfd, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _hand: {fileID: 1697441908435884629}
   _fingerFeatureStateProvider: {fileID: 5844005341614420071}
   _shapes:
   - {fileID: 11400000, guid: a4f76ee9a4bceba4385d001e7ee27427, type: 2}
@@ -49787,7 +49986,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!33 &5530015237181320328
 MeshFilter:
   m_ObjectHideFlags: 0
@@ -50260,8 +50459,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 5649874817985827543}
   _teleportArc: {fileID: 5649874816125201997}
-  _equalDistanceThreshold: 0.1
-  _hmd: {fileID: 8091271933422522458}
+  _context: {fileID: 0}
 --- !u!114 &5649874816125201997
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -50919,7 +51117,6 @@ MonoBehaviour:
   _grabOrigin: {fileID: 3440027526208926408}
   _gripPoint: {fileID: 2859500859480549518}
   _pinchPoint: {fileID: 5690659821873719761}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 6259350104057623445}
@@ -51382,7 +51579,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &5722301519991527627
 GameObject:
   m_ObjectHideFlags: 0
@@ -52130,7 +52327,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &5784408557250088326
 GameObject:
   m_ObjectHideFlags: 0
@@ -53460,6 +53657,8 @@ MonoBehaviour:
   _hoverColor: {r: 1, g: 1, b: 1, a: 0.69803923}
   _selectColor: {r: 1, g: 1, b: 1, a: 0.9490196}
   _outlineColor: {r: 0.18823531, g: 0.2392157, b: 0.3254902, a: 0.9490196}
+  _hoverSize: 0.48
+  _selectSize: 0.4
   _offsetAlongNormal: 0.005
   _playerHead: {fileID: 9099642580500608783}
 --- !u!1 &5959805516428147567
@@ -53656,7 +53855,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &5996210582781600140
 GameObject:
   m_ObjectHideFlags: 0
@@ -60145,7 +60344,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &6489747100214417421
 GameObject:
   m_ObjectHideFlags: 0
@@ -64348,7 +64547,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &6642106707517097195
 GameObject:
   m_ObjectHideFlags: 0
@@ -64412,7 +64611,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &6642106707517097211
 GameObject:
   m_ObjectHideFlags: 0
@@ -64444,7 +64643,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &6642106707517097215
 GameObject:
   m_ObjectHideFlags: 0
@@ -64460,7 +64659,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &6642106707517135041
 Transform:
   m_ObjectHideFlags: 0
@@ -71674,7 +71873,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &7491064686702159620
 GameObject:
   m_ObjectHideFlags: 0
@@ -71690,7 +71889,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &7491064686702159622
 GameObject:
   m_ObjectHideFlags: 0
@@ -71706,7 +71905,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &7491064686702159632
 GameObject:
   m_ObjectHideFlags: 0
@@ -71755,7 +71954,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &7491064686702159638
 GameObject:
   m_ObjectHideFlags: 0
@@ -72742,7 +72941,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!1 &7607084435190070497
 GameObject:
   m_ObjectHideFlags: 0
@@ -73529,6 +73728,8 @@ MonoBehaviour:
   _hoverColor: {r: 1, g: 1, b: 1, a: 0.69803923}
   _selectColor: {r: 1, g: 1, b: 1, a: 0.9490196}
   _outlineColor: {r: 0.18823531, g: 0.2392157, b: 0.3254902, a: 0.9490196}
+  _hoverSize: 0.48
+  _selectSize: 0.4
   _offsetAlongNormal: 0.005
   _playerHead: {fileID: 5174769608808082787}
 --- !u!1 &7722103444898835494
@@ -74861,7 +75062,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 08f7cfb1f9629da4494ac0840f3a3cfd, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _hand: {fileID: 3321003754917019705}
   _fingerFeatureStateProvider: {fileID: 7530589055907949067}
   _shapes:
   - {fileID: 11400000, guid: a4f76ee9a4bceba4385d001e7ee27427, type: 2}
@@ -75843,8 +76043,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 1810466405660108867}
   _teleportArc: {fileID: 8185593982282308647}
-  _equalDistanceThreshold: 0.1
-  _hmd: {fileID: 4144216589221384276}
+  _context: {fileID: 0}
 --- !u!1 &8185593982617602628
 GameObject:
   m_ObjectHideFlags: 0
@@ -76436,6 +76635,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 115a4fd4ac2e6844daa2305603ce9688, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _context: {fileID: 0}
 --- !u!114 &8300928853122545071
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -78226,7 +78426,6 @@ MonoBehaviour:
   _grabOrigin: {fileID: 1595817925833418916}
   _gripPoint: {fileID: 2177184602777252578}
   _pinchPoint: {fileID: 8602259880769827773}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 8018018105610955257}
@@ -78839,8 +79038,7 @@ MonoBehaviour:
   _data: {fileID: 0}
   _selector: {fileID: 8642537477254908091}
   _teleportArc: {fileID: 8642537477999866913}
-  _equalDistanceThreshold: 0.1
-  _hmd: {fileID: 5319294086505761334}
+  _context: {fileID: 0}
 --- !u!114 &8642537477999866913
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -79083,9 +79281,7 @@ MonoBehaviour:
   _maxIterationsPerFrame: 3
   _data: {fileID: 0}
   _selector: {fileID: 8068196874345291064}
-  _grabCenter: {fileID: 0}
   _grabTarget: {fileID: 4244392949047624392}
-  _velocityCalculator: {fileID: 0}
   _distantCandidateComputer:
     _detectionFrustums:
       _selectionFrustum: {fileID: 630916454272256964}
@@ -85874,7 +86070,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 8839895568389098425}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: aed62bf3ae2456c408f247f96808ce96, type: 3}
   m_Name: 

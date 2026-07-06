@@ -28,12 +28,12 @@ from ScanCoverQuest3CloneDataManifest import DEFAULT_MANIFEST, derived_output, l
 
 
 DEFAULT_LEARNING_PROFILE = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+    r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
     r"\Quest3CloneDataManifest\CombinedObservationStats_UsableCloneData\quest3_learning_profile.json"
 )
 
 DEFAULT_REAL_SUMMARY = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+    r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
     r"\Quest3CloneDataManifest\CombinedObservationStats_UsableCloneData\combined_observation_summary.json"
 )
 
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         "--pose-session",
         type=Path,
         default=Path(
-            r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports\ScanSessions"
+            r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports\ScanSessions"
             r"\ScanCover_MultiFrame_20260603_115601_360"
         ),
         help="ScanCover_MultiFrame_... session folder used as real Quest3 pose path.",
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "--out",
         type=Path,
         default=Path(
-            r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+            r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
             r"\Quest3VirtualCloneExperiments"
         ),
     )

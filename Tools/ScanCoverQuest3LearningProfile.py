@@ -17,7 +17,7 @@ from ScanCoverQuest3CloneDataManifest import DEFAULT_MANIFEST, derived_output, l
 
 
 DEFAULT_SUMMARY = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+    r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
     r"\Quest3ObservationStatsSessions\CombinedObservationStats\combined_observation_summary.json"
 )
 

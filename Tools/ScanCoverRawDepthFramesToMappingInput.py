@@ -25,7 +25,7 @@ from typing import Iterable
 
 
 DEFAULT_ROOT = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main"
+    r"E:\PCAII\NEW-SCANCOVER"
     r"\ScanCoverExports\RepeatCoverageSessions\RepeatCoverageSessions"
 )
 

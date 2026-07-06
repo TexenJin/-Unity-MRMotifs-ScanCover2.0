@@ -10,7 +10,7 @@ from typing import Any
 
 
 DEFAULT_MANIFEST = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main\ScanCoverExports"
+    r"E:\PCAII\NEW-SCANCOVER\ScanCoverExports"
     r"\Quest3CloneDataManifest\quest3_clone_data_manifest.json"
 )
 

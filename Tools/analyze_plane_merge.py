@@ -758,7 +758,9 @@ def triangle_circumradius_2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> flo
     ab = float(np.linalg.norm(a - b))
     bc = float(np.linalg.norm(b - c))
     ca = float(np.linalg.norm(c - a))
-    area2 = abs(float(np.cross(b - a, c - a)))
+    ba = b - a
+    ca_vec = c - a
+    area2 = abs(float(ba[0] * ca_vec[1] - ba[1] * ca_vec[0]))
     if area2 <= 1e-8:
         return float("inf")
     return (ab * bc * ca) / (2.0 * area2)

@@ -27,7 +27,7 @@ import open3d as o3d
 
 
 DEFAULT_SESSION = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main"
+    r"E:\PCAII\NEW-SCANCOVER"
     r"\ScanCoverExports\RepeatCoverageSessions"
     r"\ScanCover_RepeatCoverage_20260612_173442_610"
     r"\trusted_region_extraction"

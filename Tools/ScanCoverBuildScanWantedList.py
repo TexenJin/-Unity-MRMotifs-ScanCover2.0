@@ -30,7 +30,7 @@ from pathlib import Path
 
 
 DEFAULT_INPUT = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main"
+    r"E:\PCAII\NEW-SCANCOVER"
     r"\ScanCoverExports\RepeatCoverageSessions\RepeatCoverageSessions"
     r"\raw_depth_mapping_input_stride5_neighbor_relaxed"
 )

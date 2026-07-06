@@ -1,5 +1,312 @@
-﻿%YAML 1.1
+%YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
+--- !u!1 &920700000000000001
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 920700000000000002}
+  - component: {fileID: 920700000000000003}
+  m_Layer: 0
+  m_Name: DepthGridPointCloud_Right
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &920700000000000002
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920700000000000001}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 8339204531541255407}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &920700000000000003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 920700000000000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9ca0fc213af84db28e0bd5469b31718d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  preprocessor: {fileID: 2985787315308874788}
+  markerPrefab: {fileID: 0}
+  markerParent: {fileID: 0}
+  samplingMode: 0
+  stridePixels: 4
+  stridePixelsX: 4
+  stridePixelsY: 4
+  regularGridMaxColumns: 30
+  regularGridMaxRows: 40
+  centerRegularGridWindow: 1
+  centerRegularGridWindowOnHeadsetForward: 1
+  regularGridUseViewportCoverage: 1
+  regularGridViewportCoverageScale: 1
+  regularGridUseFixedWorldSize: 0
+  regularGridUseDepthHitPlaneOnly: 0
+  regularGridUseVerticalDepthPlaneExperiment: 0
+  regularGridUseSurfacePlaneAxesForVerticalDepthGrid: 0
+  verticalDepthGridSurfaceAxisMinFacingDot: 0.18
+  verticalDepthGridSurfaceAxisMaxWorldUpDot: 0.82
+  verticalDepthGridSampleRadiusMultiplier: 0.85
+  verticalDepthGridMaxForwardOffsetMeters: 2.5
+  regularGridWorldCellSizeMeters: 0.04
+  regularGridFixedWorldWindowScale: 0.5
+  regularGridUseSmoothDistanceScale: 1
+  regularGridFarMinStepPixels: 0.05
+  regularGridStepSoftFloorPixels: 0.1
+  regularGridFixedWorldDepthFillRadiusPixels: 4
+  depthPixelVFlip: 0
+  adaptiveTileSizePixels: 8
+  adaptiveTileSampleStride: 1
+  adaptiveMinTileValidRatio: 0.25
+  adaptiveMinNormalDot: 0.72
+  adaptiveMaxPlaneDeviationMeters: 0.03
+  viewLockedOrigin: {fileID: 0}
+  volumeLockPitch: 1
+  volumeLockRoll: 1
+  volumeForwardOffsetMeters: 1.2
+  volumeHalfExtents: {x: 1.35, y: 1, z: 0.85}
+  volumeFaceSampleMeters: 0.04
+  volumeCapturePaddingMeters: 0.12
+  volumeUseSideFaces: 1
+  volumeUseTopBottomFaces: 1
+  volumeMinBinCoverage: 0
+  volumeMinFaceNormalDot: -1
+  volumePlaneBlendMeters: 0.03
+  minConfidence: 0.2
+  minLinearDepthMeters: 0.35
+  maxLinearDepthMeters: 6
+  requireValidNormal: 0
+  neighborFill: 1
+  neighborRadiusPixels: 1
+  showMarkers: 1
+  updateEveryFrame: 1
+  orientToNormal: 0
+  surfaceBiasMeters: 0.0015
+  fallbackMarkerScaleMeters: 0.012
+  snapshotGridUniformColor: {r: 0.55, g: 0.55, b: 0.55, a: 1}
+  previewDisplayVisible: 1
+  useWorldSpaceDisplayRoots: 0
+  lockUnfrozenDisplayRoll: 0
+  lockUnfrozenDisplayPitch: 0
+  lockUnfrozenDisplayYaw: 0
+  compensateRegularGridRollSampling: 0
+  showRuntimeAxisDebug: 0
+  runtimeAxisOffset: {x: 0, y: 0, z: 0.8}
+  runtimeAxisCubeSize: 0.12
+  runtimeAxisLength: 0.4
+  runtimeAxisThickness: 0.03
+  showGridLines: 0
+  showGridOuterContourOnly: 1
+  showRectilinearFillInsideContour: 0
+  rectilinearRennetStride: 2
+  rectilinearRennetMinNormalDot: 0.45
+  rectilinearRennetMaxEdgeSpanMultiplier: 3
+  showGridTriangulation: 0
+  rectifyGridLinesAfterDepthWrap: 0
+  gridLineRequireContinuousSurface: 1
+  rectifiedGridLineMaxSpanMultiplier: 2.35
+  rectifiedGridLineMinValidRatio: 0.18
+  gridLineMinNeighborNormalDot: 0.2
+  gridLineRequireCompleteCellSupport: 0
+  gridLineMinCompleteCellIslandCount: 8
+  gridLineKeepLargestCompleteCellIslands: 1
+  gridLineMaterialOverride: {fileID: 0}
+  gridLineColor: {r: 1, g: 1, b: 1, a: 1}
+  gridLineSurfaceOffsetMeters: 0.004
+  gridLinesRenderBehindCandidatePatch: 0
+  syncGridLinesToFocusedCandidate: 0
+  focusedGridPlaneToleranceMeters: 0.08
+  focusedGridExpandMeters: 0.06
+  showGridInteriorMesh: 0
+  gridInteriorDisplayMode: 0
+  showSurfaceMesh: 0
+  keepSurfaceMeshAvailableWhenHidden: 0
+  useIndexConnectivity: 1
+  surfaceMaterialOverride: {fileID: 0}
+  maxEdgeLengthMeters: 0.2
+  minNeighborNormalDot: 0.35
+  surfaceColor: {r: 0.18, g: 0.95, b: 0.98, a: 1}
+  surfaceDoubleSided: 1
+  showGeometricSurfaceGrid: 1
+  geometricSurfaceGridUseRansacPatches: 1
+  geometricSurfaceGridSpacingMeters: 0.12
+  geometricSurfaceGridLineWidthMeters: 0.0035
+  geometricSurfaceGridSurfaceOffsetMeters: 0.008
+  geometricSurfaceGridColor: {r: 1, g: 1, b: 1, a: 0.92}
+  ransacPatchMaxSamples: 768
+  ransacPatchIterations: 48
+  ransacPatchPlanesPerBucket: 2
+  ransacPatchInlierDistanceMeters: 0.035
+  ransacPatchNormalDot: 0.72
+  ransacPatchMinInliers: 28
+  ransacPatchGridCellMeters: 0.18
+  ransacPatchMaxGridCellsPerAxis: 24
+  showProbeRowExperiment: 0
+  probeRowUseCurrentMeshHorizontalExtent: 1
+  probeRowPointCount: 13
+  probeRowMaxPointCount: 128
+  probeRowSpacingMeters: 0.06
+  probeRowHorizontalPaddingMeters: 0.12
+  probeRowTargetDistanceMeters: 1.2
+  probeRowMaxRayDistanceMeters: 6
+  probeRowMarkerScaleMeters: 0.025
+  probeRowLineWidthMeters: 0.006
+  probeRowSurfaceOffsetMeters: 0.012
+  probeRowRecognitionRadiusMeters: 0.09
+  probeRowMinNeighborhoodSamples: 3
+  probeRowStableNormalDot: 0.82
+  probeRowRefineNormalDot: 0.45
+  probeRowStablePlaneDeviationMeters: 0.025
+  probeRowStableDistanceMultiplier: 1.8
+  probeRowRefineDistanceMultiplier: 3
+  probeRowPointColor: {r: 0, g: 1, b: 1, a: 1}
+  probeRowStableLineColor: {r: 0.1, g: 1, b: 0.3, a: 1}
+  probeRowRefineLineColor: {r: 1, g: 0.85, b: 0.05, a: 1}
+  probeRowBreakLineColor: {r: 1, g: 0.08, b: 0.08, a: 1}
+  showHeightSliceContour: 0
+  heightSliceUseFrozenScreenCenterHeight: 1
+  heightSliceRowCount: 32
+  heightSliceShowPerpendicularColumns: 1
+  heightSliceColumnCount: 32
+  showHeightSlicePlaneFrame: 1
+  heightSliceShowSampleColumnPlaneFrames: 0
+  heightSliceSampleColumnPlaneFrameCount: 5
+  heightSliceEpsilonMeters: 0.01
+  heightSliceMaxSegmentMeters: 0.28
+  heightSliceLineWidthMeters: 0.006
+  heightSliceContourColor: {r: 0.08, g: 0.85, b: 1, a: 0.95}
+  heightSlicePlaneFrameColor: {r: 1, g: 1, b: 1, a: 0.35}
+  showPlaneFamilyClassification: 0
+  planeFamilyDisplayAsPointQuads: 0
+  planeFamilyPointSizeMeters: 0.014
+  planeFamilyMaxSamples: 4096
+  planeFamilyRansacIterations: 96
+  planeFamilyMaxFamilies: 10
+  planeFamilyMinInliers: 96
+  planeFamilyFitDistanceMeters: 0.055
+  planeFamilyClassifyDistanceMeters: 0.09
+  planeFamilyClassifyNormalDegrees: 48
+  planeFamilyMergeNormalDegrees: 16
+  planeFamilyMergeDistanceMeters: 0.18
+  planeFamilyUseSpatialConsistency: 1
+  planeFamilySpatialSmoothingPasses: 2
+  planeFamilyMinIslandPoints: 18
+  planeFamilyNeighborVoteThreshold: 3
+  planeFamilyWeakIslandMaxPoints: 260
+  planeFamilyWeakIslandMaxRatio: 0.08
+  planeFamilyWeakIslandBorderRatio: 0.55
+  planeFamilyWeakIslandRelaxNormalDegrees: 68
+  planeFamilyWeakIslandRelaxDistanceMultiplier: 1.25
+  planeFamilySurfaceAlpha: 1
+  planeFamilyOutlierColor: {r: 0.55, g: 0.55, b: 0.55, a: 1}
+  planeFamilyUseStructuralConsensus: 1
+  planeFamilyStrongDistanceRatio: 0.45
+  planeFamilyProjectionPaddingMeters: 0.22
+  planeFamilyNormalScoreWeight: 0.03
+  planeFamilyStructuralNeighborMinSame: 4
+  planeFamilyStructuralNeighborMinRatio: 0.45
+  planeFamilyDiagnostics: 1
+  planeFamilyDiagnosticsExportCsv: 1
+  planeFamilyDiagnosticsLogSummary: 1
+  planeFamilyDiagnosticsMinIntervalSeconds: 2
+  colorizeSurfaceRegions: 0
+  showIrregularSurfaceBucket: 1
+  irregularSurfaceBucketAlpha: 0.18
+  surfaceRegionCreaseAngleDegrees: 12
+  surfaceRegionMinQuadCount: 12
+  surfaceNormalPatchMergeAngleDegrees: 10
+  surfaceNormalFamilyAngleDegrees: 18
+  surfaceNormalAxisBucketMinDot: 0.82
+  surfaceLargeComponentMinTriangleCount: 48
+  surfaceLargeComponentKeepRatio: 0.22
+  surfaceRegionMaxNeighborDistanceMeters: 0.12
+  surfaceRegionMaxPlaneOffsetMeters: 0.03
+  surfaceRegionColorSaturation: 0.62
+  surfaceRegionColorValue: 0.95
+  isolateTopCandidateSurfaces: 0
+  topCandidateSurfaceCount: 4
+  topCandidateSurfaceMinTriangleCount: 48
+  candidatePreferViewCenter: 1
+  candidateViewCenterRadius: 0.28
+  candidateViewCenterScoreWeight: 1.25
+  candidateFaceCountScoreWeight: 0.35
+  candidateFacingScoreWeight: 0.9
+  candidateMinFacingScore: 0.55
+  candidateCenterFacingRelaxation: 0.12
+  candidateSurfaceMergeAngleDegrees: 14
+  candidateSurfaceMergePlaneOffsetMeters: 0.05
+  candidateSurfaceMergeMinSharedEdges: 2
+  rebuildLargestCandidateAsRegularGrid: 1
+  largestCandidateUseTriangularLattice: 1
+  largestCandidateUseOriginalGridTerrain: 1
+  largestCandidateProjectRegularGridToMeshTerrain: 1
+  largestCandidateShowFill: 0
+  largestCandidateGridCellSizeMeters: 0.08
+  largestCandidateGridMaxColumns: 64
+  largestCandidateGridMaxRows: 64
+  largestCandidateGridFillAlpha: 0.28
+  largestCandidateGridLineColor: {r: 1, g: 1, b: 1, a: 0.92}
+  largestCandidateGridLineWidthMeters: 0.006
+  largestCandidateGridShowCellDiagonals: 0
+  largestCandidateGridMinNeighborCount: 2
+  largestCandidateGridMinIslandCellCount: 3
+  largestCandidateGridMinCellCount: 12
+  largestCandidateGridMinIslandSpanCells: 3
+  largestCandidateGridKeepTopIslandCount: 2
+  largestCandidateGridUseViewportFilter: 1
+  largestCandidateGridMinViewportMaxSpan: 0.1
+  largestCandidateGridMinViewportArea: 0.008
+  showCandidatePlaneObjects: 1
+  candidatePlaneObjectCount: 4
+  candidatePlaneMinSizeMeters: 0.08
+  candidatePlanePaddingMeters: 0.01
+  candidatePlaneSurfaceOffsetMeters: 0.004
+  candidatePlaneAlpha: 0.32
+  candidatePlaneColor: {r: 1, g: 0.18, b: 0.12, a: 0.32}
+  showSurfaceNormalIndicators: 0
+  surfaceNormalIndicatorLengthMeters: 0.035
+  surfaceNormalIndicatorThicknessMeters: 0.0025
+  surfaceNormalIndicatorColor: {r: 1, g: 0.95, b: 0.2, a: 0.95}
+  showCenterDebugMarkers: 0
+  showScreenCenterDebugMarker: 0
+  showFocusedGridCenterDebugMarker: 0
+  showPatchCenterDebugMarker: 0
+  centerDebugMarkerScaleMeters: 0.025
+  centerDebugSurfaceOffsetMeters: 0.01
+  screenCenterDebugColor: {r: 1, g: 0.2, b: 0.2, a: 0.95}
+  gridCenterDebugColor: {r: 1, g: 0.9, b: 0.2, a: 0.95}
+  patchCenterDebugColor: {r: 0.2, g: 1, b: 1, a: 0.95}
+  showHeadsetScreenCenterMarker: 0
+  headsetScreenCenterMarkerDistanceMeters: 1
+  headsetScreenCenterMarkerScaleMeters: 0.025
+  headsetScreenCenterMarkerColor: {r: 1, g: 0.05, b: 0.05, a: 1}
+  showRawDepthScreenCenterMarker: 1
+  rawDepthScreenCenterMarkerScaleMeters: 0.03
+  rawDepthScreenCenterMarkerColor: {r: 1, g: 0.05, b: 0.05, a: 1}
+  showOriginalGridCenterMarker: 0
+  originalGridCenterMarkerScaleMeters: 0.035
+  originalGridCenterMarkerColor: {r: 1, g: 0, b: 1, a: 1}
+  debugLog: 0
+  logBounds: 0
+  dumpRosterOnceOnPlay: 0
+  dumpOnlyValidCellsInRoster: 0
 --- !u!1 &932018954280123962
 GameObject:
   m_ObjectHideFlags: 0
@@ -341,87 +648,54 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 4fdaa414be4de4948be578cca447ad66, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  builder: {fileID: 6697777679687518655}
-  mesher: {fileID: 1502512469926685553}
-  displaySurfaceBuilder: {fileID: 0}
-  tsdfBranch: {fileID: 910500000000000001}
+  runtimeCore: {fileID: 0}
   surfaceSnapshotManager: {fileID: 0}
   depthGridPointCloud: {fileID: 0}
-  depthGridReferenceShellManager: {fileID: 0}
+  depthGridSnapshot64: {fileID: 0}
+  seedConfidencePatch: {fileID: 0}
+  depthPointBurstWindow: {fileID: 0}
+  depthProbeRows: []
   autoStartOnEnable: 1
   clearOnAutoStart: 1
   preferRightHandController: 1
+  useOvrInput: 1
+  useXrControllerInput: 0
+  useGamepadFallback: 0
   startScanButton: 0
+  captureSnapshotButton: 0
+  toggleSnapshotFreezeButton: 0
   freezeBuildButton: 3
   clearAllButton: 0
-  toggleRenderButton: 0
+  deprecatedPreviewVisibilityButton: 0
+  allowDeprecatedPreviewToggleButton: 0
   startScanClearsExisting: 0
-  keepCommittedVisibleWhileScanning: 0
-  showFrozenRendererByDefault: 0
-  debugLog: 1
-  enableLegacyVisualChain: 0
-  rebuildAllChunksOnFreeze: 1
-  rebuildDisplaySurfaceOnFreeze: 0
   captureSurfaceSnapshotOnFreeze: 1
-  freezeBuildSnapshotOnly: 1
+  freezeProbeRowsAfterSnapshotCapture: 1
+  hideDepthPreviewOnClearAll: 0
+  forceClearSurfaceSnapshotsOnClearAll: 1
+  enableLegacyVisualChain: 0
+  debugLog: 1
+  inputDebounceSeconds: 0.35
+  ignoreInputWhileCaptureBurstRunning: 1
+  usePureDepthGridSnapshot64Route: 1
+  clearPureSnapshotOnClearAll: 1
+  useDepthPointBurstWindowRoute: 1
+  clearDepthPointBurstOnClearAll: 1
+  disableLegacyRoutesWhenPointBurstRoute: 1
+  useSeedConfidencePatchRoute: 1
+  clearSeedConfidenceOnClearAll: 1
+  disableLegacyRoutesWhenSeedRoute: 1
+  useCaptureBurst: 1
+  captureBurstRefreshCount: 1
+  captureBurstTimeoutSeconds: 0.6
+  captureSurfaceSnapshotOnManualCapture: 0
+  stopRealtimeAfterCaptureBurst: 1
   exportSnapshotObjOnFreeze: 0
   exportAllSnapshotsAsSingleObjOnFreeze: 0
   exportIncrementalReferenceShellOnFreeze: 0
+  exportBlSurfaceMeshObjOnFreeze: 1
+  exportGridNodeCsvOnFreeze: 1
   exportGridStateJsonOnFreeze: 0
-  integratePointReferenceShellOnFreeze: 0
-  exportPointReferenceShellObjOnFreeze: 0
-  exportPointReferenceStateJsonOnFreeze: 0
-  autoCommitWhileScanning: 1
-  autoCommitIntervalSeconds: 0.5
-  autoCommitMinConfirmedCellsPerTile: 24
-  autoCommitRecentWindowSeconds: 2
-  autoCommitMaxRecentGrowthRatio: 0.12
-  autoCommitCurrentTileOnly: 0
-  buildCommittedCollidersWhileScanning: 1
-  commitReadyTilesOnFreeze: 1
---- !u!114 &910500000000000001
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 5151920413728394309}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1b1c819c960cfc447b55aff2f66f22dd, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  referenceFrame: {fileID: 8339204531541255407}
-  builder: {fileID: 6697777679687518655}
-  environmentDepthManager: {fileID: 0}
-  depthPreprocessor: {fileID: 2985787315308874788}
-  preferredEye: 1
-  autoResolveRefs: 1
-  integrateWhileScanning: 1
-  integrateIntervalSeconds: 0.2
-  voxelSizeMeters: 0.1
-  volumeSizeX: 96
-  volumeSizeY: 48
-  volumeSizeZ: 96
-  volumeCenterLocal: {x: 0, y: 1.4, z: 0}
-  truncationPositiveMeters: 0.35
-  truncationNegativeMeters: -0.15
-  maxIntegratedWeight: 24
-  minObservationConfidence: 0.18
-  minNormalFacingDot: 0.2
-  minDepthMeters: 0.35
-  maxDepthMeters: 6
-  hideSurfaceWhileScanning: 1
-  showSurfaceWhenFrozen: 1
-  buildCollider: 0
-  minTrianglesToShow: 24
-  minObservedWeightForMeshing: 0.5
-  surfaceColor: {r: 0.18, g: 0.58, b: 1, a: 0.85}
-  mergeVoxelShell: 0
-  voxelShellMinHits: 2
-  voxelShellSkipIfTsdfWeightAtLeast: 1.5
-  voxelShellInflateMeters: 0.002
-  debugLog: 1
 --- !u!114 &1411968705968422067
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -501,6 +775,50 @@ MonoBehaviour:
   consolidationMinNormalDot: 0.65
   updateEveryFrame: 1
   debugLog: 0
+--- !u!114 &910500000000000001
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 5151920413728394309}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1b1c819c960cfc447b55aff2f66f22dd, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  referenceFrame: {fileID: 8339204531541255407}
+  builder: {fileID: 6697777679687518655}
+  environmentDepthManager: {fileID: 0}
+  depthPreprocessor: {fileID: 2985787315308874788}
+  preferredEye: 1
+  autoResolveRefs: 1
+  integrateWhileScanning: 1
+  integrateIntervalSeconds: 0.2
+  voxelSizeMeters: 0.1
+  volumeSizeX: 96
+  volumeSizeY: 48
+  volumeSizeZ: 96
+  volumeCenterLocal: {x: 0, y: 1.4, z: 0}
+  truncationPositiveMeters: 0.35
+  truncationNegativeMeters: -0.15
+  maxIntegratedWeight: 24
+  minObservationConfidence: 0.18
+  minNormalFacingDot: 0.2
+  minDepthMeters: 0.35
+  maxDepthMeters: 6
+  renderDebugSurfaceObject: 0
+  hideSurfaceWhileScanning: 1
+  showSurfaceWhenFrozen: 1
+  buildCollider: 0
+  minTrianglesToShow: 24
+  minObservedWeightForMeshing: 0.5
+  surfaceColor: {r: 0.18, g: 0.58, b: 1, a: 0.85}
+  mergeVoxelShell: 0
+  voxelShellMinHits: 2
+  voxelShellSkipIfTsdfWeightAtLeast: 1.5
+  voxelShellInflateMeters: 0.002
+  debugLog: 1
 --- !u!1 &5710583793539256057
 GameObject:
   m_ObjectHideFlags: 0
@@ -780,130 +1098,3 @@ MonoBehaviour:
   logWarnings: 1
   drawGizmosSelected: 1
   gizmoRadius: 0.03
---- !u!1 &920700000000000001
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 920700000000000002}
-  - component: {fileID: 920700000000000003}
-  m_Layer: 0
-  m_Name: DepthGridPointCloud_Right
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!4 &920700000000000002
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920700000000000001}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 8339204531541255407}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &920700000000000003
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 920700000000000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 9ca0fc213af84db28e0bd5469b31718d, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  preprocessor: {fileID: 2985787315308874788}
-  markerPrefab: {fileID: 0}
-  markerParent: {fileID: 0}
-  samplingMode: 0
-  stridePixels: 4
-  stridePixelsX: 4
-  stridePixelsY: 4
-  regularGridMaxColumns: 30
-  regularGridMaxRows: 40
-  depthPixelVFlip: 0
-  adaptiveTileSizePixels: 8
-  adaptiveTileSampleStride: 1
-  adaptiveMinTileValidRatio: 0.25
-  adaptiveMinNormalDot: 0.72
-  adaptiveMaxPlaneDeviationMeters: 0.03
-  viewLockedOrigin: {fileID: 0}
-  volumeLockPitch: 1
-  volumeLockRoll: 1
-  volumeForwardOffsetMeters: 1.2
-  volumeHalfExtents: {x: 1.35, y: 1, z: 0.85}
-  volumeFaceSampleMeters: 0.04
-  volumeCapturePaddingMeters: 0.12
-  volumeUseSideFaces: 1
-  volumeUseTopBottomFaces: 1
-  volumeMinBinCoverage: 0
-  volumeMinFaceNormalDot: -1
-  volumePlaneBlendMeters: 0.03
-  minConfidence: 0.2
-  minLinearDepthMeters: 0.35
-  maxLinearDepthMeters: 6
-  requireValidNormal: 0
-  neighborFill: 1
-  neighborRadiusPixels: 1
-  showMarkers: 1
-  updateEveryFrame: 1
-  orientToNormal: 0
-  surfaceBiasMeters: 0.0015
-  fallbackMarkerScaleMeters: 0.012
-  useWorldSpaceDisplayRoots: 0
-  lockUnfrozenDisplayRoll: 0
-  lockUnfrozenDisplayPitch: 0
-  lockUnfrozenDisplayYaw: 0
-  compensateRegularGridRollSampling: 0
-  showRuntimeAxisDebug: 0
-  confidenceGradient:
-    serializedVersion: 2
-    key0: {r: 1, g: 0, b: 0, a: 1}
-    key1: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}
-    key2: {r: 0, g: 1, b: 1, a: 1}
-    key3: {r: 0, g: 0, b: 0, a: 0}
-    key4: {r: 0, g: 0, b: 0, a: 0}
-    key5: {r: 0, g: 0, b: 0, a: 0}
-    key6: {r: 0, g: 0, b: 0, a: 0}
-    key7: {r: 0, g: 0, b: 0, a: 0}
-    ctime0: 0
-    ctime1: 32768
-    ctime2: 65535
-    ctime3: 0
-    ctime4: 0
-    ctime5: 0
-    ctime6: 0
-    ctime7: 0
-    atime0: 0
-    atime1: 65535
-    atime2: 0
-    atime3: 0
-    atime4: 0
-    atime5: 0
-    atime6: 0
-    atime7: 0
-    m_Mode: 0
-    m_ColorSpace: -1
-    m_NumColorKeys: 3
-    m_NumAlphaKeys: 2
-  showSurfaceMesh: 0
-  useIndexConnectivity: 1
-  maxEdgeLengthMeters: 0.2
-  minNeighborNormalDot: 0.35
-  surfaceColor: {r: 0.18, g: 0.95, b: 0.98, a: 1}
-  surfaceDoubleSided: 1
-  debugLog: 0
-  logBounds: 0
-

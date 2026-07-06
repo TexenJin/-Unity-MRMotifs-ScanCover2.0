@@ -32,6 +32,8 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public ScanCoverSurfaceSnapshotManager surfaceSnapshotManager;
     public ScanCoverDepthGridPointCloud depthGridPointCloud;
     public ScanCoverDepthGridSnapshot64 depthGridSnapshot64;
+    public ScanCoverRawSnapshotCompressedGrid rawSnapshotCompressedGrid;
+    public ScanCoverTsdfSingleShellPrototype tsdfSingleShell;
     public ScanCoverSeedConfidencePatch seedConfidencePatch;
     public ScanCoverDepthPointBurstWindow depthPointBurstWindow;
     public DepthEffectsDepthProbeRowRenderer[] depthProbeRows;
@@ -81,6 +83,15 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     public bool useDepthPointBurstWindowRoute = true;
     public bool clearDepthPointBurstOnClearAll = true;
     public bool disableLegacyRoutesWhenPointBurstRoute = true;
+
+    [Header("Raw Snapshot Compressed Grid Route")]
+    public bool useRawSnapshotCompressedGridRoute = true;
+    public bool clearRawSnapshotCompressedGridOnClearAll = true;
+
+    [Header("TSDF Single Shell Route")]
+    public bool useTsdfSingleShellRoute = true;
+    public bool clearTsdfSingleShellOnClearAll = true;
+    public bool clearRawSnapshotGridWhenUsingTsdfRoute = true;
 
     [Header("Seed Confidence Patch Route")]
     public bool useSeedConfidencePatchRoute = true;
@@ -158,6 +169,32 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
     {
         ResolveRefs();
 
+        if (useTsdfSingleShellRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            tsdfSingleShell?.PrepareRoute();
+            if (clearRawSnapshotGridWhenUsingTsdfRoute)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+            if (clearExisting && clearTsdfSingleShellOnClearAll)
+                tsdfSingleShell?.ClearShell();
+
+            ClearHudStats();
+            State = SessionState.Scanning;
+            return;
+        }
+
+        if (useRawSnapshotCompressedGridRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            rawSnapshotCompressedGrid?.PrepareRoute();
+            if (clearExisting && clearRawSnapshotCompressedGridOnClearAll)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+
+            ClearHudStats();
+            State = SessionState.Scanning;
+            return;
+        }
+
         if (useDepthPointBurstWindowRoute)
         {
             DisableLegacyRoutesForPointBurstRoute();
@@ -204,6 +241,24 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
         ResolveRefs();
         if (exportBlSurfaceMeshObjOnFreeze && depthGridPointCloud != null)
             depthGridPointCloud.RequestExportSurfaceMeshObjAfterNextBuild();
+
+        if (useTsdfSingleShellRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            if (clearRawSnapshotGridWhenUsingTsdfRoute)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+            tsdfSingleShell?.CaptureRawSnapshotAndIntegrate();
+            State = SessionState.Scanning;
+            return;
+        }
+
+        if (useRawSnapshotCompressedGridRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            rawSnapshotCompressedGrid?.CaptureRawSnapshotAndBuild();
+            State = SessionState.Scanning;
+            return;
+        }
 
         if (useDepthPointBurstWindowRoute)
         {
@@ -270,6 +325,24 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
         ResolveRefs();
         if (exportBlSurfaceMeshObjOnFreeze && depthGridPointCloud != null)
             depthGridPointCloud.RequestExportSurfaceMeshObjAfterNextBuild();
+
+        if (useTsdfSingleShellRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            if (clearRawSnapshotGridWhenUsingTsdfRoute)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+            tsdfSingleShell?.CaptureRawSnapshotAndIntegrate();
+            State = SessionState.Frozen;
+            return;
+        }
+
+        if (useRawSnapshotCompressedGridRoute)
+        {
+            DisableLegacyVisualsForRawSnapshotRoute();
+            rawSnapshotCompressedGrid?.CaptureRawSnapshotAndBuild();
+            State = SessionState.Scanning;
+            return;
+        }
 
         if (useDepthPointBurstWindowRoute)
         {
@@ -338,6 +411,28 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
         {
             StopCoroutine(_captureBurstRoutine);
             _captureBurstRoutine = null;
+        }
+
+        if (useTsdfSingleShellRoute)
+        {
+            if (clearTsdfSingleShellOnClearAll)
+                tsdfSingleShell?.ClearShell();
+            if (clearRawSnapshotGridWhenUsingTsdfRoute)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+
+            ClearHudStats();
+            State = SessionState.Idle;
+            return;
+        }
+
+        if (useRawSnapshotCompressedGridRoute)
+        {
+            if (clearRawSnapshotCompressedGridOnClearAll)
+                rawSnapshotCompressedGrid?.ClearDisplay();
+
+            ClearHudStats();
+            State = SessionState.Idle;
+            return;
         }
 
         if (useDepthPointBurstWindowRoute)
@@ -519,6 +614,106 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
         return captured;
     }
 
+    private static void DisableQuestSpatialScanPlayback()
+    {
+        ScanCoverQuestSpatialScanPlayback[] playbacks =
+            FindObjectsByType<ScanCoverQuestSpatialScanPlayback>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < playbacks.Length; i++)
+        {
+            if (playbacks[i] != null)
+                playbacks[i].enabled = false;
+        }
+    }
+
+    private void DisableLegacyVisualsForRawSnapshotRoute()
+    {
+        if (depthGridSnapshot64 != null)
+        {
+            depthGridSnapshot64.ClearSnapshot();
+            depthGridSnapshot64.enabled = false;
+        }
+
+        if (depthPointBurstWindow != null)
+        {
+            depthPointBurstWindow.ClearCapture();
+            depthPointBurstWindow.enabled = false;
+        }
+
+        if (seedConfidencePatch != null)
+            seedConfidencePatch.enabled = false;
+
+        if (depthGridPointCloud != null)
+        {
+            depthGridPointCloud.ApplyRuleHardeningProfileV01();
+            depthGridPointCloud.SetUpdateEveryFrame(false);
+            depthGridPointCloud.SetPreviewDisplayVisible(false);
+            depthGridPointCloud.SetPreviewVisible(false);
+        }
+
+        ScanCoverRawDepthProjectedPointCloud[] projectedPointClouds =
+            FindObjectsByType<ScanCoverRawDepthProjectedPointCloud>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < projectedPointClouds.Length; i++)
+        {
+            ScanCoverRawDepthProjectedPointCloud projectedPointCloud = projectedPointClouds[i];
+            if (projectedPointCloud == null)
+                continue;
+
+            projectedPointCloud.ClearSnapshot();
+            projectedPointCloud.enabled = false;
+        }
+
+        DisableLegacyPointCloudDisplayBehaviours();
+        SuppressMultiFrameExporterRawSnapshotOverlays();
+        DisableQuestSpatialScanPlayback();
+    }
+
+    private static void SuppressMultiFrameExporterRawSnapshotOverlays()
+    {
+        ScanCoverMultiFrameSessionExporter[] exporters =
+            FindObjectsByType<ScanCoverMultiFrameSessionExporter>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < exporters.Length; i++)
+        {
+            ScanCoverMultiFrameSessionExporter exporter = exporters[i];
+            if (exporter == null)
+                continue;
+
+            exporter.SuppressRawSnapshotVisualOverlayAndManualInput();
+        }
+    }
+
+    private static void DisableLegacyPointCloudDisplayBehaviours()
+    {
+        string[] typeNames =
+        {
+            "ScanCoverFusedPointCloudDisplayRenderer",
+            "ScanCoverFusedPointCloudManager",
+            "ScanCoverPatchLocalLatticeDebugPoints",
+            "ScanCoverSurfacePatchDebugQuads",
+            "ScanCoverDepthObservationDebugPoints",
+            "ScanCoverStableObservationCloudAccumulator",
+            "ScanCoverSamplingWindowDiagnosticTool"
+        };
+
+        MonoBehaviour[] behaviours =
+            FindObjectsByType<MonoBehaviour>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour behaviour = behaviours[i];
+            if (behaviour == null)
+                continue;
+
+            string typeName = behaviour.GetType().Name;
+            for (int j = 0; j < typeNames.Length; j++)
+            {
+                if (typeName != typeNames[j])
+                    continue;
+
+                behaviour.enabled = false;
+                break;
+            }
+        }
+    }
+
     private bool ConsumeOneInputAction()
     {
         if (Time.unscaledTime < _nextAcceptedInputTime)
@@ -600,6 +795,39 @@ public sealed class ScanCoverSkeletonSessionController : MonoBehaviour
             depthGridSnapshot64 = GetComponentInChildren<ScanCoverDepthGridSnapshot64>(true);
         if (depthGridSnapshot64 == null)
             depthGridSnapshot64 = FindAnyObjectByType<ScanCoverDepthGridSnapshot64>(FindObjectsInactive.Include);
+
+        if (rawSnapshotCompressedGrid == null)
+            rawSnapshotCompressedGrid = GetComponentInChildren<ScanCoverRawSnapshotCompressedGrid>(true);
+        if (rawSnapshotCompressedGrid == null)
+            rawSnapshotCompressedGrid = FindAnyObjectByType<ScanCoverRawSnapshotCompressedGrid>(FindObjectsInactive.Include);
+        if (rawSnapshotCompressedGrid == null && useRawSnapshotCompressedGridRoute)
+            rawSnapshotCompressedGrid = gameObject.AddComponent<ScanCoverRawSnapshotCompressedGrid>();
+
+        if (tsdfSingleShell == null)
+            tsdfSingleShell = GetComponentInChildren<ScanCoverTsdfSingleShellPrototype>(true);
+        if (tsdfSingleShell == null)
+            tsdfSingleShell = FindAnyObjectByType<ScanCoverTsdfSingleShellPrototype>(FindObjectsInactive.Include);
+        if (tsdfSingleShell == null && useTsdfSingleShellRoute)
+            tsdfSingleShell = gameObject.AddComponent<ScanCoverTsdfSingleShellPrototype>();
+
+        if (depthGridPointCloud == null)
+            depthGridPointCloud = GetComponentInChildren<ScanCoverDepthGridPointCloud>(true);
+        if (depthGridPointCloud == null)
+            depthGridPointCloud = FindAnyObjectByType<ScanCoverDepthGridPointCloud>(FindObjectsInactive.Include);
+
+        if (useTsdfSingleShellRoute)
+        {
+            if (runtimeCore == null)
+                runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
+            return;
+        }
+
+        if (useRawSnapshotCompressedGridRoute)
+        {
+            if (runtimeCore == null)
+                runtimeCore = GetComponent<ScanCoverSkeletonRuntimeCore>();
+            return;
+        }
 
         if (useDepthPointBurstWindowRoute)
         {

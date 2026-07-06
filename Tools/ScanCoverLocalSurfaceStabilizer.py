@@ -21,7 +21,7 @@ import open3d as o3d
 
 
 DEFAULT_INPUT = Path(
-    r"D:\PCA\Unity-MRMotifs-ScanCover-main"
+    r"E:\PCAII\NEW-SCANCOVER"
     r"\ScanCoverExports\RepeatCoverageSessions\RepeatCoverageSessions"
     r"\raw_depth_mapping_input_full_reworked\mapping_input_candidate.ply"
 )

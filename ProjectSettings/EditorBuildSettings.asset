@@ -5,52 +5,12 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
-  - enabled: 0
-    path: Assets/MRMotifs/MRMotifsHome.unity
-    guid: cbae9f7d29ae56649b9b96f04193ad89
-  - enabled: 0
-    path: Assets/MRMotifs/PassthroughTransitioning/Scenes/PassthroughFaderUnderlay.unity
-    guid: c439005c7779b504eb4ddab2b5fc7697
-  - enabled: 0
-    path: Assets/MRMotifs/PassthroughTransitioning/Scenes/PassthroughFaderSelective.unity
-    guid: 363c627f547d14a42b49676510598eff
-  - enabled: 0
-    path: Assets/MRMotifs/PassthroughTransitioning/Scenes/PassthroughFaderSlider.unity
-    guid: 54bfdb8f613415b499ba62dd59ac97fd
-  - enabled: 0
-    path: Assets/MRMotifs/PassthroughTransitioning/Scenes/PassthroughFaderDissolve.unity
-    guid: 04d3df86ffb21854da9450263eea9bb2
-  - enabled: 0
-    path: Assets/MRMotifs/SharedActivities/Scenes/Chess.unity
-    guid: 805ba54878fed5b46adcecbe0dea32aa
-  - enabled: 0
-    path: Assets/MRMotifs/SharedActivities/Scenes/MovieCowatching.unity
-    guid: 14ef1d0bc5d0217429ee1e3502233221
-  - enabled: 0
-    path: Assets/MRMotifs/InstantContentPlacement/Scenes/DepthEffects.unity
-    guid: 8d1c4dd34e4b68243898ee4d067493e5
-  - enabled: 0
-    path: Assets/MRMotifs/InstantContentPlacement/Scenes/InstantContentPlacement.unity
-    guid: 94e5d96fe23133a4c88c19940426946a
-  - enabled: 0
-    path: Assets/MRMotifs/ColocatedExperiences/Scenes/SpatialAnchorsBasics.unity
-    guid: c717f30a9df1ed74f96f4fdcd678d8a3
-  - enabled: 0
-    path: Assets/MRMotifs/ColocatedExperiences/Scenes/ColocationDiscovery.unity
-    guid: 8af2ff9af8f94714195ca51d1fe9c1d2
-  - enabled: 0
-    path: Assets/MRMotifs/ColocatedExperiences/Scenes/SpaceSharing.unity
-    guid: 8ac054682feb6084ba041d9e909a8a15
   - enabled: 1
     path: Assets/MRMotifs/ScanCover/Scene/DepthEffects_ScanCover.unity
     guid: d5e1205134804ce46ad6f879bf7b649b
-  - enabled: 0
-    path: Assets/MRMotifs/Scene Test/New Scene.unity
-    guid: cf779e28a1b355b4c8e60a36f16532b7
   m_configObjects:
-    Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 76cb85526c074c8458be822a82877922, type: 2}
-    com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 340ea7ca76e2c994a90d06cd455e1aee, type: 3}
-    com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: 1a29827f94e6b5c42896485f3e308f80, type: 2}
-    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 164d77ef9199b154685194b5e1feab47, type: 2}
-    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 373b0fba5dc751d439a32c7c5ad68c67, type: 2}
+    com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
+    com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: a89d63ef930f93d4594dfc5b03a4afca, type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 08eac0c1e57ea73459df9a8278b5f70e, type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 06bb08a0e0de9274e9837358e4bc9c3d, type: 2}
   m_UseUCBPForAssetBundles: 0
