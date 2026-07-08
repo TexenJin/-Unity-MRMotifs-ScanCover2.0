@@ -9026,6 +9026,28 @@ MonoBehaviour:
   exportBlSurfaceMeshObjOnFreeze: 0
   exportGridNodeCsvOnFreeze: 0
   exportGridStateJsonOnFreeze: 0
+--- !u!114 &910400000000000008
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1961903629088574029}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a7a9d303a1224c04b97c7d7a1ca17b32, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  referenceFrame: {fileID: 3458649013154915047}
+  environmentDepthManager: {fileID: 0}
+  depthGridPointCloud: {fileID: 920710000000000003}
+  surfaceSnapshotManager: {fileID: 0}
+  depthProbeRows: []
+  scanEnabled: 1
+  showPreviewOnStart: 0
+  freezeRowsAfterManualCapture: 1
+  disableEnvironmentDepthWhileIdle: 0
+  debugLog: 0
 --- !u!114 &910400000000000009
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9050,46 +9072,192 @@ MonoBehaviour:
   rebuildMeshAfterFusionBurstOnly: 0
   voxelSizeMeters: 0.065
   truncationMeters: 0.195
-  volumeSizeMeters: {x: 6.5, y: 3.2, z: 6.5}
+  volumeSizeMeters: {x: 12, y: 4, z: 12}
   maxFusionWeight: 12
   minSurfaceCornerWeight: 1
-  sampleStridePixels: 2
+  useProjectiveTsdfIntegration: 1
+  sampleStridePixels: 1
   minDepthMeters: 0.35
   maxDepthMeters: 5.5
   minConfidence: 0
   requireValidNormal: 0
   minNormalFacingCameraDot: -0.25
+  fillProjectiveDepthFromNeighbors: 0
+  projectiveNeighborFillRadiusPixels: 2
+  rejectDepthDiscontinuities: 1
+  depthDiscontinuityNeighborRadiusPixels: 1
+  maxDepthDiscontinuityMeters: 0.07
+  maxDepthDiscontinuityRatio: 0.03
+  minDepthConsistentNeighbors: 5
+  allowSparseDepthNeighborhood: 0
+  useRobustDepthPrefilter: 1
+  robustDepthFilterRadiusPixels: 2
+  minRobustDepthNeighbors: 6
+  minRobustDepthConsistencyRatio: 0.62
+  maxRobustMedianDepthDeviationMeters: 0.055
+  correctDepthToNeighborhoodMedian: 1
+  minRobustDepthWeightScale: 0.18
+  minRobustTsdfSampleWeight: 0.28
+  erodeDepthEdgesBeforeTsdf: 1
+  depthEdgeErosionRadiusPixels: 1
+  maxRobustDepthEdgeNeighbors: 2
+  robustDepthEdgeDeltaMeters: 0.055
+  robustDepthEdgeDeltaRatio: 0.025
+  depthEdgeWeightScale: 0.35
+  rejectStrongDepthEdges: 1
+  gateTsdfWritesByDepthSupport: 1
+  minTsdfDepthCheckedNeighbors: 4
+  minTsdfDepthConsistencyRatio: 0.55
+  rejectConflictingTsdfWrites: 1
+  tsdfConflictThreshold: 0.45
+  minConflictVoxelWeight: 3
+  correctStableConflictingTsdf: 1
+  minConflictCorrectionFrames: 4
+  conflictCorrectionAgreementThreshold: 0.3
+  maxCorrectableTsdfWeight: 12
+  conflictCorrectionBlend: 0.72
+  correctedTsdfWeight: 3
+  replaceDirtyTsdfOnStableConflict: 1
+  minDirtyTsdfReplaceFrames: 2
+  maxDirtyTsdfReplaceWeight: 12
+  dirtyTsdfReplaceWeight: 2
+  cleanupDirtyTsdfNeighborhood: 1
+  dirtyTsdfCleanupRadiusVoxels: 1
+  maxDirtyTsdfCleanupWeight: 4
+  cleanupOnlyPendingDirtyTsdfNeighbors: 1
+  dirtyTsdfQuarantineFrames: 4
+  requireMultiFrameStableTsdf: 1
+  minStableTsdfFrames: 3
+  stableTsdfAgreementThreshold: 0.35
+  stableTsdfBypassWeight: 3
+  enableProjectiveFreeSpaceCarving: 1
+  freeSpaceCarvingWeightScale: 0.35
+  freeSpaceCarvingBlend: 0.45
+  maxFreeSpaceCarvableWeight: 10
+  freeSpaceCarvingStepVoxelScale: 1.5
+  freeSpaceCarvingPixelStride: 3
   rebuildMeshAfterEachCapture: 1
-  maxSurfaceVertices: 90000
+  showExtractedSurfaceMesh: 1
+  useLegacyTsdfMeshDisplay: 1
+  maxSurfaceVertices: 180000
+  relaxSurfaceExtractionNearZero: 1
+  nearZeroSurfaceThreshold: 0.14
+  minStrictSurfaceSupportedCorners: 3
+  minRelaxedSurfaceSupportedCorners: 6
+  minRelaxedNearZeroCorners: 4
+  minStrictSurfaceEdgeHits: 2
+  minRelaxedSurfaceEdgeHits: 7
+  relaxedEdgeThreshold: 0.04
+  requireRelaxedSurfaceNearStrictCell: 0
+  relaxedStrictNeighborRadiusCells: 1
+  gateRelaxedQuadsByStrictSupport: 0
+  relaxedQuadStrictNeighborRadiusCells: 1
+  minRelaxedQuadStrictNeighborCells: 3
+  rejectRelaxedOnlySignChangeQuads: 0
+  suppressExtractionNearPendingTsdfCorrection: 1
+  pendingCorrectionExtractionRadiusCells: 1
+  suppressExtractionNearDirtyTsdfQuarantine: 1
+  dirtyTsdfExtractionRadiusCells: 1
+  suppressQuadOnPendingTsdfCorrectionEdge: 1
+  suppressQuadOnDirtyTsdfQuarantineEdge: 1
+  minPendingCorrectionHitsToSuppressQuad: 2
+  protectDisplayedMeshFromBadRebuild: 0
+  minAcceptedRebuildTriangleRatio: 0.55
+  maxAcceptedPrunedTriangleRatio: 0.45
+  requireMainShellPromotionGate: 1
+  minMainShellFusedFrames: 8
+  mainShellNeighborRadiusCells: 1
+  minMainShellNeighborSurfaceCells: 9
+  minMainShellAverageCornerWeight: 3
+  separateComplexDetailCandidates: 1
+  promoteComplexDetailCandidatesToMesh: 0
+  minDetailPromotionNeighborSurfaceCells: 14
+  minDetailCandidateFrames: 6
+  minDetailCandidateNeighborSurfaceCells: 9
+  showFallbackWhenMainShellHeld: 1
+  rejectStretchedExtractedQuads: 1
+  maxExtractedQuadEdgeVoxelScale: 1.7
+  pruneSmallExtractedMeshComponents: 1
+  minExtractedComponentTriangles: 96
+  minExtractedComponentExtentVoxelScale: 7
+  suspectComponentTriangleMultiplier: 3
+  pruneDanglingExtractedMeshTriangles: 1
+  danglingTrianglePruneIterations: 2
+  minTriangleSharedEdgesToKeep: 1
+  pruneSpikePatchTriangles: 1
+  spikePatchPruneIterations: 3
+  maxSpikePatchTriangles: 18
+  minSpikePatchBoundaryEdgeRatio: 0.45
+  maxSpikePatchExtentVoxelScale: 2.2
+  minSpikePatchNormalDot: 0.72
+  bridgeCleanCoplanarBoundaryEdges: 1
+  maxBoundaryBridgeDistanceVoxelScale: 2
+  minBoundaryBridgeNormalDot: 0.92
+  maxBoundaryBridgePlaneDistanceVoxelScale: 0.65
+  maxBoundaryBridgeAbsTsdf: 0.35
+  boundaryBridgeCleanRadiusVoxels: 1
+  maxBoundaryBridgesPerRebuild: 1200
   doubleSidedTriangles: 1
-  showFallbackSurfaceSamples: 1
-  maxFallbackSurfaceSamples: 48000
-  fallbackSurfaceSampleSizeMeters: 0.018
-  shellColor: {r: 0.12, g: 0.9, b: 1, a: 1}
+  showFallbackSurfaceSamples: 0
+  useFallbackMeshWhenTsdfExtractionEmpty: 0
+  addFallbackOnlyAfterTsdfSupport: 1
+  minFallbackSurfaceSampleWeight: 0.65
+  maxFallbackSurfaceSamples: 72000
+  fallbackSurfaceSampleSizeMeters: 0.028
+  displayFallbackAsCoverageTiles: 1
+  coverageTileVoxelScale: 0.45
+  maxRenderedLightCoverTiles: 72000
+  renderOnlyStableLightCoverCells: 1
+  minLightCoverCellHits: 4
+  renderOnlyCleanLightCoverCells: 1
+  showUnstableLightCoverRiskCells: 1
+  showDirtyLightCoverRiskCells: 1
+  cleanLightCoverCheckRadiusVoxels: 0
+  minCleanLightCoverVoxelWeight: 2
+  maxCleanLightCoverAbsTsdf: 0.35
+  requireNearZeroTsdfForLightCover: 0
+  useChunkedSurfaceSamples: 1
+  replaceFallbackSamplesWhenFull: 1
+  surfaceChunkSizeMeters: 2
+  maxSurfaceChunks: 1024
+  maxFallbackSamplesPerChunk: 16384
+  sideAwareSurfaceCells: 1
+  useSideAwareLightCoverKeys: 0
+  splitLightCoverNormalConflicts: 0
+  surfaceSideOffsetVoxelScale: 0.45
+  stableSurfaceCellLockHits: 4
+  maxStableCellPositionUpdateMeters: 0.015
+  renderStableCellsAsPlanarMeshCover: 0
+  useConnectedPlanarCoverMesh: 0
+  showPlanarCoverSurfaceFill: 1
+  planarCoverTileScale: 1
+  showPlanarCoverWireOverlay: 0
+  showMeshEdgeWireOverlay: 1
+  wireTileScale: 1.06
+  wireColor: {r: 0.1, g: 1, b: 0.15, a: 0.95}
+  shellColor: {r: 0.72, g: 1, b: 0.78, a: 0.36}
+  cleanCoverCellColor: {r: 0.82, g: 1, b: 0.96, a: 1}
+  unstableCoverCellColor: {r: 1, g: 0.74, b: 0.22, a: 1}
+  riskCoverCellColor: {r: 1, g: 0.16, b: 0.38, a: 1}
   shellMaterialOverride: {fileID: 0}
   debugLog: 1
---- !u!114 &910400000000000008
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1961903629088574029}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: a7a9d303a1224c04b97c7d7a1ca17b32, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  referenceFrame: {fileID: 3458649013154915047}
-  environmentDepthManager: {fileID: 0}
-  depthGridPointCloud: {fileID: 920710000000000003}
-  surfaceSnapshotManager: {fileID: 0}
-  depthProbeRows: []
-  scanEnabled: 1
-  showPreviewOnStart: 0
-  freezeRowsAfterManualCapture: 1
-  disableEnvironmentDepthWhileIdle: 0
-  debugLog: 0
+  showDiagnosticHud: 1
+  hudLocalPosition: {x: 0, y: -0.18, z: 0.78}
+  hudLocalEuler: {x: 8, y: 0, z: 0}
+  hudLocalScale: {x: 0.00075, y: 0.00075, z: 0.00075}
+  hudRefreshIntervalSeconds: 0.12
+  hudHealthyColor: {r: 0.7, g: 1, b: 0.92, a: 1}
+  hudWarningColor: {r: 1, g: 0.72, b: 0.25, a: 1}
+  runMeshDiagnosticsOnRebuild: 0
+  showMeshDiagnosticHotspots: 0
+  maxDiagnosticHotspots: 6
+  diagnosticNormalPatchMinDot: 0.74
+  diagnosticSuspectPatchMaxTriangles: 180
+  diagnosticSuspectBoundaryRatio: 0.3
+  diagnosticSuspectExtentVoxelScale: 5
+  diagnosticHotspotMarkerSizeMeters: 0.045
+  diagnosticHotspotColor: {r: 1, g: 0.08, b: 0.02, a: 0.95}
+  diagnosticSecondaryHotspotColor: {r: 1, g: 0.85, b: 0.05, a: 0.9}
 --- !u!4 &913164153757107250
 Transform:
   m_ObjectHideFlags: 0
@@ -53313,7 +53481,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &5864758147616318671
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -61612,7 +61780,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &6639473274462519704
 Transform:
   m_ObjectHideFlags: 0
