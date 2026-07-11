@@ -57,7 +57,9 @@ Shader "ScanCover/SoftTransparentUnlit"
 
             half4 frag(Varyings IN) : SV_Target
             {
-                return _BaseColor * IN.color;
+                half risk = saturate(max(IN.color.r - IN.color.g, IN.color.r - IN.color.b) * 2.5h);
+                half3 rgb = lerp(_BaseColor.rgb * IN.color.rgb, IN.color.rgb, risk);
+                return half4(rgb, _BaseColor.a * IN.color.a);
             }
             ENDHLSL
         }

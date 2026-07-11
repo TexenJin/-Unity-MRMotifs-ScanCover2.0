@@ -1,5 +1,8 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
@@ -75,6 +78,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(1, 8)] private int minDirtyTsdfReplaceFrames = 2;
     [SerializeField, Range(1, 64)] private int maxDirtyTsdfReplaceWeight = 12;
     [SerializeField, Range(1, 16)] private int dirtyTsdfReplaceWeight = 2;
+    [SerializeField] private bool enableGuardedDirtyTsdfFastReplace = true;
+    [SerializeField, Range(1, 4)] private int minGuardedDirtyTsdfReplaceFrames = 1;
+    [SerializeField, Range(1, 24)] private int maxGuardedDirtyTsdfReplaceWeight = 12;
+    [SerializeField, Range(0.05f, 1f)] private float maxGuardedDirtyTsdfReplaceAbsValue = 0.75f;
+    [SerializeField] private bool repairDirtyTsdfConflictBands = true;
+    [SerializeField, Range(0.05f, 1f)] private float minDirtyBandConflictRatio = 0.18f;
+    [SerializeField, Range(1, 64)] private int maxDirtyBandRepairWeight = 12;
+    [SerializeField, Range(0.05f, 1f)] private float minDirtyBandRepairResidual = 0.45f;
+    [SerializeField, Range(0f, 1f)] private float dirtyBandRepairWeightKeepRatio = 0.35f;
+    [SerializeField, Range(1, 32)] private int maxDirtyBandRepairsPerSample = 8;
     [SerializeField] private bool cleanupDirtyTsdfNeighborhood = true;
     [SerializeField, Range(0, 2)] private int dirtyTsdfCleanupRadiusVoxels = 1;
     [SerializeField, Range(1, 64)] private int maxDirtyTsdfCleanupWeight = 4;
@@ -88,8 +101,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.1f, 1f)] private float freeSpaceCarvingWeightScale = 0.35f;
     [SerializeField, Range(0.05f, 1f)] private float freeSpaceCarvingBlend = 0.45f;
     [SerializeField, Range(1, 32)] private int maxFreeSpaceCarvableWeight = 10;
-    [SerializeField, Range(0.25f, 3f)] private float freeSpaceCarvingStepVoxelScale = 1.5f;
     [SerializeField, Range(1, 8)] private int freeSpaceCarvingPixelStride = 3;
+    [SerializeField] private bool useTemporalFreeSpaceEvidence = true;
+    [SerializeField, Range(2, 8)] private int minFreeSpaceEvidenceFrames = 3;
+    [SerializeField, Range(2, 32)] private int maxFreeSpaceEvidenceFrameGap = 10;
+    [SerializeField, Range(1, 4)] private int freeSpaceEvidenceWeightDecay = 1;
+    [SerializeField, Range(0, 4)] private int freeSpaceEvidenceClearWeight = 1;
+    [SerializeField, Range(0.5f, 1f)] private float freeSpaceEvidenceClearTsdf = 0.85f;
+    [SerializeField] private bool protectSameFrameSurfaceFromClearing = true;
 
     [Header("Surface Extraction")]
     [SerializeField] private bool rebuildMeshAfterEachCapture = true;
@@ -146,6 +165,26 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.05f, 0.95f)] private float minSpikePatchBoundaryEdgeRatio = 0.45f;
     [SerializeField, Range(0.5f, 4f)] private float maxSpikePatchExtentVoxelScale = 2.2f;
     [SerializeField, Range(-1f, 1f)] private float minSpikePatchNormalDot = 0.72f;
+    [SerializeField] private bool fillCleanTsdfContinuityGaps = true;
+    [SerializeField, Range(1, 2)] private int tsdfContinuityFillRadiusVoxels = 2;
+    [SerializeField, Range(3, 26)] private int minTsdfContinuityNeighborVoxels = 6;
+    [SerializeField, Range(1, 6)] private int minTsdfContinuityFaceNeighborVoxels = 2;
+    [SerializeField, Range(3, 26)] private int minTsdfContinuitySameSignNeighborVoxels = 10;
+    [SerializeField, Range(0.01f, 0.35f)] private float maxTsdfContinuityNeighborAbsValue = 0.24f;
+    [SerializeField, Range(0.005f, 0.2f)] private float continuityFillAbsTsdf = 0.035f;
+    [SerializeField, Range(1, 12)] private int continuityFillWeight = 2;
+    [SerializeField, Min(0)] private int maxTsdfContinuityFillVoxelsPerRebuild = 4096;
+    [SerializeField] private bool allowSameSignContinuityBaseFill = true;
+    [SerializeField] private bool allowStableProvisionalContinuitySources = true;
+    [SerializeField] private bool rejectContinuityFillFromUnsettledNeighbors = true;
+    [SerializeField] private bool fillBoundaryNoTsdfGaps = true;
+    [SerializeField, Range(3, 26)] private int minBoundaryNoTsdfNeighborVoxels = 8;
+    [SerializeField, Range(2, 6)] private int minBoundaryNoTsdfFaceNeighborVoxels = 3;
+    [SerializeField] private bool allowBoundaryNoTsdfProvisionalAnchor = true;
+    [SerializeField, Range(0, 6)] private int minBoundaryNoTsdfCleanFaceAnchors = 0;
+    [SerializeField, Range(1, 12)] private int minBoundaryNoTsdfProvisionalAnchors = 2;
+    [SerializeField, Range(1, 6)] private int minBoundaryNoTsdfProvisionalFaceAnchors = 1;
+    [SerializeField, Min(0)] private int maxBoundaryNoTsdfFillVoxelsPerRebuild = 1024;
     [SerializeField] private bool bridgeCleanCoplanarBoundaryEdges = true;
     [SerializeField, Range(1f, 4f)] private float maxBoundaryBridgeDistanceVoxelScale = 2.0f;
     [SerializeField, Range(0.75f, 1f)] private float minBoundaryBridgeNormalDot = 0.92f;
@@ -207,6 +246,143 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private Color hudHealthyColor = new Color(0.7f, 1f, 0.92f, 1f);
     [SerializeField] private Color hudWarningColor = new Color(1f, 0.72f, 0.25f, 1f);
 
+    [Header("Confidence Audit")]
+    [SerializeField] private bool writeConfidenceAuditOnCapture = true;
+    [SerializeField, Min(1)] private int confidenceAuditSampleStride = 1;
+    [SerializeField, Min(1000)] private int maxConfidenceAuditRowsPerCapture = 250000;
+    [SerializeField] private string confidenceAuditFolderName = "ScanCoverDiagnostics";
+    [SerializeField, Range(0.5f, 1f)] private float auditDepthEdgeSupportRatio = 0.88f;
+    [SerializeField, Min(0.001f)] private float auditRobustShiftRiskMeters = 0.025f;
+    [SerializeField, Range(0f, 1f)] private float auditGrazingViewFacingThreshold = 0.42f;
+    [SerializeField, Range(1, 64)] private int auditOldLockedWeightThreshold = 10;
+    [SerializeField] private bool clearRawDepthDebugAtCaptureStart = true;
+
+    [Header("Observation Vote - Stage 2")]
+    [SerializeField] private ObservationVoteMode observationVoteMode = ObservationVoteMode.Shadow;
+    [SerializeField, Range(0f, 1f)] private float voteAcceptScore = 0.72f;
+    [SerializeField, Range(0f, 1f)] private float voteRejectScore = 0.38f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodSupportRatio = 0.82f;
+    [SerializeField, Range(0f, 1f)] private float voteBadSupportRatio = 0.55f;
+    [SerializeField, Min(0.001f)] private float voteGoodRobustShiftMeters = 0.015f;
+    [SerializeField, Min(0.001f)] private float voteBadRobustShiftMeters = 0.060f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodViewFacing = 0.50f;
+    [SerializeField, Range(0f, 1f)] private float voteBadViewFacing = 0.15f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodSampleWeight = 0.65f;
+    [SerializeField, Range(0f, 1f)] private float voteBadSampleWeight = 0.20f;
+    [SerializeField, Min(0.001f)] private float voteGoodTemporalDepthDeltaMeters = 0.020f;
+    [SerializeField, Min(0.001f)] private float voteBadTemporalDepthDeltaMeters = 0.090f;
+    [SerializeField, Min(0.001f)] private float voteGoodHistoricalSurfaceDistanceMeters = 0.050f;
+    [SerializeField, Min(0.001f)] private float voteBadHistoricalSurfaceDistanceMeters = 0.160f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodOldTsdfResidual = 0.15f;
+    [SerializeField, Range(0f, 1f)] private float voteBadOldTsdfResidual = 0.55f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodHistoryAgreement = 0.70f;
+    [SerializeField, Range(0f, 1f)] private float voteBadHistoryAgreement = 0.25f;
+    [SerializeField, Range(1, 4)] private int voteHistoryNeighborhoodRadiusVoxels = 1;
+    [SerializeField, Min(0.02f)] private float voteCorrespondenceCellSizeMeters = 0.08f;
+    [SerializeField, Min(0.02f)] private float voteMaxCorrespondenceDistanceMeters = 0.20f;
+    [SerializeField, Range(0f, 1f)] private float voteGoodBandConflictRatio = 0.05f;
+    [SerializeField, Range(0f, 1f)] private float voteBadBandConflictRatio = 0.35f;
+    [SerializeField, Range(0f, 2f)] private float voteGoodBandMeanResidual = 0.15f;
+    [SerializeField, Range(0f, 2f)] private float voteBadBandMeanResidual = 0.75f;
+    [SerializeField] private bool enforceObservationWriteGate = true;
+    [SerializeField] private bool holdUnconfirmedPendingWrites = true;
+    [SerializeField, Range(0.05f, 1f)] private float confirmedPendingWriteWeightScale = 0.35f;
+    [SerializeField] private bool allowPendingBootstrapSeeds = true;
+    [SerializeField, Range(0.05f, 0.5f)] private float pendingBootstrapWeightScale = 0.20f;
+    [SerializeField] private bool allowStrongSampleSeedWrites = true;
+    [SerializeField] private bool lockStrongSampleSeedToTemporaryTsdf = true;
+    [SerializeField, Range(0.05f, 0.5f)] private float strongSampleSeedWeightScale = 0.25f;
+    [SerializeField, Range(0f, 1f)] private float maxStrongSampleSeedOldTsdfResidual = 0.12f;
+    [SerializeField] private bool allowProvisionalTsdfSupportWrites = true;
+    [SerializeField, Range(1, 2)] private int provisionalTsdfSupportWeight = 2;
+    [SerializeField, Range(0.05f, 0.6f)] private float provisionalTsdfSupportBlend = 0.25f;
+    [SerializeField, Range(0.05f, 1f)] private float provisionalTsdfNearSurfaceAbs = 0.30f;
+    [SerializeField] private bool allowNearSurfaceProvisionalBootstrap = true;
+    [SerializeField, Range(0.02f, 0.5f)] private float maxNearSurfaceProvisionalBootstrapAbsTsdf = 0.18f;
+    [SerializeField, Range(0f, 1f)] private float minNearSurfaceProvisionalBootstrapVoteScore = 0.85f;
+    [SerializeField, Range(0f, 1f)] private float minNearSurfaceProvisionalBootstrapSupportRatio = 0.90f;
+    [SerializeField] private bool requireProvisionalPlaneCompatibility = true;
+    [SerializeField, Range(1, 2)] private int provisionalPlaneCompatibilityRadiusVoxels = 1;
+    [SerializeField, Range(1, 8)] private int minProvisionalPlaneCompatibleNeighbors = 1;
+    [SerializeField, Range(0.5f, 1f)] private float minProvisionalPlaneNormalDot = 0.88f;
+    [SerializeField, Range(0.05f, 2f)] private float maxProvisionalPlaneDistanceVoxelScale = 0.85f;
+    [SerializeField, Range(0.02f, 0.5f)] private float maxProvisionalPlaneNeighborAbsTsdf = 0.30f;
+    [SerializeField] private bool requireProvisionalLocalSupport = true;
+    [SerializeField, Range(1, 2)] private int provisionalLocalSupportRadiusVoxels = 1;
+    [SerializeField, Range(1, 12)] private int minProvisionalLocalSupportVoxels = 3;
+    [SerializeField, Range(0, 6)] private int minProvisionalLocalStableVoxels = 1;
+    [SerializeField, Range(0, 6)] private int minProvisionalLocalAxialVoxels = 1;
+    [SerializeField, Range(0.02f, 0.5f)] private float maxProvisionalLocalSupportAbsTsdf = 0.25f;
+    [SerializeField, Range(0.05f, 1f)] private float maxProvisionalLocalSupportResidual = 0.45f;
+    [SerializeField] private bool retireUnconfirmedProvisionalTsdf = true;
+    [SerializeField, Range(1, 12)] private int provisionalTsdfMaxAgeFrames = 4;
+    [SerializeField, Range(0f, 1f)] private float minProvisionalVoteScore = 0.70f;
+    [SerializeField, Range(0f, 1f)] private float minProvisionalSupportRatio = 0.82f;
+    [SerializeField, Range(0f, 0.5f)] private float maxProvisionalBandConflictRatio = 0.05f;
+    [SerializeField] private bool rejectProvisionalCleanHistoryMismatch = true;
+    [SerializeField, Min(0.001f)] private float maxProvisionalSameFrameDepthDeltaMeters = 0.03f;
+    [SerializeField, Range(0, 8)] private int maxProvisionalExistingWeight = 2;
+    [SerializeField, Min(0.01f)] private float sameFrameConflictDepthMeters = 0.03f;
+    [SerializeField, Min(0.03f)] private float sameFrameConflictSearchMeters = 0.18f;
+    [SerializeField, Range(1f, 45f)] private float sameFrameConflictMaxNormalAngleDegrees = 20f;
+    [SerializeField] private bool enableSameFrameEntryGate = true;
+    [SerializeField, Min(0.01f)] private float maxSameFrameEntryProvisionalDepthMeters = 0.06f;
+    [SerializeField, Range(0.05f, 0.6f)] private float sameFrameEntryProvisionalWeightScale = 0.20f;
+    [SerializeField] private bool gateFormalIntegrateWrites = true;
+    [SerializeField] private bool downgradeBlockedFormalIntegrateToProvisional = true;
+    [SerializeField, Range(0f, 1f)] private float minFormalIntegrateVoteScore = 0.72f;
+    [SerializeField, Range(0f, 1f)] private float minFormalIntegrateSupportRatio = 0.82f;
+    [SerializeField, Range(0f, 0.5f)] private float maxFormalIntegrateBandConflictRatio = 0.05f;
+    [SerializeField, Range(0f, 2f)] private float maxFormalIntegrateBandMeanResidual = 0.20f;
+    [SerializeField] private bool rejectFormalCleanHistoryMismatch = true;
+    [SerializeField] private bool rejectFormalIntegrateWeakHistory = true;
+    [SerializeField] private bool rejectFormalIntegrateTemporalDepthJump = true;
+    [SerializeField] private bool requireHistoryForFormalStrongCurrentClean = true;
+    [SerializeField, Range(0, 16)] private int minFormalStrongCurrentOldWeight = 5;
+    [SerializeField, Range(0, 16)] private int minFormalStrongCurrentBandHistory = 2;
+    [SerializeField, Range(0f, 1f)] private float minFormalStrongCurrentHistoryAgreement = 0.65f;
+    [SerializeField] private bool allowLocalSupportForFormalStrongCurrentHistory = true;
+    [SerializeField, Range(1, 12)] private int minFormalStrongCurrentLocalSupportVoxels = 4;
+    [SerializeField, Range(0, 6)] private int minFormalStrongCurrentLocalStableVoxels = 1;
+    [SerializeField, Range(0, 6)] private int minFormalStrongCurrentLocalAxialVoxels = 2;
+    [SerializeField] private bool promoteStrongCurrentProvisionalToFormal = true;
+    [SerializeField, Range(1, 8)] private int minStrongCurrentProvisionalHits = 2;
+    [SerializeField, Range(1, 8)] private int minStrongCurrentProvisionalWeight = 2;
+    [SerializeField, Range(0, 16)] private int minStrongCurrentProvisionalBandHistory = 1;
+    [SerializeField, Range(0f, 1f)] private float minStrongCurrentProvisionalHistoryAgreement = 0.65f;
+    [SerializeField, Range(0.05f, 1f)] private float strongCurrentProvisionalPromoteWeight = 1f;
+    [SerializeField] private bool allowProvisionalNeighborPromotionSupport = true;
+    [SerializeField, Range(1, 12)] private int minStrongCurrentPromotionLocalSupportVoxels = 2;
+    [SerializeField, Range(0, 6)] private int minStrongCurrentPromotionStableVoxels = 0;
+    [SerializeField, Range(0, 6)] private int minStrongCurrentPromotionAxialVoxels = 1;
+    [SerializeField] private bool rejectStrongCurrentPromotionDoubleLayer = true;
+    [SerializeField, Range(1, 4)] private int strongCurrentPromotionDoubleLayerSearchRadiusVoxels = 2;
+    [SerializeField, Min(0.01f)] private float maxStrongCurrentPromotionDoubleLayerSeparationMeters = 0.085f;
+    [SerializeField, Range(0.05f, 0.75f)] private float maxStrongCurrentPromotionDoubleLayerNeighborAbsTsdf = 0.5f;
+    [SerializeField, Range(0f, 1f)] private float maxFormalCleanHistoryOldTsdfResidual = 0.12f;
+    [SerializeField, Range(0f, 2f)] private float maxFormalCleanHistoryBandMeanResidual = 0.16f;
+    [SerializeField, Range(0f, 0.5f)] private float maxFormalCleanHistoryBandConflictRatio = 0.02f;
+    [SerializeField, Min(0.001f)] private float maxFormalIntegrateSameFrameDepthDeltaMeters = 0.03f;
+    [SerializeField, Min(0.001f)] private float maxFormalIntegrateCrossFrameDepthDeltaMeters = 0.03f;
+    [SerializeField, Range(0f, 1f)] private float maxFormalIntegrateOldTsdfResidual = 0.25f;
+    [SerializeField] private bool rejectDirtyReplaceOnCleanHistoryMismatch = true;
+    [SerializeField] private bool rejectCrossFrameCleanSurfaceConflict = true;
+    [SerializeField, Min(0.01f)] private float crossFrameCleanConflictDepthMeters = 0.03f;
+    [SerializeField, Min(0.03f)] private float crossFrameCleanConflictSearchMeters = 0.18f;
+    [SerializeField, Range(0.25f, 4f)] private float crossFrameCleanConflictMaxLateralVoxelScale = 1.5f;
+    [SerializeField, Range(1f, 60f)] private float crossFrameCleanConflictMaxNormalAngleDegrees = 30f;
+    [SerializeField] private bool enableOldCleanTsdfMetabolism = true;
+    [SerializeField, Range(1, 8)] private int minOldCleanMetabolismConflictHits = 3;
+    [SerializeField, Range(1, 64)] private int maxOldCleanMetabolismWeight = 18;
+    [SerializeField, Range(0.05f, 1f)] private float minOldCleanMetabolismResidual = 0.35f;
+    [SerializeField, Range(0.05f, 1f)] private float minOldCleanMetabolismCrossFrameVoxelResidual = 0.35f;
+    [SerializeField, Range(0.05f, 1f)] private float minOldCleanMetabolismBandVoxelResidual = 0.35f;
+    [SerializeField, Range(0f, 1f)] private float minOldCleanMetabolismSupportRatio = 0.82f;
+    [SerializeField, Range(0f, 0.5f)] private float maxOldCleanMetabolismBandConflictRatio = 0.08f;
+    [SerializeField, Range(0.005f, 0.08f)] private float maxOldCleanMetabolismSameFrameDeltaMeters = 0.035f;
+    [SerializeField, Range(1, 8)] private int oldCleanMetabolismDecayWeight = 2;
+    [SerializeField, Range(0, 8)] private int oldCleanMetabolismClearWeight = 2;
+
     [Header("Mesh Diagnostics")]
     [SerializeField] private bool runMeshDiagnosticsOnRebuild = false;
     [SerializeField] private bool showMeshDiagnosticHotspots = false;
@@ -218,6 +394,70 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Min(0.005f)] private float diagnosticHotspotMarkerSizeMeters = 0.045f;
     [SerializeField] private Color diagnosticHotspotColor = new Color(1f, 0.08f, 0.02f, 0.95f);
     [SerializeField] private Color diagnosticSecondaryHotspotColor = new Color(1f, 0.85f, 0.05f, 0.9f);
+    [SerializeField] private Color pureGeometrySuspectColor = new Color(0.1f, 0.85f, 1f, 1f);
+    [SerializeField] private bool showMeshTumorSuspectOverlay = true;
+    [SerializeField, Range(0, 2)] private int tumorSuspectTsdfRadiusVoxels = 1;
+    [SerializeField, Range(0.05f, 0.95f)] private float tumorSuspectOpenBoundaryRatio = 0.62f;
+    [SerializeField, Range(2f, 20f)] private float tumorSuspectSmallIslandExtentVoxelScale = 4.5f;
+    [SerializeField, Range(4, 1024)] private int tumorSuspectSmallIslandMaxTriangles = 96;
+    [SerializeField, Range(1.2f, 5f)] private float tumorSuspectLongEdgeVoxelScale = 3.2f;
+    [SerializeField, Range(10f, 80f)] private float pureGeometryNormalDeviationDegrees = 38f;
+    [SerializeField, Range(0.2f, 2f)] private float pureGeometryPlaneOffsetVoxelScale = 0.65f;
+    [SerializeField, Range(0.75f, 1f)] private float pureGeometryParallelNormalDot = 0.92f;
+    [SerializeField, Range(0.15f, 1.5f)] private float pureGeometryMinLayerSeparationVoxelScale = 0.35f;
+    [SerializeField, Range(1f, 5f)] private float pureGeometryMaxLayerSeparationVoxelScale = 3f;
+    [SerializeField, Range(0.25f, 2f)] private float pureGeometryMaxLayerLateralVoxelScale = 0.8f;
+    [SerializeField] private bool validateDoubleLayerWithWriteProvenance = true;
+    [SerializeField, Min(0.01f)] private float doubleLayerMinSourcePlaneSeparationMeters = 0.03f;
+    [SerializeField, Range(1f, 60f)] private float doubleLayerMaxSourceNormalAngleDegrees = 30f;
+    [SerializeField, Range(0.25f, 3f)] private float doubleLayerMaxSourceLateralVoxelScale = 1.5f;
+    [SerializeField, Range(0f, 1f)] private float doubleLayerMinMeshSourceNormalDot = 0.70f;
+    [SerializeField] private Color tumorSuspectHighColor = new Color(1f, 0.03f, 0.02f, 1f);
+    [SerializeField] private Color tumorSuspectMediumColor = new Color(1f, 0.72f, 0.08f, 0.95f);
+    [SerializeField] private Color tumorCauseDirtyColor = new Color(1f, 0.02f, 0.04f, 1f);
+    [SerializeField] private Color tumorCauseNonManifoldColor = new Color(0.74f, 0.1f, 1f, 1f);
+    [SerializeField] private Color tumorCauseIslandColor = new Color(1f, 0.58f, 0.02f, 1f);
+    [SerializeField] private Color tumorCauseOpenColor = new Color(1f, 0.92f, 0.08f, 0.95f);
+    [SerializeField] private Color tumorCauseLongEdgeColor = new Color(0.05f, 0.85f, 1f, 0.95f);
+    [SerializeField] private bool showDirtyTsdfEvidenceOverlay = false;
+    [SerializeField, Range(16, 512)] private int maxDirtyTsdfEvidenceMarkers = 160;
+    [SerializeField, Min(0.005f)] private float dirtyTsdfEvidenceMarkerSizeMeters = 0.07f;
+    [SerializeField, Range(0.05f, 1f)] private float dirtyTsdfEvidenceLineAlpha = 1f;
+    [SerializeField] private bool backfillCurrentDirtyTsdfMarkers = true;
+    [SerializeField] private bool forceMeshGridDisplayOnEnable = true;
+    [SerializeField] private bool showRawDepthDebugView = false;
+    [SerializeField] private bool restrictRawDepthDebugToNearTsdfSurface = true;
+    [SerializeField, Range(0, 3)] private int rawDepthDebugNearSurfaceRadiusVoxels = 1;
+    [SerializeField, Range(0, 2)] private int rawDepthDebugDirtyRadiusVoxels = 0;
+    [SerializeField, Range(0.01f, 0.8f)] private float rawDepthDebugNearSurfaceAbsTsdf = 0.28f;
+    [SerializeField] private bool showAcceptedRawDepthDebugSamples = false;
+    [SerializeField, Range(1, 64)] private int acceptedRawDepthDebugSampleStride = 12;
+    [SerializeField, Range(1, 64)] private int rawDepthDebugDepthEdgeSampleStride = 5;
+    [SerializeField, Range(1, 64)] private int rawDepthDebugRobustSampleStride = 8;
+    [SerializeField, Range(1, 64)] private int rawDepthDebugRejectedSampleStride = 8;
+    [SerializeField, Min(256)] private int maxRawDepthDebugSamples = 12000;
+    [SerializeField, Min(0.002f)] private float rawDepthDebugSampleSizeMeters = 0.024f;
+    [SerializeField, Range(0.05f, 1f)] private float rawDepthDebugAlpha = 0.96f;
+    [SerializeField] private Color rawDepthDebugAcceptedColor = new Color(0.92f, 1f, 1f, 0.24f);
+    [SerializeField] private Color rawDepthDebugDirtyColor = new Color(1f, 0.02f, 0.02f, 1f);
+    [SerializeField] private Color rawDepthDebugPendingColor = new Color(1f, 0.05f, 0.85f, 1f);
+    [SerializeField] private Color rawDepthDebugStableBandColor = new Color(0.05f, 0.9f, 1f, 1f);
+    [SerializeField] private Color rawDepthDebugConflictEdgeColor = new Color(1f, 0.92f, 0.02f, 1f);
+    [SerializeField] private Color rawDepthDebugConflictViewColor = new Color(1f, 0.42f, 0.02f, 1f);
+    [SerializeField] private Color rawDepthDebugConflictLockedColor = new Color(1f, 0.02f, 0.02f, 1f);
+    [SerializeField] private Color rawDepthDebugDepthEdgeColor = new Color(1f, 0.9f, 0.05f, 1f);
+    [SerializeField] private Color rawDepthDebugRobustColor = new Color(1f, 0.45f, 0.02f, 1f);
+    [SerializeField] private Color rawDepthDebugSupportColor = new Color(1f, 0.05f, 0.85f, 1f);
+    [SerializeField] private Color rawDepthDebugOutsideColor = new Color(0.05f, 0.35f, 1f, 1f);
+    [SerializeField] private Color rawDepthDebugRejectedColor = new Color(0.45f, 0.45f, 0.45f, 1f);
+    [Header("Raw Coverage Grid Diagnostics")]
+    [SerializeField] private bool enableRawCoverageGridDiagnostics = true;
+    [SerializeField] private bool showRawCoverageGridOverlay = true;
+    [SerializeField] private bool hideMeshWhenRawCoverageGridOverlay = true;
+    [SerializeField] private bool renderRawCoverageGridAsWorldCubes = false;
+    [SerializeField, Min(0.03f)] private float rawCoverageGridCellSizeMeters = 0.10f;
+    [SerializeField, Min(256)] private int maxRawCoverageGridCells = 4096;
+    [SerializeField, Range(1, 64)] private int rawCoverageAcceptedDisplayStride = 5;
 
     private GameObject _meshObject;
     private MeshFilter _meshFilter;
@@ -240,6 +480,31 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private Material _diagnosticSecondaryHotspotMaterial;
     private readonly List<GameObject> _diagnosticHotspotMarkers = new List<GameObject>(8);
     private readonly List<MeshDiagnosticHotspot> _meshDiagnosticHotspots = new List<MeshDiagnosticHotspot>(16);
+    private GameObject _dirtyEvidenceObject;
+    private MeshFilter _dirtyEvidenceMeshFilter;
+    private MeshRenderer _dirtyEvidenceRenderer;
+    private Mesh _dirtyEvidenceMesh;
+    private Material _dirtyEvidenceMaterial;
+    private readonly List<DirtyTsdfEvidence> _dirtyTsdfEvidence = new List<DirtyTsdfEvidence>(256);
+    private GameObject _rawDepthDebugObject;
+    private MeshFilter _rawDepthDebugMeshFilter;
+    private MeshRenderer _rawDepthDebugRenderer;
+    private Mesh _rawDepthDebugMesh;
+    private Material _rawDepthDebugMaterial;
+    private readonly List<Vector3> _rawDepthDebugPoints = new List<Vector3>(12000);
+    private readonly List<RawDepthDebugKind> _rawDepthDebugKinds = new List<RawDepthDebugKind>(12000);
+    private readonly Dictionary<Vector3Int, RawCoverageGridCell> _rawCoverageGridCells = new Dictionary<Vector3Int, RawCoverageGridCell>(4096);
+    private int _rawDepthDebugReplaceCursor;
+    private int _rawDepthDebugClassifierRevision = -1;
+    private int _acceptedRawDepthDebugCounter;
+    private int _rawDepthDebugDepthEdgeCounter;
+    private int _rawDepthDebugRobustCounter;
+    private int _rawDepthDebugRejectedCounter;
+    private int _rawCoverageOverlayBuildVersion = -1;
+    private int _rawCoverageGridVersion;
+    private Vector3 _activeTsdfSourceCamera;
+    private Vector3 _activeTsdfSourceSurface;
+    private bool _activeTsdfSourceValid;
 
     private float[] _tsdf;
     private byte[] _weights;
@@ -250,6 +515,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private byte[] _correctionTsdfHits;
     private int[] _correctionTsdfLastFrame;
     private int[] _dirtyTsdfLastFrame;
+    private byte[] _provisionalTsdf;
+    private int[] _provisionalTsdfLastFrame;
+    private byte[] _provisionalTsdfHits;
+    private byte[] _oldCleanConflictHits;
+    private int[] _oldCleanConflictLastFrame;
+    private byte[] _freeSpaceEvidenceHits;
+    private int[] _freeSpaceEvidenceLastFrame;
     private int[] _cellVertexIndices;
     private byte[] _detailCandidateCellHits;
     private int[] _detailCandidateCellLastFrame;
@@ -301,12 +573,103 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastDepthEdgeDownweightedCount { get; private set; }
     public int LastRejectedTsdfConflictCount { get; private set; }
     public int LastPendingStableTsdfCount { get; private set; }
+    public int LastProvisionalTsdfSupportWriteCount { get; private set; }
+    public int LastProvisionalTsdfSupportBlockedCount { get; private set; }
+    public int LastProvisionalTsdfNearSurfaceBlockedCount { get; private set; }
+    public int LastProvisionalTsdfNearSurfacePositiveBlockedCount { get; private set; }
+    public int LastProvisionalTsdfNearSurfaceNegativeBlockedCount { get; private set; }
+    public int LastProvisionalTsdfFarBandSkippedCount { get; private set; }
+    public int LastProvisionalTsdfCleanHistoryBlockedCount { get; private set; }
+    public int LastProvisionalTsdfDisabledBlockedCount { get; private set; }
+    public int LastProvisionalTsdfInvalidBlockedCount { get; private set; }
+    public int LastProvisionalTsdfVoteBlockedCount { get; private set; }
+    public int LastProvisionalTsdfScoreBlockedCount { get; private set; }
+    public int LastProvisionalTsdfSupportRatioBlockedCount { get; private set; }
+    public int LastProvisionalTsdfBandBlockedCount { get; private set; }
+    public int LastProvisionalTsdfSameFrameBlockedCount { get; private set; }
+    public int LastProvisionalTsdfCrossFrameBlockedCount { get; private set; }
+    public int LastProvisionalTsdfDirtyPendingBlockedCount { get; private set; }
+    public int LastProvisionalTsdfOldWeightBlockedCount { get; private set; }
+    public int LastProvisionalTsdfConflictBlockedCount { get; private set; }
+    public int LastProvisionalTsdfPlaneBlockedCount { get; private set; }
+    public int LastProvisionalTsdfPendingStabilityBlockedCount { get; private set; }
+    public int LastProvisionalTsdfFormalDowngradeBlockedCount { get; private set; }
+    public int LastProvisionalTsdfExistingWeightBypassCount { get; private set; }
+    public int LastProvisionalTsdfBootstrapLocalBypassCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityPassCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityBlockedCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityNoReferenceCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityCandidateCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityNormalRejectedCount { get; private set; }
+    public int LastProvisionalPlaneCompatibilityDistanceRejectedCount { get; private set; }
+    public int LastProvisionalLocalSupportPassCount { get; private set; }
+    public int LastProvisionalLocalSupportBlockedCount { get; private set; }
+    public int LastProvisionalLocalSupportNeighborCount { get; private set; }
+    public int LastProvisionalLocalSupportStableNeighborCount { get; private set; }
+    public int LastProvisionalLocalSupportAxialNeighborCount { get; private set; }
+    public int LastProvisionalTsdfConfirmedCount { get; private set; }
+    public int LastProvisionalTsdfConfirmedByWeightCount { get; private set; }
+    public int LastProvisionalTsdfRetiredCount { get; private set; }
+    public int LastProvisionalTsdfRetiredExpiredCount { get; private set; }
+    public int LastProvisionalTsdfDirtyClearedCount { get; private set; }
+    public int LastOldCleanMetabolismWatchCount { get; private set; }
+    public int LastOldCleanMetabolismDecayCount { get; private set; }
+    public int LastOldCleanMetabolismClearCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedCount { get; private set; }
+    public int LastOldCleanMetabolismCandidateCount { get; private set; }
+    public int LastOldCleanMetabolismWaitingHitsCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedSupportCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedSameFrameCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedWeightCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedResidualCount { get; private set; }
+    public int LastOldCleanMetabolismBlockedDirtyPendingCount { get; private set; }
+    public int LastOldCleanMetabolismSkippedWeakBandCount { get; private set; }
+    public int LastOldCleanMetabolismSkippedWeakCrossFrameCount { get; private set; }
     public int LastPendingTsdfCorrectionCount { get; private set; }
     public int LastCorrectedTsdfCount { get; private set; }
     public int LastReplacedDirtyTsdfCount { get; private set; }
+    public int LastGuardedDirtyTsdfReplaceCount { get; private set; }
+    public int LastDirtyTsdfBandRepairCount { get; private set; }
+    public int LastDirtyTsdfBandRepairSampleCount { get; private set; }
+    public int LastDirtyTsdfBandRepairTriggerCount { get; private set; }
+    public int LastDirtyTsdfBandRepairProbeCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedDisabledCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedNoSampleCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedNoHistoryCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedLowConflictCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedBudgetCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedOutsideCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedEmptyCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedWeightCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedSameSignCount { get; private set; }
+    public int LastDirtyTsdfBandRepairBlockedResidualCount { get; private set; }
     public int LastCleanedDirtyTsdfNeighborCount { get; private set; }
     public int LastDirtyTsdfQuarantineCount { get; private set; }
+    public int LastDirtyTsdfPendingNewCount { get; private set; }
+    public int LastDirtyTsdfPendingRepeatCount { get; private set; }
+    public int LastDirtyTsdfRejectedConflictCount { get; private set; }
+    public int LastDirtyTsdfReplaceBlockedDisabledCount { get; private set; }
+    public int LastDirtyTsdfReplaceBlockedWeightCount { get; private set; }
+    public int LastDirtyTsdfReplaceBlockedHitsCount { get; private set; }
+    public int LastDirtyTsdfReplaceBlockedCleanHistoryCount { get; private set; }
+    public int LastGuardedDirtyTsdfBlockedHitsCount { get; private set; }
+    public int LastGuardedDirtyTsdfBlockedWeightCount { get; private set; }
+    public int LastGuardedDirtyTsdfBlockedValueCount { get; private set; }
+    public int LastDirtyTsdfQuarantineNewCount { get; private set; }
+    public int LastDirtyTsdfQuarantineRefreshCount { get; private set; }
+    public int LastDirtyTsdfActiveCount { get; private set; }
+    public int LastDirtyTsdfExpiredCount { get; private set; }
     public int LastCarvedFreeSpaceVoxelCount { get; private set; }
+    public int LastFreeSpaceEvidenceCandidateCount { get; private set; }
+    public int LastFreeSpaceEvidenceNewCount { get; private set; }
+    public int LastFreeSpaceEvidenceRepeatCount { get; private set; }
+    public int LastFreeSpaceEvidenceWaitingCount { get; private set; }
+    public int LastFreeSpaceEvidenceAppliedCount { get; private set; }
+    public int LastFreeSpaceEvidenceClearedCount { get; private set; }
+    public int LastFreeSpaceEvidenceBlockedHighWeightCount { get; private set; }
+    public int LastFreeSpaceEvidenceBlockedSameFrameCount { get; private set; }
+    public int LastFreeSpaceEvidenceDuplicateFrameCount { get; private set; }
+    public int LastFreeSpaceEvidenceCancelledBySurfaceCount { get; private set; }
     public int LastNeighborFilledSampleCount { get; private set; }
     public int LastRejectedFallbackWeakCount { get; private set; }
     public int LastSkippedFallbackCapacityCount { get; private set; }
@@ -368,6 +731,239 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public float LastDiagWorstPatchBoundaryRatio { get; private set; }
     public float LastDiagWorstPatchExtentMeters { get; private set; }
     public string LastDiagLikelyCause { get; private set; } = "none";
+    public int LastTumorSuspectTriangleCount { get; private set; }
+    public int LastTumorRiskVertexCount { get; private set; }
+    public int LastTumorDirtyTriangleCount { get; private set; }
+    public int LastTumorPendingTriangleCount { get; private set; }
+    public int LastTumorReplaceHitBlockedTriangleCount { get; private set; }
+    public int LastTumorReplaceWeightBlockedTriangleCount { get; private set; }
+    public int LastTumorReplaceReadyTriangleCount { get; private set; }
+    public int LastSuspectMeshSourceIntegrateVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceProvisionalVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceStrongSeedVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceContinuityVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceCarveVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceReplaceVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceRepairVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceOtherVoxelCount { get; private set; }
+    public int LastSuspectMeshSourceUnknownVoxelCount { get; private set; }
+    public int LastTumorIslandTriangleCount { get; private set; }
+    public int LastTumorOpenEdgeTriangleCount { get; private set; }
+    public int LastTumorNonManifoldTriangleCount { get; private set; }
+    public int LastTumorLongEdgeTriangleCount { get; private set; }
+    public int LastIslandCauseComponentCount { get; private set; }
+    public int LastIslandCauseBoundaryVoxelCount { get; private set; }
+    public int LastIslandCauseNoTsdfCount { get; private set; }
+    public int LastIslandCausePendingCount { get; private set; }
+    public int LastIslandCauseDirtyCount { get; private set; }
+    public int LastIslandCauseLowWeightCount { get; private set; }
+    public int LastIslandCausePlaneMismatchCount { get; private set; }
+    public int LastIslandCausePrunedCount { get; private set; }
+    public int LastTsdfContinuityCandidateCount { get; private set; }
+    public int LastTsdfContinuityFilledCount { get; private set; }
+    public int LastTsdfContinuitySameSignFilledCount { get; private set; }
+    public int LastTsdfContinuityMixedSignFilledCount { get; private set; }
+    public int LastTsdfContinuityProvisionalNeighborCount { get; private set; }
+    public int LastTsdfContinuityBlockedDirtyPendingCount { get; private set; }
+    public int LastTsdfContinuityBlockedLowSupportCount { get; private set; }
+    public int LastTsdfContinuityBlockedBudgetCount { get; private set; }
+    public int LastTsdfContinuityBlockedUnsettledNeighborCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfCandidateCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFilledCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedSupportCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedFaceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedAxisCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedCleanAnchorCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedProvisionalAnchorCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedNearSurfaceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfBlockedBudgetCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfRelaxedAnchorFilledCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfVerifiedJointAnchorFilledCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfZeroCleanJointAnchorFilledCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalPresentNeighborCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalFacePresentCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalAcceptedNeighborCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalAcceptedFaceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedWeightCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedDirtyPendingCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedTsdfCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedResidualCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedProvenanceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfProvisionalBlockedNotFaceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport0Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport1Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport2Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport3Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport4Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport5Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSupport6Count { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceDeficitOneCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceDeficitTwoPlusCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotAcceptedCleanCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotAcceptedProvisionalCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotBlockedWeightCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotBlockedDirtyPendingCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotBlockedProvenanceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotBlockedTsdfCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotBlockedResidualCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfFaceSlotOutOfBoundsCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfVerifiedTwoFaceCandidateCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfVerifiedTwoFaceFilledCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportPassedCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportDeficitOneCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportDeficitTwoCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportDeficitThreeCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportDeficitFourPlusCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotAcceptedCleanCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotAcceptedProvisionalCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotBlockedWeightCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotBlockedDirtyPendingCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotBlockedProvenanceCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotBlockedTsdfCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotBlockedResidualCount { get; private set; }
+    public int LastTsdfBoundaryNoTsdfSupportSlotOutOfBoundsCount { get; private set; }
+    public int LastPureGeometrySuspectTriangleCount { get; private set; }
+    public int LastPureGeometryNormalTriangleCount { get; private set; }
+    public int LastPureGeometryProtrusionTriangleCount { get; private set; }
+    public int LastPureGeometryDoubleLayerTriangleCount { get; private set; }
+    public int LastDoubleLayerSourceDirtyCount { get; private set; }
+    public int LastDoubleLayerSourcePendingCount { get; private set; }
+    public int LastDoubleLayerSourceBandConflictCount { get; private set; }
+    public int LastDoubleLayerSourceOldLockedCount { get; private set; }
+    public int LastDoubleLayerSourceCleanCount { get; private set; }
+    public int LastDoubleLayerSourceEmptyCount { get; private set; }
+    public int LastDoubleLayerSourceMixedCount { get; private set; }
+    public int LastDoubleLayerSourceUnknownCount { get; private set; }
+    public int LastDoubleLayerCleanNoLifecycleCount { get; private set; }
+    public int LastDoubleLayerCleanNoProvenanceCount { get; private set; }
+    public int LastDoubleLayerCleanConflictHistoryCount { get; private set; }
+    public int LastDoubleLayerCleanReplaceHistoryCount { get; private set; }
+    public int LastDoubleLayerCleanExpiredDirtyCount { get; private set; }
+    public int LastDoubleLayerCleanLowWeightCount { get; private set; }
+    public int LastDoubleLayerCleanHighWeightCount { get; private set; }
+    public int LastDoubleLayerCleanLastIntegrateCount { get; private set; }
+    public int LastDoubleLayerCleanLastCarveCount { get; private set; }
+    public int LastDoubleLayerCleanLastReplaceCount { get; private set; }
+    public int LastDoubleLayerCleanLastRepairCount { get; private set; }
+    public int LastDoubleLayerCleanIntegrateCarveHistoryCount { get; private set; }
+    public int LastDoubleLayerCleanMultiFrameHistoryCount { get; private set; }
+    public int LastVoteSameFrameConflictRejectCount { get; private set; }
+    public int LastVotePendingHoldCount { get; private set; }
+    public int LastVotePendingConfirmedWriteCount { get; private set; }
+    public int LastVotePendingBootstrapWriteCount { get; private set; }
+    public int LastStrongSampleSeedWriteCount { get; private set; }
+    public int LastStrongSampleSeedBlockedCount { get; private set; }
+    public int LastStrongSampleSeedTemporaryBlockedCount { get; private set; }
+    public int LastStrongSampleSeedTempNearSurfaceBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempVoteBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempScoreBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempSupportBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempBandBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempSameFrameBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempCrossFrameBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempDirtyPendingBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempOldWeightBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempConflictBlockCount { get; private set; }
+    public int LastStrongSampleSeedTempLocalBlockCount { get; private set; }
+    public int LastVoteStrongCurrentAcceptCount { get; private set; }
+    public int LastVoteCrossFrameCleanConflictRejectCount { get; private set; }
+    public int LastSameFrameEntryStableCount { get; private set; }
+    public int LastSameFrameEntryProvisionalCount { get; private set; }
+    public int LastSameFrameEntryProvisionalWriteCount { get; private set; }
+    public int LastSameFrameEntryRejectedCount { get; private set; }
+    public int LastSameFrameEntryHeldCount { get; private set; }
+    public int LastFormalIntegrateWriteCount { get; private set; }
+    public int LastFormalIntegrateBlockedCount { get; private set; }
+    public int LastFormalIntegrateProvisionalCount { get; private set; }
+    public int LastFormalIntegrateBlockVoteCount { get; private set; }
+    public int LastFormalIntegrateBlockScoreCount { get; private set; }
+    public int LastFormalIntegrateBlockSupportCount { get; private set; }
+    public int LastFormalIntegrateBlockBandCount { get; private set; }
+    public int LastFormalIntegrateBlockResidualCount { get; private set; }
+    public int LastFormalIntegrateBlockCleanHistoryCount { get; private set; }
+    public int LastFormalIntegrateBlockWeakHistoryCount { get; private set; }
+    public int LastFormalIntegrateBlockTemporalDepthJumpCount { get; private set; }
+    public int LastFormalIntegrateBlockStrongCurrentHistoryCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBypassCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockLocalCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockSupportCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockStableCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockAxialCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockResidualCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockPlaneCount { get; private set; }
+    public int LastFormalStrongCurrentLocalHistoryBlockDoubleLayerCount { get; private set; }
+    public int LastStrongCurrentProvisionalPromotedCount { get; private set; }
+    public int LastStrongCurrentProvisionalPromotionBlockedCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockDisabledCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockTagCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockStorageCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockInvalidCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockNoProvisionalCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockNoProvisionalNearSurfaceCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockNoProvisionalFarBandCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockHitsCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockWeightCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockBandHistoryCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockAgreementCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockCleanHistoryCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockDirtyPendingCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockSameFrameCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockCrossFrameCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockConflictCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockLocalCount { get; private set; }
+    public int LastStrongCurrentProvisionalBlockPlaneCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalPassCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalBlockCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalNeighborCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalProvisionalNeighborCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalStableNeighborCount { get; private set; }
+    public int LastStrongCurrentPromotionLocalAxialNeighborCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerCandidateCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerBlockCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerNormalRejectCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerPlaneRejectCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerLateralRejectCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerDirtyNeighborCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerIntegrateBlockCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerReplaceBlockCount { get; private set; }
+    public int LastStrongCurrentPromotionDoubleLayerOtherBlockCount { get; private set; }
+    public int LastFormalIntegrateBlockSameFrameCount { get; private set; }
+    public int LastFormalIntegrateBlockCrossFrameCount { get; private set; }
+    public int LastFormalIntegrateBlockOldTsdfCount { get; private set; }
+    public int LastFormalIntegrateBlockDirtyPendingCount { get; private set; }
+    public int LastDoubleLayerValidatedPairCount { get; private set; }
+    public int LastDoubleLayerRejectedMissingSourceCount { get; private set; }
+    public int LastDoubleLayerRejectedSourceNormalCount { get; private set; }
+    public int LastDoubleLayerRejectedSourcePlaneCount { get; private set; }
+    public int LastDoubleLayerRejectedSourceLateralCount { get; private set; }
+    public int LastDoubleLayerMeshAlignmentMismatchCount { get; private set; }
+    public int LastDirtyEvidenceRenderedCount { get; private set; }
+    public int LastDirtyEvidenceBackfillCount { get; private set; }
+    public int LastRawDepthDebugRenderedCount { get; private set; }
+    public int LastRawDepthDebugAcceptedCount { get; private set; }
+    public int LastRawDepthDebugDirtyCount { get; private set; }
+    public int LastRawDepthDebugPendingCount { get; private set; }
+    public int LastRawDepthDebugStableBandCount { get; private set; }
+    public int LastRawDepthDebugConflictEdgeCount { get; private set; }
+    public int LastRawDepthDebugConflictViewCount { get; private set; }
+    public int LastRawDepthDebugConflictLockedCount { get; private set; }
+    public int LastRawDepthDebugRejectedCount { get; private set; }
+    public int LastRawDepthDebugDepthEdgeCount { get; private set; }
+    public int LastRawDepthDebugRobustCount { get; private set; }
+    public int LastRawDepthDebugSupportCount { get; private set; }
+    public int LastRawDepthDebugOutsideCount { get; private set; }
+    public int LastRawCoverageGridSampleCount { get; private set; }
+    public int LastRawCoverageGridDroppedSampleCount { get; private set; }
+    public int LastRawCoverageGridCellCount { get; private set; }
+    public int LastRawCoverageAcceptedCellCount { get; private set; }
+    public int LastRawCoverageProblemCellCount { get; private set; }
+    public int LastRawCoverageMixedCellCount { get; private set; }
+    public int LastRawCoverageAcceptedComponentCount { get; private set; }
+    public int LastRawCoverageLargestAcceptedComponentCells { get; private set; }
+    public int LastRawCoverageProblemComponentCount { get; private set; }
+    public int LastRawCoverageLargestProblemComponentCells { get; private set; }
+    public int LastRawCoverageRenderedCellCount { get; private set; }
     public int LastMainShellPromotedCellCount { get; private set; }
     public int LastCandidateShellHeldCellCount { get; private set; }
     public int LastDetailCandidateHeldCellCount { get; private set; }
@@ -442,6 +1038,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public string Reason;
     }
 
+    private enum DirtyTsdfEvidenceReason
+    {
+        PendingConflict,
+        RepeatedPending,
+        ReplaceDirty,
+        CorrectedOldDepth,
+        CleanupNeighbor,
+        RejectedConflict
+    }
+
+    private struct DirtyTsdfEvidence
+    {
+        public int VoxelIndex;
+        public int FrameIndex;
+        public int OldWeight;
+        public float OldTsdf;
+        public float NewTsdf;
+        public Vector3 VoxelCenter;
+        public Vector3 CameraPosition;
+        public Vector3 SurfacePoint;
+        public DirtyTsdfEvidenceReason Reason;
+    }
+
     private enum SurfaceEdgeKind
     {
         None,
@@ -456,20 +1075,450 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         Risk
     }
 
+    private enum RawDepthDebugKind
+    {
+        Accepted,
+        Dirty,
+        Pending,
+        StableBand,
+        ConflictEdge,
+        ConflictView,
+        ConflictLocked,
+        Rejected,
+        DepthEdge,
+        Robust,
+        Support,
+        Outside
+    }
+
+    private struct RawCoverageGridCell
+    {
+        public Vector3 PositionSum;
+        public int AcceptedCount;
+        public int ProblemCount;
+        public RawDepthDebugKind WorstKind;
+    }
+
+    private enum ObservationVoteMode
+    {
+        Shadow,
+        RejectOnly
+    }
+
+    private enum ObservationVoteState
+    {
+        Unassessed,
+        Accept,
+        Pending,
+        Reject
+    }
+
+    private StringBuilder _confidenceAuditRows;
+    private StringBuilder _confidenceAuditFrameRows;
+    private StringBuilder _doubleLayerPairRows;
+    private int _doubleLayerPairRowCount;
+    private int _doubleLayerPairDroppedRows;
+    private StreamWriter _contributionLedgerWriter;
+    private string _contributionLedgerPath;
+    private int _contributionLedgerRowCount;
+    private int _contributionLedgerWriteFailures;
+    private int _activeLedgerSampleIndex = -1;
+    private int _activeLedgerPixelX = -1;
+    private int _activeLedgerPixelY = -1;
+    private string _confidenceAuditDirectory;
+    private string _confidenceAuditStem;
+    private int _confidenceAuditRowCount;
+    private int _confidenceAuditDroppedRows;
+    private int _confidenceAuditCaptureIndex;
+    private int _confidenceAuditIntegratedFrames;
+    private string _lastConfidenceAuditPath = "off";
+    private static readonly CultureInfo AuditCulture = CultureInfo.InvariantCulture;
+    private bool _auditSampleActive;
+    private float _auditCenterAbsSampleTsdf;
+    private float _auditCenterSampleTsdf;
+    private float _auditCenterOldTsdf;
+    private int _auditCenterOldWeight;
+    private int _auditCenterStableHitsBefore;
+    private int _auditCenterStableHitsAfter;
+    private int _auditCenterCorrectionHitsBefore;
+    private int _auditCenterCorrectionHitsAfter;
+    private bool _auditCenterSignFlip;
+    private float _auditCenterResidual;
+    private string _auditCenterOutcome = "none";
+    private int _auditBandWritten;
+    private int _auditBandPendingStable;
+    private int _auditBandPendingCorrection;
+    private int _auditBandReplaced;
+    private int _auditBandCorrected;
+    private int _auditBandRejectedConflict;
+    private float _auditSampleSupportRatio;
+    private float _auditSampleRobustShiftMeters;
+    private float _auditSampleViewFacing;
+    private Vector3 _auditSampleNormal;
+    private float _auditTemporalDepthDeltaMeters = -1f;
+    private float _auditTemporalWorldDeltaMeters = -1f;
+    private float _auditTemporalNormalDeltaDegrees = -1f;
+    private float _auditSameFrameDepthDeltaMeters = -1f;
+    private float _auditSameFrameNormalDeltaDegrees = -1f;
+    private float _auditCrossFrameCleanDepthDeltaMeters = -1f;
+    private float _auditCrossFrameCleanLateralMeters = -1f;
+    private float _auditCrossFrameCleanNormalDeltaDegrees = -1f;
+    private int _auditCrossFrameCleanFrameGap = -1;
+    private int _auditCrossFrameCleanWeight = 0;
+    private float _auditHistoricalSurfaceDistanceMeters = -1f;
+    private float _auditOldTsdfResidual = -1f;
+    private int _auditOldTsdfWeight;
+    private float _auditHistoryAgreement = -1f;
+    private int _auditHistorySupportCount;
+    private int _auditBandHistoryCount;
+    private int _auditBandConflictCount;
+    private int _auditBandHighWeightConflictCount;
+    private float _auditBandConflictRatio = -1f;
+    private float _auditBandHighWeightConflictRatio = -1f;
+    private float _auditBandMeanResidual = -1f;
+    private float _auditBandMaxResidual = -1f;
+    private ObservationVoteState _auditVoteState;
+    private float _auditVoteScore;
+    private string _auditVoteReasons = "unassessed";
+    private bool _auditVoteEnforced;
+    private bool _auditStrongSampleSeedWrite;
+    private int _auditVoteAcceptCount;
+    private int _auditVotePendingCount;
+    private int _auditVoteRejectCount;
+    private int _auditVoteEnforcedRejectCount;
+    private Dictionary<Vector3Int, VoteHistoryCell> _votePreviousFrameHistory = new Dictionary<Vector3Int, VoteHistoryCell>(8192);
+    private Dictionary<Vector3Int, VoteHistoryCell> _voteCurrentFrameHistory = new Dictionary<Vector3Int, VoteHistoryCell>(8192);
+    private readonly Dictionary<Vector3Int, VoteHistoryCell> _voteCurrentFrameRawHistory = new Dictionary<Vector3Int, VoteHistoryCell>(8192);
+
+    private struct VoteHistoryCell
+    {
+        public Vector3 PositionSum;
+        public Vector3 NormalSum;
+        public int Count;
+    }
+    private float _auditMaxPosePositionDelta;
+    private float _auditMaxPoseAngleDelta;
+    private float _auditMaxSnapshotLatencyMs;
+    private readonly Dictionary<int, VoxelAuditLifecycle> _voxelAuditLifecycle = new Dictionary<int, VoxelAuditLifecycle>(4096);
+    private readonly Dictionary<int, VoxelWriteProvenance> _voxelWriteProvenance = new Dictionary<int, VoxelWriteProvenance>(32768);
+    private readonly HashSet<int> _captureAuditVoxels = new HashSet<int>();
+    private readonly HashSet<int> _auditSuspectMeshVoxels = new HashSet<int>();
+    private readonly HashSet<int> _auditPureGeometryMeshVoxels = new HashSet<int>();
+    private int _auditMeshAssociatedVoxelCount;
+    private int _auditRecurrentAfterReplaceCount;
+    private int _auditLikelyDepthInstabilityCount;
+    private int _auditViewOrRegistrationCount;
+    private int _auditSuspectAssociatedConflictVoxelCount;
+    private int _auditSuspectVoxelsLinkedToConflictCount;
+    private int _auditPureGeometryAssociatedConflictVoxelCount;
+    private int _auditPureGeometryVoxelsLinkedToConflictCount;
+    private int _auditLockedAboveCorrectableWeightCount;
+    private int _auditLockedBandConflictCount;
+    private int _auditLockedReplaceRecurrentCount;
+    private int _auditLockedDepthUnstableCount;
+    private int _auditLockedViewChangedCount;
+    private int _auditLockedUnderSupportedCount;
+    private int _auditLockedStableOldSurfaceCount;
+    private int _auditFrameReferenceCount;
+    private Vector3 _auditFrameReferenceVectorSum;
+    private float _auditFrameReferenceMagnitudeSum;
+
+    private struct VoxelAuditLifecycle
+    {
+        public int FirstConflictFrame;
+        public int LastConflictFrame;
+        public int ConflictCount;
+        public int ReplaceCount;
+        public int ConflictAfterReplaceCount;
+        public int LastReplaceFrame;
+        public int LastOldWeight;
+        public float LastOldTsdf;
+        public float LastSampleTsdf;
+        public float LastResidual;
+        public string LastCause;
+        public string LastLockSubtype;
+        public int LastCorrectionHits;
+        public float LastBandConflictRatio;
+        public float LastBandHighWeightConflictRatio;
+        public float LastHistoryAgreement;
+        public float LastHistoricalSurfaceDistanceMeters;
+        public int MeshNearbyVertices;
+        public bool SuspectMeshNearby;
+        public bool PureGeometryMeshNearby;
+        public int PriorWriteFrame;
+        public int PriorWriteFrameGap;
+        public float PriorCameraTravelMeters;
+        public float PriorSurfaceShiftMeters;
+        public float PriorCameraRotationDeltaDegrees;
+        public float PriorRayAngleDeltaDegrees;
+        public float PriorDepthDeltaMeters;
+        public float PriorNormalAngleDeltaDegrees;
+        public bool PriorWriteKnown;
+    }
+
+    private struct VoxelWriteProvenance
+    {
+        public int FirstFrame;
+        public int Frame;
+        public int Capture;
+        public int Sample;
+        public int PixelX;
+        public int PixelY;
+        public int WriteCount;
+        public int IntegrateCount;
+        public int CarveCount;
+        public int ReplaceCount;
+        public int RepairCount;
+        public string LastOperation;
+        public Vector3 CameraPosition;
+        public Quaternion CameraRotation;
+        public Vector3 SurfacePoint;
+        public Vector3 RayDirection;
+        public Vector3 SurfaceNormal;
+        public float SurfaceDepth;
+        public float OldTsdf;
+        public int OldWeight;
+        public float Tsdf;
+        public int Weight;
+    }
+
+    private void ResetStrongSampleSeedTemporaryBlockDiagnostics()
+    {
+        LastStrongSampleSeedTemporaryBlockedCount = 0;
+        LastStrongSampleSeedTempNearSurfaceBlockCount = 0;
+        LastStrongSampleSeedTempVoteBlockCount = 0;
+        LastStrongSampleSeedTempScoreBlockCount = 0;
+        LastStrongSampleSeedTempSupportBlockCount = 0;
+        LastStrongSampleSeedTempBandBlockCount = 0;
+        LastStrongSampleSeedTempSameFrameBlockCount = 0;
+        LastStrongSampleSeedTempCrossFrameBlockCount = 0;
+        LastStrongSampleSeedTempDirtyPendingBlockCount = 0;
+        LastStrongSampleSeedTempOldWeightBlockCount = 0;
+        LastStrongSampleSeedTempConflictBlockCount = 0;
+        LastStrongSampleSeedTempLocalBlockCount = 0;
+    }
+
+    private void ResetProvisionalTsdfBlockDiagnostics()
+    {
+        LastProvisionalTsdfDisabledBlockedCount = 0;
+        LastProvisionalTsdfInvalidBlockedCount = 0;
+        LastProvisionalTsdfNearSurfaceBlockedCount = 0;
+        LastProvisionalTsdfNearSurfacePositiveBlockedCount = 0;
+        LastProvisionalTsdfNearSurfaceNegativeBlockedCount = 0;
+        LastProvisionalTsdfFarBandSkippedCount = 0;
+        LastProvisionalTsdfVoteBlockedCount = 0;
+        LastProvisionalTsdfScoreBlockedCount = 0;
+        LastProvisionalTsdfSupportRatioBlockedCount = 0;
+        LastProvisionalTsdfBandBlockedCount = 0;
+        LastProvisionalTsdfCleanHistoryBlockedCount = 0;
+        LastProvisionalTsdfSameFrameBlockedCount = 0;
+        LastProvisionalTsdfCrossFrameBlockedCount = 0;
+        LastProvisionalTsdfDirtyPendingBlockedCount = 0;
+        LastProvisionalTsdfOldWeightBlockedCount = 0;
+        LastProvisionalTsdfConflictBlockedCount = 0;
+        LastProvisionalTsdfPlaneBlockedCount = 0;
+        LastProvisionalTsdfPendingStabilityBlockedCount = 0;
+        LastProvisionalTsdfFormalDowngradeBlockedCount = 0;
+        LastProvisionalTsdfExistingWeightBypassCount = 0;
+        LastProvisionalTsdfBootstrapLocalBypassCount = 0;
+        LastProvisionalPlaneCompatibilityPassCount = 0;
+        LastProvisionalPlaneCompatibilityBlockedCount = 0;
+        LastProvisionalPlaneCompatibilityNoReferenceCount = 0;
+        LastProvisionalPlaneCompatibilityCandidateCount = 0;
+        LastProvisionalPlaneCompatibilityNormalRejectedCount = 0;
+        LastProvisionalPlaneCompatibilityDistanceRejectedCount = 0;
+        LastProvisionalLocalSupportBlockedCount = 0;
+    }
+
+    private void RecordProvisionalTsdfBlock(string reason)
+    {
+        if (_auditStrongSampleSeedWrite)
+            return;
+
+        switch (reason)
+        {
+            case "disabled":
+                LastProvisionalTsdfDisabledBlockedCount++;
+                break;
+            case "invalid":
+                LastProvisionalTsdfInvalidBlockedCount++;
+                break;
+            case "near_surface":
+                LastProvisionalTsdfNearSurfaceBlockedCount++;
+                break;
+            case "near_surface_positive":
+                LastProvisionalTsdfNearSurfaceBlockedCount++;
+                LastProvisionalTsdfNearSurfacePositiveBlockedCount++;
+                break;
+            case "near_surface_negative":
+                LastProvisionalTsdfNearSurfaceBlockedCount++;
+                LastProvisionalTsdfNearSurfaceNegativeBlockedCount++;
+                break;
+            case "vote":
+                LastProvisionalTsdfVoteBlockedCount++;
+                break;
+            case "score":
+                LastProvisionalTsdfScoreBlockedCount++;
+                break;
+            case "support":
+                LastProvisionalTsdfSupportRatioBlockedCount++;
+                break;
+            case "band":
+                LastProvisionalTsdfBandBlockedCount++;
+                break;
+            case "clean_history":
+                LastProvisionalTsdfCleanHistoryBlockedCount++;
+                break;
+            case "same_frame":
+                LastProvisionalTsdfSameFrameBlockedCount++;
+                break;
+            case "cross_frame":
+                LastProvisionalTsdfCrossFrameBlockedCount++;
+                break;
+            case "dirty_pending":
+                LastProvisionalTsdfDirtyPendingBlockedCount++;
+                break;
+            case "old_weight":
+                LastProvisionalTsdfOldWeightBlockedCount++;
+                break;
+            case "conflict":
+                LastProvisionalTsdfConflictBlockedCount++;
+                break;
+            case "plane":
+                LastProvisionalTsdfPlaneBlockedCount++;
+                break;
+            case "local":
+                LastProvisionalLocalSupportBlockedCount++;
+                break;
+        }
+    }
+
+    private void ResetFormalIntegrateGateDiagnostics()
+    {
+        LastFormalIntegrateWriteCount = 0;
+        LastFormalIntegrateBlockedCount = 0;
+        LastFormalIntegrateProvisionalCount = 0;
+        LastFormalIntegrateBlockVoteCount = 0;
+        LastFormalIntegrateBlockScoreCount = 0;
+        LastFormalIntegrateBlockSupportCount = 0;
+        LastFormalIntegrateBlockBandCount = 0;
+        LastFormalIntegrateBlockResidualCount = 0;
+        LastFormalIntegrateBlockCleanHistoryCount = 0;
+        LastFormalIntegrateBlockWeakHistoryCount = 0;
+        LastFormalIntegrateBlockTemporalDepthJumpCount = 0;
+        LastFormalIntegrateBlockStrongCurrentHistoryCount = 0;
+        LastFormalStrongCurrentLocalHistoryBypassCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockLocalCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockSupportCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockStableCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockAxialCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockResidualCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockPlaneCount = 0;
+        LastFormalStrongCurrentLocalHistoryBlockDoubleLayerCount = 0;
+        LastStrongCurrentProvisionalPromotedCount = 0;
+        LastStrongCurrentProvisionalPromotionBlockedCount = 0;
+        LastStrongCurrentProvisionalBlockDisabledCount = 0;
+        LastStrongCurrentProvisionalBlockTagCount = 0;
+        LastStrongCurrentProvisionalBlockStorageCount = 0;
+        LastStrongCurrentProvisionalBlockInvalidCount = 0;
+        LastStrongCurrentProvisionalBlockNoProvisionalCount = 0;
+        LastStrongCurrentProvisionalBlockNoProvisionalNearSurfaceCount = 0;
+        LastStrongCurrentProvisionalBlockNoProvisionalFarBandCount = 0;
+        LastStrongCurrentProvisionalBlockHitsCount = 0;
+        LastStrongCurrentProvisionalBlockWeightCount = 0;
+        LastStrongCurrentProvisionalBlockBandHistoryCount = 0;
+        LastStrongCurrentProvisionalBlockAgreementCount = 0;
+        LastStrongCurrentProvisionalBlockCleanHistoryCount = 0;
+        LastStrongCurrentProvisionalBlockDirtyPendingCount = 0;
+        LastStrongCurrentProvisionalBlockSameFrameCount = 0;
+        LastStrongCurrentProvisionalBlockCrossFrameCount = 0;
+        LastStrongCurrentProvisionalBlockConflictCount = 0;
+        LastStrongCurrentProvisionalBlockLocalCount = 0;
+        LastStrongCurrentProvisionalBlockPlaneCount = 0;
+        LastStrongCurrentPromotionLocalPassCount = 0;
+        LastStrongCurrentPromotionLocalBlockCount = 0;
+        LastStrongCurrentPromotionLocalNeighborCount = 0;
+        LastStrongCurrentPromotionLocalProvisionalNeighborCount = 0;
+        LastStrongCurrentPromotionLocalStableNeighborCount = 0;
+        LastStrongCurrentPromotionLocalAxialNeighborCount = 0;
+        LastStrongCurrentPromotionDoubleLayerCandidateCount = 0;
+        LastStrongCurrentPromotionDoubleLayerBlockCount = 0;
+        LastStrongCurrentPromotionDoubleLayerNormalRejectCount = 0;
+        LastStrongCurrentPromotionDoubleLayerPlaneRejectCount = 0;
+        LastStrongCurrentPromotionDoubleLayerLateralRejectCount = 0;
+        LastStrongCurrentPromotionDoubleLayerDirtyNeighborCount = 0;
+        LastStrongCurrentPromotionDoubleLayerIntegrateBlockCount = 0;
+        LastStrongCurrentPromotionDoubleLayerReplaceBlockCount = 0;
+        LastStrongCurrentPromotionDoubleLayerOtherBlockCount = 0;
+        LastFormalIntegrateBlockSameFrameCount = 0;
+        LastFormalIntegrateBlockCrossFrameCount = 0;
+        LastFormalIntegrateBlockOldTsdfCount = 0;
+        LastFormalIntegrateBlockDirtyPendingCount = 0;
+    }
+
+    private void ResetSuspectMeshSourceDiagnostics()
+    {
+        LastSuspectMeshSourceIntegrateVoxelCount = 0;
+        LastSuspectMeshSourceProvisionalVoxelCount = 0;
+        LastSuspectMeshSourceStrongSeedVoxelCount = 0;
+        LastSuspectMeshSourceContinuityVoxelCount = 0;
+        LastSuspectMeshSourceCarveVoxelCount = 0;
+        LastSuspectMeshSourceReplaceVoxelCount = 0;
+        LastSuspectMeshSourceRepairVoxelCount = 0;
+        LastSuspectMeshSourceOtherVoxelCount = 0;
+        LastSuspectMeshSourceUnknownVoxelCount = 0;
+    }
+
     private void Awake()
     {
+        if (forceMeshGridDisplayOnEnable)
+            showRawDepthDebugView = false;
+        ApplyContinuityBaseFillPreset();
         ResolveRefs();
         EnsureObjects();
     }
 
     private void OnEnable()
     {
+        if (forceMeshGridDisplayOnEnable)
+            showRawDepthDebugView = false;
+        ApplyContinuityBaseFillPreset();
         ResolveRefs();
         EnsureObjects();
     }
 
+    private void ApplyContinuityBaseFillPreset()
+    {
+        if (!fillCleanTsdfContinuityGaps)
+            return;
+
+        tsdfContinuityFillRadiusVoxels = Mathf.Max(tsdfContinuityFillRadiusVoxels, 2);
+        minTsdfContinuityFaceNeighborVoxels = Mathf.Max(minTsdfContinuityFaceNeighborVoxels, 2);
+        minTsdfContinuitySameSignNeighborVoxels = Mathf.Min(minTsdfContinuitySameSignNeighborVoxels, 10);
+        maxTsdfContinuityNeighborAbsValue = Mathf.Max(maxTsdfContinuityNeighborAbsValue, 0.24f);
+        maxTsdfContinuityFillVoxelsPerRebuild = Mathf.Max(maxTsdfContinuityFillVoxelsPerRebuild, 4096);
+        allowSameSignContinuityBaseFill = true;
+        allowStableProvisionalContinuitySources = true;
+        fillBoundaryNoTsdfGaps = true;
+        minBoundaryNoTsdfNeighborVoxels = Mathf.Min(minBoundaryNoTsdfNeighborVoxels, 8);
+        minBoundaryNoTsdfFaceNeighborVoxels = Mathf.Max(minBoundaryNoTsdfFaceNeighborVoxels, 3);
+        allowBoundaryNoTsdfProvisionalAnchor = true;
+        minBoundaryNoTsdfCleanFaceAnchors = Mathf.Clamp(minBoundaryNoTsdfCleanFaceAnchors, 0, 6);
+        minBoundaryNoTsdfProvisionalAnchors = Mathf.Clamp(minBoundaryNoTsdfProvisionalAnchors, 2, 12);
+        minBoundaryNoTsdfProvisionalFaceAnchors = Mathf.Clamp(minBoundaryNoTsdfProvisionalFaceAnchors, 1, 6);
+        maxBoundaryNoTsdfFillVoxelsPerRebuild = Mathf.Max(maxBoundaryNoTsdfFillVoxelsPerRebuild, 1024);
+    }
+
+    private void OnDisable()
+    {
+        if (_confidenceAuditRows != null)
+            EndConfidenceAuditCapture(_confidenceAuditIntegratedFrames, "component disabled");
+    }
+
     private void OnDestroy()
     {
+        if (_confidenceAuditRows != null)
+            EndConfidenceAuditCapture(_confidenceAuditIntegratedFrames, "component destroyed");
         if (_mesh != null)
             Destroy(_mesh);
         if (_runtimeMaterial != null)
@@ -482,6 +1531,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Destroy(_wireRuntimeMaterial);
         if (_wireObject != null)
             Destroy(_wireObject);
+        if (_dirtyEvidenceMesh != null)
+            Destroy(_dirtyEvidenceMesh);
+        if (_dirtyEvidenceMaterial != null)
+            Destroy(_dirtyEvidenceMaterial);
+        if (_dirtyEvidenceObject != null)
+            Destroy(_dirtyEvidenceObject);
+        if (_rawDepthDebugMesh != null)
+            Destroy(_rawDepthDebugMesh);
+        if (_rawDepthDebugMaterial != null)
+            Destroy(_rawDepthDebugMaterial);
+        if (_rawDepthDebugObject != null)
+            Destroy(_rawDepthDebugObject);
         if (_hudRoot != null)
             Destroy(_hudRoot);
         if (_diagnosticHotspotRoot != null)
@@ -553,6 +1614,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _correctionTsdfHits = null;
         _correctionTsdfLastFrame = null;
         _dirtyTsdfLastFrame = null;
+        _provisionalTsdf = null;
+        _provisionalTsdfLastFrame = null;
+        _provisionalTsdfHits = null;
+        _oldCleanConflictHits = null;
+        _oldCleanConflictLastFrame = null;
+        _freeSpaceEvidenceHits = null;
+        _freeSpaceEvidenceLastFrame = null;
         _cellVertexIndices = null;
         _detailCandidateCellHits = null;
         _detailCandidateCellLastFrame = null;
@@ -561,7 +1629,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _fallbackSurfaceVoxelKeys.Clear();
         _fallbackSurfaceVoxels.Clear();
         _surfaceChunks.Clear();
+        _voxelAuditLifecycle.Clear();
+        _voxelWriteProvenance.Clear();
+        _captureAuditVoxels.Clear();
         _surfaceChunkOrder.Clear();
+        _dirtyTsdfEvidence.Clear();
+        if (_dirtyEvidenceMesh != null)
+            _dirtyEvidenceMesh.Clear();
+        if (_dirtyEvidenceObject != null)
+            _dirtyEvidenceObject.SetActive(false);
+        if (_rawDepthDebugMesh != null)
+            _rawDepthDebugMesh.Clear();
+        if (_rawDepthDebugObject != null)
+            _rawDepthDebugObject.SetActive(false);
+        ClearRawDepthDebugCache();
+        ResetRawDepthDebugCounters();
         _fallbackSurfaceReplaceCursor = 0;
         LastSurfaceChunkCount = 0;
         LastEvictedSurfaceChunkCount = 0;
@@ -569,11 +1651,56 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         TotalEvictedSurfaceChunkCount = 0;
         TotalEvictedSurfaceCellCount = 0;
         LastSurfaceCellConflictCount = 0;
+        LastProvisionalTsdfSupportWriteCount = 0;
+        LastProvisionalTsdfSupportBlockedCount = 0;
+        ResetProvisionalTsdfBlockDiagnostics();
+        LastStrongSampleSeedWriteCount = 0;
+        LastStrongSampleSeedBlockedCount = 0;
+        ResetStrongSampleSeedTemporaryBlockDiagnostics();
+        ResetFormalIntegrateGateDiagnostics();
+        LastProvisionalLocalSupportPassCount = 0;
+        LastProvisionalLocalSupportNeighborCount = 0;
+        LastProvisionalLocalSupportStableNeighborCount = 0;
+        LastProvisionalLocalSupportAxialNeighborCount = 0;
+        LastProvisionalTsdfConfirmedCount = 0;
+        LastProvisionalTsdfConfirmedByWeightCount = 0;
+        LastProvisionalTsdfRetiredCount = 0;
+        LastProvisionalTsdfRetiredExpiredCount = 0;
+        LastProvisionalTsdfDirtyClearedCount = 0;
+        LastOldCleanMetabolismWatchCount = 0;
+        LastOldCleanMetabolismDecayCount = 0;
+        LastOldCleanMetabolismClearCount = 0;
+        LastOldCleanMetabolismBlockedCount = 0;
+        LastOldCleanMetabolismCandidateCount = 0;
+        LastOldCleanMetabolismWaitingHitsCount = 0;
+        LastOldCleanMetabolismBlockedSupportCount = 0;
+        LastOldCleanMetabolismBlockedSameFrameCount = 0;
+        LastOldCleanMetabolismBlockedWeightCount = 0;
+        LastOldCleanMetabolismBlockedResidualCount = 0;
+        LastOldCleanMetabolismBlockedDirtyPendingCount = 0;
+        LastOldCleanMetabolismSkippedWeakBandCount = 0;
+        LastOldCleanMetabolismSkippedWeakCrossFrameCount = 0;
         LastPendingTsdfCorrectionCount = 0;
         LastCorrectedTsdfCount = 0;
         LastReplacedDirtyTsdfCount = 0;
+        LastGuardedDirtyTsdfReplaceCount = 0;
+        LastDirtyTsdfBandRepairCount = 0;
+        LastDirtyTsdfBandRepairSampleCount = 0;
+        LastDirtyTsdfBandRepairTriggerCount = 0;
+        LastDirtyTsdfBandRepairProbeCount = 0;
+        LastDirtyTsdfBandRepairBlockedDisabledCount = 0;
+        LastDirtyTsdfBandRepairBlockedNoSampleCount = 0;
+        LastDirtyTsdfBandRepairBlockedNoHistoryCount = 0;
+        LastDirtyTsdfBandRepairBlockedLowConflictCount = 0;
+        LastDirtyTsdfBandRepairBlockedBudgetCount = 0;
+        LastDirtyTsdfBandRepairBlockedOutsideCount = 0;
+        LastDirtyTsdfBandRepairBlockedEmptyCount = 0;
+        LastDirtyTsdfBandRepairBlockedWeightCount = 0;
+        LastDirtyTsdfBandRepairBlockedSameSignCount = 0;
+        LastDirtyTsdfBandRepairBlockedResidualCount = 0;
         LastCleanedDirtyTsdfNeighborCount = 0;
         LastDirtyTsdfQuarantineCount = 0;
+        ResetDirtyTsdfDiagnostics();
         LastRejectedTsdfDepthSupportCount = 0;
         LastRejectedRobustDepthCount = 0;
         LastRobustDepthDownweightedCount = 0;
@@ -582,6 +1709,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastDepthEdgeDownweightedCount = 0;
         LastRejectedFallbackWeakCount = 0;
         LastCarvedFreeSpaceVoxelCount = 0;
+        ResetFreeSpaceEvidenceDiagnostics();
         LastRejectedBadMeshRebuildCount = 0;
         LastHeldDisplayTriangleCount = 0;
         ResetExtractionDiagnostics();
@@ -663,6 +1791,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         List<int> triangles = new List<int>(Mathf.Min(maxSurfaceVertices * 3, cellCount * 6));
         List<Color> colors = new List<Color>(Mathf.Min(maxSurfaceVertices, cellCount));
         ResetExtractionDiagnostics();
+        RetireExpiredProvisionalTsdf();
+        FillCleanTsdfContinuityGaps();
 
         Vector3[] cornerPositions = new Vector3[8];
         float[] cornerValues = new float[8];
@@ -771,6 +1901,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         AnalyzeMeshDiagnostics(vertices, triangles);
+        ApplyMeshTumorSuspectOverlay(vertices, triangles, colors);
 
         if (ShouldKeepDisplayedMesh(previousTriangleCount, vertices.Count, triangles.Count / 3))
         {
@@ -799,6 +1930,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastMeshVertexCount = vertices.Count;
         LastMeshTriangleCount = triangles.Count / 3;
         RebuildWireOverlay(vertices, triangles);
+        RebuildRawDepthDebugMesh();
+        ApplyRawDepthDebugDisplayMode();
 
         if (debugLog)
         {
@@ -839,10 +1972,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         ResolveRefs();
         EnsureObjects();
+        BeginConfidenceAuditCapture();
 
         if (rawDepthSource == null)
         {
             Warn("Raw depth source is missing.");
+            EndConfidenceAuditCapture(0, "raw depth source missing");
             _captureRoutine = null;
             yield break;
         }
@@ -872,9 +2007,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     ready.frameIndex != lastAcceptedFrame)
                 {
                     integratedThisFrame = IntegrateSnapshot(ready);
+                    // A fully gated frame is still consumed; do not repeatedly reprocess it.
+                    lastAcceptedFrame = ready.frameIndex;
                     if (integratedThisFrame)
                     {
-                        lastAcceptedFrame = ready.frameIndex;
                         integratedFrames++;
                     }
                     if (integratedThisFrame && rebuildMeshAfterEachCapture && !rebuildMeshAfterFusionBurstOnly)
@@ -906,6 +2042,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 this);
         }
 
+        EndConfidenceAuditCapture(integratedFrames, integratedFrames > 0 ? "complete" : "no integrated frame");
         _captureRoutine = null;
     }
 
@@ -921,12 +2058,25 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         EnsureVolumeInitialized();
 
         Vector3 cameraPosition = GetCameraPosition();
+        double integrationRealtime = Time.realtimeSinceStartupAsDouble;
+        float posePositionDelta = snapshot.hasSnapshotCameraPose
+            ? Vector3.Distance(snapshot.snapshotCameraPosition, cameraPosition)
+            : -1f;
+        Quaternion integrationRotation = Camera.main != null ? Camera.main.transform.rotation : Quaternion.identity;
+        float poseAngleDelta = snapshot.hasSnapshotCameraPose
+            ? Quaternion.Angle(snapshot.snapshotCameraRotation, integrationRotation)
+            : -1f;
+        float snapshotLatencyMs = snapshot.snapshotRealtimeSeconds > 0d
+            ? (float)((integrationRealtime - snapshot.snapshotRealtimeSeconds) * 1000d)
+            : -1f;
+        ResetFrameReferenceAudit();
         Vector3[] positions = snapshot.worldPositions;
         Vector3[] normals = snapshot.worldNormals;
         Color[] meta = snapshot.observationMeta;
         int width = snapshot.resolutionWidth;
         int height = snapshot.resolutionHeight;
         int expected = Mathf.Min(width * height, positions.Length);
+        BeginVoteHistoryFrame();
         int stride = Mathf.Max(1, sampleStridePixels);
         int halfBandSteps = Mathf.Max(1, Mathf.CeilToInt(truncationMeters / voxelSizeMeters));
 
@@ -946,28 +2096,128 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     continue;
 
                 LastInputSampleCount++;
+                _activeLedgerSampleIndex = index;
+                _activeLedgerPixelX = x;
+                _activeLedgerPixelY = y;
+                bool auditThisSample = ShouldAuditSample(index);
+                BeginConfidenceAuditSample(auditThisSample);
+                Vector3 rawPoint = positions[index];
 
                 if (!TryGetUsableSampleOrNeighbor(x, y, width, height, positions, normals, meta, cameraPosition, out Vector3 point, out Vector3 normal, out float sampleWeight))
+                {
+                    SetObservationVote(ObservationVoteState.Reject, 0f, "invalid_or_basic_filter");
+                    RecordRawCoverageGridSample(positions[index], RawDepthDebugKind.Rejected, false);
+                    CacheRawDepthDebugSample(positions[index], RawDepthDebugKind.Rejected);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, rawPoint, 0f, 0, 0, 0f, 0f, 0, 0, "discard", "invalid_or_basic_filter", auditThisSample);
                     continue;
+                }
 
                 if (!PassDepthNeighborhoodConsistency(x, y, width, height, positions, cameraPosition, point, out int checkedDepthNeighbors, out int consistentDepthNeighbors))
                 {
+                    SetObservationVote(ObservationVoteState.Reject, 0.05f, "depth_discontinuity");
                     LastRejectedDepthDiscontinuityCount++;
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.DepthEdge, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.DepthEdge);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, 0f, 0f, 0, 0, "discard", "depth_discontinuity", auditThisSample);
                     continue;
                 }
 
+                Vector3 pointBeforeRobust = point;
                 if (!ApplyRobustDepthPrefilter(x, y, width, height, positions, cameraPosition, ref point, ref sampleWeight))
                 {
+                    SetObservationVote(ObservationVoteState.Reject, 0.10f, "robust_depth_outlier");
                     LastRejectedRobustDepthCount++;
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Robust, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Robust);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "robust_depth_outlier", auditThisSample);
                     continue;
                 }
+                _auditSampleSupportRatio = checkedDepthNeighbors > 0 ? (float)consistentDepthNeighbors / checkedDepthNeighbors : 0f;
+                _auditSampleRobustShiftMeters = Vector3.Distance(pointBeforeRobust, point);
+                Vector3 auditViewDirection = (cameraPosition - point).normalized;
+                _auditSampleViewFacing = normal.sqrMagnitude > 0.0001f
+                    ? Mathf.Abs(Vector3.Dot(normal.normalized, auditViewDirection))
+                    : 0f;
+                _auditSampleNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+                MeasureTemporalVoteFeatures(cameraPosition, point, _auditSampleNormal);
+                MeasureHistoricalTsdfVoteFeatures(point);
+                MeasureTsdfBandVoteFeatures(cameraPosition, point, _auditSampleNormal, halfBandSteps);
+                MeasureCrossFrameCleanSurfaceConflict(point, _auditSampleNormal);
+                RecordCurrentFrameRawVoteSample(point, _auditSampleNormal);
 
                 if (!PassTsdfDepthSupport(checkedDepthNeighbors, consistentDepthNeighbors))
                 {
+                    SetObservationVote(ObservationVoteState.Reject, 0.15f, "insufficient_depth_support");
                     LastRejectedTsdfDepthSupportCount++;
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Support, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Support);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "insufficient_depth_support", auditThisSample);
                     continue;
                 }
+                ObservationVoteState observationVote = EvaluateObservationVote(sampleWeight);
+                if (observationVote == ObservationVoteState.Accept)
+                    RecordVoteHistorySample(point, _auditSampleNormal);
+                if (observationVote == ObservationVoteState.Reject &&
+                    (enforceObservationWriteGate || observationVoteMode == ObservationVoteMode.RejectOnly))
+                {
+                    TryMetabolizeOldCleanTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "vote_reject", auditThisSample);
+                    continue;
+                }
+                if (observationVote == ObservationVoteState.Pending &&
+                    enforceObservationWriteGate &&
+                    holdUnconfirmedPendingWrites)
+                {
+                    if (!PendingObservationHasWriteSupport(sampleWeight, out bool bootstrapWrite, out bool sameFrameProvisionalWrite, out bool strongSampleSeedWrite))
+                    {
+                        LastVotePendingHoldCount++;
+                        if (HasSameFrameEntryConflict())
+                            LastSameFrameEntryHeldCount++;
+                        RecordRawCoverageGridSample(point, RawDepthDebugKind.Pending, false);
+                        CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
+                        AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "hold", "vote_pending_hold", auditThisSample);
+                        continue;
+                    }
+                    if (strongSampleSeedWrite)
+                    {
+                        _auditStrongSampleSeedWrite = true;
+                        sampleWeight *= Mathf.Clamp(strongSampleSeedWeightScale, 0.05f, 0.5f);
+                        LastStrongSampleSeedWriteCount++;
+                        if (bootstrapWrite)
+                            LastVotePendingBootstrapWriteCount++;
+                    }
+                    else if (sameFrameProvisionalWrite)
+                    {
+                        sampleWeight *= Mathf.Clamp(sameFrameEntryProvisionalWeightScale, 0.05f, 0.6f);
+                        LastSameFrameEntryProvisionalWriteCount++;
+                    }
+                    else if (bootstrapWrite)
+                    {
+                        sampleWeight *= Mathf.Clamp(pendingBootstrapWeightScale, 0.05f, 0.5f);
+                        LastVotePendingBootstrapWriteCount++;
+                    }
+                    else
+                    {
+                        sampleWeight *= Mathf.Clamp(confirmedPendingWriteWeightScale, 0.05f, 1f);
+                        LastVotePendingConfirmedWriteCount++;
+                    }
+                    RecordVoteHistorySample(point, _auditSampleNormal);
+                }
+                AccumulateFrameReferenceAudit(point);
 
+                float oldTsdfAtSurface = 0f;
+                int oldWeightAtSurface = 0;
+                int oldPendingHitsAtSurface = 0;
+                if (TryWorldToVoxel(point, out int auditVx, out int auditVy, out int auditVz))
+                {
+                    int auditVoxelIndex = Index(auditVx, auditVy, auditVz);
+                    oldTsdfAtSurface = _tsdf[auditVoxelIndex];
+                    oldWeightAtSurface = _weights[auditVoxelIndex];
+                    if (_correctionTsdfHits != null && auditVoxelIndex >= 0 && auditVoxelIndex < _correctionTsdfHits.Length)
+                        oldPendingHitsAtSurface = _correctionTsdfHits[auditVoxelIndex];
+                }
                 int dirtyReplaceBeforeSample = LastReplacedDirtyTsdfCount;
                 int dirtyCleanBeforeSample = LastCleanedDirtyTsdfNeighborCount;
                 int dirtyQuarantineBeforeSample = LastDirtyTsdfQuarantineCount;
@@ -977,6 +2227,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (!touchedDenseTsdf)
                 {
                     LastRejectedOutsideVolumeCount++;
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Outside, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Outside);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "discard", "outside_tsdf_volume", auditThisSample);
                     continue;
                 }
 
@@ -989,15 +2242,43 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 {
                     LastBlockedDirtyLightCoverSampleCount++;
                     TotalBlockedDirtyLightCoverSampleCount++;
+                    RecordRawCoverageGridSample(point, RawDepthKindFromAuditOutcome(), false);
+                    CacheRawDepthDebugSample(point, RawDepthKindFromAuditOutcome());
+                    string repairReason = LastReplacedDirtyTsdfCount > dirtyReplaceBeforeSample ? "dirty_replaced" :
+                        (LastDirtyTsdfQuarantineCount > dirtyQuarantineBeforeSample ? "dirty_quarantined" : "dirty_neighbor_cleaned");
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "repair", repairReason, auditThisSample);
                 }
                 else if (!addFallbackOnlyAfterTsdfSupport || sampleWeight >= minFallbackSurfaceSampleWeight)
+                {
                     AddFallbackSurfaceSample(point, normal);
+                    RawDepthDebugKind outcomeKind = RawDepthKindFromAuditOutcome();
+                    string decision = _auditCenterOutcome == "pending_correction" || _auditCenterOutcome == "pending_stability"
+                        ? "pending"
+                        : (_auditCenterOutcome == "rejected_conflict" ? "discard" : "accept");
+                    RecordRawCoverageGridSample(point, outcomeKind, observationVote == ObservationVoteState.Accept);
+                    CacheRawDepthDebugSample(point, outcomeKind);
+                    string reason = _auditCenterOutcome;
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, decision, reason, auditThisSample);
+                }
                 else
+                {
                     LastRejectedFallbackWeakCount++;
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
+                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "discard", "fallback_weight_weak", auditThisSample);
+                }
             }
         }
 
+        FinalizeRawCoverageGridDiagnostics();
+        AppendConfidenceAuditFrame(snapshot.frameIndex, snapshotLatencyMs, posePositionDelta, poseAngleDelta, cameraPosition);
+        EndVoteHistoryFrame();
+        _activeLedgerSampleIndex = -1;
+        _activeLedgerPixelX = -1;
+        _activeLedgerPixelY = -1;
         IntegratedFrameCount++;
+        _confidenceAuditIntegratedFrames++;
+        UpdateDirtyTsdfLifecycleDiagnostics();
         if (debugLog)
         {
             Debug.Log(
@@ -1006,6 +2287,2519 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         return LastIntegratedSampleCount > 0;
+    }
+
+    private void BeginConfidenceAuditCapture()
+    {
+        ResetRawCoverageGridDiagnostics();
+        if (!writeConfidenceAuditOnCapture)
+            return;
+
+        if (clearRawDepthDebugAtCaptureStart)
+            ClearRawDepthDebugCache();
+        _confidenceAuditCaptureIndex++;
+        _confidenceAuditRowCount = 0;
+        _confidenceAuditDroppedRows = 0;
+        _confidenceAuditIntegratedFrames = 0;
+        _auditVoteAcceptCount = 0;
+        _auditVotePendingCount = 0;
+        _auditVoteRejectCount = 0;
+        _auditVoteEnforcedRejectCount = 0;
+        LastVoteSameFrameConflictRejectCount = 0;
+        LastVotePendingHoldCount = 0;
+        LastVotePendingConfirmedWriteCount = 0;
+        LastVotePendingBootstrapWriteCount = 0;
+        LastStrongSampleSeedWriteCount = 0;
+        LastStrongSampleSeedBlockedCount = 0;
+        ResetStrongSampleSeedTemporaryBlockDiagnostics();
+        ResetFormalIntegrateGateDiagnostics();
+        LastVoteStrongCurrentAcceptCount = 0;
+        LastVoteCrossFrameCleanConflictRejectCount = 0;
+        LastSameFrameEntryStableCount = 0;
+        LastSameFrameEntryProvisionalCount = 0;
+        LastSameFrameEntryProvisionalWriteCount = 0;
+        LastSameFrameEntryRejectedCount = 0;
+        LastSameFrameEntryHeldCount = 0;
+        _confidenceAuditRows = new StringBuilder(1024 * 1024);
+        _confidenceAuditFrameRows = new StringBuilder(2048);
+        _doubleLayerPairRows = new StringBuilder(256 * 1024);
+        _doubleLayerPairRowCount = 0;
+        _doubleLayerPairDroppedRows = 0;
+        _doubleLayerPairRows.AppendLine(
+            "capture,detect_frame,triangle_a,triangle_b,separation_m,lateral_m,normal_dot," +
+            "a_center_x,a_center_y,a_center_z,a_voxel_index,a_voxel_x,a_voxel_y,a_voxel_z,a_tsdf,a_weight,a_first_frame,a_last_frame,a_capture,a_sample,a_pixel_x,a_pixel_y,a_last_operation,a_write_count,a_integrate_count,a_carve_count,a_replace_count,a_repair_count,a_surface_depth_m,a_ray_x,a_ray_y,a_ray_z,a_dirty,a_pending," +
+            "b_center_x,b_center_y,b_center_z,b_voxel_index,b_voxel_x,b_voxel_y,b_voxel_z,b_tsdf,b_weight,b_first_frame,b_last_frame,b_capture,b_sample,b_pixel_x,b_pixel_y,b_last_operation,b_write_count,b_integrate_count,b_carve_count,b_replace_count,b_repair_count,b_surface_depth_m,b_ray_x,b_ray_y,b_ray_z,b_dirty,b_pending," +
+            "same_last_frame,same_sample,frame_gap,surface_depth_delta_m,ray_angle_deg,both_integrated,either_carved");
+        _confidenceAuditFrameRows.AppendLine(
+            "capture,frame,snapshot_latency_ms,pose_position_delta_m,pose_angle_delta_deg,integration_camera_x,integration_camera_y,integration_camera_z,stable_reference_count,reference_mean_residual_m,reference_vector_coherence,reference_mean_dx,reference_mean_dy,reference_mean_dz");
+        _captureAuditVoxels.Clear();
+        _auditMaxPosePositionDelta = 0f;
+        _auditMaxPoseAngleDelta = 0f;
+        _auditMaxSnapshotLatencyMs = 0f;
+        _auditMeshAssociatedVoxelCount = 0;
+        _auditRecurrentAfterReplaceCount = 0;
+        _auditLikelyDepthInstabilityCount = 0;
+        _auditViewOrRegistrationCount = 0;
+        _auditSuspectAssociatedConflictVoxelCount = 0;
+        _auditSuspectVoxelsLinkedToConflictCount = 0;
+        _auditPureGeometryAssociatedConflictVoxelCount = 0;
+        _auditPureGeometryVoxelsLinkedToConflictCount = 0;
+        _auditPureGeometryAssociatedConflictVoxelCount = 0;
+        _auditPureGeometryVoxelsLinkedToConflictCount = 0;
+        _confidenceAuditRows.AppendLine(
+            "capture,frame,sample,pixel_x,pixel_y,world_x,world_y,world_z,sample_weight,depth_checked,depth_consistent,support_ratio,robust_shift_m,view_facing,temporal_depth_delta_m,temporal_world_delta_m,temporal_normal_delta_deg,historical_surface_distance_m,old_tsdf_residual,old_tsdf_history_weight,history_agreement,history_support_count,band_history_count,band_conflict_count,band_high_weight_conflict_count,band_conflict_ratio,band_high_weight_conflict_ratio,band_mean_residual,band_max_residual,vote_state,vote_score,vote_reasons,vote_enforced,old_tsdf,old_weight,pending_hits,decision,reason,center_sample_tsdf,center_old_tsdf,center_old_weight,center_stable_hits_before,center_stable_hits_after,center_correction_hits_before,center_correction_hits_after,center_sign_flip,center_residual,center_outcome,center_conflict_cause,band_written,band_pending_stable,band_pending_correction,band_replaced,band_corrected,band_rejected_conflict,same_frame_depth_delta_m,same_frame_normal_delta_deg,cross_frame_clean_depth_delta_m,cross_frame_clean_lateral_m,cross_frame_clean_normal_delta_deg,cross_frame_clean_frame_gap,cross_frame_clean_weight");
+        string timestamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", AuditCulture);
+        _confidenceAuditStem = $"confidence_audit_{timestamp}_{_confidenceAuditCaptureIndex:D3}";
+        _confidenceAuditDirectory = ResolveConfidenceAuditDirectory();
+        BeginContributionLedger();
+    }
+
+    private void BeginContributionLedger()
+    {
+        _contributionLedgerRowCount = 0;
+        _contributionLedgerWriteFailures = 0;
+        _contributionLedgerPath = null;
+        try
+        {
+            Directory.CreateDirectory(_confidenceAuditDirectory);
+            _contributionLedgerPath = Path.Combine(
+                _confidenceAuditDirectory,
+                _confidenceAuditStem + "_contribution_ledger.csv");
+            _contributionLedgerWriter = new StreamWriter(
+                _contributionLedgerPath,
+                false,
+                new UTF8Encoding(false),
+                1024 * 1024);
+            _contributionLedgerWriter.WriteLine(
+                "capture,frame,sample,pixel_x,pixel_y,voxel_index,voxel_x,voxel_y,voxel_z,world_x,world_y,world_z,operation,old_tsdf,old_weight,observed_tsdf,observed_weight,new_tsdf,new_weight,old_numerator,observed_numerator,new_numerator,pending_stable_hits,pending_correction_hits,support_ratio,robust_shift_m,view_facing,temporal_depth_delta_m,temporal_world_delta_m,temporal_normal_delta_deg,historical_surface_distance_m,old_tsdf_residual,old_tsdf_history_weight,history_agreement,history_support_count,band_history_count,band_conflict_count,band_high_weight_conflict_count,band_conflict_ratio,band_high_weight_conflict_ratio,band_mean_residual,band_max_residual,vote_state,vote_score,vote_reasons,vote_enforced,normal_x,normal_y,normal_z,same_frame_depth_delta_m,same_frame_normal_delta_deg,cross_frame_clean_depth_delta_m,cross_frame_clean_lateral_m,cross_frame_clean_normal_delta_deg,cross_frame_clean_frame_gap,cross_frame_clean_weight");
+        }
+        catch (System.Exception error)
+        {
+            _contributionLedgerWriter = null;
+            _contributionLedgerWriteFailures++;
+            Debug.LogWarning($"[ScanCover] Contribution ledger could not start: {error.Message}", this);
+        }
+    }
+
+    private void RecordContributionLedger(
+        int index,
+        string operation,
+        float oldTsdf,
+        int oldWeight,
+        float observedTsdf,
+        float observedWeight,
+        float newTsdf,
+        int newWeight)
+    {
+        if (index < 0)
+            return;
+
+        UpdateProvisionalTsdfLifecycle(index, operation);
+        RecordVoxelWriteProvenance(index, operation, oldTsdf, oldWeight, newTsdf, newWeight);
+        if (ShouldCancelFreeSpaceEvidence(index, operation, observedTsdf))
+            CancelFreeSpaceEvidence(index);
+        if (_contributionLedgerWriter == null)
+            return;
+
+        try
+        {
+            IndexToVoxel(index, out int x, out int y, out int z);
+            Vector3 world = VoxelCenter(x, y, z);
+            _contributionLedgerWriter.Write(_confidenceAuditCaptureIndex);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(LastRawFrameIndex);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_activeLedgerSampleIndex);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_activeLedgerPixelX);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_activeLedgerPixelY);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(index);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(x);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(y);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(z);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(world.x);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(world.y);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(world.z);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(operation);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(oldTsdf);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(oldWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(observedTsdf);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(observedWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(newTsdf);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(newWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(oldTsdf * oldWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(observedTsdf * observedWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(newTsdf * newWeight);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(ReadAuditHit(_pendingTsdfHits, index));
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(ReadAuditHit(_correctionTsdfHits, index));
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleSupportRatio);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleRobustShiftMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleViewFacing);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditTemporalDepthDeltaMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditTemporalWorldDeltaMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditTemporalNormalDeltaDegrees);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditHistoricalSurfaceDistanceMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditOldTsdfResidual);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditOldTsdfWeight);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditHistoryAgreement);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditHistorySupportCount);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditBandHistoryCount);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditBandConflictCount);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditBandHighWeightConflictCount);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditBandConflictRatio);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditBandHighWeightConflictRatio);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditBandMeanResidual);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditBandMaxResidual);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditVoteState.ToString().ToUpperInvariant());
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditVoteScore);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditVoteReasons);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditVoteEnforced ? 1 : 0);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleNormal.x);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleNormal.y);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSampleNormal.z);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSameFrameDepthDeltaMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditSameFrameNormalDeltaDegrees);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditCrossFrameCleanDepthDeltaMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditCrossFrameCleanLateralMeters);
+            _contributionLedgerWriter.Write(',');
+            WriteLedgerFloat(_auditCrossFrameCleanNormalDeltaDegrees);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditCrossFrameCleanFrameGap);
+            _contributionLedgerWriter.Write(',');
+            _contributionLedgerWriter.Write(_auditCrossFrameCleanWeight);
+            _contributionLedgerWriter.WriteLine();
+            _contributionLedgerRowCount++;
+        }
+        catch (System.Exception error)
+        {
+            _contributionLedgerWriteFailures++;
+            if (_contributionLedgerWriteFailures == 1)
+                Debug.LogWarning($"[ScanCover] Contribution ledger write failed: {error.Message}", this);
+        }
+    }
+
+    private void UpdateProvisionalTsdfLifecycle(int index, string operation)
+    {
+        if (_provisionalTsdf == null || _provisionalTsdfLastFrame == null || index < 0 || index >= _provisionalTsdf.Length)
+            return;
+
+        bool provisionalWrite =
+            operation == "provisional_support" ||
+            operation == "strong_sample_seed" ||
+            operation == "same_frame_provisional";
+
+        if (provisionalWrite)
+        {
+            _provisionalTsdf[index] = 1;
+            _provisionalTsdfLastFrame[index] = LastRawFrameIndex;
+            if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+                _provisionalTsdfHits[index] = (byte)Mathf.Min(255, _provisionalTsdfHits[index] + 1);
+            return;
+        }
+
+        if (_provisionalTsdf[index] == 0)
+            return;
+
+        if (operation == "provisional_retire" || operation == "provisional_dirty_clear")
+        {
+            _provisionalTsdf[index] = 0;
+            _provisionalTsdfLastFrame[index] = int.MinValue;
+            if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+                _provisionalTsdfHits[index] = 0;
+            return;
+        }
+
+        _provisionalTsdf[index] = 0;
+        _provisionalTsdfLastFrame[index] = int.MinValue;
+        if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+            _provisionalTsdfHits[index] = 0;
+        LastProvisionalTsdfConfirmedCount++;
+    }
+
+    private void RecordVoxelWriteProvenance(
+        int index,
+        string operation,
+        float oldTsdf,
+        int oldWeight,
+        float newTsdf,
+        int newWeight)
+    {
+        if (_weights == null || index < 0 || index >= _weights.Length)
+            return;
+
+        bool hadPrior = _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance);
+        if (!hadPrior)
+            provenance.FirstFrame = LastRawFrameIndex;
+
+        provenance.Frame = LastRawFrameIndex;
+        provenance.Capture = _confidenceAuditCaptureIndex;
+        provenance.Sample = _activeLedgerSampleIndex;
+        provenance.PixelX = _activeLedgerPixelX;
+        provenance.PixelY = _activeLedgerPixelY;
+        provenance.WriteCount++;
+        provenance.LastOperation = operation ?? "unknown";
+        if (operation == "integrate")
+            provenance.IntegrateCount++;
+        else if (operation == "free_space_carve")
+            provenance.CarveCount++;
+        else if (operation == "replace" || operation == "guarded_replace")
+            provenance.ReplaceCount++;
+        else if (operation == "band_repair" || operation == "conflict_correct" || operation == "cleanup_neighbor")
+            provenance.RepairCount++;
+
+        Vector3 writeCamera = _activeTsdfSourceValid ? _activeTsdfSourceCamera : GetCameraPosition();
+        Vector3 writeSurface = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenterFromIndex(index);
+        provenance.CameraPosition = writeCamera;
+        provenance.CameraRotation = Camera.main != null ? Camera.main.transform.rotation : Quaternion.identity;
+        provenance.SurfacePoint = writeSurface;
+        provenance.RayDirection = (writeSurface - writeCamera).normalized;
+        provenance.SurfaceNormal = _auditSampleNormal;
+        provenance.SurfaceDepth = Vector3.Distance(writeCamera, writeSurface);
+        provenance.OldTsdf = oldTsdf;
+        provenance.OldWeight = oldWeight;
+        provenance.Tsdf = newTsdf;
+        provenance.Weight = newWeight;
+        _voxelWriteProvenance[index] = provenance;
+    }
+
+    private void WriteLedgerFloat(float value)
+    {
+        _contributionLedgerWriter.Write(value.ToString("0.######", AuditCulture));
+    }
+
+    private void AppendConfidenceAuditFrame(int frameIndex, float latencyMs, float positionDelta, float angleDelta, Vector3 integrationCamera)
+    {
+        if (_confidenceAuditFrameRows == null)
+            return;
+        _auditMaxSnapshotLatencyMs = Mathf.Max(_auditMaxSnapshotLatencyMs, Mathf.Max(0f, latencyMs));
+        _auditMaxPosePositionDelta = Mathf.Max(_auditMaxPosePositionDelta, Mathf.Max(0f, positionDelta));
+        _auditMaxPoseAngleDelta = Mathf.Max(_auditMaxPoseAngleDelta, Mathf.Max(0f, angleDelta));
+        Vector3 meanVector = _auditFrameReferenceCount > 0
+            ? _auditFrameReferenceVectorSum / _auditFrameReferenceCount
+            : Vector3.zero;
+        float meanResidual = _auditFrameReferenceCount > 0
+            ? _auditFrameReferenceMagnitudeSum / _auditFrameReferenceCount
+            : 0f;
+        float coherence = _auditFrameReferenceMagnitudeSum > 0.000001f
+            ? _auditFrameReferenceVectorSum.magnitude / _auditFrameReferenceMagnitudeSum
+            : 0f;
+        _confidenceAuditFrameRows
+            .Append(_confidenceAuditCaptureIndex).Append(',')
+            .Append(frameIndex).Append(',')
+            .Append(AuditFloat(latencyMs)).Append(',')
+            .Append(AuditFloat(positionDelta)).Append(',')
+            .Append(AuditFloat(angleDelta)).Append(',')
+            .Append(AuditFloat(integrationCamera.x)).Append(',')
+            .Append(AuditFloat(integrationCamera.y)).Append(',')
+            .Append(AuditFloat(integrationCamera.z)).Append(',')
+            .Append(_auditFrameReferenceCount).Append(',')
+            .Append(AuditFloat(meanResidual)).Append(',')
+            .Append(AuditFloat(coherence)).Append(',')
+            .Append(AuditFloat(meanVector.x)).Append(',')
+            .Append(AuditFloat(meanVector.y)).Append(',')
+            .Append(AuditFloat(meanVector.z)).AppendLine();
+    }
+
+    private void ResetFrameReferenceAudit()
+    {
+        _auditFrameReferenceCount = 0;
+        _auditFrameReferenceVectorSum = Vector3.zero;
+        _auditFrameReferenceMagnitudeSum = 0f;
+    }
+
+    private void AccumulateFrameReferenceAudit(Vector3 point)
+    {
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(point, out int cx, out int cy, out int cz))
+            return;
+
+        int minWeight = Mathf.Max(minConflictVoxelWeight, Mathf.CeilToInt(maxFusionWeight * 0.75f));
+        float bestDistanceSq = float.PositiveInfinity;
+        Vector3 bestCenter = Vector3.zero;
+        for (int dz = -2; dz <= 2; dz++)
+        for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if (_weights[index] < minWeight || Mathf.Abs(_tsdf[index]) > rawDepthDebugNearSurfaceAbsTsdf)
+                continue;
+            Vector3 center = VoxelCenter(x, y, z);
+            float distanceSq = (point - center).sqrMagnitude;
+            if (distanceSq >= bestDistanceSq)
+                continue;
+            bestDistanceSq = distanceSq;
+            bestCenter = center;
+        }
+
+        if (float.IsNaN(bestDistanceSq) || float.IsInfinity(bestDistanceSq) || bestDistanceSq > Mathf.Pow(voxelSizeMeters * 2.5f, 2f))
+            return;
+        Vector3 residual = point - bestCenter;
+        _auditFrameReferenceVectorSum += residual;
+        _auditFrameReferenceMagnitudeSum += residual.magnitude;
+        _auditFrameReferenceCount++;
+    }
+
+    private bool ShouldAuditSample(int sampleIndex)
+    {
+        return writeConfidenceAuditOnCapture &&
+            _confidenceAuditRows != null &&
+            sampleIndex >= 0 &&
+            sampleIndex % Mathf.Max(1, confidenceAuditSampleStride) == 0;
+    }
+
+    private void BeginConfidenceAuditSample(bool enabled)
+    {
+        // The same per-sample classification drives the overlay even when this row is not persisted.
+        _auditSampleActive = true;
+        _auditCenterAbsSampleTsdf = float.PositiveInfinity;
+        _auditCenterSampleTsdf = 0f;
+        _auditCenterOldTsdf = 0f;
+        _auditCenterOldWeight = 0;
+        _auditCenterStableHitsBefore = 0;
+        _auditCenterStableHitsAfter = 0;
+        _auditCenterCorrectionHitsBefore = 0;
+        _auditCenterCorrectionHitsAfter = 0;
+        _auditCenterSignFlip = false;
+        _auditCenterResidual = 0f;
+        _auditCenterOutcome = "none";
+        _auditBandWritten = 0;
+        _auditBandPendingStable = 0;
+        _auditBandPendingCorrection = 0;
+        _auditBandReplaced = 0;
+        _auditBandCorrected = 0;
+        _auditBandRejectedConflict = 0;
+        _auditSampleSupportRatio = 0f;
+        _auditSampleRobustShiftMeters = 0f;
+        _auditSampleViewFacing = 0f;
+        _auditSampleNormal = Vector3.zero;
+        _auditTemporalDepthDeltaMeters = -1f;
+        _auditTemporalWorldDeltaMeters = -1f;
+        _auditTemporalNormalDeltaDegrees = -1f;
+        _auditSameFrameDepthDeltaMeters = -1f;
+        _auditSameFrameNormalDeltaDegrees = -1f;
+        _auditCrossFrameCleanDepthDeltaMeters = -1f;
+        _auditCrossFrameCleanLateralMeters = -1f;
+        _auditCrossFrameCleanNormalDeltaDegrees = -1f;
+        _auditCrossFrameCleanFrameGap = -1;
+        _auditCrossFrameCleanWeight = 0;
+        _auditHistoricalSurfaceDistanceMeters = -1f;
+        _auditOldTsdfResidual = -1f;
+        _auditOldTsdfWeight = 0;
+        _auditHistoryAgreement = -1f;
+        _auditHistorySupportCount = 0;
+        _auditBandHistoryCount = 0;
+        _auditBandConflictCount = 0;
+        _auditBandHighWeightConflictCount = 0;
+        _auditBandConflictRatio = -1f;
+        _auditBandHighWeightConflictRatio = -1f;
+        _auditBandMeanResidual = -1f;
+        _auditBandMaxResidual = -1f;
+        _auditVoteState = ObservationVoteState.Unassessed;
+        _auditVoteScore = 0f;
+        _auditVoteReasons = "unassessed";
+        _auditVoteEnforced = false;
+        _auditStrongSampleSeedWrite = false;
+    }
+
+    private void SetObservationVote(ObservationVoteState state, float score, string reasons, bool enforced = false)
+    {
+        if (_auditVoteState != ObservationVoteState.Unassessed)
+            return;
+
+        _auditVoteState = state;
+        _auditVoteScore = Mathf.Clamp01(score);
+        _auditVoteReasons = string.IsNullOrEmpty(reasons) ? "none" : reasons.Replace(',', '|');
+        _auditVoteEnforced = enforced;
+        switch (state)
+        {
+            case ObservationVoteState.Accept:
+                _auditVoteAcceptCount++;
+                break;
+            case ObservationVoteState.Pending:
+                _auditVotePendingCount++;
+                break;
+            case ObservationVoteState.Reject:
+                _auditVoteRejectCount++;
+                if (enforced)
+                    _auditVoteEnforcedRejectCount++;
+                break;
+        }
+    }
+
+    private Vector3Int VoteHistoryKey(Vector3 point)
+    {
+        float inv = 1f / Mathf.Max(0.02f, voteCorrespondenceCellSizeMeters);
+        return new Vector3Int(
+            Mathf.FloorToInt(point.x * inv),
+            Mathf.FloorToInt(point.y * inv),
+            Mathf.FloorToInt(point.z * inv));
+    }
+
+    private void BeginVoteHistoryFrame()
+    {
+        _voteCurrentFrameHistory.Clear();
+        _voteCurrentFrameRawHistory.Clear();
+    }
+
+    private void EndVoteHistoryFrame()
+    {
+        Dictionary<Vector3Int, VoteHistoryCell> previous = _votePreviousFrameHistory;
+        _votePreviousFrameHistory = _voteCurrentFrameHistory;
+        _voteCurrentFrameHistory = previous;
+        _voteCurrentFrameHistory.Clear();
+        _voteCurrentFrameRawHistory.Clear();
+    }
+
+    private void MeasureTemporalVoteFeatures(Vector3 cameraPosition, Vector3 point, Vector3 normal)
+    {
+        Vector3Int key = VoteHistoryKey(point);
+        float bestDistance = Mathf.Max(0.02f, voteMaxCorrespondenceDistanceMeters);
+        bool found = false;
+        Vector3 bestPoint = Vector3.zero;
+        Vector3 bestNormal = Vector3.zero;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            Vector3Int candidateKey = key + new Vector3Int(dx, dy, dz);
+            if (!_votePreviousFrameHistory.TryGetValue(candidateKey, out VoteHistoryCell cell) || cell.Count <= 0)
+                continue;
+            Vector3 candidate = cell.PositionSum / cell.Count;
+            float distance = Vector3.Distance(point, candidate);
+            if (distance >= bestDistance)
+                continue;
+            bestDistance = distance;
+            bestPoint = candidate;
+            bestNormal = cell.NormalSum.sqrMagnitude > 0.0001f ? cell.NormalSum.normalized : Vector3.zero;
+            found = true;
+        }
+
+        if (found)
+        {
+            Vector3 ray = point - cameraPosition;
+            ray = ray.sqrMagnitude > 0.0001f ? ray.normalized : Vector3.forward;
+            Vector3 delta = point - bestPoint;
+            _auditTemporalDepthDeltaMeters = Mathf.Abs(Vector3.Dot(delta, ray));
+            _auditTemporalWorldDeltaMeters = delta.magnitude;
+            if (normal.sqrMagnitude > 0.0001f && bestNormal.sqrMagnitude > 0.0001f)
+                _auditTemporalNormalDeltaDegrees = Vector3.Angle(normal, bestNormal);
+        }
+
+        float sameFrameSearch = Mathf.Max(0.03f, sameFrameConflictSearchMeters);
+        float sameFrameNormalLimit = Mathf.Clamp(sameFrameConflictMaxNormalAngleDegrees, 1f, 45f);
+        for (int dz = -2; dz <= 2; dz++)
+        for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++)
+        {
+            Vector3Int candidateKey = key + new Vector3Int(dx, dy, dz);
+            if (!_voteCurrentFrameRawHistory.TryGetValue(candidateKey, out VoteHistoryCell cell) || cell.Count <= 0)
+                continue;
+            Vector3 candidate = cell.PositionSum / cell.Count;
+            if (Vector3.Distance(point, candidate) > sameFrameSearch)
+                continue;
+            Vector3 candidateNormal = cell.NormalSum.sqrMagnitude > 0.0001f ? cell.NormalSum.normalized : Vector3.zero;
+            float normalAngle = normal.sqrMagnitude > 0.0001f && candidateNormal.sqrMagnitude > 0.0001f
+                ? Vector3.Angle(normal, candidateNormal)
+                : 0f;
+            if (normalAngle > sameFrameNormalLimit)
+                continue;
+            Vector3 planeNormal = candidateNormal.sqrMagnitude > 0.0001f
+                ? candidateNormal
+                : (normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.up);
+            float depthDelta = Mathf.Abs(Vector3.Dot(point - candidate, planeNormal));
+            if (depthDelta <= _auditSameFrameDepthDeltaMeters)
+                continue;
+            _auditSameFrameDepthDeltaMeters = depthDelta;
+            _auditSameFrameNormalDeltaDegrees = normalAngle;
+        }
+    }
+
+    private void RecordVoteHistorySample(Vector3 point, Vector3 normal)
+    {
+        Vector3Int key = VoteHistoryKey(point);
+        _voteCurrentFrameHistory.TryGetValue(key, out VoteHistoryCell current);
+        current.PositionSum += point;
+        current.NormalSum += normal;
+        current.Count++;
+        _voteCurrentFrameHistory[key] = current;
+    }
+
+    private void RecordCurrentFrameRawVoteSample(Vector3 point, Vector3 normal)
+    {
+        Vector3Int key = VoteHistoryKey(point);
+        _voteCurrentFrameRawHistory.TryGetValue(key, out VoteHistoryCell current);
+        current.PositionSum += point;
+        current.NormalSum += normal;
+        current.Count++;
+        _voteCurrentFrameRawHistory[key] = current;
+    }
+
+    private void MeasureCrossFrameCleanSurfaceConflict(Vector3 point, Vector3 normal)
+    {
+        if (_tsdf == null ||
+            _weights == null ||
+            _voxelWriteProvenance == null ||
+            _voxelWriteProvenance.Count <= 0 ||
+            normal.sqrMagnitude < 0.0001f ||
+            !TryWorldToVoxel(point, out int cx, out int cy, out int cz))
+        {
+            return;
+        }
+
+        Vector3 sampleNormal = normal.normalized;
+        float searchMeters = Mathf.Max(0.03f, crossFrameCleanConflictSearchMeters);
+        int radius = Mathf.Clamp(Mathf.CeilToInt(searchMeters / Mathf.Max(0.001f, voxelSizeMeters)), 1, 5);
+        float minPlane = Mathf.Max(0.01f, crossFrameCleanConflictDepthMeters);
+        float maxLateral = Mathf.Max(
+            voxelSizeMeters * 0.25f,
+            voxelSizeMeters * Mathf.Max(0.25f, crossFrameCleanConflictMaxLateralVoxelScale));
+        float normalLimit = Mathf.Clamp(crossFrameCleanConflictMaxNormalAngleDegrees, 1f, 60f);
+
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+
+            int index = Index(x, y, z);
+            int oldWeight = _weights[index];
+            if (oldWeight < minSurfaceCornerWeight || Mathf.Abs(_tsdf[index]) > maxCleanLightCoverAbsTsdf)
+                continue;
+            if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+                continue;
+            if (provenance.Frame == LastRawFrameIndex || provenance.IntegrateCount <= 0)
+                continue;
+            if (provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+                continue;
+
+            Vector3 sourceNormal = provenance.SurfaceNormal.normalized;
+            float normalAngle = Vector3.Angle(sampleNormal, sourceNormal);
+            if (normalAngle > 90f)
+            {
+                sourceNormal = -sourceNormal;
+                normalAngle = 180f - normalAngle;
+            }
+            if (normalAngle > normalLimit)
+                continue;
+
+            Vector3 planeNormal = (sampleNormal + sourceNormal).normalized;
+            if (planeNormal.sqrMagnitude < 0.0001f)
+                planeNormal = sampleNormal;
+
+            Vector3 delta = point - provenance.SurfacePoint;
+            float planeSeparation = Mathf.Abs(Vector3.Dot(delta, planeNormal));
+            if (planeSeparation < minPlane)
+                continue;
+            float lateralSq = Mathf.Max(0f, delta.sqrMagnitude - planeSeparation * planeSeparation);
+            if (lateralSq > maxLateral * maxLateral)
+                continue;
+
+            if (planeSeparation <= _auditCrossFrameCleanDepthDeltaMeters)
+                continue;
+            _auditCrossFrameCleanDepthDeltaMeters = planeSeparation;
+            _auditCrossFrameCleanLateralMeters = Mathf.Sqrt(lateralSq);
+            _auditCrossFrameCleanNormalDeltaDegrees = normalAngle;
+            _auditCrossFrameCleanFrameGap = Mathf.Abs(LastRawFrameIndex - provenance.Frame);
+            _auditCrossFrameCleanWeight = oldWeight;
+        }
+    }
+
+    private void MeasureHistoricalTsdfVoteFeatures(Vector3 point)
+    {
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(point, out int cx, out int cy, out int cz))
+            return;
+
+        int centerIndex = Index(cx, cy, cz);
+        if (_weights[centerIndex] > 0)
+        {
+            _auditOldTsdfWeight = _weights[centerIndex];
+            _auditOldTsdfResidual = Mathf.Abs(_tsdf[centerIndex]);
+        }
+
+        int radius = Mathf.Clamp(voteHistoryNeighborhoodRadiusVoxels, 1, 4);
+        int historyCount = 0;
+        int agreementCount = 0;
+        float nearest = float.PositiveInfinity;
+        float agreementDistance = Mathf.Max(
+            voteGoodHistoricalSurfaceDistanceMeters,
+            voxelSizeMeters * 1.5f);
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if (_weights[index] < minSurfaceCornerWeight || Mathf.Abs(_tsdf[index]) > maxCleanLightCoverAbsTsdf)
+                continue;
+
+            float distance = Vector3.Distance(point, VoxelCenter(x, y, z));
+            nearest = Mathf.Min(nearest, distance);
+            historyCount++;
+            if (distance <= agreementDistance)
+                agreementCount++;
+        }
+
+        _auditHistorySupportCount = historyCount;
+        if (historyCount > 0)
+        {
+            _auditHistoricalSurfaceDistanceMeters = nearest;
+            _auditHistoryAgreement = (float)agreementCount / historyCount;
+        }
+    }
+
+    private void MeasureTsdfBandVoteFeatures(
+        Vector3 cameraPosition,
+        Vector3 point,
+        Vector3 normal,
+        int halfBandSteps)
+    {
+        float residualSum = 0f;
+        if (useProjectiveTsdfIntegration)
+        {
+            Vector3 toSurface = point - cameraPosition;
+            float surfaceDepth = toSurface.magnitude;
+            if (surfaceDepth <= 0.0001f)
+                return;
+            Vector3 ray = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - halfBandSteps * voxel);
+            float endDepth = surfaceDepth + halfBandSteps * voxel;
+            for (float voxelDepth = startDepth; voxelDepth <= endDepth + voxel * 0.25f; voxelDepth += voxel)
+            {
+                Vector3 world = cameraPosition + ray * voxelDepth;
+                float sampleTsdf = Mathf.Clamp((surfaceDepth - voxelDepth) / truncationMeters, -1f, 1f);
+                AccumulateTsdfBandVoteVoxel(world, sampleTsdf, ref residualSum);
+            }
+        }
+        else
+        {
+            for (int step = -halfBandSteps; step <= halfBandSteps; step++)
+            {
+                float signedDistance = step * voxelSizeMeters;
+                Vector3 world = point + normal * signedDistance;
+                float sampleTsdf = Mathf.Clamp(signedDistance / truncationMeters, -1f, 1f);
+                AccumulateTsdfBandVoteVoxel(world, sampleTsdf, ref residualSum);
+            }
+        }
+
+        if (_auditBandHistoryCount <= 0)
+            return;
+        _auditBandConflictRatio = (float)_auditBandConflictCount / _auditBandHistoryCount;
+        _auditBandHighWeightConflictRatio = (float)_auditBandHighWeightConflictCount / _auditBandHistoryCount;
+        _auditBandMeanResidual = residualSum / _auditBandHistoryCount;
+    }
+
+    private void AccumulateTsdfBandVoteVoxel(Vector3 world, float sampleTsdf, ref float residualSum)
+    {
+        if (!TryWorldToVoxel(world, out int x, out int y, out int z))
+            return;
+        int index = Index(x, y, z);
+        int oldWeight = _weights[index];
+        if (oldWeight <= 0)
+            return;
+
+        float residual = Mathf.Abs(_tsdf[index] - sampleTsdf);
+        _auditBandHistoryCount++;
+        residualSum += residual;
+        _auditBandMaxResidual = Mathf.Max(_auditBandMaxResidual, residual);
+        bool signConflict =
+            Mathf.Sign(_tsdf[index]) != Mathf.Sign(sampleTsdf) &&
+            residual >= tsdfConflictThreshold;
+        if (!signConflict)
+            return;
+        _auditBandConflictCount++;
+        if (oldWeight >= minConflictVoxelWeight)
+            _auditBandHighWeightConflictCount++;
+    }
+
+    private static float VoteScoreOrNeutral(float measured, float bad, float good, bool higherIsBetter)
+    {
+        if (measured < 0f)
+            return 0.5f;
+        float low = Mathf.Min(bad, good);
+        float high = Mathf.Max(bad, good);
+        float score = Mathf.InverseLerp(low, high, measured);
+        return higherIsBetter ? score : 1f - score;
+    }
+
+    private ObservationVoteState EvaluateObservationVote(float sampleWeight)
+    {
+        float supportScore = Mathf.InverseLerp(
+            Mathf.Min(voteBadSupportRatio, voteGoodSupportRatio),
+            Mathf.Max(voteBadSupportRatio, voteGoodSupportRatio),
+            _auditSampleSupportRatio);
+        float robustScore = 1f - Mathf.InverseLerp(
+            Mathf.Min(voteGoodRobustShiftMeters, voteBadRobustShiftMeters),
+            Mathf.Max(voteGoodRobustShiftMeters, voteBadRobustShiftMeters),
+            _auditSampleRobustShiftMeters);
+        float viewScore = Mathf.InverseLerp(
+            Mathf.Min(voteBadViewFacing, voteGoodViewFacing),
+            Mathf.Max(voteBadViewFacing, voteGoodViewFacing),
+            _auditSampleViewFacing);
+        float weightScore = Mathf.InverseLerp(
+            Mathf.Min(voteBadSampleWeight, voteGoodSampleWeight),
+            Mathf.Max(voteBadSampleWeight, voteGoodSampleWeight),
+            sampleWeight);
+        float temporalDepthScore = VoteScoreOrNeutral(
+            _auditTemporalDepthDeltaMeters,
+            voteGoodTemporalDepthDeltaMeters,
+            voteBadTemporalDepthDeltaMeters,
+            false);
+        float historicalSurfaceScore = VoteScoreOrNeutral(
+            _auditHistoricalSurfaceDistanceMeters,
+            voteGoodHistoricalSurfaceDistanceMeters,
+            voteBadHistoricalSurfaceDistanceMeters,
+            false);
+        float oldTsdfScore = VoteScoreOrNeutral(
+            _auditOldTsdfResidual,
+            voteGoodOldTsdfResidual,
+            voteBadOldTsdfResidual,
+            false);
+        float historyAgreementScore = VoteScoreOrNeutral(
+            _auditHistoryAgreement,
+            voteBadHistoryAgreement,
+            voteGoodHistoryAgreement,
+            true);
+        float bandConflictRisk = Mathf.Max(
+            _auditBandConflictRatio,
+            _auditBandHighWeightConflictRatio);
+        float bandConflictScore = VoteScoreOrNeutral(
+            bandConflictRisk,
+            voteGoodBandConflictRatio,
+            voteBadBandConflictRatio,
+            false);
+        float bandResidualScore = VoteScoreOrNeutral(
+            _auditBandMeanResidual,
+            voteGoodBandMeanResidual,
+            voteBadBandMeanResidual,
+            false);
+        float score =
+            supportScore * 0.05f +
+            robustScore * 0.05f +
+            viewScore * 0.05f +
+            weightScore * 0.025f +
+            temporalDepthScore * 0.20f +
+            historicalSurfaceScore * 0.15f +
+            oldTsdfScore * 0.15f +
+            historyAgreementScore * 0.025f +
+            bandConflictScore * 0.225f +
+            bandResidualScore * 0.075f;
+
+        StringBuilder reasons = new StringBuilder(48);
+        if (supportScore < 0.5f)
+            reasons.Append("weak_support|");
+        if (robustScore < 0.5f)
+            reasons.Append("depth_shift|");
+        if (viewScore < 0.5f)
+            reasons.Append("grazing_view|");
+        if (weightScore < 0.5f)
+            reasons.Append("low_weight|");
+        if (temporalDepthScore < 0.5f)
+            reasons.Append("temporal_depth_jump|");
+        if (historicalSurfaceScore < 0.5f)
+            reasons.Append("off_history_surface|");
+        if (oldTsdfScore < 0.5f)
+            reasons.Append("old_tsdf_residual|");
+        if (historyAgreementScore < 0.5f)
+            reasons.Append("weak_history|");
+        if (bandConflictScore < 0.5f)
+            reasons.Append("band_conflict|");
+        if (bandResidualScore < 0.5f)
+            reasons.Append("band_residual|");
+        bool sameFrameConflict = HasSameFrameEntryConflict();
+        bool sameFrameProvisional = SameFrameEntryCanUseProvisional(sampleWeight);
+        if (sameFrameConflict)
+            reasons.Append(sameFrameProvisional ? "same_frame_provisional|" : "same_frame_depth_conflict|");
+        bool crossFrameCleanConflict =
+            rejectCrossFrameCleanSurfaceConflict &&
+            _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.01f, crossFrameCleanConflictDepthMeters);
+        if (crossFrameCleanConflict)
+            reasons.Append("cross_frame_clean_conflict|");
+        bool strongCurrentEvidence =
+            _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
+            _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters) &&
+            _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+            sampleWeight >= Mathf.Clamp01(voteGoodSampleWeight);
+        bool strongCurrentAccept =
+            strongCurrentEvidence &&
+            !sameFrameConflict &&
+            !crossFrameCleanConflict &&
+            reasons.Length == 0;
+        if (reasons.Length == 0)
+            reasons.Append("clean");
+        else
+            reasons.Length--;
+
+        ObservationVoteState state = (sameFrameConflict && !sameFrameProvisional) || crossFrameCleanConflict
+            ? ObservationVoteState.Reject
+            : (strongCurrentAccept || score >= Mathf.Max(voteAcceptScore, voteRejectScore)
+                ? ObservationVoteState.Accept
+                : (score < Mathf.Min(voteAcceptScore, voteRejectScore)
+                    ? ObservationVoteState.Reject
+                    : ObservationVoteState.Pending));
+        if (sameFrameProvisional && state == ObservationVoteState.Accept)
+            state = ObservationVoteState.Pending;
+        bool enforced = state == ObservationVoteState.Reject &&
+            (enforceObservationWriteGate || observationVoteMode == ObservationVoteMode.RejectOnly);
+        SetObservationVote(
+            state,
+            score,
+            strongCurrentAccept ? "strong_current_clean" : reasons.ToString(),
+            enforced);
+        if (!sameFrameConflict)
+            LastSameFrameEntryStableCount++;
+        else if (sameFrameProvisional)
+            LastSameFrameEntryProvisionalCount++;
+        else
+            LastSameFrameEntryRejectedCount++;
+        if (sameFrameConflict)
+            LastVoteSameFrameConflictRejectCount++;
+        if (crossFrameCleanConflict)
+            LastVoteCrossFrameCleanConflictRejectCount++;
+        if (strongCurrentAccept)
+            LastVoteStrongCurrentAcceptCount++;
+        return state;
+    }
+
+    private bool HasSameFrameEntryConflict()
+    {
+        return _auditSameFrameDepthDeltaMeters >= Mathf.Max(0.01f, sameFrameConflictDepthMeters) &&
+               (_auditSameFrameNormalDeltaDegrees < 0f ||
+                _auditSameFrameNormalDeltaDegrees <= Mathf.Clamp(sameFrameConflictMaxNormalAngleDegrees, 1f, 45f));
+    }
+
+    private bool SameFrameEntryCanUseProvisional(float sampleWeight)
+    {
+        if (!enableSameFrameEntryGate || !allowProvisionalTsdfSupportWrites || !HasSameFrameEntryConflict())
+            return false;
+        if (_auditSameFrameDepthDeltaMeters > Mathf.Max(sameFrameConflictDepthMeters, maxSameFrameEntryProvisionalDepthMeters))
+            return false;
+        bool bandSafe =
+            _auditBandConflictRatio < 0f ||
+            _auditBandConflictRatio <= Mathf.Clamp01(voteGoodBandConflictRatio);
+        return bandSafe &&
+               _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
+               _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters * 2f) &&
+               _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+               sampleWeight >= Mathf.Clamp01(voteBadSampleWeight);
+    }
+
+    private bool PendingObservationHasWriteSupport(float sampleWeight, out bool bootstrapWrite, out bool sameFrameProvisionalWrite, out bool strongSampleSeedWrite)
+    {
+        bootstrapWrite = false;
+        sameFrameProvisionalWrite = false;
+        strongSampleSeedWrite = false;
+        bool temporalConfirmed =
+            _auditTemporalDepthDeltaMeters >= 0f &&
+            _auditTemporalDepthDeltaMeters <= Mathf.Max(0.001f, voteGoodTemporalDepthDeltaMeters);
+        bool historyConfirmed =
+            _auditHistorySupportCount > 0 &&
+            _auditHistoryAgreement >= Mathf.Clamp01(voteGoodHistoryAgreement) &&
+            (_auditHistoricalSurfaceDistanceMeters < 0f ||
+             _auditHistoricalSurfaceDistanceMeters <= Mathf.Max(0.001f, voteGoodHistoricalSurfaceDistanceMeters));
+        bool bandSafe =
+            _auditBandConflictRatio < 0f ||
+            _auditBandConflictRatio <= Mathf.Clamp01(voteGoodBandConflictRatio);
+        bool sameFrameSafe =
+            _auditSameFrameDepthDeltaMeters < 0f ||
+            _auditSameFrameDepthDeltaMeters < Mathf.Max(0.01f, sameFrameConflictDepthMeters);
+        bool crossFrameCleanSafe =
+            !rejectCrossFrameCleanSurfaceConflict ||
+            _auditCrossFrameCleanDepthDeltaMeters < 0f ||
+            _auditCrossFrameCleanDepthDeltaMeters < Mathf.Max(0.01f, crossFrameCleanConflictDepthMeters);
+        bool strongLocalObservation =
+            _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
+            _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters) &&
+            _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+            sampleWeight >= Mathf.Clamp01(voteGoodSampleWeight);
+        bool oldTsdfSafe =
+            _auditOldTsdfWeight <= 0 ||
+            _auditOldTsdfResidual < 0f ||
+            _auditOldTsdfResidual <= Mathf.Clamp01(maxStrongSampleSeedOldTsdfResidual);
+        bool strongSeedAllowed =
+            allowStrongSampleSeedWrites &&
+            strongLocalObservation &&
+            bandSafe &&
+            sameFrameSafe &&
+            crossFrameCleanSafe &&
+            oldTsdfSafe;
+        bool bootstrapAllowed =
+            allowPendingBootstrapSeeds &&
+            IntegratedFrameCount <= 0 &&
+            strongLocalObservation &&
+            bandSafe &&
+            sameFrameSafe &&
+            crossFrameCleanSafe;
+        if (strongSeedAllowed)
+        {
+            strongSampleSeedWrite = true;
+            bootstrapWrite = bootstrapAllowed;
+            return true;
+        }
+        if (allowStrongSampleSeedWrites && strongLocalObservation)
+            LastStrongSampleSeedBlockedCount++;
+
+        if (bootstrapAllowed)
+        {
+            bootstrapWrite = true;
+            return true;
+        }
+
+        if (SameFrameEntryCanUseProvisional(sampleWeight))
+        {
+            sameFrameProvisionalWrite = true;
+            return true;
+        }
+
+        return (temporalConfirmed || historyConfirmed) &&
+               bandSafe &&
+               sameFrameSafe &&
+               crossFrameCleanSafe &&
+               _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio);
+    }
+
+    private RawDepthDebugKind RawDepthKindFromAuditOutcome()
+    {
+        if (_auditCenterOutcome == "replaced" ||
+            _auditCenterOutcome == "corrected" ||
+            _auditCenterOutcome == "rejected_conflict" ||
+            _auditCenterOutcome == "pending_correction")
+        {
+            switch (AuditCenterConflictCause())
+            {
+                case "depth_edge":
+                    return RawDepthDebugKind.ConflictEdge;
+                case "view_angle":
+                    return RawDepthDebugKind.ConflictView;
+                case "old_weight_locked":
+                    return RawDepthDebugKind.ConflictLocked;
+                default:
+                    return RawDepthDebugKind.Pending;
+            }
+        }
+        if (_auditCenterOutcome == "pending_stability" || _auditBandPendingStable > 0)
+            return RawDepthDebugKind.StableBand;
+        return RawDepthDebugKind.Accepted;
+    }
+
+    private string AuditCenterConflictCause()
+    {
+        if (!_auditCenterSignFlip && _auditCenterResidual < tsdfConflictThreshold)
+            return "none";
+        if (_auditSampleSupportRatio < Mathf.Clamp01(auditDepthEdgeSupportRatio) ||
+            _auditSampleRobustShiftMeters >= Mathf.Max(0.001f, auditRobustShiftRiskMeters))
+            return "depth_edge";
+        if (_auditSampleViewFacing > 0f &&
+            _auditSampleViewFacing < Mathf.Clamp01(auditGrazingViewFacingThreshold))
+            return "view_angle";
+        if (_auditCenterOldWeight >= Mathf.Max(1, auditOldLockedWeightThreshold))
+            return "old_weight_locked";
+        return "unclassified";
+    }
+
+    private void AppendConfidenceAuditRow(
+        int frameIndex,
+        int sampleIndex,
+        int pixelX,
+        int pixelY,
+        Vector3 point,
+        float sampleWeight,
+        int checkedNeighbors,
+        int consistentNeighbors,
+        float robustShiftMeters,
+        float oldTsdf,
+        int oldWeight,
+        int pendingHits,
+        string decision,
+        string reason,
+        bool enabled)
+    {
+        if (!enabled || _confidenceAuditRows == null)
+            return;
+        if (_confidenceAuditRowCount >= Mathf.Max(1000, maxConfidenceAuditRowsPerCapture))
+        {
+            _confidenceAuditDroppedRows++;
+            return;
+        }
+
+        float supportRatio = checkedNeighbors > 0 ? (float)consistentNeighbors / checkedNeighbors : 0f;
+        _confidenceAuditRows
+            .Append(_confidenceAuditCaptureIndex).Append(',')
+            .Append(frameIndex).Append(',')
+            .Append(sampleIndex).Append(',')
+            .Append(pixelX).Append(',')
+            .Append(pixelY).Append(',')
+            .Append(AuditFloat(point.x)).Append(',')
+            .Append(AuditFloat(point.y)).Append(',')
+            .Append(AuditFloat(point.z)).Append(',')
+            .Append(AuditFloat(sampleWeight)).Append(',')
+            .Append(checkedNeighbors).Append(',')
+            .Append(consistentNeighbors).Append(',')
+            .Append(AuditFloat(supportRatio)).Append(',')
+            .Append(AuditFloat(robustShiftMeters)).Append(',')
+            .Append(AuditFloat(_auditSampleViewFacing)).Append(',')
+            .Append(AuditFloat(_auditTemporalDepthDeltaMeters)).Append(',')
+            .Append(AuditFloat(_auditTemporalWorldDeltaMeters)).Append(',')
+            .Append(AuditFloat(_auditTemporalNormalDeltaDegrees)).Append(',')
+            .Append(AuditFloat(_auditHistoricalSurfaceDistanceMeters)).Append(',')
+            .Append(AuditFloat(_auditOldTsdfResidual)).Append(',')
+            .Append(_auditOldTsdfWeight).Append(',')
+            .Append(AuditFloat(_auditHistoryAgreement)).Append(',')
+            .Append(_auditHistorySupportCount).Append(',')
+            .Append(_auditBandHistoryCount).Append(',')
+            .Append(_auditBandConflictCount).Append(',')
+            .Append(_auditBandHighWeightConflictCount).Append(',')
+            .Append(AuditFloat(_auditBandConflictRatio)).Append(',')
+            .Append(AuditFloat(_auditBandHighWeightConflictRatio)).Append(',')
+            .Append(AuditFloat(_auditBandMeanResidual)).Append(',')
+            .Append(AuditFloat(_auditBandMaxResidual)).Append(',')
+            .Append(_auditVoteState.ToString().ToUpperInvariant()).Append(',')
+            .Append(AuditFloat(_auditVoteScore)).Append(',')
+            .Append(_auditVoteReasons).Append(',')
+            .Append(_auditVoteEnforced ? 1 : 0).Append(',')
+            .Append(AuditFloat(oldTsdf)).Append(',')
+            .Append(oldWeight).Append(',')
+            .Append(pendingHits).Append(',')
+            .Append(decision).Append(',')
+            .Append(reason).Append(',')
+            .Append(AuditFloat(_auditCenterSampleTsdf)).Append(',')
+            .Append(AuditFloat(_auditCenterOldTsdf)).Append(',')
+            .Append(_auditCenterOldWeight).Append(',')
+            .Append(_auditCenterStableHitsBefore).Append(',')
+            .Append(_auditCenterStableHitsAfter).Append(',')
+            .Append(_auditCenterCorrectionHitsBefore).Append(',')
+            .Append(_auditCenterCorrectionHitsAfter).Append(',')
+            .Append(_auditCenterSignFlip ? 1 : 0).Append(',')
+            .Append(AuditFloat(_auditCenterResidual)).Append(',')
+            .Append(_auditCenterOutcome).Append(',')
+            .Append(AuditCenterConflictCause()).Append(',')
+            .Append(_auditBandWritten).Append(',')
+            .Append(_auditBandPendingStable).Append(',')
+            .Append(_auditBandPendingCorrection).Append(',')
+            .Append(_auditBandReplaced).Append(',')
+            .Append(_auditBandCorrected).Append(',')
+            .Append(_auditBandRejectedConflict).Append(',')
+            .Append(AuditFloat(_auditSameFrameDepthDeltaMeters)).Append(',')
+            .Append(AuditFloat(_auditSameFrameNormalDeltaDegrees)).Append(',')
+            .Append(AuditFloat(_auditCrossFrameCleanDepthDeltaMeters)).Append(',')
+            .Append(AuditFloat(_auditCrossFrameCleanLateralMeters)).Append(',')
+            .Append(AuditFloat(_auditCrossFrameCleanNormalDeltaDegrees)).Append(',')
+            .Append(_auditCrossFrameCleanFrameGap).Append(',')
+            .Append(_auditCrossFrameCleanWeight)
+            .AppendLine();
+        _confidenceAuditRowCount++;
+    }
+
+    private void EndConfidenceAuditCapture(int integratedFrames, string status)
+    {
+        if (!writeConfidenceAuditOnCapture || _confidenceAuditRows == null)
+            return;
+
+        try
+        {
+            Directory.CreateDirectory(_confidenceAuditDirectory);
+            string csvPath = Path.Combine(_confidenceAuditDirectory, _confidenceAuditStem + "_samples.csv");
+            string framesPath = Path.Combine(_confidenceAuditDirectory, _confidenceAuditStem + "_frames.csv");
+            string lifecyclePath = Path.Combine(_confidenceAuditDirectory, _confidenceAuditStem + "_voxel_lifecycle.csv");
+            string doubleLayerPairsPath = Path.Combine(_confidenceAuditDirectory, _confidenceAuditStem + "_double_layer_pairs.csv");
+            string summaryPath = Path.Combine(_confidenceAuditDirectory, _confidenceAuditStem + "_summary.txt");
+            if (_contributionLedgerWriter != null)
+            {
+                _contributionLedgerWriter.Flush();
+                _contributionLedgerWriter.Dispose();
+                _contributionLedgerWriter = null;
+            }
+            AnalyzeAuditMeshAssociation();
+            File.WriteAllText(csvPath, _confidenceAuditRows.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(framesPath, _confidenceAuditFrameRows != null ? _confidenceAuditFrameRows.ToString() : string.Empty, new UTF8Encoding(false));
+            File.WriteAllText(lifecyclePath, BuildVoxelAuditLifecycleCsv(), new UTF8Encoding(false));
+            File.WriteAllText(doubleLayerPairsPath, _doubleLayerPairRows != null ? _doubleLayerPairRows.ToString() : string.Empty, new UTF8Encoding(false));
+
+            StringBuilder summary = new StringBuilder(1024);
+            summary.AppendLine("ScanCover confidence audit");
+            summary.AppendLine("status=" + status);
+            summary.AppendLine("capture=" + _confidenceAuditCaptureIndex);
+            summary.AppendLine("integrated_frames=" + integratedFrames);
+            summary.AppendLine("observed_frames=" + _confidenceAuditIntegratedFrames);
+            summary.AppendLine("rows=" + _confidenceAuditRowCount);
+            summary.AppendLine("dropped_rows=" + _confidenceAuditDroppedRows);
+            summary.AppendLine("sample_stride=" + Mathf.Max(1, confidenceAuditSampleStride));
+            summary.AppendLine("vote_mode=" + observationVoteMode);
+            summary.AppendLine("vote_accept=" + _auditVoteAcceptCount);
+            summary.AppendLine("vote_pending=" + _auditVotePendingCount);
+            summary.AppendLine("vote_reject=" + _auditVoteRejectCount);
+            summary.AppendLine("vote_enforced_reject=" + _auditVoteEnforcedRejectCount);
+            summary.AppendLine("vote_write_gate_enabled=" + (enforceObservationWriteGate ? 1 : 0));
+            summary.AppendLine("vote_same_frame_conflict_reject=" + LastVoteSameFrameConflictRejectCount);
+            summary.AppendLine("vote_cross_frame_clean_conflict_reject=" + LastVoteCrossFrameCleanConflictRejectCount);
+            summary.AppendLine("same_frame_entry_gate_enabled=" + (enableSameFrameEntryGate ? 1 : 0));
+            summary.AppendLine("same_frame_entry_stable=" + LastSameFrameEntryStableCount);
+            summary.AppendLine("same_frame_entry_provisional=" + LastSameFrameEntryProvisionalCount);
+            summary.AppendLine("same_frame_entry_provisional_write=" + LastSameFrameEntryProvisionalWriteCount);
+            summary.AppendLine("same_frame_entry_rejected=" + LastSameFrameEntryRejectedCount);
+            summary.AppendLine("same_frame_entry_held=" + LastSameFrameEntryHeldCount);
+            summary.AppendLine("same_frame_entry_max_provisional_depth_m=" + AuditFloat(maxSameFrameEntryProvisionalDepthMeters));
+            summary.AppendLine("same_frame_entry_provisional_weight_scale=" + AuditFloat(sameFrameEntryProvisionalWeightScale));
+            summary.AppendLine("formal_integrate_gate_enabled=" + (gateFormalIntegrateWrites ? 1 : 0));
+            summary.AppendLine("formal_integrate_write=" + LastFormalIntegrateWriteCount);
+            summary.AppendLine("formal_integrate_block=" + LastFormalIntegrateBlockedCount);
+            summary.AppendLine("formal_integrate_provisional=" + LastFormalIntegrateProvisionalCount);
+            summary.AppendLine("formal_integrate_block_vote=" + LastFormalIntegrateBlockVoteCount);
+            summary.AppendLine("formal_integrate_block_score=" + LastFormalIntegrateBlockScoreCount);
+            summary.AppendLine("formal_integrate_block_support=" + LastFormalIntegrateBlockSupportCount);
+            summary.AppendLine("formal_integrate_block_band=" + LastFormalIntegrateBlockBandCount);
+            summary.AppendLine("formal_integrate_block_residual=" + LastFormalIntegrateBlockResidualCount);
+            summary.AppendLine("formal_integrate_block_clean_history=" + LastFormalIntegrateBlockCleanHistoryCount);
+            summary.AppendLine("formal_integrate_block_weak_history=" + LastFormalIntegrateBlockWeakHistoryCount);
+            summary.AppendLine("formal_integrate_block_temporal_depth_jump=" + LastFormalIntegrateBlockTemporalDepthJumpCount);
+            summary.AppendLine("formal_integrate_block_strong_current_history=" + LastFormalIntegrateBlockStrongCurrentHistoryCount);
+            summary.AppendLine("formal_integrate_block_same_frame=" + LastFormalIntegrateBlockSameFrameCount);
+            summary.AppendLine("formal_integrate_block_cross_frame=" + LastFormalIntegrateBlockCrossFrameCount);
+            summary.AppendLine("formal_integrate_block_old_tsdf=" + LastFormalIntegrateBlockOldTsdfCount);
+            summary.AppendLine("formal_integrate_block_dirty_pending=" + LastFormalIntegrateBlockDirtyPendingCount);
+            summary.AppendLine("formal_integrate_min_score=" + AuditFloat(minFormalIntegrateVoteScore));
+            summary.AppendLine("formal_integrate_min_support=" + AuditFloat(minFormalIntegrateSupportRatio));
+            summary.AppendLine("formal_integrate_max_band_conflict=" + AuditFloat(maxFormalIntegrateBandConflictRatio));
+            summary.AppendLine("formal_integrate_max_band_residual=" + AuditFloat(maxFormalIntegrateBandMeanResidual));
+            summary.AppendLine("formal_clean_history_gate_enabled=" + (rejectFormalCleanHistoryMismatch ? 1 : 0));
+            summary.AppendLine("formal_weak_history_gate_enabled=" + (rejectFormalIntegrateWeakHistory ? 1 : 0));
+            summary.AppendLine("formal_temporal_depth_jump_gate_enabled=" + (rejectFormalIntegrateTemporalDepthJump ? 1 : 0));
+            summary.AppendLine("formal_strong_current_history_gate_enabled=" + (requireHistoryForFormalStrongCurrentClean ? 1 : 0));
+            summary.AppendLine("formal_strong_current_min_old_weight=" + Mathf.Clamp(minFormalStrongCurrentOldWeight, 0, 16));
+            summary.AppendLine("formal_strong_current_min_band_history=" + Mathf.Clamp(minFormalStrongCurrentBandHistory, 0, 16));
+            summary.AppendLine("formal_strong_current_min_history_agreement=" + AuditFloat(minFormalStrongCurrentHistoryAgreement));
+            summary.AppendLine("formal_strong_current_local_history_bypass_enabled=" + (allowLocalSupportForFormalStrongCurrentHistory ? 1 : 0));
+            summary.AppendLine("formal_strong_current_local_history_bypass=" + LastFormalStrongCurrentLocalHistoryBypassCount);
+            summary.AppendLine("formal_strong_current_local_history_block_local=" + LastFormalStrongCurrentLocalHistoryBlockLocalCount);
+            summary.AppendLine("formal_strong_current_local_history_block_support=" + LastFormalStrongCurrentLocalHistoryBlockSupportCount);
+            summary.AppendLine("formal_strong_current_local_history_block_stable=" + LastFormalStrongCurrentLocalHistoryBlockStableCount);
+            summary.AppendLine("formal_strong_current_local_history_block_axial=" + LastFormalStrongCurrentLocalHistoryBlockAxialCount);
+            summary.AppendLine("formal_strong_current_local_history_block_residual=" + LastFormalStrongCurrentLocalHistoryBlockResidualCount);
+            summary.AppendLine("formal_strong_current_local_history_block_plane=" + LastFormalStrongCurrentLocalHistoryBlockPlaneCount);
+            summary.AppendLine("formal_strong_current_local_history_block_double_layer=" + LastFormalStrongCurrentLocalHistoryBlockDoubleLayerCount);
+            summary.AppendLine("formal_strong_current_local_min=" + Mathf.Clamp(minFormalStrongCurrentLocalSupportVoxels, 1, 26));
+            summary.AppendLine("formal_strong_current_local_min_stable=" + Mathf.Clamp(minFormalStrongCurrentLocalStableVoxels, 0, 26));
+            summary.AppendLine("formal_strong_current_local_min_axial=" + Mathf.Clamp(minFormalStrongCurrentLocalAxialVoxels, 0, 6));
+            summary.AppendLine("strong_current_provisional_promote_enabled=" + (promoteStrongCurrentProvisionalToFormal ? 1 : 0));
+            summary.AppendLine("strong_current_provisional_promote=" + LastStrongCurrentProvisionalPromotedCount);
+            summary.AppendLine("strong_current_provisional_promote_block=" + LastStrongCurrentProvisionalPromotionBlockedCount);
+            summary.AppendLine("strong_current_provisional_block_disabled=" + LastStrongCurrentProvisionalBlockDisabledCount);
+            summary.AppendLine("strong_current_provisional_block_tag=" + LastStrongCurrentProvisionalBlockTagCount);
+            summary.AppendLine("strong_current_provisional_block_storage=" + LastStrongCurrentProvisionalBlockStorageCount);
+            summary.AppendLine("strong_current_provisional_block_invalid=" + LastStrongCurrentProvisionalBlockInvalidCount);
+            summary.AppendLine("strong_current_provisional_block_no_provisional=" + LastStrongCurrentProvisionalBlockNoProvisionalCount);
+            summary.AppendLine("strong_current_provisional_block_no_provisional_near_surface=" + LastStrongCurrentProvisionalBlockNoProvisionalNearSurfaceCount);
+            summary.AppendLine("strong_current_provisional_block_no_provisional_far_band=" + LastStrongCurrentProvisionalBlockNoProvisionalFarBandCount);
+            summary.AppendLine("strong_current_provisional_block_hits=" + LastStrongCurrentProvisionalBlockHitsCount);
+            summary.AppendLine("strong_current_provisional_block_weight=" + LastStrongCurrentProvisionalBlockWeightCount);
+            summary.AppendLine("strong_current_provisional_block_band_history=" + LastStrongCurrentProvisionalBlockBandHistoryCount);
+            summary.AppendLine("strong_current_provisional_block_agreement=" + LastStrongCurrentProvisionalBlockAgreementCount);
+            summary.AppendLine("strong_current_provisional_block_clean_history=" + LastStrongCurrentProvisionalBlockCleanHistoryCount);
+            summary.AppendLine("strong_current_provisional_block_dirty_pending=" + LastStrongCurrentProvisionalBlockDirtyPendingCount);
+            summary.AppendLine("strong_current_provisional_block_same_frame=" + LastStrongCurrentProvisionalBlockSameFrameCount);
+            summary.AppendLine("strong_current_provisional_block_cross_frame=" + LastStrongCurrentProvisionalBlockCrossFrameCount);
+            summary.AppendLine("strong_current_provisional_block_conflict=" + LastStrongCurrentProvisionalBlockConflictCount);
+            summary.AppendLine("strong_current_provisional_block_local=" + LastStrongCurrentProvisionalBlockLocalCount);
+            summary.AppendLine("strong_current_provisional_block_plane=" + LastStrongCurrentProvisionalBlockPlaneCount);
+            summary.AppendLine("strong_current_promotion_neighbor_support_enabled=" + (allowProvisionalNeighborPromotionSupport ? 1 : 0));
+            summary.AppendLine("strong_current_promotion_local_pass=" + LastStrongCurrentPromotionLocalPassCount);
+            summary.AppendLine("strong_current_promotion_local_block=" + LastStrongCurrentPromotionLocalBlockCount);
+            summary.AppendLine("strong_current_promotion_local_neighbors=" + LastStrongCurrentPromotionLocalNeighborCount);
+            summary.AppendLine("strong_current_promotion_local_provisional_neighbors=" + LastStrongCurrentPromotionLocalProvisionalNeighborCount);
+            summary.AppendLine("strong_current_promotion_local_stable_neighbors=" + LastStrongCurrentPromotionLocalStableNeighborCount);
+            summary.AppendLine("strong_current_promotion_local_axial_neighbors=" + LastStrongCurrentPromotionLocalAxialNeighborCount);
+            summary.AppendLine("strong_current_promotion_local_min=" + Mathf.Clamp(minStrongCurrentPromotionLocalSupportVoxels, 1, 26));
+            summary.AppendLine("strong_current_promotion_local_min_stable=" + Mathf.Clamp(minStrongCurrentPromotionStableVoxels, 0, 26));
+            summary.AppendLine("strong_current_promotion_local_min_axial=" + Mathf.Clamp(minStrongCurrentPromotionAxialVoxels, 0, 6));
+            summary.AppendLine("strong_current_promotion_double_layer_gate_enabled=" + (rejectStrongCurrentPromotionDoubleLayer ? 1 : 0));
+            summary.AppendLine("strong_current_promotion_double_layer_candidates=" + LastStrongCurrentPromotionDoubleLayerCandidateCount);
+            summary.AppendLine("strong_current_promotion_double_layer_block=" + LastStrongCurrentPromotionDoubleLayerBlockCount);
+            summary.AppendLine("strong_current_promotion_double_layer_normal_reject=" + LastStrongCurrentPromotionDoubleLayerNormalRejectCount);
+            summary.AppendLine("strong_current_promotion_double_layer_plane_reject=" + LastStrongCurrentPromotionDoubleLayerPlaneRejectCount);
+            summary.AppendLine("strong_current_promotion_double_layer_lateral_reject=" + LastStrongCurrentPromotionDoubleLayerLateralRejectCount);
+            summary.AppendLine("strong_current_promotion_double_layer_dirty_neighbors=" + LastStrongCurrentPromotionDoubleLayerDirtyNeighborCount);
+            summary.AppendLine("strong_current_promotion_double_layer_block_integrate=" + LastStrongCurrentPromotionDoubleLayerIntegrateBlockCount);
+            summary.AppendLine("strong_current_promotion_double_layer_block_replace=" + LastStrongCurrentPromotionDoubleLayerReplaceBlockCount);
+            summary.AppendLine("strong_current_promotion_double_layer_block_other=" + LastStrongCurrentPromotionDoubleLayerOtherBlockCount);
+            summary.AppendLine("strong_current_promotion_double_layer_radius=" + Mathf.Clamp(strongCurrentPromotionDoubleLayerSearchRadiusVoxels, 1, 4));
+            summary.AppendLine("strong_current_promotion_double_layer_max_sep_m=" + AuditFloat(maxStrongCurrentPromotionDoubleLayerSeparationMeters));
+            summary.AppendLine("strong_current_promotion_double_layer_max_neighbor_abs=" + AuditFloat(maxStrongCurrentPromotionDoubleLayerNeighborAbsTsdf));
+            summary.AppendLine("strong_current_provisional_min_hits=" + Mathf.Clamp(minStrongCurrentProvisionalHits, 1, 8));
+            summary.AppendLine("strong_current_provisional_min_weight=" + Mathf.Clamp(minStrongCurrentProvisionalWeight, 1, 8));
+            summary.AppendLine("strong_current_provisional_min_band_history=" + Mathf.Clamp(minStrongCurrentProvisionalBandHistory, 0, 16));
+            summary.AppendLine("strong_current_provisional_min_history_agreement=" + AuditFloat(minStrongCurrentProvisionalHistoryAgreement));
+            summary.AppendLine("strong_current_provisional_promote_weight=" + AuditFloat(strongCurrentProvisionalPromoteWeight));
+            summary.AppendLine("formal_clean_history_max_old_tsdf=" + AuditFloat(maxFormalCleanHistoryOldTsdfResidual));
+            summary.AppendLine("formal_clean_history_max_band_residual=" + AuditFloat(maxFormalCleanHistoryBandMeanResidual));
+            summary.AppendLine("formal_clean_history_max_band_conflict=" + AuditFloat(maxFormalCleanHistoryBandConflictRatio));
+            summary.AppendLine("vote_pending_hold=" + LastVotePendingHoldCount);
+            summary.AppendLine("vote_pending_confirmed_write=" + LastVotePendingConfirmedWriteCount);
+            summary.AppendLine("vote_pending_bootstrap_write=" + LastVotePendingBootstrapWriteCount);
+            summary.AppendLine("strong_sample_seed_enabled=" + (allowStrongSampleSeedWrites ? 1 : 0));
+            summary.AppendLine("strong_sample_seed_temporary_lock=" + (lockStrongSampleSeedToTemporaryTsdf ? 1 : 0));
+            summary.AppendLine("strong_sample_seed_write=" + LastStrongSampleSeedWriteCount);
+            summary.AppendLine("strong_sample_seed_block=" + LastStrongSampleSeedBlockedCount);
+            summary.AppendLine("strong_sample_seed_temp_block=" + LastStrongSampleSeedTemporaryBlockedCount);
+            summary.AppendLine("strong_sample_seed_temp_block_near_surface=" + LastStrongSampleSeedTempNearSurfaceBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_vote=" + LastStrongSampleSeedTempVoteBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_score=" + LastStrongSampleSeedTempScoreBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_support=" + LastStrongSampleSeedTempSupportBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_band=" + LastStrongSampleSeedTempBandBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_same_frame=" + LastStrongSampleSeedTempSameFrameBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_cross_frame=" + LastStrongSampleSeedTempCrossFrameBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_dirty_pending=" + LastStrongSampleSeedTempDirtyPendingBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_old_weight=" + LastStrongSampleSeedTempOldWeightBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_conflict=" + LastStrongSampleSeedTempConflictBlockCount);
+            summary.AppendLine("strong_sample_seed_temp_block_local=" + LastStrongSampleSeedTempLocalBlockCount);
+            summary.AppendLine("strong_sample_seed_weight_scale=" + AuditFloat(strongSampleSeedWeightScale));
+            summary.AppendLine("strong_sample_seed_max_old_tsdf_residual=" + AuditFloat(maxStrongSampleSeedOldTsdfResidual));
+            summary.AppendLine("vote_strong_current_accept=" + LastVoteStrongCurrentAcceptCount);
+            summary.AppendLine("vote_same_frame_conflict_depth_m=" + AuditFloat(sameFrameConflictDepthMeters));
+            summary.AppendLine("vote_cross_frame_clean_conflict_depth_m=" + AuditFloat(crossFrameCleanConflictDepthMeters));
+            summary.AppendLine("vote_cross_frame_clean_conflict_search_m=" + AuditFloat(crossFrameCleanConflictSearchMeters));
+            summary.AppendLine("vote_pending_weight_scale=" + AuditFloat(confirmedPendingWriteWeightScale));
+            summary.AppendLine("provisional_tsdf_enabled=" + (allowProvisionalTsdfSupportWrites ? 1 : 0));
+            summary.AppendLine("provisional_tsdf_write=" + LastProvisionalTsdfSupportWriteCount);
+            summary.AppendLine("provisional_tsdf_block=" + LastProvisionalTsdfSupportBlockedCount);
+            summary.AppendLine("provisional_tsdf_near_surface_abs=" + AuditFloat(provisionalTsdfNearSurfaceAbs));
+            summary.AppendLine("provisional_tsdf_near_surface_block=" + LastProvisionalTsdfNearSurfaceBlockedCount);
+            summary.AppendLine("provisional_tsdf_near_surface_positive_block=" + LastProvisionalTsdfNearSurfacePositiveBlockedCount);
+            summary.AppendLine("provisional_tsdf_near_surface_negative_block=" + LastProvisionalTsdfNearSurfaceNegativeBlockedCount);
+            summary.AppendLine("provisional_tsdf_far_band_skip=" + LastProvisionalTsdfFarBandSkippedCount);
+            summary.AppendLine("provisional_tsdf_disabled_block=" + LastProvisionalTsdfDisabledBlockedCount);
+            summary.AppendLine("provisional_tsdf_invalid_block=" + LastProvisionalTsdfInvalidBlockedCount);
+            summary.AppendLine("provisional_tsdf_vote_block=" + LastProvisionalTsdfVoteBlockedCount);
+            summary.AppendLine("provisional_tsdf_score_block=" + LastProvisionalTsdfScoreBlockedCount);
+            summary.AppendLine("provisional_tsdf_support_block=" + LastProvisionalTsdfSupportRatioBlockedCount);
+            summary.AppendLine("provisional_tsdf_band_block=" + LastProvisionalTsdfBandBlockedCount);
+            summary.AppendLine("provisional_tsdf_clean_history_block=" + LastProvisionalTsdfCleanHistoryBlockedCount);
+            summary.AppendLine("provisional_tsdf_same_frame_block=" + LastProvisionalTsdfSameFrameBlockedCount);
+            summary.AppendLine("provisional_tsdf_cross_frame_block=" + LastProvisionalTsdfCrossFrameBlockedCount);
+            summary.AppendLine("provisional_tsdf_dirty_pending_block=" + LastProvisionalTsdfDirtyPendingBlockedCount);
+            summary.AppendLine("provisional_tsdf_old_weight_block=" + LastProvisionalTsdfOldWeightBlockedCount);
+            summary.AppendLine("provisional_tsdf_conflict_block=" + LastProvisionalTsdfConflictBlockedCount);
+            summary.AppendLine("provisional_tsdf_plane_block=" + LastProvisionalTsdfPlaneBlockedCount);
+            summary.AppendLine("provisional_tsdf_pending_stability_block=" + LastProvisionalTsdfPendingStabilityBlockedCount);
+            summary.AppendLine("provisional_tsdf_formal_downgrade_block=" + LastProvisionalTsdfFormalDowngradeBlockedCount);
+            summary.AppendLine("provisional_tsdf_existing_weight_bypass=" + LastProvisionalTsdfExistingWeightBypassCount);
+            summary.AppendLine("provisional_tsdf_bootstrap_local_bypass=" + LastProvisionalTsdfBootstrapLocalBypassCount);
+            summary.AppendLine("provisional_tsdf_bootstrap_enabled=" + (allowNearSurfaceProvisionalBootstrap ? 1 : 0));
+            summary.AppendLine("provisional_tsdf_bootstrap_max_abs=" + AuditFloat(maxNearSurfaceProvisionalBootstrapAbsTsdf));
+            summary.AppendLine("provisional_tsdf_bootstrap_min_vote=" + AuditFloat(minNearSurfaceProvisionalBootstrapVoteScore));
+            summary.AppendLine("provisional_tsdf_bootstrap_min_support=" + AuditFloat(minNearSurfaceProvisionalBootstrapSupportRatio));
+            summary.AppendLine("provisional_plane_compat_enabled=" + (requireProvisionalPlaneCompatibility ? 1 : 0));
+            summary.AppendLine("provisional_plane_compat_pass=" + LastProvisionalPlaneCompatibilityPassCount);
+            summary.AppendLine("provisional_plane_compat_block=" + LastProvisionalPlaneCompatibilityBlockedCount);
+            summary.AppendLine("provisional_plane_compat_no_ref=" + LastProvisionalPlaneCompatibilityNoReferenceCount);
+            summary.AppendLine("provisional_plane_compat_candidates=" + LastProvisionalPlaneCompatibilityCandidateCount);
+            summary.AppendLine("provisional_plane_compat_normal_reject=" + LastProvisionalPlaneCompatibilityNormalRejectedCount);
+            summary.AppendLine("provisional_plane_compat_distance_reject=" + LastProvisionalPlaneCompatibilityDistanceRejectedCount);
+            summary.AppendLine("provisional_plane_compat_radius=" + provisionalPlaneCompatibilityRadiusVoxels);
+            summary.AppendLine("provisional_plane_compat_min_neighbors=" + minProvisionalPlaneCompatibleNeighbors);
+            summary.AppendLine("provisional_plane_compat_min_normal_dot=" + AuditFloat(minProvisionalPlaneNormalDot));
+            summary.AppendLine("provisional_plane_compat_max_distance_vox=" + AuditFloat(maxProvisionalPlaneDistanceVoxelScale));
+            summary.AppendLine("provisional_local_support_enabled=" + (requireProvisionalLocalSupport ? 1 : 0));
+            summary.AppendLine("provisional_local_support_pass=" + LastProvisionalLocalSupportPassCount);
+            summary.AppendLine("provisional_local_support_block=" + LastProvisionalLocalSupportBlockedCount);
+            summary.AppendLine("provisional_local_support_neighbors=" + LastProvisionalLocalSupportNeighborCount);
+            summary.AppendLine("provisional_local_support_stable_neighbors=" + LastProvisionalLocalSupportStableNeighborCount);
+            summary.AppendLine("provisional_local_support_axial_neighbors=" + LastProvisionalLocalSupportAxialNeighborCount);
+            summary.AppendLine("provisional_local_support_radius=" + provisionalLocalSupportRadiusVoxels);
+            summary.AppendLine("provisional_local_support_min=" + minProvisionalLocalSupportVoxels);
+            summary.AppendLine("provisional_local_support_min_stable=" + minProvisionalLocalStableVoxels);
+            summary.AppendLine("provisional_local_support_min_axial=" + minProvisionalLocalAxialVoxels);
+            summary.AppendLine("provisional_local_support_max_abs=" + AuditFloat(maxProvisionalLocalSupportAbsTsdf));
+            summary.AppendLine("provisional_local_support_max_residual=" + AuditFloat(maxProvisionalLocalSupportResidual));
+            summary.AppendLine("provisional_tsdf_confirmed=" + LastProvisionalTsdfConfirmedCount);
+            summary.AppendLine("provisional_tsdf_confirmed_by_weight=" + LastProvisionalTsdfConfirmedByWeightCount);
+            summary.AppendLine("provisional_tsdf_retired=" + LastProvisionalTsdfRetiredCount);
+            summary.AppendLine("provisional_tsdf_retired_expired=" + LastProvisionalTsdfRetiredExpiredCount);
+            summary.AppendLine("provisional_tsdf_dirty_cleared=" + LastProvisionalTsdfDirtyClearedCount);
+            summary.AppendLine("provisional_tsdf_weight=" + provisionalTsdfSupportWeight);
+            summary.AppendLine("provisional_tsdf_blend=" + AuditFloat(provisionalTsdfSupportBlend));
+            summary.AppendLine("provisional_tsdf_max_age_frames=" + provisionalTsdfMaxAgeFrames);
+            summary.AppendLine("old_clean_metabolism_enabled=" + (enableOldCleanTsdfMetabolism ? 1 : 0));
+            summary.AppendLine("old_clean_metabolism_watch=" + LastOldCleanMetabolismWatchCount);
+            summary.AppendLine("old_clean_metabolism_decay=" + LastOldCleanMetabolismDecayCount);
+            summary.AppendLine("old_clean_metabolism_clear=" + LastOldCleanMetabolismClearCount);
+            summary.AppendLine("old_clean_metabolism_block=" + LastOldCleanMetabolismBlockedCount);
+            summary.AppendLine("old_clean_metabolism_candidate=" + LastOldCleanMetabolismCandidateCount);
+            summary.AppendLine("old_clean_metabolism_waiting_hits=" + LastOldCleanMetabolismWaitingHitsCount);
+            summary.AppendLine("old_clean_metabolism_block_support=" + LastOldCleanMetabolismBlockedSupportCount);
+            summary.AppendLine("old_clean_metabolism_block_same_frame=" + LastOldCleanMetabolismBlockedSameFrameCount);
+            summary.AppendLine("old_clean_metabolism_block_weight=" + LastOldCleanMetabolismBlockedWeightCount);
+            summary.AppendLine("old_clean_metabolism_block_residual=" + LastOldCleanMetabolismBlockedResidualCount);
+            summary.AppendLine("old_clean_metabolism_block_dirty_pending=" + LastOldCleanMetabolismBlockedDirtyPendingCount);
+            summary.AppendLine("old_clean_metabolism_skip_weak_band=" + LastOldCleanMetabolismSkippedWeakBandCount);
+            summary.AppendLine("old_clean_metabolism_skip_weak_cross_frame=" + LastOldCleanMetabolismSkippedWeakCrossFrameCount);
+            summary.AppendLine("old_clean_metabolism_min_hits=" + minOldCleanMetabolismConflictHits);
+            summary.AppendLine("old_clean_metabolism_max_weight=" + maxOldCleanMetabolismWeight);
+            summary.AppendLine("old_clean_metabolism_clear_weight=" + oldCleanMetabolismClearWeight);
+            summary.AppendLine("old_clean_metabolism_cross_frame_voxel_residual=" + AuditFloat(minOldCleanMetabolismCrossFrameVoxelResidual));
+            summary.AppendLine("old_clean_metabolism_band_voxel_residual=" + AuditFloat(minOldCleanMetabolismBandVoxelResidual));
+            summary.AppendLine("fusion_total_frames=" + IntegratedFrameCount);
+            summary.AppendLine("free_space_evidence_enabled=" + (useTemporalFreeSpaceEvidence ? 1 : 0));
+            summary.AppendLine("free_space_evidence_candidates=" + LastFreeSpaceEvidenceCandidateCount);
+            summary.AppendLine("free_space_evidence_new=" + LastFreeSpaceEvidenceNewCount);
+            summary.AppendLine("free_space_evidence_repeat=" + LastFreeSpaceEvidenceRepeatCount);
+            summary.AppendLine("free_space_evidence_waiting=" + LastFreeSpaceEvidenceWaitingCount);
+            summary.AppendLine("free_space_evidence_applied=" + LastFreeSpaceEvidenceAppliedCount);
+            summary.AppendLine("free_space_evidence_cleared=" + LastFreeSpaceEvidenceClearedCount);
+            summary.AppendLine("free_space_evidence_block_high_weight=" + LastFreeSpaceEvidenceBlockedHighWeightCount);
+            summary.AppendLine("free_space_evidence_block_same_frame=" + LastFreeSpaceEvidenceBlockedSameFrameCount);
+            summary.AppendLine("free_space_evidence_duplicate_frame=" + LastFreeSpaceEvidenceDuplicateFrameCount);
+            summary.AppendLine("free_space_evidence_cancelled_by_surface=" + LastFreeSpaceEvidenceCancelledBySurfaceCount);
+            summary.AppendLine("free_space_evidence_min_frames=" + Mathf.Clamp(minFreeSpaceEvidenceFrames, 2, 8));
+            summary.AppendLine("free_space_evidence_max_gap=" + Mathf.Max(2, maxFreeSpaceEvidenceFrameGap));
+            summary.AppendLine("free_space_evidence_weight_decay=" + Mathf.Clamp(freeSpaceEvidenceWeightDecay, 1, 4));
+            summary.AppendLine("pending_wait=" + LastPendingTsdfCorrectionCount);
+            summary.AppendLine("dirty_replace=" + LastReplacedDirtyTsdfCount);
+            summary.AppendLine("dirty_guard=" + LastGuardedDirtyTsdfReplaceCount);
+            summary.AppendLine("dirty_replace_block_clean_history=" + LastDirtyTsdfReplaceBlockedCleanHistoryCount);
+            summary.AppendLine("dirty_band_repair=" + LastDirtyTsdfBandRepairCount);
+            summary.AppendLine("dirty_band_repair_samples=" + LastDirtyTsdfBandRepairSampleCount);
+            summary.AppendLine("dirty_band_repair_triggers=" + LastDirtyTsdfBandRepairTriggerCount);
+            summary.AppendLine("dirty_band_repair_probes=" + LastDirtyTsdfBandRepairProbeCount);
+            summary.AppendLine("dirty_band_repair_block_disabled=" + LastDirtyTsdfBandRepairBlockedDisabledCount);
+            summary.AppendLine("dirty_band_repair_block_no_sample=" + LastDirtyTsdfBandRepairBlockedNoSampleCount);
+            summary.AppendLine("dirty_band_repair_block_no_history=" + LastDirtyTsdfBandRepairBlockedNoHistoryCount);
+            summary.AppendLine("dirty_band_repair_block_low_conflict=" + LastDirtyTsdfBandRepairBlockedLowConflictCount);
+            summary.AppendLine("dirty_band_repair_block_budget=" + LastDirtyTsdfBandRepairBlockedBudgetCount);
+            summary.AppendLine("dirty_band_repair_block_outside=" + LastDirtyTsdfBandRepairBlockedOutsideCount);
+            summary.AppendLine("dirty_band_repair_block_empty=" + LastDirtyTsdfBandRepairBlockedEmptyCount);
+            summary.AppendLine("dirty_band_repair_block_weight=" + LastDirtyTsdfBandRepairBlockedWeightCount);
+            summary.AppendLine("dirty_band_repair_block_same_sign=" + LastDirtyTsdfBandRepairBlockedSameSignCount);
+            summary.AppendLine("dirty_band_repair_block_residual=" + LastDirtyTsdfBandRepairBlockedResidualCount);
+            summary.AppendLine("dirty_active=" + LastDirtyTsdfActiveCount);
+            summary.AppendLine("mesh_triangles=" + LastMeshTriangleCount);
+            summary.AppendLine("island_cause_components=" + LastIslandCauseComponentCount);
+            summary.AppendLine("island_cause_boundary_voxels=" + LastIslandCauseBoundaryVoxelCount);
+            summary.AppendLine("island_cause_no_tsdf=" + LastIslandCauseNoTsdfCount);
+            summary.AppendLine("island_cause_pending=" + LastIslandCausePendingCount);
+            summary.AppendLine("island_cause_dirty=" + LastIslandCauseDirtyCount);
+            summary.AppendLine("island_cause_low_weight=" + LastIslandCauseLowWeightCount);
+            summary.AppendLine("island_cause_plane_mismatch=" + LastIslandCausePlaneMismatchCount);
+            summary.AppendLine("island_cause_pruned_or_topology=" + LastIslandCausePrunedCount);
+            summary.AppendLine("tsdf_continuity_candidates=" + LastTsdfContinuityCandidateCount);
+            summary.AppendLine("tsdf_continuity_filled=" + LastTsdfContinuityFilledCount);
+            summary.AppendLine("tsdf_continuity_same_sign_filled=" + LastTsdfContinuitySameSignFilledCount);
+            summary.AppendLine("tsdf_continuity_mixed_sign_filled=" + LastTsdfContinuityMixedSignFilledCount);
+            summary.AppendLine("tsdf_continuity_provisional_neighbors=" + LastTsdfContinuityProvisionalNeighborCount);
+            summary.AppendLine("tsdf_continuity_block_dirty_pending=" + LastTsdfContinuityBlockedDirtyPendingCount);
+            summary.AppendLine("tsdf_continuity_block_low_support=" + LastTsdfContinuityBlockedLowSupportCount);
+            summary.AppendLine("tsdf_continuity_block_budget=" + LastTsdfContinuityBlockedBudgetCount);
+            summary.AppendLine("tsdf_continuity_block_unsettled_neighbor=" + LastTsdfContinuityBlockedUnsettledNeighborCount);
+            summary.AppendLine("tsdf_continuity_allow_same_sign=" + (allowSameSignContinuityBaseFill ? 1 : 0));
+            summary.AppendLine("tsdf_continuity_allow_provisional_sources=" + (allowStableProvisionalContinuitySources ? 1 : 0));
+            summary.AppendLine("tsdf_continuity_same_sign_min=" + Mathf.Clamp(minTsdfContinuitySameSignNeighborVoxels, 3, 26));
+            summary.AppendLine("tsdf_continuity_face_min=" + Mathf.Clamp(minTsdfContinuityFaceNeighborVoxels, 1, 6));
+            summary.AppendLine("tsdf_boundary_no_tsdf_candidates=" + LastTsdfBoundaryNoTsdfCandidateCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_filled=" + LastTsdfBoundaryNoTsdfFilledCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_blocked=" + LastTsdfBoundaryNoTsdfBlockedCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_support=" + LastTsdfBoundaryNoTsdfBlockedSupportCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_face=" + LastTsdfBoundaryNoTsdfBlockedFaceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_axis=" + LastTsdfBoundaryNoTsdfBlockedAxisCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_clean_anchor=" + LastTsdfBoundaryNoTsdfBlockedCleanAnchorCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_provisional_anchor=" + LastTsdfBoundaryNoTsdfBlockedProvisionalAnchorCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_near_surface=" + LastTsdfBoundaryNoTsdfBlockedNearSurfaceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_block_budget=" + LastTsdfBoundaryNoTsdfBlockedBudgetCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_relaxed_anchor_filled=" + LastTsdfBoundaryNoTsdfRelaxedAnchorFilledCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_verified_joint_anchor_filled=" + LastTsdfBoundaryNoTsdfVerifiedJointAnchorFilledCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_zero_clean_joint_anchor_filled=" + LastTsdfBoundaryNoTsdfZeroCleanJointAnchorFilledCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_present=" + LastTsdfBoundaryNoTsdfProvisionalPresentNeighborCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_face_present=" + LastTsdfBoundaryNoTsdfProvisionalFacePresentCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_accept=" + LastTsdfBoundaryNoTsdfProvisionalAcceptedNeighborCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_face_accept=" + LastTsdfBoundaryNoTsdfProvisionalAcceptedFaceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_weight=" + LastTsdfBoundaryNoTsdfProvisionalBlockedWeightCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_dirty_pending=" + LastTsdfBoundaryNoTsdfProvisionalBlockedDirtyPendingCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_tsdf=" + LastTsdfBoundaryNoTsdfProvisionalBlockedTsdfCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_residual=" + LastTsdfBoundaryNoTsdfProvisionalBlockedResidualCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_provenance=" + LastTsdfBoundaryNoTsdfProvisionalBlockedProvenanceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_prov_block_not_face=" + LastTsdfBoundaryNoTsdfProvisionalBlockedNotFaceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_0=" + LastTsdfBoundaryNoTsdfFaceSupport0Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_1=" + LastTsdfBoundaryNoTsdfFaceSupport1Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_2=" + LastTsdfBoundaryNoTsdfFaceSupport2Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_3=" + LastTsdfBoundaryNoTsdfFaceSupport3Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_4=" + LastTsdfBoundaryNoTsdfFaceSupport4Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_5=" + LastTsdfBoundaryNoTsdfFaceSupport5Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_hist_6=" + LastTsdfBoundaryNoTsdfFaceSupport6Count);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_deficit_one=" + LastTsdfBoundaryNoTsdfFaceDeficitOneCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_deficit_two_plus=" + LastTsdfBoundaryNoTsdfFaceDeficitTwoPlusCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_accept_clean=" + LastTsdfBoundaryNoTsdfFaceSlotAcceptedCleanCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_accept_provisional=" + LastTsdfBoundaryNoTsdfFaceSlotAcceptedProvisionalCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_block_weight=" + LastTsdfBoundaryNoTsdfFaceSlotBlockedWeightCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_block_dirty_pending=" + LastTsdfBoundaryNoTsdfFaceSlotBlockedDirtyPendingCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_block_provenance=" + LastTsdfBoundaryNoTsdfFaceSlotBlockedProvenanceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_block_tsdf=" + LastTsdfBoundaryNoTsdfFaceSlotBlockedTsdfCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_block_residual=" + LastTsdfBoundaryNoTsdfFaceSlotBlockedResidualCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_slot_out_of_bounds=" + LastTsdfBoundaryNoTsdfFaceSlotOutOfBoundsCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_verified_two_face_candidates=" + LastTsdfBoundaryNoTsdfVerifiedTwoFaceCandidateCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_verified_two_face_filled=" + LastTsdfBoundaryNoTsdfVerifiedTwoFaceFilledCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_passed=" + LastTsdfBoundaryNoTsdfSupportPassedCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_deficit_one=" + LastTsdfBoundaryNoTsdfSupportDeficitOneCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_deficit_two=" + LastTsdfBoundaryNoTsdfSupportDeficitTwoCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_deficit_three=" + LastTsdfBoundaryNoTsdfSupportDeficitThreeCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_deficit_four_plus=" + LastTsdfBoundaryNoTsdfSupportDeficitFourPlusCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_accept_clean=" + LastTsdfBoundaryNoTsdfSupportSlotAcceptedCleanCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_accept_provisional=" + LastTsdfBoundaryNoTsdfSupportSlotAcceptedProvisionalCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_block_weight=" + LastTsdfBoundaryNoTsdfSupportSlotBlockedWeightCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_block_dirty_pending=" + LastTsdfBoundaryNoTsdfSupportSlotBlockedDirtyPendingCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_block_provenance=" + LastTsdfBoundaryNoTsdfSupportSlotBlockedProvenanceCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_block_tsdf=" + LastTsdfBoundaryNoTsdfSupportSlotBlockedTsdfCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_block_residual=" + LastTsdfBoundaryNoTsdfSupportSlotBlockedResidualCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_support_slot_out_of_bounds=" + LastTsdfBoundaryNoTsdfSupportSlotOutOfBoundsCount);
+            summary.AppendLine("tsdf_boundary_no_tsdf_min=" + Mathf.Clamp(minBoundaryNoTsdfNeighborVoxels, 3, 26));
+            summary.AppendLine("tsdf_boundary_no_tsdf_face_min=" + Mathf.Clamp(minBoundaryNoTsdfFaceNeighborVoxels, 2, 6));
+            summary.AppendLine("tsdf_boundary_no_tsdf_provisional_anchor_enabled=" + (allowBoundaryNoTsdfProvisionalAnchor ? 1 : 0));
+            summary.AppendLine("tsdf_boundary_no_tsdf_clean_face_anchor_min=0");
+            summary.AppendLine("tsdf_boundary_no_tsdf_clean_face_anchor_serialized=" + Mathf.Clamp(minBoundaryNoTsdfCleanFaceAnchors, 0, 6));
+            summary.AppendLine("tsdf_boundary_no_tsdf_provisional_anchor_min=" + Mathf.Clamp(minBoundaryNoTsdfProvisionalAnchors, 1, 12));
+            summary.AppendLine("tsdf_boundary_no_tsdf_provisional_face_anchor_min=" + Mathf.Clamp(minBoundaryNoTsdfProvisionalFaceAnchors, 1, 6));
+            summary.AppendLine("pose_max_position_delta_m=" + AuditFloat(_auditMaxPosePositionDelta));
+            summary.AppendLine("pose_max_angle_delta_deg=" + AuditFloat(_auditMaxPoseAngleDelta));
+            summary.AppendLine("snapshot_max_latency_ms=" + AuditFloat(_auditMaxSnapshotLatencyMs));
+            summary.AppendLine("conflict_voxels=" + _captureAuditVoxels.Count);
+            summary.AppendLine("mesh_associated_conflict_voxels=" + _auditMeshAssociatedVoxelCount);
+            summary.AppendLine("recurrent_after_replace_voxels=" + _auditRecurrentAfterReplaceCount);
+            summary.AppendLine("likely_depth_instability_voxels=" + _auditLikelyDepthInstabilityCount);
+            summary.AppendLine("view_or_registration_ambiguous_voxels=" + _auditViewOrRegistrationCount);
+            summary.AppendLine("suspect_mesh_voxels=" + _auditSuspectMeshVoxels.Count);
+            summary.AppendLine("suspect_mesh_source_integrate=" + LastSuspectMeshSourceIntegrateVoxelCount);
+            summary.AppendLine("suspect_mesh_source_provisional=" + LastSuspectMeshSourceProvisionalVoxelCount);
+            summary.AppendLine("suspect_mesh_source_strong_seed=" + LastSuspectMeshSourceStrongSeedVoxelCount);
+            summary.AppendLine("suspect_mesh_source_continuity=" + LastSuspectMeshSourceContinuityVoxelCount);
+            summary.AppendLine("suspect_mesh_source_carve=" + LastSuspectMeshSourceCarveVoxelCount);
+            summary.AppendLine("suspect_mesh_source_replace=" + LastSuspectMeshSourceReplaceVoxelCount);
+            summary.AppendLine("suspect_mesh_source_repair=" + LastSuspectMeshSourceRepairVoxelCount);
+            summary.AppendLine("suspect_mesh_source_other=" + LastSuspectMeshSourceOtherVoxelCount);
+            summary.AppendLine("suspect_mesh_source_unknown=" + LastSuspectMeshSourceUnknownVoxelCount);
+            summary.AppendLine("conflict_voxels_linked_to_suspect_mesh=" + _auditSuspectAssociatedConflictVoxelCount);
+            summary.AppendLine("suspect_mesh_voxels_linked_to_conflict=" + _auditSuspectVoxelsLinkedToConflictCount);
+            summary.AppendLine("pure_geometry_triangles=" + LastPureGeometrySuspectTriangleCount);
+            summary.AppendLine("pure_geometry_normal_triangles=" + LastPureGeometryNormalTriangleCount);
+            summary.AppendLine("pure_geometry_protrusion_triangles=" + LastPureGeometryProtrusionTriangleCount);
+            summary.AppendLine("pure_geometry_double_layer_triangles=" + LastPureGeometryDoubleLayerTriangleCount);
+            summary.AppendLine("double_layer_source_dirty=" + LastDoubleLayerSourceDirtyCount);
+            summary.AppendLine("double_layer_source_pending=" + LastDoubleLayerSourcePendingCount);
+            summary.AppendLine("double_layer_source_band_conflict=" + LastDoubleLayerSourceBandConflictCount);
+            summary.AppendLine("double_layer_source_old_locked=" + LastDoubleLayerSourceOldLockedCount);
+            summary.AppendLine("double_layer_source_clean=" + LastDoubleLayerSourceCleanCount);
+            summary.AppendLine("double_layer_source_empty=" + LastDoubleLayerSourceEmptyCount);
+            summary.AppendLine("double_layer_source_mixed=" + LastDoubleLayerSourceMixedCount);
+            summary.AppendLine("double_layer_source_unknown=" + LastDoubleLayerSourceUnknownCount);
+            summary.AppendLine("double_layer_clean_definition=weighted_without_active_dirty_pending_band_or_old_lock");
+            summary.AppendLine("double_layer_clean_no_lifecycle=" + LastDoubleLayerCleanNoLifecycleCount);
+            summary.AppendLine("double_layer_clean_no_provenance=" + LastDoubleLayerCleanNoProvenanceCount);
+            summary.AppendLine("double_layer_clean_conflict_history=" + LastDoubleLayerCleanConflictHistoryCount);
+            summary.AppendLine("double_layer_clean_replace_history=" + LastDoubleLayerCleanReplaceHistoryCount);
+            summary.AppendLine("double_layer_clean_expired_dirty=" + LastDoubleLayerCleanExpiredDirtyCount);
+            summary.AppendLine("double_layer_clean_low_weight=" + LastDoubleLayerCleanLowWeightCount);
+            summary.AppendLine("double_layer_clean_high_weight=" + LastDoubleLayerCleanHighWeightCount);
+            summary.AppendLine("double_layer_clean_last_integrate=" + LastDoubleLayerCleanLastIntegrateCount);
+            summary.AppendLine("double_layer_clean_last_carve=" + LastDoubleLayerCleanLastCarveCount);
+            summary.AppendLine("double_layer_clean_last_replace=" + LastDoubleLayerCleanLastReplaceCount);
+            summary.AppendLine("double_layer_clean_last_repair=" + LastDoubleLayerCleanLastRepairCount);
+            summary.AppendLine("double_layer_clean_integrate_carve_history=" + LastDoubleLayerCleanIntegrateCarveHistoryCount);
+            summary.AppendLine("double_layer_clean_multi_frame_history=" + LastDoubleLayerCleanMultiFrameHistoryCount);
+            summary.AppendLine("double_layer_pair_rows=" + _doubleLayerPairRowCount);
+            summary.AppendLine("double_layer_pair_dropped_rows=" + _doubleLayerPairDroppedRows);
+            summary.AppendLine("double_layer_pairs_csv=" + doubleLayerPairsPath);
+            summary.AppendLine("double_layer_validated_pairs=" + LastDoubleLayerValidatedPairCount);
+            summary.AppendLine("double_layer_reject_missing_source=" + LastDoubleLayerRejectedMissingSourceCount);
+            summary.AppendLine("double_layer_reject_source_normal=" + LastDoubleLayerRejectedSourceNormalCount);
+            summary.AppendLine("double_layer_reject_source_plane=" + LastDoubleLayerRejectedSourcePlaneCount);
+            summary.AppendLine("double_layer_reject_source_lateral=" + LastDoubleLayerRejectedSourceLateralCount);
+            summary.AppendLine("double_layer_mesh_alignment_mismatch=" + LastDoubleLayerMeshAlignmentMismatchCount);
+            summary.AppendLine("raw_coverage_grid_enabled=" + (enableRawCoverageGridDiagnostics ? 1 : 0));
+            summary.AppendLine("raw_coverage_grid_cell_size_m=" + AuditFloat(rawCoverageGridCellSizeMeters));
+            summary.AppendLine("raw_coverage_grid_samples=" + LastRawCoverageGridSampleCount);
+            summary.AppendLine("raw_coverage_grid_dropped_samples=" + LastRawCoverageGridDroppedSampleCount);
+            summary.AppendLine("raw_coverage_grid_cells=" + LastRawCoverageGridCellCount);
+            summary.AppendLine("raw_coverage_grid_accepted_cells=" + LastRawCoverageAcceptedCellCount);
+            summary.AppendLine("raw_coverage_grid_problem_cells=" + LastRawCoverageProblemCellCount);
+            summary.AppendLine("raw_coverage_grid_mixed_cells=" + LastRawCoverageMixedCellCount);
+            summary.AppendLine("raw_coverage_grid_accepted_components=" + LastRawCoverageAcceptedComponentCount);
+            summary.AppendLine("raw_coverage_grid_largest_accepted_component=" + LastRawCoverageLargestAcceptedComponentCells);
+            summary.AppendLine("raw_coverage_grid_problem_components=" + LastRawCoverageProblemComponentCount);
+            summary.AppendLine("raw_coverage_grid_largest_problem_component=" + LastRawCoverageLargestProblemComponentCells);
+            summary.AppendLine("raw_coverage_grid_rendered_cells=" + LastRawCoverageRenderedCellCount);
+            summary.AppendLine("pure_geometry_voxels=" + _auditPureGeometryMeshVoxels.Count);
+            summary.AppendLine("conflict_voxels_linked_to_pure_geometry=" + _auditPureGeometryAssociatedConflictVoxelCount);
+            summary.AppendLine("pure_geometry_voxels_linked_to_conflict=" + _auditPureGeometryVoxelsLinkedToConflictCount);
+            summary.AppendLine("old_locked_above_correctable_weight=" + _auditLockedAboveCorrectableWeightCount);
+            summary.AppendLine("old_locked_band_conflict=" + _auditLockedBandConflictCount);
+            summary.AppendLine("old_locked_replace_recurrent=" + _auditLockedReplaceRecurrentCount);
+            summary.AppendLine("old_locked_depth_unstable=" + _auditLockedDepthUnstableCount);
+            summary.AppendLine("old_locked_view_changed=" + _auditLockedViewChangedCount);
+            summary.AppendLine("old_locked_under_supported=" + _auditLockedUnderSupportedCount);
+            summary.AppendLine("old_locked_stable_old_surface=" + _auditLockedStableOldSurfaceCount);
+            summary.AppendLine("snapshot_pose_sync_suspect=" + ((_auditMaxPosePositionDelta > 0.025f || _auditMaxPoseAngleDelta > 2f || _auditMaxSnapshotLatencyMs > 50f) ? 1 : 0));
+            summary.AppendLine("samples_csv=" + csvPath);
+            summary.AppendLine("frames_csv=" + framesPath);
+            summary.AppendLine("voxel_lifecycle_csv=" + lifecyclePath);
+            summary.AppendLine("contribution_ledger_rows=" + _contributionLedgerRowCount);
+            summary.AppendLine("contribution_ledger_write_failures=" + _contributionLedgerWriteFailures);
+            summary.AppendLine("contribution_ledger_csv=" + (_contributionLedgerPath ?? "unavailable"));
+            File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(false));
+            _lastConfidenceAuditPath = csvPath;
+            if (debugLog)
+                Debug.Log($"[ScanCover] Confidence audit written: {csvPath} rows={_confidenceAuditRowCount} dropped={_confidenceAuditDroppedRows}", this);
+        }
+        catch (System.Exception firstError)
+        {
+            try
+            {
+                string fallbackDirectory = Path.Combine(Application.persistentDataPath, SanitizeAuditFolderName());
+                Directory.CreateDirectory(fallbackDirectory);
+                string fallbackPath = Path.Combine(fallbackDirectory, _confidenceAuditStem + "_samples.csv");
+                File.WriteAllText(fallbackPath, _confidenceAuditRows.ToString(), new UTF8Encoding(false));
+                _lastConfidenceAuditPath = fallbackPath + " (fallback)";
+                Debug.LogWarning($"[ScanCover] Install directory audit write failed; wrote fallback file to {fallbackPath}. Error: {firstError.Message}", this);
+            }
+            catch (System.Exception fallbackError)
+            {
+                _lastConfidenceAuditPath = "WRITE FAILED";
+                Debug.LogError($"[ScanCover] Confidence audit write failed. install={firstError.Message}; fallback={fallbackError.Message}", this);
+            }
+        }
+        finally
+        {
+            if (_contributionLedgerWriter != null)
+            {
+                _contributionLedgerWriter.Dispose();
+                _contributionLedgerWriter = null;
+            }
+            _confidenceAuditRows = null;
+            _confidenceAuditFrameRows = null;
+            _doubleLayerPairRows = null;
+        }
+    }
+
+    private void AnalyzeAuditMeshAssociation()
+    {
+        _auditMeshAssociatedVoxelCount = 0;
+        _auditSuspectAssociatedConflictVoxelCount = 0;
+        _auditSuspectVoxelsLinkedToConflictCount = 0;
+        if (_mesh == null || _captureAuditVoxels.Count <= 0)
+            return;
+
+        HashSet<int> meshVoxels = new HashSet<int>();
+        Vector3[] meshVertices = _mesh.vertices;
+        for (int i = 0; i < meshVertices.Length; i++)
+        {
+            Vector3 world = _meshObject != null ? _meshObject.transform.TransformPoint(meshVertices[i]) : meshVertices[i];
+            if (TryWorldToVoxel(world, out int x, out int y, out int z))
+                meshVoxels.Add(Index(x, y, z));
+        }
+
+        foreach (int voxelIndex in _captureAuditVoxels)
+        {
+            if (!_voxelAuditLifecycle.TryGetValue(voxelIndex, out VoxelAuditLifecycle life))
+                continue;
+            IndexToVoxel(voxelIndex, out int cx, out int cy, out int cz);
+            int nearby = 0;
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int x = cx + dx;
+                int y = cy + dy;
+                int z = cz + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                    continue;
+                if (meshVoxels.Contains(Index(x, y, z)))
+                    nearby++;
+            }
+            life.MeshNearbyVertices = nearby;
+            life.SuspectMeshNearby = NeighborhoodContainsVoxel(_auditSuspectMeshVoxels, cx, cy, cz, 1);
+            life.PureGeometryMeshNearby = NeighborhoodContainsVoxel(_auditPureGeometryMeshVoxels, cx, cy, cz, 1);
+            _voxelAuditLifecycle[voxelIndex] = life;
+            if (nearby > 0)
+                _auditMeshAssociatedVoxelCount++;
+            if (life.SuspectMeshNearby)
+                _auditSuspectAssociatedConflictVoxelCount++;
+            if (life.PureGeometryMeshNearby)
+                _auditPureGeometryAssociatedConflictVoxelCount++;
+        }
+
+        foreach (int suspectVoxel in _auditSuspectMeshVoxels)
+        {
+            IndexToVoxel(suspectVoxel, out int x, out int y, out int z);
+            if (NeighborhoodContainsVoxel(_captureAuditVoxels, x, y, z, 1))
+                _auditSuspectVoxelsLinkedToConflictCount++;
+        }
+        foreach (int pureVoxel in _auditPureGeometryMeshVoxels)
+        {
+            IndexToVoxel(pureVoxel, out int x, out int y, out int z);
+            if (NeighborhoodContainsVoxel(_captureAuditVoxels, x, y, z, 1))
+                _auditPureGeometryVoxelsLinkedToConflictCount++;
+        }
+    }
+
+    private bool NeighborhoodContainsVoxel(HashSet<int> voxels, int cx, int cy, int cz, int radius)
+    {
+        if (voxels == null || voxels.Count <= 0)
+            return false;
+        int r = Mathf.Max(0, radius);
+        for (int dz = -r; dz <= r; dz++)
+        for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            if (voxels.Contains(Index(x, y, z)))
+                return true;
+        }
+        return false;
+    }
+
+    private string BuildVoxelAuditLifecycleCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(1024, _captureAuditVoxels.Count * 120));
+        csv.AppendLine("voxel_index,x,y,z,world_x,world_y,world_z,first_conflict_frame,last_conflict_frame,conflicts,replaces,conflicts_after_replace,last_replace_frame,old_weight,old_tsdf,sample_tsdf,residual,cause,lock_subtype,correction_hits,band_conflict_ratio,band_high_weight_conflict_ratio,history_agreement,historical_surface_distance_m,prior_write_known,prior_write_frame,prior_write_frame_gap,prior_camera_travel_m,prior_camera_rotation_delta_deg,prior_ray_angle_delta_deg,prior_depth_delta_m,prior_normal_angle_delta_deg,prior_surface_shift_m,mesh_nearby_voxels,suspect_mesh_nearby,pure_geometry_mesh_nearby");
+        _auditRecurrentAfterReplaceCount = 0;
+        _auditLikelyDepthInstabilityCount = 0;
+        _auditViewOrRegistrationCount = 0;
+        _auditLockedAboveCorrectableWeightCount = 0;
+        _auditLockedBandConflictCount = 0;
+        _auditLockedReplaceRecurrentCount = 0;
+        _auditLockedDepthUnstableCount = 0;
+        _auditLockedViewChangedCount = 0;
+        _auditLockedUnderSupportedCount = 0;
+        _auditLockedStableOldSurfaceCount = 0;
+        foreach (int voxelIndex in _captureAuditVoxels)
+        {
+            if (!_voxelAuditLifecycle.TryGetValue(voxelIndex, out VoxelAuditLifecycle life))
+                continue;
+            IndexToVoxel(voxelIndex, out int x, out int y, out int z);
+            Vector3 center = VoxelCenter(x, y, z);
+            if (life.ConflictAfterReplaceCount > 0)
+                _auditRecurrentAfterReplaceCount++;
+            if (life.PriorWriteKnown && life.PriorSurfaceShiftMeters >= 0.08f)
+            {
+                if (life.PriorCameraTravelMeters < 0.08f)
+                    _auditLikelyDepthInstabilityCount++;
+                else
+                    _auditViewOrRegistrationCount++;
+            }
+            CountOldWeightLockSubtype(life.LastLockSubtype);
+            csv.Append(voxelIndex).Append(',').Append(x).Append(',').Append(y).Append(',').Append(z).Append(',')
+                .Append(AuditFloat(center.x)).Append(',').Append(AuditFloat(center.y)).Append(',').Append(AuditFloat(center.z)).Append(',')
+                .Append(life.FirstConflictFrame).Append(',').Append(life.LastConflictFrame).Append(',')
+                .Append(life.ConflictCount).Append(',').Append(life.ReplaceCount).Append(',')
+                .Append(life.ConflictAfterReplaceCount).Append(',').Append(life.LastReplaceFrame).Append(',')
+                .Append(life.LastOldWeight).Append(',').Append(AuditFloat(life.LastOldTsdf)).Append(',')
+                .Append(AuditFloat(life.LastSampleTsdf)).Append(',').Append(AuditFloat(life.LastResidual)).Append(',')
+                .Append(life.LastCause).Append(',').Append(life.LastLockSubtype).Append(',')
+                .Append(life.LastCorrectionHits).Append(',').Append(AuditFloat(life.LastBandConflictRatio)).Append(',')
+                .Append(AuditFloat(life.LastBandHighWeightConflictRatio)).Append(',')
+                .Append(AuditFloat(life.LastHistoryAgreement)).Append(',')
+                .Append(AuditFloat(life.LastHistoricalSurfaceDistanceMeters)).Append(',')
+                .Append(life.PriorWriteKnown ? 1 : 0).Append(',')
+                .Append(life.PriorWriteFrame).Append(',').Append(life.PriorWriteFrameGap).Append(',')
+                .Append(AuditFloat(life.PriorCameraTravelMeters)).Append(',')
+                .Append(AuditFloat(life.PriorCameraRotationDeltaDegrees)).Append(',')
+                .Append(AuditFloat(life.PriorRayAngleDeltaDegrees)).Append(',')
+                .Append(AuditFloat(life.PriorDepthDeltaMeters)).Append(',')
+                .Append(AuditFloat(life.PriorNormalAngleDeltaDegrees)).Append(',')
+                .Append(AuditFloat(life.PriorSurfaceShiftMeters)).Append(',')
+                .Append(life.MeshNearbyVertices).Append(',').Append(life.SuspectMeshNearby ? 1 : 0).Append(',')
+                .Append(life.PureGeometryMeshNearby ? 1 : 0).AppendLine();
+        }
+        return csv.ToString();
+    }
+
+    private void CountOldWeightLockSubtype(string subtype)
+    {
+        switch (subtype)
+        {
+            case "above_correctable_weight":
+                _auditLockedAboveCorrectableWeightCount++;
+                break;
+            case "band_conflict":
+                _auditLockedBandConflictCount++;
+                break;
+            case "replace_recurrent":
+                _auditLockedReplaceRecurrentCount++;
+                break;
+            case "depth_unstable":
+                _auditLockedDepthUnstableCount++;
+                break;
+            case "view_changed":
+                _auditLockedViewChangedCount++;
+                break;
+            case "under_supported_pending":
+                _auditLockedUnderSupportedCount++;
+                break;
+            case "stable_old_surface":
+                _auditLockedStableOldSurfaceCount++;
+                break;
+        }
+    }
+
+    private string ResolveConfidenceAuditDirectory()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        // APK contents are read-only. persistentDataPath is this installed app's writable data directory.
+        return Path.Combine(Application.persistentDataPath, SanitizeAuditFolderName());
+#else
+        string installDirectory = Application.dataPath;
+        try
+        {
+            DirectoryInfo dataDirectory = Directory.GetParent(Application.dataPath);
+            if (dataDirectory != null)
+                installDirectory = dataDirectory.FullName;
+        }
+        catch (System.Exception)
+        {
+            // Application.dataPath remains a usable fallback candidate.
+        }
+        return Path.Combine(installDirectory, SanitizeAuditFolderName());
+#endif
+    }
+
+    private string SanitizeAuditFolderName()
+    {
+        string folder = string.IsNullOrWhiteSpace(confidenceAuditFolderName) ? "ScanCoverDiagnostics" : confidenceAuditFolderName.Trim();
+        foreach (char invalid in Path.GetInvalidFileNameChars())
+            folder = folder.Replace(invalid, '_');
+        return folder;
+    }
+
+    private static string AuditFloat(float value)
+    {
+        return float.IsNaN(value) || float.IsInfinity(value) ? string.Empty : value.ToString("0.######", AuditCulture);
+    }
+
+    private void ResetRawDepthDebugCounters()
+    {
+        LastRawDepthDebugRenderedCount = 0;
+        LastRawDepthDebugAcceptedCount = 0;
+        LastRawDepthDebugDirtyCount = 0;
+        LastRawDepthDebugPendingCount = 0;
+        LastRawDepthDebugStableBandCount = 0;
+        LastRawDepthDebugConflictEdgeCount = 0;
+        LastRawDepthDebugConflictViewCount = 0;
+        LastRawDepthDebugConflictLockedCount = 0;
+        LastRawDepthDebugRejectedCount = 0;
+        LastRawDepthDebugDepthEdgeCount = 0;
+        LastRawDepthDebugRobustCount = 0;
+        LastRawDepthDebugSupportCount = 0;
+        LastRawDepthDebugOutsideCount = 0;
+    }
+
+    private void ClearRawDepthDebugCache()
+    {
+        _rawDepthDebugPoints.Clear();
+        _rawDepthDebugKinds.Clear();
+        _rawDepthDebugReplaceCursor = 0;
+        _acceptedRawDepthDebugCounter = 0;
+        _rawDepthDebugDepthEdgeCounter = 0;
+        _rawDepthDebugRobustCounter = 0;
+        _rawDepthDebugRejectedCounter = 0;
+    }
+
+    private void ResetRawCoverageGridDiagnostics()
+    {
+        _rawCoverageGridCells.Clear();
+        _rawCoverageGridVersion++;
+        _rawCoverageOverlayBuildVersion = -1;
+        LastRawCoverageGridSampleCount = 0;
+        LastRawCoverageGridDroppedSampleCount = 0;
+        LastRawCoverageGridCellCount = 0;
+        LastRawCoverageAcceptedCellCount = 0;
+        LastRawCoverageProblemCellCount = 0;
+        LastRawCoverageMixedCellCount = 0;
+        LastRawCoverageAcceptedComponentCount = 0;
+        LastRawCoverageLargestAcceptedComponentCells = 0;
+        LastRawCoverageProblemComponentCount = 0;
+        LastRawCoverageLargestProblemComponentCells = 0;
+        LastRawCoverageRenderedCellCount = 0;
+    }
+
+    private void RecordRawCoverageGridSample(Vector3 point, RawDepthDebugKind kind, bool accepted)
+    {
+        if (!enableRawCoverageGridDiagnostics || !Finite(point))
+            return;
+
+        LastRawCoverageGridSampleCount++;
+        Vector3Int key = RawCoverageGridKey(point);
+        if (!_rawCoverageGridCells.TryGetValue(key, out RawCoverageGridCell cell))
+        {
+            if (_rawCoverageGridCells.Count >= Mathf.Max(1, maxRawCoverageGridCells))
+            {
+                LastRawCoverageGridDroppedSampleCount++;
+                return;
+            }
+
+            cell = new RawCoverageGridCell
+            {
+                PositionSum = Vector3.zero,
+                AcceptedCount = 0,
+                ProblemCount = 0,
+                WorstKind = kind
+            };
+        }
+
+        cell.PositionSum += point;
+        if (accepted)
+            cell.AcceptedCount++;
+        else
+            cell.ProblemCount++;
+
+        if (RawDepthDebugPriority(kind) > RawDepthDebugPriority(cell.WorstKind))
+            cell.WorstKind = kind;
+
+        _rawCoverageGridCells[key] = cell;
+        _rawCoverageGridVersion++;
+        _rawCoverageOverlayBuildVersion = -1;
+    }
+
+    private Vector3Int RawCoverageGridKey(Vector3 point)
+    {
+        float cellSize = Mathf.Max(0.03f, rawCoverageGridCellSizeMeters);
+        return new Vector3Int(
+            Mathf.FloorToInt(point.x / cellSize),
+            Mathf.FloorToInt(point.y / cellSize),
+            Mathf.FloorToInt(point.z / cellSize));
+    }
+
+    private void FinalizeRawCoverageGridDiagnostics()
+    {
+        if (!enableRawCoverageGridDiagnostics)
+            return;
+
+        LastRawCoverageGridCellCount = _rawCoverageGridCells.Count;
+        HashSet<Vector3Int> acceptedCells = new HashSet<Vector3Int>();
+        HashSet<Vector3Int> problemCells = new HashSet<Vector3Int>();
+        LastRawCoverageAcceptedCellCount = 0;
+        LastRawCoverageProblemCellCount = 0;
+        LastRawCoverageMixedCellCount = 0;
+
+        foreach (KeyValuePair<Vector3Int, RawCoverageGridCell> pair in _rawCoverageGridCells)
+        {
+            bool hasAccepted = pair.Value.AcceptedCount > 0;
+            bool hasProblem = pair.Value.ProblemCount > 0;
+            if (hasAccepted)
+            {
+                acceptedCells.Add(pair.Key);
+                LastRawCoverageAcceptedCellCount++;
+            }
+            if (hasProblem)
+            {
+                problemCells.Add(pair.Key);
+                LastRawCoverageProblemCellCount++;
+            }
+            if (hasAccepted && hasProblem)
+                LastRawCoverageMixedCellCount++;
+        }
+
+        LastRawCoverageAcceptedComponentCount = CountRawCoverageComponents(acceptedCells, out int largestAccepted);
+        LastRawCoverageLargestAcceptedComponentCells = largestAccepted;
+        LastRawCoverageProblemComponentCount = CountRawCoverageComponents(problemCells, out int largestProblem);
+        LastRawCoverageLargestProblemComponentCells = largestProblem;
+    }
+
+    private int CountRawCoverageComponents(HashSet<Vector3Int> cells, out int largest)
+    {
+        largest = 0;
+        if (cells == null || cells.Count <= 0)
+            return 0;
+
+        int components = 0;
+        HashSet<Vector3Int> visited = new HashSet<Vector3Int>();
+        Queue<Vector3Int> queue = new Queue<Vector3Int>();
+        Vector3Int[] offsets =
+        {
+            new Vector3Int(1, 0, 0), new Vector3Int(-1, 0, 0),
+            new Vector3Int(0, 1, 0), new Vector3Int(0, -1, 0),
+            new Vector3Int(0, 0, 1), new Vector3Int(0, 0, -1)
+        };
+
+        foreach (Vector3Int seed in cells)
+        {
+            if (visited.Contains(seed))
+                continue;
+
+            components++;
+            int size = 0;
+            visited.Add(seed);
+            queue.Enqueue(seed);
+            while (queue.Count > 0)
+            {
+                Vector3Int current = queue.Dequeue();
+                size++;
+                for (int i = 0; i < offsets.Length; i++)
+                {
+                    Vector3Int next = current + offsets[i];
+                    if (!cells.Contains(next) || visited.Contains(next))
+                        continue;
+                    visited.Add(next);
+                    queue.Enqueue(next);
+                }
+            }
+
+            if (size > largest)
+                largest = size;
+        }
+
+        return components;
+    }
+
+    private void BuildRawCoverageGridDebugCache()
+    {
+        if (!enableRawCoverageGridDiagnostics || !showRawCoverageGridOverlay)
+            return;
+        if (_rawCoverageOverlayBuildVersion == _rawCoverageGridVersion)
+            return;
+
+        ClearRawDepthDebugCache();
+        int limit = Mathf.Max(1, maxRawDepthDebugSamples);
+        int acceptedStride = Mathf.Max(1, rawCoverageAcceptedDisplayStride);
+        int acceptedCounter = 0;
+        foreach (KeyValuePair<Vector3Int, RawCoverageGridCell> pair in _rawCoverageGridCells)
+        {
+            RawCoverageGridCell cell = pair.Value;
+            bool hasAccepted = cell.AcceptedCount > 0;
+            bool hasProblem = cell.ProblemCount > 0;
+            RawDepthDebugKind kind = hasProblem ? cell.WorstKind : RawDepthDebugKind.Accepted;
+            if (hasAccepted && !hasProblem)
+            {
+                acceptedCounter++;
+                if (acceptedCounter % acceptedStride != 0)
+                    continue;
+            }
+
+            int total = Mathf.Max(1, cell.AcceptedCount + cell.ProblemCount);
+            _rawDepthDebugPoints.Add(cell.PositionSum / total);
+            _rawDepthDebugKinds.Add(kind);
+            if (_rawDepthDebugPoints.Count >= limit)
+                break;
+        }
+
+        LastRawCoverageRenderedCellCount = _rawDepthDebugPoints.Count;
+        _rawCoverageOverlayBuildVersion = _rawCoverageGridVersion;
+    }
+
+    private void CacheRawDepthDebugSample(Vector3 point, RawDepthDebugKind kind)
+    {
+        if (!showRawDepthDebugView || !Finite(point))
+            return;
+        const int classifierRevision = 6;
+        if (_rawDepthDebugClassifierRevision != classifierRevision)
+        {
+            ClearRawDepthDebugCache();
+            _rawDepthDebugClassifierRevision = classifierRevision;
+        }
+        if (restrictRawDepthDebugToNearTsdfSurface && !RawDepthDebugPointTouchesNearTsdfSurface(point))
+            return;
+        if (kind == RawDepthDebugKind.Accepted)
+        {
+            if (!showAcceptedRawDepthDebugSamples)
+                return;
+            _acceptedRawDepthDebugCounter++;
+            if (_acceptedRawDepthDebugCounter % Mathf.Max(1, acceptedRawDepthDebugSampleStride) != 0)
+                return;
+        }
+        else if (kind == RawDepthDebugKind.DepthEdge)
+        {
+            _rawDepthDebugDepthEdgeCounter++;
+            if (_rawDepthDebugDepthEdgeCounter % Mathf.Max(1, rawDepthDebugDepthEdgeSampleStride) != 0)
+                return;
+        }
+        else if (kind == RawDepthDebugKind.Robust)
+        {
+            _rawDepthDebugRobustCounter++;
+            if (_rawDepthDebugRobustCounter % Mathf.Max(1, rawDepthDebugRobustSampleStride) != 0)
+                return;
+        }
+        else if (kind == RawDepthDebugKind.Rejected)
+        {
+            _rawDepthDebugRejectedCounter++;
+            if (_rawDepthDebugRejectedCounter % Mathf.Max(1, rawDepthDebugRejectedSampleStride) != 0)
+                return;
+        }
+
+        int limit = Mathf.Max(1, maxRawDepthDebugSamples);
+        if (_rawDepthDebugPoints.Count < limit)
+        {
+            _rawDepthDebugPoints.Add(point);
+            _rawDepthDebugKinds.Add(kind);
+            return;
+        }
+
+        int index = FindRawDepthDebugReplacementIndex(kind, limit);
+        _rawDepthDebugPoints[index] = point;
+        _rawDepthDebugKinds[index] = kind;
+        _rawDepthDebugReplaceCursor = (index + 1) % limit;
+    }
+
+    private int FindRawDepthDebugReplacementIndex(RawDepthDebugKind incomingKind, int limit)
+    {
+        limit = Mathf.Max(1, Mathf.Min(limit, _rawDepthDebugKinds.Count));
+        int incomingPriority = RawDepthDebugPriority(incomingKind);
+        int start = Mathf.Abs(_rawDepthDebugReplaceCursor) % limit;
+        int best = start;
+        int bestPriority = int.MaxValue;
+        for (int i = 0; i < limit; i++)
+        {
+            int index = (start + i) % limit;
+            int priority = RawDepthDebugPriority(_rawDepthDebugKinds[index]);
+            if (priority < incomingPriority)
+                return index;
+            if (priority < bestPriority)
+            {
+                best = index;
+                bestPriority = priority;
+            }
+        }
+
+        return bestPriority <= incomingPriority ? best : start;
+    }
+
+    private static int RawDepthDebugPriority(RawDepthDebugKind kind)
+    {
+        switch (kind)
+        {
+            case RawDepthDebugKind.Dirty:
+                return 6;
+            case RawDepthDebugKind.ConflictLocked:
+            case RawDepthDebugKind.ConflictView:
+            case RawDepthDebugKind.ConflictEdge:
+                return 6;
+            case RawDepthDebugKind.Pending:
+                return 5;
+            case RawDepthDebugKind.StableBand:
+                return 2;
+            case RawDepthDebugKind.Support:
+                return 4;
+            case RawDepthDebugKind.Outside:
+                return 3;
+            case RawDepthDebugKind.Robust:
+                return 2;
+            case RawDepthDebugKind.DepthEdge:
+                return 1;
+            case RawDepthDebugKind.Rejected:
+            case RawDepthDebugKind.Accepted:
+            default:
+                return 0;
+        }
+    }
+
+    private bool RawDepthDebugPointTouchesNearTsdfSurface(Vector3 point)
+    {
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(point, out int x, out int y, out int z))
+            return false;
+
+        int radius = Mathf.Clamp(rawDepthDebugDirtyRadiusVoxels, 0, 2);
+        float maxAbsTsdf = Mathf.Clamp(rawDepthDebugNearSurfaceAbsTsdf, 0.01f, 0.8f);
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int vz = z + dz;
+            if (vz < 0 || vz >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int vy = y + dy;
+                if (vy < 0 || vy >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int vx = x + dx;
+                    if (vx < 0 || vx >= _dimX)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (_weights[index] < minSurfaceCornerWeight)
+                        continue;
+                    if (Mathf.Abs(_tsdf[index]) <= maxAbsTsdf)
+                        return true;
+                    if (VoxelHasPendingTsdfCorrection(index) || VoxelIsDirtyQuarantined(index))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryGetRawDepthDebugDirtyKind(Vector3 point, out RawDepthDebugKind kind)
+    {
+        kind = RawDepthDebugKind.Rejected;
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(point, out int x, out int y, out int z))
+            return false;
+
+        int radius = Mathf.Clamp(rawDepthDebugNearSurfaceRadiusVoxels, 0, 3);
+        bool pending = false;
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int vz = z + dz;
+            if (vz < 0 || vz >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int vy = y + dy;
+                if (vy < 0 || vy >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int vx = x + dx;
+                    if (vx < 0 || vx >= _dimX)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (VoxelIsDirtyQuarantined(index))
+                    {
+                        kind = RawDepthDebugKind.Dirty;
+                        return true;
+                    }
+                    if (VoxelHasPendingTsdfCorrection(index))
+                        pending = true;
+                }
+            }
+        }
+
+        if (pending)
+        {
+            kind = RawDepthDebugKind.Pending;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void AddRawDepthDebugSample(
+        List<Vector3> vertices,
+        List<int> triangles,
+        List<Color> colors,
+        Vector3 point,
+        Vector3 cameraPosition,
+        RawDepthDebugKind kind)
+    {
+        if ((!showRawDepthDebugView && !showRawCoverageGridOverlay) || vertices == null || triangles == null || colors == null)
+            return;
+        if (LastRawDepthDebugRenderedCount >= Mathf.Max(1, maxRawDepthDebugSamples))
+            return;
+        if (!Finite(point))
+            return;
+
+        Color color = RawDepthDebugColor(kind);
+        color.a = Mathf.Clamp01(rawDepthDebugAlpha);
+
+        Vector3 view = point - cameraPosition;
+        if (!Finite(view) || view.sqrMagnitude < 0.0001f)
+            view = Vector3.forward;
+        view.Normalize();
+
+        Vector3 tangent = Vector3.Cross(Vector3.up, view);
+        if (tangent.sqrMagnitude < 0.0001f)
+            tangent = Vector3.Cross(Vector3.right, view);
+        tangent.Normalize();
+        Vector3 bitangent = Vector3.Cross(view, tangent).normalized;
+
+        float half = Mathf.Max(0.001f, rawDepthDebugSampleSizeMeters) * 0.5f;
+        int baseIndex = vertices.Count;
+        vertices.Add(point - tangent * half - bitangent * half);
+        vertices.Add(point + tangent * half - bitangent * half);
+        vertices.Add(point + tangent * half + bitangent * half);
+        vertices.Add(point - tangent * half + bitangent * half);
+        AddVertexColors(colors, color, 4);
+
+        triangles.Add(baseIndex);
+        triangles.Add(baseIndex + 1);
+        triangles.Add(baseIndex + 2);
+        triangles.Add(baseIndex);
+        triangles.Add(baseIndex + 2);
+        triangles.Add(baseIndex + 3);
+
+        LastRawDepthDebugRenderedCount++;
+        switch (kind)
+        {
+            case RawDepthDebugKind.Accepted:
+                LastRawDepthDebugAcceptedCount++;
+                break;
+            case RawDepthDebugKind.Dirty:
+                LastRawDepthDebugDirtyCount++;
+                break;
+            case RawDepthDebugKind.Pending:
+                LastRawDepthDebugPendingCount++;
+                break;
+            case RawDepthDebugKind.StableBand:
+                LastRawDepthDebugStableBandCount++;
+                break;
+            case RawDepthDebugKind.ConflictEdge:
+                LastRawDepthDebugConflictEdgeCount++;
+                break;
+            case RawDepthDebugKind.ConflictView:
+                LastRawDepthDebugConflictViewCount++;
+                break;
+            case RawDepthDebugKind.ConflictLocked:
+                LastRawDepthDebugConflictLockedCount++;
+                break;
+            case RawDepthDebugKind.DepthEdge:
+                LastRawDepthDebugDepthEdgeCount++;
+                break;
+            case RawDepthDebugKind.Robust:
+                LastRawDepthDebugRobustCount++;
+                break;
+            case RawDepthDebugKind.Support:
+                LastRawDepthDebugSupportCount++;
+                break;
+            case RawDepthDebugKind.Outside:
+                LastRawDepthDebugOutsideCount++;
+                break;
+            case RawDepthDebugKind.Rejected:
+            default:
+                LastRawDepthDebugRejectedCount++;
+                break;
+        }
+    }
+
+    private void AddRawDepthDebugCubeSample(
+        List<Vector3> vertices,
+        List<int> triangles,
+        List<Color> colors,
+        Vector3 point,
+        RawDepthDebugKind kind)
+    {
+        if ((!showRawDepthDebugView && !showRawCoverageGridOverlay) || vertices == null || triangles == null || colors == null)
+            return;
+        if (LastRawDepthDebugRenderedCount >= Mathf.Max(1, maxRawDepthDebugSamples))
+            return;
+        if (!Finite(point))
+            return;
+
+        Color color = RawDepthDebugColor(kind);
+        color.a = Mathf.Clamp01(rawDepthDebugAlpha);
+
+        float half = Mathf.Max(0.001f, rawDepthDebugSampleSizeMeters) * 0.5f;
+        int baseIndex = vertices.Count;
+        vertices.Add(point + new Vector3(-half, -half, -half));
+        vertices.Add(point + new Vector3( half, -half, -half));
+        vertices.Add(point + new Vector3( half,  half, -half));
+        vertices.Add(point + new Vector3(-half,  half, -half));
+        vertices.Add(point + new Vector3(-half, -half,  half));
+        vertices.Add(point + new Vector3( half, -half,  half));
+        vertices.Add(point + new Vector3( half,  half,  half));
+        vertices.Add(point + new Vector3(-half,  half,  half));
+        AddVertexColors(colors, color, 8);
+
+        AddCubeFace(triangles, baseIndex, 0, 2, 1, 3);
+        AddCubeFace(triangles, baseIndex, 4, 5, 6, 7);
+        AddCubeFace(triangles, baseIndex, 0, 1, 5, 4);
+        AddCubeFace(triangles, baseIndex, 2, 3, 7, 6);
+        AddCubeFace(triangles, baseIndex, 1, 2, 6, 5);
+        AddCubeFace(triangles, baseIndex, 3, 0, 4, 7);
+
+        LastRawDepthDebugRenderedCount++;
+        switch (kind)
+        {
+            case RawDepthDebugKind.Accepted:
+                LastRawDepthDebugAcceptedCount++;
+                break;
+            case RawDepthDebugKind.Dirty:
+                LastRawDepthDebugDirtyCount++;
+                break;
+            case RawDepthDebugKind.Pending:
+                LastRawDepthDebugPendingCount++;
+                break;
+            case RawDepthDebugKind.StableBand:
+                LastRawDepthDebugStableBandCount++;
+                break;
+            case RawDepthDebugKind.ConflictEdge:
+                LastRawDepthDebugConflictEdgeCount++;
+                break;
+            case RawDepthDebugKind.ConflictView:
+                LastRawDepthDebugConflictViewCount++;
+                break;
+            case RawDepthDebugKind.ConflictLocked:
+                LastRawDepthDebugConflictLockedCount++;
+                break;
+            case RawDepthDebugKind.DepthEdge:
+                LastRawDepthDebugDepthEdgeCount++;
+                break;
+            case RawDepthDebugKind.Robust:
+                LastRawDepthDebugRobustCount++;
+                break;
+            case RawDepthDebugKind.Support:
+                LastRawDepthDebugSupportCount++;
+                break;
+            case RawDepthDebugKind.Outside:
+                LastRawDepthDebugOutsideCount++;
+                break;
+            case RawDepthDebugKind.Rejected:
+            default:
+                LastRawDepthDebugRejectedCount++;
+                break;
+        }
+    }
+
+    private static void AddCubeFace(List<int> triangles, int baseIndex, int a, int b, int c, int d)
+    {
+        triangles.Add(baseIndex + a);
+        triangles.Add(baseIndex + b);
+        triangles.Add(baseIndex + c);
+        triangles.Add(baseIndex + a);
+        triangles.Add(baseIndex + c);
+        triangles.Add(baseIndex + d);
+    }
+
+    private Color RawDepthDebugColor(RawDepthDebugKind kind)
+    {
+        switch (kind)
+        {
+            case RawDepthDebugKind.Accepted:
+                return rawDepthDebugAcceptedColor;
+            case RawDepthDebugKind.Dirty:
+                return rawDepthDebugDirtyColor;
+            case RawDepthDebugKind.Pending:
+                return rawDepthDebugPendingColor;
+            case RawDepthDebugKind.StableBand:
+                return rawDepthDebugStableBandColor;
+            case RawDepthDebugKind.ConflictEdge:
+                return rawDepthDebugConflictEdgeColor;
+            case RawDepthDebugKind.ConflictView:
+                return rawDepthDebugConflictViewColor;
+            case RawDepthDebugKind.ConflictLocked:
+                return rawDepthDebugConflictLockedColor;
+            case RawDepthDebugKind.DepthEdge:
+                return rawDepthDebugDepthEdgeColor;
+            case RawDepthDebugKind.Robust:
+                return rawDepthDebugRobustColor;
+            case RawDepthDebugKind.Support:
+                return rawDepthDebugSupportColor;
+            case RawDepthDebugKind.Outside:
+                return rawDepthDebugOutsideColor;
+            case RawDepthDebugKind.Rejected:
+            default:
+                return rawDepthDebugRejectedColor;
+        }
+    }
+
+    private void RebuildRawDepthDebugMesh()
+    {
+        const int classifierRevision = 6;
+        bool coverageOverlay = enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay;
+        if (coverageOverlay)
+        {
+            BuildRawCoverageGridDebugCache();
+        }
+        else if (_rawDepthDebugClassifierRevision != classifierRevision)
+        {
+            ClearRawDepthDebugCache();
+            _rawDepthDebugClassifierRevision = classifierRevision;
+        }
+
+        if (!showRawDepthDebugView && !coverageOverlay)
+        {
+            if (_rawDepthDebugObject != null)
+                _rawDepthDebugObject.SetActive(false);
+            ResetRawDepthDebugCounters();
+            return;
+        }
+
+        EnsureRawDepthDebugObjects();
+        if (_rawDepthDebugMesh == null)
+            return;
+
+        _rawDepthDebugMesh.Clear();
+        ResetRawDepthDebugCounters();
+        if (_rawDepthDebugPoints.Count <= 0 || _rawDepthDebugKinds.Count <= 0)
+        {
+            _rawDepthDebugObject.SetActive(false);
+            return;
+        }
+
+        int count = Mathf.Min(_rawDepthDebugPoints.Count, _rawDepthDebugKinds.Count, Mathf.Max(1, maxRawDepthDebugSamples));
+        bool worldCubes = false;
+        List<Vector3> vertices = new List<Vector3>(count * (worldCubes ? 8 : 4));
+        List<int> triangles = new List<int>(count * (worldCubes ? 36 : 6));
+        List<Color> colors = new List<Color>(count * (worldCubes ? 8 : 4));
+        Vector3 cameraPosition = GetCameraPosition();
+        for (int i = 0; i < count; i++)
+        {
+            if (worldCubes)
+                AddRawDepthDebugCubeSample(vertices, triangles, colors, _rawDepthDebugPoints[i], _rawDepthDebugKinds[i]);
+            else
+                AddRawDepthDebugSample(vertices, triangles, colors, _rawDepthDebugPoints[i], cameraPosition, _rawDepthDebugKinds[i]);
+        }
+
+        if (vertices.Count <= 0 || triangles.Count <= 0)
+        {
+            _rawDepthDebugObject.SetActive(false);
+            return;
+        }
+
+        _rawDepthDebugMesh.indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        _rawDepthDebugMesh.SetVertices(vertices);
+        _rawDepthDebugMesh.SetColors(colors);
+        _rawDepthDebugMesh.SetTriangles(triangles, 0, true);
+        _rawDepthDebugMesh.RecalculateBounds();
+        _rawDepthDebugObject.SetActive(true);
     }
 
     private bool TryGetUsableSample(
@@ -1365,27 +5159,649 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return (values[mid - 1] + values[mid]) * 0.5f;
     }
 
+    private bool PassFormalIntegrateGate(int index, float sampleTsdf, int oldWeight, out string reason)
+    {
+        reason = null;
+        if (!gateFormalIntegrateWrites)
+            return true;
+
+        if (_auditVoteState != ObservationVoteState.Accept)
+        {
+            reason = "vote";
+            return false;
+        }
+
+        if (_auditVoteScore < Mathf.Clamp01(minFormalIntegrateVoteScore))
+        {
+            reason = "score";
+            return false;
+        }
+
+        if (_auditSampleSupportRatio < Mathf.Clamp01(minFormalIntegrateSupportRatio))
+        {
+            reason = "support";
+            return false;
+        }
+
+        if (rejectFormalCleanHistoryMismatch &&
+            oldWeight > 0 &&
+            AuditVoteHasTag("clean") &&
+            FormalCleanHasHistoryMismatch())
+        {
+            reason = "clean_history";
+            return false;
+        }
+
+        if (rejectFormalIntegrateWeakHistory && AuditVoteHasExactTag("weak_history"))
+        {
+            reason = "weak_history";
+            return false;
+        }
+
+        if (rejectFormalIntegrateTemporalDepthJump && AuditVoteHasExactTag("temporal_depth_jump"))
+        {
+            reason = "temporal_depth_jump";
+            return false;
+        }
+
+        if (requireHistoryForFormalStrongCurrentClean &&
+            AuditVoteHasExactTag("strong_current_clean") &&
+            !StrongCurrentCleanHasFormalHistory(index, sampleTsdf, oldWeight))
+        {
+            reason = "strong_current_history";
+            return false;
+        }
+
+        if (_auditBandConflictRatio >= 0f &&
+            _auditBandConflictRatio > Mathf.Clamp01(maxFormalIntegrateBandConflictRatio))
+        {
+            reason = "band";
+            return false;
+        }
+
+        if (_auditBandMeanResidual >= 0f &&
+            _auditBandMeanResidual > Mathf.Clamp(maxFormalIntegrateBandMeanResidual, 0f, 2f))
+        {
+            reason = "residual";
+            return false;
+        }
+
+        if (_auditSameFrameDepthDeltaMeters >= 0f &&
+            _auditSameFrameDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateSameFrameDepthDeltaMeters))
+        {
+            reason = "same_frame";
+            return false;
+        }
+
+        if (rejectCrossFrameCleanSurfaceConflict &&
+            _auditCrossFrameCleanDepthDeltaMeters >= 0f &&
+            _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateCrossFrameDepthDeltaMeters))
+        {
+            reason = "cross_frame";
+            return false;
+        }
+
+        if (oldWeight > 0 &&
+            _auditOldTsdfResidual >= 0f &&
+            _auditOldTsdfResidual > Mathf.Clamp01(maxFormalIntegrateOldTsdfResidual))
+        {
+            reason = "old_tsdf";
+            return false;
+        }
+
+        if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+        {
+            reason = "dirty_pending";
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool AuditVoteHasExactTag(string tag)
+    {
+        if (string.IsNullOrEmpty(_auditVoteReasons))
+            return false;
+
+        string[] parts = _auditVoteReasons.Split('|');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (parts[i] == tag)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool StrongCurrentCleanHasFormalHistory(int index, float sampleTsdf, int oldWeight)
+    {
+        int requiredOldWeight = Mathf.Clamp(minFormalStrongCurrentOldWeight, 0, 16);
+        int requiredBandHistory = Mathf.Clamp(minFormalStrongCurrentBandHistory, 0, 16);
+        float requiredAgreement = Mathf.Clamp01(minFormalStrongCurrentHistoryAgreement);
+
+        bool hasFormalHistory =
+            oldWeight >= requiredOldWeight &&
+            (requiredBandHistory <= 0 || _auditBandHistoryCount >= requiredBandHistory) &&
+            (requiredAgreement <= 0f || _auditHistoryAgreement < 0f || _auditHistoryAgreement >= requiredAgreement);
+        if (hasFormalHistory)
+            return true;
+
+        if (!allowLocalSupportForFormalStrongCurrentHistory)
+            return false;
+
+        if (!HasFormalStrongCurrentLocalSupport(index, sampleTsdf, out int localSupport, out int localStable, out int localAxial, out int localResidualRejects))
+        {
+            LastFormalStrongCurrentLocalHistoryBlockLocalCount++;
+            int minSupport = Mathf.Clamp(minFormalStrongCurrentLocalSupportVoxels, 1, 26);
+            int minStable = Mathf.Clamp(minFormalStrongCurrentLocalStableVoxels, 0, 26);
+            int minAxial = Mathf.Clamp(minFormalStrongCurrentLocalAxialVoxels, 0, 6);
+            if (localSupport < minSupport)
+                LastFormalStrongCurrentLocalHistoryBlockSupportCount++;
+            if (localStable < minStable)
+                LastFormalStrongCurrentLocalHistoryBlockStableCount++;
+            if (localAxial < minAxial)
+                LastFormalStrongCurrentLocalHistoryBlockAxialCount++;
+            if (localSupport <= 0 && localResidualRejects > 0)
+                LastFormalStrongCurrentLocalHistoryBlockResidualCount++;
+            return false;
+        }
+
+        if (!HasProvisionalPlaneCompatibility(index, sampleTsdf))
+        {
+            LastFormalStrongCurrentLocalHistoryBlockPlaneCount++;
+            return false;
+        }
+
+        if (WouldStrongCurrentPromotionCreateDoubleLayer(index, sampleTsdf))
+        {
+            LastFormalStrongCurrentLocalHistoryBlockDoubleLayerCount++;
+            return false;
+        }
+
+        LastFormalStrongCurrentLocalHistoryBypassCount++;
+        return true;
+    }
+
+    private bool HasFormalStrongCurrentLocalSupport(int index, float sampleTsdf, out int support, out int stable, out int axial, out int residualRejects)
+    {
+        support = 0;
+        stable = 0;
+        axial = 0;
+        residualRejects = 0;
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return false;
+
+        IndexToVoxel(index, out int x, out int y, out int z);
+        int radius = Mathf.Clamp(provisionalLocalSupportRadiusVoxels, 1, 2);
+        int minSupport = Mathf.Clamp(minFormalStrongCurrentLocalSupportVoxels, 1, 26);
+        int minStable = Mathf.Clamp(minFormalStrongCurrentLocalStableVoxels, 0, 26);
+        int minAxial = Mathf.Clamp(minFormalStrongCurrentLocalAxialVoxels, 0, 6);
+        float maxAbs = Mathf.Clamp(maxProvisionalLocalSupportAbsTsdf, 0.01f, 0.5f);
+        float maxResidual = Mathf.Clamp(maxProvisionalLocalSupportResidual, 0.01f, 1f);
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    int nz = z + dz;
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                        continue;
+
+                    int neighbor = Index(nx, ny, nz);
+                    int weight = _weights[neighbor];
+                    if (weight < minSurfaceCornerWeight ||
+                        VoxelIsDirtyQuarantined(neighbor) ||
+                        VoxelHasPendingTsdfCorrection(neighbor))
+                    {
+                        continue;
+                    }
+
+                    float value = _tsdf[neighbor];
+                    if (float.IsNaN(value) || float.IsInfinity(value))
+                        continue;
+                    if (Mathf.Abs(value) > maxAbs || Mathf.Abs(value - sampleTsdf) > maxResidual)
+                    {
+                        residualRejects++;
+                        continue;
+                    }
+
+                    support++;
+                    if (weight >= stableTsdfBypassWeight)
+                        stable++;
+                    if (Mathf.Abs(dx) + Mathf.Abs(dy) + Mathf.Abs(dz) == 1)
+                        axial++;
+                }
+            }
+        }
+
+        return support >= minSupport && stable >= minStable && axial >= minAxial;
+    }
+
+    private bool TryPromoteStrongCurrentProvisional(int index, float sampleTsdf, float sampleWeight, float oldTsdf, int oldWeight)
+    {
+        if (!promoteStrongCurrentProvisionalToFormal)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("disabled");
+            return false;
+        }
+        if (!AuditVoteHasExactTag("strong_current_clean"))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("tag");
+            return false;
+        }
+        if (_provisionalTsdf == null || _provisionalTsdfLastFrame == null || _provisionalTsdfHits == null)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("storage");
+            return false;
+        }
+        if (index < 0 || index >= _tsdf.Length || index >= _weights.Length || index >= _provisionalTsdf.Length || index >= _provisionalTsdfHits.Length)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("invalid");
+            return false;
+        }
+        if (_provisionalTsdf[index] == 0)
+        {
+            string noProvisionalReason = Mathf.Abs(sampleTsdf) <= Mathf.Clamp01(provisionalTsdfNearSurfaceAbs)
+                ? "no_provisional_near_surface"
+                : "no_provisional_far_band";
+            RecordStrongCurrentProvisionalPromotionBlock(noProvisionalReason);
+            return false;
+        }
+
+        int requiredHits = Mathf.Clamp(minStrongCurrentProvisionalHits, 1, 8);
+        int hits = _provisionalTsdfHits[index];
+        if (hits < requiredHits)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("hits");
+            return false;
+        }
+
+        int requiredWeight = Mathf.Clamp(minStrongCurrentProvisionalWeight, 1, 8);
+        if (oldWeight < requiredWeight)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("weight");
+            return false;
+        }
+
+        int requiredBandHistory = Mathf.Clamp(minStrongCurrentProvisionalBandHistory, 0, 16);
+        if (requiredBandHistory > 0 && _auditBandHistoryCount < requiredBandHistory)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("band_history");
+            return false;
+        }
+
+        float requiredAgreement = Mathf.Clamp01(minStrongCurrentProvisionalHistoryAgreement);
+        if (requiredAgreement > 0f && _auditHistoryAgreement >= 0f && _auditHistoryAgreement < requiredAgreement)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("agreement");
+            return false;
+        }
+
+        if (FormalCleanHasHistoryMismatch())
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("clean_history");
+            return false;
+        }
+
+        if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("dirty_pending");
+            return false;
+        }
+
+        if (_auditSameFrameDepthDeltaMeters >= 0f &&
+            _auditSameFrameDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateSameFrameDepthDeltaMeters))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("same_frame");
+            return false;
+        }
+
+        if (rejectCrossFrameCleanSurfaceConflict &&
+            _auditCrossFrameCleanDepthDeltaMeters >= 0f &&
+            _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateCrossFrameDepthDeltaMeters))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("cross_frame");
+            return false;
+        }
+
+        if (oldWeight > 0 &&
+            Mathf.Sign(oldTsdf) != Mathf.Sign(sampleTsdf) &&
+            Mathf.Abs(oldTsdf - sampleTsdf) >= tsdfConflictThreshold)
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("conflict");
+            return false;
+        }
+
+        if (!HasProvisionalPlaneCompatibility(index, sampleTsdf))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("plane");
+            return false;
+        }
+
+        if (!HasStrongCurrentPromotionLocalSupport(index, sampleTsdf))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("local");
+            return false;
+        }
+
+        if (WouldStrongCurrentPromotionCreateDoubleLayer(index, sampleTsdf))
+        {
+            RecordStrongCurrentProvisionalPromotionBlock("double_layer");
+            return false;
+        }
+
+        float promoteWeight = Mathf.Clamp(strongCurrentProvisionalPromoteWeight, 0.05f, 1f);
+        promoteWeight = Mathf.Max(promoteWeight, Mathf.Clamp01(sampleWeight));
+        int cappedWeight = Mathf.Min(maxFusionWeight, oldWeight + Mathf.Max(1, Mathf.RoundToInt(promoteWeight)));
+        float denominator = Mathf.Max(0.0001f, oldWeight + promoteWeight);
+        _tsdf[index] = Mathf.Clamp((oldTsdf * oldWeight + sampleTsdf * promoteWeight) / denominator, -1f, 1f);
+        _weights[index] = (byte)cappedWeight;
+        RecordContributionLedger(index, "strong_current_promote", oldTsdf, oldWeight, sampleTsdf, promoteWeight, _tsdf[index], _weights[index]);
+        LastStrongCurrentProvisionalPromotedCount++;
+        LastFormalIntegrateWriteCount++;
+        LastUpdatedVoxelCount++;
+        return true;
+    }
+
+    private bool IsProvisionalSurfaceCandidate(float sampleTsdf)
+    {
+        return Mathf.Abs(sampleTsdf) <= Mathf.Clamp01(provisionalTsdfNearSurfaceAbs);
+    }
+
+    private bool IsProvisionalTracked(int index)
+    {
+        return _provisionalTsdf != null &&
+               index >= 0 &&
+               index < _provisionalTsdf.Length &&
+               _provisionalTsdf[index] != 0;
+    }
+
+    private void RecordProvisionalFarBandSkip(float sampleTsdf)
+    {
+        LastProvisionalTsdfFarBandSkippedCount++;
+        RecordStrongSampleSeedTemporaryBlock("near_surface");
+    }
+
+    private bool CanBootstrapNearSurfaceProvisional(float sampleTsdf)
+    {
+        if (!allowNearSurfaceProvisionalBootstrap)
+            return false;
+        if (Mathf.Abs(sampleTsdf) > Mathf.Clamp01(maxNearSurfaceProvisionalBootstrapAbsTsdf))
+            return false;
+        if (_auditVoteState != ObservationVoteState.Accept && !AuditVoteHasExactTag("strong_current_clean"))
+            return false;
+        if (_auditVoteScore < Mathf.Clamp01(minNearSurfaceProvisionalBootstrapVoteScore))
+            return false;
+        if (_auditSampleSupportRatio < Mathf.Clamp01(minNearSurfaceProvisionalBootstrapSupportRatio))
+            return false;
+        if (_auditBandConflictRatio >= 0f && _auditBandConflictRatio > Mathf.Clamp01(maxProvisionalBandConflictRatio))
+            return false;
+        return true;
+    }
+
+    private bool AuditVoteHasTag(string tag)
+    {
+        if (string.IsNullOrEmpty(_auditVoteReasons))
+            return false;
+
+        string[] parts = _auditVoteReasons.Split('|');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string part = parts[i];
+            if (part == tag || part == "strong_current_" + tag)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool FormalCleanHasHistoryMismatch()
+    {
+        if (_auditOldTsdfResidual >= 0f &&
+            _auditOldTsdfResidual > Mathf.Clamp01(maxFormalCleanHistoryOldTsdfResidual))
+            return true;
+
+        if (_auditBandMeanResidual >= 0f &&
+            _auditBandMeanResidual > Mathf.Clamp(maxFormalCleanHistoryBandMeanResidual, 0f, 2f))
+            return true;
+
+        if (_auditBandConflictRatio >= 0f &&
+            _auditBandConflictRatio > Mathf.Clamp01(maxFormalCleanHistoryBandConflictRatio))
+            return true;
+
+        return false;
+    }
+
+    private void RecordFormalIntegrateBlock(string reason)
+    {
+        LastFormalIntegrateBlockedCount++;
+        switch (reason)
+        {
+            case "vote":
+                LastFormalIntegrateBlockVoteCount++;
+                break;
+            case "score":
+                LastFormalIntegrateBlockScoreCount++;
+                break;
+            case "support":
+                LastFormalIntegrateBlockSupportCount++;
+                break;
+            case "band":
+                LastFormalIntegrateBlockBandCount++;
+                break;
+            case "residual":
+                LastFormalIntegrateBlockResidualCount++;
+                break;
+            case "clean_history":
+                LastFormalIntegrateBlockCleanHistoryCount++;
+                break;
+            case "weak_history":
+                LastFormalIntegrateBlockWeakHistoryCount++;
+                break;
+            case "temporal_depth_jump":
+                LastFormalIntegrateBlockTemporalDepthJumpCount++;
+                break;
+            case "strong_current_history":
+                LastFormalIntegrateBlockStrongCurrentHistoryCount++;
+                break;
+            case "same_frame":
+                LastFormalIntegrateBlockSameFrameCount++;
+                break;
+            case "cross_frame":
+                LastFormalIntegrateBlockCrossFrameCount++;
+                break;
+            case "old_tsdf":
+                LastFormalIntegrateBlockOldTsdfCount++;
+                break;
+            case "dirty_pending":
+                LastFormalIntegrateBlockDirtyPendingCount++;
+                break;
+        }
+    }
+
+    private void RecordStrongCurrentProvisionalPromotionBlock(string reason)
+    {
+        LastStrongCurrentProvisionalPromotionBlockedCount++;
+        switch (reason)
+        {
+            case "disabled":
+                LastStrongCurrentProvisionalBlockDisabledCount++;
+                break;
+            case "tag":
+                LastStrongCurrentProvisionalBlockTagCount++;
+                break;
+            case "storage":
+                LastStrongCurrentProvisionalBlockStorageCount++;
+                break;
+            case "invalid":
+                LastStrongCurrentProvisionalBlockInvalidCount++;
+                break;
+            case "no_provisional":
+                LastStrongCurrentProvisionalBlockNoProvisionalCount++;
+                break;
+            case "no_provisional_near_surface":
+                LastStrongCurrentProvisionalBlockNoProvisionalCount++;
+                LastStrongCurrentProvisionalBlockNoProvisionalNearSurfaceCount++;
+                break;
+            case "no_provisional_far_band":
+                LastStrongCurrentProvisionalBlockNoProvisionalCount++;
+                LastStrongCurrentProvisionalBlockNoProvisionalFarBandCount++;
+                break;
+            case "hits":
+                LastStrongCurrentProvisionalBlockHitsCount++;
+                break;
+            case "weight":
+                LastStrongCurrentProvisionalBlockWeightCount++;
+                break;
+            case "band_history":
+                LastStrongCurrentProvisionalBlockBandHistoryCount++;
+                break;
+            case "agreement":
+                LastStrongCurrentProvisionalBlockAgreementCount++;
+                break;
+            case "clean_history":
+                LastStrongCurrentProvisionalBlockCleanHistoryCount++;
+                break;
+            case "dirty_pending":
+                LastStrongCurrentProvisionalBlockDirtyPendingCount++;
+                break;
+            case "same_frame":
+                LastStrongCurrentProvisionalBlockSameFrameCount++;
+                break;
+            case "cross_frame":
+                LastStrongCurrentProvisionalBlockCrossFrameCount++;
+                break;
+            case "conflict":
+                LastStrongCurrentProvisionalBlockConflictCount++;
+                break;
+            case "local":
+                LastStrongCurrentProvisionalBlockLocalCount++;
+                break;
+            case "plane":
+                LastStrongCurrentProvisionalBlockPlaneCount++;
+                break;
+            case "double_layer":
+                LastStrongCurrentPromotionDoubleLayerBlockCount++;
+                break;
+        }
+    }
+
     private void IntegrateVoxel(int x, int y, int z, float sampleTsdf, float sampleWeight)
     {
         int index = Index(x, y, z);
         int oldWeight = _weights[index];
         float oldTsdf = _tsdf[index];
+        bool auditCenter = SelectConfidenceAuditCenter(index, sampleTsdf, oldTsdf, oldWeight);
         if (rejectConflictingTsdfWrites &&
             oldWeight >= minConflictVoxelWeight &&
             Mathf.Sign(oldTsdf) != Mathf.Sign(sampleTsdf) &&
             Mathf.Abs(oldTsdf - sampleTsdf) >= tsdfConflictThreshold)
         {
+            if (auditCenter)
+                RecordVoxelAuditConflict(index, oldWeight, oldTsdf, sampleTsdf);
+            int replacedBefore = LastReplacedDirtyTsdfCount;
+            int correctedBefore = LastCorrectedTsdfCount;
             if (TryCorrectConflictingTsdf(index, sampleTsdf, oldWeight, oldTsdf))
+            {
+                if (LastReplacedDirtyTsdfCount > replacedBefore)
+                {
+                    RecordVoxelAuditReplace(index, auditCenter);
+                    RecordConfidenceAuditVoxelOutcome(index, auditCenter, "replaced");
+                }
+                else if (LastCorrectedTsdfCount > correctedBefore)
+                    RecordConfidenceAuditVoxelOutcome(index, auditCenter, "corrected");
+                else
+                    RecordConfidenceAuditVoxelOutcome(index, auditCenter, "pending_correction");
                 return;
+            }
 
+            RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.RejectedConflict, oldWeight, oldTsdf, sampleTsdf);
+            LastDirtyTsdfRejectedConflictCount++;
             LastRejectedTsdfConflictCount++;
+            RecordConfidenceAuditVoxelOutcome(index, auditCenter, "rejected_conflict");
+            return;
+        }
+
+        if (_auditStrongSampleSeedWrite && lockStrongSampleSeedToTemporaryTsdf)
+        {
+            if (TryWriteProvisionalTsdfSupport(index, sampleTsdf, sampleWeight, oldTsdf, oldWeight))
+            {
+                RecordConfidenceAuditVoxelOutcome(index, auditCenter, "strong_sample_seed");
+                return;
+            }
+
+            LastStrongSampleSeedTemporaryBlockedCount++;
+            RecordConfidenceAuditVoxelOutcome(index, auditCenter, "strong_sample_seed_blocked");
             return;
         }
 
         if (!PassMultiFrameTsdfStability(index, sampleTsdf, oldWeight))
+        {
+            if (TryMetabolizeOldCleanTsdf(index, sampleTsdf, oldTsdf, oldWeight))
+            {
+                RecordConfidenceAuditVoxelOutcome(index, auditCenter, "old_clean_metabolism");
+                return;
+            }
+
+            if (IsProvisionalSurfaceCandidate(sampleTsdf) &&
+                TryWriteProvisionalTsdfSupport(index, sampleTsdf, sampleWeight, oldTsdf, oldWeight))
+            {
+                RecordConfidenceAuditVoxelOutcome(index, auditCenter, "provisional_support");
+                return;
+            }
+
+            if (IsProvisionalSurfaceCandidate(sampleTsdf))
+            {
+                LastProvisionalTsdfSupportBlockedCount++;
+                LastProvisionalTsdfPendingStabilityBlockedCount++;
+            }
+            else
+            {
+                RecordProvisionalFarBandSkip(sampleTsdf);
+            }
+            RecordConfidenceAuditVoxelOutcome(index, auditCenter, "pending_stability");
             return;
+        }
         if (requireMultiFrameStableTsdf && oldWeight <= 0)
             sampleWeight = Mathf.Max(sampleWeight, minStableTsdfFrames * Mathf.Clamp01(sampleWeight));
+
+        if (!PassFormalIntegrateGate(index, sampleTsdf, oldWeight, out string formalBlockReason))
+        {
+            RecordFormalIntegrateBlock(formalBlockReason);
+            if (formalBlockReason == "strong_current_history" &&
+                TryPromoteStrongCurrentProvisional(index, sampleTsdf, sampleWeight, oldTsdf, oldWeight))
+            {
+                RecordConfidenceAuditVoxelOutcome(index, auditCenter, "strong_current_promoted");
+                return;
+            }
+
+            if (downgradeBlockedFormalIntegrateToProvisional &&
+                IsProvisionalSurfaceCandidate(sampleTsdf) &&
+                TryWriteProvisionalTsdfSupport(index, sampleTsdf, sampleWeight, oldTsdf, oldWeight))
+            {
+                LastFormalIntegrateProvisionalCount++;
+                RecordConfidenceAuditVoxelOutcome(index, auditCenter, "formal_provisional");
+                return;
+            }
+
+            if (downgradeBlockedFormalIntegrateToProvisional && IsProvisionalSurfaceCandidate(sampleTsdf))
+            {
+                LastProvisionalTsdfSupportBlockedCount++;
+                LastProvisionalTsdfFormalDowngradeBlockedCount++;
+            }
+            else if (downgradeBlockedFormalIntegrateToProvisional)
+            {
+                RecordProvisionalFarBandSkip(sampleTsdf);
+            }
+            RecordConfidenceAuditVoxelOutcome(index, auditCenter, "formal_blocked");
+            return;
+        }
 
         int cappedWeight = Mathf.Min(maxFusionWeight, oldWeight + Mathf.Max(1, Mathf.RoundToInt(sampleWeight)));
         float weightedOld = oldTsdf * oldWeight;
@@ -1393,7 +5809,942 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float denominator = Mathf.Max(0.0001f, oldWeight + sampleWeight);
         _tsdf[index] = Mathf.Clamp(weightedOld + weightedNew, -maxFusionWeight, maxFusionWeight) / Mathf.Min(denominator, maxFusionWeight);
         _weights[index] = (byte)cappedWeight;
+        RecordContributionLedger(index, "integrate", oldTsdf, oldWeight, sampleTsdf, sampleWeight, _tsdf[index], _weights[index]);
+        LastFormalIntegrateWriteCount++;
         LastUpdatedVoxelCount++;
+        RecordConfidenceAuditVoxelOutcome(index, auditCenter, "written");
+    }
+
+    private bool TryMetabolizeOldCleanTsdf(int index, float sampleTsdf, float oldTsdf, int oldWeight)
+    {
+        if (!enableOldCleanTsdfMetabolism)
+            return false;
+        if (_oldCleanConflictHits == null || _oldCleanConflictLastFrame == null)
+            return false;
+        if (index < 0 || index >= _tsdf.Length || index >= _weights.Length || index >= _oldCleanConflictHits.Length)
+            return false;
+
+        bool rawCrossFrameCleanConflict =
+            rejectCrossFrameCleanSurfaceConflict &&
+            _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.01f, crossFrameCleanConflictDepthMeters);
+        float voxelResidual = Mathf.Abs(oldTsdf - sampleTsdf);
+        bool crossFrameCleanConflict =
+            rawCrossFrameCleanConflict &&
+            voxelResidual >= Mathf.Clamp01(minOldCleanMetabolismCrossFrameVoxelResidual);
+        bool oldTsdfResidualConflict =
+            oldWeight > 0 &&
+            voxelResidual >= Mathf.Clamp01(minOldCleanMetabolismResidual);
+        bool rawLockedBandConflict =
+            _auditBandHighWeightConflictCount > 0 &&
+            (_auditBandHighWeightConflictRatio < 0f ||
+             _auditBandHighWeightConflictRatio >= Mathf.Clamp01(maxOldCleanMetabolismBandConflictRatio));
+        bool lockedBandConflict =
+            rawLockedBandConflict &&
+            voxelResidual >= Mathf.Clamp01(minOldCleanMetabolismBandVoxelResidual);
+        if (!crossFrameCleanConflict && !oldTsdfResidualConflict && rawLockedBandConflict && !lockedBandConflict)
+        {
+            LastOldCleanMetabolismSkippedWeakBandCount++;
+            return false;
+        }
+        if (!crossFrameCleanConflict && !oldTsdfResidualConflict && rawCrossFrameCleanConflict)
+        {
+            LastOldCleanMetabolismSkippedWeakCrossFrameCount++;
+            return false;
+        }
+        if (!crossFrameCleanConflict && !oldTsdfResidualConflict && !lockedBandConflict)
+            return false;
+
+        LastOldCleanMetabolismCandidateCount++;
+
+        if (_auditSampleSupportRatio < Mathf.Clamp01(minOldCleanMetabolismSupportRatio))
+        {
+            LastOldCleanMetabolismBlockedCount++;
+            LastOldCleanMetabolismBlockedSupportCount++;
+            return false;
+        }
+
+        if (_auditSameFrameDepthDeltaMeters >= 0f &&
+            _auditSameFrameDepthDeltaMeters > Mathf.Max(0.001f, maxOldCleanMetabolismSameFrameDeltaMeters))
+        {
+            LastOldCleanMetabolismBlockedCount++;
+            LastOldCleanMetabolismBlockedSameFrameCount++;
+            return false;
+        }
+
+        if (oldWeight <= 0 || oldWeight > Mathf.Clamp(maxOldCleanMetabolismWeight, 1, maxFusionWeight))
+        {
+            LastOldCleanMetabolismBlockedCount++;
+            LastOldCleanMetabolismBlockedWeightCount++;
+            return false;
+        }
+
+        if (voxelResidual < Mathf.Clamp01(minOldCleanMetabolismResidual))
+        {
+            LastOldCleanMetabolismBlockedCount++;
+            LastOldCleanMetabolismBlockedResidualCount++;
+            return false;
+        }
+
+        if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+        {
+            LastOldCleanMetabolismBlockedCount++;
+            LastOldCleanMetabolismBlockedDirtyPendingCount++;
+            return false;
+        }
+
+        int frameIndex = LastRawFrameIndex;
+        if (_oldCleanConflictLastFrame[index] != frameIndex)
+        {
+            _oldCleanConflictHits[index] = (byte)Mathf.Min(255, _oldCleanConflictHits[index] + 1);
+            _oldCleanConflictLastFrame[index] = frameIndex;
+        }
+
+        LastOldCleanMetabolismWatchCount++;
+        if (_oldCleanConflictHits[index] < Mathf.Max(1, minOldCleanMetabolismConflictHits))
+        {
+            LastOldCleanMetabolismWaitingHitsCount++;
+            return false;
+        }
+
+        int currentWeight = _weights[index];
+        float currentTsdf = _tsdf[index];
+        int newWeight = Mathf.Max(0, currentWeight - Mathf.Max(1, oldCleanMetabolismDecayWeight));
+        if (newWeight <= Mathf.Max(0, oldCleanMetabolismClearWeight))
+        {
+            _tsdf[index] = 1f;
+            _weights[index] = 0;
+            _oldCleanConflictHits[index] = 0;
+            _oldCleanConflictLastFrame[index] = int.MinValue;
+            RecordContributionLedger(index, "old_clean_clear", currentTsdf, currentWeight, sampleTsdf, 0f, _tsdf[index], _weights[index]);
+            LastOldCleanMetabolismClearCount++;
+        }
+        else
+        {
+            _weights[index] = (byte)newWeight;
+            RecordContributionLedger(index, "old_clean_decay", currentTsdf, currentWeight, sampleTsdf, 0f, _tsdf[index], _weights[index]);
+            LastOldCleanMetabolismDecayCount++;
+        }
+
+        LastUpdatedVoxelCount++;
+        return true;
+    }
+
+    private int TryMetabolizeOldCleanTsdfBand(Vector3 cameraPosition, Vector3 surfacePoint, float sampleWeight, int halfBandSteps)
+    {
+        if (!enableOldCleanTsdfMetabolism)
+            return 0;
+
+        Vector3 toSurface = surfacePoint - cameraPosition;
+        float surfaceDepth = toSurface.magnitude;
+        if (!Finite(toSurface) || surfaceDepth <= 0.0001f)
+            return 0;
+
+        Vector3 rayDirection = toSurface / surfaceDepth;
+        float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+        float startDepth = Mathf.Max(0.01f, surfaceDepth - Mathf.Max(1, halfBandSteps) * voxel);
+        float endDepth = surfaceDepth + Mathf.Max(1, halfBandSteps) * voxel;
+        int changed = 0;
+        for (float voxelDepth = startDepth; voxelDepth <= endDepth + voxel * 0.25f; voxelDepth += voxel)
+        {
+            Vector3 voxelWorld = cameraPosition + rayDirection * voxelDepth;
+            if (!TryWorldToVoxel(voxelWorld, out int vx, out int vy, out int vz))
+                continue;
+
+            int index = Index(vx, vy, vz);
+            float signedDistance = surfaceDepth - voxelDepth;
+            float sampleTsdf = Mathf.Clamp(signedDistance / truncationMeters, -1f, 1f);
+            if (TryMetabolizeOldCleanTsdf(index, sampleTsdf, _tsdf[index], _weights[index]))
+                changed++;
+        }
+
+        return changed;
+    }
+
+    private bool TryWriteProvisionalTsdfSupport(int index, float sampleTsdf, float sampleWeight, float oldTsdf, int oldWeight)
+    {
+        if (!allowProvisionalTsdfSupportWrites)
+        {
+            RecordProvisionalTsdfBlock("disabled");
+            RecordStrongSampleSeedTemporaryBlock("disabled");
+            return false;
+        }
+        if (index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+        {
+            RecordProvisionalTsdfBlock("invalid");
+            RecordStrongSampleSeedTemporaryBlock("invalid");
+            return false;
+        }
+        if (Mathf.Abs(sampleTsdf) > Mathf.Clamp01(provisionalTsdfNearSurfaceAbs))
+        {
+            RecordProvisionalTsdfBlock(sampleTsdf >= 0f ? "near_surface_positive" : "near_surface_negative");
+            RecordStrongSampleSeedTemporaryBlock("near_surface");
+            return false;
+        }
+        if (_auditVoteState == ObservationVoteState.Reject || _auditVoteEnforced)
+        {
+            RecordProvisionalTsdfBlock("vote");
+            RecordStrongSampleSeedTemporaryBlock("vote");
+            return false;
+        }
+        if (!_auditStrongSampleSeedWrite &&
+            _auditVoteState != ObservationVoteState.Accept &&
+            _auditVoteScore < Mathf.Clamp01(minProvisionalVoteScore))
+        {
+            RecordProvisionalTsdfBlock("score");
+            RecordStrongSampleSeedTemporaryBlock("score");
+            return false;
+        }
+        if (_auditSampleSupportRatio < Mathf.Clamp01(minProvisionalSupportRatio))
+        {
+            RecordProvisionalTsdfBlock("support");
+            RecordStrongSampleSeedTemporaryBlock("support");
+            return false;
+        }
+        if (_auditBandConflictRatio >= 0f && _auditBandConflictRatio > Mathf.Clamp01(maxProvisionalBandConflictRatio))
+        {
+            RecordProvisionalTsdfBlock("band");
+            RecordStrongSampleSeedTemporaryBlock("band");
+            return false;
+        }
+        if (rejectProvisionalCleanHistoryMismatch &&
+            AuditVoteHasTag("clean") &&
+            FormalCleanHasHistoryMismatch())
+        {
+            RecordProvisionalTsdfBlock("clean_history");
+            RecordStrongSampleSeedTemporaryBlock("clean_history");
+            return false;
+        }
+        if (_auditSameFrameDepthDeltaMeters >= 0f &&
+            _auditSameFrameDepthDeltaMeters >= Mathf.Max(0.001f, maxProvisionalSameFrameDepthDeltaMeters))
+        {
+            RecordProvisionalTsdfBlock("same_frame");
+            RecordStrongSampleSeedTemporaryBlock("same_frame");
+            return false;
+        }
+        if (rejectCrossFrameCleanSurfaceConflict &&
+            _auditCrossFrameCleanDepthDeltaMeters >= 0f &&
+            _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.001f, crossFrameCleanConflictDepthMeters))
+        {
+            RecordProvisionalTsdfBlock("cross_frame");
+            RecordStrongSampleSeedTemporaryBlock("cross_frame");
+            return false;
+        }
+        if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+        {
+            RecordProvisionalTsdfBlock("dirty_pending");
+            RecordStrongSampleSeedTemporaryBlock("dirty_pending");
+            return false;
+        }
+        bool alreadyProvisional = IsProvisionalTracked(index);
+        if (oldWeight > Mathf.Max(0, maxProvisionalExistingWeight) && !alreadyProvisional)
+        {
+            RecordProvisionalTsdfBlock("old_weight");
+            RecordStrongSampleSeedTemporaryBlock("old_weight");
+            return false;
+        }
+        if (oldWeight > Mathf.Max(0, maxProvisionalExistingWeight))
+            LastProvisionalTsdfExistingWeightBypassCount++;
+        if (oldWeight > 0 &&
+            Mathf.Sign(oldTsdf) != Mathf.Sign(sampleTsdf) &&
+            Mathf.Abs(oldTsdf - sampleTsdf) >= tsdfConflictThreshold)
+        {
+            RecordProvisionalTsdfBlock("conflict");
+            RecordStrongSampleSeedTemporaryBlock("conflict");
+            return false;
+        }
+        if (!alreadyProvisional && !HasProvisionalPlaneCompatibility(index, sampleTsdf))
+        {
+            RecordProvisionalTsdfBlock("plane");
+            RecordStrongSampleSeedTemporaryBlock("plane");
+            return false;
+        }
+        if (!_auditStrongSampleSeedWrite && !HasProvisionalLocalSupport(index, sampleTsdf))
+        {
+            if (!alreadyProvisional && !CanBootstrapNearSurfaceProvisional(sampleTsdf))
+            {
+                RecordProvisionalTsdfBlock("local");
+                RecordStrongSampleSeedTemporaryBlock("local");
+                return false;
+            }
+            LastProvisionalTsdfBootstrapLocalBypassCount++;
+        }
+
+        int maxTemporaryWeight = Mathf.Max(1, Mathf.Min(maxFusionWeight, stableTsdfBypassWeight - 1));
+        int targetWeight = Mathf.Clamp(
+            Mathf.Max(oldWeight, Mathf.Clamp(provisionalTsdfSupportWeight, 1, 2)),
+            1,
+            maxTemporaryWeight);
+        float provisionalWeight = Mathf.Clamp(
+            sampleWeight * Mathf.Clamp(provisionalTsdfSupportBlend, 0.05f, 0.6f),
+            0.05f,
+            targetWeight);
+
+        float newTsdf;
+        if (oldWeight <= 0)
+        {
+            newTsdf = sampleTsdf;
+        }
+        else
+        {
+            float denominator = Mathf.Max(0.0001f, oldWeight + provisionalWeight);
+            newTsdf = (oldTsdf * oldWeight + sampleTsdf * provisionalWeight) / denominator;
+        }
+
+        _tsdf[index] = Mathf.Clamp(newTsdf, -1f, 1f);
+        _weights[index] = (byte)targetWeight;
+        RecordContributionLedger(index, _auditStrongSampleSeedWrite ? "strong_sample_seed" : "provisional_support", oldTsdf, oldWeight, sampleTsdf, provisionalWeight, _tsdf[index], _weights[index]);
+        LastUpdatedVoxelCount++;
+        LastProvisionalTsdfSupportWriteCount++;
+        return true;
+    }
+
+    private void RecordStrongSampleSeedTemporaryBlock(string reason)
+    {
+        if (!_auditStrongSampleSeedWrite)
+            return;
+
+        switch (reason)
+        {
+            case "near_surface":
+                LastStrongSampleSeedTempNearSurfaceBlockCount++;
+                break;
+            case "vote":
+                LastStrongSampleSeedTempVoteBlockCount++;
+                break;
+            case "score":
+                LastStrongSampleSeedTempScoreBlockCount++;
+                break;
+            case "support":
+                LastStrongSampleSeedTempSupportBlockCount++;
+                break;
+            case "band":
+                LastStrongSampleSeedTempBandBlockCount++;
+                break;
+            case "same_frame":
+                LastStrongSampleSeedTempSameFrameBlockCount++;
+                break;
+            case "cross_frame":
+                LastStrongSampleSeedTempCrossFrameBlockCount++;
+                break;
+            case "dirty_pending":
+                LastStrongSampleSeedTempDirtyPendingBlockCount++;
+                break;
+            case "old_weight":
+                LastStrongSampleSeedTempOldWeightBlockCount++;
+                break;
+            case "conflict":
+                LastStrongSampleSeedTempConflictBlockCount++;
+                break;
+            case "local":
+                LastStrongSampleSeedTempLocalBlockCount++;
+                break;
+        }
+    }
+
+    private bool HasProvisionalLocalSupport(int index, float sampleTsdf)
+    {
+        if (!requireProvisionalLocalSupport)
+            return true;
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return false;
+
+        IndexToVoxel(index, out int x, out int y, out int z);
+        int radius = Mathf.Clamp(provisionalLocalSupportRadiusVoxels, 1, 2);
+        int minSupport = Mathf.Clamp(minProvisionalLocalSupportVoxels, 1, 26);
+        int minStable = Mathf.Clamp(minProvisionalLocalStableVoxels, 0, 26);
+        int minAxial = Mathf.Clamp(minProvisionalLocalAxialVoxels, 0, 6);
+        float maxAbs = Mathf.Clamp(maxProvisionalLocalSupportAbsTsdf, 0.01f, 0.5f);
+        float maxResidual = Mathf.Clamp(maxProvisionalLocalSupportResidual, 0.01f, 1f);
+        int support = 0;
+        int stable = 0;
+        int axial = 0;
+
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    int nz = z + dz;
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                        continue;
+
+                    int neighbor = Index(nx, ny, nz);
+                    int weight = _weights[neighbor];
+                    if (weight < minSurfaceCornerWeight ||
+                        VoxelIsDirtyQuarantined(neighbor) ||
+                        VoxelHasPendingTsdfCorrection(neighbor))
+                    {
+                        continue;
+                    }
+
+                    float value = _tsdf[neighbor];
+                    if (float.IsNaN(value) ||
+                        float.IsInfinity(value) ||
+                        Mathf.Abs(value) > maxAbs ||
+                        Mathf.Abs(value - sampleTsdf) > maxResidual)
+                    {
+                        continue;
+                    }
+
+                    support++;
+                    if (weight >= stableTsdfBypassWeight)
+                        stable++;
+                    if (Mathf.Abs(dx) + Mathf.Abs(dy) + Mathf.Abs(dz) == 1)
+                        axial++;
+                }
+            }
+        }
+
+        LastProvisionalLocalSupportNeighborCount += support;
+        LastProvisionalLocalSupportStableNeighborCount += stable;
+        LastProvisionalLocalSupportAxialNeighborCount += axial;
+
+        if (support < minSupport || stable < minStable || axial < minAxial)
+            return false;
+
+        LastProvisionalLocalSupportPassCount++;
+        return true;
+    }
+
+    private bool HasStrongCurrentPromotionLocalSupport(int index, float sampleTsdf)
+    {
+        if (!allowProvisionalNeighborPromotionSupport)
+            return HasProvisionalLocalSupport(index, sampleTsdf);
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return false;
+
+        IndexToVoxel(index, out int x, out int y, out int z);
+        int radius = Mathf.Clamp(provisionalLocalSupportRadiusVoxels, 1, 2);
+        int minSupport = Mathf.Clamp(minStrongCurrentPromotionLocalSupportVoxels, 1, 26);
+        int minStable = Mathf.Clamp(minStrongCurrentPromotionStableVoxels, 0, 26);
+        int minAxial = Mathf.Clamp(minStrongCurrentPromotionAxialVoxels, 0, 6);
+        float maxAbs = Mathf.Clamp(maxProvisionalLocalSupportAbsTsdf, 0.01f, 0.5f);
+        float maxResidual = Mathf.Clamp(maxProvisionalLocalSupportResidual, 0.01f, 1f);
+        int support = 0;
+        int provisionalSupport = 0;
+        int stable = 0;
+        int axial = 0;
+
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    int nz = z + dz;
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                        continue;
+
+                    int neighbor = Index(nx, ny, nz);
+                    int weight = _weights[neighbor];
+                    bool provisional = IsProvisionalTracked(neighbor);
+                    if ((!provisional && weight < minSurfaceCornerWeight) ||
+                        VoxelIsDirtyQuarantined(neighbor) ||
+                        VoxelHasPendingTsdfCorrection(neighbor))
+                    {
+                        continue;
+                    }
+
+                    float value = _tsdf[neighbor];
+                    if (float.IsNaN(value) ||
+                        float.IsInfinity(value) ||
+                        Mathf.Abs(value) > maxAbs ||
+                        Mathf.Abs(value - sampleTsdf) > maxResidual)
+                    {
+                        continue;
+                    }
+
+                    support++;
+                    if (provisional)
+                        provisionalSupport++;
+                    if (weight >= stableTsdfBypassWeight)
+                        stable++;
+                    if (Mathf.Abs(dx) + Mathf.Abs(dy) + Mathf.Abs(dz) == 1)
+                        axial++;
+                }
+            }
+        }
+
+        LastStrongCurrentPromotionLocalNeighborCount += support;
+        LastStrongCurrentPromotionLocalProvisionalNeighborCount += provisionalSupport;
+        LastStrongCurrentPromotionLocalStableNeighborCount += stable;
+        LastStrongCurrentPromotionLocalAxialNeighborCount += axial;
+
+        if (support < minSupport || stable < minStable || axial < minAxial)
+        {
+            LastStrongCurrentPromotionLocalBlockCount++;
+            return false;
+        }
+
+        LastStrongCurrentPromotionLocalPassCount++;
+        return true;
+    }
+
+    private bool WouldStrongCurrentPromotionCreateDoubleLayer(int index, float sampleTsdf)
+    {
+        if (!rejectStrongCurrentPromotionDoubleLayer)
+            return false;
+        if (_tsdf == null || _weights == null || _voxelWriteProvenance == null ||
+            index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+        {
+            return false;
+        }
+
+        Vector3 sampleNormal = _auditSampleNormal;
+        if (!Finite(sampleNormal) || sampleNormal.sqrMagnitude < 0.0001f)
+            return false;
+        sampleNormal.Normalize();
+
+        Vector3 sampleSurface = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenterFromIndex(index);
+        if (!Finite(sampleSurface))
+            return false;
+
+        IndexToVoxel(index, out int cx, out int cy, out int cz);
+        int radius = Mathf.Clamp(strongCurrentPromotionDoubleLayerSearchRadiusVoxels, 1, 4);
+        float minNormalDot = Mathf.Cos(Mathf.Clamp(doubleLayerMaxSourceNormalAngleDegrees, 1f, 60f) * Mathf.Deg2Rad);
+        float minPlaneSeparation = Mathf.Max(0.01f, doubleLayerMinSourcePlaneSeparationMeters);
+        float maxPlaneSeparation = Mathf.Max(
+            minPlaneSeparation,
+            Mathf.Max(
+                maxStrongCurrentPromotionDoubleLayerSeparationMeters,
+                Mathf.Max(voxelSizeMeters * pureGeometryMaxLayerSeparationVoxelScale, minPlaneSeparation * 1.75f)));
+        float maxLateral = Mathf.Max(voxelSizeMeters * 0.25f, voxelSizeMeters * doubleLayerMaxSourceLateralVoxelScale);
+        float maxAbs = Mathf.Clamp(maxStrongCurrentPromotionDoubleLayerNeighborAbsTsdf, 0.05f, 0.75f);
+
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int nx = cx + dx;
+                    int ny = cy + dy;
+                    int nz = cz + dz;
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                        continue;
+
+                    int neighbor = Index(nx, ny, nz);
+                    int weight = _weights[neighbor];
+                    bool dirtyOrPending = VoxelIsDirtyQuarantined(neighbor) || VoxelHasPendingTsdfCorrection(neighbor);
+                    if (weight <= 0)
+                    {
+                        continue;
+                    }
+
+                    float neighborTsdf = _tsdf[neighbor];
+                    if (float.IsNaN(neighborTsdf) ||
+                        float.IsInfinity(neighborTsdf) ||
+                        Mathf.Abs(neighborTsdf) > maxAbs)
+                    {
+                        continue;
+                    }
+
+                    if (!dirtyOrPending && weight < minSurfaceCornerWeight)
+                        continue;
+
+                    if (!_voxelWriteProvenance.TryGetValue(neighbor, out VoxelWriteProvenance provenance))
+                        continue;
+                    if (!Finite(provenance.SurfacePoint) ||
+                        !Finite(provenance.SurfaceNormal) ||
+                        provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+                    {
+                        continue;
+                    }
+
+                    LastStrongCurrentPromotionDoubleLayerCandidateCount++;
+                    if (dirtyOrPending)
+                        LastStrongCurrentPromotionDoubleLayerDirtyNeighborCount++;
+
+                    Vector3 neighborNormal = provenance.SurfaceNormal.normalized;
+                    float normalDot = Vector3.Dot(sampleNormal, neighborNormal);
+                    if (Mathf.Abs(normalDot) < minNormalDot)
+                    {
+                        LastStrongCurrentPromotionDoubleLayerNormalRejectCount++;
+                        continue;
+                    }
+                    if (normalDot < 0f)
+                        neighborNormal = -neighborNormal;
+
+                    Vector3 layerNormal = sampleNormal + neighborNormal;
+                    if (layerNormal.sqrMagnitude < 0.0001f)
+                    {
+                        LastStrongCurrentPromotionDoubleLayerNormalRejectCount++;
+                        continue;
+                    }
+                    layerNormal.Normalize();
+
+                    Vector3 delta = sampleSurface - provenance.SurfacePoint;
+                    float planeSeparation = Mathf.Abs(Vector3.Dot(delta, layerNormal));
+                    if (planeSeparation < minPlaneSeparation || planeSeparation > maxPlaneSeparation)
+                    {
+                        LastStrongCurrentPromotionDoubleLayerPlaneRejectCount++;
+                        continue;
+                    }
+
+                    float lateralSq = Mathf.Max(0f, delta.sqrMagnitude - planeSeparation * planeSeparation);
+                    if (lateralSq > maxLateral * maxLateral)
+                    {
+                        LastStrongCurrentPromotionDoubleLayerLateralRejectCount++;
+                        continue;
+                    }
+
+                    CountStrongCurrentPromotionDoubleLayerBlockSource(provenance, dirtyOrPending);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void CountStrongCurrentPromotionDoubleLayerBlockSource(VoxelWriteProvenance provenance, bool dirtyOrPending)
+    {
+        if (dirtyOrPending)
+        {
+            LastStrongCurrentPromotionDoubleLayerReplaceBlockCount++;
+            return;
+        }
+
+        switch (provenance.LastOperation)
+        {
+            case "integrate":
+                LastStrongCurrentPromotionDoubleLayerIntegrateBlockCount++;
+                break;
+            case "replace":
+            case "guarded_replace":
+            case "band_repair":
+            case "conflict_correct":
+            case "cleanup_neighbor":
+                LastStrongCurrentPromotionDoubleLayerReplaceBlockCount++;
+                break;
+            default:
+                LastStrongCurrentPromotionDoubleLayerOtherBlockCount++;
+                break;
+        }
+    }
+
+    private bool HasProvisionalPlaneCompatibility(int index, float sampleTsdf)
+    {
+        if (!requireProvisionalPlaneCompatibility)
+            return true;
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return false;
+
+        Vector3 sampleNormal = _auditSampleNormal;
+        if (!Finite(sampleNormal) || sampleNormal.sqrMagnitude < 0.0001f)
+        {
+            LastProvisionalPlaneCompatibilityNoReferenceCount++;
+            return true;
+        }
+
+        sampleNormal.Normalize();
+        Vector3 sampleSurface = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenterFromIndex(index);
+        if (!Finite(sampleSurface))
+        {
+            LastProvisionalPlaneCompatibilityNoReferenceCount++;
+            return true;
+        }
+
+        IndexToVoxel(index, out int x, out int y, out int z);
+        int radius = Mathf.Clamp(provisionalPlaneCompatibilityRadiusVoxels, 1, 2);
+        int minCompatible = Mathf.Clamp(minProvisionalPlaneCompatibleNeighbors, 1, 8);
+        float minNormalDot = Mathf.Clamp(minProvisionalPlaneNormalDot, 0.5f, 1f);
+        float maxPlaneDistance = Mathf.Max(0.005f, maxProvisionalPlaneDistanceVoxelScale * Mathf.Max(0.0001f, voxelSizeMeters));
+        float maxAbs = Mathf.Clamp(maxProvisionalPlaneNeighborAbsTsdf, 0.01f, 0.5f);
+        int candidates = 0;
+        int compatible = 0;
+
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    int nz = z + dz;
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                        continue;
+
+                    int neighbor = Index(nx, ny, nz);
+                    bool trackedProvisional = IsProvisionalTracked(neighbor);
+                    int weight = _weights[neighbor];
+                    if (!trackedProvisional && weight < minSurfaceCornerWeight)
+                        continue;
+                    if (VoxelIsDirtyQuarantined(neighbor) || VoxelHasPendingTsdfCorrection(neighbor))
+                        continue;
+
+                    float neighborTsdf = _tsdf[neighbor];
+                    if (float.IsNaN(neighborTsdf) ||
+                        float.IsInfinity(neighborTsdf) ||
+                        Mathf.Abs(neighborTsdf) > maxAbs ||
+                        Mathf.Abs(neighborTsdf - sampleTsdf) > maxProvisionalLocalSupportResidual)
+                    {
+                        continue;
+                    }
+
+                    if (!_voxelWriteProvenance.TryGetValue(neighbor, out VoxelWriteProvenance provenance))
+                        continue;
+                    if (!Finite(provenance.SurfacePoint) ||
+                        !Finite(provenance.SurfaceNormal) ||
+                        provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+                    {
+                        continue;
+                    }
+
+                    candidates++;
+                    Vector3 neighborNormal = provenance.SurfaceNormal.normalized;
+                    float normalDot = Mathf.Abs(Vector3.Dot(sampleNormal, neighborNormal));
+                    if (normalDot < minNormalDot)
+                    {
+                        LastProvisionalPlaneCompatibilityNormalRejectedCount++;
+                        continue;
+                    }
+
+                    float planeDistance = Mathf.Abs(Vector3.Dot(sampleSurface - provenance.SurfacePoint, sampleNormal));
+                    if (planeDistance > maxPlaneDistance)
+                    {
+                        LastProvisionalPlaneCompatibilityDistanceRejectedCount++;
+                        continue;
+                    }
+
+                    compatible++;
+                    if (compatible >= minCompatible)
+                    {
+                        LastProvisionalPlaneCompatibilityCandidateCount += candidates;
+                        LastProvisionalPlaneCompatibilityPassCount++;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        LastProvisionalPlaneCompatibilityCandidateCount += candidates;
+        if (candidates <= 0)
+        {
+            LastProvisionalPlaneCompatibilityNoReferenceCount++;
+            return true;
+        }
+
+        LastProvisionalPlaneCompatibilityBlockedCount++;
+        return false;
+    }
+
+    private void RetireExpiredProvisionalTsdf()
+    {
+        if (!retireUnconfirmedProvisionalTsdf || _provisionalTsdf == null || _provisionalTsdfLastFrame == null || _tsdf == null || _weights == null)
+            return;
+
+        int maxAge = Mathf.Max(1, provisionalTsdfMaxAgeFrames);
+        int maxWeight = Mathf.Clamp(provisionalTsdfSupportWeight, 1, 2);
+        int count = Mathf.Min(_provisionalTsdf.Length, Mathf.Min(_tsdf.Length, _weights.Length));
+        for (int index = 0; index < count; index++)
+        {
+            if (_provisionalTsdf[index] == 0)
+                continue;
+
+            bool dirtyOrPending = VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index);
+            int age = LastRawFrameIndex - _provisionalTsdfLastFrame[index];
+            if (!dirtyOrPending && age >= 0 && age < maxAge)
+                continue;
+
+            int oldWeight = _weights[index];
+            if (!dirtyOrPending && oldWeight > maxWeight)
+            {
+                _provisionalTsdf[index] = 0;
+                _provisionalTsdfLastFrame[index] = int.MinValue;
+                LastProvisionalTsdfConfirmedCount++;
+                LastProvisionalTsdfConfirmedByWeightCount++;
+                continue;
+            }
+
+            float oldTsdf = _tsdf[index];
+            _tsdf[index] = 1f;
+            _weights[index] = 0;
+            string operation = dirtyOrPending ? "provisional_dirty_clear" : "provisional_retire";
+            if (dirtyOrPending)
+                LastProvisionalTsdfDirtyClearedCount++;
+            else
+            {
+                LastProvisionalTsdfRetiredCount++;
+                LastProvisionalTsdfRetiredExpiredCount++;
+            }
+
+            if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+                _provisionalTsdfHits[index] = 0;
+
+            RecordContributionLedger(index, operation, oldTsdf, oldWeight, 1f, 0f, _tsdf[index], _weights[index]);
+        }
+    }
+
+    private bool SelectConfidenceAuditCenter(int index, float sampleTsdf, float oldTsdf, int oldWeight)
+    {
+        if (!_auditSampleActive)
+            return false;
+        float absSample = Mathf.Abs(sampleTsdf);
+        if (absSample > _auditCenterAbsSampleTsdf)
+            return false;
+
+        _auditCenterAbsSampleTsdf = absSample;
+        _auditCenterSampleTsdf = sampleTsdf;
+        _auditCenterOldTsdf = oldTsdf;
+        _auditCenterOldWeight = oldWeight;
+        _auditCenterStableHitsBefore = ReadAuditHit(_pendingTsdfHits, index);
+        _auditCenterStableHitsAfter = _auditCenterStableHitsBefore;
+        _auditCenterCorrectionHitsBefore = ReadAuditHit(_correctionTsdfHits, index);
+        _auditCenterCorrectionHitsAfter = _auditCenterCorrectionHitsBefore;
+        _auditCenterSignFlip = oldWeight > 0 && Mathf.Sign(oldTsdf) != Mathf.Sign(sampleTsdf);
+        _auditCenterResidual = oldWeight > 0 ? Mathf.Abs(oldTsdf - sampleTsdf) : 0f;
+        _auditCenterOutcome = "none";
+        return true;
+    }
+
+    private void RecordConfidenceAuditVoxelOutcome(int index, bool auditCenter, string outcome)
+    {
+        if (!_auditSampleActive)
+            return;
+
+        switch (outcome)
+        {
+            case "written":
+            case "provisional_support":
+                _auditBandWritten++;
+                break;
+            case "pending_stability":
+                _auditBandPendingStable++;
+                break;
+            case "pending_correction":
+                _auditBandPendingCorrection++;
+                break;
+            case "replaced":
+                _auditBandReplaced++;
+                break;
+            case "corrected":
+                _auditBandCorrected++;
+                break;
+            case "rejected_conflict":
+                _auditBandRejectedConflict++;
+                break;
+        }
+
+        if (!auditCenter)
+            return;
+        _auditCenterStableHitsAfter = ReadAuditHit(_pendingTsdfHits, index);
+        _auditCenterCorrectionHitsAfter = ReadAuditHit(_correctionTsdfHits, index);
+        _auditCenterOutcome = outcome;
+    }
+
+    private static int ReadAuditHit(byte[] hits, int index)
+    {
+        return hits != null && index >= 0 && index < hits.Length ? hits[index] : 0;
+    }
+
+    private void RecordVoxelAuditConflict(int index, int oldWeight, float oldTsdf, float sampleTsdf)
+    {
+        if (!_voxelAuditLifecycle.TryGetValue(index, out VoxelAuditLifecycle life))
+        {
+            life.FirstConflictFrame = LastRawFrameIndex;
+            life.LastReplaceFrame = int.MinValue;
+        }
+        if (life.LastReplaceFrame != int.MinValue && LastRawFrameIndex > life.LastReplaceFrame)
+            life.ConflictAfterReplaceCount++;
+        life.LastConflictFrame = LastRawFrameIndex;
+        life.ConflictCount++;
+        life.LastOldWeight = oldWeight;
+        life.LastOldTsdf = oldTsdf;
+        life.LastSampleTsdf = sampleTsdf;
+        life.LastResidual = Mathf.Abs(oldTsdf - sampleTsdf);
+        life.LastCause = AuditCenterConflictCause();
+        life.LastCorrectionHits = _auditCenterCorrectionHitsAfter;
+        life.LastBandConflictRatio = _auditBandConflictRatio;
+        life.LastBandHighWeightConflictRatio = _auditBandHighWeightConflictRatio;
+        life.LastHistoryAgreement = _auditHistoryAgreement;
+        life.LastHistoricalSurfaceDistanceMeters = _auditHistoricalSurfaceDistanceMeters;
+        if (_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance prior))
+        {
+            Vector3 currentCamera = _activeTsdfSourceValid ? _activeTsdfSourceCamera : GetCameraPosition();
+            Vector3 currentSurface = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenterFromIndex(index);
+            life.PriorWriteKnown = true;
+            life.PriorWriteFrame = prior.Frame;
+            life.PriorWriteFrameGap = LastRawFrameIndex - prior.Frame;
+            life.PriorCameraTravelMeters = Vector3.Distance(prior.CameraPosition, currentCamera);
+            life.PriorSurfaceShiftMeters = Vector3.Distance(prior.SurfacePoint, currentSurface);
+            Quaternion currentRotation = Camera.main != null ? Camera.main.transform.rotation : Quaternion.identity;
+            Vector3 currentRay = (currentSurface - currentCamera).normalized;
+            life.PriorCameraRotationDeltaDegrees = Quaternion.Angle(prior.CameraRotation, currentRotation);
+            life.PriorRayAngleDeltaDegrees = prior.RayDirection.sqrMagnitude > 0.0001f && currentRay.sqrMagnitude > 0.0001f
+                ? Vector3.Angle(prior.RayDirection, currentRay)
+                : 0f;
+            life.PriorDepthDeltaMeters = Mathf.Abs(prior.SurfaceDepth - Vector3.Distance(currentCamera, currentSurface));
+            life.PriorNormalAngleDeltaDegrees = prior.SurfaceNormal.sqrMagnitude > 0.0001f && _auditSampleNormal.sqrMagnitude > 0.0001f
+                ? Vector3.Angle(prior.SurfaceNormal, _auditSampleNormal)
+                : 0f;
+        }
+        life.LastLockSubtype = AuditOldWeightLockSubtype(life);
+        _voxelAuditLifecycle[index] = life;
+        _captureAuditVoxels.Add(index);
+    }
+
+    private string AuditOldWeightLockSubtype(VoxelAuditLifecycle life)
+    {
+        if (life.LastCause != "old_weight_locked")
+            return "none";
+
+        if (life.ConflictAfterReplaceCount > 0 || life.ReplaceCount > 0)
+            return "replace_recurrent";
+
+        if (life.LastOldWeight > Mathf.Max(1, maxCorrectableTsdfWeight))
+            return "above_correctable_weight";
+
+        if (life.LastBandConflictRatio >= 0.20f || life.LastBandHighWeightConflictRatio >= 0.10f)
+            return "band_conflict";
+
+        if (life.PriorWriteKnown && life.PriorSurfaceShiftMeters >= 0.08f)
+        {
+            if (life.PriorCameraTravelMeters < 0.08f && life.PriorCameraRotationDeltaDegrees < 3f)
+                return "depth_unstable";
+            if (life.PriorRayAngleDeltaDegrees >= 25f ||
+                life.PriorCameraTravelMeters >= 0.15f ||
+                life.PriorNormalAngleDeltaDegrees >= 35f)
+                return "view_changed";
+        }
+
+        if (life.LastCorrectionHits > 0 && life.LastCorrectionHits < Mathf.Max(1, minDirtyTsdfReplaceFrames))
+            return "under_supported_pending";
+
+        return "stable_old_surface";
+    }
+
+    private void RecordVoxelAuditReplace(int index, bool auditCenter)
+    {
+        if (!auditCenter || !_voxelAuditLifecycle.TryGetValue(index, out VoxelAuditLifecycle life))
+            return;
+        life.ReplaceCount++;
+        life.LastReplaceFrame = LastRawFrameIndex;
+        _voxelAuditLifecycle[index] = life;
+    }
+
+    private Vector3 VoxelCenterFromIndex(int index)
+    {
+        IndexToVoxel(index, out int x, out int y, out int z);
+        return VoxelCenter(x, y, z);
     }
 
     private bool TryCorrectConflictingTsdf(int index, float sampleTsdf, int oldWeight, float oldTsdf)
@@ -1411,7 +6762,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _correctionTsdf[index] = sampleTsdf;
             _correctionTsdfHits[index] = 1;
             _correctionTsdfLastFrame[index] = frameIndex;
+            RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.PendingConflict, oldWeight, oldTsdf, sampleTsdf);
+            LastDirtyTsdfPendingNewCount++;
             LastPendingTsdfCorrectionCount++;
+            TryRepairDirtyTsdfConflictBand();
             return true;
         }
 
@@ -1428,7 +6782,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (TryReplaceDirtyTsdf(index, oldWeight))
                 return true;
 
+            RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.RepeatedPending, oldWeight, oldTsdf, sampleTsdf);
+            LastDirtyTsdfPendingRepeatCount++;
             LastPendingTsdfCorrectionCount++;
+            TryRepairDirtyTsdfConflictBand();
             return true;
         }
 
@@ -1438,31 +6795,238 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float corrected = Mathf.Lerp(oldTsdf, _correctionTsdf[index], conflictCorrectionBlend);
         _tsdf[index] = Mathf.Clamp(corrected, -1f, 1f);
         _weights[index] = (byte)Mathf.Clamp(correctedTsdfWeight, minSurfaceCornerWeight, maxFusionWeight);
+        RecordContributionLedger(index, "conflict_correct", oldTsdf, oldWeight, _correctionTsdf[index], conflictCorrectionBlend, _tsdf[index], _weights[index]);
         _correctionTsdfHits[index] = 0;
         _correctionTsdfLastFrame[index] = int.MinValue;
+        RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.CorrectedOldDepth, oldWeight, oldTsdf, sampleTsdf);
         LastCorrectedTsdfCount++;
         LastUpdatedVoxelCount++;
+        TryRepairDirtyTsdfConflictBand();
         return true;
+    }
+
+    private bool TryRepairDirtyTsdfConflictBand()
+    {
+        if (!repairDirtyTsdfConflictBands)
+        {
+            LastDirtyTsdfBandRepairBlockedDisabledCount++;
+            return false;
+        }
+        if (!_auditSampleActive)
+        {
+            LastDirtyTsdfBandRepairBlockedNoSampleCount++;
+            return false;
+        }
+        if (_auditBandHistoryCount <= 0)
+        {
+            LastDirtyTsdfBandRepairBlockedNoHistoryCount++;
+            return false;
+        }
+        if (_auditBandConflictRatio < Mathf.Clamp01(minDirtyBandConflictRatio))
+        {
+            LastDirtyTsdfBandRepairBlockedLowConflictCount++;
+            return false;
+        }
+
+        LastDirtyTsdfBandRepairTriggerCount++;
+        int repaired = useProjectiveTsdfIntegration
+            ? RepairProjectiveDirtyTsdfConflictBand()
+            : RepairNormalDirtyTsdfConflictBand();
+        if (repaired <= 0)
+            return false;
+
+        LastDirtyTsdfBandRepairCount += repaired;
+        LastDirtyTsdfBandRepairSampleCount++;
+        return true;
+    }
+
+    private int RepairProjectiveDirtyTsdfConflictBand()
+    {
+        Vector3 cameraPosition = _activeTsdfSourceValid ? _activeTsdfSourceCamera : GetCameraPosition();
+        Vector3 surfacePoint = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenterFromIndex(0);
+        Vector3 toSurface = surfacePoint - cameraPosition;
+        float surfaceDepth = toSurface.magnitude;
+        if (!Finite(toSurface) || surfaceDepth <= 0.0001f)
+            return 0;
+
+        Vector3 ray = toSurface / surfaceDepth;
+        float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+        int halfBandSteps = Mathf.Max(1, Mathf.CeilToInt(truncationMeters / voxel));
+        float startDepth = Mathf.Max(0.01f, surfaceDepth - halfBandSteps * voxel);
+        float endDepth = surfaceDepth + halfBandSteps * voxel;
+        int repaired = 0;
+        for (float voxelDepth = startDepth; voxelDepth <= endDepth + voxel * 0.25f; voxelDepth += voxel)
+        {
+            Vector3 world = cameraPosition + ray * voxelDepth;
+            float sampleTsdf = Mathf.Clamp((surfaceDepth - voxelDepth) / truncationMeters, -1f, 1f);
+            repaired += RepairDirtyTsdfConflictBandVoxel(world, sampleTsdf, repaired);
+            if (repaired >= Mathf.Max(1, maxDirtyBandRepairsPerSample))
+                break;
+        }
+        return repaired;
+    }
+
+    private int RepairNormalDirtyTsdfConflictBand()
+    {
+        Vector3 surfacePoint = _activeTsdfSourceValid ? _activeTsdfSourceSurface : Vector3.zero;
+        Vector3 normal = _auditSampleNormal.sqrMagnitude > 0.0001f ? _auditSampleNormal.normalized : Vector3.up;
+        int halfBandSteps = Mathf.Max(1, Mathf.CeilToInt(truncationMeters / Mathf.Max(0.0001f, voxelSizeMeters)));
+        int repaired = 0;
+        for (int step = -halfBandSteps; step <= halfBandSteps; step++)
+        {
+            float signedDistance = step * voxelSizeMeters;
+            Vector3 world = surfacePoint + normal * signedDistance;
+            float sampleTsdf = Mathf.Clamp(signedDistance / truncationMeters, -1f, 1f);
+            repaired += RepairDirtyTsdfConflictBandVoxel(world, sampleTsdf, repaired);
+            if (repaired >= Mathf.Max(1, maxDirtyBandRepairsPerSample))
+                break;
+        }
+        return repaired;
+    }
+
+    private int RepairDirtyTsdfConflictBandVoxel(Vector3 world, float sampleTsdf, int repairedSoFar)
+    {
+        if (repairedSoFar >= Mathf.Max(1, maxDirtyBandRepairsPerSample))
+        {
+            LastDirtyTsdfBandRepairBlockedBudgetCount++;
+            return 0;
+        }
+        if (!TryWorldToVoxel(world, out int x, out int y, out int z))
+        {
+            LastDirtyTsdfBandRepairBlockedOutsideCount++;
+            return 0;
+        }
+
+        LastDirtyTsdfBandRepairProbeCount++;
+        int index = Index(x, y, z);
+        int oldWeight = _weights[index];
+        if (oldWeight <= 0)
+        {
+            LastDirtyTsdfBandRepairBlockedEmptyCount++;
+            return 0;
+        }
+        if (oldWeight > Mathf.Max(1, maxDirtyBandRepairWeight))
+        {
+            LastDirtyTsdfBandRepairBlockedWeightCount++;
+            return 0;
+        }
+
+        float oldTsdf = _tsdf[index];
+        float residual = Mathf.Abs(oldTsdf - sampleTsdf);
+        if (Mathf.Sign(oldTsdf) == Mathf.Sign(sampleTsdf))
+        {
+            LastDirtyTsdfBandRepairBlockedSameSignCount++;
+            return 0;
+        }
+        if (residual < Mathf.Clamp(minDirtyBandRepairResidual, 0.05f, 1f))
+        {
+            LastDirtyTsdfBandRepairBlockedResidualCount++;
+            return 0;
+        }
+
+        int keptWeight = Mathf.FloorToInt(oldWeight * Mathf.Clamp01(dirtyBandRepairWeightKeepRatio));
+        float newTsdf = keptWeight > 0
+            ? Mathf.Clamp(Mathf.Lerp(oldTsdf, sampleTsdf, 0.5f), -1f, 1f)
+            : 1f;
+        int newWeight = Mathf.Clamp(keptWeight, 0, maxFusionWeight);
+        _tsdf[index] = newTsdf;
+        _weights[index] = (byte)newWeight;
+        if (_correctionTsdfHits != null && index >= 0 && index < _correctionTsdfHits.Length)
+        {
+            _correctionTsdf[index] = sampleTsdf;
+            _correctionTsdfHits[index] = (byte)Mathf.Max(_correctionTsdfHits[index], 1);
+            _correctionTsdfLastFrame[index] = LastRawFrameIndex;
+        }
+        RecordContributionLedger(index, "band_repair", oldTsdf, oldWeight, sampleTsdf, 1f, _tsdf[index], _weights[index]);
+        RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.CleanupNeighbor, oldWeight, oldTsdf, sampleTsdf);
+        MarkDirtyTsdfQuarantine(index);
+        LastUpdatedVoxelCount++;
+        return 1;
     }
 
     private bool TryReplaceDirtyTsdf(int index, int oldWeight)
     {
-        if (!replaceDirtyTsdfOnStableConflict ||
-            oldWeight > Mathf.Max(1, maxDirtyTsdfReplaceWeight) ||
-            _correctionTsdfHits[index] < Mathf.Max(1, minDirtyTsdfReplaceFrames))
+        if (!replaceDirtyTsdfOnStableConflict)
+        {
+            LastDirtyTsdfReplaceBlockedDisabledCount++;
+            return false;
+        }
+
+        if (oldWeight > Mathf.Max(1, maxDirtyTsdfReplaceWeight))
+        {
+            LastDirtyTsdfReplaceBlockedWeightCount++;
+            return false;
+        }
+        if (rejectDirtyReplaceOnCleanHistoryMismatch &&
+            AuditVoteHasTag("clean") &&
+            FormalCleanHasHistoryMismatch())
+        {
+            LastDirtyTsdfReplaceBlockedCleanHistoryCount++;
+            return false;
+        }
+
+        if (_correctionTsdfHits[index] < Mathf.Max(1, minDirtyTsdfReplaceFrames))
+        {
+            if (TryGuardedReplaceDirtyTsdf(index, oldWeight))
+                return true;
+            LastDirtyTsdfReplaceBlockedHitsCount++;
+            return false;
+        }
+
+        ReplaceDirtyTsdfNow(index, oldWeight, false);
+        return true;
+    }
+
+    private bool TryGuardedReplaceDirtyTsdf(int index, int oldWeight)
+    {
+        if (!enableGuardedDirtyTsdfFastReplace ||
+            _correctionTsdfHits == null ||
+            _correctionTsdf == null ||
+            index < 0 ||
+            index >= _correctionTsdfHits.Length)
         {
             return false;
         }
 
-        _tsdf[index] = Mathf.Clamp(_correctionTsdf[index], -1f, 1f);
+        int hits = _correctionTsdfHits[index];
+        if (hits < Mathf.Max(1, minGuardedDirtyTsdfReplaceFrames))
+        {
+            LastGuardedDirtyTsdfBlockedHitsCount++;
+            return false;
+        }
+        if (oldWeight > Mathf.Max(1, maxGuardedDirtyTsdfReplaceWeight))
+        {
+            LastGuardedDirtyTsdfBlockedWeightCount++;
+            return false;
+        }
+
+        float replacementTsdf = Mathf.Clamp(_correctionTsdf[index], -1f, 1f);
+        if (Mathf.Abs(replacementTsdf) > Mathf.Clamp(maxGuardedDirtyTsdfReplaceAbsValue, 0.05f, 1f))
+        {
+            LastGuardedDirtyTsdfBlockedValueCount++;
+            return false;
+        }
+
+        ReplaceDirtyTsdfNow(index, oldWeight, true);
+        return true;
+    }
+
+    private void ReplaceDirtyTsdfNow(int index, int oldWeight, bool guarded)
+    {
+        float oldTsdf = _tsdf[index];
+        float replacementTsdf = Mathf.Clamp(_correctionTsdf[index], -1f, 1f);
+        _tsdf[index] = replacementTsdf;
         _weights[index] = (byte)Mathf.Clamp(dirtyTsdfReplaceWeight, minSurfaceCornerWeight, maxFusionWeight);
+        RecordContributionLedger(index, guarded ? "guarded_replace" : "replace", oldTsdf, oldWeight, replacementTsdf, dirtyTsdfReplaceWeight, _tsdf[index], _weights[index]);
+        RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.ReplaceDirty, oldWeight, oldTsdf, replacementTsdf);
         MarkDirtyTsdfQuarantine(index);
-        CleanupDirtyTsdfNeighborhood(index, _correctionTsdf[index]);
+        CleanupDirtyTsdfNeighborhood(index, replacementTsdf);
         _correctionTsdfHits[index] = 0;
         _correctionTsdfLastFrame[index] = int.MinValue;
         LastReplacedDirtyTsdfCount++;
+        if (guarded)
+            LastGuardedDirtyTsdfReplaceCount++;
         LastUpdatedVoxelCount++;
-        return true;
     }
 
     private void CleanupDirtyTsdfNeighborhood(int centerIndex, float replacementTsdf)
@@ -1502,8 +7066,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     if (!signConflict && !pendingConflict)
                         continue;
 
+                    int neighborOldWeight = _weights[index];
+                    float neighborOldTsdf = _tsdf[index];
+                    RecordDirtyTsdfEvidence(index, DirtyTsdfEvidenceReason.CleanupNeighbor, neighborOldWeight, neighborOldTsdf, replacementTsdf);
                     _tsdf[index] = 1f;
                     _weights[index] = 0;
+                    RecordContributionLedger(index, "cleanup_neighbor", neighborOldTsdf, neighborOldWeight, replacementTsdf, 0f, _tsdf[index], _weights[index]);
                     if (_correctionTsdfHits != null && index < _correctionTsdfHits.Length)
                     {
                         _correctionTsdfHits[index] = 0;
@@ -1521,8 +7089,207 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (_dirtyTsdfLastFrame == null || index < 0 || index >= _dirtyTsdfLastFrame.Length)
             return;
+        int previousFrame = _dirtyTsdfLastFrame[index];
+        bool wasActive =
+            previousFrame != int.MinValue &&
+            LastRawFrameIndex - previousFrame <= Mathf.Max(0, dirtyTsdfQuarantineFrames);
+        if (wasActive)
+            LastDirtyTsdfQuarantineRefreshCount++;
+        else
+            LastDirtyTsdfQuarantineNewCount++;
         _dirtyTsdfLastFrame[index] = LastRawFrameIndex;
         LastDirtyTsdfQuarantineCount++;
+    }
+
+    private void UpdateDirtyTsdfLifecycleDiagnostics()
+    {
+        LastDirtyTsdfActiveCount = 0;
+        LastDirtyTsdfExpiredCount = 0;
+        if (_dirtyTsdfLastFrame == null)
+            return;
+
+        int maxAge = Mathf.Max(0, dirtyTsdfQuarantineFrames);
+        for (int i = 0; i < _dirtyTsdfLastFrame.Length; i++)
+        {
+            int frame = _dirtyTsdfLastFrame[i];
+            if (frame == int.MinValue)
+                continue;
+            if (LastRawFrameIndex - frame <= maxAge)
+                LastDirtyTsdfActiveCount++;
+            else
+                LastDirtyTsdfExpiredCount++;
+        }
+    }
+
+    private void RecordDirtyTsdfEvidence(int index, DirtyTsdfEvidenceReason reason, int oldWeight, float oldTsdf, float newTsdf)
+    {
+        if (!showDirtyTsdfEvidenceOverlay || index < 0 || index >= _dimX * _dimY * _dimZ)
+            return;
+
+        IndexToVoxel(index, out int x, out int y, out int z);
+        DirtyTsdfEvidence evidence = new DirtyTsdfEvidence
+        {
+            VoxelIndex = index,
+            FrameIndex = LastRawFrameIndex,
+            OldWeight = oldWeight,
+            OldTsdf = oldTsdf,
+            NewTsdf = newTsdf,
+            VoxelCenter = VoxelCenter(x, y, z),
+            CameraPosition = _activeTsdfSourceValid ? _activeTsdfSourceCamera : GetCameraPosition(),
+            SurfacePoint = _activeTsdfSourceValid ? _activeTsdfSourceSurface : VoxelCenter(x, y, z),
+            Reason = reason
+        };
+
+        int limit = Mathf.Max(1, maxDirtyTsdfEvidenceMarkers);
+        while (_dirtyTsdfEvidence.Count >= limit)
+            _dirtyTsdfEvidence.RemoveAt(0);
+        _dirtyTsdfEvidence.Add(evidence);
+    }
+
+    private void UpdateDirtyTsdfEvidenceOverlay()
+    {
+        if (!showDirtyTsdfEvidenceOverlay)
+        {
+            if (_dirtyEvidenceObject != null)
+                _dirtyEvidenceObject.SetActive(false);
+            return;
+        }
+
+        EnsureDirtyTsdfEvidenceObjects();
+        if (_dirtyEvidenceMesh == null)
+            return;
+
+        _dirtyEvidenceMesh.Clear();
+        int start = Mathf.Max(0, _dirtyTsdfEvidence.Count - Mathf.Max(1, maxDirtyTsdfEvidenceMarkers));
+        float marker = Mathf.Max(0.005f, dirtyTsdfEvidenceMarkerSizeMeters);
+        List<Vector3> vertices = new List<Vector3>((_dirtyTsdfEvidence.Count - start) * 32);
+        List<int> indices = new List<int>((_dirtyTsdfEvidence.Count - start) * 48);
+        List<Color> colors = new List<Color>((_dirtyTsdfEvidence.Count - start) * 32);
+        LastDirtyEvidenceRenderedCount = 0;
+        LastDirtyEvidenceBackfillCount = 0;
+
+        for (int i = start; i < _dirtyTsdfEvidence.Count; i++)
+        {
+            DirtyTsdfEvidence evidence = _dirtyTsdfEvidence[i];
+            Color color = DirtyTsdfEvidenceColor(evidence.Reason);
+            Vector3 lineStart = evidence.CameraPosition;
+            Vector3 lineEnd = evidence.VoxelCenter;
+            if ((lineEnd - lineStart).sqrMagnitude > 9f)
+                lineStart = Vector3.Lerp(lineEnd, lineStart, 3f / Mathf.Max(0.001f, (lineEnd - lineStart).magnitude));
+
+            AddEvidenceLine(vertices, indices, colors, lineStart, lineEnd, color);
+            AddEvidenceCube(vertices, indices, colors, lineEnd, marker, color);
+            LastDirtyEvidenceRenderedCount++;
+        }
+
+        AddCurrentDirtyTsdfBackfillMarkers(vertices, indices, colors, marker);
+
+        _dirtyEvidenceMesh.indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        _dirtyEvidenceMesh.SetVertices(vertices);
+        _dirtyEvidenceMesh.SetColors(colors);
+        _dirtyEvidenceMesh.SetIndices(indices, MeshTopology.Lines, 0, true);
+        _dirtyEvidenceMesh.RecalculateBounds();
+        _dirtyEvidenceObject.SetActive(vertices.Count > 0);
+    }
+
+    private void AddCurrentDirtyTsdfBackfillMarkers(List<Vector3> vertices, List<int> indices, List<Color> colors, float marker)
+    {
+        if (!backfillCurrentDirtyTsdfMarkers || _tsdf == null || _weights == null)
+            return;
+
+        int maxMarkers = Mathf.Max(1, maxDirtyTsdfEvidenceMarkers);
+        int stride = Mathf.Max(1, Mathf.CeilToInt(Mathf.Pow((_dimX * _dimY * _dimZ) / Mathf.Max(1f, maxMarkers * 12f), 1f / 3f)));
+        for (int z = 0; z < _dimZ && LastDirtyEvidenceBackfillCount < maxMarkers; z += stride)
+        {
+            for (int y = 0; y < _dimY && LastDirtyEvidenceBackfillCount < maxMarkers; y += stride)
+            {
+                for (int x = 0; x < _dimX && LastDirtyEvidenceBackfillCount < maxMarkers; x += stride)
+                {
+                    int index = Index(x, y, z);
+                    bool dirty = VoxelIsDirtyQuarantined(index);
+                    bool pending = VoxelHasPendingTsdfCorrection(index);
+                    if (!dirty && !pending)
+                        continue;
+
+                    Color color = dirty ? new Color(0f, 0.35f, 1f, 1f) : Color.white;
+                    color.a = Mathf.Clamp01(dirtyTsdfEvidenceLineAlpha);
+                    AddEvidenceCube(vertices, indices, colors, VoxelCenter(x, y, z), marker * 0.8f, color);
+                    LastDirtyEvidenceBackfillCount++;
+                }
+            }
+        }
+    }
+
+    private static void AddEvidenceLine(List<Vector3> vertices, List<int> indices, List<Color> colors, Vector3 a, Vector3 b, Color color)
+    {
+        int start = vertices.Count;
+        vertices.Add(a);
+        vertices.Add(b);
+        indices.Add(start);
+        indices.Add(start + 1);
+        colors.Add(color);
+        colors.Add(color);
+    }
+
+    private static void AddEvidenceCube(List<Vector3> vertices, List<int> indices, List<Color> colors, Vector3 center, float size, Color color)
+    {
+        float h = Mathf.Max(0.002f, size) * 0.5f;
+        int start = vertices.Count;
+        vertices.Add(center + new Vector3(-h, -h, -h));
+        vertices.Add(center + new Vector3( h, -h, -h));
+        vertices.Add(center + new Vector3( h,  h, -h));
+        vertices.Add(center + new Vector3(-h,  h, -h));
+        vertices.Add(center + new Vector3(-h, -h,  h));
+        vertices.Add(center + new Vector3( h, -h,  h));
+        vertices.Add(center + new Vector3( h,  h,  h));
+        vertices.Add(center + new Vector3(-h,  h,  h));
+
+        AddEvidenceEdge(indices, start, 0, 1);
+        AddEvidenceEdge(indices, start, 1, 2);
+        AddEvidenceEdge(indices, start, 2, 3);
+        AddEvidenceEdge(indices, start, 3, 0);
+        AddEvidenceEdge(indices, start, 4, 5);
+        AddEvidenceEdge(indices, start, 5, 6);
+        AddEvidenceEdge(indices, start, 6, 7);
+        AddEvidenceEdge(indices, start, 7, 4);
+        AddEvidenceEdge(indices, start, 0, 4);
+        AddEvidenceEdge(indices, start, 1, 5);
+        AddEvidenceEdge(indices, start, 2, 6);
+        AddEvidenceEdge(indices, start, 3, 7);
+
+        for (int i = 0; i < 8; i++)
+            colors.Add(color);
+    }
+
+    private static void AddEvidenceEdge(List<int> indices, int start, int a, int b)
+    {
+        indices.Add(start + a);
+        indices.Add(start + b);
+    }
+
+    private Color DirtyTsdfEvidenceColor(DirtyTsdfEvidenceReason reason)
+    {
+        Color color;
+        switch (reason)
+        {
+            case DirtyTsdfEvidenceReason.CleanupNeighbor:
+                color = Color.black;
+                break;
+            case DirtyTsdfEvidenceReason.CorrectedOldDepth:
+                color = Color.white;
+                break;
+            case DirtyTsdfEvidenceReason.RejectedConflict:
+                color = new Color(1f, 0.55f, 0f, 1f);
+                break;
+            case DirtyTsdfEvidenceReason.ReplaceDirty:
+            case DirtyTsdfEvidenceReason.PendingConflict:
+            case DirtyTsdfEvidenceReason.RepeatedPending:
+            default:
+                color = new Color(0f, 0.35f, 1f, 1f);
+                break;
+        }
+        color.a = Mathf.Clamp01(dirtyTsdfEvidenceLineAlpha);
+        return color;
     }
 
     private bool PassMultiFrameTsdfStability(int index, float sampleTsdf, int oldWeight)
@@ -1583,6 +7350,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float startDepth = Mathf.Max(0.01f, surfaceDepth - halfBandSteps * voxel);
         float endDepth = surfaceDepth + halfBandSteps * voxel;
         bool touchedDenseTsdf = false;
+        _activeTsdfSourceCamera = cameraPosition;
+        _activeTsdfSourceSurface = surfacePoint;
+        _activeTsdfSourceValid = true;
 
         if (allowFreeSpaceCarving)
             CarveProjectiveFreeSpace(cameraPosition, rayDirection, surfaceDepth, sampleWeight);
@@ -1599,6 +7369,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
         }
 
+        _activeTsdfSourceValid = false;
         return touchedDenseTsdf;
     }
 
@@ -1608,19 +7379,117 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (carveEnd <= minDepthMeters)
             return;
 
-        float step = Mathf.Max(0.005f, voxelSizeMeters * Mathf.Clamp(freeSpaceCarvingStepVoxelScale, 0.25f, 3f));
         float carveWeight = Mathf.Clamp01(sampleWeight) * Mathf.Clamp01(freeSpaceCarvingWeightScale);
         if (carveWeight <= 0.0001f)
             return;
 
-        for (float voxelDepth = Mathf.Max(0.01f, minDepthMeters); voxelDepth <= carveEnd; voxelDepth += step)
-        {
-            Vector3 voxelWorld = cameraPosition + rayDirection * voxelDepth;
-            if (!TryWorldToVoxel(voxelWorld, out int vx, out int vy, out int vz))
-                continue;
+        float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+        Vector3 halfVoxel = Vector3.one * (voxel * 0.5f);
+        Vector3 volumeMin = _volumeOriginWorld - halfVoxel;
+        Vector3 volumeMax = _volumeOriginWorld + new Vector3(
+            Mathf.Max(0, _dimX - 1) * voxel,
+            Mathf.Max(0, _dimY - 1) * voxel,
+            Mathf.Max(0, _dimZ - 1) * voxel) + halfVoxel;
+        float traversalStart = Mathf.Max(0.01f, minDepthMeters);
+        float traversalEnd = carveEnd;
+        if (!ClipRaySegmentToBounds(cameraPosition, rayDirection, volumeMin, volumeMax, ref traversalStart, ref traversalEnd))
+            return;
 
+        float interiorStart = Mathf.Min(traversalEnd, traversalStart + voxel * 0.0001f);
+        Vector3 startPoint = cameraPosition + rayDirection * interiorStart;
+        Vector3 grid = (startPoint - volumeMin) / voxel;
+        int vx = Mathf.Clamp(Mathf.FloorToInt(grid.x), 0, _dimX - 1);
+        int vy = Mathf.Clamp(Mathf.FloorToInt(grid.y), 0, _dimY - 1);
+        int vz = Mathf.Clamp(Mathf.FloorToInt(grid.z), 0, _dimZ - 1);
+        int stepX = rayDirection.x > 0f ? 1 : rayDirection.x < 0f ? -1 : 0;
+        int stepY = rayDirection.y > 0f ? 1 : rayDirection.y < 0f ? -1 : 0;
+        int stepZ = rayDirection.z > 0f ? 1 : rayDirection.z < 0f ? -1 : 0;
+        float tMaxX = NextVoxelBoundaryDepth(cameraPosition.x, rayDirection.x, volumeMin.x, voxel, vx, stepX);
+        float tMaxY = NextVoxelBoundaryDepth(cameraPosition.y, rayDirection.y, volumeMin.y, voxel, vy, stepY);
+        float tMaxZ = NextVoxelBoundaryDepth(cameraPosition.z, rayDirection.z, volumeMin.z, voxel, vz, stepZ);
+        float tDeltaX = stepX == 0 ? float.PositiveInfinity : voxel / Mathf.Abs(rayDirection.x);
+        float tDeltaY = stepY == 0 ? float.PositiveInfinity : voxel / Mathf.Abs(rayDirection.y);
+        float tDeltaZ = stepZ == 0 ? float.PositiveInfinity : voxel / Mathf.Abs(rayDirection.z);
+
+        while (vx >= 0 && vy >= 0 && vz >= 0 && vx < _dimX && vy < _dimY && vz < _dimZ)
+        {
             CarveFreeSpaceVoxel(Index(vx, vy, vz), carveWeight);
+
+            float nextDepth = Mathf.Min(tMaxX, Mathf.Min(tMaxY, tMaxZ));
+            if (nextDepth > traversalEnd + 0.0001f)
+                break;
+
+            const float boundaryEpsilon = 0.00001f;
+            if (tMaxX <= nextDepth + boundaryEpsilon)
+            {
+                vx += stepX;
+                tMaxX += tDeltaX;
+            }
+            if (tMaxY <= nextDepth + boundaryEpsilon)
+            {
+                vy += stepY;
+                tMaxY += tDeltaY;
+            }
+            if (tMaxZ <= nextDepth + boundaryEpsilon)
+            {
+                vz += stepZ;
+                tMaxZ += tDeltaZ;
+            }
         }
+    }
+
+    private static bool ClipRaySegmentToBounds(
+        Vector3 origin,
+        Vector3 direction,
+        Vector3 boundsMin,
+        Vector3 boundsMax,
+        ref float segmentStart,
+        ref float segmentEnd)
+    {
+        return ClipRayAxis(origin.x, direction.x, boundsMin.x, boundsMax.x, ref segmentStart, ref segmentEnd) &&
+               ClipRayAxis(origin.y, direction.y, boundsMin.y, boundsMax.y, ref segmentStart, ref segmentEnd) &&
+               ClipRayAxis(origin.z, direction.z, boundsMin.z, boundsMax.z, ref segmentStart, ref segmentEnd) &&
+               segmentEnd >= segmentStart;
+    }
+
+    private static bool ClipRayAxis(
+        float origin,
+        float direction,
+        float axisMin,
+        float axisMax,
+        ref float segmentStart,
+        ref float segmentEnd)
+    {
+        if (Mathf.Abs(direction) <= 0.000001f)
+            return origin >= axisMin && origin <= axisMax;
+
+        float inverse = 1f / direction;
+        float near = (axisMin - origin) * inverse;
+        float far = (axisMax - origin) * inverse;
+        if (near > far)
+        {
+            float swap = near;
+            near = far;
+            far = swap;
+        }
+
+        segmentStart = Mathf.Max(segmentStart, near);
+        segmentEnd = Mathf.Min(segmentEnd, far);
+        return segmentEnd >= segmentStart;
+    }
+
+    private static float NextVoxelBoundaryDepth(
+        float rayOrigin,
+        float rayDirection,
+        float gridMin,
+        float voxel,
+        int voxelIndex,
+        int step)
+    {
+        if (step == 0 || Mathf.Abs(rayDirection) <= 0.000001f)
+            return float.PositiveInfinity;
+        float boundary = gridMin + (voxelIndex + (step > 0 ? 1 : 0)) * voxel;
+        return (boundary - rayOrigin) / rayDirection;
     }
 
     private void CarveFreeSpaceVoxel(int index, float carveWeight)
@@ -1629,23 +7498,173 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return;
 
         int oldWeight = _weights[index];
-        if (oldWeight <= 0 || oldWeight > maxFreeSpaceCarvableWeight)
+        if (oldWeight <= 0)
             return;
+
+        LastFreeSpaceEvidenceCandidateCount++;
+        if (protectSameFrameSurfaceFromClearing &&
+            _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance sameFrameProvenance) &&
+            IsConfirmedSameFrameSurfaceWrite(index, sameFrameProvenance))
+        {
+            LastFreeSpaceEvidenceBlockedSameFrameCount++;
+            return;
+        }
+
+        if (oldWeight > maxFreeSpaceCarvableWeight)
+        {
+            LastFreeSpaceEvidenceBlockedHighWeightCount++;
+            return;
+        }
 
         float oldTsdf = _tsdf[index];
         if (oldTsdf >= 0.98f)
             return;
 
+        if (useTemporalFreeSpaceEvidence)
+        {
+            if (_freeSpaceEvidenceHits == null || _freeSpaceEvidenceLastFrame == null || index >= _freeSpaceEvidenceHits.Length)
+                return;
+
+            int previousFrame = _freeSpaceEvidenceLastFrame[index];
+            if (previousFrame == LastRawFrameIndex)
+            {
+                LastFreeSpaceEvidenceDuplicateFrameCount++;
+                return;
+            }
+
+            int frameGap = previousFrame == int.MinValue ? int.MaxValue : LastRawFrameIndex - previousFrame;
+            if (previousFrame == int.MinValue || frameGap <= 0 || frameGap > Mathf.Max(2, maxFreeSpaceEvidenceFrameGap))
+            {
+                _freeSpaceEvidenceHits[index] = 1;
+                LastFreeSpaceEvidenceNewCount++;
+            }
+            else
+            {
+                _freeSpaceEvidenceHits[index] = (byte)Mathf.Min(255, _freeSpaceEvidenceHits[index] + 1);
+                LastFreeSpaceEvidenceRepeatCount++;
+            }
+            _freeSpaceEvidenceLastFrame[index] = LastRawFrameIndex;
+
+            if (_freeSpaceEvidenceHits[index] < Mathf.Clamp(minFreeSpaceEvidenceFrames, 2, 8))
+            {
+                LastFreeSpaceEvidenceWaitingCount++;
+                return;
+            }
+        }
+
         float blend = Mathf.Clamp01(freeSpaceCarvingBlend) * Mathf.Clamp01(carveWeight);
-        _tsdf[index] = Mathf.Lerp(oldTsdf, 1f, blend);
-        if (_tsdf[index] > 0.75f && oldWeight > 1)
-            _weights[index] = (byte)(oldWeight - 1);
+        float candidateTsdf = Mathf.Lerp(oldTsdf, 1f, blend);
+        int decay = useTemporalFreeSpaceEvidence ? Mathf.Clamp(freeSpaceEvidenceWeightDecay, 1, 4) : 1;
+        int candidateWeight = Mathf.Max(0, oldWeight - decay);
+        int clearWeight = Mathf.Clamp(freeSpaceEvidenceClearWeight, 0, 4);
+        bool commitClear = candidateWeight <= clearWeight &&
+                           candidateTsdf >= Mathf.Clamp01(freeSpaceEvidenceClearTsdf);
+
+        _tsdf[index] = candidateTsdf;
+        _weights[index] = (byte)(commitClear ? 0 : Mathf.Max(1, candidateWeight));
+        LastFreeSpaceEvidenceAppliedCount++;
+        if (commitClear)
+        {
+            _tsdf[index] = 1f;
+            if (_provisionalTsdf != null && index < _provisionalTsdf.Length)
+            {
+                _provisionalTsdf[index] = 0;
+                _provisionalTsdfHits[index] = 0;
+                _provisionalTsdfLastFrame[index] = int.MinValue;
+            }
+            if (_freeSpaceEvidenceHits != null && index < _freeSpaceEvidenceHits.Length)
+            {
+                _freeSpaceEvidenceHits[index] = 0;
+                _freeSpaceEvidenceLastFrame[index] = int.MinValue;
+            }
+            LastFreeSpaceEvidenceClearedCount++;
+        }
+        RecordContributionLedger(index, "free_space_carve", oldTsdf, oldWeight, 1f, carveWeight, _tsdf[index], _weights[index]);
         LastCarvedFreeSpaceVoxelCount++;
+    }
+
+    private bool IsConfirmedSameFrameSurfaceWrite(int index, VoxelWriteProvenance provenance)
+    {
+        if (provenance.Frame != LastRawFrameIndex || provenance.LastOperation == "free_space_carve")
+            return false;
+
+        bool trustedSurfaceOperation =
+            provenance.LastOperation == "integrate" ||
+            provenance.LastOperation == "strong_current_promote" ||
+            provenance.LastOperation == "replace" ||
+            provenance.LastOperation == "guarded_replace" ||
+            provenance.LastOperation == "band_repair" ||
+            provenance.LastOperation == "conflict_correct";
+        if (!trustedSurfaceOperation)
+            return false;
+
+        Vector3 voxelCenter = VoxelCenterFromIndex(index);
+        float surfaceDistance = Vector3.Distance(voxelCenter, provenance.SurfacePoint);
+        float surfaceWindow = Mathf.Max(
+            Mathf.Max(0.005f, voxelSizeMeters) * 0.9f,
+            Mathf.Max(0.001f, truncationMeters) * Mathf.Clamp(nearZeroSurfaceThreshold, 0.02f, 0.45f));
+        if (surfaceDistance <= surfaceWindow)
+            return true;
+
+        float nearZeroWindow = Mathf.Max(
+            Mathf.Clamp(nearZeroSurfaceThreshold, 0.02f, 0.45f),
+            Mathf.Max(0.005f, voxelSizeMeters) / Mathf.Max(0.001f, truncationMeters) * 0.5f);
+        return Mathf.Abs(provenance.Tsdf) <= nearZeroWindow;
+    }
+
+    private bool ShouldCancelFreeSpaceEvidence(int index, string operation, float observedTsdf)
+    {
+        bool trustedSurfaceOperation =
+            operation == "integrate" ||
+            operation == "strong_current_promote" ||
+            operation == "replace" ||
+            operation == "guarded_replace" ||
+            operation == "band_repair" ||
+            operation == "conflict_correct";
+        if (!trustedSurfaceOperation)
+            return false;
+
+        float nearZeroWindow = Mathf.Max(
+            Mathf.Clamp(nearZeroSurfaceThreshold, 0.02f, 0.45f),
+            Mathf.Max(0.005f, voxelSizeMeters) / Mathf.Max(0.001f, truncationMeters) * 0.5f);
+        if (Mathf.Abs(observedTsdf) > nearZeroWindow)
+            return false;
+
+        return _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) &&
+               IsConfirmedSameFrameSurfaceWrite(index, provenance);
+    }
+
+    private void CancelFreeSpaceEvidence(int index)
+    {
+        if (_freeSpaceEvidenceHits == null || _freeSpaceEvidenceLastFrame == null || index < 0 || index >= _freeSpaceEvidenceHits.Length)
+            return;
+        if (_freeSpaceEvidenceHits[index] == 0)
+            return;
+        _freeSpaceEvidenceHits[index] = 0;
+        _freeSpaceEvidenceLastFrame[index] = int.MinValue;
+        LastFreeSpaceEvidenceCancelledBySurfaceCount++;
+    }
+
+    private void ResetFreeSpaceEvidenceDiagnostics()
+    {
+        LastFreeSpaceEvidenceCandidateCount = 0;
+        LastFreeSpaceEvidenceNewCount = 0;
+        LastFreeSpaceEvidenceRepeatCount = 0;
+        LastFreeSpaceEvidenceWaitingCount = 0;
+        LastFreeSpaceEvidenceAppliedCount = 0;
+        LastFreeSpaceEvidenceClearedCount = 0;
+        LastFreeSpaceEvidenceBlockedHighWeightCount = 0;
+        LastFreeSpaceEvidenceBlockedSameFrameCount = 0;
+        LastFreeSpaceEvidenceDuplicateFrameCount = 0;
+        LastFreeSpaceEvidenceCancelledBySurfaceCount = 0;
     }
 
     private bool IntegrateNormalTsdfBand(Vector3 point, Vector3 normal, float sampleWeight, int halfBandSteps)
     {
         bool touchedDenseTsdf = false;
+        _activeTsdfSourceCamera = GetCameraPosition();
+        _activeTsdfSourceSurface = point;
+        _activeTsdfSourceValid = true;
         for (int step = -halfBandSteps; step <= halfBandSteps; step++)
         {
             float signedDistance = step * voxelSizeMeters;
@@ -1658,6 +7677,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
         }
 
+        _activeTsdfSourceValid = false;
         return touchedDenseTsdf;
     }
 
@@ -1821,12 +7841,46 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastDepthEdgeDownweightedCount = 0;
         LastRejectedTsdfConflictCount = 0;
         LastPendingStableTsdfCount = 0;
+        LastProvisionalTsdfSupportWriteCount = 0;
+        LastProvisionalTsdfSupportBlockedCount = 0;
+        ResetProvisionalTsdfBlockDiagnostics();
+        LastStrongSampleSeedWriteCount = 0;
+        LastStrongSampleSeedBlockedCount = 0;
+        ResetStrongSampleSeedTemporaryBlockDiagnostics();
+        ResetFormalIntegrateGateDiagnostics();
+        LastProvisionalLocalSupportPassCount = 0;
+        LastProvisionalLocalSupportNeighborCount = 0;
+        LastProvisionalLocalSupportStableNeighborCount = 0;
+        LastProvisionalLocalSupportAxialNeighborCount = 0;
+        LastProvisionalTsdfConfirmedCount = 0;
+        LastProvisionalTsdfConfirmedByWeightCount = 0;
+        LastProvisionalTsdfRetiredCount = 0;
+        LastProvisionalTsdfRetiredExpiredCount = 0;
+        LastProvisionalTsdfDirtyClearedCount = 0;
+        LastOldCleanMetabolismWatchCount = 0;
+        LastOldCleanMetabolismDecayCount = 0;
+        LastOldCleanMetabolismClearCount = 0;
+        LastOldCleanMetabolismBlockedCount = 0;
+        LastOldCleanMetabolismCandidateCount = 0;
+        LastOldCleanMetabolismWaitingHitsCount = 0;
+        LastOldCleanMetabolismBlockedSupportCount = 0;
+        LastOldCleanMetabolismBlockedSameFrameCount = 0;
+        LastOldCleanMetabolismBlockedWeightCount = 0;
+        LastOldCleanMetabolismBlockedResidualCount = 0;
+        LastOldCleanMetabolismBlockedDirtyPendingCount = 0;
+        LastOldCleanMetabolismSkippedWeakBandCount = 0;
+        LastOldCleanMetabolismSkippedWeakCrossFrameCount = 0;
         LastPendingTsdfCorrectionCount = 0;
         LastCorrectedTsdfCount = 0;
         LastReplacedDirtyTsdfCount = 0;
+        LastGuardedDirtyTsdfReplaceCount = 0;
+        LastDirtyTsdfBandRepairCount = 0;
+        LastDirtyTsdfBandRepairSampleCount = 0;
         LastCleanedDirtyTsdfNeighborCount = 0;
         LastDirtyTsdfQuarantineCount = 0;
+        ResetDirtyTsdfDiagnostics();
         LastCarvedFreeSpaceVoxelCount = 0;
+        ResetFreeSpaceEvidenceDiagnostics();
         LastRejectedFallbackWeakCount = 0;
         LastSkippedFallbackCapacityCount = 0;
         LastEvictedSurfaceChunkCount = 0;
@@ -1835,6 +7889,36 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastSkippedDirtyLightCoverCellCount = 0;
         LastBlockedDirtyLightCoverSampleCount = 0;
         LastSkippedUnstableLightCoverCellCount = 0;
+    }
+
+    private void ResetDirtyTsdfDiagnostics()
+    {
+        LastDirtyTsdfPendingNewCount = 0;
+        LastDirtyTsdfPendingRepeatCount = 0;
+        LastDirtyTsdfRejectedConflictCount = 0;
+        LastDirtyTsdfBandRepairTriggerCount = 0;
+        LastDirtyTsdfBandRepairProbeCount = 0;
+        LastDirtyTsdfBandRepairBlockedDisabledCount = 0;
+        LastDirtyTsdfBandRepairBlockedNoSampleCount = 0;
+        LastDirtyTsdfBandRepairBlockedNoHistoryCount = 0;
+        LastDirtyTsdfBandRepairBlockedLowConflictCount = 0;
+        LastDirtyTsdfBandRepairBlockedBudgetCount = 0;
+        LastDirtyTsdfBandRepairBlockedOutsideCount = 0;
+        LastDirtyTsdfBandRepairBlockedEmptyCount = 0;
+        LastDirtyTsdfBandRepairBlockedWeightCount = 0;
+        LastDirtyTsdfBandRepairBlockedSameSignCount = 0;
+        LastDirtyTsdfBandRepairBlockedResidualCount = 0;
+        LastDirtyTsdfReplaceBlockedDisabledCount = 0;
+        LastDirtyTsdfReplaceBlockedWeightCount = 0;
+        LastDirtyTsdfReplaceBlockedHitsCount = 0;
+        LastDirtyTsdfReplaceBlockedCleanHistoryCount = 0;
+        LastGuardedDirtyTsdfBlockedHitsCount = 0;
+        LastGuardedDirtyTsdfBlockedWeightCount = 0;
+        LastGuardedDirtyTsdfBlockedValueCount = 0;
+        LastDirtyTsdfQuarantineNewCount = 0;
+        LastDirtyTsdfQuarantineRefreshCount = 0;
+        LastDirtyTsdfActiveCount = 0;
+        LastDirtyTsdfExpiredCount = 0;
     }
 
     private void BuildFallbackSurfaceSampleMesh(List<Vector3> vertices, List<int> triangles, List<Color> colors)
@@ -2636,6 +8720,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _volumeOriginWorld = center - new Vector3((_dimX - 1) * voxel, (_dimY - 1) * voxel, (_dimZ - 1) * voxel) * 0.5f;
 
         int count = _dimX * _dimY * _dimZ;
+        _voxelAuditLifecycle.Clear();
+        _voxelWriteProvenance.Clear();
+        _captureAuditVoxels.Clear();
         _tsdf = new float[count];
         _weights = new byte[count];
         _pendingTsdf = new float[count];
@@ -2645,12 +8732,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _correctionTsdfHits = new byte[count];
         _correctionTsdfLastFrame = new int[count];
         _dirtyTsdfLastFrame = new int[count];
+        _provisionalTsdf = new byte[count];
+        _provisionalTsdfLastFrame = new int[count];
+        _provisionalTsdfHits = new byte[count];
+        _oldCleanConflictHits = new byte[count];
+        _oldCleanConflictLastFrame = new int[count];
+        _freeSpaceEvidenceHits = new byte[count];
+        _freeSpaceEvidenceLastFrame = new int[count];
         for (int i = 0; i < count; i++)
         {
             _tsdf[i] = 1f;
             _pendingTsdfLastFrame[i] = int.MinValue;
             _correctionTsdfLastFrame[i] = int.MinValue;
             _dirtyTsdfLastFrame[i] = int.MinValue;
+            _provisionalTsdfLastFrame[i] = int.MinValue;
+            _oldCleanConflictLastFrame[i] = int.MinValue;
+            _freeSpaceEvidenceLastFrame[i] = int.MinValue;
         }
 
         _volumeInitialized = true;
@@ -2790,6 +8887,516 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         vertex = sum / count;
         return Finite(vertex);
+    }
+
+    private void FillCleanTsdfContinuityGaps()
+    {
+        if (!fillCleanTsdfContinuityGaps || _tsdf == null || _weights == null)
+            return;
+
+        int total = _dimX * _dimY * _dimZ;
+        if (total <= 0 || _tsdf.Length < total || _weights.Length < total)
+            return;
+
+        int radius = Mathf.Clamp(tsdfContinuityFillRadiusVoxels, 1, 2);
+        int requiredSupport = Mathf.Clamp(minTsdfContinuityNeighborVoxels, 3, 26);
+        int requiredFaceSupport = Mathf.Clamp(minTsdfContinuityFaceNeighborVoxels, 1, 6);
+        int requiredSameSignSupport = Mathf.Clamp(minTsdfContinuitySameSignNeighborVoxels, requiredSupport, 26);
+        int requiredBoundaryNoTsdfSupport = Mathf.Clamp(minBoundaryNoTsdfNeighborVoxels, requiredSupport, requiredSameSignSupport);
+        int requiredBoundaryNoTsdfFaceSupport = Mathf.Clamp(minBoundaryNoTsdfFaceNeighborVoxels, requiredFaceSupport, 6);
+        int maxBoundaryNoTsdfFill = Mathf.Max(0, maxBoundaryNoTsdfFillVoxelsPerRebuild);
+        int maxFill = Mathf.Max(0, maxTsdfContinuityFillVoxelsPerRebuild);
+        float maxAbs = Mathf.Clamp(maxTsdfContinuityNeighborAbsValue, 0.01f, 0.35f);
+        float fillAbs = Mathf.Clamp(continuityFillAbsTsdf, 0.005f, maxAbs);
+        int fillWeight = Mathf.Clamp(Mathf.Max(continuityFillWeight, minSurfaceCornerWeight), 1, 255);
+
+        for (int z = 1; z < _dimZ - 1; z++)
+        {
+            for (int y = 1; y < _dimY - 1; y++)
+            {
+                for (int x = 1; x < _dimX - 1; x++)
+                {
+                    if (maxFill > 0 && LastTsdfContinuityFilledCount >= maxFill)
+                    {
+                        LastTsdfContinuityBlockedBudgetCount++;
+                        return;
+                    }
+
+                    int index = Index(x, y, z);
+                    if (_weights[index] > 0)
+                        continue;
+
+                    LastTsdfContinuityCandidateCount++;
+                    if (NeighborhoodTouchesDirtyOrPending(x, y, z, radius))
+                    {
+                        LastTsdfContinuityBlockedDirtyPendingCount++;
+                        continue;
+                    }
+                    if (rejectContinuityFillFromUnsettledNeighbors &&
+                        NeighborhoodHasUnsettledContinuitySource(x, y, z, radius))
+                    {
+                        LastTsdfContinuityBlockedUnsettledNeighborCount++;
+                        continue;
+                    }
+
+                    int support = 0;
+                    int faceSupport = 0;
+                    int cleanAnchorSupport = 0;
+                    int cleanAnchorFaceSupport = 0;
+                    int stableProvisionalSupport = 0;
+                    int stableProvisionalFaceSupport = 0;
+                    int nearSurfaceFaceSupport = 0;
+                    int faceAxisMask = 0;
+                    int positive = 0;
+                    int negative = 0;
+                    float weightedTsdf = 0f;
+                    int weightSum = 0;
+                    int bNoProvPresent = 0;
+                    int bNoProvFacePresent = 0;
+                    int bNoProvAccepted = 0;
+                    int bNoProvFaceAccepted = 0;
+                    int bNoProvBlockWeight = 0;
+                    int bNoProvBlockDirtyPending = 0;
+                    int bNoProvBlockTsdf = 0;
+                    int bNoProvBlockResidual = 0;
+                    int bNoProvBlockProvenance = 0;
+                    int bNoProvBlockNotFace = 0;
+                    int bNoFaceAcceptClean = 0;
+                    int bNoFaceAcceptProvisional = 0;
+                    int bNoFaceBlockWeight = 0;
+                    int bNoFaceBlockDirtyPending = 0;
+                    int bNoFaceBlockProvenance = 0;
+                    int bNoFaceBlockTsdf = 0;
+                    int bNoFaceBlockResidual = 0;
+                    int bNoFaceOutOfBounds = 0;
+                    int bNoSupportBlockWeight = 0;
+                    int bNoSupportBlockDirtyPending = 0;
+                    int bNoSupportBlockProvenance = 0;
+                    int bNoSupportBlockTsdf = 0;
+                    int bNoSupportBlockResidual = 0;
+                    int bNoSupportOutOfBounds = 0;
+
+                    for (int dz = -radius; dz <= radius; dz++)
+                    {
+                        for (int dy = -radius; dy <= radius; dy++)
+                        {
+                            for (int dx = -radius; dx <= radius; dx++)
+                            {
+                                if (dx == 0 && dy == 0 && dz == 0)
+                                    continue;
+
+                                int nx = x + dx;
+                                int ny = y + dy;
+                                int nz = z + dz;
+                                bool faceNeighbor = Mathf.Abs(dx) + Mathf.Abs(dy) + Mathf.Abs(dz) == 1;
+                                if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                                {
+                                    bNoSupportOutOfBounds++;
+                                    if (faceNeighbor)
+                                        bNoFaceOutOfBounds++;
+                                    continue;
+                                }
+
+                                int neighbor = Index(nx, ny, nz);
+                                bool provisionalFlag = HasProvisionalTsdfMarker(neighbor);
+                                if (provisionalFlag)
+                                {
+                                    bNoProvPresent++;
+                                    if (faceNeighbor)
+                                        bNoProvFacePresent++;
+                                    else
+                                        bNoProvBlockNotFace++;
+                                }
+
+                                if (_weights[neighbor] < minSurfaceCornerWeight)
+                                {
+                                    bNoSupportBlockWeight++;
+                                    if (faceNeighbor)
+                                        bNoFaceBlockWeight++;
+                                    if (provisionalFlag)
+                                        bNoProvBlockWeight++;
+                                    continue;
+                                }
+                                if (VoxelIsDirtyQuarantined(neighbor) ||
+                                    VoxelHasPendingTsdfCorrection(neighbor))
+                                {
+                                    bNoSupportBlockDirtyPending++;
+                                    if (faceNeighbor)
+                                        bNoFaceBlockDirtyPending++;
+                                    if (provisionalFlag)
+                                        bNoProvBlockDirtyPending++;
+                                    continue;
+                                }
+
+                                if (!IsAllowedContinuitySupportSource(neighbor))
+                                {
+                                    bNoSupportBlockProvenance++;
+                                    if (faceNeighbor)
+                                        bNoFaceBlockProvenance++;
+                                    if (provisionalFlag)
+                                        bNoProvBlockProvenance++;
+                                    continue;
+                                }
+
+                                float value = _tsdf[neighbor];
+                                if (float.IsNaN(value) || float.IsInfinity(value))
+                                {
+                                    bNoSupportBlockTsdf++;
+                                    if (faceNeighbor)
+                                        bNoFaceBlockTsdf++;
+                                    if (provisionalFlag)
+                                        bNoProvBlockTsdf++;
+                                    continue;
+                                }
+                                if (Mathf.Abs(value) > maxAbs)
+                                {
+                                    bNoSupportBlockResidual++;
+                                    if (faceNeighbor)
+                                        bNoFaceBlockResidual++;
+                                    if (provisionalFlag)
+                                        bNoProvBlockResidual++;
+                                    continue;
+                                }
+
+                                bool stableProvisional = IsStableProvisionalContinuitySource(neighbor);
+                                if (stableProvisional)
+                                {
+                                    bNoProvAccepted++;
+                                    if (faceNeighbor)
+                                        bNoProvFaceAccepted++;
+                                }
+                                int weight = Mathf.Max(1, _weights[neighbor]);
+                                weightedTsdf += value * weight;
+                                weightSum += weight;
+                                support++;
+                                if (faceNeighbor)
+                                {
+                                    faceSupport++;
+                                    if (Mathf.Abs(value) <= fillAbs * 1.5f)
+                                        nearSurfaceFaceSupport++;
+                                    if (dx != 0)
+                                        faceAxisMask |= 1;
+                                    else if (dy != 0)
+                                        faceAxisMask |= 2;
+                                    else
+                                        faceAxisMask |= 4;
+                                }
+                                if (stableProvisional)
+                                {
+                                    LastTsdfContinuityProvisionalNeighborCount++;
+                                    stableProvisionalSupport++;
+                                    if (faceNeighbor)
+                                    {
+                                        stableProvisionalFaceSupport++;
+                                        bNoFaceAcceptProvisional++;
+                                    }
+                                }
+                                else
+                                {
+                                    cleanAnchorSupport++;
+                                    if (faceNeighbor)
+                                    {
+                                        cleanAnchorFaceSupport++;
+                                        bNoFaceAcceptClean++;
+                                    }
+                                }
+                                if (value >= 0f)
+                                    positive++;
+                                else
+                                    negative++;
+                            }
+                        }
+                    }
+
+                    bool hasMixedSign = positive > 0 && negative > 0;
+                    bool allSameSign = support > 0 && (positive == support || negative == support);
+                    bool ordinaryCleanAnchored = cleanAnchorSupport >= requiredSupport && cleanAnchorFaceSupport >= requiredFaceSupport;
+                    bool mixedSign = hasMixedSign && ordinaryCleanAnchored;
+                    bool sameSignBase = allowSameSignContinuityBaseFill &&
+                        ordinaryCleanAnchored &&
+                        support >= requiredSameSignSupport &&
+                        allSameSign;
+                    bool boundaryNoTsdfFill = false;
+                    bool verifiedJointAnchor = false;
+                    bool verifiedTwoFaceBoundary = false;
+                    int faceAxisCount = CountBits3(faceAxisMask);
+                    bool boundaryNoTsdfCandidate = fillBoundaryNoTsdfGaps &&
+                        !hasMixedSign &&
+                        !sameSignBase &&
+                        allSameSign &&
+                        faceAxisCount >= 2 &&
+                        faceSupport >= requiredFaceSupport;
+                    if (boundaryNoTsdfCandidate)
+                    {
+                        LastTsdfBoundaryNoTsdfCandidateCount++;
+                        LastTsdfBoundaryNoTsdfProvisionalPresentNeighborCount += bNoProvPresent;
+                        LastTsdfBoundaryNoTsdfProvisionalFacePresentCount += bNoProvFacePresent;
+                        LastTsdfBoundaryNoTsdfProvisionalAcceptedNeighborCount += bNoProvAccepted;
+                        LastTsdfBoundaryNoTsdfProvisionalAcceptedFaceCount += bNoProvFaceAccepted;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedWeightCount += bNoProvBlockWeight;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedDirtyPendingCount += bNoProvBlockDirtyPending;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedTsdfCount += bNoProvBlockTsdf;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedResidualCount += bNoProvBlockResidual;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedProvenanceCount += bNoProvBlockProvenance;
+                        LastTsdfBoundaryNoTsdfProvisionalBlockedNotFaceCount += bNoProvBlockNotFace;
+                        switch (Mathf.Clamp(faceSupport, 0, 6))
+                        {
+                            case 0: LastTsdfBoundaryNoTsdfFaceSupport0Count++; break;
+                            case 1: LastTsdfBoundaryNoTsdfFaceSupport1Count++; break;
+                            case 2: LastTsdfBoundaryNoTsdfFaceSupport2Count++; break;
+                            case 3: LastTsdfBoundaryNoTsdfFaceSupport3Count++; break;
+                            case 4: LastTsdfBoundaryNoTsdfFaceSupport4Count++; break;
+                            case 5: LastTsdfBoundaryNoTsdfFaceSupport5Count++; break;
+                            case 6: LastTsdfBoundaryNoTsdfFaceSupport6Count++; break;
+                        }
+                        int faceDeficit = Mathf.Max(0, requiredBoundaryNoTsdfFaceSupport - faceSupport);
+                        if (faceDeficit == 1)
+                            LastTsdfBoundaryNoTsdfFaceDeficitOneCount++;
+                        else if (faceDeficit >= 2)
+                            LastTsdfBoundaryNoTsdfFaceDeficitTwoPlusCount++;
+                        LastTsdfBoundaryNoTsdfFaceSlotAcceptedCleanCount += bNoFaceAcceptClean;
+                        LastTsdfBoundaryNoTsdfFaceSlotAcceptedProvisionalCount += bNoFaceAcceptProvisional;
+                        LastTsdfBoundaryNoTsdfFaceSlotBlockedWeightCount += bNoFaceBlockWeight;
+                        LastTsdfBoundaryNoTsdfFaceSlotBlockedDirtyPendingCount += bNoFaceBlockDirtyPending;
+                        LastTsdfBoundaryNoTsdfFaceSlotBlockedProvenanceCount += bNoFaceBlockProvenance;
+                        LastTsdfBoundaryNoTsdfFaceSlotBlockedTsdfCount += bNoFaceBlockTsdf;
+                        LastTsdfBoundaryNoTsdfFaceSlotBlockedResidualCount += bNoFaceBlockResidual;
+                        LastTsdfBoundaryNoTsdfFaceSlotOutOfBoundsCount += bNoFaceOutOfBounds;
+                        int supportDeficit = Mathf.Max(0, requiredBoundaryNoTsdfSupport - support);
+                        if (supportDeficit == 0)
+                            LastTsdfBoundaryNoTsdfSupportPassedCount++;
+                        else if (supportDeficit == 1)
+                            LastTsdfBoundaryNoTsdfSupportDeficitOneCount++;
+                        else if (supportDeficit == 2)
+                            LastTsdfBoundaryNoTsdfSupportDeficitTwoCount++;
+                        else if (supportDeficit == 3)
+                            LastTsdfBoundaryNoTsdfSupportDeficitThreeCount++;
+                        else
+                            LastTsdfBoundaryNoTsdfSupportDeficitFourPlusCount++;
+                        LastTsdfBoundaryNoTsdfSupportSlotAcceptedCleanCount += cleanAnchorSupport;
+                        LastTsdfBoundaryNoTsdfSupportSlotAcceptedProvisionalCount += stableProvisionalSupport;
+                        LastTsdfBoundaryNoTsdfSupportSlotBlockedWeightCount += bNoSupportBlockWeight;
+                        LastTsdfBoundaryNoTsdfSupportSlotBlockedDirtyPendingCount += bNoSupportBlockDirtyPending;
+                        LastTsdfBoundaryNoTsdfSupportSlotBlockedProvenanceCount += bNoSupportBlockProvenance;
+                        LastTsdfBoundaryNoTsdfSupportSlotBlockedTsdfCount += bNoSupportBlockTsdf;
+                        LastTsdfBoundaryNoTsdfSupportSlotBlockedResidualCount += bNoSupportBlockResidual;
+                        LastTsdfBoundaryNoTsdfSupportSlotOutOfBoundsCount += bNoSupportOutOfBounds;
+                        bool hasBudget = maxBoundaryNoTsdfFill <= 0 || LastTsdfBoundaryNoTsdfFilledCount < maxBoundaryNoTsdfFill;
+                        bool enoughSupport = support >= requiredBoundaryNoTsdfSupport;
+                        bool enoughAxis = faceAxisCount >= 2;
+                        bool enoughNearSurface = nearSurfaceFaceSupport >= 1;
+                        verifiedTwoFaceBoundary = faceSupport == 2 &&
+                            faceAxisCount == 2 &&
+                            stableProvisionalFaceSupport == 2 &&
+                            cleanAnchorFaceSupport == 0 &&
+                            enoughSupport &&
+                            enoughNearSurface &&
+                            bNoFaceBlockDirtyPending == 0 &&
+                            bNoFaceBlockProvenance == 0 &&
+                            bNoFaceBlockTsdf == 0 &&
+                            bNoFaceBlockResidual == 0;
+                        if (verifiedTwoFaceBoundary)
+                            LastTsdfBoundaryNoTsdfVerifiedTwoFaceCandidateCount++;
+                        bool enoughFace = faceSupport >= requiredBoundaryNoTsdfFaceSupport || verifiedTwoFaceBoundary;
+                        bool strictCleanAnchor = cleanAnchorFaceSupport >= 2;
+                        verifiedJointAnchor = allowBoundaryNoTsdfProvisionalAnchor &&
+                            stableProvisionalSupport >= Mathf.Clamp(minBoundaryNoTsdfProvisionalAnchors, 1, 12) &&
+                            stableProvisionalFaceSupport >= Mathf.Clamp(minBoundaryNoTsdfProvisionalFaceAnchors, 1, 6) &&
+                            cleanAnchorSupport + stableProvisionalSupport >= requiredBoundaryNoTsdfSupport &&
+                            (cleanAnchorFaceSupport + stableProvisionalFaceSupport >= requiredBoundaryNoTsdfFaceSupport || verifiedTwoFaceBoundary);
+                        bool enoughCleanAnchor = strictCleanAnchor || verifiedJointAnchor;
+                        boundaryNoTsdfFill = hasBudget &&
+                            enoughSupport &&
+                            enoughFace &&
+                            enoughCleanAnchor &&
+                            enoughNearSurface &&
+                            enoughAxis;
+                        if (!boundaryNoTsdfFill)
+                        {
+                            LastTsdfBoundaryNoTsdfBlockedCount++;
+                            if (!hasBudget)
+                                LastTsdfBoundaryNoTsdfBlockedBudgetCount++;
+                            if (!enoughSupport)
+                                LastTsdfBoundaryNoTsdfBlockedSupportCount++;
+                            if (!enoughFace)
+                                LastTsdfBoundaryNoTsdfBlockedFaceCount++;
+                            if (!enoughAxis)
+                                LastTsdfBoundaryNoTsdfBlockedAxisCount++;
+                            if (!enoughCleanAnchor)
+                            {
+                                LastTsdfBoundaryNoTsdfBlockedCleanAnchorCount++;
+                                if (!verifiedJointAnchor)
+                                    LastTsdfBoundaryNoTsdfBlockedProvisionalAnchorCount++;
+                            }
+                            if (!enoughNearSurface)
+                                LastTsdfBoundaryNoTsdfBlockedNearSurfaceCount++;
+                        }
+                    }
+
+                    if (support < requiredSupport || faceSupport < requiredFaceSupport || weightSum <= 0 || (!mixedSign && !sameSignBase && !boundaryNoTsdfFill))
+                    {
+                        LastTsdfContinuityBlockedLowSupportCount++;
+                        continue;
+                    }
+
+                    float oldTsdf = _tsdf[index];
+                    int oldWeight = _weights[index];
+                    float filledTsdf = Mathf.Clamp(weightedTsdf / weightSum, -fillAbs, fillAbs);
+                    if (Mathf.Abs(filledTsdf) < 0.001f)
+                        filledTsdf = positive >= negative ? fillAbs : -fillAbs;
+                    if (sameSignBase || boundaryNoTsdfFill)
+                        filledTsdf = positive >= negative ? fillAbs : -fillAbs;
+
+                    _tsdf[index] = filledTsdf;
+                    _weights[index] = (byte)fillWeight;
+                    RecordContributionLedger(index, boundaryNoTsdfFill ? "boundary_no_tsdf_fill" : "continuity_fill", oldTsdf, oldWeight, filledTsdf, fillWeight, filledTsdf, _weights[index]);
+                    LastTsdfContinuityFilledCount++;
+                    if (boundaryNoTsdfFill)
+                    {
+                        LastTsdfBoundaryNoTsdfFilledCount++;
+                        if (cleanAnchorFaceSupport < 2)
+                            LastTsdfBoundaryNoTsdfRelaxedAnchorFilledCount++;
+                        if (verifiedJointAnchor)
+                        {
+                            LastTsdfBoundaryNoTsdfVerifiedJointAnchorFilledCount++;
+                            if (cleanAnchorFaceSupport == 0)
+                                LastTsdfBoundaryNoTsdfZeroCleanJointAnchorFilledCount++;
+                        }
+                        if (verifiedTwoFaceBoundary)
+                            LastTsdfBoundaryNoTsdfVerifiedTwoFaceFilledCount++;
+                        LastTsdfContinuitySameSignFilledCount++;
+                    }
+                    else if (sameSignBase)
+                        LastTsdfContinuitySameSignFilledCount++;
+                    else
+                        LastTsdfContinuityMixedSignFilledCount++;
+                }
+            }
+        }
+    }
+
+    private bool IsAllowedContinuitySupportSource(int index)
+    {
+        if (!rejectContinuityFillFromUnsettledNeighbors)
+            return true;
+
+        if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+            return false;
+
+        string operation = provenance.LastOperation;
+        if (IsStableProvisionalContinuityOperation(operation))
+            return allowStableProvisionalContinuitySources;
+
+        return !IsUnsettledContinuitySource(operation);
+    }
+
+    private bool IsStableProvisionalContinuitySource(int index)
+    {
+        return _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) &&
+               IsStableProvisionalContinuityOperation(provenance.LastOperation);
+    }
+
+    private bool HasProvisionalTsdfMarker(int index)
+    {
+        return _provisionalTsdf != null &&
+               index >= 0 &&
+               index < _provisionalTsdf.Length &&
+               _provisionalTsdf[index] != 0;
+    }
+
+    private static bool IsStableProvisionalContinuityOperation(string operation)
+    {
+        return operation == "provisional_support" ||
+               operation == "strong_sample_seed";
+    }
+
+    private static int CountBits3(int value)
+    {
+        value &= 7;
+        int count = 0;
+        if ((value & 1) != 0)
+            count++;
+        if ((value & 2) != 0)
+            count++;
+        if ((value & 4) != 0)
+            count++;
+        return count;
+    }
+
+    private bool NeighborhoodTouchesDirtyOrPending(int x, int y, int z, int radius)
+    {
+        int r = Mathf.Clamp(radius, 0, 2);
+        for (int dz = -r; dz <= r; dz++)
+        {
+            for (int dy = -r; dy <= r; dy++)
+            {
+                for (int dx = -r; dx <= r; dx++)
+                {
+                    int vx = x + dx;
+                    int vy = y + dy;
+                    int vz = z + dz;
+                    if (vx < 0 || vy < 0 || vz < 0 || vx >= _dimX || vy >= _dimY || vz >= _dimZ)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool NeighborhoodHasUnsettledContinuitySource(int x, int y, int z, int radius)
+    {
+        int r = Mathf.Clamp(radius, 0, 2);
+        for (int dz = -r; dz <= r; dz++)
+        {
+            for (int dy = -r; dy <= r; dy++)
+            {
+                for (int dx = -r; dx <= r; dx++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0)
+                        continue;
+
+                    int vx = x + dx;
+                    int vy = y + dy;
+                    int vz = z + dz;
+                    if (vx < 0 || vy < 0 || vz < 0 || vx >= _dimX || vy >= _dimY || vz >= _dimZ)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (_weights[index] <= 0)
+                        continue;
+
+                    if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+                        return true;
+
+                    if (!allowStableProvisionalContinuitySources &&
+                        IsStableProvisionalContinuityOperation(provenance.LastOperation))
+                    {
+                        return true;
+                    }
+
+                    if (IsUnsettledContinuitySource(provenance.LastOperation))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsUnsettledContinuitySource(string operation)
+    {
+        return operation == "continuity_fill" ||
+               operation == "boundary_no_tsdf_fill" ||
+               operation == "replace" ||
+               operation == "guarded_replace" ||
+               operation == "band_repair" ||
+               operation == "conflict_correct" ||
+               operation == "cleanup_neighbor";
     }
 
     private bool TryBuildLegacyCellVertex(
@@ -4043,6 +10650,70 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAddedBoundaryBridgeCount = 0;
         LastRejectedBoundaryBridgeCount = 0;
         LastHeldDisplayTriangleCount = 0;
+        LastTsdfContinuityCandidateCount = 0;
+        LastTsdfContinuityFilledCount = 0;
+        LastTsdfContinuitySameSignFilledCount = 0;
+        LastTsdfContinuityMixedSignFilledCount = 0;
+        LastTsdfContinuityProvisionalNeighborCount = 0;
+        LastTsdfContinuityBlockedDirtyPendingCount = 0;
+        LastTsdfContinuityBlockedLowSupportCount = 0;
+        LastTsdfContinuityBlockedBudgetCount = 0;
+        LastTsdfContinuityBlockedUnsettledNeighborCount = 0;
+        LastTsdfBoundaryNoTsdfCandidateCount = 0;
+        LastTsdfBoundaryNoTsdfFilledCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedSupportCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedFaceCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedAxisCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedCleanAnchorCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedProvisionalAnchorCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedNearSurfaceCount = 0;
+        LastTsdfBoundaryNoTsdfBlockedBudgetCount = 0;
+        LastTsdfBoundaryNoTsdfRelaxedAnchorFilledCount = 0;
+        LastTsdfBoundaryNoTsdfVerifiedJointAnchorFilledCount = 0;
+        LastTsdfBoundaryNoTsdfZeroCleanJointAnchorFilledCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalPresentNeighborCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalFacePresentCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalAcceptedNeighborCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalAcceptedFaceCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedWeightCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedDirtyPendingCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedTsdfCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedResidualCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedProvenanceCount = 0;
+        LastTsdfBoundaryNoTsdfProvisionalBlockedNotFaceCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport0Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport1Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport2Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport3Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport4Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport5Count = 0;
+        LastTsdfBoundaryNoTsdfFaceSupport6Count = 0;
+        LastTsdfBoundaryNoTsdfFaceDeficitOneCount = 0;
+        LastTsdfBoundaryNoTsdfFaceDeficitTwoPlusCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotAcceptedCleanCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotAcceptedProvisionalCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotBlockedWeightCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotBlockedDirtyPendingCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotBlockedProvenanceCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotBlockedTsdfCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotBlockedResidualCount = 0;
+        LastTsdfBoundaryNoTsdfFaceSlotOutOfBoundsCount = 0;
+        LastTsdfBoundaryNoTsdfVerifiedTwoFaceCandidateCount = 0;
+        LastTsdfBoundaryNoTsdfVerifiedTwoFaceFilledCount = 0;
+        LastTsdfBoundaryNoTsdfSupportPassedCount = 0;
+        LastTsdfBoundaryNoTsdfSupportDeficitOneCount = 0;
+        LastTsdfBoundaryNoTsdfSupportDeficitTwoCount = 0;
+        LastTsdfBoundaryNoTsdfSupportDeficitThreeCount = 0;
+        LastTsdfBoundaryNoTsdfSupportDeficitFourPlusCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotAcceptedCleanCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotAcceptedProvisionalCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotBlockedWeightCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotBlockedDirtyPendingCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotBlockedProvenanceCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotBlockedTsdfCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotBlockedResidualCount = 0;
+        LastTsdfBoundaryNoTsdfSupportSlotOutOfBoundsCount = 0;
     }
 
     private void ResetMeshDiagnostics()
@@ -4059,6 +10730,1271 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastDiagWorstPatchExtentMeters = 0f;
         LastDiagLikelyCause = "none";
         _meshDiagnosticHotspots.Clear();
+    }
+
+    private void ResetTumorSuspectOverlayDiagnostics()
+    {
+        _auditSuspectMeshVoxels.Clear();
+        _auditPureGeometryMeshVoxels.Clear();
+        LastTumorSuspectTriangleCount = 0;
+        LastTumorRiskVertexCount = 0;
+        LastTumorDirtyTriangleCount = 0;
+        LastTumorPendingTriangleCount = 0;
+        LastTumorReplaceHitBlockedTriangleCount = 0;
+        LastTumorReplaceWeightBlockedTriangleCount = 0;
+        LastTumorReplaceReadyTriangleCount = 0;
+        ResetSuspectMeshSourceDiagnostics();
+        LastTumorIslandTriangleCount = 0;
+        LastTumorOpenEdgeTriangleCount = 0;
+        LastTumorNonManifoldTriangleCount = 0;
+        LastTumorLongEdgeTriangleCount = 0;
+        LastIslandCauseComponentCount = 0;
+        LastIslandCauseBoundaryVoxelCount = 0;
+        LastIslandCauseNoTsdfCount = 0;
+        LastIslandCausePendingCount = 0;
+        LastIslandCauseDirtyCount = 0;
+        LastIslandCauseLowWeightCount = 0;
+        LastIslandCausePlaneMismatchCount = 0;
+        LastIslandCausePrunedCount = 0;
+        LastPureGeometrySuspectTriangleCount = 0;
+        LastPureGeometryNormalTriangleCount = 0;
+        LastPureGeometryProtrusionTriangleCount = 0;
+        LastPureGeometryDoubleLayerTriangleCount = 0;
+        LastDoubleLayerSourceDirtyCount = 0;
+        LastDoubleLayerSourcePendingCount = 0;
+        LastDoubleLayerSourceBandConflictCount = 0;
+        LastDoubleLayerSourceOldLockedCount = 0;
+        LastDoubleLayerSourceCleanCount = 0;
+        LastDoubleLayerSourceEmptyCount = 0;
+        LastDoubleLayerSourceMixedCount = 0;
+        LastDoubleLayerSourceUnknownCount = 0;
+        LastDoubleLayerCleanNoLifecycleCount = 0;
+        LastDoubleLayerCleanNoProvenanceCount = 0;
+        LastDoubleLayerCleanConflictHistoryCount = 0;
+        LastDoubleLayerCleanReplaceHistoryCount = 0;
+        LastDoubleLayerCleanExpiredDirtyCount = 0;
+        LastDoubleLayerCleanLowWeightCount = 0;
+        LastDoubleLayerCleanHighWeightCount = 0;
+        LastDoubleLayerCleanLastIntegrateCount = 0;
+        LastDoubleLayerCleanLastCarveCount = 0;
+        LastDoubleLayerCleanLastReplaceCount = 0;
+        LastDoubleLayerCleanLastRepairCount = 0;
+        LastDoubleLayerCleanIntegrateCarveHistoryCount = 0;
+        LastDoubleLayerCleanMultiFrameHistoryCount = 0;
+        LastDoubleLayerValidatedPairCount = 0;
+        LastDoubleLayerRejectedMissingSourceCount = 0;
+        LastDoubleLayerRejectedSourceNormalCount = 0;
+        LastDoubleLayerRejectedSourcePlaneCount = 0;
+        LastDoubleLayerRejectedSourceLateralCount = 0;
+        LastDoubleLayerMeshAlignmentMismatchCount = 0;
+    }
+
+    private void ApplyMeshTumorSuspectOverlay(List<Vector3> vertices, List<int> triangles, List<Color> colors)
+    {
+        ResetTumorSuspectOverlayDiagnostics();
+        if (!showMeshTumorSuspectOverlay || vertices == null || triangles == null || colors == null || triangles.Count < 3)
+            return;
+
+        while (colors.Count < vertices.Count)
+            colors.Add(cleanCoverCellColor);
+        if (colors.Count != vertices.Count)
+            return;
+
+        int triangleCount = triangles.Count / 3;
+        Dictionary<ulong, List<int>> edgeToTriangles = new Dictionary<ulong, List<int>>(triangleCount * 3);
+        Vector3[] triangleCenters = new Vector3[triangleCount];
+        Vector3[] triangleNormals = new Vector3[triangleCount];
+        bool[] riskHigh = new bool[triangleCount];
+        bool[] riskMedium = new bool[triangleCount];
+        bool[] dirtyRisk = new bool[triangleCount];
+        bool[] pendingRisk = new bool[triangleCount];
+        bool[] hitBlockedRisk = new bool[triangleCount];
+        bool[] weightBlockedRisk = new bool[triangleCount];
+        bool[] replaceReadyRisk = new bool[triangleCount];
+        bool[] nonManifoldRisk = new bool[triangleCount];
+        bool[] islandRisk = new bool[triangleCount];
+        bool[] openRisk = new bool[triangleCount];
+        bool[] longEdgeRisk = new bool[triangleCount];
+        bool[] pureNormalRisk = new bool[triangleCount];
+        bool[] pureProtrusionRisk = new bool[triangleCount];
+        bool[] pureDoubleLayerRisk = new bool[triangleCount];
+        bool[] pureGeometryRisk = new bool[triangleCount];
+
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            int a = triangles[tri * 3];
+            int b = triangles[tri * 3 + 1];
+            int c = triangles[tri * 3 + 2];
+            if (!TriangleIndicesValid(vertices, a, b, c))
+                continue;
+
+            triangleCenters[tri] = (vertices[a] + vertices[b] + vertices[c]) / 3f;
+            triangleNormals[tri] = ComputeTriangleNormal(vertices, triangles, tri);
+            AddEdgeTriangle(edgeToTriangles, a, b, tri);
+            AddEdgeTriangle(edgeToTriangles, b, c, tri);
+            AddEdgeTriangle(edgeToTriangles, c, a, tri);
+        }
+
+        int[] boundaryEdgesPerTri = new int[triangleCount];
+        int[] nonManifoldEdgesPerTri = new int[triangleCount];
+        int boundaryUseLimit = doubleSidedTriangles ? 2 : 1;
+        int manifoldUseLimit = doubleSidedTriangles ? 4 : 2;
+        foreach (KeyValuePair<ulong, List<int>> pair in edgeToTriangles)
+        {
+            int count = pair.Value != null ? pair.Value.Count : 0;
+            if (count > boundaryUseLimit && count <= manifoldUseLimit)
+                continue;
+
+            for (int i = 0; i < pair.Value.Count; i++)
+            {
+                int tri = pair.Value[i];
+                if (tri < 0 || tri >= triangleCount)
+                    continue;
+                if (count <= boundaryUseLimit)
+                    boundaryEdgesPerTri[tri]++;
+                else
+                    nonManifoldEdgesPerTri[tri]++;
+            }
+        }
+
+        float longEdgeSq = Mathf.Pow(Mathf.Max(0.02f, voxelSizeMeters * tumorSuspectLongEdgeVoxelScale), 2f);
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            int a = triangles[tri * 3];
+            int b = triangles[tri * 3 + 1];
+            int c = triangles[tri * 3 + 2];
+            if (!TriangleIndicesValid(vertices, a, b, c))
+                continue;
+
+            bool dirty = false;
+            bool pending = false;
+            bool hitBlocked = false;
+            bool weightBlocked = false;
+            bool replaceReady = false;
+            AccumulateMeshTsdfRepairState(triangleCenters[tri], ref dirty, ref pending, ref hitBlocked, ref weightBlocked, ref replaceReady);
+            AccumulateMeshTsdfRepairState(vertices[a], ref dirty, ref pending, ref hitBlocked, ref weightBlocked, ref replaceReady);
+            AccumulateMeshTsdfRepairState(vertices[b], ref dirty, ref pending, ref hitBlocked, ref weightBlocked, ref replaceReady);
+            AccumulateMeshTsdfRepairState(vertices[c], ref dirty, ref pending, ref hitBlocked, ref weightBlocked, ref replaceReady);
+            if (dirty)
+            {
+                riskHigh[tri] = true;
+                dirtyRisk[tri] = true;
+                LastTumorDirtyTriangleCount++;
+            }
+            if (pending)
+                pendingRisk[tri] = true;
+            if (hitBlocked)
+                hitBlockedRisk[tri] = true;
+            if (weightBlocked)
+                weightBlockedRisk[tri] = true;
+            if (replaceReady)
+                replaceReadyRisk[tri] = true;
+
+            if (nonManifoldEdgesPerTri[tri] > 0)
+            {
+                riskHigh[tri] = true;
+                nonManifoldRisk[tri] = true;
+                LastTumorNonManifoldTriangleCount++;
+            }
+
+            if (boundaryEdgesPerTri[tri] >= 3)
+            {
+                riskMedium[tri] = true;
+                openRisk[tri] = true;
+                LastTumorOpenEdgeTriangleCount++;
+            }
+
+            bool longEdge = (vertices[a] - vertices[b]).sqrMagnitude > longEdgeSq ||
+                            (vertices[b] - vertices[c]).sqrMagnitude > longEdgeSq ||
+                            (vertices[c] - vertices[a]).sqrMagnitude > longEdgeSq;
+            if (longEdge)
+            {
+                if (dirty)
+                    riskHigh[tri] = true;
+                else
+                    riskMedium[tri] = true;
+                longEdgeRisk[tri] = true;
+                LastTumorLongEdgeTriangleCount++;
+            }
+        }
+
+        MarkSmallOpenMeshIslands(vertices, triangles, edgeToTriangles, triangleCenters, boundaryEdgesPerTri, riskHigh, riskMedium, islandRisk);
+        DetectPureGeometrySuspects(
+            vertices,
+            triangles,
+            edgeToTriangles,
+            triangleCenters,
+            triangleNormals,
+            nonManifoldRisk,
+            islandRisk,
+            pureNormalRisk,
+            pureProtrusionRisk,
+            pureDoubleLayerRisk,
+            pureGeometryRisk);
+
+        bool[] vertexRisk = new bool[vertices.Count];
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            if (pureGeometryRisk[tri])
+                riskMedium[tri] = true;
+            if (!riskHigh[tri] && !riskMedium[tri])
+                continue;
+
+            LastTumorSuspectTriangleCount++;
+            if (pendingRisk[tri])
+                LastTumorPendingTriangleCount++;
+            if (hitBlockedRisk[tri])
+                LastTumorReplaceHitBlockedTriangleCount++;
+            if (weightBlockedRisk[tri])
+                LastTumorReplaceWeightBlockedTriangleCount++;
+            if (replaceReadyRisk[tri])
+                LastTumorReplaceReadyTriangleCount++;
+            Color color = pureGeometryRisk[tri]
+                ? pureGeometrySuspectColor
+                : MeshTumorCauseColor(
+                dirtyRisk[tri],
+                nonManifoldRisk[tri],
+                islandRisk[tri],
+                openRisk[tri],
+                longEdgeRisk[tri],
+                riskHigh[tri]);
+            int a = triangles[tri * 3];
+            int b = triangles[tri * 3 + 1];
+            int c = triangles[tri * 3 + 2];
+            AddAuditSuspectMeshVoxel(triangleCenters[tri]);
+            AddAuditSuspectMeshVoxel(vertices[a]);
+            AddAuditSuspectMeshVoxel(vertices[b]);
+            AddAuditSuspectMeshVoxel(vertices[c]);
+            if (pureGeometryRisk[tri])
+            {
+                LastPureGeometrySuspectTriangleCount++;
+                if (pureNormalRisk[tri])
+                    LastPureGeometryNormalTriangleCount++;
+                if (pureProtrusionRisk[tri])
+                    LastPureGeometryProtrusionTriangleCount++;
+                if (pureDoubleLayerRisk[tri])
+                {
+                    LastPureGeometryDoubleLayerTriangleCount++;
+                    CountDoubleLayerSource(triangleCenters[tri], vertices[a], vertices[b], vertices[c]);
+                }
+                AddAuditPureGeometryMeshVoxel(triangleCenters[tri]);
+                AddAuditPureGeometryMeshVoxel(vertices[a]);
+                AddAuditPureGeometryMeshVoxel(vertices[b]);
+                AddAuditPureGeometryMeshVoxel(vertices[c]);
+            }
+            PaintRiskVertex(colors, vertexRisk, a, color);
+            PaintRiskVertex(colors, vertexRisk, b, color);
+            PaintRiskVertex(colors, vertexRisk, c, color);
+        }
+
+        for (int i = 0; i < vertexRisk.Length; i++)
+        {
+            if (vertexRisk[i])
+                LastTumorRiskVertexCount++;
+        }
+    }
+
+    private void AddAuditSuspectMeshVoxel(Vector3 world)
+    {
+        if (TryWorldToVoxel(world, out int x, out int y, out int z))
+        {
+            int index = Index(x, y, z);
+            if (_auditSuspectMeshVoxels.Add(index))
+                CountSuspectMeshSource(index);
+        }
+    }
+
+    private void CountSuspectMeshSource(int index)
+    {
+        if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) ||
+            string.IsNullOrEmpty(provenance.LastOperation))
+        {
+            LastSuspectMeshSourceUnknownVoxelCount++;
+            return;
+        }
+
+        switch (provenance.LastOperation)
+        {
+            case "integrate":
+                LastSuspectMeshSourceIntegrateVoxelCount++;
+                break;
+            case "provisional_support":
+                LastSuspectMeshSourceProvisionalVoxelCount++;
+                break;
+            case "strong_sample_seed":
+                LastSuspectMeshSourceStrongSeedVoxelCount++;
+                break;
+            case "continuity_fill":
+                LastSuspectMeshSourceContinuityVoxelCount++;
+                break;
+            case "free_space_carve":
+                LastSuspectMeshSourceCarveVoxelCount++;
+                break;
+            case "replace":
+            case "guarded_replace":
+                LastSuspectMeshSourceReplaceVoxelCount++;
+                break;
+            case "band_repair":
+            case "conflict_correct":
+            case "cleanup_neighbor":
+                LastSuspectMeshSourceRepairVoxelCount++;
+                break;
+            default:
+                LastSuspectMeshSourceOtherVoxelCount++;
+                break;
+        }
+    }
+
+    private void AddAuditPureGeometryMeshVoxel(Vector3 world)
+    {
+        if (TryWorldToVoxel(world, out int x, out int y, out int z))
+            _auditPureGeometryMeshVoxels.Add(Index(x, y, z));
+    }
+
+    private void CountDoubleLayerSource(Vector3 center, Vector3 a, Vector3 b, Vector3 c)
+    {
+        bool dirty = false;
+        bool pending = false;
+        bool bandConflict = false;
+        bool oldLocked = false;
+        bool cleanWeighted = false;
+        bool emptyWeighted = false;
+        bool anySample = false;
+        DoubleLayerCleanEvidence cleanEvidence = new DoubleLayerCleanEvidence();
+
+        AccumulateDoubleLayerSource(center, ref dirty, ref pending, ref bandConflict, ref oldLocked, ref cleanWeighted, ref emptyWeighted, ref anySample, ref cleanEvidence);
+        AccumulateDoubleLayerSource(a, ref dirty, ref pending, ref bandConflict, ref oldLocked, ref cleanWeighted, ref emptyWeighted, ref anySample, ref cleanEvidence);
+        AccumulateDoubleLayerSource(b, ref dirty, ref pending, ref bandConflict, ref oldLocked, ref cleanWeighted, ref emptyWeighted, ref anySample, ref cleanEvidence);
+        AccumulateDoubleLayerSource(c, ref dirty, ref pending, ref bandConflict, ref oldLocked, ref cleanWeighted, ref emptyWeighted, ref anySample, ref cleanEvidence);
+
+        int riskyKinds = 0;
+        if (dirty) riskyKinds++;
+        if (bandConflict) riskyKinds++;
+        if (oldLocked) riskyKinds++;
+        if (pending) riskyKinds++;
+
+        if (riskyKinds > 1)
+            LastDoubleLayerSourceMixedCount++;
+        else if (dirty)
+            LastDoubleLayerSourceDirtyCount++;
+        else if (bandConflict)
+            LastDoubleLayerSourceBandConflictCount++;
+        else if (oldLocked)
+            LastDoubleLayerSourceOldLockedCount++;
+        else if (pending)
+            LastDoubleLayerSourcePendingCount++;
+        else if (cleanWeighted)
+        {
+            LastDoubleLayerSourceCleanCount++;
+            CountDoubleLayerCleanEvidence(cleanEvidence);
+        }
+        else if (emptyWeighted || anySample)
+            LastDoubleLayerSourceEmptyCount++;
+        else
+            LastDoubleLayerSourceUnknownCount++;
+    }
+
+    private struct DoubleLayerCleanEvidence
+    {
+        public bool NoLifecycle;
+        public bool NoProvenance;
+        public bool ConflictHistory;
+        public bool ReplaceHistory;
+        public bool ExpiredDirty;
+        public bool LowWeight;
+        public bool HighWeight;
+        public bool LastIntegrate;
+        public bool LastCarve;
+        public bool LastReplace;
+        public bool LastRepair;
+        public bool IntegrateCarveHistory;
+        public bool MultiFrameHistory;
+    }
+
+    private void CountDoubleLayerCleanEvidence(DoubleLayerCleanEvidence evidence)
+    {
+        if (evidence.NoLifecycle)
+            LastDoubleLayerCleanNoLifecycleCount++;
+        if (evidence.NoProvenance)
+            LastDoubleLayerCleanNoProvenanceCount++;
+        if (evidence.ConflictHistory)
+            LastDoubleLayerCleanConflictHistoryCount++;
+        if (evidence.ReplaceHistory)
+            LastDoubleLayerCleanReplaceHistoryCount++;
+        if (evidence.ExpiredDirty)
+            LastDoubleLayerCleanExpiredDirtyCount++;
+        if (evidence.LowWeight)
+            LastDoubleLayerCleanLowWeightCount++;
+        if (evidence.HighWeight)
+            LastDoubleLayerCleanHighWeightCount++;
+        if (evidence.LastIntegrate)
+            LastDoubleLayerCleanLastIntegrateCount++;
+        if (evidence.LastCarve)
+            LastDoubleLayerCleanLastCarveCount++;
+        if (evidence.LastReplace)
+            LastDoubleLayerCleanLastReplaceCount++;
+        if (evidence.LastRepair)
+            LastDoubleLayerCleanLastRepairCount++;
+        if (evidence.IntegrateCarveHistory)
+            LastDoubleLayerCleanIntegrateCarveHistoryCount++;
+        if (evidence.MultiFrameHistory)
+            LastDoubleLayerCleanMultiFrameHistoryCount++;
+    }
+
+    private void AccumulateDoubleLayerSource(
+        Vector3 world,
+        ref bool dirty,
+        ref bool pending,
+        ref bool bandConflict,
+        ref bool oldLocked,
+        ref bool cleanWeighted,
+        ref bool emptyWeighted,
+        ref bool anySample,
+        ref DoubleLayerCleanEvidence cleanEvidence)
+    {
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(world, out int x, out int y, out int z))
+            return;
+
+        anySample = true;
+        int radius = Mathf.Clamp(tumorSuspectTsdfRadiusVoxels, 0, 2);
+        int weighted = 0;
+        int risky = 0;
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int vz = z + dz;
+            if (vz < 0 || vz >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int vy = y + dy;
+                if (vy < 0 || vy >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int vx = x + dx;
+                    if (vx < 0 || vx >= _dimX)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    int weight = _weights[index];
+                    if (weight > 0)
+                    {
+                        weighted++;
+                        if (weight <= Mathf.Max(1, minConflictVoxelWeight))
+                            cleanEvidence.LowWeight = true;
+                        if (weight > Mathf.Max(minConflictVoxelWeight, maxDirtyTsdfReplaceWeight))
+                            cleanEvidence.HighWeight = true;
+                        if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+                        {
+                            cleanEvidence.NoProvenance = true;
+                        }
+                        else
+                        {
+                            if (provenance.LastOperation == "integrate")
+                                cleanEvidence.LastIntegrate = true;
+                            else if (provenance.LastOperation == "free_space_carve")
+                                cleanEvidence.LastCarve = true;
+                            else if (provenance.LastOperation == "replace" || provenance.LastOperation == "guarded_replace")
+                                cleanEvidence.LastReplace = true;
+                            else if (provenance.LastOperation == "band_repair" ||
+                                     provenance.LastOperation == "conflict_correct" ||
+                                     provenance.LastOperation == "cleanup_neighbor")
+                                cleanEvidence.LastRepair = true;
+                            if (provenance.IntegrateCount > 0 && provenance.CarveCount > 0)
+                                cleanEvidence.IntegrateCarveHistory = true;
+                            if (provenance.Frame > provenance.FirstFrame)
+                                cleanEvidence.MultiFrameHistory = true;
+                        }
+                        if (!_voxelAuditLifecycle.TryGetValue(index, out VoxelAuditLifecycle history))
+                        {
+                            cleanEvidence.NoLifecycle = true;
+                        }
+                        else
+                        {
+                            if (history.ConflictCount > 0)
+                                cleanEvidence.ConflictHistory = true;
+                            if (history.ReplaceCount > 0)
+                                cleanEvidence.ReplaceHistory = true;
+                        }
+                        if (_dirtyTsdfLastFrame != null &&
+                            index < _dirtyTsdfLastFrame.Length &&
+                            _dirtyTsdfLastFrame[index] != int.MinValue &&
+                            !VoxelIsDirtyQuarantined(index))
+                        {
+                            cleanEvidence.ExpiredDirty = true;
+                        }
+                    }
+                    if (VoxelIsDirtyQuarantined(index))
+                    {
+                        dirty = true;
+                        risky++;
+                    }
+                    if (VoxelHasPendingTsdfCorrection(index))
+                    {
+                        pending = true;
+                        risky++;
+                    }
+                    if (_voxelAuditLifecycle.TryGetValue(index, out VoxelAuditLifecycle life))
+                    {
+                        if (life.LastCause == "old_weight_locked")
+                        {
+                            oldLocked = true;
+                            risky++;
+                        }
+                        if (life.LastLockSubtype == "band_conflict")
+                        {
+                            bandConflict = true;
+                            risky++;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (weighted > 0 && risky <= 0)
+            cleanWeighted = true;
+        if (weighted <= 0)
+            emptyWeighted = true;
+    }
+
+    private void DetectPureGeometrySuspects(
+        List<Vector3> vertices,
+        List<int> triangles,
+        Dictionary<ulong, List<int>> edgeToTriangles,
+        Vector3[] centers,
+        Vector3[] normals,
+        bool[] nonManifold,
+        bool[] island,
+        bool[] normalRisk,
+        bool[] protrusionRisk,
+        bool[] doubleLayerRisk,
+        bool[] pureRisk)
+    {
+        int triangleCount = triangles.Count / 3;
+        float normalDotLimit = Mathf.Cos(Mathf.Clamp(pureGeometryNormalDeviationDegrees, 10f, 80f) * Mathf.Deg2Rad);
+        float parallelDot = Mathf.Clamp(pureGeometryParallelNormalDot, 0.75f, 1f);
+        float planeOffset = Mathf.Max(0.005f, voxelSizeMeters * pureGeometryPlaneOffsetVoxelScale);
+        List<int> neighbors = new List<int>(16);
+
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            if (normals[tri].sqrMagnitude < 0.0001f)
+                continue;
+            CollectAdjacentTriangles(triangles, edgeToTriangles, tri, neighbors);
+            if (neighbors.Count >= 2)
+            {
+                Vector3 reference = normals[neighbors[0]].normalized;
+                Vector3 normalSum = Vector3.zero;
+                Vector3 centerSum = Vector3.zero;
+                int valid = 0;
+                for (int i = 0; i < neighbors.Count; i++)
+                {
+                    int other = neighbors[i];
+                    Vector3 n = normals[other];
+                    if (n.sqrMagnitude < 0.0001f)
+                        continue;
+                    n.Normalize();
+                    if (Vector3.Dot(n, reference) < 0f)
+                        n = -n;
+                    normalSum += n;
+                    centerSum += centers[other];
+                    valid++;
+                }
+
+                if (valid >= 2 && normalSum.sqrMagnitude > 0.0001f)
+                {
+                    float neighborCoherence = normalSum.magnitude / valid;
+                    Vector3 averageNormal = normalSum.normalized;
+                    float currentDot = Mathf.Abs(Vector3.Dot(normals[tri].normalized, averageNormal));
+                    if (neighborCoherence >= parallelDot && currentDot < normalDotLimit)
+                        normalRisk[tri] = true;
+
+                    Vector3 averageCenter = centerSum / valid;
+                    float offset = Mathf.Abs(Vector3.Dot(centers[tri] - averageCenter, averageNormal));
+                    if (neighborCoherence >= parallelDot && currentDot >= parallelDot && offset >= planeOffset)
+                        protrusionRisk[tri] = true;
+                }
+            }
+
+            pureRisk[tri] = nonManifold[tri] || island[tri] || normalRisk[tri] || protrusionRisk[tri];
+        }
+
+        Dictionary<int, List<int>> spatial = new Dictionary<int, List<int>>(triangleCount);
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            if (!TryWorldToVoxel(centers[tri], out int x, out int y, out int z))
+                continue;
+            int key = Index(x, y, z);
+            if (!spatial.TryGetValue(key, out List<int> list))
+            {
+                list = new List<int>(4);
+                spatial.Add(key, list);
+            }
+            list.Add(tri);
+        }
+
+        float minSeparation = Mathf.Max(0.005f, voxelSizeMeters * pureGeometryMinLayerSeparationVoxelScale);
+        float maxSeparation = Mathf.Max(minSeparation, voxelSizeMeters * pureGeometryMaxLayerSeparationVoxelScale);
+        float maxLateral = Mathf.Max(0.005f, voxelSizeMeters * pureGeometryMaxLayerLateralVoxelScale);
+        int radius = Mathf.Clamp(Mathf.CeilToInt(pureGeometryMaxLayerSeparationVoxelScale), 1, 5);
+        HashSet<ulong> recordedPairs = new HashSet<ulong>();
+        HashSet<ulong> evaluatedPairs = new HashSet<ulong>();
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            if (!TryWorldToVoxel(centers[tri], out int cx, out int cy, out int cz) || normals[tri].sqrMagnitude < 0.0001f)
+                continue;
+            Vector3 normal = normals[tri].normalized;
+            bool found = false;
+            for (int dz = -radius; dz <= radius && !found; dz++)
+            for (int dy = -radius; dy <= radius && !found; dy++)
+            for (int dx = -radius; dx <= radius && !found; dx++)
+            {
+                if (dx * dx + dy * dy + dz * dz > radius * radius)
+                    continue;
+                int x = cx + dx;
+                int y = cy + dy;
+                int z = cz + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                    continue;
+                if (!spatial.TryGetValue(Index(x, y, z), out List<int> candidates))
+                    continue;
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    int other = candidates[i];
+                    if (other == tri || normals[other].sqrMagnitude < 0.0001f)
+                        continue;
+                    if (Mathf.Abs(Vector3.Dot(normal, normals[other].normalized)) < parallelDot)
+                        continue;
+                    Vector3 delta = centers[other] - centers[tri];
+                    float separation = Mathf.Abs(Vector3.Dot(delta, normal));
+                    if (separation < minSeparation || separation > maxSeparation)
+                        continue;
+                    float lateralSq = Mathf.Max(0f, delta.sqrMagnitude - separation * separation);
+                    if (lateralSq > maxLateral * maxLateral)
+                        continue;
+                    int pairA = Mathf.Min(tri, other);
+                    int pairB = Mathf.Max(tri, other);
+                    ulong pairKey = ((ulong)(uint)pairA << 32) | (uint)pairB;
+                    if (!evaluatedPairs.Add(pairKey))
+                        continue;
+                    if (!ValidateDoubleLayerPairSources(
+                            centers[pairA],
+                            centers[pairB],
+                            normals[pairA],
+                            normals[pairB]))
+                    {
+                        continue;
+                    }
+                    doubleLayerRisk[tri] = true;
+                    doubleLayerRisk[other] = true;
+                    pureRisk[tri] = true;
+                    pureRisk[other] = true;
+                    if (recordedPairs.Add(pairKey))
+                    {
+                        AppendDoubleLayerPairAudit(
+                            pairA,
+                            pairB,
+                            centers[pairA],
+                            centers[pairB],
+                            normals[pairA],
+                            normals[pairB],
+                            separation,
+                            Mathf.Sqrt(lateralSq));
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    private bool ValidateDoubleLayerPairSources(
+        Vector3 centerA,
+        Vector3 centerB,
+        Vector3 meshNormalA,
+        Vector3 meshNormalB)
+    {
+        if (!validateDoubleLayerWithWriteProvenance)
+        {
+            LastDoubleLayerValidatedPairCount++;
+            return true;
+        }
+        if (!TryResolveDoubleLayerSide(centerA, out DoubleLayerSideAudit sideA) ||
+            !TryResolveDoubleLayerSide(centerB, out DoubleLayerSideAudit sideB) ||
+            !sideA.HasProvenance ||
+            !sideB.HasProvenance)
+        {
+            LastDoubleLayerRejectedMissingSourceCount++;
+            return false;
+        }
+
+        Vector3 sourceNormalA = sideA.Provenance.SurfaceNormal;
+        Vector3 sourceNormalB = sideB.Provenance.SurfaceNormal;
+        if (sourceNormalA.sqrMagnitude < 0.0001f || sourceNormalB.sqrMagnitude < 0.0001f)
+        {
+            LastDoubleLayerRejectedSourceNormalCount++;
+            return false;
+        }
+        sourceNormalA.Normalize();
+        sourceNormalB.Normalize();
+        float sourceNormalDot = Vector3.Dot(sourceNormalA, sourceNormalB);
+        if (Mathf.Abs(sourceNormalDot) <
+            Mathf.Cos(Mathf.Clamp(doubleLayerMaxSourceNormalAngleDegrees, 1f, 60f) * Mathf.Deg2Rad))
+        {
+            LastDoubleLayerRejectedSourceNormalCount++;
+            return false;
+        }
+        if (sourceNormalDot < 0f)
+            sourceNormalB = -sourceNormalB;
+        Vector3 sourceNormal = sourceNormalA + sourceNormalB;
+        if (sourceNormal.sqrMagnitude < 0.0001f)
+        {
+            LastDoubleLayerRejectedSourceNormalCount++;
+            return false;
+        }
+        sourceNormal.Normalize();
+
+        Vector3 sourceDelta = sideB.Provenance.SurfacePoint - sideA.Provenance.SurfacePoint;
+        float sourcePlaneSeparation = Mathf.Abs(Vector3.Dot(sourceDelta, sourceNormal));
+        if (sourcePlaneSeparation < Mathf.Max(0.01f, doubleLayerMinSourcePlaneSeparationMeters))
+        {
+            LastDoubleLayerRejectedSourcePlaneCount++;
+            return false;
+        }
+        float sourceLateralSq = Mathf.Max(
+            0f,
+            sourceDelta.sqrMagnitude - sourcePlaneSeparation * sourcePlaneSeparation);
+        float maxSourceLateral = Mathf.Max(
+            voxelSizeMeters * 0.25f,
+            voxelSizeMeters * doubleLayerMaxSourceLateralVoxelScale);
+        if (sourceLateralSq > maxSourceLateral * maxSourceLateral)
+        {
+            LastDoubleLayerRejectedSourceLateralCount++;
+            return false;
+        }
+
+        Vector3 meshNormal = meshNormalA.normalized;
+        Vector3 alignedMeshB = meshNormalB.normalized;
+        if (Vector3.Dot(meshNormal, alignedMeshB) < 0f)
+            alignedMeshB = -alignedMeshB;
+        meshNormal = (meshNormal + alignedMeshB).normalized;
+        if (meshNormal.sqrMagnitude < 0.0001f ||
+            Mathf.Abs(Vector3.Dot(meshNormal, sourceNormal)) <
+            Mathf.Clamp01(doubleLayerMinMeshSourceNormalDot))
+        {
+            LastDoubleLayerMeshAlignmentMismatchCount++;
+        }
+
+        LastDoubleLayerValidatedPairCount++;
+        return true;
+    }
+
+    private struct DoubleLayerSideAudit
+    {
+        public bool Found;
+        public int Index;
+        public int X;
+        public int Y;
+        public int Z;
+        public float Tsdf;
+        public int Weight;
+        public bool Dirty;
+        public bool Pending;
+        public bool HasProvenance;
+        public VoxelWriteProvenance Provenance;
+    }
+
+    private void AppendDoubleLayerPairAudit(
+        int triangleA,
+        int triangleB,
+        Vector3 centerA,
+        Vector3 centerB,
+        Vector3 normalA,
+        Vector3 normalB,
+        float separation,
+        float lateral)
+    {
+        if (_doubleLayerPairRows == null)
+            return;
+        if (_doubleLayerPairRowCount >= Mathf.Max(1000, maxConfidenceAuditRowsPerCapture))
+        {
+            _doubleLayerPairDroppedRows++;
+            return;
+        }
+
+        TryResolveDoubleLayerSide(centerA, out DoubleLayerSideAudit sideA);
+        TryResolveDoubleLayerSide(centerB, out DoubleLayerSideAudit sideB);
+        VoxelWriteProvenance provenanceA = sideA.Provenance;
+        VoxelWriteProvenance provenanceB = sideB.Provenance;
+        bool bothProvenance = sideA.HasProvenance && sideB.HasProvenance;
+        int frameGap = bothProvenance ? Mathf.Abs(provenanceA.Frame - provenanceB.Frame) : -1;
+        float depthDelta = bothProvenance ? Mathf.Abs(provenanceA.SurfaceDepth - provenanceB.SurfaceDepth) : -1f;
+        float rayAngle = bothProvenance &&
+                         provenanceA.RayDirection.sqrMagnitude > 0.0001f &&
+                         provenanceB.RayDirection.sqrMagnitude > 0.0001f
+            ? Vector3.Angle(provenanceA.RayDirection, provenanceB.RayDirection)
+            : -1f;
+
+        StringBuilder row = _doubleLayerPairRows;
+        row.Append(_confidenceAuditCaptureIndex).Append(',')
+            .Append(LastRawFrameIndex).Append(',')
+            .Append(triangleA).Append(',')
+            .Append(triangleB).Append(',')
+            .Append(AuditFloat(separation)).Append(',')
+            .Append(AuditFloat(lateral)).Append(',')
+            .Append(AuditFloat(Mathf.Abs(Vector3.Dot(normalA.normalized, normalB.normalized)))).Append(',');
+        AppendDoubleLayerSideAudit(row, centerA, sideA);
+        row.Append(',');
+        AppendDoubleLayerSideAudit(row, centerB, sideB);
+        row.Append(',')
+            .Append(bothProvenance && provenanceA.Frame == provenanceB.Frame ? 1 : 0).Append(',')
+            .Append(bothProvenance && provenanceA.Sample == provenanceB.Sample ? 1 : 0).Append(',')
+            .Append(frameGap).Append(',')
+            .Append(AuditFloat(depthDelta)).Append(',')
+            .Append(AuditFloat(rayAngle)).Append(',')
+            .Append(bothProvenance && provenanceA.IntegrateCount > 0 && provenanceB.IntegrateCount > 0 ? 1 : 0).Append(',')
+            .Append(bothProvenance && (provenanceA.CarveCount > 0 || provenanceB.CarveCount > 0) ? 1 : 0)
+            .AppendLine();
+        _doubleLayerPairRowCount++;
+    }
+
+    private bool TryResolveDoubleLayerSide(Vector3 world, out DoubleLayerSideAudit side)
+    {
+        side = new DoubleLayerSideAudit();
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(world, out int cx, out int cy, out int cz))
+            return false;
+
+        int radius = Mathf.Clamp(tumorSuspectTsdfRadiusVoxels, 1, 2);
+        float bestScore = float.PositiveInfinity;
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            int weight = _weights[index];
+            if (weight <= 0)
+                continue;
+            float distanceSq = (VoxelCenter(x, y, z) - world).sqrMagnitude;
+            float score = Mathf.Abs(_tsdf[index]) * voxelSizeMeters * voxelSizeMeters + distanceSq;
+            if (score >= bestScore)
+                continue;
+
+            bestScore = score;
+            side.Found = true;
+            side.Index = index;
+            side.X = x;
+            side.Y = y;
+            side.Z = z;
+            side.Tsdf = _tsdf[index];
+            side.Weight = weight;
+            side.Dirty = VoxelIsDirtyQuarantined(index);
+            side.Pending = VoxelHasPendingTsdfCorrection(index);
+            side.HasProvenance = _voxelWriteProvenance.TryGetValue(index, out side.Provenance);
+        }
+        return side.Found;
+    }
+
+    private static void AppendDoubleLayerSideAudit(StringBuilder row, Vector3 center, DoubleLayerSideAudit side)
+    {
+        VoxelWriteProvenance provenance = side.Provenance;
+        row.Append(AuditFloat(center.x)).Append(',')
+            .Append(AuditFloat(center.y)).Append(',')
+            .Append(AuditFloat(center.z)).Append(',')
+            .Append(side.Found ? side.Index : -1).Append(',')
+            .Append(side.Found ? side.X : -1).Append(',')
+            .Append(side.Found ? side.Y : -1).Append(',')
+            .Append(side.Found ? side.Z : -1).Append(',')
+            .Append(side.Found ? AuditFloat(side.Tsdf) : "-1").Append(',')
+            .Append(side.Found ? side.Weight : 0).Append(',')
+            .Append(side.HasProvenance ? provenance.FirstFrame : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.Frame : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.Capture : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.Sample : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.PixelX : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.PixelY : -1).Append(',')
+            .Append(side.HasProvenance ? provenance.LastOperation : "untracked").Append(',')
+            .Append(side.HasProvenance ? provenance.WriteCount : 0).Append(',')
+            .Append(side.HasProvenance ? provenance.IntegrateCount : 0).Append(',')
+            .Append(side.HasProvenance ? provenance.CarveCount : 0).Append(',')
+            .Append(side.HasProvenance ? provenance.ReplaceCount : 0).Append(',')
+            .Append(side.HasProvenance ? provenance.RepairCount : 0).Append(',')
+            .Append(side.HasProvenance ? AuditFloat(provenance.SurfaceDepth) : "-1").Append(',')
+            .Append(side.HasProvenance ? AuditFloat(provenance.RayDirection.x) : "-1").Append(',')
+            .Append(side.HasProvenance ? AuditFloat(provenance.RayDirection.y) : "-1").Append(',')
+            .Append(side.HasProvenance ? AuditFloat(provenance.RayDirection.z) : "-1").Append(',')
+            .Append(side.Dirty ? 1 : 0).Append(',')
+            .Append(side.Pending ? 1 : 0);
+    }
+
+    private static void CollectAdjacentTriangles(
+        List<int> triangles,
+        Dictionary<ulong, List<int>> edgeToTriangles,
+        int tri,
+        List<int> neighbors)
+    {
+        neighbors.Clear();
+        int a = triangles[tri * 3];
+        int b = triangles[tri * 3 + 1];
+        int c = triangles[tri * 3 + 2];
+        CollectEdgeAdjacent(edgeToTriangles, EdgeKey(a, b), tri, neighbors);
+        CollectEdgeAdjacent(edgeToTriangles, EdgeKey(b, c), tri, neighbors);
+        CollectEdgeAdjacent(edgeToTriangles, EdgeKey(c, a), tri, neighbors);
+    }
+
+    private static void CollectEdgeAdjacent(
+        Dictionary<ulong, List<int>> edgeToTriangles,
+        ulong edge,
+        int tri,
+        List<int> neighbors)
+    {
+        if (!edgeToTriangles.TryGetValue(edge, out List<int> linked))
+            return;
+        for (int i = 0; i < linked.Count; i++)
+        {
+            int other = linked[i];
+            if (other != tri && !neighbors.Contains(other))
+                neighbors.Add(other);
+        }
+    }
+
+    private void MarkSmallOpenMeshIslands(
+        List<Vector3> vertices,
+        List<int> triangles,
+        Dictionary<ulong, List<int>> edgeToTriangles,
+        Vector3[] triangleCenters,
+        int[] boundaryEdgesPerTri,
+        bool[] riskHigh,
+        bool[] riskMedium,
+        bool[] islandRisk)
+    {
+        int triangleCount = triangles.Count / 3;
+        bool[] visited = new bool[triangleCount];
+        Queue<int> queue = new Queue<int>();
+        List<int> component = new List<int>(256);
+        int maxIslandTriangles = Mathf.Max(4, tumorSuspectSmallIslandMaxTriangles);
+        float extentLimit = Mathf.Max(0.02f, voxelSizeMeters * tumorSuspectSmallIslandExtentVoxelScale);
+        float boundaryLimit = Mathf.Clamp01(tumorSuspectOpenBoundaryRatio);
+
+        for (int start = 0; start < triangleCount; start++)
+        {
+            if (visited[start])
+                continue;
+
+            component.Clear();
+            visited[start] = true;
+            queue.Enqueue(start);
+            Vector3 min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+            Vector3 max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+            int edgeTotal = 0;
+            int boundaryTotal = 0;
+
+            while (queue.Count > 0)
+            {
+                int tri = queue.Dequeue();
+                component.Add(tri);
+                edgeTotal += 3;
+                boundaryTotal += tri < boundaryEdgesPerTri.Length ? boundaryEdgesPerTri[tri] : 0;
+
+                int a = triangles[tri * 3];
+                int b = triangles[tri * 3 + 1];
+                int c = triangles[tri * 3 + 2];
+                if (TriangleIndicesValid(vertices, a, b, c))
+                {
+                    min = Vector3.Min(min, vertices[a]);
+                    min = Vector3.Min(min, vertices[b]);
+                    min = Vector3.Min(min, vertices[c]);
+                    max = Vector3.Max(max, vertices[a]);
+                    max = Vector3.Max(max, vertices[b]);
+                    max = Vector3.Max(max, vertices[c]);
+                }
+
+                EnqueueTriNeighbors(triangles, edgeToTriangles, tri, visited, queue);
+            }
+
+            if (component.Count <= 0 || edgeTotal <= 0 || !Finite(min) || !Finite(max))
+                continue;
+
+            Vector3 extent = max - min;
+            float maxExtent = Mathf.Max(extent.x, Mathf.Max(extent.y, extent.z));
+            float boundaryRatio = (float)boundaryTotal / edgeTotal;
+            bool smallOpenIsland = component.Count <= maxIslandTriangles &&
+                                   maxExtent <= extentLimit &&
+                                   boundaryRatio >= boundaryLimit;
+            if (!smallOpenIsland)
+                continue;
+
+            LastTumorIslandTriangleCount += component.Count;
+            AnalyzeIslandBoundaryCauses(component, vertices, triangles, triangleCenters, boundaryEdgesPerTri);
+            for (int i = 0; i < component.Count; i++)
+            {
+                int tri = component[i];
+                islandRisk[tri] = true;
+                bool unsafeTsdf = MeshPointTouchesUnsafeTsdf(triangleCenters[tri]);
+                if (unsafeTsdf && boundaryRatio >= Mathf.Min(0.9f, boundaryLimit + 0.18f))
+                    riskHigh[tri] = true;
+                else
+                    riskMedium[tri] = true;
+            }
+        }
+    }
+
+    private void AnalyzeIslandBoundaryCauses(
+        List<int> component,
+        List<Vector3> vertices,
+        List<int> triangles,
+        Vector3[] triangleCenters,
+        int[] boundaryEdgesPerTri)
+    {
+        if (component == null || component.Count <= 0 || vertices == null || triangles == null)
+            return;
+
+        LastIslandCauseComponentCount++;
+        HashSet<int> sampled = new HashSet<int>();
+        int supportedCleanNearSurface = 0;
+        int blockedOrMissing = 0;
+
+        for (int i = 0; i < component.Count; i++)
+        {
+            int tri = component[i];
+            if (tri < 0 || tri * 3 + 2 >= triangles.Count)
+                continue;
+            if (boundaryEdgesPerTri != null && tri < boundaryEdgesPerTri.Length && boundaryEdgesPerTri[tri] <= 0)
+                continue;
+
+            CountIslandBoundaryCauseSample(triangleCenters != null && tri < triangleCenters.Length ? triangleCenters[tri] : Vector3.zero, sampled, ref supportedCleanNearSurface, ref blockedOrMissing);
+
+            int a = triangles[tri * 3];
+            int b = triangles[tri * 3 + 1];
+            int c = triangles[tri * 3 + 2];
+            if (!TriangleIndicesValid(vertices, a, b, c))
+                continue;
+
+            CountIslandBoundaryCauseSample(vertices[a], sampled, ref supportedCleanNearSurface, ref blockedOrMissing);
+            CountIslandBoundaryCauseSample(vertices[b], sampled, ref supportedCleanNearSurface, ref blockedOrMissing);
+            CountIslandBoundaryCauseSample(vertices[c], sampled, ref supportedCleanNearSurface, ref blockedOrMissing);
+        }
+
+        LastIslandCauseBoundaryVoxelCount += sampled.Count;
+        if (sampled.Count <= 0 || supportedCleanNearSurface >= Mathf.Max(1, blockedOrMissing))
+            LastIslandCausePrunedCount += component.Count;
+    }
+
+    private void CountIslandBoundaryCauseSample(
+        Vector3 world,
+        HashSet<int> sampled,
+        ref int supportedCleanNearSurface,
+        ref int blockedOrMissing)
+    {
+        if (!Finite(world) || sampled == null)
+            return;
+
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(world, out int cx, out int cy, out int cz))
+        {
+            LastIslandCauseNoTsdfCount++;
+            blockedOrMissing++;
+            return;
+        }
+
+        int radius = Mathf.Clamp(tumorSuspectTsdfRadiusVoxels, 0, 2);
+        float nearSurface = Mathf.Max(0.02f, maxCleanLightCoverAbsTsdf);
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int z = cz + dz;
+            if (z < 0 || z >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int y = cy + dy;
+                if (y < 0 || y >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int x = cx + dx;
+                    if (x < 0 || x >= _dimX)
+                        continue;
+
+                    int index = Index(x, y, z);
+                    if (!sampled.Add(index))
+                        continue;
+
+                    int weight = _weights[index];
+                    if (VoxelIsDirtyQuarantined(index))
+                    {
+                        LastIslandCauseDirtyCount++;
+                        blockedOrMissing++;
+                    }
+                    else if (VoxelHasPendingTsdfCorrection(index))
+                    {
+                        LastIslandCausePendingCount++;
+                        blockedOrMissing++;
+                    }
+                    else if (weight <= 0)
+                    {
+                        LastIslandCauseNoTsdfCount++;
+                        blockedOrMissing++;
+                    }
+                    else if (weight < Mathf.Max(1, minSurfaceCornerWeight))
+                    {
+                        LastIslandCauseLowWeightCount++;
+                        blockedOrMissing++;
+                    }
+                    else if (Mathf.Abs(_tsdf[index]) > nearSurface)
+                    {
+                        LastIslandCausePlaneMismatchCount++;
+                        blockedOrMissing++;
+                    }
+                    else
+                    {
+                        supportedCleanNearSurface++;
+                    }
+                }
+            }
+        }
+    }
+
+    private Color MeshTumorCauseColor(bool dirty, bool nonManifold, bool island, bool open, bool longEdge, bool high)
+    {
+        if (dirty)
+            return tumorCauseDirtyColor;
+        if (nonManifold)
+            return tumorCauseNonManifoldColor;
+        if (island)
+            return tumorCauseIslandColor;
+        if (longEdge)
+            return tumorCauseLongEdgeColor;
+        if (open)
+            return tumorCauseOpenColor;
+        return high ? tumorSuspectHighColor : tumorSuspectMediumColor;
+    }
+
+    private bool MeshPointTouchesUnsafeTsdf(Vector3 world)
+    {
+        if (_tsdf == null || _weights == null || !TryWorldToVoxel(world, out int x, out int y, out int z))
+            return false;
+
+        int radius = Mathf.Clamp(tumorSuspectTsdfRadiusVoxels, 0, 2);
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int vz = z + dz;
+            if (vz < 0 || vz >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int vy = y + dy;
+                if (vy < 0 || vy >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int vx = x + dx;
+                    if (vx < 0 || vx >= _dimX)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void AccumulateMeshTsdfRepairState(
+        Vector3 world,
+        ref bool dirty,
+        ref bool pending,
+        ref bool hitBlocked,
+        ref bool weightBlocked,
+        ref bool replaceReady)
+    {
+        if (_tsdf == null ||
+            _weights == null ||
+            _correctionTsdfHits == null ||
+            !TryWorldToVoxel(world, out int x, out int y, out int z))
+        {
+            return;
+        }
+
+        int radius = Mathf.Clamp(tumorSuspectTsdfRadiusVoxels, 0, 2);
+        int minHits = Mathf.Max(1, minDirtyTsdfReplaceFrames);
+        int maxWeight = Mathf.Max(1, maxDirtyTsdfReplaceWeight);
+        for (int dz = -radius; dz <= radius; dz++)
+        {
+            int vz = z + dz;
+            if (vz < 0 || vz >= _dimZ)
+                continue;
+            for (int dy = -radius; dy <= radius; dy++)
+            {
+                int vy = y + dy;
+                if (vy < 0 || vy >= _dimY)
+                    continue;
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    int vx = x + dx;
+                    if (vx < 0 || vx >= _dimX)
+                        continue;
+
+                    int index = Index(vx, vy, vz);
+                    if (VoxelIsDirtyQuarantined(index))
+                        dirty = true;
+
+                    int hits = PendingTsdfCorrectionHits(index);
+                    if (hits <= 0)
+                        continue;
+
+                    pending = true;
+                    int weight = _weights[index];
+                    if (!replaceDirtyTsdfOnStableConflict)
+                        continue;
+                    if (weight > maxWeight)
+                    {
+                        weightBlocked = true;
+                        continue;
+                    }
+                    if (hits < minHits)
+                        hitBlocked = true;
+                    else
+                        replaceReady = true;
+                }
+            }
+        }
+    }
+
+    private static bool TriangleIndicesValid(List<Vector3> vertices, int a, int b, int c)
+    {
+        return vertices != null &&
+               a >= 0 && b >= 0 && c >= 0 &&
+               a < vertices.Count && b < vertices.Count && c < vertices.Count;
+    }
+
+    private static void PaintRiskVertex(List<Color> colors, bool[] vertexRisk, int index, Color color)
+    {
+        if (colors == null || vertexRisk == null || index < 0 || index >= colors.Count || index >= vertexRisk.Length)
+            return;
+
+        if (!vertexRisk[index] || RiskColorRank(color) > RiskColorRank(colors[index]))
+            colors[index] = color;
+        vertexRisk[index] = true;
+    }
+
+    private static int RiskColorRank(Color color)
+    {
+        if (color.r > 0.9f && color.g < 0.2f)
+            return 5;
+        if (color.b > 0.8f && color.r > 0.5f && color.g < 0.35f)
+            return 4;
+        if (color.r > 0.9f && color.g > 0.35f && color.g < 0.8f)
+            return 3;
+        if (color.b > 0.8f && color.g > 0.6f)
+            return 2;
+        if (color.r > 0.9f && color.g >= 0.8f)
+            return 2;
+        return 1;
     }
 
     private void AnalyzeMeshComponents(List<int> triangles, Dictionary<ulong, List<int>> edgeToTriangles, int triangleCount)
@@ -4653,7 +12589,96 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _wireMeshFilter.sharedMesh = _wireMesh;
         _wireMeshRenderer.sharedMaterial = ResolveWireMaterial();
         _wireObject.SetActive(showMeshEdgeWireOverlay || showPlanarCoverWireOverlay);
+        EnsureDirtyTsdfEvidenceObjects();
+        EnsureRawDepthDebugObjects();
+        ApplyRawDepthDebugDisplayMode();
         EnsureDiagnosticHud();
+    }
+
+    private void ApplyRawDepthDebugDisplayMode()
+    {
+        bool coverageOverlay = enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay;
+        bool hideMeshForCoverage = coverageOverlay && hideMeshWhenRawCoverageGridOverlay;
+        if (_meshRenderer != null)
+            _meshRenderer.enabled = !showRawDepthDebugView && !hideMeshForCoverage && (showPlanarCoverSurfaceFill || !renderStableCellsAsPlanarMeshCover || !showPlanarCoverWireOverlay);
+        if (_wireObject != null)
+            _wireObject.SetActive(!showRawDepthDebugView && !hideMeshForCoverage && (showMeshEdgeWireOverlay || showPlanarCoverWireOverlay));
+        if (_rawDepthDebugObject != null)
+            _rawDepthDebugObject.SetActive((showRawDepthDebugView || coverageOverlay) && LastRawDepthDebugRenderedCount > 0);
+    }
+
+    private void EnsureDirtyTsdfEvidenceObjects()
+    {
+        if (_dirtyEvidenceObject == null)
+            _dirtyEvidenceObject = new GameObject("[ScanCover] Dirty TSDF Evidence");
+
+        if (forceWorldSpaceDisplay)
+        {
+            _dirtyEvidenceObject.transform.SetParent(null, true);
+            _dirtyEvidenceObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _dirtyEvidenceObject.transform.localScale = Vector3.one;
+        }
+        else if (_dirtyEvidenceObject.transform.parent != displayRoot)
+        {
+            _dirtyEvidenceObject.transform.SetParent(displayRoot, false);
+        }
+
+        if (_dirtyEvidenceMeshFilter == null)
+            _dirtyEvidenceMeshFilter = _dirtyEvidenceObject.GetComponent<MeshFilter>();
+        if (_dirtyEvidenceMeshFilter == null)
+            _dirtyEvidenceMeshFilter = _dirtyEvidenceObject.AddComponent<MeshFilter>();
+
+        if (_dirtyEvidenceRenderer == null)
+            _dirtyEvidenceRenderer = _dirtyEvidenceObject.GetComponent<MeshRenderer>();
+        if (_dirtyEvidenceRenderer == null)
+            _dirtyEvidenceRenderer = _dirtyEvidenceObject.AddComponent<MeshRenderer>();
+
+        if (_dirtyEvidenceMesh == null)
+        {
+            _dirtyEvidenceMesh = new Mesh { name = "ScanCover_DirtyTsdfEvidence" };
+            _dirtyEvidenceMesh.indexFormat = IndexFormat.UInt32;
+        }
+
+        _dirtyEvidenceMeshFilter.sharedMesh = _dirtyEvidenceMesh;
+        _dirtyEvidenceRenderer.sharedMaterial = ResolveDirtyEvidenceMaterial();
+        _dirtyEvidenceObject.SetActive(false);
+    }
+
+    private void EnsureRawDepthDebugObjects()
+    {
+        if (_rawDepthDebugObject == null)
+            _rawDepthDebugObject = new GameObject("[ScanCover] Raw Depth Debug");
+
+        if (forceWorldSpaceDisplay)
+        {
+            _rawDepthDebugObject.transform.SetParent(null, true);
+            _rawDepthDebugObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _rawDepthDebugObject.transform.localScale = Vector3.one;
+        }
+        else if (_rawDepthDebugObject.transform.parent != displayRoot)
+        {
+            _rawDepthDebugObject.transform.SetParent(displayRoot, false);
+        }
+
+        if (_rawDepthDebugMeshFilter == null)
+            _rawDepthDebugMeshFilter = _rawDepthDebugObject.GetComponent<MeshFilter>();
+        if (_rawDepthDebugMeshFilter == null)
+            _rawDepthDebugMeshFilter = _rawDepthDebugObject.AddComponent<MeshFilter>();
+
+        if (_rawDepthDebugRenderer == null)
+            _rawDepthDebugRenderer = _rawDepthDebugObject.GetComponent<MeshRenderer>();
+        if (_rawDepthDebugRenderer == null)
+            _rawDepthDebugRenderer = _rawDepthDebugObject.AddComponent<MeshRenderer>();
+
+        if (_rawDepthDebugMesh == null)
+        {
+            _rawDepthDebugMesh = new Mesh { name = "ScanCover_RawDepthDebug" };
+            _rawDepthDebugMesh.indexFormat = IndexFormat.UInt32;
+        }
+
+        _rawDepthDebugMeshFilter.sharedMesh = _rawDepthDebugMesh;
+        _rawDepthDebugRenderer.sharedMaterial = ResolveRawDepthDebugMaterial();
+        _rawDepthDebugObject.SetActive((showRawDepthDebugView || (enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay)) && LastRawDepthDebugRenderedCount > 0);
     }
 
     private void EnsureDiagnosticHud()
@@ -4771,7 +12796,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         bool renderBudgetExceeded = useChunkedSurfaceSamples && fallbackSampleCount > maxFallbackSurfaceSamples;
         bool mainShellIsHolding = LastCandidateShellHeldCellCount + LastDetailCandidateHeldCellCount > Mathf.Max(128, LastMainShellPromotedCellCount);
         bool meshDiagnosticsWarning = LastDiagSuspectPatchCount > 0 || LastDiagNonManifoldEdgeCount > 0;
-        bool warning = invalidRatio > 0.35f || denseOutsideIsBlocking || acceptRatio < 0.25f || LastSkippedFallbackCapacityCount > 0 || LastSurfaceCellConflictCount > 0 || renderBudgetExceeded || mainShellIsHolding || meshDiagnosticsWarning;
+        bool tumorSuspectWarning = LastTumorSuspectTriangleCount > 0;
+        bool warning = invalidRatio > 0.35f || denseOutsideIsBlocking || acceptRatio < 0.25f || LastSkippedFallbackCapacityCount > 0 || LastSurfaceCellConflictCount > 0 || renderBudgetExceeded || mainShellIsHolding || meshDiagnosticsWarning || tumorSuspectWarning;
         _hudText.color = warning ? hudWarningColor : hudHealthyColor;
 
         string likelyCause = "OK";
@@ -4785,6 +12811,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             likelyCause = "SURFACE CELL CAP HIT";
         else if (LastSurfaceCellConflictCount > 0)
             likelyCause = "SURFACE SIDE CONFLICT";
+        else if (tumorSuspectWarning)
+            likelyCause = "MESH SUSPECT OVERLAY";
         else if (meshDiagnosticsWarning)
             likelyCause = LastDiagLikelyCause;
         else if (LastRejectedDepthDiscontinuityCount > Mathf.Max(32, LastIntegratedSampleCount / 8))
@@ -4822,16 +12850,56 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             : (renderStableCellsAsPlanarMeshCover ? "LIGHT TSDF COVER" : "FALLBACK RAW CELLS");
         _hudText.text =
             "ScanCover SAFEHUD\n" +
-            $"State   : {(_captureRoutine != null ? "FUSING" : "READY")} / {likelyCause}\n" +
-            $"Mode    : {displayModeText}  frame={LastRawFrameIndex} fused={IntegratedFrameCount}\n" +
-            $"Input   : {LastIntegratedSampleCount}/{LastInputSampleCount} ({acceptRatio:P0}) rejects={totalRejects} edge={LastRejectedDepthDiscontinuityCount} robust={LastRejectedRobustDepthCount} support={LastRejectedTsdfDepthSupportCount}\n" +
-            $"Dirty   : wait={LastPendingTsdfCorrectionCount} corr={LastCorrectedTsdfCount} replace={LastReplacedDirtyTsdfCount} clean={LastCleanedDirtyTsdfNeighborCount} q={LastDirtyTsdfQuarantineCount} block={LastBlockedDirtyLightCoverSampleCount}/{TotalBlockedDirtyLightCoverSampleCount}\n" +
-            $"Cover   : rendered={LastRenderedFallbackSampleCount}/{lightCoverBudget} clean={LastCleanLightCoverCellCount} weak={LastUnstableLightCoverCellCount} risk={LastRiskLightCoverCellCount}\n" +
-            $"Cache   : cells={fallbackSampleCount} chunks={LastSurfaceChunkCount}/{maxSurfaceChunks} evict={LastEvictedSurfaceChunkCount}/{TotalEvictedSurfaceChunkCount} cells={LastEvictedSurfaceCellCount}/{TotalEvictedSurfaceCellCount}\n" +
-            $"Extract : cells={LastBuiltSurfaceCellVertexCount}/{LastSurfaceCellScanCount} cand S/R={LastStrictSurfaceCellCandidateCount}/{LastRelaxedSurfaceCellCandidateCount} rej no/gate/edge={LastRejectedNoSurfaceCellCount}/{LastRejectedMainGateCellCount}/{LastRejectedNoEdgeCellCount + LastRejectedEdgeCountCellCount}\n" +
-            $"Quads   : cand={LastSurfaceQuadCandidateCount} add={LastAddedSurfaceQuadCount} weak={LastRejectedWeakQuadCount} pre/comp/br/final={LastPrePruneMeshTriangleCount}/{LastPostComponentMeshTriangleCount}/{LastPostBridgeMeshTriangleCount}/{LastMeshTriangleCount}\n" +
-            $"Mesh    : verts={LastMeshVertexCount} tris={LastMeshTriangleCount} relax={LastRelaxedSurfaceEdgeCount}/{LastRejectedRelaxedQuadCount} bridge={LastAddedBoundaryBridgeCount}/{LastBoundaryBridgeCandidateCount}/{LastRejectedBoundaryBridgeCount} prune={LastPrunedComponentTriangleCount}/{LastPrunedDanglingTriangleCount}/{LastPrunedSpikeTriangleCount} gate pend={LastRejectedCorrectionPendingCellCount}/{LastRejectedCorrectionPendingQuadCount} dirty={LastRejectedDirtyQuarantineCellCount}/{LastRejectedDirtyQuarantineQuadCount}\n" +
-            $"Gates   : dirty={minDirtyTsdfReplaceFrames}/{maxDirtyTsdfReplaceWeight}/{dirtyTsdfCleanupRadiusVoxels}/{maxDirtyTsdfCleanupWeight}/{(cleanupOnlyPendingDirtyTsdfNeighbors ? "pending" : "sign")}/{dirtyTsdfQuarantineFrames} light={lightCoverBudget}/{(renderOnlyStableLightCoverCells ? minLightCoverCellHits.ToString() : "all")} key={(useSideAwareLightCoverKeys ? "side" : "stable")} norm={(splitLightCoverNormalConflicts ? "split" : "keep")} clean={(requireNearZeroTsdfForLightCover ? "tsdf" : "q")}/r{cleanLightCoverCheckRadiusVoxels} support={supportGateText}";
+            $"State : {(_captureRoutine != null ? "FUSING" : "READY")} / {likelyCause}\n" +
+            $"Mode  : {displayModeText} f={LastRawFrameIndex} fused={IntegratedFrameCount} in={LastIntegratedSampleCount}/{LastInputSampleCount} {acceptRatio:P0}\n" +
+            $"Vote  : {observationVoteMode} A/P/R={_auditVoteAcceptCount}/{_auditVotePendingCount}/{_auditVoteRejectCount} blocked={_auditVoteEnforcedRejectCount}\n" +
+            $"Entry : strongA={LastVoteStrongCurrentAcceptCount} same/cross={LastVoteSameFrameConflictRejectCount}/{LastVoteCrossFrameCleanConflictRejectCount} pending={LastVotePendingHoldCount}/{LastVotePendingConfirmedWriteCount}\n" +
+            $"Formal: ok/block/prov={LastFormalIntegrateWriteCount}/{LastFormalIntegrateBlockedCount}/{LastFormalIntegrateProvisionalCount} strongBlock={LastFormalIntegrateBlockStrongCurrentHistoryCount}\n" +
+            $"FLocal: pass/block s/st/a/r={LastFormalStrongCurrentLocalHistoryBypassCount}/{LastFormalStrongCurrentLocalHistoryBlockLocalCount} {LastFormalStrongCurrentLocalHistoryBlockSupportCount}/{LastFormalStrongCurrentLocalHistoryBlockStableCount}/{LastFormalStrongCurrentLocalHistoryBlockAxialCount}/{LastFormalStrongCurrentLocalHistoryBlockResidualCount}\n" +
+            $"Promote: strong={LastStrongCurrentProvisionalPromotedCount}/{LastStrongCurrentProvisionalPromotionBlockedCount} hits>={minStrongCurrentProvisionalHits} w>={minStrongCurrentProvisionalWeight}\n" +
+            $"PBlock: no(n/f)={LastStrongCurrentProvisionalBlockNoProvisionalCount}({LastStrongCurrentProvisionalBlockNoProvisionalNearSurfaceCount}/{LastStrongCurrentProvisionalBlockNoProvisionalFarBandCount}) hit/w/hist/frm/local={LastStrongCurrentProvisionalBlockHitsCount}/{LastStrongCurrentProvisionalBlockWeightCount}/{LastStrongCurrentProvisionalBlockCleanHistoryCount + LastStrongCurrentProvisionalBlockAgreementCount + LastStrongCurrentProvisionalBlockBandHistoryCount}/{LastStrongCurrentProvisionalBlockSameFrameCount + LastStrongCurrentProvisionalBlockCrossFrameCount}/{LastStrongCurrentProvisionalBlockLocalCount}\n" +
+            $"Seed  : strong={LastStrongSampleSeedWriteCount}/{LastStrongSampleSeedBlockedCount} tempBlock={LastStrongSampleSeedTemporaryBlockedCount} lock={(lockStrongSampleSeedToTemporaryTsdf ? 1 : 0)}\n" +
+            $"RawCov: cells={LastRawCoverageGridCellCount} A/P/M={LastRawCoverageAcceptedCellCount}/{LastRawCoverageProblemCellCount}/{LastRawCoverageMixedCellCount} compA={LastRawCoverageAcceptedComponentCount}/{LastRawCoverageLargestAcceptedComponentCells} compP={LastRawCoverageProblemComponentCount}/{LastRawCoverageLargestProblemComponentCells}\n" +
+            $"Dirty : wait={LastPendingTsdfCorrectionCount} rep={LastReplacedDirtyTsdfCount} guard={LastGuardedDirtyTsdfReplaceCount} hBlock={LastDirtyTsdfReplaceBlockedHitsCount} cleanH={LastDirtyTsdfReplaceBlockedCleanHistoryCount} active={LastDirtyTsdfActiveCount}\n" +
+            $"Clear : cand={LastFreeSpaceEvidenceCandidateCount} new/rep/wait={LastFreeSpaceEvidenceNewCount}/{LastFreeSpaceEvidenceRepeatCount}/{LastFreeSpaceEvidenceWaitingCount} apply/clear={LastFreeSpaceEvidenceAppliedCount}/{LastFreeSpaceEvidenceClearedCount} block hi/same/dup={LastFreeSpaceEvidenceBlockedHighWeightCount}/{LastFreeSpaceEvidenceBlockedSameFrameCount}/{LastFreeSpaceEvidenceDuplicateFrameCount} cancel={LastFreeSpaceEvidenceCancelledBySurfaceCount}\n" +
+            $"Metab : cand={LastOldCleanMetabolismCandidateCount} skip={LastOldCleanMetabolismSkippedWeakBandCount}/{LastOldCleanMetabolismSkippedWeakCrossFrameCount} watch={LastOldCleanMetabolismWatchCount} wait={LastOldCleanMetabolismWaitingHitsCount} d/c={LastOldCleanMetabolismDecayCount}/{LastOldCleanMetabolismClearCount} block={LastOldCleanMetabolismBlockedCount}\n" +
+            $"Mesh  : tris={LastMeshTriangleCount} suspect={LastTumorSuspectTriangleCount} dirty={LastTumorDirtyTriangleCount}\n" +
+            $"Shape : island/open/long={LastTumorIslandTriangleCount}/{LastTumorOpenEdgeTriangleCount}/{LastTumorLongEdgeTriangleCount}\n" +
+            $"Island: comp={LastIslandCauseComponentCount} no/p/d/low/plane/prn={LastIslandCauseNoTsdfCount}/{LastIslandCausePendingCount}/{LastIslandCauseDirtyCount}/{LastIslandCauseLowWeightCount}/{LastIslandCausePlaneMismatchCount}/{LastIslandCausePrunedCount}\n" +
+            $"Cont  : prov={LastProvisionalTsdfSupportWriteCount}/{LastProvisionalTsdfSupportBlockedCount} conf/ret={LastProvisionalTsdfConfirmedCount}/{LastProvisionalTsdfRetiredCount} fill={LastTsdfContinuityFilledCount} same/mix/pN={LastTsdfContinuitySameSignFilledCount}/{LastTsdfContinuityMixedSignFilledCount}/{LastTsdfContinuityProvisionalNeighborCount} bNo={LastTsdfBoundaryNoTsdfFilledCount}/{LastTsdfBoundaryNoTsdfCandidateCount}\n" +
+            $"BNoBlk: sup/face/axis/anchor/prov/near={LastTsdfBoundaryNoTsdfBlockedSupportCount}/{LastTsdfBoundaryNoTsdfBlockedFaceCount}/{LastTsdfBoundaryNoTsdfBlockedAxisCount}/{LastTsdfBoundaryNoTsdfBlockedCleanAnchorCount}/{LastTsdfBoundaryNoTsdfBlockedProvisionalAnchorCount}/{LastTsdfBoundaryNoTsdfBlockedNearSurfaceCount} joint/zero={LastTsdfBoundaryNoTsdfVerifiedJointAnchorFilledCount}/{LastTsdfBoundaryNoTsdfZeroCleanJointAnchorFilledCount}\n" +
+            $"BNoPrv: present/face/ok/okF={LastTsdfBoundaryNoTsdfProvisionalPresentNeighborCount}/{LastTsdfBoundaryNoTsdfProvisionalFacePresentCount}/{LastTsdfBoundaryNoTsdfProvisionalAcceptedNeighborCount}/{LastTsdfBoundaryNoTsdfProvisionalAcceptedFaceCount} block w/d/t/r/p/nf={LastTsdfBoundaryNoTsdfProvisionalBlockedWeightCount}/{LastTsdfBoundaryNoTsdfProvisionalBlockedDirtyPendingCount}/{LastTsdfBoundaryNoTsdfProvisionalBlockedTsdfCount}/{LastTsdfBoundaryNoTsdfProvisionalBlockedResidualCount}/{LastTsdfBoundaryNoTsdfProvisionalBlockedProvenanceCount}/{LastTsdfBoundaryNoTsdfProvisionalBlockedNotFaceCount}\n" +
+            $"BNoFace: hist0..6={LastTsdfBoundaryNoTsdfFaceSupport0Count}/{LastTsdfBoundaryNoTsdfFaceSupport1Count}/{LastTsdfBoundaryNoTsdfFaceSupport2Count}/{LastTsdfBoundaryNoTsdfFaceSupport3Count}/{LastTsdfBoundaryNoTsdfFaceSupport4Count}/{LastTsdfBoundaryNoTsdfFaceSupport5Count}/{LastTsdfBoundaryNoTsdfFaceSupport6Count} deficit1/2+={LastTsdfBoundaryNoTsdfFaceDeficitOneCount}/{LastTsdfBoundaryNoTsdfFaceDeficitTwoPlusCount} two={LastTsdfBoundaryNoTsdfVerifiedTwoFaceFilledCount}/{LastTsdfBoundaryNoTsdfVerifiedTwoFaceCandidateCount}\n" +
+            $"FaceWhy: okC/P={LastTsdfBoundaryNoTsdfFaceSlotAcceptedCleanCount}/{LastTsdfBoundaryNoTsdfFaceSlotAcceptedProvisionalCount} block w/d/p/t/r/oob={LastTsdfBoundaryNoTsdfFaceSlotBlockedWeightCount}/{LastTsdfBoundaryNoTsdfFaceSlotBlockedDirtyPendingCount}/{LastTsdfBoundaryNoTsdfFaceSlotBlockedProvenanceCount}/{LastTsdfBoundaryNoTsdfFaceSlotBlockedTsdfCount}/{LastTsdfBoundaryNoTsdfFaceSlotBlockedResidualCount}/{LastTsdfBoundaryNoTsdfFaceSlotOutOfBoundsCount}\n" +
+            $"BNoSup: pass/d1/d2/d3/d4+={LastTsdfBoundaryNoTsdfSupportPassedCount}/{LastTsdfBoundaryNoTsdfSupportDeficitOneCount}/{LastTsdfBoundaryNoTsdfSupportDeficitTwoCount}/{LastTsdfBoundaryNoTsdfSupportDeficitThreeCount}/{LastTsdfBoundaryNoTsdfSupportDeficitFourPlusCount} okC/P={LastTsdfBoundaryNoTsdfSupportSlotAcceptedCleanCount}/{LastTsdfBoundaryNoTsdfSupportSlotAcceptedProvisionalCount}\n" +
+            $"SupWhy: block w/d/p/t/r/oob={LastTsdfBoundaryNoTsdfSupportSlotBlockedWeightCount}/{LastTsdfBoundaryNoTsdfSupportSlotBlockedDirtyPendingCount}/{LastTsdfBoundaryNoTsdfSupportSlotBlockedProvenanceCount}/{LastTsdfBoundaryNoTsdfSupportSlotBlockedTsdfCount}/{LastTsdfBoundaryNoTsdfSupportSlotBlockedResidualCount}/{LastTsdfBoundaryNoTsdfSupportSlotOutOfBoundsCount}\n" +
+            $"VBlock: near(+/-)={LastProvisionalTsdfNearSurfaceBlockedCount}({LastProvisionalTsdfNearSurfacePositiveBlockedCount}/{LastProvisionalTsdfNearSurfaceNegativeBlockedCount}) far={LastProvisionalTsdfFarBandSkippedCount} pending/formal={LastProvisionalTsdfPendingStabilityBlockedCount}/{LastProvisionalTsdfFormalDowngradeBlockedCount}\n" +
+            $"VPass : oldW/bootstrap={LastProvisionalTsdfExistingWeightBypassCount}/{LastProvisionalTsdfBootstrapLocalBypassCount} vote/sup/band/hist/frm/old/plane/local={LastProvisionalTsdfVoteBlockedCount + LastProvisionalTsdfScoreBlockedCount}/{LastProvisionalTsdfSupportRatioBlockedCount}/{LastProvisionalTsdfBandBlockedCount}/{LastProvisionalTsdfCleanHistoryBlockedCount}/{LastProvisionalTsdfSameFrameBlockedCount + LastProvisionalTsdfCrossFrameBlockedCount}/{LastProvisionalTsdfOldWeightBlockedCount + LastProvisionalTsdfConflictBlockedCount}/{LastProvisionalTsdfPlaneBlockedCount}/{LastProvisionalLocalSupportBlockedCount}\n" +
+            $"Plane : pass/block/noRef cand n/d={LastProvisionalPlaneCompatibilityPassCount}/{LastProvisionalPlaneCompatibilityBlockedCount}/{LastProvisionalPlaneCompatibilityNoReferenceCount} {LastProvisionalPlaneCompatibilityCandidateCount} {LastProvisionalPlaneCompatibilityNormalRejectedCount}/{LastProvisionalPlaneCompatibilityDistanceRejectedCount}\n" +
+            $"Geom  : pure={LastPureGeometrySuspectTriangleCount} bump={LastPureGeometryProtrusionTriangleCount} layer={LastPureGeometryDoubleLayerTriangleCount} ok={LastDoubleLayerValidatedPairCount}\n" +
+            $"Layer : ok={LastDoubleLayerValidatedPairCount} miss/norm/plane/lat={LastDoubleLayerRejectedMissingSourceCount}/{LastDoubleLayerRejectedSourceNormalCount}/{LastDoubleLayerRejectedSourcePlaneCount}/{LastDoubleLayerRejectedSourceLateralCount}\n" +
+            $"Cause : pend={LastTumorPendingTriangleCount} hBlock={LastTumorReplaceHitBlockedTriangleCount} wBlock={LastTumorReplaceWeightBlockedTriangleCount} band={_auditLockedBandConflictCount}\n" +
+            $"Audit : rows={_confidenceAuditRowCount} drop={_confidenceAuditDroppedRows} file={AuditDisplayName()}\n" +
+            $"Gate  : dirty={minDirtyTsdfReplaceFrames}/{maxDirtyTsdfReplaceWeight} guard={minGuardedDirtyTsdfReplaceFrames}/{maxGuardedDirtyTsdfReplaceWeight}/{maxGuardedDirtyTsdfReplaceAbsValue:F2}\n" +
+            (showRawDepthDebugView || showRawCoverageGridOverlay
+                ? "Legend: red=dirty/locked gray=reject yellow=edge pink=pending cyan=stable white=accepted\n"
+                : "Legend: red=dirty orange=island yellow=open cyan=stretch\n");
+    }
+
+    private string AuditDisplayName()
+    {
+        if (_confidenceAuditRows != null)
+            return _confidenceAuditStem + " (recording)";
+        if (string.IsNullOrEmpty(_lastConfidenceAuditPath))
+            return "off";
+        try
+        {
+            return Path.GetFileName(_lastConfidenceAuditPath);
+        }
+        catch (System.Exception)
+        {
+            return _lastConfidenceAuditPath;
+        }
     }
 
     private Material ResolveMaterial()
@@ -4882,6 +12950,44 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ConfigureTransparentMaterial(_wireRuntimeMaterial);
         _wireRuntimeMaterial.renderQueue = (int)RenderQueue.Transparent + 20;
         return _wireRuntimeMaterial;
+    }
+
+    private Material ResolveDirtyEvidenceMaterial()
+    {
+        if (_dirtyEvidenceMaterial == null)
+        {
+            Shader shader = Resources.Load<Shader>("ScanCoverSoftTransparentUnlit");
+            if (shader == null)
+                shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+                shader = Shader.Find("Sprites/Default");
+            _dirtyEvidenceMaterial = new Material(shader);
+            _dirtyEvidenceMaterial.name = "ScanCover_DirtyTsdfEvidence_Material";
+        }
+
+        ApplyMaterialColor(_dirtyEvidenceMaterial, Color.white);
+        ConfigureTransparentMaterial(_dirtyEvidenceMaterial);
+        _dirtyEvidenceMaterial.renderQueue = (int)RenderQueue.Overlay;
+        return _dirtyEvidenceMaterial;
+    }
+
+    private Material ResolveRawDepthDebugMaterial()
+    {
+        if (_rawDepthDebugMaterial == null)
+        {
+            Shader shader = Resources.Load<Shader>("ScanCoverSoftTransparentUnlit");
+            if (shader == null)
+                shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+                shader = Shader.Find("Sprites/Default");
+            _rawDepthDebugMaterial = new Material(shader);
+            _rawDepthDebugMaterial.name = "ScanCover_RawDepthDebug_Material";
+        }
+
+        ApplyMaterialColor(_rawDepthDebugMaterial, Color.white);
+        ConfigureTransparentMaterial(_rawDepthDebugMaterial);
+        _rawDepthDebugMaterial.renderQueue = (int)RenderQueue.Transparent + 60;
+        return _rawDepthDebugMaterial;
     }
 
     private static void ApplyMaterialColor(Material material, Color color)

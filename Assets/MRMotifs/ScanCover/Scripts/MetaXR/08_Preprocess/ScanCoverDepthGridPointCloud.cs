@@ -44,6 +44,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         public int frameIndex;
         public int resolutionWidth;
         public int resolutionHeight;
+        public double snapshotRealtimeSeconds;
+        public bool hasSnapshotCameraPose;
+        public Vector3 snapshotCameraPosition;
+        public Quaternion snapshotCameraRotation;
         public Vector3[] worldPositions;
         public Vector3[] worldNormals;
         public Color[] observationMeta;
@@ -9232,6 +9236,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             frameIndex = _latestRawDepthFrameSnapshot.frameIndex,
             resolutionWidth = _latestRawDepthFrameSnapshot.resolutionWidth,
             resolutionHeight = _latestRawDepthFrameSnapshot.resolutionHeight,
+            snapshotRealtimeSeconds = _latestRawDepthFrameSnapshot.snapshotRealtimeSeconds,
+            hasSnapshotCameraPose = _latestRawDepthFrameSnapshot.hasSnapshotCameraPose,
+            snapshotCameraPosition = _latestRawDepthFrameSnapshot.snapshotCameraPosition,
+            snapshotCameraRotation = _latestRawDepthFrameSnapshot.snapshotCameraRotation,
             worldPositions = (Vector3[])_latestRawDepthFrameSnapshot.worldPositions.Clone(),
             worldNormals = (Vector3[])_latestRawDepthFrameSnapshot.worldNormals.Clone(),
             observationMeta = (Color[])_latestRawDepthFrameSnapshot.observationMeta.Clone()
@@ -9642,6 +9650,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             meta[i] = observationMeta[i];
         }
         _rawDepthSnapshotFrameIndex++;
+        Camera snapshotCamera = Camera.main;
 
         _latestRawDepthFrameSnapshot = new RawDepthFrameSnapshot
         {
@@ -9649,6 +9658,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             frameIndex = _rawDepthSnapshotFrameIndex,
             resolutionWidth = resolution.x,
             resolutionHeight = resolution.y,
+            snapshotRealtimeSeconds = Time.realtimeSinceStartupAsDouble,
+            hasSnapshotCameraPose = snapshotCamera != null,
+            snapshotCameraPosition = snapshotCamera != null ? snapshotCamera.transform.position : Vector3.zero,
+            snapshotCameraRotation = snapshotCamera != null ? snapshotCamera.transform.rotation : Quaternion.identity,
             worldPositions = positions,
             worldNormals = normals,
             observationMeta = meta
