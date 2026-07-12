@@ -10,6 +10,12 @@ using UnityEngine.UI;
 [DisallowMultipleComponent]
 public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 {
+    private static readonly Vector3Int[] FaceDirections =
+    {
+        new Vector3Int(-1, 0, 0), new Vector3Int(1, 0, 0),
+        new Vector3Int(0, -1, 0), new Vector3Int(0, 1, 0),
+        new Vector3Int(0, 0, -1), new Vector3Int(0, 0, 1)
+    };
     [Header("Refs")]
     [SerializeField] private ScanCoverDepthGridPointCloud rawDepthSource;
     [SerializeField] private Transform volumeAnchor;
@@ -114,6 +120,100 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool rebuildMeshAfterEachCapture = true;
     [SerializeField] private bool showExtractedSurfaceMesh = true;
     [SerializeField] private bool useLegacyTsdfMeshDisplay = true;
+    [Header("Stage 03A Clean TSDF Iso-Surface")]
+    [SerializeField] private bool useStage03ACleanIsoSurface = true;
+    [SerializeField] private bool useV09LegacyExtractorForStage03A = true;
+    [SerializeField] private bool useV09ExactCornerEligibilityForDiagnosis = true;
+    [SerializeField] private bool useV08DirectBandWriteForDiagnosis = true;
+    [SerializeField] private bool requireCleanMeshVoxelProvenance = true;
+    [SerializeField] private bool allowVerifiedContinuityInCleanMesh = true;
+    [Header("Hard TSDF Write Audit")]
+    [SerializeField] private bool enableHardTsdfWriteAudit = true;
+    [SerializeField] private bool writeHardTsdfAuditOnCapture = true;
+    [SerializeField, Range(1, 128)] private int maxHardAuditVoxelSamplesPerStage = 32;
+    [Header("TSDF Surface Profile Diagnostics")]
+    [SerializeField] private bool writeHoleAndLayerDiagnosticsOnCapture = true;
+    [SerializeField, Range(12, 96)] private int layerDiagnosticRaysX = 48;
+    [SerializeField, Range(9, 72)] private int layerDiagnosticRaysY = 36;
+    [SerializeField, Range(0.25f, 1f)] private float layerDiagnosticStepVoxels = 0.5f;
+    [SerializeField, Range(256, 12000)] private int maxHoleDiagnosticRows = 4000;
+    [Header("Guarded Hole Side Repair")]
+    [SerializeField] private bool enableGuardedHoleSideRepair = true;
+    [SerializeField, Range(1, 2048)] private int maxHoleSideRepairsPerRebuild = 512;
+    [SerializeField, Range(1, 6)] private int minHoleSideRepairOppositeFaceSupport = 2;
+    [SerializeField, Range(1, 6)] private int minHoleSideRepairExistingFaceSupport = 2;
+    [SerializeField, Range(1, 8)] private int minHoleSideRepairBridgingCells = 1;
+    [SerializeField, Range(0.01f, 0.3f)] private float holeSideRepairAbsTsdf = 0.06f;
+    [SerializeField, Range(0.05f, 0.5f)] private float maxHoleSideRepairNeighborAbsTsdf = 0.25f;
+    [SerializeField] private bool blockHoleRepairThatCreatesMultipleZeroCrossings = true;
+    [SerializeField, Range(2, 8)] private int holeRepairZeroCrossingCheckRadiusVoxels = 4;
+    [SerializeField] private bool usePrimaryPlaneHoleRepair = true;
+    [SerializeField, Range(1, 4)] private int primaryPlaneHoleAnchorRadiusVoxels = 2;
+    [SerializeField, Range(3, 16)] private int minPrimaryPlaneHoleAnchors = 4;
+    [SerializeField, Range(0.75f, 1f)] private float minPrimaryPlaneHoleNormalDot = 0.92f;
+    [SerializeField, Range(0.01f, 0.2f)] private float maxPrimaryPlaneHoleResidualMeters = 0.06f;
+    [SerializeField, Range(0, 2)] private int primaryPlaneHoleBandRadiusVoxels = 1;
+    [SerializeField] private bool confirmPrimaryPlaneHoleBandsFromNearbyAccept = true;
+    [SerializeField, Range(1, 3)] private int primaryPlaneHoleAcceptRadiusVoxels = 1;
+    [SerializeField, Range(1, 4)] private int primaryPlaneHoleAcceptTangentialRadiusVoxels = 3;
+    [SerializeField, Range(0.5f, 1.5f)] private float primaryPlaneHoleAcceptNormalHalfThicknessVoxels = 0.75f;
+    [SerializeField, Range(0.01f, 0.12f)] private float primaryPlaneHoleAcceptMaxPlaneDistanceMeters = 0.05f;
+    [SerializeField, Range(0.01f, 0.3f)] private float primaryPlaneHoleAcceptMaxTsdfDelta = 0.18f;
+    [SerializeField, Range(1, 8)] private int primaryPlaneHoleMaxAgeFrames = 3;
+    [Header("Layer Pair Classification")]
+    [SerializeField, Range(0.03f, 0.25f)] private float duplicateLayerMaxGapMeters = 0.12f;
+    [SerializeField, Range(0.5f, 1f)] private float duplicateLayerMinNormalDot = 0.9f;
+    [SerializeField, Range(0.15f, 1f)] private float legalOcclusionMinGapMeters = 0.30f;
+    [SerializeField] private bool gateAtomicAcceptDuplicateLayers = true;
+    [SerializeField, Range(1, 5)] private int atomicAcceptDuplicateSearchRadiusVoxels = 2;
+    [SerializeField, Range(0.01f, 0.08f)] private float atomicAcceptDuplicateMinGapMeters = 0.03f;
+    [SerializeField, Range(1, 2048)] private int maxDuplicateLayerCleanupVoxelsPerRebuild = 512;
+    [SerializeField, Range(1, 4)] private int duplicateLayerCleanupWeightStep = 1;
+    [SerializeField, Range(2, 8)] private int duplicateLayerRepeatBoostThreshold = 2;
+    [SerializeField, Range(2, 16)] private int duplicateLayerMaxBoostedWeightStep = 8;
+    [Header("Atomic Observation TSDF Bands")]
+    [SerializeField] private bool useAtomicObservationTsdfBands = true;
+    [SerializeField, Range(0.05f, 0.5f)] private float atomicProvisionalBandWeightScale = 0.2f;
+    [SerializeField, Range(1, 4)] private int atomicProvisionalBandMaxWeight = 2;
+    [SerializeField, Range(0.5f, 1.25f)] private float projectiveVoxelCenterRadiusScale = 0.9f;
+    [Header("Accepted Sign Recovery")]
+    [SerializeField] private bool enableAcceptedSignRecovery = true;
+    [SerializeField, Range(2, 6)] private int acceptedSignRecoveryMinFrames = 3;
+    [SerializeField, Range(1, 6)] private int acceptedSignRecoveryMinNeighborSupport = 2;
+    [SerializeField, Range(0.05f, 0.6f)] private float acceptedSignRecoveryMaxAbsTsdf = 0.35f;
+    [SerializeField, Range(1, 16)] private int acceptedSignRecoveryOldWeightCap = 4;
+    [Header("Hole Boundary Diagnosis")]
+    [SerializeField] private bool showHoleBoundaryDiagnosis = true;
+    [SerializeField] private bool hideMeshWhileShowingHoleBoundaryDiagnosis = true;
+    [SerializeField, Range(128, 12000)] private int maxHoleBoundaryMarkers = 4000;
+    [SerializeField, Range(0.005f, 0.08f)] private float holeBoundaryMarkerSizeMeters = 0.025f;
+    [SerializeField, Range(8, 600)] private int holeBoundaryRetiredMemoryFrames = 180;
+    [SerializeField] private Color holeBoundaryWaitingColor = new Color(0.05f, 0.45f, 1f, 1f);
+    [SerializeField] private Color holeBoundaryRetiredColor = new Color(0.9f, 0.05f, 1f, 1f);
+    [SerializeField] private Color holeBoundaryNoBandColor = new Color(1f, 0.85f, 0.02f, 1f);
+    [SerializeField] private Color holeBoundaryPositiveOnlyColor = new Color(1f, 0.38f, 0.02f, 1f);
+    [SerializeField] private Color holeBoundaryNegativeOnlyColor = new Color(1f, 0.04f, 0.02f, 1f);
+    [SerializeField] private Color holeBoundarySpatialMissColor = new Color(1f, 0.05f, 0.58f, 1f);
+    [SerializeField] private Color holeBoundaryWeakCornersColor = new Color(0.05f, 1f, 0.95f, 1f);
+    [SerializeField] private Color holeCauseNoRawColor = new Color(0.45f, 0.45f, 0.45f, 1f);
+    [SerializeField] private Color holeCausePendingColor = new Color(0.05f, 0.45f, 1f, 1f);
+    [SerializeField] private Color holeCauseNoBandColor = new Color(1f, 0.85f, 0.02f, 1f);
+    [SerializeField] private Color holeCauseNoZeroCrossColor = new Color(1f, 0.32f, 0.02f, 1f);
+    [SerializeField] private Color holeCauseVertexRejectColor = new Color(0.05f, 1f, 0.95f, 1f);
+    [SerializeField] private Color holeCauseQuadRejectColor = new Color(0.95f, 0.08f, 0.75f, 1f);
+    [SerializeField] private Color holeCauseClearedColor = new Color(1f, 0.03f, 0.02f, 1f);
+    [SerializeField] private Color holeCauseFrameMismatchColor = Color.white;
+    [SerializeField] private Color holeCauseCrossFrameColor = new Color(0.62f, 0.08f, 1f, 1f);
+    [SerializeField] private Color primaryLayerDiagnosticColor = new Color(0.05f, 0.8f, 1f, 1f);
+    [SerializeField] private Color secondaryLayerDiagnosticColor = new Color(1f, 0.05f, 0.72f, 1f);
+    [Header("Layer Diagnostic Display")]
+    [SerializeField] private bool showMeshBehindLayerDiagnostics = true;
+    [SerializeField] private bool showMeshAsWireOnlyBehindLayerDiagnostics = true;
+    [SerializeField] private bool showGlobalPairedLayerDiagnostics = true;
+    [SerializeField] private bool showAllLayerDiagnosticMarkers = true;
+    [SerializeField, Range(12000, 100000)] private int maxFullLayerDiagnosticMarkers = 72000;
+    [SerializeField, Range(0.02f, 0.5f)] private float layerDiagnosticMaxAbsTsdf = 0.22f;
+    [SerializeField, Range(0.25f, 1f)] private float primaryLayerDiagnosticSizeScale = 0.6f;
     [SerializeField, Min(0)] private int maxSurfaceVertices = 180000;
     [SerializeField] private bool relaxSurfaceExtractionNearZero = true;
     [SerializeField, Range(0.02f, 0.45f)] private float nearZeroSurfaceThreshold = 0.14f;
@@ -139,6 +239,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool protectDisplayedMeshFromBadRebuild = false;
     [SerializeField, Range(0.1f, 1f)] private float minAcceptedRebuildTriangleRatio = 0.55f;
     [SerializeField, Range(0f, 1f)] private float maxAcceptedPrunedTriangleRatio = 0.45f;
+    [Header("Committed Mesh Stability")]
+    [SerializeField] private bool guardCommittedMeshSpatialCoverage = true;
+    [SerializeField, Range(0.5f, 1f)] private float minCommittedMeshBlockRetention = 0.90f;
+    [SerializeField, Range(1, 8)] private int committedMeshBlockSizeVoxels = 2;
+    [SerializeField] private bool useStrictCommittedMeshRetention = true;
+    [SerializeField, Range(0.8f, 1f)] private float minCommittedMeshTriangleRetention = 0.90f;
+    [SerializeField] private bool absorbNewBlocksFromHeldCandidate = false;
+    [SerializeField, Range(256, 20000)] private int maxHeldCandidateTrianglesToAbsorb = 6000;
     [SerializeField] private bool requireMainShellPromotionGate = true;
     [SerializeField, Range(1, 24)] private int minMainShellFusedFrames = 8;
     [SerializeField, Range(1, 3)] private int mainShellNeighborRadiusCells = 1;
@@ -490,6 +598,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private MeshFilter _rawDepthDebugMeshFilter;
     private MeshRenderer _rawDepthDebugRenderer;
     private Mesh _rawDepthDebugMesh;
+    private GameObject _holeBoundaryDiagnosticObject;
+    private MeshFilter _holeBoundaryDiagnosticMeshFilter;
+    private MeshRenderer _holeBoundaryDiagnosticRenderer;
+    private Mesh _holeBoundaryDiagnosticMesh;
     private Material _rawDepthDebugMaterial;
     private readonly List<Vector3> _rawDepthDebugPoints = new List<Vector3>(12000);
     private readonly List<RawDepthDebugKind> _rawDepthDebugKinds = new List<RawDepthDebugKind>(12000);
@@ -505,9 +617,66 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private Vector3 _activeTsdfSourceCamera;
     private Vector3 _activeTsdfSourceSurface;
     private bool _activeTsdfSourceValid;
+    private int _surfaceDiagnosticCaptureIndex;
+    private string _lastHoleDiagnosticPath = "off";
+    private string _lastLayerDiagnosticPath = "off";
+    private int _lastLayerNoZeroRayCount;
+    private int _lastLayerSingleZeroRayCount;
+    private int _lastLayerMultiZeroRayCount;
+    private int _lastLayerDisplayPairRayCount;
+    private int _lastLayerLegalOcclusionRayCount;
+    private int _lastLayerDuplicateRayCount;
+    private int _lastLayerAmbiguousRayCount;
+    private int _lastHoleDiagnosticRowCount;
+    public int LastHoleSideRepairCandidateCount { get; private set; }
+    public int LastHoleSideRepairAppliedCount { get; private set; }
+    public int LastHoleSideRepairBlockedSupportCount { get; private set; }
+    public int LastHoleSideRepairBlockedDirtyCount { get; private set; }
+    public int LastHoleSideRepairBlockedMultiZeroCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneCount { get; private set; }
+    public int LastHoleSideRepairPlaneBandVoxelCount { get; private set; }
+    public int LastHoleSideRepairPlaneConfirmedCount { get; private set; }
+    public int LastHoleSideRepairPlaneRetiredCount { get; private set; }
+    public int LastHoleSideRepairRetiredNoNearAcceptCount { get; private set; }
+    public int LastHoleSideRepairRetiredSignMismatchCount { get; private set; }
+    public int LastHoleSideRepairRetiredPlaneMismatchCount { get; private set; }
+    public int LastHoleSideRepairRetiredTsdfDeltaCount { get; private set; }
+    public int LastHoleSideRepairRetiredExpiredAfterPassCount { get; private set; }
+    public int LastHoleSideRepairPlaneDistance0ToHalfCount { get; private set; }
+    public int LastHoleSideRepairPlaneDistanceHalfTo075Count { get; private set; }
+    public int LastHoleSideRepairPlaneDistance075To1Count { get; private set; }
+    public int LastHoleSideRepairPlaneDistance1To15Count { get; private set; }
+    public int LastHoleSideRepairPlaneDistance15To2Count { get; private set; }
+    public int LastHoleSideRepairPlaneDistanceOver2Count { get; private set; }
+    public int LastAtomicAcceptDuplicateCandidateCount { get; private set; }
+    public int LastAtomicAcceptDuplicateDowngradeCount { get; private set; }
+    public int LastAtomicAcceptDuplicateSameSurfaceCount { get; private set; }
+    public int LastDuplicateLayerCleanupQueuedCount { get; private set; }
+    public int LastDuplicateLayerCleanupDecayedCount { get; private set; }
+    public int LastDuplicateLayerCleanupClearedCount { get; private set; }
+    public int LastDuplicateLayerCleanupBoostedCount { get; private set; }
+    public int LastDuplicateLayerCleanupMaxEvidence { get; private set; }
 
     private float[] _tsdf;
     private byte[] _weights;
+    private float[] _atomicProvisionalBandTsdf;
+    private byte[] _atomicProvisionalBandWeight;
+    private int[] _atomicProvisionalBandRetiredLastFrame;
+    private byte[] _atomicProvisionalBandRetiredSign;
+    private byte[] _surfaceBandVisitFlags;
+    private byte[] _surfaceBandAcceptSignLostFlags;
+    private int[] _acceptedPositiveLastSequence;
+    private int[] _acceptedNegativeLastSequence;
+    private int[] _acceptedPositiveRetainedLastSequence;
+    private int[] _acceptedNegativeRetainedLastSequence;
+    private int _acceptedWriteSequence;
+    private byte[] _acceptedSignRecoveryPositiveFrames;
+    private byte[] _acceptedSignRecoveryNegativeFrames;
+    private int[] _acceptedSignRecoveryPositiveLastFrame;
+    private int[] _acceptedSignRecoveryNegativeLastFrame;
+    private byte[] _surfaceObservationState;
+    private int[] _surfaceObservationLastFrame;
+    private int[] _clearedVoxelLastFrame;
     private float[] _pendingTsdf;
     private byte[] _pendingTsdfHits;
     private int[] _pendingTsdfLastFrame;
@@ -518,6 +687,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private byte[] _provisionalTsdf;
     private int[] _provisionalTsdfLastFrame;
     private byte[] _provisionalTsdfHits;
+    private readonly Dictionary<int, int> _primaryPlaneHoleConfirmations = new Dictionary<int, int>();
+    private readonly Dictionary<int, int> _primaryPlaneHoleLastValidationFrame = new Dictionary<int, int>();
+    private readonly Dictionary<int, byte> _primaryPlaneHoleAcceptEvidence = new Dictionary<int, byte>();
+    private readonly Dictionary<int, float> _primaryPlaneHoleMinPlaneDistanceVoxels = new Dictionary<int, float>();
+    private int _pendingPrimaryPlaneHoleAcceptConfirmedCount;
+    private readonly HashSet<Vector3Int> _committedMeshBlocks = new HashSet<Vector3Int>();
+    private readonly HashSet<Vector3Int> _candidateMeshBlocks = new HashSet<Vector3Int>();
     private byte[] _oldCleanConflictHits;
     private int[] _oldCleanConflictLastFrame;
     private byte[] _freeSpaceEvidenceHits;
@@ -610,6 +786,68 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastProvisionalTsdfConfirmedCount { get; private set; }
     public int LastProvisionalTsdfConfirmedByWeightCount { get; private set; }
     public int LastProvisionalTsdfRetiredCount { get; private set; }
+    public int LastAtomicAcceptedBandVoxelWriteCount { get; private set; }
+    public int LastAtomicProvisionalBandVoxelWriteCount { get; private set; }
+    public int LastAtomicPromotedProvisionalVoxelCount { get; private set; }
+    public int LastAtomicRetiredProvisionalVoxelCount { get; private set; }
+    public int LastHoleBoundaryWaitingCount { get; private set; }
+    public int LastHoleBoundaryRetiredCount { get; private set; }
+    public int LastHoleBoundaryNoBandCount { get; private set; }
+    public int LastHoleBoundaryPositiveOnlyCount { get; private set; }
+    public int LastHoleBoundaryNegativeOnlyCount { get; private set; }
+    public int LastHoleBoundarySpatialMissCount { get; private set; }
+    public int LastHoleBoundaryWeakCornersCount { get; private set; }
+    public int LastHoleBoundaryRenderedMarkerCount { get; private set; }
+    public int LastPrimaryLayerDiagnosticMarkerCount { get; private set; }
+    public int LastSecondaryLayerDiagnosticMarkerCount { get; private set; }
+    public int LastUnclassifiedLayerDiagnosticMarkerCount { get; private set; }
+    public int LastConfirmedSecondaryLayerVoxelCount { get; private set; }
+    public int LastLayerHoleTrendHoleLoad { get; private set; }
+    public int LastLayerHoleTrendSecondaryDelta { get; private set; }
+    public int LastLayerHoleTrendHoleDelta { get; private set; }
+    public float LastLayerHoleTrendCorrelation { get; private set; }
+    public int LastLayerHoleTrendSampleCount { get; private set; }
+    public int LastHoleCauseNoRawCount { get; private set; }
+    public int LastHoleCausePendingCount { get; private set; }
+    public int LastHoleCauseNoBandCount { get; private set; }
+    public int LastHoleCauseNoZeroCrossCount { get; private set; }
+    public int LastHoleCausePositiveOnlyCount { get; private set; }
+    public int LastHoleCauseNegativeOnlyCount { get; private set; }
+    public int LastMissingSideNoVisitCount { get; private set; }
+    public int LastMissingSideProvisionalCount { get; private set; }
+    public int LastMissingSideBlockedCount { get; private set; }
+    public int LastMissingSideAcceptLostCount { get; private set; }
+    public int LastMissingSidePendingNoPromoteCount { get; private set; }
+    public int LastMissingSideRejectCount { get; private set; }
+    public int LastMissingSideOtherBlockCount { get; private set; }
+    public int LastMissingSideAcceptedOverwrittenCount { get; private set; }
+    public int LastMissingSideAcceptedSpatialMissCount { get; private set; }
+    public int LastMissingSideAcceptedReflattenedCount { get; private set; }
+    public int LastReflattenedByCarveCount { get; private set; }
+    public int LastReflattenedByClearCount { get; private set; }
+    public int LastReflattenedByProvisionalCount { get; private set; }
+    public int LastReflattenedByOtherCount { get; private set; }
+    public int LastReflattenedByAcceptedWriterCount { get; private set; }
+    public int LastReflattenedByContinuityWriterCount { get; private set; }
+    public int LastReflattenedByFusionWriterCount { get; private set; }
+    public int LastReflattenedByUntrackedWriterCount { get; private set; }
+    public int LastHardAuditIntegrationCount { get; private set; }
+    public int LastHardAuditRetireCount { get; private set; }
+    public int LastHardAuditContinuityCount { get; private set; }
+    public int LastHardAuditExtractionCount { get; private set; }
+    public int LastHardAuditTsdfOnlyCount { get; private set; }
+    public int LastHardAuditWeightOnlyCount { get; private set; }
+    public int LastHardAuditBothCount { get; private set; }
+    public int LastMissingSideGoneCount { get; private set; }
+    public int LastMissingSideInvalidCount { get; private set; }
+    public int LastAcceptedSignRecoveryCandidateCount { get; private set; }
+    public int LastAcceptedSignRecoveryNeighborBlockedCount { get; private set; }
+    public int LastAcceptedSignRecoveryAppliedCount { get; private set; }
+    public int LastHoleCauseVertexRejectCount { get; private set; }
+    public int LastHoleCauseQuadRejectCount { get; private set; }
+    public int LastHoleCauseClearedCount { get; private set; }
+    public int LastHoleCauseLocalOffsetCount { get; private set; }
+    public int LastHoleCauseCrossFrameCount { get; private set; }
     public int LastProvisionalTsdfRetiredExpiredCount { get; private set; }
     public int LastProvisionalTsdfDirtyClearedCount { get; private set; }
     public int LastOldCleanMetabolismWatchCount { get; private set; }
@@ -720,6 +958,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRejectedBoundaryBridgeCount { get; private set; }
     public int LastRejectedBadMeshRebuildCount { get; private set; }
     public int LastHeldDisplayTriangleCount { get; private set; }
+    public int LastCommittedMeshBlockCount { get; private set; }
+    public int LastCandidateMeshBlockCount { get; private set; }
+    public int LastRetainedCommittedMeshBlockCount { get; private set; }
+    public int LastCommittedMeshHoldSpatialCount { get; private set; }
+    public int LastCommittedMeshHoldTriangleCount { get; private set; }
+    public int LastCommittedMeshGrowthTriangleCount { get; private set; }
     public int LastDiagMeshComponentCount { get; private set; }
     public int LastDiagLargestComponentTriangles { get; private set; }
     public int LastDiagBoundaryEdgeCount { get; private set; }
@@ -1091,6 +1335,59 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         Outside
     }
 
+    private enum HoleBoundaryDiagnosticKind
+    {
+        WaitingPromotion,
+        Retired,
+        NoBand,
+        PositiveOnly,
+        NegativeOnly,
+        SpatialMiss,
+        WeakCorners
+    }
+
+    private enum HoleSupportCause
+    {
+        NoRaw,
+        Pending,
+        NoBand,
+        NoZeroCross,
+        VertexReject,
+        QuadReject,
+        Cleared,
+        LocalOffset,
+        CrossFrame
+    }
+
+    private enum DiagnosticLayerRole
+    {
+        None,
+        Primary,
+        Secondary
+    }
+
+    private enum MissingSideCause
+    {
+        NoVisit,
+        Provisional,
+        AcceptLost,
+        PendingNoPromote,
+        Reject,
+        AcceptedOverwritten,
+        AcceptedSpatialMiss,
+        AcceptedReflattenedCarve,
+        AcceptedReflattenedClear,
+        AcceptedReflattenedProvisional,
+        AcceptedReflattenedAcceptedWriter,
+        AcceptedReflattenedContinuityWriter,
+        AcceptedReflattenedFusionWriter,
+        AcceptedReflattenedUntrackedWriter,
+        AcceptedReflattenedOther,
+        OtherBlock,
+        Gone,
+        Invalid
+    }
+
     private struct RawCoverageGridCell
     {
         public Vector3 PositionSum;
@@ -1178,6 +1475,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float _auditBandMeanResidual = -1f;
     private float _auditBandMaxResidual = -1f;
     private ObservationVoteState _auditVoteState;
+    private ObservationVoteState _activeAtomicBandVote;
+    private bool _activeAtomicBandWrite;
+    private byte _activeSurfaceObservationState;
     private float _auditVoteScore;
     private string _auditVoteReasons = "unassessed";
     private bool _auditVoteEnforced;
@@ -1201,6 +1501,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float _auditMaxSnapshotLatencyMs;
     private readonly Dictionary<int, VoxelAuditLifecycle> _voxelAuditLifecycle = new Dictionary<int, VoxelAuditLifecycle>(4096);
     private readonly Dictionary<int, VoxelWriteProvenance> _voxelWriteProvenance = new Dictionary<int, VoxelWriteProvenance>(32768);
+    private readonly Dictionary<int, int> _duplicateLayerCleanupEvidence = new Dictionary<int, int>();
+    private readonly List<Vector2> _layerHoleTrendSamples = new List<Vector2>(24);
+    private int _lastLayerHoleTrendIntegratedFrame = -1;
+    private int _voxelWriteSequence;
+    private float[] _hardAuditExpectedTsdf;
+    private byte[] _hardAuditExpectedWeights;
+    private StringBuilder _hardAuditRows;
+    private StringBuilder _hardAuditSampleRows;
+    private int _hardAuditCaptureIndex;
+    private string _hardAuditStem;
+    private string _lastHardAuditPath = "off";
     private readonly HashSet<int> _captureAuditVoxels = new HashSet<int>();
     private readonly HashSet<int> _auditSuspectMeshVoxels = new HashSet<int>();
     private readonly HashSet<int> _auditPureGeometryMeshVoxels = new HashSet<int>();
@@ -1265,6 +1576,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public int PixelX;
         public int PixelY;
         public int WriteCount;
+        public int WriteSequence;
         public int IntegrateCount;
         public int CarveCount;
         public int ReplaceCount;
@@ -1471,8 +1783,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void Awake()
     {
-        if (forceMeshGridDisplayOnEnable)
-            showRawDepthDebugView = false;
+        ApplyStage03ADisplayPreset();
         ApplyContinuityBaseFillPreset();
         ResolveRefs();
         EnsureObjects();
@@ -1480,11 +1791,54 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void OnEnable()
     {
-        if (forceMeshGridDisplayOnEnable)
-            showRawDepthDebugView = false;
+        ApplyStage03ADisplayPreset();
         ApplyContinuityBaseFillPreset();
         ResolveRefs();
         EnsureObjects();
+    }
+
+    private void ApplyStage03ADisplayPreset()
+    {
+        if (!forceMeshGridDisplayOnEnable && !useStage03ACleanIsoSurface)
+            return;
+
+        showRawDepthDebugView = false;
+        showRawCoverageGridOverlay = false;
+        hideMeshWhenRawCoverageGridOverlay = false;
+        showExtractedSurfaceMesh = true;
+        showPlanarCoverSurfaceFill = true;
+        showMeshEdgeWireOverlay = true;
+        if (useStage03ACleanIsoSurface)
+        {
+            DisableDiagnosticDiskWrites();
+            useAtomicObservationTsdfBands = true;
+            useV08DirectBandWriteForDiagnosis = false;
+            useV09ExactCornerEligibilityForDiagnosis = false;
+            useLegacyTsdfMeshDisplay = useV09LegacyExtractorForStage03A;
+            suppressExtractionNearPendingTsdfCorrection = false;
+            suppressExtractionNearDirtyTsdfQuarantine = false;
+            suppressQuadOnPendingTsdfCorrectionEdge = false;
+            suppressQuadOnDirtyTsdfQuarantineEdge = false;
+            requireMainShellPromotionGate = false;
+            bridgeCleanCoplanarBoundaryEdges = false;
+            pruneSmallExtractedMeshComponents = false;
+            pruneDanglingExtractedMeshTriangles = false;
+            pruneSpikePatchTriangles = false;
+            showMeshTumorSuspectOverlay = false;
+        }
+    }
+
+    private void DisableDiagnosticDiskWrites()
+    {
+        writeConfidenceAuditOnCapture = false;
+        if (_contributionLedgerWriter != null)
+        {
+            _contributionLedgerWriter.Dispose();
+            _contributionLedgerWriter = null;
+        }
+        _confidenceAuditRows = null;
+        _confidenceAuditFrameRows = null;
+        _doubleLayerPairRows = null;
     }
 
     private void ApplyContinuityBaseFillPreset()
@@ -1541,6 +1895,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Destroy(_rawDepthDebugMesh);
         if (_rawDepthDebugMaterial != null)
             Destroy(_rawDepthDebugMaterial);
+        if (_holeBoundaryDiagnosticMesh != null)
+            Destroy(_holeBoundaryDiagnosticMesh);
+        if (_holeBoundaryDiagnosticObject != null)
+            Destroy(_holeBoundaryDiagnosticObject);
         if (_rawDepthDebugObject != null)
             Destroy(_rawDepthDebugObject);
         if (_hudRoot != null)
@@ -1607,6 +1965,23 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _volumeInitialized = false;
         _tsdf = null;
         _weights = null;
+        _atomicProvisionalBandTsdf = null;
+        _atomicProvisionalBandWeight = null;
+        _atomicProvisionalBandRetiredLastFrame = null;
+        _atomicProvisionalBandRetiredSign = null;
+        _surfaceBandVisitFlags = null;
+        _surfaceBandAcceptSignLostFlags = null;
+        _acceptedPositiveLastSequence = null;
+        _acceptedNegativeLastSequence = null;
+        _acceptedPositiveRetainedLastSequence = null;
+        _acceptedNegativeRetainedLastSequence = null;
+        _acceptedWriteSequence = 0;
+        _hardAuditExpectedTsdf = null;
+        _hardAuditExpectedWeights = null;
+        ResetHardTsdfWriteAuditCounters();
+        _surfaceObservationState = null;
+        _surfaceObservationLastFrame = null;
+        _clearedVoxelLastFrame = null;
         _pendingTsdf = null;
         _pendingTsdfHits = null;
         _pendingTsdfLastFrame = null;
@@ -1631,6 +2006,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _surfaceChunks.Clear();
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
+        _voxelWriteSequence = 0;
         _captureAuditVoxels.Clear();
         _surfaceChunkOrder.Clear();
         _dirtyTsdfEvidence.Clear();
@@ -1642,6 +2018,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _rawDepthDebugMesh.Clear();
         if (_rawDepthDebugObject != null)
             _rawDepthDebugObject.SetActive(false);
+        if (_holeBoundaryDiagnosticMesh != null)
+            _holeBoundaryDiagnosticMesh.Clear();
+        if (_holeBoundaryDiagnosticObject != null)
+            _holeBoundaryDiagnosticObject.SetActive(false);
         ClearRawDepthDebugCache();
         ResetRawDepthDebugCounters();
         _fallbackSurfaceReplaceCursor = 0;
@@ -1665,6 +2045,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastProvisionalTsdfConfirmedCount = 0;
         LastProvisionalTsdfConfirmedByWeightCount = 0;
         LastProvisionalTsdfRetiredCount = 0;
+        LastAtomicAcceptedBandVoxelWriteCount = 0;
+        LastAtomicProvisionalBandVoxelWriteCount = 0;
+        LastAtomicAcceptDuplicateCandidateCount = 0;
+        LastAtomicAcceptDuplicateDowngradeCount = 0;
+        LastAtomicAcceptDuplicateSameSurfaceCount = 0;
+        LastAtomicPromotedProvisionalVoxelCount = 0;
+        LastAtomicRetiredProvisionalVoxelCount = 0;
+        LastHoleBoundaryWaitingCount = 0;
+        LastHoleBoundaryRetiredCount = 0;
+        LastHoleBoundaryNoBandCount = 0;
+        LastHoleBoundaryPositiveOnlyCount = 0;
+        LastHoleBoundaryNegativeOnlyCount = 0;
+        LastHoleBoundarySpatialMissCount = 0;
+        LastHoleBoundaryWeakCornersCount = 0;
+        LastHoleBoundaryRenderedMarkerCount = 0;
         LastProvisionalTsdfRetiredExpiredCount = 0;
         LastProvisionalTsdfDirtyClearedCount = 0;
         LastOldCleanMetabolismWatchCount = 0;
@@ -1712,6 +2107,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ResetFreeSpaceEvidenceDiagnostics();
         LastRejectedBadMeshRebuildCount = 0;
         LastHeldDisplayTriangleCount = 0;
+        LastCommittedMeshBlockCount = 0;
+        LastCandidateMeshBlockCount = 0;
+        LastRetainedCommittedMeshBlockCount = 0;
+        LastCommittedMeshHoldSpatialCount = 0;
+        LastCommittedMeshHoldTriangleCount = 0;
+        LastCommittedMeshGrowthTriangleCount = 0;
+        _committedMeshBlocks.Clear();
+        _candidateMeshBlocks.Clear();
         ResetExtractionDiagnostics();
         IntegratedFrameCount = 0;
         LastRawFrameIndex = -1;
@@ -1791,8 +2194,40 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         List<int> triangles = new List<int>(Mathf.Min(maxSurfaceVertices * 3, cellCount * 6));
         List<Color> colors = new List<Color>(Mathf.Min(maxSurfaceVertices, cellCount));
         ResetExtractionDiagnostics();
+        LastHoleSideRepairCandidateCount = 0;
+        LastHoleSideRepairAppliedCount = 0;
+        LastHoleSideRepairBlockedSupportCount = 0;
+        LastHoleSideRepairBlockedDirtyCount = 0;
+        LastHoleSideRepairBlockedMultiZeroCount = 0;
+        LastHoleSideRepairBlockedPlaneCount = 0;
+        LastHoleSideRepairPlaneBandVoxelCount = 0;
+        LastHoleSideRepairPlaneConfirmedCount = _pendingPrimaryPlaneHoleAcceptConfirmedCount;
+        _pendingPrimaryPlaneHoleAcceptConfirmedCount = 0;
+        LastHoleSideRepairPlaneRetiredCount = 0;
+        LastHoleSideRepairRetiredNoNearAcceptCount = 0;
+        LastHoleSideRepairRetiredSignMismatchCount = 0;
+        LastHoleSideRepairRetiredPlaneMismatchCount = 0;
+        LastHoleSideRepairRetiredTsdfDeltaCount = 0;
+        LastHoleSideRepairRetiredExpiredAfterPassCount = 0;
+        LastHoleSideRepairPlaneDistance0ToHalfCount = 0;
+        LastHoleSideRepairPlaneDistanceHalfTo075Count = 0;
+        LastHoleSideRepairPlaneDistance075To1Count = 0;
+        LastHoleSideRepairPlaneDistance1To15Count = 0;
+        LastHoleSideRepairPlaneDistance15To2Count = 0;
+        LastHoleSideRepairPlaneDistanceOver2Count = 0;
+        LastDuplicateLayerCleanupQueuedCount = _duplicateLayerCleanupEvidence.Count;
+        LastDuplicateLayerCleanupDecayedCount = 0;
+        LastDuplicateLayerCleanupClearedCount = 0;
+        LastDuplicateLayerCleanupBoostedCount = 0;
+        LastDuplicateLayerCleanupMaxEvidence = 0;
+        AuditUntrackedTsdfWrites("integration");
+        ConfirmPrimaryPlaneHoleBands();
         RetireExpiredProvisionalTsdf();
+        AuditUntrackedTsdfWrites("retire");
+        CleanupConfirmedDuplicateLayers();
         FillCleanTsdfContinuityGaps();
+        RepairGuardedHoleSides();
+        AuditUntrackedTsdfWrites("continuity");
 
         Vector3[] cornerPositions = new Vector3[8];
         float[] cornerValues = new float[8];
@@ -1829,7 +2264,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     for (int x = 0; x < _dimX; x++)
                     {
                         int xIndex = Index(x, y, z);
-                        if (useLegacyTsdfMeshDisplay)
+                        if (UseLegacyMeshExtraction)
                         {
                             if (x + 1 < _dimX && IsLegacySignChange(xIndex, Index(x + 1, y, z)))
                             {
@@ -1868,6 +2303,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     }
                 }
             }
+            RebuildHoleBoundaryDiagnostic(cellX, cellY, cellZ, vertices.Count, triangles);
         }
 
         bool mainShellHeld = requireMainShellPromotionGate && (LastCandidateShellHeldCellCount + LastDetailCandidateHeldCellCount) > 0;
@@ -1884,7 +2320,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         {
             LastMeshUsedExtractedTsdf = true;
             LastPrePruneMeshTriangleCount = triangles.Count / 3;
-            if (useLegacyTsdfMeshDisplay)
+            if (UseLegacyMeshExtraction)
             {
                 LastPostComponentMeshTriangleCount = triangles.Count / 3;
                 LastPostBridgeMeshTriangleCount = triangles.Count / 3;
@@ -1902,12 +2338,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         AnalyzeMeshDiagnostics(vertices, triangles);
         ApplyMeshTumorSuspectOverlay(vertices, triangles, colors);
+        AuditUntrackedTsdfWrites("extraction");
 
-        if (ShouldKeepDisplayedMesh(previousTriangleCount, vertices.Count, triangles.Count / 3))
+        if (ShouldKeepDisplayedMesh(previousTriangleCount, vertices, triangles.Count / 3))
         {
-            LastMeshVertexCount = previousVertexCount;
-            LastMeshTriangleCount = previousTriangleCount;
-            LastHeldDisplayTriangleCount = previousTriangleCount;
+            // A candidate rejected by the stability gate must stay atomic.  Appending only its
+            // new blocks to the old mesh creates unvalidated seams at the frozen boundary.
+            int absorbedTriangles = 0;
+            LastCommittedMeshGrowthTriangleCount = absorbedTriangles;
+            LastMeshVertexCount = _mesh != null ? _mesh.vertexCount : previousVertexCount;
+            LastMeshTriangleCount = _mesh != null ? _mesh.triangles.Length / 3 : previousTriangleCount;
+            LastHeldDisplayTriangleCount = LastMeshTriangleCount;
             LastRejectedBadMeshRebuildCount++;
             if (debugLog)
             {
@@ -1926,6 +2367,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _mesh.SetTriangles(triangles, 0, true);
         _mesh.RecalculateNormals();
         _mesh.RecalculateBounds();
+        CommitDisplayedMeshBlocks(vertices);
 
         LastMeshVertexCount = vertices.Count;
         LastMeshTriangleCount = triangles.Count / 3;
@@ -1943,29 +2385,201 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return vertices.Count > 0;
     }
 
-    private bool ShouldKeepDisplayedMesh(int previousTriangleCount, int newVertexCount, int newTriangleCount)
+    private bool ShouldKeepDisplayedMesh(int previousTriangleCount, List<Vector3> candidateVertices, int newTriangleCount)
     {
-        if (!protectDisplayedMeshFromBadRebuild || previousTriangleCount <= 0)
+        if (previousTriangleCount <= 0)
             return false;
+        int newVertexCount = candidateVertices != null ? candidateVertices.Count : 0;
         if (newVertexCount <= 0 || newTriangleCount <= 0)
             return true;
 
-        float minRatio = Mathf.Clamp(minAcceptedRebuildTriangleRatio, 0.1f, 1f);
-        if (newTriangleCount < previousTriangleCount * minRatio)
-            return true;
-
-        int candidateTriangleBudget = newTriangleCount + LastPrunedMeshTriangleCount;
-        if (candidateTriangleBudget > 0)
+        if (guardCommittedMeshSpatialCoverage)
         {
-            float prunedRatio = (float)LastPrunedMeshTriangleCount / candidateTriangleBudget;
-            if (prunedRatio > Mathf.Clamp01(maxAcceptedPrunedTriangleRatio) &&
-                newTriangleCount < previousTriangleCount)
+            EnsureCommittedMeshBlocksFromDisplayedMesh();
+            BuildMeshBlockSet(candidateVertices, _candidateMeshBlocks);
+            LastCommittedMeshBlockCount = _committedMeshBlocks.Count;
+            LastCandidateMeshBlockCount = _candidateMeshBlocks.Count;
+            LastRetainedCommittedMeshBlockCount = CountRetainedCommittedMeshBlocks();
+            if (_committedMeshBlocks.Count > 0)
             {
+                float retainedRatio = (float)LastRetainedCommittedMeshBlockCount / _committedMeshBlocks.Count;
+                int newBlockCount = Mathf.Max(0, _candidateMeshBlocks.Count - LastRetainedCommittedMeshBlockCount);
+                bool extendsObservedArea = newBlockCount >= Mathf.Max(4, _committedMeshBlocks.Count / 50);
+                float requiredBlockRetention = useStrictCommittedMeshRetention
+                    ? Mathf.Min(0.92f, Mathf.Clamp01(minCommittedMeshBlockRetention))
+                    : Mathf.Clamp01(minCommittedMeshBlockRetention);
+                float growthRetentionFloor = Mathf.Min(requiredBlockRetention, 0.82f);
+                if (retainedRatio < requiredBlockRetention &&
+                    (!extendsObservedArea || retainedRatio < growthRetentionFloor))
+                {
+                    LastCommittedMeshHoldSpatialCount++;
+                    return true;
+                }
+            }
+        }
+
+        if (useStrictCommittedMeshRetention &&
+            newTriangleCount < previousTriangleCount * Mathf.Min(0.92f, Mathf.Clamp(minCommittedMeshTriangleRetention, 0.8f, 1f)))
+        {
+            LastCommittedMeshHoldTriangleCount++;
+            return true;
+        }
+
+        if (protectDisplayedMeshFromBadRebuild)
+        {
+            float minRatio = Mathf.Clamp(minAcceptedRebuildTriangleRatio, 0.1f, 1f);
+            if (newTriangleCount < previousTriangleCount * minRatio)
                 return true;
+
+            int candidateTriangleBudget = newTriangleCount + LastPrunedMeshTriangleCount;
+            if (candidateTriangleBudget > 0)
+            {
+                float prunedRatio = (float)LastPrunedMeshTriangleCount / candidateTriangleBudget;
+                if (prunedRatio > Mathf.Clamp01(maxAcceptedPrunedTriangleRatio) &&
+                    newTriangleCount < previousTriangleCount)
+                {
+                    return true;
+                }
             }
         }
 
         return false;
+    }
+
+    private void EnsureCommittedMeshBlocksFromDisplayedMesh()
+    {
+        if (_committedMeshBlocks.Count > 0 || _mesh == null || _mesh.vertexCount <= 0)
+            return;
+        BuildMeshBlockSet(_mesh.vertices, _committedMeshBlocks);
+    }
+
+    private void CommitDisplayedMeshBlocks(IList<Vector3> vertices)
+    {
+        BuildMeshBlockSet(vertices, _committedMeshBlocks);
+        LastCommittedMeshBlockCount = _committedMeshBlocks.Count;
+        LastCandidateMeshBlockCount = _committedMeshBlocks.Count;
+        LastRetainedCommittedMeshBlockCount = _committedMeshBlocks.Count;
+    }
+
+    private void BuildMeshBlockSet(IList<Vector3> vertices, HashSet<Vector3Int> destination)
+    {
+        destination.Clear();
+        if (vertices == null)
+            return;
+        int blockVoxels = useStrictCommittedMeshRetention
+            ? Mathf.Min(2, Mathf.Clamp(committedMeshBlockSizeVoxels, 1, 8))
+            : Mathf.Clamp(committedMeshBlockSizeVoxels, 1, 8);
+        float blockSize = Mathf.Max(0.001f, voxelSizeMeters * blockVoxels);
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            Vector3 local = (vertices[i] - _volumeOriginWorld) / blockSize;
+            destination.Add(new Vector3Int(
+                Mathf.FloorToInt(local.x),
+                Mathf.FloorToInt(local.y),
+                Mathf.FloorToInt(local.z)));
+        }
+    }
+
+    private int CountRetainedCommittedMeshBlocks()
+    {
+        int retained = 0;
+        foreach (Vector3Int block in _committedMeshBlocks)
+        {
+            if (_candidateMeshBlocks.Contains(block))
+                retained++;
+        }
+        return retained;
+    }
+
+    private int AbsorbNewBlocksFromHeldCandidate(
+        List<Vector3> candidateVertices,
+        List<int> candidateTriangles,
+        List<Color> candidateColors)
+    {
+        if (_mesh == null || candidateVertices == null || candidateTriangles == null || candidateTriangles.Count < 3)
+            return 0;
+
+        EnsureCommittedMeshBlocksFromDisplayedMesh();
+        List<Vector3> mergedVertices = new List<Vector3>(_mesh.vertexCount + 1024);
+        List<int> mergedTriangles = new List<int>(_mesh.triangles.Length + 3072);
+        List<Color> mergedColors = new List<Color>(_mesh.vertexCount + 1024);
+        _mesh.GetVertices(mergedVertices);
+        _mesh.GetTriangles(mergedTriangles, 0);
+        _mesh.GetColors(mergedColors);
+        while (mergedColors.Count < mergedVertices.Count)
+            mergedColors.Add(Color.white);
+
+        Dictionary<int, int> remappedVertices = new Dictionary<int, int>();
+        int addedTriangles = 0;
+        int triangleBudget = Mathf.Clamp(maxHeldCandidateTrianglesToAbsorb, 256, 20000);
+        for (int i = 0; i + 2 < candidateTriangles.Count && addedTriangles < triangleBudget; i += 3)
+        {
+            int ia = candidateTriangles[i];
+            int ib = candidateTriangles[i + 1];
+            int ic = candidateTriangles[i + 2];
+            if (ia < 0 || ib < 0 || ic < 0 ||
+                ia >= candidateVertices.Count || ib >= candidateVertices.Count || ic >= candidateVertices.Count)
+            {
+                continue;
+            }
+
+            Vector3 centroid = (candidateVertices[ia] + candidateVertices[ib] + candidateVertices[ic]) / 3f;
+            if (_committedMeshBlocks.Contains(MeshBlockForPoint(centroid)))
+                continue;
+            if (mergedVertices.Count + 3 > maxSurfaceVertices)
+                break;
+
+            mergedTriangles.Add(RemapCandidateVertex(ia, candidateVertices, candidateColors, mergedVertices, mergedColors, remappedVertices));
+            mergedTriangles.Add(RemapCandidateVertex(ib, candidateVertices, candidateColors, mergedVertices, mergedColors, remappedVertices));
+            mergedTriangles.Add(RemapCandidateVertex(ic, candidateVertices, candidateColors, mergedVertices, mergedColors, remappedVertices));
+            addedTriangles++;
+        }
+
+        if (addedTriangles <= 0)
+            return 0;
+
+        _mesh.Clear();
+        _mesh.indexFormat = mergedVertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        _mesh.SetVertices(mergedVertices);
+        _mesh.SetColors(mergedColors);
+        _mesh.SetTriangles(mergedTriangles, 0, true);
+        _mesh.RecalculateNormals();
+        _mesh.RecalculateBounds();
+        CommitDisplayedMeshBlocks(mergedVertices);
+        RebuildWireOverlay(mergedVertices, mergedTriangles);
+        return addedTriangles;
+    }
+
+    private int RemapCandidateVertex(
+        int candidateIndex,
+        List<Vector3> candidateVertices,
+        List<Color> candidateColors,
+        List<Vector3> mergedVertices,
+        List<Color> mergedColors,
+        Dictionary<int, int> remappedVertices)
+    {
+        if (remappedVertices.TryGetValue(candidateIndex, out int mergedIndex))
+            return mergedIndex;
+        mergedIndex = mergedVertices.Count;
+        remappedVertices[candidateIndex] = mergedIndex;
+        mergedVertices.Add(candidateVertices[candidateIndex]);
+        mergedColors.Add(candidateColors != null && candidateIndex < candidateColors.Count
+            ? candidateColors[candidateIndex]
+            : Color.white);
+        return mergedIndex;
+    }
+
+    private Vector3Int MeshBlockForPoint(Vector3 point)
+    {
+        int blockVoxels = useStrictCommittedMeshRetention
+            ? Mathf.Min(2, Mathf.Clamp(committedMeshBlockSizeVoxels, 1, 8))
+            : Mathf.Clamp(committedMeshBlockSizeVoxels, 1, 8);
+        float blockSize = Mathf.Max(0.001f, voxelSizeMeters * blockVoxels);
+        Vector3 local = (point - _volumeOriginWorld) / blockSize;
+        return new Vector3Int(
+            Mathf.FloorToInt(local.x),
+            Mathf.FloorToInt(local.y),
+            Mathf.FloorToInt(local.z));
     }
 
     private IEnumerator CaptureRawSnapshotAndIntegrateRoutine()
@@ -2144,6 +2758,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 MeasureTsdfBandVoteFeatures(cameraPosition, point, _auditSampleNormal, halfBandSteps);
                 MeasureCrossFrameCleanSurfaceConflict(point, _auditSampleNormal);
                 RecordCurrentFrameRawVoteSample(point, _auditSampleNormal);
+                MarkSurfaceObservationState(point, 1);
 
                 if (!PassTsdfDepthSupport(checkedDepthNeighbors, consistentDepthNeighbors))
                 {
@@ -2155,18 +2770,34 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     continue;
                 }
                 ObservationVoteState observationVote = EvaluateObservationVote(sampleWeight);
+                if (observationVote == ObservationVoteState.Accept &&
+                    WouldAtomicAcceptCreateDuplicateLayer(point, _auditSampleNormal))
+                {
+                    observationVote = ObservationVoteState.Pending;
+                    LastAtomicAcceptDuplicateDowngradeCount++;
+                    SetObservationVote(
+                        ObservationVoteState.Pending,
+                        _auditVoteScore,
+                        string.IsNullOrEmpty(_auditVoteReasons)
+                            ? "duplicate_layer_guard"
+                            : _auditVoteReasons + "+duplicate_layer_guard",
+                        true);
+                }
+                MarkSurfaceObservationState(point, observationVote == ObservationVoteState.Accept ? (byte)3 : observationVote == ObservationVoteState.Pending ? (byte)2 : (byte)4);
                 if (observationVote == ObservationVoteState.Accept)
                     RecordVoteHistorySample(point, _auditSampleNormal);
                 if (observationVote == ObservationVoteState.Reject &&
-                    (enforceObservationWriteGate || observationVoteMode == ObservationVoteMode.RejectOnly))
+                    (useAtomicObservationTsdfBands || enforceObservationWriteGate || observationVoteMode == ObservationVoteMode.RejectOnly))
                 {
+                    MarkRejectedObservationBand(cameraPosition, point, normal, halfBandSteps);
                     TryMetabolizeOldCleanTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps);
                     RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "vote_reject", auditThisSample);
                     continue;
                 }
-                if (observationVote == ObservationVoteState.Pending &&
+                if (!useAtomicObservationTsdfBands &&
+                    observationVote == ObservationVoteState.Pending &&
                     enforceObservationWriteGate &&
                     holdUnconfirmedPendingWrites)
                 {
@@ -2205,6 +2836,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     }
                     RecordVoteHistorySample(point, _auditSampleNormal);
                 }
+                else if (useAtomicObservationTsdfBands && observationVote == ObservationVoteState.Pending)
+                {
+                    sampleWeight *= Mathf.Clamp(atomicProvisionalBandWeightScale, 0.05f, 0.5f);
+                    RecordVoteHistorySample(point, _auditSampleNormal);
+                }
                 AccumulateFrameReferenceAudit(point);
 
                 float oldTsdfAtSurface = 0f;
@@ -2221,9 +2857,23 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 int dirtyReplaceBeforeSample = LastReplacedDirtyTsdfCount;
                 int dirtyCleanBeforeSample = LastCleanedDirtyTsdfNeighborCount;
                 int dirtyQuarantineBeforeSample = LastDirtyTsdfQuarantineCount;
-                bool touchedDenseTsdf = useProjectiveTsdfIntegration
-                    ? IntegrateProjectiveTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps, ShouldCarveFreeSpaceAtPixel(x, y, stride))
-                    : IntegrateNormalTsdfBand(point, normal, sampleWeight, halfBandSteps);
+                bool touchedDenseTsdf;
+                _activeAtomicBandWrite = useAtomicObservationTsdfBands;
+                _activeAtomicBandVote = observationVote;
+                _activeSurfaceObservationState = observationVote == ObservationVoteState.Accept ? (byte)3 : (byte)2;
+                try
+                {
+                    bool allowClearingRay = observationVote == ObservationVoteState.Accept && ShouldCarveFreeSpaceAtPixel(x, y, stride);
+                    touchedDenseTsdf = useProjectiveTsdfIntegration
+                        ? IntegrateProjectiveTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps, allowClearingRay)
+                        : IntegrateNormalTsdfBand(point, normal, sampleWeight, halfBandSteps);
+                }
+                finally
+                {
+                    _activeAtomicBandWrite = false;
+                    _activeAtomicBandVote = ObservationVoteState.Unassessed;
+                    _activeSurfaceObservationState = 0;
+                }
                 if (!touchedDenseTsdf)
                 {
                     LastRejectedOutsideVolumeCount++;
@@ -2289,8 +2939,398 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return LastIntegratedSampleCount > 0;
     }
 
+    private void BeginSurfaceProfileDiagnostics()
+    {
+        _surfaceDiagnosticCaptureIndex++;
+        _lastLayerNoZeroRayCount = 0;
+        _lastLayerSingleZeroRayCount = 0;
+        _lastLayerMultiZeroRayCount = 0;
+        _lastLayerDisplayPairRayCount = 0;
+        _lastLayerLegalOcclusionRayCount = 0;
+        _lastLayerDuplicateRayCount = 0;
+        _lastLayerAmbiguousRayCount = 0;
+        _lastHoleDiagnosticRowCount = 0;
+    }
+
+    private void EndSurfaceProfileDiagnostics(int integratedFrames, string status)
+    {
+        if (!writeHoleAndLayerDiagnosticsOnCapture || _tsdf == null || _weights == null)
+            return;
+
+        try
+        {
+            string directory = ResolveConfidenceAuditDirectory();
+            Directory.CreateDirectory(directory);
+            string timestamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", AuditCulture);
+            string stem = $"surface_profile_{timestamp}_{_surfaceDiagnosticCaptureIndex:D3}";
+            string holePath = Path.Combine(directory, stem + "_holes.csv");
+            string rayPath = Path.Combine(directory, stem + "_rays.csv");
+            string layerPath = Path.Combine(directory, stem + "_layers.csv");
+            string pairPath = Path.Combine(directory, stem + "_layer_pairs.csv");
+            string summaryPath = Path.Combine(directory, stem + "_summary.txt");
+
+            StringBuilder holes = BuildHoleProfileCsv();
+            BuildLayerProfileCsv(out StringBuilder rays, out StringBuilder layers, out StringBuilder pairs);
+            File.WriteAllText(holePath, holes.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(rayPath, rays.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(layerPath, layers.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(pairPath, pairs.ToString(), new UTF8Encoding(false));
+
+            StringBuilder summary = new StringBuilder(512);
+            summary.AppendLine("ScanCover TSDF surface profile");
+            summary.AppendLine("status=" + status);
+            summary.AppendLine("capture=" + _surfaceDiagnosticCaptureIndex);
+            summary.AppendLine("integrated_frames=" + integratedFrames);
+            summary.AppendLine("hole_rows=" + _lastHoleDiagnosticRowCount);
+            summary.AppendLine("ray_no_zero=" + _lastLayerNoZeroRayCount);
+            summary.AppendLine("ray_single_zero=" + _lastLayerSingleZeroRayCount);
+            summary.AppendLine("ray_multi_zero=" + _lastLayerMultiZeroRayCount);
+            summary.AppendLine("ray_display_pair=" + _lastLayerDisplayPairRayCount);
+            summary.AppendLine("ray_legal_occlusion=" + _lastLayerLegalOcclusionRayCount);
+            summary.AppendLine("ray_duplicate_layer=" + _lastLayerDuplicateRayCount);
+            summary.AppendLine("ray_ambiguous_multi=" + _lastLayerAmbiguousRayCount);
+            summary.AppendLine("layer_viz_primary=" + LastPrimaryLayerDiagnosticMarkerCount);
+            summary.AppendLine("layer_viz_secondary=" + LastSecondaryLayerDiagnosticMarkerCount);
+            summary.AppendLine("layer_viz_unclassified=" + LastUnclassifiedLayerDiagnosticMarkerCount);
+            summary.AppendLine("layer_confirmed_secondary_voxels=" + LastConfirmedSecondaryLayerVoxelCount);
+            summary.AppendLine("layer_hole_trend_hole_load=" + LastLayerHoleTrendHoleLoad);
+            summary.AppendLine("layer_hole_trend_secondary_delta=" + LastLayerHoleTrendSecondaryDelta);
+            summary.AppendLine("layer_hole_trend_hole_delta=" + LastLayerHoleTrendHoleDelta);
+            summary.AppendLine("layer_hole_trend_correlation=" + AuditFloat(LastLayerHoleTrendCorrelation));
+            summary.AppendLine("layer_hole_trend_samples=" + LastLayerHoleTrendSampleCount);
+            summary.AppendLine("hole_repair_candidate=" + LastHoleSideRepairCandidateCount);
+            summary.AppendLine("hole_repair_applied=" + LastHoleSideRepairAppliedCount);
+            summary.AppendLine("hole_repair_block_support=" + LastHoleSideRepairBlockedSupportCount);
+            summary.AppendLine("hole_repair_block_dirty=" + LastHoleSideRepairBlockedDirtyCount);
+            summary.AppendLine("hole_repair_block_multizero=" + LastHoleSideRepairBlockedMultiZeroCount);
+            summary.AppendLine("hole_repair_block_plane=" + LastHoleSideRepairBlockedPlaneCount);
+            summary.AppendLine("hole_repair_plane_band_voxels=" + LastHoleSideRepairPlaneBandVoxelCount);
+            summary.AppendLine("hole_repair_plane_confirmed=" + LastHoleSideRepairPlaneConfirmedCount);
+            summary.AppendLine("hole_repair_plane_retired=" + LastHoleSideRepairPlaneRetiredCount);
+            summary.AppendLine("hole_repair_retired_no_near_accept=" + LastHoleSideRepairRetiredNoNearAcceptCount);
+            summary.AppendLine("hole_repair_retired_sign_mismatch=" + LastHoleSideRepairRetiredSignMismatchCount);
+            summary.AppendLine("hole_repair_retired_plane_mismatch=" + LastHoleSideRepairRetiredPlaneMismatchCount);
+            summary.AppendLine("hole_repair_retired_tsdf_delta=" + LastHoleSideRepairRetiredTsdfDeltaCount);
+            summary.AppendLine("hole_repair_retired_expired_after_pass=" + LastHoleSideRepairRetiredExpiredAfterPassCount);
+            summary.AppendLine("hole_repair_plane_distance_0_0p5_vox=" + LastHoleSideRepairPlaneDistance0ToHalfCount);
+            summary.AppendLine("hole_repair_plane_distance_0p5_0p75_vox=" + LastHoleSideRepairPlaneDistanceHalfTo075Count);
+            summary.AppendLine("hole_repair_plane_distance_0p75_1_vox=" + LastHoleSideRepairPlaneDistance075To1Count);
+            summary.AppendLine("hole_repair_plane_distance_1_1p5_vox=" + LastHoleSideRepairPlaneDistance1To15Count);
+            summary.AppendLine("hole_repair_plane_distance_1p5_2_vox=" + LastHoleSideRepairPlaneDistance15To2Count);
+            summary.AppendLine("hole_repair_plane_distance_over_2_vox=" + LastHoleSideRepairPlaneDistanceOver2Count);
+            summary.AppendLine("mesh_commit_blocks=" + LastCommittedMeshBlockCount);
+            summary.AppendLine("mesh_candidate_blocks=" + LastCandidateMeshBlockCount);
+            summary.AppendLine("mesh_retained_commit_blocks=" + LastRetainedCommittedMeshBlockCount);
+            summary.AppendLine("mesh_hold_spatial=" + LastCommittedMeshHoldSpatialCount);
+            summary.AppendLine("mesh_hold_triangles=" + LastCommittedMeshHoldTriangleCount);
+            summary.AppendLine("mesh_growth_triangles=" + LastCommittedMeshGrowthTriangleCount);
+            summary.AppendLine("accept_duplicate_candidates=" + LastAtomicAcceptDuplicateCandidateCount);
+            summary.AppendLine("accept_duplicate_downgraded=" + LastAtomicAcceptDuplicateDowngradeCount);
+            summary.AppendLine("accept_duplicate_same_surface=" + LastAtomicAcceptDuplicateSameSurfaceCount);
+            summary.AppendLine("duplicate_cleanup_queued=" + LastDuplicateLayerCleanupQueuedCount);
+            summary.AppendLine("duplicate_cleanup_decayed=" + LastDuplicateLayerCleanupDecayedCount);
+            summary.AppendLine("duplicate_cleanup_cleared=" + LastDuplicateLayerCleanupClearedCount);
+            summary.AppendLine("duplicate_cleanup_boosted=" + LastDuplicateLayerCleanupBoostedCount);
+            summary.AppendLine("duplicate_cleanup_max_evidence=" + LastDuplicateLayerCleanupMaxEvidence);
+            File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(false));
+            _lastHoleDiagnosticPath = holePath;
+            _lastLayerDiagnosticPath = rayPath;
+        }
+        catch (System.Exception ex)
+        {
+            _lastHoleDiagnosticPath = "WRITE FAILED";
+            _lastLayerDiagnosticPath = "WRITE FAILED";
+            Debug.LogWarning("[ScanCover] Surface profile write failed: " + ex.Message, this);
+        }
+    }
+
+    private StringBuilder BuildHoleProfileCsv()
+    {
+        StringBuilder csv = new StringBuilder(256 * 1024);
+        csv.AppendLine("capture,frame,cell_x,cell_y,cell_z,world_x,world_y,world_z,cause,positive_only,negative_only,vertex_index,corner,voxel_index,tsdf,weight,last_operation,last_write_sequence");
+        if (_cellVertexIndices == null || _mesh == null)
+            return csv;
+
+        int cellX = Mathf.Max(0, _dimX - 1);
+        int cellY = Mathf.Max(0, _dimY - 1);
+        int cellZ = Mathf.Max(0, _dimZ - 1);
+        bool[] vertexUsed = new bool[Mathf.Max(0, _mesh.vertexCount)];
+        int[] meshTriangles = _mesh.triangles;
+        for (int i = 0; i < meshTriangles.Length; i++)
+        {
+            int vertex = meshTriangles[i];
+            if (vertex >= 0 && vertex < vertexUsed.Length)
+                vertexUsed[vertex] = true;
+        }
+
+        int limit = Mathf.Max(1, maxHoleDiagnosticRows);
+        for (int z = 0; z < cellZ && _lastHoleDiagnosticRowCount < limit; z++)
+        for (int y = 0; y < cellY && _lastHoleDiagnosticRowCount < limit; y++)
+        for (int x = 0; x < cellX && _lastHoleDiagnosticRowCount < limit; x++)
+        {
+            int cellIndex = CellIndex(x, y, z, cellX, cellY);
+            int vertexIndex = _cellVertexIndices[cellIndex];
+            bool used = vertexIndex >= 0 && vertexIndex < vertexUsed.Length && vertexUsed[vertexIndex];
+            if (used || (vertexIndex < 0 && !CellTouchesUsedSurface(x, y, z, cellX, cellY, cellZ, vertexUsed)))
+                continue;
+
+            HoleSupportCause cause = ClassifyHoleSupportCause(x, y, z, vertexIndex, out bool positiveOnly, out bool negativeOnly);
+            Vector3 center = CellCenter(x, y, z);
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int vx = x + ((corner & 1) != 0 ? 1 : 0);
+                int vy = y + ((corner & 2) != 0 ? 1 : 0);
+                int vz = z + ((corner & 4) != 0 ? 1 : 0);
+                int voxelIndex = Index(vx, vy, vz);
+                bool hasProvenance = _voxelWriteProvenance.TryGetValue(voxelIndex, out VoxelWriteProvenance provenance);
+                csv.Append(_surfaceDiagnosticCaptureIndex).Append(',').Append(IntegratedFrameCount).Append(',')
+                    .Append(x).Append(',').Append(y).Append(',').Append(z).Append(',')
+                    .Append(AuditFloat(center.x)).Append(',').Append(AuditFloat(center.y)).Append(',').Append(AuditFloat(center.z)).Append(',')
+                    .Append(cause).Append(',').Append(positiveOnly ? 1 : 0).Append(',').Append(negativeOnly ? 1 : 0).Append(',')
+                    .Append(vertexIndex).Append(',').Append(corner).Append(',').Append(voxelIndex).Append(',')
+                    .Append(AuditFloat(_tsdf[voxelIndex])).Append(',').Append(_weights[voxelIndex]).Append(',')
+                    .Append(hasProvenance ? provenance.LastOperation : "untracked").Append(',')
+                    .Append(hasProvenance ? provenance.WriteSequence : 0).AppendLine();
+            }
+            _lastHoleDiagnosticRowCount++;
+        }
+        return csv;
+    }
+
+    private void BuildLayerProfileCsv(out StringBuilder rays, out StringBuilder layers, out StringBuilder pairs)
+    {
+        rays = new StringBuilder(128 * 1024);
+        layers = new StringBuilder(256 * 1024);
+        pairs = new StringBuilder(128 * 1024);
+        rays.AppendLine("capture,frame,ray_x,ray_y,zero_crossings,near_zero_runs,classification,first_depth_m,last_depth_m,max_layer_gap_m");
+        layers.AppendLine("capture,frame,ray_x,ray_y,layer,depth_m,world_x,world_y,world_z,front_voxel,front_tsdf,front_weight,front_operation,front_sequence,back_voxel,back_tsdf,back_weight,back_operation,back_sequence");
+        pairs.AppendLine("capture,frame,ray_x,ray_y,pair,classification,front_depth_m,back_depth_m,gap_m,normal_dot,lateral_m,front_operation,front_sequence,front_capture,front_surface_x,front_surface_y,front_surface_z,back_operation,back_sequence,back_capture,back_surface_x,back_surface_y,back_surface_z");
+        Camera camera = Camera.main;
+        if (camera == null)
+            return;
+
+        int countX = Mathf.Max(1, layerDiagnosticRaysX);
+        int countY = Mathf.Max(1, layerDiagnosticRaysY);
+        for (int ry = 0; ry < countY; ry++)
+        for (int rx = 0; rx < countX; rx++)
+        {
+            Ray ray = camera.ViewportPointToRay(new Vector3((rx + 0.5f) / countX, (ry + 0.5f) / countY, 0f));
+            if (!TryIntersectVolume(ray, out float enter, out float exit))
+                continue;
+
+            List<float> depths = new List<float>(4);
+            List<int> frontIndices = new List<int>(4);
+            List<int> backIndices = new List<int>(4);
+            int nearZeroRuns = 0;
+            bool inNearZeroRun = false;
+            bool hasPrevious = false;
+            float previousTsdf = 0f;
+            int previousIndex = -1;
+            float previousDepth = 0f;
+            int lastIndex = -1;
+            float step = Mathf.Max(0.001f, voxelSizeMeters * Mathf.Max(0.25f, layerDiagnosticStepVoxels));
+            for (float depth = Mathf.Max(0f, enter); depth <= exit; depth += step)
+            {
+                Vector3 point = ray.origin + ray.direction * depth;
+                if (!TryWorldToVoxel(point, out int vx, out int vy, out int vz))
+                    continue;
+                int index = Index(vx, vy, vz);
+                if (index == lastIndex)
+                    continue;
+                lastIndex = index;
+                if (_weights[index] <= 0)
+                {
+                    hasPrevious = false;
+                    inNearZeroRun = false;
+                    continue;
+                }
+
+                float value = _tsdf[index];
+                bool nearZero = Mathf.Abs(value) <= 0.25f;
+                if (nearZero && !inNearZeroRun)
+                    nearZeroRuns++;
+                inNearZeroRun = nearZero;
+                if (hasPrevious && ((previousTsdf < 0f && value >= 0f) || (previousTsdf > 0f && value <= 0f)))
+                {
+                    float denominator = Mathf.Abs(previousTsdf) + Mathf.Abs(value);
+                    float fraction = denominator > 0.000001f ? Mathf.Abs(previousTsdf) / denominator : 0.5f;
+                    depths.Add(Mathf.Lerp(previousDepth, depth, fraction));
+                    frontIndices.Add(previousIndex);
+                    backIndices.Add(index);
+                }
+                previousTsdf = value;
+                previousIndex = index;
+                previousDepth = depth;
+                hasPrevious = true;
+            }
+
+            string classification;
+            if (depths.Count <= 0)
+            {
+                classification = "NO_ZERO";
+                _lastLayerNoZeroRayCount++;
+            }
+            else if (depths.Count == 1 && nearZeroRuns > 1)
+            {
+                classification = "DISPLAY_PAIR";
+                _lastLayerSingleZeroRayCount++;
+                _lastLayerDisplayPairRayCount++;
+            }
+            else if (depths.Count == 1)
+            {
+                classification = "SINGLE_ZERO";
+                _lastLayerSingleZeroRayCount++;
+            }
+            else
+            {
+                _lastLayerMultiZeroRayCount++;
+                bool hasDuplicate = false;
+                bool hasAmbiguous = false;
+                for (int pair = 0; pair < depths.Count - 1; pair++)
+                {
+                    string pairClass = AppendLayerPairProfileRow(
+                        pairs, rx, ry, pair, depths[pair], depths[pair + 1],
+                        frontIndices[pair], backIndices[pair], frontIndices[pair + 1], backIndices[pair + 1]);
+                    hasDuplicate |= pairClass == "DUPLICATE_LAYER";
+                    hasAmbiguous |= pairClass == "AMBIGUOUS_MULTI";
+                }
+                if (hasDuplicate)
+                {
+                    classification = "DUPLICATE_LAYER";
+                    _lastLayerDuplicateRayCount++;
+                }
+                else if (hasAmbiguous)
+                {
+                    classification = "AMBIGUOUS_MULTI";
+                    _lastLayerAmbiguousRayCount++;
+                }
+                else
+                {
+                    classification = "LEGAL_OCCLUSION";
+                    _lastLayerLegalOcclusionRayCount++;
+                }
+            }
+
+            float maxGap = 0f;
+            for (int i = 1; i < depths.Count; i++)
+                maxGap = Mathf.Max(maxGap, depths[i] - depths[i - 1]);
+            rays.Append(_surfaceDiagnosticCaptureIndex).Append(',').Append(IntegratedFrameCount).Append(',')
+                .Append(rx).Append(',').Append(ry).Append(',').Append(depths.Count).Append(',').Append(nearZeroRuns).Append(',')
+                .Append(classification).Append(',')
+                .Append(depths.Count > 0 ? AuditFloat(depths[0]) : string.Empty).Append(',')
+                .Append(depths.Count > 0 ? AuditFloat(depths[depths.Count - 1]) : string.Empty).Append(',')
+                .Append(AuditFloat(maxGap)).AppendLine();
+
+            for (int layer = 0; layer < depths.Count; layer++)
+                AppendLayerProfileRow(layers, rx, ry, layer, depths[layer], ray, frontIndices[layer], backIndices[layer]);
+        }
+    }
+
+    private string AppendLayerPairProfileRow(
+        StringBuilder csv, int rayX, int rayY, int pair, float frontDepth, float backDepth,
+        int frontA, int frontB, int backA, int backB)
+    {
+        bool hasFront = TryGetNewestLayerProvenance(frontA, frontB, out VoxelWriteProvenance front);
+        bool hasBack = TryGetNewestLayerProvenance(backA, backB, out VoxelWriteProvenance back);
+        float gap = Mathf.Max(0f, backDepth - frontDepth);
+        float normalDot = -1f;
+        float lateral = -1f;
+        string classification = "AMBIGUOUS_MULTI";
+        if (hasFront && hasBack && front.SurfaceNormal.sqrMagnitude > 0.0001f && back.SurfaceNormal.sqrMagnitude > 0.0001f)
+        {
+            Vector3 frontNormal = front.SurfaceNormal.normalized;
+            Vector3 backNormal = back.SurfaceNormal.normalized;
+            normalDot = Mathf.Abs(Vector3.Dot(frontNormal, backNormal));
+            Vector3 meanNormal = (frontNormal + (Vector3.Dot(frontNormal, backNormal) >= 0f ? backNormal : -backNormal)).normalized;
+            Vector3 delta = back.SurfacePoint - front.SurfacePoint;
+            lateral = (delta - meanNormal * Vector3.Dot(delta, meanNormal)).magnitude;
+            if (gap <= duplicateLayerMaxGapMeters && normalDot >= duplicateLayerMinNormalDot && lateral <= duplicateLayerMaxGapMeters * 1.5f)
+                classification = "DUPLICATE_LAYER";
+            else if (gap >= legalOcclusionMinGapMeters || normalDot < 0.7f || lateral > 0.25f)
+                classification = "LEGAL_OCCLUSION";
+        }
+
+        csv.Append(_surfaceDiagnosticCaptureIndex).Append(',').Append(IntegratedFrameCount).Append(',')
+            .Append(rayX).Append(',').Append(rayY).Append(',').Append(pair).Append(',').Append(classification).Append(',')
+            .Append(AuditFloat(frontDepth)).Append(',').Append(AuditFloat(backDepth)).Append(',').Append(AuditFloat(gap)).Append(',')
+            .Append(AuditFloat(normalDot)).Append(',').Append(AuditFloat(lateral)).Append(',')
+            .Append(hasFront ? front.LastOperation : "untracked").Append(',').Append(hasFront ? front.WriteSequence : 0).Append(',').Append(hasFront ? front.Capture : 0).Append(',')
+            .Append(hasFront ? AuditFloat(front.SurfacePoint.x) : string.Empty).Append(',').Append(hasFront ? AuditFloat(front.SurfacePoint.y) : string.Empty).Append(',').Append(hasFront ? AuditFloat(front.SurfacePoint.z) : string.Empty).Append(',')
+            .Append(hasBack ? back.LastOperation : "untracked").Append(',').Append(hasBack ? back.WriteSequence : 0).Append(',').Append(hasBack ? back.Capture : 0).Append(',')
+            .Append(hasBack ? AuditFloat(back.SurfacePoint.x) : string.Empty).Append(',').Append(hasBack ? AuditFloat(back.SurfacePoint.y) : string.Empty).Append(',').Append(hasBack ? AuditFloat(back.SurfacePoint.z) : string.Empty).AppendLine();
+        return classification;
+    }
+
+    private bool TryGetNewestLayerProvenance(int a, int b, out VoxelWriteProvenance provenance)
+    {
+        bool hasA = _voxelWriteProvenance.TryGetValue(a, out VoxelWriteProvenance pa);
+        bool hasB = _voxelWriteProvenance.TryGetValue(b, out VoxelWriteProvenance pb);
+        if (hasA && (!hasB || pa.WriteSequence >= pb.WriteSequence))
+        {
+            provenance = pa;
+            return true;
+        }
+        if (hasB)
+        {
+            provenance = pb;
+            return true;
+        }
+        provenance = default;
+        return false;
+    }
+
+    private void AppendLayerProfileRow(StringBuilder csv, int rayX, int rayY, int layer, float depth, Ray ray, int frontIndex, int backIndex)
+    {
+        Vector3 world = ray.origin + ray.direction * depth;
+        bool hasFront = _voxelWriteProvenance.TryGetValue(frontIndex, out VoxelWriteProvenance front);
+        bool hasBack = _voxelWriteProvenance.TryGetValue(backIndex, out VoxelWriteProvenance back);
+        csv.Append(_surfaceDiagnosticCaptureIndex).Append(',').Append(IntegratedFrameCount).Append(',')
+            .Append(rayX).Append(',').Append(rayY).Append(',').Append(layer).Append(',').Append(AuditFloat(depth)).Append(',')
+            .Append(AuditFloat(world.x)).Append(',').Append(AuditFloat(world.y)).Append(',').Append(AuditFloat(world.z)).Append(',')
+            .Append(frontIndex).Append(',').Append(AuditFloat(_tsdf[frontIndex])).Append(',').Append(_weights[frontIndex]).Append(',')
+            .Append(hasFront ? front.LastOperation : "untracked").Append(',').Append(hasFront ? front.WriteSequence : 0).Append(',')
+            .Append(backIndex).Append(',').Append(AuditFloat(_tsdf[backIndex])).Append(',').Append(_weights[backIndex]).Append(',')
+            .Append(hasBack ? back.LastOperation : "untracked").Append(',').Append(hasBack ? back.WriteSequence : 0).AppendLine();
+    }
+
+    private bool TryIntersectVolume(Ray ray, out float enter, out float exit)
+    {
+        Vector3 min = _volumeOriginWorld;
+        Vector3 max = _volumeOriginWorld + new Vector3((_dimX - 1) * voxelSizeMeters, (_dimY - 1) * voxelSizeMeters, (_dimZ - 1) * voxelSizeMeters);
+        enter = 0f;
+        exit = float.MaxValue;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            float origin = ray.origin[axis];
+            float direction = ray.direction[axis];
+            if (Mathf.Abs(direction) < 0.000001f)
+            {
+                if (origin < min[axis] || origin > max[axis])
+                    return false;
+                continue;
+            }
+            float inverse = 1f / direction;
+            float a = (min[axis] - origin) * inverse;
+            float b = (max[axis] - origin) * inverse;
+            if (a > b)
+            {
+                float swap = a;
+                a = b;
+                b = swap;
+            }
+            enter = Mathf.Max(enter, a);
+            exit = Mathf.Min(exit, b);
+            if (exit < enter)
+                return false;
+        }
+        return exit >= Mathf.Max(0f, enter);
+    }
+
     private void BeginConfidenceAuditCapture()
     {
+        BeginSurfaceProfileDiagnostics();
+        ResetHardTsdfWriteAuditCounters();
+        BeginHardTsdfWriteAuditCapture();
         ResetRawCoverageGridDiagnostics();
         if (!writeConfidenceAuditOnCapture)
             return;
@@ -2535,7 +3575,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         bool provisionalWrite =
             operation == "provisional_support" ||
             operation == "strong_sample_seed" ||
-            operation == "same_frame_provisional";
+            operation == "same_frame_provisional" ||
+            operation == "hole_side_repair" ||
+            operation == "primary_plane_hole_band";
 
         if (provisionalWrite)
         {
@@ -2549,7 +3591,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (_provisionalTsdf[index] == 0)
             return;
 
-        if (operation == "provisional_retire" || operation == "provisional_dirty_clear")
+        if (operation == "provisional_retire" || operation == "provisional_dirty_clear" ||
+            operation == "primary_plane_hole_retire")
         {
             _provisionalTsdf[index] = 0;
             _provisionalTsdfLastFrame[index] = int.MinValue;
@@ -2586,6 +3629,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         provenance.PixelX = _activeLedgerPixelX;
         provenance.PixelY = _activeLedgerPixelY;
         provenance.WriteCount++;
+        provenance.WriteSequence = ++_voxelWriteSequence;
         provenance.LastOperation = operation ?? "unknown";
         if (operation == "integrate")
             provenance.IntegrateCount++;
@@ -2609,6 +3653,157 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         provenance.Tsdf = newTsdf;
         provenance.Weight = newWeight;
         _voxelWriteProvenance[index] = provenance;
+        if (_hardAuditExpectedTsdf != null && index < _hardAuditExpectedTsdf.Length)
+            _hardAuditExpectedTsdf[index] = newTsdf;
+        if (_hardAuditExpectedWeights != null && index < _hardAuditExpectedWeights.Length)
+            _hardAuditExpectedWeights[index] = (byte)Mathf.Clamp(newWeight, 0, 255);
+    }
+
+    private void ResetHardTsdfWriteAuditCounters()
+    {
+        LastHardAuditIntegrationCount = 0;
+        LastHardAuditRetireCount = 0;
+        LastHardAuditContinuityCount = 0;
+        LastHardAuditExtractionCount = 0;
+        LastHardAuditTsdfOnlyCount = 0;
+        LastHardAuditWeightOnlyCount = 0;
+        LastHardAuditBothCount = 0;
+    }
+
+    private void BeginHardTsdfWriteAuditCapture()
+    {
+        if (!enableHardTsdfWriteAudit || !writeHardTsdfAuditOnCapture)
+        {
+            _hardAuditRows = null;
+            _hardAuditSampleRows = null;
+            return;
+        }
+
+        _hardAuditCaptureIndex++;
+        _hardAuditStem = $"hard_write_audit_{System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", AuditCulture)}_{_hardAuditCaptureIndex:D3}";
+        _hardAuditRows = new StringBuilder(1024);
+        _hardAuditRows.AppendLine("capture,frame,stage,changed,tsdf_only,weight_only,both,first_voxel,max_tsdf_delta,max_weight_delta");
+        _hardAuditSampleRows = new StringBuilder(8192);
+        _hardAuditSampleRows.AppendLine("capture,frame,stage,voxel_index,x,y,z,expected_tsdf,actual_tsdf,expected_weight,actual_weight,last_operation,last_write_sequence");
+    }
+
+    private void EndHardTsdfWriteAuditCapture()
+    {
+        if (_hardAuditRows == null || !writeHardTsdfAuditOnCapture)
+            return;
+
+        try
+        {
+            string directory = ResolveConfidenceAuditDirectory();
+            Directory.CreateDirectory(directory);
+            string summaryPath = Path.Combine(directory, _hardAuditStem + ".csv");
+            string samplePath = Path.Combine(directory, _hardAuditStem + "_voxels.csv");
+            File.WriteAllText(summaryPath, _hardAuditRows.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(samplePath, _hardAuditSampleRows != null ? _hardAuditSampleRows.ToString() : string.Empty, new UTF8Encoding(false));
+            _lastHardAuditPath = summaryPath;
+        }
+        catch (System.Exception error)
+        {
+            _lastHardAuditPath = "WRITE FAILED";
+            Debug.LogWarning($"[ScanCover] Hard write audit could not be written: {error.Message}", this);
+        }
+        finally
+        {
+            _hardAuditRows = null;
+            _hardAuditSampleRows = null;
+        }
+    }
+
+    private void AuditUntrackedTsdfWrites(string stage)
+    {
+        if (!enableHardTsdfWriteAudit || _tsdf == null || _weights == null)
+            return;
+        if (_hardAuditExpectedTsdf == null || _hardAuditExpectedTsdf.Length != _tsdf.Length ||
+            _hardAuditExpectedWeights == null || _hardAuditExpectedWeights.Length != _weights.Length)
+        {
+            _hardAuditExpectedTsdf = (float[])_tsdf.Clone();
+            _hardAuditExpectedWeights = (byte[])_weights.Clone();
+            return;
+        }
+
+        int changed = 0;
+        int tsdfOnly = 0;
+        int weightOnly = 0;
+        int both = 0;
+        int firstVoxel = -1;
+        int sampled = 0;
+        float maxTsdfDelta = 0f;
+        int maxWeightDelta = 0;
+        for (int i = 0; i < _tsdf.Length; i++)
+        {
+            bool tsdfChanged = !Mathf.Approximately(_tsdf[i], _hardAuditExpectedTsdf[i]);
+            bool weightChanged = _weights[i] != _hardAuditExpectedWeights[i];
+            if (!tsdfChanged && !weightChanged)
+                continue;
+
+            changed++;
+            if (firstVoxel < 0)
+                firstVoxel = i;
+            maxTsdfDelta = Mathf.Max(maxTsdfDelta, Mathf.Abs(_tsdf[i] - _hardAuditExpectedTsdf[i]));
+            maxWeightDelta = Mathf.Max(maxWeightDelta, Mathf.Abs(_weights[i] - _hardAuditExpectedWeights[i]));
+            if (tsdfChanged && weightChanged)
+            {
+                both++;
+                LastHardAuditBothCount++;
+            }
+            else if (tsdfChanged)
+            {
+                tsdfOnly++;
+                LastHardAuditTsdfOnlyCount++;
+            }
+            else
+            {
+                weightOnly++;
+                LastHardAuditWeightOnlyCount++;
+            }
+
+            if (_hardAuditSampleRows != null && sampled < Mathf.Max(1, maxHardAuditVoxelSamplesPerStage))
+            {
+                IndexToVoxel(i, out int x, out int y, out int z);
+                bool hasProvenance = _voxelWriteProvenance.TryGetValue(i, out VoxelWriteProvenance provenance);
+                _hardAuditSampleRows
+                    .Append(_hardAuditCaptureIndex).Append(',')
+                    .Append(LastRawFrameIndex).Append(',')
+                    .Append(stage).Append(',')
+                    .Append(i).Append(',').Append(x).Append(',').Append(y).Append(',').Append(z).Append(',')
+                    .Append(AuditFloat(_hardAuditExpectedTsdf[i])).Append(',')
+                    .Append(AuditFloat(_tsdf[i])).Append(',')
+                    .Append(_hardAuditExpectedWeights[i]).Append(',').Append(_weights[i]).Append(',')
+                    .Append(hasProvenance ? provenance.LastOperation : "untracked").Append(',')
+                    .Append(hasProvenance ? provenance.WriteSequence : 0)
+                    .AppendLine();
+                sampled++;
+            }
+
+            // Adopt the observed value after reporting it so a later checkpoint
+            // cannot charge the same untracked mutation to a second stage.
+            _hardAuditExpectedTsdf[i] = _tsdf[i];
+            _hardAuditExpectedWeights[i] = _weights[i];
+        }
+
+        switch (stage)
+        {
+            case "integration": LastHardAuditIntegrationCount += changed; break;
+            case "retire": LastHardAuditRetireCount += changed; break;
+            case "continuity": LastHardAuditContinuityCount += changed; break;
+            case "extraction": LastHardAuditExtractionCount += changed; break;
+        }
+
+        if (_hardAuditRows != null)
+        {
+            _hardAuditRows
+                .Append(_hardAuditCaptureIndex).Append(',')
+                .Append(LastRawFrameIndex).Append(',')
+                .Append(stage).Append(',')
+                .Append(changed).Append(',').Append(tsdfOnly).Append(',').Append(weightOnly).Append(',').Append(both).Append(',')
+                .Append(firstVoxel).Append(',').Append(AuditFloat(maxTsdfDelta)).Append(',').Append(maxWeightDelta)
+                .AppendLine();
+        }
     }
 
     private void WriteLedgerFloat(float value)
@@ -2885,6 +4080,26 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         current.NormalSum += normal;
         current.Count++;
         _voteCurrentFrameRawHistory[key] = current;
+    }
+
+    private void MarkSurfaceObservationState(Vector3 point, byte state)
+    {
+        if (_surfaceObservationState == null || _surfaceObservationLastFrame == null || !Finite(point))
+            return;
+        if (!TryWorldToVoxel(point, out int x, out int y, out int z))
+            return;
+        int index = Index(x, y, z);
+        _surfaceObservationState[index] = state;
+        _surfaceObservationLastFrame[index] = LastRawFrameIndex;
+    }
+
+    private void MarkSurfaceObservationVoxel(int index, byte state)
+    {
+        if (state == 0 || _surfaceObservationState == null || _surfaceObservationLastFrame == null ||
+            index < 0 || index >= _surfaceObservationState.Length)
+            return;
+        _surfaceObservationState[index] = state;
+        _surfaceObservationLastFrame[index] = LastRawFrameIndex;
     }
 
     private void MeasureCrossFrameCleanSurfaceConflict(Vector3 point, Vector3 normal)
@@ -3453,6 +4668,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void EndConfidenceAuditCapture(int integratedFrames, string status)
     {
+        EndSurfaceProfileDiagnostics(integratedFrames, status);
+        EndHardTsdfWriteAuditCapture();
         if (!writeConfidenceAuditOnCapture || _confidenceAuditRows == null)
             return;
 
@@ -4740,6 +5957,940 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
     }
 
+    private struct HoleBoundaryMarkerCandidate
+    {
+        public Vector3 Center;
+        public Color Color;
+        public float ViewScore;
+        public int Priority;
+        public float SizeScale;
+    }
+
+    private struct HoleSideRepairProposal
+    {
+        public int Index;
+        public float Tsdf;
+    }
+
+    private void RebuildHoleBoundaryDiagnostic(int cellX, int cellY, int cellZ, int meshVertexCount, List<int> meshTriangles)
+    {
+        LastHoleCauseNoRawCount = 0;
+        LastHoleCausePendingCount = 0;
+        LastHoleCauseNoBandCount = 0;
+        LastHoleCauseNoZeroCrossCount = 0;
+        LastHoleCausePositiveOnlyCount = 0;
+        LastHoleCauseNegativeOnlyCount = 0;
+        LastMissingSideNoVisitCount = 0;
+        LastMissingSideProvisionalCount = 0;
+        LastMissingSideBlockedCount = 0;
+        LastMissingSideAcceptLostCount = 0;
+        LastMissingSidePendingNoPromoteCount = 0;
+        LastMissingSideRejectCount = 0;
+        LastMissingSideOtherBlockCount = 0;
+        LastMissingSideAcceptedOverwrittenCount = 0;
+        LastMissingSideAcceptedSpatialMissCount = 0;
+        LastMissingSideAcceptedReflattenedCount = 0;
+        LastReflattenedByCarveCount = 0;
+        LastReflattenedByClearCount = 0;
+        LastReflattenedByProvisionalCount = 0;
+        LastReflattenedByOtherCount = 0;
+        LastReflattenedByAcceptedWriterCount = 0;
+        LastReflattenedByContinuityWriterCount = 0;
+        LastReflattenedByFusionWriterCount = 0;
+        LastReflattenedByUntrackedWriterCount = 0;
+        LastMissingSideGoneCount = 0;
+        LastMissingSideInvalidCount = 0;
+        LastHoleCauseVertexRejectCount = 0;
+        LastHoleCauseQuadRejectCount = 0;
+        LastHoleCauseClearedCount = 0;
+        LastHoleCauseLocalOffsetCount = 0;
+        LastHoleCauseCrossFrameCount = 0;
+        LastHoleBoundaryRenderedMarkerCount = 0;
+        LastPrimaryLayerDiagnosticMarkerCount = 0;
+        LastSecondaryLayerDiagnosticMarkerCount = 0;
+        LastUnclassifiedLayerDiagnosticMarkerCount = 0;
+        LastConfirmedSecondaryLayerVoxelCount = 0;
+        EnsureHoleBoundaryDiagnosticObjects();
+        if (_holeBoundaryDiagnosticMesh == null)
+            return;
+
+        _holeBoundaryDiagnosticMesh.Clear();
+        if (!showHoleBoundaryDiagnosis || _cellVertexIndices == null)
+        {
+            _holeBoundaryDiagnosticObject.SetActive(false);
+            return;
+        }
+
+        int limit = Mathf.Max(1, maxHoleBoundaryMarkers);
+        List<Vector3> vertices = new List<Vector3>(limit * 4);
+        List<int> triangles = new List<int>(limit * 6);
+        List<Color> colors = new List<Color>(limit * 4);
+        Vector3 cameraPosition = GetCameraPosition();
+        Vector3 cameraForward = GetCameraForward();
+        List<HoleBoundaryMarkerCandidate> markerCandidates = new List<HoleBoundaryMarkerCandidate>(limit * 2);
+        bool[] vertexUsed = new bool[Mathf.Max(0, meshVertexCount)];
+        if (meshTriangles != null)
+        {
+            for (int i = 0; i < meshTriangles.Count; i++)
+            {
+                int vertexIndex = meshTriangles[i];
+                if (vertexIndex >= 0 && vertexIndex < vertexUsed.Length)
+                    vertexUsed[vertexIndex] = true;
+            }
+        }
+        for (int z = 0; z < cellZ; z++)
+        {
+            for (int y = 0; y < cellY; y++)
+            {
+                for (int x = 0; x < cellX; x++)
+                {
+                    int cellIndex = CellIndex(x, y, z, cellX, cellY);
+                    int vertexIndex = _cellVertexIndices[cellIndex];
+                    bool usedByMesh = vertexIndex >= 0 && vertexIndex < vertexUsed.Length && vertexUsed[vertexIndex];
+                    if (usedByMesh)
+                        continue;
+                    if (vertexIndex < 0 && !CellTouchesUsedSurface(x, y, z, cellX, cellY, cellZ, vertexUsed))
+                        continue;
+
+                    HoleSupportCause cause = ClassifyHoleSupportCause(
+                        x, y, z, vertexIndex, out bool positiveOnly, out bool negativeOnly);
+                    Color color = HoleSupportCauseColor(cause);
+                    if (positiveOnly)
+                    {
+                        LastHoleCausePositiveOnlyCount++;
+                        CountMissingSideCause(x, y, z, true);
+                    }
+                    if (negativeOnly)
+                    {
+                        LastHoleCauseNegativeOnlyCount++;
+                        CountMissingSideCause(x, y, z, false);
+                    }
+                    if (cause == HoleSupportCause.NoZeroCross && !positiveOnly && !negativeOnly)
+                        LastMissingSideInvalidCount += 2;
+                    switch (cause)
+                    {
+                        case HoleSupportCause.NoRaw:
+                            LastHoleCauseNoRawCount++;
+                            break;
+                        case HoleSupportCause.Pending:
+                            LastHoleCausePendingCount++;
+                            break;
+                        case HoleSupportCause.NoBand:
+                            LastHoleCauseNoBandCount++;
+                            break;
+                        case HoleSupportCause.NoZeroCross:
+                            LastHoleCauseNoZeroCrossCount++;
+                            break;
+                        case HoleSupportCause.VertexReject:
+                            LastHoleCauseVertexRejectCount++;
+                            break;
+                        case HoleSupportCause.QuadReject:
+                            LastHoleCauseQuadRejectCount++;
+                            break;
+                        case HoleSupportCause.Cleared:
+                            LastHoleCauseClearedCount++;
+                            break;
+                        case HoleSupportCause.LocalOffset:
+                            LastHoleCauseLocalOffsetCount++;
+                            break;
+                        case HoleSupportCause.CrossFrame:
+                            LastHoleCauseCrossFrameCount++;
+                            break;
+                    }
+
+                    Vector3 center = VoxelCenter(x, y, z) + Vector3.one * (Mathf.Max(0.0001f, voxelSizeMeters) * 0.5f);
+                    DiagnosticLayerRole layerRole = ClassifyDiagnosticLayerRole(center);
+                    if (layerRole == DiagnosticLayerRole.None)
+                    {
+                        LastUnclassifiedLayerDiagnosticMarkerCount++;
+                        continue;
+                    }
+                    if (layerRole == DiagnosticLayerRole.Primary)
+                    {
+                        LastPrimaryLayerDiagnosticMarkerCount++;
+                        if (!showAllLayerDiagnosticMarkers && !PassLayerDiagnosticSpatialSample(x, y, z, 3))
+                            continue;
+                        color = primaryLayerDiagnosticColor;
+                    }
+                    else
+                    {
+                        LastSecondaryLayerDiagnosticMarkerCount++;
+                        if (!showAllLayerDiagnosticMarkers && !PassLayerDiagnosticSpatialSample(x, y, z, 3))
+                            continue;
+                        color = secondaryLayerDiagnosticColor;
+                    }
+                    Vector3 toMarker = center - cameraPosition;
+                    float distanceSq = toMarker.sqrMagnitude;
+                    float forwardDot = distanceSq > 0.000001f
+                        ? Vector3.Dot(cameraForward, toMarker / Mathf.Sqrt(distanceSq))
+                        : 1f;
+                    // Prefer nearby markers in the current view. Markers behind the user
+                    // remain eligible, but naturally leave the bounded render budget.
+                    float viewPenalty = Mathf.Max(0f, 1f - forwardDot) * (distanceSq + 1f) * 4f;
+                    markerCandidates.Add(new HoleBoundaryMarkerCandidate
+                    {
+                        Center = center,
+                        Color = color,
+                        ViewScore = distanceSq + viewPenalty,
+                        Priority = 0,
+                        SizeScale = primaryLayerDiagnosticSizeScale
+                    });
+                }
+            }
+        }
+
+        if (showGlobalPairedLayerDiagnostics)
+        {
+            // Hole-cause accounting above remains intact for disk diagnostics. Rendering,
+            // however, comes from every written near-surface voxel so both sides of a
+            // competing layer pair remain visible even away from a mesh hole.
+            markerCandidates.Clear();
+            LastPrimaryLayerDiagnosticMarkerCount = 0;
+            LastSecondaryLayerDiagnosticMarkerCount = 0;
+            LastUnclassifiedLayerDiagnosticMarkerCount = 0;
+            AppendGlobalPairedLayerDiagnosticCandidates(markerCandidates, cameraPosition, cameraForward);
+        }
+        UpdateLayerHoleTrend();
+
+        markerCandidates.Sort((a, b) =>
+        {
+            int priority = a.Priority.CompareTo(b.Priority);
+            return priority != 0 ? priority : a.ViewScore.CompareTo(b.ViewScore);
+        });
+        int renderLimit = showAllLayerDiagnosticMarkers
+            ? Mathf.Max(12000, maxFullLayerDiagnosticMarkers)
+            : limit;
+        int renderedMarkers = Mathf.Min(renderLimit, markerCandidates.Count);
+        for (int i = 0; i < renderedMarkers; i++)
+        {
+            HoleBoundaryMarkerCandidate candidate = markerCandidates[i];
+            AddHoleBoundaryPoint(vertices, triangles, colors, candidate.Center, cameraPosition, candidate.Color, candidate.SizeScale);
+        }
+        LastHoleBoundaryRenderedMarkerCount = renderedMarkers;
+
+        if (vertices.Count == 0)
+        {
+            _holeBoundaryDiagnosticObject.SetActive(false);
+            return;
+        }
+
+        _holeBoundaryDiagnosticMesh.indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        _holeBoundaryDiagnosticMesh.SetVertices(vertices);
+        _holeBoundaryDiagnosticMesh.SetColors(colors);
+        _holeBoundaryDiagnosticMesh.SetTriangles(triangles, 0, true);
+        _holeBoundaryDiagnosticMesh.RecalculateBounds();
+        _holeBoundaryDiagnosticObject.SetActive(true);
+    }
+
+    private void AppendGlobalPairedLayerDiagnosticCandidates(
+        List<HoleBoundaryMarkerCandidate> markerCandidates,
+        Vector3 cameraPosition,
+        Vector3 cameraForward)
+    {
+        if (_tsdf == null || _weights == null || _voxelWriteProvenance.Count == 0)
+            return;
+
+        float maxAbsTsdf = Mathf.Clamp(layerDiagnosticMaxAbsTsdf, 0.02f, 0.5f);
+        foreach (KeyValuePair<int, VoxelWriteProvenance> entry in _voxelWriteProvenance)
+        {
+            int index = entry.Key;
+            if (index < 0 || index >= _tsdf.Length || index >= _weights.Length ||
+                _weights[index] < minSurfaceCornerWeight || Mathf.Abs(_tsdf[index]) > maxAbsTsdf)
+                continue;
+
+            IndexToVoxel(index, out int x, out int y, out int z);
+            Vector3 center = VoxelCenter(x, y, z);
+            DiagnosticLayerRole layerRole = ClassifyDiagnosticLayerRole(center);
+            if (layerRole == DiagnosticLayerRole.Secondary)
+                LastConfirmedSecondaryLayerVoxelCount++;
+            if (layerRole == DiagnosticLayerRole.None)
+            {
+                LastUnclassifiedLayerDiagnosticMarkerCount++;
+                // A trustworthy near-zero voxel without a detected competitor is the
+                // visible baseline surface. Keep it in the primary layer display while
+                // preserving the unclassified count in diagnostics.
+                layerRole = DiagnosticLayerRole.Primary;
+            }
+
+            if (!showAllLayerDiagnosticMarkers && !PassLayerDiagnosticSpatialSample(x, y, z, 3))
+                continue;
+
+            if (layerRole == DiagnosticLayerRole.Secondary)
+                LastSecondaryLayerDiagnosticMarkerCount++;
+            else
+                LastPrimaryLayerDiagnosticMarkerCount++;
+
+            Vector3 toMarker = center - cameraPosition;
+            float distanceSq = toMarker.sqrMagnitude;
+            float forwardDot = distanceSq > 0.000001f
+                ? Vector3.Dot(cameraForward, toMarker / Mathf.Sqrt(distanceSq))
+                : 1f;
+            float viewPenalty = Mathf.Max(0f, 1f - forwardDot) * (distanceSq + 1f) * 4f;
+            markerCandidates.Add(new HoleBoundaryMarkerCandidate
+            {
+                Center = center,
+                Color = layerRole == DiagnosticLayerRole.Secondary
+                    ? secondaryLayerDiagnosticColor
+                    : primaryLayerDiagnosticColor,
+                ViewScore = distanceSq + viewPenalty,
+                Priority = 0,
+                SizeScale = primaryLayerDiagnosticSizeScale
+            });
+        }
+    }
+
+    private void UpdateLayerHoleTrend()
+    {
+        int frame = IntegratedFrameCount;
+        int holeLoad = LastHoleCauseNoBandCount + LastHoleCauseNoZeroCrossCount +
+            LastHoleCauseVertexRejectCount + LastHoleCauseQuadRejectCount;
+        LastLayerHoleTrendHoleLoad = holeLoad;
+        if (frame == _lastLayerHoleTrendIntegratedFrame)
+            return;
+
+        _lastLayerHoleTrendIntegratedFrame = frame;
+        if (_layerHoleTrendSamples.Count > 0)
+        {
+            Vector2 previous = _layerHoleTrendSamples[_layerHoleTrendSamples.Count - 1];
+            LastLayerHoleTrendSecondaryDelta = LastConfirmedSecondaryLayerVoxelCount - Mathf.RoundToInt(previous.x);
+            LastLayerHoleTrendHoleDelta = holeLoad - Mathf.RoundToInt(previous.y);
+        }
+        else
+        {
+            LastLayerHoleTrendSecondaryDelta = 0;
+            LastLayerHoleTrendHoleDelta = 0;
+        }
+
+        _layerHoleTrendSamples.Add(new Vector2(LastConfirmedSecondaryLayerVoxelCount, holeLoad));
+        if (_layerHoleTrendSamples.Count > 24)
+            _layerHoleTrendSamples.RemoveAt(0);
+        LastLayerHoleTrendSampleCount = _layerHoleTrendSamples.Count;
+        LastLayerHoleTrendCorrelation = ComputeLayerHoleTrendCorrelation(_layerHoleTrendSamples);
+    }
+
+    private static float ComputeLayerHoleTrendCorrelation(List<Vector2> samples)
+    {
+        if (samples == null || samples.Count < 3)
+            return 0f;
+
+        float meanX = 0f;
+        float meanY = 0f;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            meanX += samples[i].x;
+            meanY += samples[i].y;
+        }
+        meanX /= samples.Count;
+        meanY /= samples.Count;
+
+        float covariance = 0f;
+        float varianceX = 0f;
+        float varianceY = 0f;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            float dx = samples[i].x - meanX;
+            float dy = samples[i].y - meanY;
+            covariance += dx * dy;
+            varianceX += dx * dx;
+            varianceY += dy * dy;
+        }
+        float denominator = Mathf.Sqrt(varianceX * varianceY);
+        return denominator > 0.0001f ? Mathf.Clamp(covariance / denominator, -1f, 1f) : 0f;
+    }
+
+    private string LayerHoleTrendRelationText()
+    {
+        if (LastLayerHoleTrendSampleCount < 3)
+            return "WARMUP";
+        if (LastLayerHoleTrendCorrelation >= 0.35f)
+            return "COUPLED";
+        if (LastLayerHoleTrendCorrelation <= -0.35f)
+            return "TRADEOFF";
+        return "WEAK";
+    }
+
+    private static bool PassLayerDiagnosticSpatialSample(int x, int y, int z, int stride)
+    {
+        stride = Mathf.Max(1, stride);
+        if (stride == 1)
+            return true;
+
+        unchecked
+        {
+            uint hash = (uint)x * 73856093u;
+            hash ^= (uint)y * 19349663u;
+            hash ^= (uint)z * 83492791u;
+            return hash % (uint)stride == 0u;
+        }
+    }
+
+    private bool CellTouchesUsedSurface(int x, int y, int z, int cellX, int cellY, int cellZ, bool[] vertexUsed)
+    {
+        return CellVertexIsUsed(x - 1, y, z, cellX, cellY, cellZ, vertexUsed) ||
+               CellVertexIsUsed(x + 1, y, z, cellX, cellY, cellZ, vertexUsed) ||
+               CellVertexIsUsed(x, y - 1, z, cellX, cellY, cellZ, vertexUsed) ||
+               CellVertexIsUsed(x, y + 1, z, cellX, cellY, cellZ, vertexUsed) ||
+               CellVertexIsUsed(x, y, z - 1, cellX, cellY, cellZ, vertexUsed) ||
+               CellVertexIsUsed(x, y, z + 1, cellX, cellY, cellZ, vertexUsed);
+    }
+
+    private bool CellVertexIsUsed(int x, int y, int z, int cellX, int cellY, int cellZ, bool[] vertexUsed)
+    {
+        if (x < 0 || y < 0 || z < 0 || x >= cellX || y >= cellY || z >= cellZ)
+            return false;
+        int vertexIndex = _cellVertexIndices[CellIndex(x, y, z, cellX, cellY)];
+        return vertexIndex >= 0 && vertexIndex < vertexUsed.Length && vertexUsed[vertexIndex];
+    }
+
+    private HoleSupportCause ClassifyHoleSupportCause(
+        int x, int y, int z, int vertexIndex, out bool positiveOnly, out bool negativeOnly)
+    {
+        positiveOnly = false;
+        negativeOnly = false;
+        bool pending = false;
+        bool cleared = false;
+        bool rawAtCell = false;
+        int formalCorners = 0;
+        bool hasPositive = false;
+        bool hasNegative = false;
+        for (int dz = 0; dz <= 1; dz++)
+        for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            int index = Index(x + dx, y + dy, z + dz);
+            pending |= _atomicProvisionalBandWeight != null && _atomicProvisionalBandWeight[index] > 0;
+            cleared |= _clearedVoxelLastFrame != null && _clearedVoxelLastFrame[index] != int.MinValue;
+            rawAtCell |= _surfaceObservationState != null && _surfaceObservationState[index] > 0;
+            if (_weights[index] <= 0)
+                continue;
+            formalCorners++;
+            hasPositive |= _tsdf[index] >= 0f;
+            hasNegative |= _tsdf[index] <= 0f;
+        }
+
+        if (cleared)
+            return HoleSupportCause.Cleared;
+        if (pending)
+            return HoleSupportCause.Pending;
+        if (!rawAtCell)
+        {
+            if (!TryFindNearestObservationFrame(x, y, z, 2, out int observationFrame))
+                return HoleSupportCause.NoRaw;
+            return CellHasFormalWriteFromFrame(x, y, z, observationFrame)
+                ? HoleSupportCause.LocalOffset
+                : (CellHasFormalWriteFromOtherFrame(x, y, z, observationFrame)
+                    ? HoleSupportCause.CrossFrame
+                    : HoleSupportCause.LocalOffset);
+        }
+        if (formalCorners == 0)
+            return HoleSupportCause.NoBand;
+        if (!hasPositive || !hasNegative)
+        {
+            positiveOnly = hasPositive && !hasNegative;
+            negativeOnly = hasNegative && !hasPositive;
+            return HoleSupportCause.NoZeroCross;
+        }
+        return vertexIndex < 0 ? HoleSupportCause.VertexReject : HoleSupportCause.QuadReject;
+    }
+
+    private bool TryFindNearestObservationFrame(int x, int y, int z, int radius, out int frame)
+    {
+        frame = int.MinValue;
+        if (_surfaceObservationState == null || _surfaceObservationLastFrame == null)
+            return false;
+        int bestDistanceSquared = int.MaxValue;
+        for (int vz = Mathf.Max(0, z - radius); vz <= Mathf.Min(_dimZ - 1, z + 1 + radius); vz++)
+        for (int vy = Mathf.Max(0, y - radius); vy <= Mathf.Min(_dimY - 1, y + 1 + radius); vy++)
+        for (int vx = Mathf.Max(0, x - radius); vx <= Mathf.Min(_dimX - 1, x + 1 + radius); vx++)
+        {
+            int index = Index(vx, vy, vz);
+            if (_surfaceObservationState[index] <= 0 || _surfaceObservationLastFrame[index] == int.MinValue)
+                continue;
+            int dx = vx < x ? x - vx : (vx > x + 1 ? vx - (x + 1) : 0);
+            int dy = vy < y ? y - vy : (vy > y + 1 ? vy - (y + 1) : 0);
+            int dz = vz < z ? z - vz : (vz > z + 1 ? vz - (z + 1) : 0);
+            int distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (distanceSquared >= bestDistanceSquared)
+                continue;
+            bestDistanceSquared = distanceSquared;
+            frame = _surfaceObservationLastFrame[index];
+        }
+        return frame != int.MinValue;
+    }
+
+    private bool CellHasFormalWriteFromFrame(int x, int y, int z, int frame)
+    {
+        for (int dz = 0; dz <= 1; dz++)
+        for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            int index = Index(x + dx, y + dy, z + dz);
+            if (_weights[index] > 0 &&
+                _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) &&
+                provenance.Frame == frame)
+                return true;
+        }
+        return false;
+    }
+
+    private bool CellHasFormalWriteFromOtherFrame(int x, int y, int z, int frame)
+    {
+        for (int dz = 0; dz <= 1; dz++)
+        for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            int index = Index(x + dx, y + dy, z + dz);
+            if (_weights[index] > 0 &&
+                _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) &&
+                provenance.Frame != int.MinValue && provenance.Frame != frame)
+                return true;
+        }
+        return false;
+    }
+
+    private void CountMissingSideCause(int x, int y, int z, bool missingPositive)
+    {
+        switch (ClassifyMissingSideCause(x, y, z, missingPositive))
+        {
+            case MissingSideCause.Provisional: LastMissingSideProvisionalCount++; break;
+            case MissingSideCause.AcceptLost:
+                LastMissingSideAcceptLostCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.PendingNoPromote:
+                LastMissingSidePendingNoPromoteCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.Reject:
+                LastMissingSideRejectCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedOverwritten:
+                LastMissingSideAcceptedOverwrittenCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedSpatialMiss:
+                LastMissingSideAcceptedSpatialMissCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedCarve:
+                LastReflattenedByCarveCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedClear:
+                LastReflattenedByClearCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedProvisional:
+                LastReflattenedByProvisionalCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedOther:
+                LastReflattenedByOtherCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedAcceptedWriter:
+                LastReflattenedByAcceptedWriterCount++;
+                LastReflattenedByOtherCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedContinuityWriter:
+                LastReflattenedByContinuityWriterCount++;
+                LastReflattenedByOtherCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedFusionWriter:
+                LastReflattenedByFusionWriterCount++;
+                LastReflattenedByOtherCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.AcceptedReflattenedUntrackedWriter:
+                LastReflattenedByUntrackedWriterCount++;
+                LastReflattenedByOtherCount++;
+                LastMissingSideAcceptedReflattenedCount++;
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.OtherBlock:
+                LastMissingSideOtherBlockCount++;
+                LastMissingSideBlockedCount++;
+                break;
+            case MissingSideCause.Gone: LastMissingSideGoneCount++; break;
+            case MissingSideCause.Invalid: LastMissingSideInvalidCount++; break;
+            default: LastMissingSideNoVisitCount++; break;
+        }
+    }
+
+    private MissingSideCause ClassifyMissingSideCause(int x, int y, int z, bool positive)
+    {
+        byte acceptedFlag = positive ? (byte)1 : (byte)2;
+        byte pendingFlag = positive ? (byte)4 : (byte)8;
+        byte signFlag = positive ? (byte)1 : (byte)2;
+        bool acceptedVisited = false;
+        bool pendingVisited = false;
+        bool rejectedVisited = false;
+        bool acceptSignLost = false;
+        int desiredRetainedLastSequence = int.MinValue;
+        int oppositeAcceptedLastSequence = int.MinValue;
+        int reflattenedOperationSequence = int.MinValue;
+        string reflattenedOperation = null;
+        int memory = Mathf.Max(1, holeBoundaryRetiredMemoryFrames);
+
+        for (int dz = 0; dz <= 1; dz++)
+        for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            int index = Index(x + dx, y + dy, z + dz);
+            if (_weights[index] > 0 && (float.IsNaN(_tsdf[index]) || float.IsInfinity(_tsdf[index])))
+                return MissingSideCause.Invalid;
+            if (_atomicProvisionalBandWeight != null && _atomicProvisionalBandWeight[index] > 0)
+            {
+                float provisional = _atomicProvisionalBandTsdf[index];
+                if (float.IsNaN(provisional) || float.IsInfinity(provisional))
+                    return MissingSideCause.Invalid;
+                if ((positive && provisional >= 0f) || (!positive && provisional <= 0f))
+                    return MissingSideCause.Provisional;
+            }
+            if (_clearedVoxelLastFrame != null && RecentDiagnosticFrame(_clearedVoxelLastFrame[index], memory))
+                return MissingSideCause.Gone;
+            if (_atomicProvisionalBandRetiredLastFrame != null &&
+                _atomicProvisionalBandRetiredSign != null &&
+                RecentDiagnosticFrame(_atomicProvisionalBandRetiredLastFrame[index], memory) &&
+                (_atomicProvisionalBandRetiredSign[index] & signFlag) != 0)
+                return MissingSideCause.Gone;
+            if (_surfaceBandVisitFlags != null)
+            {
+                acceptedVisited |= (_surfaceBandVisitFlags[index] & acceptedFlag) != 0;
+                pendingVisited |= (_surfaceBandVisitFlags[index] & pendingFlag) != 0;
+                byte rejectFlag = positive ? (byte)16 : (byte)32;
+                rejectedVisited |= (_surfaceBandVisitFlags[index] & rejectFlag) != 0;
+            }
+            if (_surfaceBandAcceptSignLostFlags != null)
+                acceptSignLost |= (_surfaceBandAcceptSignLostFlags[index] & signFlag) != 0;
+            int[] desiredRetained = positive ? _acceptedPositiveRetainedLastSequence : _acceptedNegativeRetainedLastSequence;
+            int[] oppositeAccepted = positive ? _acceptedNegativeLastSequence : _acceptedPositiveLastSequence;
+            if (desiredRetained != null)
+            {
+                desiredRetainedLastSequence = Mathf.Max(desiredRetainedLastSequence, desiredRetained[index]);
+                bool currentlyMissingDesiredSign = _weights[index] <= 0 ||
+                    (positive ? _tsdf[index] < 0f : _tsdf[index] > 0f);
+                if (desiredRetained[index] != int.MinValue && currentlyMissingDesiredSign &&
+                    _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) &&
+                    provenance.WriteSequence >= reflattenedOperationSequence)
+                {
+                    reflattenedOperationSequence = provenance.WriteSequence;
+                    reflattenedOperation = provenance.LastOperation;
+                }
+            }
+            if (oppositeAccepted != null)
+                oppositeAcceptedLastSequence = Mathf.Max(oppositeAcceptedLastSequence, oppositeAccepted[index]);
+        }
+
+        if (acceptedVisited)
+        {
+            if (acceptSignLost)
+                return MissingSideCause.AcceptLost;
+            if (desiredRetainedLastSequence == int.MinValue)
+                return MissingSideCause.AcceptedSpatialMiss;
+            if (oppositeAcceptedLastSequence > desiredRetainedLastSequence)
+                return MissingSideCause.AcceptedOverwritten;
+            return ClassifyReflattenedOperation(reflattenedOperation);
+        }
+        if (pendingVisited)
+            return MissingSideCause.PendingNoPromote;
+        if (rejectedVisited)
+            return MissingSideCause.Reject;
+        return MissingSideCause.NoVisit;
+    }
+
+    private MissingSideCause ClassifyReflattenedOperation(string operation)
+    {
+        if (operation == "free_space_carve")
+            return MissingSideCause.AcceptedReflattenedCarve;
+        if (operation == "old_clean_clear" || operation == "provisional_dirty_clear" ||
+            operation == "provisional_retire" || operation == "cleanup_neighbor")
+            return MissingSideCause.AcceptedReflattenedClear;
+        if (operation == "provisional_support" || operation == "strong_sample_seed" ||
+            operation == "same_frame_provisional")
+            return MissingSideCause.AcceptedReflattenedProvisional;
+        if (operation == "atomic_accept_band" || operation == "integrate" ||
+            operation == "strong_current_promote" || operation == "v08_direct_diag")
+            return MissingSideCause.AcceptedReflattenedAcceptedWriter;
+        if (operation == "continuity_fill" || operation == "boundary_no_tsdf_fill")
+            return MissingSideCause.AcceptedReflattenedContinuityWriter;
+        if (operation == "replace" || operation == "guarded_replace" ||
+            operation == "band_repair" || operation == "conflict_correct" ||
+            operation == "old_clean_decay")
+            return MissingSideCause.AcceptedReflattenedFusionWriter;
+        if (string.IsNullOrEmpty(operation) || operation == "unknown")
+            return MissingSideCause.AcceptedReflattenedUntrackedWriter;
+        return MissingSideCause.AcceptedReflattenedUntrackedWriter;
+    }
+
+    private bool RecentDiagnosticFrame(int frame, int memory)
+    {
+        if (frame == int.MinValue)
+            return false;
+        int age = LastRawFrameIndex - frame;
+        return age >= 0 && age <= memory;
+    }
+
+    private void MarkSurfaceBandVisit(int index, float sampleTsdf)
+    {
+        if (_surfaceBandVisitFlags == null || index < 0 || index >= _surfaceBandVisitFlags.Length)
+            return;
+        byte flags = 0;
+        if (_activeAtomicBandVote == ObservationVoteState.Accept)
+            flags = sampleTsdf >= 0f ? (byte)1 : (byte)2;
+        else if (_activeAtomicBandVote == ObservationVoteState.Pending)
+            flags = sampleTsdf >= 0f ? (byte)4 : (byte)8;
+        else if (_activeAtomicBandVote == ObservationVoteState.Reject)
+            flags = sampleTsdf >= 0f ? (byte)16 : (byte)32;
+        if (Mathf.Approximately(sampleTsdf, 0f))
+            flags |= _activeAtomicBandVote == ObservationVoteState.Accept ? (byte)3 :
+                     _activeAtomicBandVote == ObservationVoteState.Pending ? (byte)12 :
+                     _activeAtomicBandVote == ObservationVoteState.Reject ? (byte)48 : (byte)0;
+        _surfaceBandVisitFlags[index] |= flags;
+    }
+
+    private Color HoleSupportCauseColor(HoleSupportCause cause)
+    {
+        switch (cause)
+        {
+            case HoleSupportCause.NoRaw: return holeCauseNoRawColor;
+            case HoleSupportCause.Pending: return holeCausePendingColor;
+            case HoleSupportCause.NoBand: return holeCauseNoBandColor;
+            case HoleSupportCause.NoZeroCross: return holeCauseNoZeroCrossColor;
+            case HoleSupportCause.VertexReject: return holeCauseVertexRejectColor;
+            case HoleSupportCause.QuadReject: return holeCauseQuadRejectColor;
+            case HoleSupportCause.Cleared: return holeCauseClearedColor;
+            case HoleSupportCause.LocalOffset: return holeCauseFrameMismatchColor;
+            default: return holeCauseCrossFrameColor;
+        }
+    }
+
+    private HoleBoundaryDiagnosticKind ClassifyHoleBoundaryCell(int x, int y, int z)
+    {
+        bool waiting = false;
+        bool retired = false;
+        int formalCorners = 0;
+        bool hasPositive = false;
+        bool hasNegative = false;
+        int retiredMemory = Mathf.Max(1, holeBoundaryRetiredMemoryFrames);
+        for (int dz = 0; dz <= 1; dz++)
+        {
+            for (int dy = 0; dy <= 1; dy++)
+            {
+                for (int dx = 0; dx <= 1; dx++)
+                {
+                    int index = Index(x + dx, y + dy, z + dz);
+                    if (_weights != null && index < _weights.Length && _weights[index] > 0)
+                    {
+                        formalCorners++;
+                        if (_tsdf[index] >= 0f)
+                            hasPositive = true;
+                        if (_tsdf[index] <= 0f)
+                            hasNegative = true;
+                    }
+                    if (_atomicProvisionalBandWeight != null && index < _atomicProvisionalBandWeight.Length && _atomicProvisionalBandWeight[index] > 0)
+                        waiting = true;
+                    if (_atomicProvisionalBandRetiredLastFrame != null && index < _atomicProvisionalBandRetiredLastFrame.Length)
+                    {
+                        int retiredFrame = _atomicProvisionalBandRetiredLastFrame[index];
+                        int age = LastRawFrameIndex - retiredFrame;
+                        if (retiredFrame != int.MinValue && age >= 0 && age <= retiredMemory)
+                            retired = true;
+                    }
+                }
+            }
+        }
+
+        if (waiting)
+            return HoleBoundaryDiagnosticKind.WaitingPromotion;
+        if (retired)
+            return HoleBoundaryDiagnosticKind.Retired;
+        if (formalCorners == 0)
+            return HoleBoundaryDiagnosticKind.NoBand;
+        if (hasPositive && hasNegative)
+            return HoleBoundaryDiagnosticKind.WeakCorners;
+        if (NeighborContainsOppositeTsdfSign(x, y, z, hasPositive))
+            return HoleBoundaryDiagnosticKind.SpatialMiss;
+        return hasPositive
+            ? HoleBoundaryDiagnosticKind.PositiveOnly
+            : HoleBoundaryDiagnosticKind.NegativeOnly;
+    }
+
+    private bool NeighborContainsOppositeTsdfSign(int cellX, int cellY, int cellZ, bool currentPositive)
+    {
+        int minX = Mathf.Max(0, cellX - 1);
+        int minY = Mathf.Max(0, cellY - 1);
+        int minZ = Mathf.Max(0, cellZ - 1);
+        int maxX = Mathf.Min(_dimX - 1, cellX + 2);
+        int maxY = Mathf.Min(_dimY - 1, cellY + 2);
+        int maxZ = Mathf.Min(_dimZ - 1, cellZ + 2);
+        for (int z = minZ; z <= maxZ; z++)
+        {
+            for (int y = minY; y <= maxY; y++)
+            {
+                for (int x = minX; x <= maxX; x++)
+                {
+                    int index = Index(x, y, z);
+                    if (_weights == null || index >= _weights.Length || _weights[index] == 0)
+                        continue;
+                    if (currentPositive ? _tsdf[index] < 0f : _tsdf[index] > 0f)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private DiagnosticLayerRole ClassifyDiagnosticLayerRole(Vector3 center)
+    {
+        if (!TryResolveDoubleLayerSide(center, out DoubleLayerSideAudit current) ||
+            !current.HasProvenance ||
+            current.Provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+        {
+            return DiagnosticLayerRole.None;
+        }
+
+        Vector3 normal = current.Provenance.SurfaceNormal.normalized;
+        float voxel = Mathf.Max(0.005f, voxelSizeMeters);
+        int maxSteps = Mathf.Clamp(Mathf.CeilToInt(duplicateLayerMaxGapMeters / voxel) + 1, 2, 12);
+        DoubleLayerSideAudit partner = default;
+        bool foundPartner = false;
+        float bestSeparation = float.PositiveInfinity;
+        for (int sign = -1; sign <= 1; sign += 2)
+        {
+            for (int step = 1; step <= maxSteps; step++)
+            {
+                Vector3 probe = center + normal * (sign * step * voxel);
+                if (!TryResolveDoubleLayerSide(probe, out DoubleLayerSideAudit candidate) ||
+                    candidate.Index == current.Index ||
+                    !candidate.HasProvenance ||
+                    candidate.Provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+                {
+                    continue;
+                }
+
+                Vector3 candidateNormal = candidate.Provenance.SurfaceNormal.normalized;
+                if (Mathf.Abs(Vector3.Dot(normal, candidateNormal)) < duplicateLayerMinNormalDot)
+                    continue;
+                Vector3 delta = candidate.Provenance.SurfacePoint - current.Provenance.SurfacePoint;
+                float separation = Mathf.Abs(Vector3.Dot(delta, normal));
+                if (separation < atomicAcceptDuplicateMinGapMeters || separation > duplicateLayerMaxGapMeters)
+                    continue;
+                float lateralSq = Mathf.Max(0f, delta.sqrMagnitude - separation * separation);
+                if (lateralSq > duplicateLayerMaxGapMeters * duplicateLayerMaxGapMeters * 2.25f)
+                    continue;
+                if (separation >= bestSeparation)
+                    continue;
+
+                bestSeparation = separation;
+                partner = candidate;
+                foundPartner = true;
+            }
+        }
+
+        if (!foundPartner)
+            return DiagnosticLayerRole.None;
+
+        float currentScore = DiagnosticLayerStrength(current);
+        float partnerScore = DiagnosticLayerStrength(partner);
+        if (Mathf.Abs(currentScore - partnerScore) < 0.001f)
+        {
+            currentScore += current.Provenance.WriteSequence >= partner.Provenance.WriteSequence ? 0.01f : 0f;
+            partnerScore += partner.Provenance.WriteSequence > current.Provenance.WriteSequence ? 0.01f : 0f;
+        }
+        return currentScore >= partnerScore ? DiagnosticLayerRole.Primary : DiagnosticLayerRole.Secondary;
+    }
+
+    private float DiagnosticLayerStrength(DoubleLayerSideAudit side)
+    {
+        VoxelWriteProvenance provenance = side.Provenance;
+        float score = Mathf.Max(0, side.Weight) * 4f;
+        score += Mathf.Min(32, provenance.WriteCount) * 0.5f;
+        score += Mathf.Min(16, provenance.IntegrateCount) * 2f;
+        score += DiagnosticLayerOperationStrength(provenance.LastOperation);
+        score -= Mathf.Min(16, provenance.RepairCount) * 1.5f;
+        if (side.Pending)
+            score -= 16f;
+        if (side.Dirty)
+            score -= 32f;
+        return score;
+    }
+
+    private static float DiagnosticLayerOperationStrength(string operation)
+    {
+        switch (operation)
+        {
+            case "atomic_accept_band":
+            case "strong_current_promote":
+            case "integrate":
+                return 24f;
+            case "guarded_replace":
+            case "replace":
+            case "conflict_correct":
+                return 12f;
+            case "continuity_fill":
+            case "boundary_no_tsdf_fill":
+                return 6f;
+            case "hole_side_repair":
+                return -8f;
+            case "duplicate_layer_decay":
+            case "duplicate_layer_clear":
+            case "free_space_carve":
+                return -12f;
+            default:
+                return 0f;
+        }
+    }
+
+    private void AddHoleBoundaryPoint(List<Vector3> vertices, List<int> triangles, List<Color> colors, Vector3 center, Vector3 cameraPosition, Color color, float sizeScale = 1f)
+    {
+        float half = Mathf.Max(0.0025f, holeBoundaryMarkerSizeMeters * Mathf.Max(0.1f, sizeScale) * 0.5f);
+        Vector3 view = center - cameraPosition;
+        if (!Finite(view) || view.sqrMagnitude < 0.0001f)
+            view = Vector3.forward;
+        view.Normalize();
+        Vector3 tangent = Vector3.Cross(Vector3.up, view);
+        if (tangent.sqrMagnitude < 0.0001f)
+            tangent = Vector3.Cross(Vector3.right, view);
+        tangent.Normalize();
+        Vector3 bitangent = Vector3.Cross(view, tangent).normalized;
+        int start = vertices.Count;
+        vertices.Add(center - tangent * half - bitangent * half);
+        vertices.Add(center + tangent * half - bitangent * half);
+        vertices.Add(center + tangent * half + bitangent * half);
+        vertices.Add(center - tangent * half + bitangent * half);
+        colors.Add(color);
+        colors.Add(color);
+        colors.Add(color);
+        colors.Add(color);
+        triangles.Add(start);
+        triangles.Add(start + 1);
+        triangles.Add(start + 2);
+        triangles.Add(start);
+        triangles.Add(start + 2);
+        triangles.Add(start + 3);
+    }
+
     private void RebuildRawDepthDebugMesh()
     {
         const int classifierRevision = 6;
@@ -5695,6 +7846,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private void IntegrateVoxel(int x, int y, int z, float sampleTsdf, float sampleWeight)
     {
         int index = Index(x, y, z);
+        if (useAtomicObservationTsdfBands && _activeAtomicBandWrite)
+        {
+            if (_activeAtomicBandVote == ObservationVoteState.Accept)
+                IntegrateAtomicAcceptedBandVoxel(index, sampleTsdf, sampleWeight);
+            else if (_activeAtomicBandVote == ObservationVoteState.Pending)
+                IntegrateAtomicProvisionalBandVoxel(index, sampleTsdf, sampleWeight);
+            return;
+        }
+
+        if (useStage03ACleanIsoSurface && useV08DirectBandWriteForDiagnosis)
+        {
+            IntegrateVoxelV08Diagnostic(index, sampleTsdf, sampleWeight);
+            return;
+        }
+
         int oldWeight = _weights[index];
         float oldTsdf = _tsdf[index];
         bool auditCenter = SelectConfidenceAuditCenter(index, sampleTsdf, oldTsdf, oldWeight);
@@ -5813,6 +7979,306 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastFormalIntegrateWriteCount++;
         LastUpdatedVoxelCount++;
         RecordConfidenceAuditVoxelOutcome(index, auditCenter, "written");
+    }
+
+    private void IntegrateAtomicAcceptedBandVoxel(int index, float sampleTsdf, float sampleWeight)
+    {
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return;
+
+        int oldWeight = _weights[index];
+        float oldTsdf = _tsdf[index];
+        float writeWeight = Mathf.Max(0.0001f, sampleWeight);
+        int fusionOldWeight = oldWeight;
+        if (ShouldRecoverAcceptedSign(index, sampleTsdf, oldTsdf))
+        {
+            LastAcceptedSignRecoveryCandidateCount++;
+            if (HasAcceptedSignRecoveryNeighborSupport(index, sampleTsdf))
+            {
+                fusionOldWeight = Mathf.Min(oldWeight, Mathf.Max(1, acceptedSignRecoveryOldWeightCap));
+                LastAcceptedSignRecoveryAppliedCount++;
+            }
+            else
+            {
+                LastAcceptedSignRecoveryNeighborBlockedCount++;
+            }
+        }
+        float denominator = Mathf.Max(0.0001f, fusionOldWeight + writeWeight);
+        _tsdf[index] = Mathf.Clamp((oldTsdf * fusionOldWeight + sampleTsdf * writeWeight) / denominator, -1f, 1f);
+        _weights[index] = (byte)Mathf.Min(maxFusionWeight, fusionOldWeight + Mathf.Max(1, Mathf.RoundToInt(writeWeight)));
+        RecordAtomicAcceptSignResult(index, sampleTsdf, _tsdf[index]);
+
+        bool promoted = _atomicProvisionalBandWeight != null &&
+                        index < _atomicProvisionalBandWeight.Length &&
+                        _atomicProvisionalBandWeight[index] > 0;
+        RecordContributionLedger(index, "atomic_accept_band", oldTsdf, oldWeight, sampleTsdf, writeWeight, _tsdf[index], _weights[index]);
+        ConfirmNearbyPrimaryPlaneHoleBandsFromAccept(index, sampleTsdf);
+        ClearAtomicProvisionalBandVoxel(index);
+        if (_atomicProvisionalBandRetiredLastFrame != null && index < _atomicProvisionalBandRetiredLastFrame.Length)
+            _atomicProvisionalBandRetiredLastFrame[index] = int.MinValue;
+        if (promoted)
+            LastAtomicPromotedProvisionalVoxelCount++;
+        LastAtomicAcceptedBandVoxelWriteCount++;
+        LastFormalIntegrateWriteCount++;
+        LastUpdatedVoxelCount++;
+    }
+
+    private void ConfirmNearbyPrimaryPlaneHoleBandsFromAccept(int acceptedIndex, float acceptedTsdf)
+    {
+        if (!usePrimaryPlaneHoleRepair || !confirmPrimaryPlaneHoleBandsFromNearbyAccept ||
+            !_activeTsdfSourceValid || _auditSampleNormal.sqrMagnitude < 0.0001f ||
+            _provisionalTsdf == null || _weights == null ||
+            Mathf.Abs(acceptedTsdf) > Mathf.Clamp(primaryPlaneHoleAcceptMaxTsdfDelta, 0.01f, 0.3f) + holeSideRepairAbsTsdf)
+        {
+            return;
+        }
+
+        Vector3 planeNormal = _auditSampleNormal.normalized;
+        Vector3 planePoint = _activeTsdfSourceSurface;
+        int acceptedSign = acceptedTsdf >= 0f ? 1 : -1;
+        int tangentialRadiusVoxels = Mathf.Clamp(primaryPlaneHoleAcceptTangentialRadiusVoxels, 1, 4);
+        int radius = Mathf.Max(Mathf.Clamp(primaryPlaneHoleAcceptRadiusVoxels, 1, 3), tangentialRadiusVoxels);
+        float maxTangentialDistance = Mathf.Max(voxelSizeMeters, voxelSizeMeters * tangentialRadiusVoxels);
+        float maxPlaneDistance = Mathf.Min(
+            Mathf.Max(voxelSizeMeters * 0.5f, primaryPlaneHoleAcceptMaxPlaneDistanceMeters),
+            voxelSizeMeters * Mathf.Clamp(primaryPlaneHoleAcceptNormalHalfThicknessVoxels, 0.5f, 1.5f));
+        float maxTsdfDelta = Mathf.Clamp(primaryPlaneHoleAcceptMaxTsdfDelta, 0.01f, 0.3f);
+        IndexToVoxel(acceptedIndex, out int cx, out int cy, out int cz);
+
+        for (int z = Mathf.Max(0, cz - radius); z <= Mathf.Min(_dimZ - 1, cz + radius); z++)
+        for (int y = Mathf.Max(0, cy - radius); y <= Mathf.Min(_dimY - 1, cy + radius); y++)
+        for (int x = Mathf.Max(0, cx - radius); x <= Mathf.Min(_dimX - 1, cx + radius); x++)
+        {
+            int candidate = Index(x, y, z);
+            if (candidate == acceptedIndex || !HasProvisionalTsdfMarker(candidate) ||
+                !_voxelWriteProvenance.TryGetValue(candidate, out VoxelWriteProvenance provenance) ||
+                provenance.LastOperation != "primary_plane_hole_band")
+            {
+                continue;
+            }
+
+            Vector3 candidateOffset = VoxelCenter(x, y, z) - planePoint;
+            float signedPlaneDistance = Vector3.Dot(candidateOffset, planeNormal);
+            Vector3 tangentialOffset = candidateOffset - planeNormal * signedPlaneDistance;
+            if (tangentialOffset.sqrMagnitude > maxTangentialDistance * maxTangentialDistance)
+                continue;
+
+            byte evidence = _primaryPlaneHoleAcceptEvidence.TryGetValue(candidate, out byte priorEvidence)
+                ? priorEvidence
+                : (byte)0;
+            evidence |= 1; // A real Accept reached the candidate's search neighborhood.
+            float candidateTsdf = _tsdf[candidate];
+            int candidateSign = candidateTsdf >= 0f ? 1 : -1;
+            if (candidateSign != acceptedSign)
+            {
+                _primaryPlaneHoleAcceptEvidence[candidate] = evidence;
+                continue;
+            }
+            evidence |= 2;
+
+            float planeDistance = Mathf.Abs(signedPlaneDistance);
+            if (planeDistance > maxPlaneDistance)
+            {
+                float distanceVoxels = planeDistance / Mathf.Max(0.001f, voxelSizeMeters);
+                if (!_primaryPlaneHoleMinPlaneDistanceVoxels.TryGetValue(candidate, out float priorDistance) ||
+                    distanceVoxels < priorDistance)
+                {
+                    _primaryPlaneHoleMinPlaneDistanceVoxels[candidate] = distanceVoxels;
+                }
+                _primaryPlaneHoleAcceptEvidence[candidate] = evidence;
+                continue;
+            }
+            evidence |= 4;
+
+            if (Mathf.Abs(candidateTsdf - acceptedTsdf) > maxTsdfDelta)
+            {
+                _primaryPlaneHoleAcceptEvidence[candidate] = evidence;
+                continue;
+            }
+            evidence |= 8;
+            _primaryPlaneHoleAcceptEvidence[candidate] = evidence;
+
+            int oldWeight = _weights[candidate];
+            _weights[candidate] = (byte)Mathf.Max(minSurfaceCornerWeight, oldWeight);
+            RecordContributionLedger(
+                candidate,
+                "primary_plane_hole_accept_confirmed",
+                candidateTsdf,
+                oldWeight,
+                candidateTsdf,
+                1f,
+                candidateTsdf,
+                _weights[candidate]);
+            _primaryPlaneHoleConfirmations.Remove(candidate);
+            _primaryPlaneHoleLastValidationFrame.Remove(candidate);
+            _primaryPlaneHoleAcceptEvidence.Remove(candidate);
+            _primaryPlaneHoleMinPlaneDistanceVoxels.Remove(candidate);
+            _pendingPrimaryPlaneHoleAcceptConfirmedCount++;
+        }
+    }
+
+    private bool ShouldRecoverAcceptedSign(int index, float sampleTsdf, float oldTsdf)
+    {
+        if (!enableAcceptedSignRecovery || Mathf.Abs(sampleTsdf) > acceptedSignRecoveryMaxAbsTsdf)
+            return false;
+        if (Mathf.Approximately(sampleTsdf, 0f) || Mathf.Sign(sampleTsdf) == Mathf.Sign(oldTsdf))
+        {
+            ClearOppositeAcceptedSignRecoveryEvidence(index, sampleTsdf);
+            return false;
+        }
+
+        byte[] frames = sampleTsdf > 0f ? _acceptedSignRecoveryPositiveFrames : _acceptedSignRecoveryNegativeFrames;
+        int[] lastFrames = sampleTsdf > 0f ? _acceptedSignRecoveryPositiveLastFrame : _acceptedSignRecoveryNegativeLastFrame;
+        if (frames == null || lastFrames == null || index < 0 || index >= frames.Length)
+            return false;
+
+        if (lastFrames[index] != IntegratedFrameCount)
+        {
+            frames[index] = (byte)Mathf.Min(byte.MaxValue, frames[index] + 1);
+            lastFrames[index] = IntegratedFrameCount;
+        }
+        return frames[index] >= Mathf.Max(2, acceptedSignRecoveryMinFrames);
+    }
+
+    private void ClearOppositeAcceptedSignRecoveryEvidence(int index, float sampleTsdf)
+    {
+        byte[] frames = sampleTsdf >= 0f ? _acceptedSignRecoveryNegativeFrames : _acceptedSignRecoveryPositiveFrames;
+        if (frames != null && index >= 0 && index < frames.Length)
+            frames[index] = 0;
+    }
+
+    private bool HasAcceptedSignRecoveryNeighborSupport(int index, float sampleTsdf)
+    {
+        byte[] frames = sampleTsdf > 0f ? _acceptedSignRecoveryPositiveFrames : _acceptedSignRecoveryNegativeFrames;
+        if (frames == null || index < 0 || index >= frames.Length)
+            return false;
+
+        int xy = _dimX * _dimY;
+        int z = index / xy;
+        int rem = index - z * xy;
+        int y = rem / _dimX;
+        int x = rem - y * _dimX;
+        int requiredFrames = Mathf.Max(1, acceptedSignRecoveryMinFrames - 1);
+        int support = 0;
+        if (x > 0 && frames[index - 1] >= requiredFrames) support++;
+        if (x + 1 < _dimX && frames[index + 1] >= requiredFrames) support++;
+        if (y > 0 && frames[index - _dimX] >= requiredFrames) support++;
+        if (y + 1 < _dimY && frames[index + _dimX] >= requiredFrames) support++;
+        if (z > 0 && frames[index - xy] >= requiredFrames) support++;
+        if (z + 1 < _dimZ && frames[index + xy] >= requiredFrames) support++;
+        return support >= Mathf.Max(1, acceptedSignRecoveryMinNeighborSupport);
+    }
+
+    private void RecordAtomicAcceptSignResult(int index, float sampleTsdf, float fusedTsdf)
+    {
+        if (_surfaceBandAcceptSignLostFlags == null || index < 0 || index >= _surfaceBandAcceptSignLostFlags.Length)
+            return;
+        if (_acceptedWriteSequence == int.MaxValue)
+            ResetAcceptedWriteSequenceHistory();
+        int writeSequence = ++_acceptedWriteSequence;
+        byte signFlag = sampleTsdf >= 0f ? (byte)1 : (byte)2;
+        bool retained = sampleTsdf >= 0f ? fusedTsdf >= 0f : fusedTsdf <= 0f;
+        int[] acceptedSequences = sampleTsdf >= 0f ? _acceptedPositiveLastSequence : _acceptedNegativeLastSequence;
+        int[] retainedSequences = sampleTsdf >= 0f ? _acceptedPositiveRetainedLastSequence : _acceptedNegativeRetainedLastSequence;
+        if (acceptedSequences != null && index < acceptedSequences.Length)
+            acceptedSequences[index] = writeSequence;
+        if (Mathf.Approximately(sampleTsdf, 0f))
+        {
+            signFlag = 3;
+            retained = Mathf.Approximately(fusedTsdf, 0f);
+        }
+        if (retained)
+        {
+            _surfaceBandAcceptSignLostFlags[index] = (byte)(_surfaceBandAcceptSignLostFlags[index] & ~signFlag);
+            if (retainedSequences != null && index < retainedSequences.Length)
+                retainedSequences[index] = writeSequence;
+        }
+        else
+            _surfaceBandAcceptSignLostFlags[index] |= signFlag;
+    }
+
+    private void ResetAcceptedWriteSequenceHistory()
+    {
+        _acceptedWriteSequence = 0;
+        if (_acceptedPositiveLastSequence != null) System.Array.Fill(_acceptedPositiveLastSequence, int.MinValue);
+        if (_acceptedNegativeLastSequence != null) System.Array.Fill(_acceptedNegativeLastSequence, int.MinValue);
+        if (_acceptedPositiveRetainedLastSequence != null) System.Array.Fill(_acceptedPositiveRetainedLastSequence, int.MinValue);
+        if (_acceptedNegativeRetainedLastSequence != null) System.Array.Fill(_acceptedNegativeRetainedLastSequence, int.MinValue);
+    }
+
+    private void IntegrateAtomicProvisionalBandVoxel(int index, float sampleTsdf, float sampleWeight)
+    {
+        if (_atomicProvisionalBandTsdf == null || _atomicProvisionalBandWeight == null ||
+            index < 0 || index >= _atomicProvisionalBandTsdf.Length || index >= _atomicProvisionalBandWeight.Length)
+            return;
+
+        int oldWeight = _atomicProvisionalBandWeight[index];
+        float oldTsdf = oldWeight > 0 ? _atomicProvisionalBandTsdf[index] : sampleTsdf;
+        float writeWeight = Mathf.Max(0.0001f, sampleWeight);
+        float denominator = Mathf.Max(0.0001f, oldWeight + writeWeight);
+        _atomicProvisionalBandTsdf[index] = Mathf.Clamp((oldTsdf * oldWeight + sampleTsdf * writeWeight) / denominator, -1f, 1f);
+        _atomicProvisionalBandWeight[index] = (byte)Mathf.Min(
+            Mathf.Max(1, atomicProvisionalBandMaxWeight),
+            oldWeight + Mathf.Max(1, Mathf.RoundToInt(writeWeight)));
+
+        if (_provisionalTsdf != null && index < _provisionalTsdf.Length)
+            _provisionalTsdf[index] = 1;
+        if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+            _provisionalTsdfHits[index] = (byte)Mathf.Min(byte.MaxValue, _provisionalTsdfHits[index] + 1);
+        if (_provisionalTsdfLastFrame != null && index < _provisionalTsdfLastFrame.Length)
+            _provisionalTsdfLastFrame[index] = LastRawFrameIndex;
+        if (_atomicProvisionalBandRetiredLastFrame != null && index < _atomicProvisionalBandRetiredLastFrame.Length)
+            _atomicProvisionalBandRetiredLastFrame[index] = int.MinValue;
+
+        LastAtomicProvisionalBandVoxelWriteCount++;
+        LastUpdatedVoxelCount++;
+    }
+
+    private void ClearAtomicProvisionalBandVoxel(int index)
+    {
+        if (_atomicProvisionalBandTsdf != null && index >= 0 && index < _atomicProvisionalBandTsdf.Length)
+            _atomicProvisionalBandTsdf[index] = 1f;
+        if (_atomicProvisionalBandWeight != null && index >= 0 && index < _atomicProvisionalBandWeight.Length)
+            _atomicProvisionalBandWeight[index] = 0;
+        if (_provisionalTsdf != null && index >= 0 && index < _provisionalTsdf.Length)
+            _provisionalTsdf[index] = 0;
+        if (_provisionalTsdfHits != null && index >= 0 && index < _provisionalTsdfHits.Length)
+            _provisionalTsdfHits[index] = 0;
+        if (_provisionalTsdfLastFrame != null && index >= 0 && index < _provisionalTsdfLastFrame.Length)
+            _provisionalTsdfLastFrame[index] = int.MinValue;
+    }
+
+    private void IntegrateVoxelV08Diagnostic(int index, float sampleTsdf, float sampleWeight)
+    {
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return;
+
+        int oldWeight = _weights[index];
+        float oldTsdf = _tsdf[index];
+        int addedWeight = Mathf.Max(1, Mathf.RoundToInt(sampleWeight));
+        int cappedWeight = Mathf.Min(maxFusionWeight, oldWeight + addedWeight);
+        float denominator = Mathf.Max(0.0001f, oldWeight + sampleWeight);
+        _tsdf[index] = Mathf.Clamp(
+            (oldTsdf * oldWeight + sampleTsdf * sampleWeight) / Mathf.Min(denominator, maxFusionWeight),
+            -1f,
+            1f);
+        _weights[index] = (byte)cappedWeight;
+
+        if (_provisionalTsdf != null && index < _provisionalTsdf.Length)
+            _provisionalTsdf[index] = 0;
+        if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
+            _provisionalTsdfHits[index] = 0;
+        if (_provisionalTsdfLastFrame != null && index < _provisionalTsdfLastFrame.Length)
+            _provisionalTsdfLastFrame[index] = int.MinValue;
+        if (_correctionTsdfHits != null && index < _correctionTsdfHits.Length)
+            _correctionTsdfHits[index] = 0;
+        if (_correctionTsdfLastFrame != null && index < _correctionTsdfLastFrame.Length)
+            _correctionTsdfLastFrame[index] = int.MinValue;
+        if (_dirtyTsdfLastFrame != null && index < _dirtyTsdfLastFrame.Length)
+            _dirtyTsdfLastFrame[index] = int.MinValue;
+
+        RecordContributionLedger(index, "v08_direct_diag", oldTsdf, oldWeight, sampleTsdf, sampleWeight, _tsdf[index], _weights[index]);
+        LastUpdatedVoxelCount++;
     }
 
     private bool TryMetabolizeOldCleanTsdf(int index, float sampleTsdf, float oldTsdf, int oldWeight)
@@ -6411,6 +8877,85 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return false;
     }
 
+    private bool WouldAtomicAcceptCreateDuplicateLayer(Vector3 sampleSurface, Vector3 sampleNormal)
+    {
+        if (!gateAtomicAcceptDuplicateLayers || _weights == null || _voxelWriteProvenance == null ||
+            !Finite(sampleSurface) || !Finite(sampleNormal) || sampleNormal.sqrMagnitude < 0.0001f ||
+            !TryWorldToVoxel(sampleSurface, out int cx, out int cy, out int cz))
+        {
+            return false;
+        }
+
+        sampleNormal.Normalize();
+        int radius = Mathf.Clamp(atomicAcceptDuplicateSearchRadiusVoxels, 1, 5);
+        float minGap = Mathf.Max(0.005f, atomicAcceptDuplicateMinGapMeters);
+        float maxGap = Mathf.Max(minGap, duplicateLayerMaxGapMeters);
+        float minNormalDot = Mathf.Clamp01(duplicateLayerMinNormalDot);
+        float maxLateral = Mathf.Max(voxelSizeMeters * 1.5f, maxGap * 1.5f);
+        bool hasSameSurface = false;
+        int duplicateIndex = -1;
+        float closestDuplicateGap = float.MaxValue;
+
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int nx = cx + dx;
+            int ny = cy + dy;
+            int nz = cz + dz;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                continue;
+
+            int neighbor = Index(nx, ny, nz);
+            if (_weights[neighbor] < minSurfaceCornerWeight ||
+                !_voxelWriteProvenance.TryGetValue(neighbor, out VoxelWriteProvenance provenance) ||
+                !Finite(provenance.SurfacePoint) || !Finite(provenance.SurfaceNormal) ||
+                provenance.SurfaceNormal.sqrMagnitude < 0.0001f)
+            {
+                continue;
+            }
+
+            Vector3 priorNormal = provenance.SurfaceNormal.normalized;
+            float normalDot = Mathf.Abs(Vector3.Dot(sampleNormal, priorNormal));
+            if (normalDot < minNormalDot)
+                continue;
+
+            LastAtomicAcceptDuplicateCandidateCount++;
+            Vector3 alignedNormal = Vector3.Dot(sampleNormal, priorNormal) < 0f ? -priorNormal : priorNormal;
+            Vector3 layerNormal = sampleNormal + alignedNormal;
+            if (layerNormal.sqrMagnitude < 0.0001f)
+                continue;
+            layerNormal.Normalize();
+
+            Vector3 delta = sampleSurface - provenance.SurfacePoint;
+            float planeGap = Mathf.Abs(Vector3.Dot(delta, layerNormal));
+            float lateralSq = Mathf.Max(0f, delta.sqrMagnitude - planeGap * planeGap);
+            if (planeGap < minGap)
+            {
+                LastAtomicAcceptDuplicateSameSurfaceCount++;
+                hasSameSurface = true;
+                continue;
+            }
+            if (planeGap <= maxGap && lateralSq <= maxLateral * maxLateral && planeGap < closestDuplicateGap)
+            {
+                closestDuplicateGap = planeGap;
+                duplicateIndex = neighbor;
+            }
+        }
+
+        if (duplicateIndex < 0)
+            return false;
+
+        if (hasSameSurface)
+        {
+            _duplicateLayerCleanupEvidence.TryGetValue(duplicateIndex, out int evidence);
+            _duplicateLayerCleanupEvidence[duplicateIndex] = Mathf.Min(255, evidence + 1);
+            return false;
+        }
+
+        return true;
+    }
+
     private void CountStrongCurrentPromotionDoubleLayerBlockSource(VoxelWriteProvenance provenance, bool dirtyOrPending)
     {
         if (dirtyOrPending)
@@ -6435,6 +8980,55 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 LastStrongCurrentPromotionDoubleLayerOtherBlockCount++;
                 break;
         }
+    }
+
+    private void CleanupConfirmedDuplicateLayers()
+    {
+        if (_tsdf == null || _weights == null || _duplicateLayerCleanupEvidence.Count == 0)
+            return;
+
+        int budget = Mathf.Max(1, maxDuplicateLayerCleanupVoxelsPerRebuild);
+        int baseWeightStep = Mathf.Max(1, duplicateLayerCleanupWeightStep);
+        int boostThreshold = Mathf.Max(2, duplicateLayerRepeatBoostThreshold);
+        int maxBoostedStep = Mathf.Max(baseWeightStep, duplicateLayerMaxBoostedWeightStep);
+        List<KeyValuePair<int, int>> ranked = new List<KeyValuePair<int, int>>(_duplicateLayerCleanupEvidence);
+        ranked.Sort((a, b) => b.Value.CompareTo(a.Value));
+        List<int> processed = new List<int>(Mathf.Min(budget, ranked.Count));
+        for (int candidate = 0; candidate < ranked.Count && processed.Count < budget; candidate++)
+        {
+            int index = ranked[candidate].Key;
+            int evidence = Mathf.Max(1, ranked[candidate].Value);
+            processed.Add(index);
+            LastDuplicateLayerCleanupMaxEvidence = Mathf.Max(LastDuplicateLayerCleanupMaxEvidence, evidence);
+            if (index < 0 || index >= _weights.Length || _weights[index] <= 0)
+                continue;
+
+            int weightStep = baseWeightStep;
+            if (evidence >= boostThreshold)
+            {
+                weightStep = Mathf.Min(maxBoostedStep, baseWeightStep + evidence - boostThreshold + 1);
+                LastDuplicateLayerCleanupBoostedCount++;
+            }
+            float oldTsdf = _tsdf[index];
+            int oldWeight = _weights[index];
+            int newWeight = Mathf.Max(0, oldWeight - weightStep);
+            if (newWeight <= 0)
+            {
+                _tsdf[index] = 1f;
+                _weights[index] = 0;
+                RecordContributionLedger(index, "duplicate_layer_clear", oldTsdf, oldWeight, 1f, 0f, 1f, 0);
+                LastDuplicateLayerCleanupClearedCount++;
+            }
+            else
+            {
+                _weights[index] = (byte)newWeight;
+                RecordContributionLedger(index, "duplicate_layer_decay", oldTsdf, oldWeight, oldTsdf, 0f, oldTsdf, newWeight);
+                LastDuplicateLayerCleanupDecayedCount++;
+            }
+        }
+
+        for (int i = 0; i < processed.Count; i++)
+            _duplicateLayerCleanupEvidence.Remove(processed[i]);
     }
 
     private bool HasProvisionalPlaneCompatibility(int index, float sampleTsdf)
@@ -6549,6 +9143,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void RetireExpiredProvisionalTsdf()
     {
+        if (useAtomicObservationTsdfBands)
+        {
+            RetireExpiredAtomicProvisionalBands();
+            return;
+        }
+
         if (!retireUnconfirmedProvisionalTsdf || _provisionalTsdf == null || _provisionalTsdfLastFrame == null || _tsdf == null || _weights == null)
             return;
 
@@ -6591,6 +9191,45 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 _provisionalTsdfHits[index] = 0;
 
             RecordContributionLedger(index, operation, oldTsdf, oldWeight, 1f, 0f, _tsdf[index], _weights[index]);
+        }
+    }
+
+    private void RetireExpiredAtomicProvisionalBands()
+    {
+        if (!retireUnconfirmedProvisionalTsdf || _provisionalTsdf == null || _provisionalTsdfLastFrame == null ||
+            _atomicProvisionalBandTsdf == null || _atomicProvisionalBandWeight == null)
+            return;
+
+        int maxAge = Mathf.Max(1, provisionalTsdfMaxAgeFrames);
+        int count = Mathf.Min(_provisionalTsdf.Length, _atomicProvisionalBandWeight.Length);
+        for (int index = 0; index < count; index++)
+        {
+            if (_provisionalTsdf[index] == 0 || _atomicProvisionalBandWeight[index] == 0)
+                continue;
+
+            bool dirtyOrPending = VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index);
+            int age = LastRawFrameIndex - _provisionalTsdfLastFrame[index];
+            if (!dirtyOrPending && age >= 0 && age < maxAge)
+                continue;
+
+            if (_atomicProvisionalBandRetiredLastFrame != null && index < _atomicProvisionalBandRetiredLastFrame.Length)
+                _atomicProvisionalBandRetiredLastFrame[index] = LastRawFrameIndex;
+            if (_atomicProvisionalBandRetiredSign != null && index < _atomicProvisionalBandRetiredSign.Length)
+            {
+                float retiredTsdf = _atomicProvisionalBandTsdf[index];
+                _atomicProvisionalBandRetiredSign[index] = retiredTsdf >= 0f ? (byte)1 : (byte)2;
+                if (Mathf.Approximately(retiredTsdf, 0f))
+                    _atomicProvisionalBandRetiredSign[index] = 3;
+            }
+            ClearAtomicProvisionalBandVoxel(index);
+            LastAtomicRetiredProvisionalVoxelCount++;
+            if (dirtyOrPending)
+                LastProvisionalTsdfDirtyClearedCount++;
+            else
+            {
+                LastProvisionalTsdfRetiredCount++;
+                LastProvisionalTsdfRetiredExpiredCount++;
+            }
         }
     }
 
@@ -7338,7 +9977,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return ((sx + sy) % carveStride) == 0;
     }
 
-    private bool IntegrateProjectiveTsdfBand(Vector3 cameraPosition, Vector3 surfacePoint, float sampleWeight, int halfBandSteps, bool allowFreeSpaceCarving)
+    private void MarkRejectedObservationBand(Vector3 cameraPosition, Vector3 point, Vector3 normal, int halfBandSteps)
+    {
+        if (!showHoleBoundaryDiagnosis)
+            return;
+        ObservationVoteState savedVote = _activeAtomicBandVote;
+        byte savedState = _activeSurfaceObservationState;
+        _activeAtomicBandVote = ObservationVoteState.Reject;
+        _activeSurfaceObservationState = 4;
+        try
+        {
+            if (useProjectiveTsdfIntegration)
+                IntegrateProjectiveTsdfBand(cameraPosition, point, 0f, halfBandSteps, false, true);
+            else
+                IntegrateNormalTsdfBand(point, normal, 0f, halfBandSteps, true);
+        }
+        finally
+        {
+            _activeAtomicBandVote = savedVote;
+            _activeSurfaceObservationState = savedState;
+        }
+    }
+
+    private bool IntegrateProjectiveTsdfBand(Vector3 cameraPosition, Vector3 surfacePoint, float sampleWeight, int halfBandSteps, bool allowFreeSpaceCarving, bool diagnosticOnly = false)
     {
         Vector3 toSurface = surfacePoint - cameraPosition;
         float surfaceDepth = toSurface.magnitude;
@@ -7357,16 +10018,48 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (allowFreeSpaceCarving)
             CarveProjectiveFreeSpace(cameraPosition, rayDirection, surfaceDepth, sampleWeight);
 
-        for (float voxelDepth = startDepth; voxelDepth <= endDepth + voxel * 0.25f; voxelDepth += voxel)
-        {
-            Vector3 voxelWorld = cameraPosition + rayDirection * voxelDepth;
-            if (!TryWorldToVoxel(voxelWorld, out int vx, out int vy, out int vz))
-                continue;
+        Vector3 segmentStart = cameraPosition + rayDirection * startDepth;
+        Vector3 segmentEnd = cameraPosition + rayDirection * endDepth;
+        float lateralRadius = voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f);
+        Vector3 boundsMin = Vector3.Min(segmentStart, segmentEnd) - Vector3.one * lateralRadius;
+        Vector3 boundsMax = Vector3.Max(segmentStart, segmentEnd) + Vector3.one * lateralRadius;
+        Vector3 minGrid = (boundsMin - _volumeOriginWorld) / voxel;
+        Vector3 maxGrid = (boundsMax - _volumeOriginWorld) / voxel;
+        int minX = Mathf.Clamp(Mathf.FloorToInt(minGrid.x), 0, _dimX - 1);
+        int minY = Mathf.Clamp(Mathf.FloorToInt(minGrid.y), 0, _dimY - 1);
+        int minZ = Mathf.Clamp(Mathf.FloorToInt(minGrid.z), 0, _dimZ - 1);
+        int maxX = Mathf.Clamp(Mathf.CeilToInt(maxGrid.x), 0, _dimX - 1);
+        int maxY = Mathf.Clamp(Mathf.CeilToInt(maxGrid.y), 0, _dimY - 1);
+        int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxGrid.z), 0, _dimZ - 1);
+        float lateralRadiusSq = lateralRadius * lateralRadius;
+        float depthEpsilon = voxel * 0.5f;
 
-            touchedDenseTsdf = true;
-            float signedDistance = surfaceDepth - voxelDepth;
-            float sampleTsdf = Mathf.Clamp(signedDistance / truncationMeters, -1f, 1f);
-            IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
+        for (int vz = minZ; vz <= maxZ; vz++)
+        {
+            for (int vy = minY; vy <= maxY; vy++)
+            {
+                for (int vx = minX; vx <= maxX; vx++)
+                {
+                    Vector3 center = VoxelCenter(vx, vy, vz);
+                    float centerDepth = Vector3.Dot(center - cameraPosition, rayDirection);
+                    if (centerDepth < startDepth - depthEpsilon || centerDepth > endDepth + depthEpsilon)
+                        continue;
+
+                    Vector3 projectedCenter = cameraPosition + rayDirection * centerDepth;
+                    if ((center - projectedCenter).sqrMagnitude > lateralRadiusSq)
+                        continue;
+
+                    float signedDistance = surfaceDepth - centerDepth;
+                    float sampleTsdf = Mathf.Clamp(signedDistance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                    int voxelIndex = Index(vx, vy, vz);
+                    MarkSurfaceBandVisit(voxelIndex, sampleTsdf);
+                    if (Mathf.Abs(signedDistance) <= voxel * 0.75f)
+                        MarkSurfaceObservationVoxel(voxelIndex, _activeSurfaceObservationState);
+                    if (!diagnosticOnly)
+                        IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
+                    touchedDenseTsdf = true;
+                }
+            }
         }
 
         _activeTsdfSourceValid = false;
@@ -7566,6 +10259,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (commitClear)
         {
             _tsdf[index] = 1f;
+            if (_clearedVoxelLastFrame != null && index < _clearedVoxelLastFrame.Length)
+                _clearedVoxelLastFrame[index] = LastRawFrameIndex;
             if (_provisionalTsdf != null && index < _provisionalTsdf.Length)
             {
                 _provisionalTsdf[index] = 0;
@@ -7659,7 +10354,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastFreeSpaceEvidenceCancelledBySurfaceCount = 0;
     }
 
-    private bool IntegrateNormalTsdfBand(Vector3 point, Vector3 normal, float sampleWeight, int halfBandSteps)
+    private bool IntegrateNormalTsdfBand(Vector3 point, Vector3 normal, float sampleWeight, int halfBandSteps, bool diagnosticOnly = false)
     {
         bool touchedDenseTsdf = false;
         _activeTsdfSourceCamera = GetCameraPosition();
@@ -7674,7 +10369,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
             touchedDenseTsdf = true;
             float sampleTsdf = Mathf.Clamp(signedDistance / truncationMeters, -1f, 1f);
-            IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
+            int voxelIndex = Index(vx, vy, vz);
+            MarkSurfaceBandVisit(voxelIndex, sampleTsdf);
+            if (Mathf.Abs(signedDistance) <= Mathf.Max(0.0001f, voxelSizeMeters) * 0.75f)
+                MarkSurfaceObservationVoxel(voxelIndex, _activeSurfaceObservationState);
+            if (!diagnosticOnly)
+                IntegrateVoxel(vx, vy, vz, sampleTsdf, sampleWeight);
         }
 
         _activeTsdfSourceValid = false;
@@ -7855,6 +10555,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastProvisionalTsdfConfirmedCount = 0;
         LastProvisionalTsdfConfirmedByWeightCount = 0;
         LastProvisionalTsdfRetiredCount = 0;
+        LastAtomicAcceptedBandVoxelWriteCount = 0;
+        LastAtomicProvisionalBandVoxelWriteCount = 0;
+        LastAcceptedSignRecoveryCandidateCount = 0;
+        LastAcceptedSignRecoveryNeighborBlockedCount = 0;
+        LastAcceptedSignRecoveryAppliedCount = 0;
+        LastAtomicPromotedProvisionalVoxelCount = 0;
+        LastAtomicRetiredProvisionalVoxelCount = 0;
         LastProvisionalTsdfRetiredExpiredCount = 0;
         LastProvisionalTsdfDirtyClearedCount = 0;
         LastOldCleanMetabolismWatchCount = 0;
@@ -8722,9 +11429,28 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int count = _dimX * _dimY * _dimZ;
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
+        _voxelWriteSequence = 0;
         _captureAuditVoxels.Clear();
         _tsdf = new float[count];
         _weights = new byte[count];
+        _atomicProvisionalBandTsdf = new float[count];
+        _atomicProvisionalBandWeight = new byte[count];
+        _atomicProvisionalBandRetiredLastFrame = new int[count];
+        _atomicProvisionalBandRetiredSign = new byte[count];
+        _surfaceBandVisitFlags = new byte[count];
+        _surfaceBandAcceptSignLostFlags = new byte[count];
+        _acceptedPositiveLastSequence = new int[count];
+        _acceptedNegativeLastSequence = new int[count];
+        _acceptedPositiveRetainedLastSequence = new int[count];
+        _acceptedNegativeRetainedLastSequence = new int[count];
+        _acceptedWriteSequence = 0;
+        _acceptedSignRecoveryPositiveFrames = new byte[count];
+        _acceptedSignRecoveryNegativeFrames = new byte[count];
+        _acceptedSignRecoveryPositiveLastFrame = new int[count];
+        _acceptedSignRecoveryNegativeLastFrame = new int[count];
+        _surfaceObservationState = new byte[count];
+        _surfaceObservationLastFrame = new int[count];
+        _clearedVoxelLastFrame = new int[count];
         _pendingTsdf = new float[count];
         _pendingTsdfHits = new byte[count];
         _pendingTsdfLastFrame = new int[count];
@@ -8742,6 +11468,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         for (int i = 0; i < count; i++)
         {
             _tsdf[i] = 1f;
+            _atomicProvisionalBandTsdf[i] = 1f;
+            _atomicProvisionalBandRetiredLastFrame[i] = int.MinValue;
+            _acceptedSignRecoveryPositiveLastFrame[i] = int.MinValue;
+            _acceptedSignRecoveryNegativeLastFrame[i] = int.MinValue;
+            _acceptedPositiveLastSequence[i] = int.MinValue;
+            _acceptedNegativeLastSequence[i] = int.MinValue;
+            _acceptedPositiveRetainedLastSequence[i] = int.MinValue;
+            _acceptedNegativeRetainedLastSequence[i] = int.MinValue;
+            _surfaceObservationLastFrame[i] = int.MinValue;
+            _clearedVoxelLastFrame[i] = int.MinValue;
             _pendingTsdfLastFrame[i] = int.MinValue;
             _correctionTsdfLastFrame[i] = int.MinValue;
             _dirtyTsdfLastFrame[i] = int.MinValue;
@@ -8749,6 +11485,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _oldCleanConflictLastFrame[i] = int.MinValue;
             _freeSpaceEvidenceLastFrame[i] = int.MinValue;
         }
+
+        _hardAuditExpectedTsdf = (float[])_tsdf.Clone();
+        _hardAuditExpectedWeights = (byte[])_weights.Clone();
+        ResetHardTsdfWriteAuditCounters();
 
         _volumeInitialized = true;
     }
@@ -8762,7 +11502,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         byte[] cornerWeights,
         out Vector3 vertex)
     {
-        if (useLegacyTsdfMeshDisplay)
+        if (UseLegacyMeshExtraction)
             return TryBuildLegacyCellVertex(x, y, z, cornerPositions, cornerValues, cornerWeights, out vertex);
 
         vertex = Vector3.zero;
@@ -8780,7 +11520,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             int index = Index(vx, vy, vz);
             cornerPositions[i] = VoxelCenter(vx, vy, vz);
             cornerValues[i] = _tsdf[index];
-            cornerWeights[i] = _weights[index];
+            cornerWeights[i] = IsCleanMeshTsdfVoxel(index) ? _weights[index] : (byte)0;
 
             if (cornerWeights[i] >= minSurfaceCornerWeight)
             {
@@ -8797,7 +11537,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         bool hasStrictSurface = hasPositive && hasNegative;
         bool hasRelaxedSurface =
-            relaxSurfaceExtractionNearZero &&
+            AllowRelaxedMeshExtraction &&
             hasNearZero &&
             supportedCorners >= Mathf.Max(2, minRelaxedSurfaceSupportedCorners) &&
             nearZeroCorners >= Mathf.Max(1, minRelaxedNearZeroCorners);
@@ -8887,6 +11627,456 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         vertex = sum / count;
         return Finite(vertex);
+    }
+
+    private void RepairGuardedHoleSides()
+    {
+        if (!enableGuardedHoleSideRepair || _tsdf == null || _weights == null)
+            return;
+
+        int budget = Mathf.Max(1, maxHoleSideRepairsPerRebuild);
+        Dictionary<int, HoleSideRepairProposal> proposals = new Dictionary<int, HoleSideRepairProposal>(budget);
+        HashSet<int> conflicted = new HashSet<int>();
+        float maxAbs = Mathf.Max(0.01f, maxHoleSideRepairNeighborAbsTsdf);
+        int requiredBridgingCells = Mathf.Clamp(minHoleSideRepairBridgingCells, 1, 8);
+        int requiredOpposite = Mathf.Clamp(minHoleSideRepairOppositeFaceSupport, 1, 6);
+        int requiredExisting = Mathf.Clamp(minHoleSideRepairExistingFaceSupport, 1, 6);
+
+        for (int z = 0; z < _dimZ - 1 && proposals.Count < budget; z++)
+        for (int y = 0; y < _dimY - 1 && proposals.Count < budget; y++)
+        for (int x = 0; x < _dimX - 1 && proposals.Count < budget; x++)
+        {
+            int positive = 0;
+            int negative = 0;
+            int empty = 0;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int index = Index(x + ((corner & 1) != 0 ? 1 : 0), y + ((corner & 2) != 0 ? 1 : 0), z + ((corner & 4) != 0 ? 1 : 0));
+                if (_weights[index] <= 0)
+                    empty++;
+                else if (_tsdf[index] >= 0f)
+                    positive++;
+                else
+                    negative++;
+            }
+            if (empty <= 0 || (positive > 0 && negative > 0) || (positive <= 0 && negative <= 0))
+                continue;
+
+            int desiredSign = positive > 0 ? -1 : 1;
+            for (int corner = 0; corner < 8 && proposals.Count < budget; corner++)
+            {
+                int index = Index(x + ((corner & 1) != 0 ? 1 : 0), y + ((corner & 2) != 0 ? 1 : 0), z + ((corner & 4) != 0 ? 1 : 0));
+                if (_weights[index] > 0 || conflicted.Contains(index))
+                    continue;
+                LastHoleSideRepairCandidateCount++;
+                IndexToVoxel(index, out int vx, out int vy, out int vz);
+                if (NeighborhoodTouchesDirtyOrPending(vx, vy, vz, 1))
+                {
+                    LastHoleSideRepairBlockedDirtyCount++;
+                    continue;
+                }
+
+                List<HoleSideRepairProposal> candidateBand = null;
+                bool primaryPlaneValid = usePrimaryPlaneHoleRepair &&
+                    TryBuildPrimaryPlaneHoleBand(index, desiredSign, out candidateBand);
+                if (usePrimaryPlaneHoleRepair && !primaryPlaneValid)
+                {
+                    LastHoleSideRepairBlockedPlaneCount++;
+                    continue;
+                }
+
+                bool legacyTopologyValid = HasHoleRepairCellTopology(
+                        vx,
+                        vy,
+                        vz,
+                        desiredSign,
+                        maxAbs,
+                        requiredBridgingCells,
+                        requiredOpposite,
+                        requiredExisting);
+                if (!legacyTopologyValid && !primaryPlaneValid)
+                {
+                    LastHoleSideRepairBlockedSupportCount++;
+                    continue;
+                }
+
+                if (candidateBand == null)
+                {
+                    candidateBand = new List<HoleSideRepairProposal>(1)
+                    {
+                        new HoleSideRepairProposal
+                        {
+                            Index = index,
+                            Tsdf = desiredSign * Mathf.Max(0.01f, holeSideRepairAbsTsdf)
+                        }
+                    };
+                }
+
+                bool bandConflict = false;
+                for (int bandIndex = 0; bandIndex < candidateBand.Count; bandIndex++)
+                {
+                    HoleSideRepairProposal candidate = candidateBand[bandIndex];
+                    if (proposals.TryGetValue(candidate.Index, out HoleSideRepairProposal prior) &&
+                        Mathf.Sign(prior.Tsdf) != Mathf.Sign(candidate.Tsdf))
+                    {
+                        proposals.Remove(candidate.Index);
+                        conflicted.Add(candidate.Index);
+                        bandConflict = true;
+                    }
+                }
+                if (bandConflict)
+                {
+                    LastHoleSideRepairBlockedSupportCount++;
+                    continue;
+                }
+                for (int bandIndex = 0; bandIndex < candidateBand.Count && proposals.Count < budget; bandIndex++)
+                {
+                    HoleSideRepairProposal candidate = candidateBand[bandIndex];
+                    if (!conflicted.Contains(candidate.Index) && _weights[candidate.Index] <= 0)
+                        proposals[candidate.Index] = candidate;
+                }
+            }
+        }
+
+        foreach (HoleSideRepairProposal proposal in proposals.Values)
+        {
+            int index = proposal.Index;
+            if (_weights[index] > 0)
+                continue;
+            if (blockHoleRepairThatCreatesMultipleZeroCrossings &&
+                WouldHoleRepairCreateMultipleZeroCrossings(index, proposal.Tsdf, proposals))
+            {
+                LastHoleSideRepairBlockedMultiZeroCount++;
+                continue;
+            }
+            float oldTsdf = _tsdf[index];
+            int oldWeight = _weights[index];
+            _tsdf[index] = proposal.Tsdf;
+            _weights[index] = 1;
+            string operation = usePrimaryPlaneHoleRepair ? "primary_plane_hole_band" : "hole_side_repair";
+            RecordContributionLedger(index, operation, oldTsdf, oldWeight, proposal.Tsdf, 1f, proposal.Tsdf, 1);
+            LastHoleSideRepairAppliedCount++;
+            if (usePrimaryPlaneHoleRepair)
+            {
+                LastHoleSideRepairPlaneBandVoxelCount++;
+                if (!_primaryPlaneHoleConfirmations.ContainsKey(index))
+                    _primaryPlaneHoleConfirmations[index] = 1;
+                _primaryPlaneHoleLastValidationFrame[index] = LastRawFrameIndex;
+                _primaryPlaneHoleAcceptEvidence[index] = 0;
+                _primaryPlaneHoleMinPlaneDistanceVoxels.Remove(index);
+            }
+        }
+    }
+
+    private void ConfirmPrimaryPlaneHoleBands()
+    {
+        if (!usePrimaryPlaneHoleRepair || _provisionalTsdf == null || _weights == null)
+            return;
+
+        List<int> candidates = new List<int>();
+        foreach (KeyValuePair<int, VoxelWriteProvenance> pair in _voxelWriteProvenance)
+        {
+            int index = pair.Key;
+            if (pair.Value.LastOperation == "primary_plane_hole_band" &&
+                index >= 0 && index < _weights.Length &&
+                HasProvisionalTsdfMarker(index))
+            {
+                candidates.Add(index);
+            }
+        }
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            int index = candidates[i];
+            int writtenFrame = _provisionalTsdfLastFrame != null && index < _provisionalTsdfLastFrame.Length
+                ? _provisionalTsdfLastFrame[index]
+                : LastRawFrameIndex;
+            if (LastRawFrameIndex - writtenFrame < Mathf.Max(1, primaryPlaneHoleMaxAgeFrames))
+                continue;
+
+            float oldTsdf = _tsdf[index];
+            int oldWeight = _weights[index];
+            _tsdf[index] = 1f;
+            _weights[index] = 0;
+            RecordContributionLedger(index, "primary_plane_hole_retire", oldTsdf, oldWeight, 1f, 0f, 1f, 0);
+            _primaryPlaneHoleConfirmations.Remove(index);
+            _primaryPlaneHoleLastValidationFrame.Remove(index);
+            byte evidence = _primaryPlaneHoleAcceptEvidence.TryGetValue(index, out byte recordedEvidence)
+                ? recordedEvidence
+                : (byte)0;
+            _primaryPlaneHoleAcceptEvidence.Remove(index);
+            float closestPlaneDistanceVoxels = _primaryPlaneHoleMinPlaneDistanceVoxels.TryGetValue(index, out float recordedDistance)
+                ? recordedDistance
+                : float.PositiveInfinity;
+            _primaryPlaneHoleMinPlaneDistanceVoxels.Remove(index);
+            if ((evidence & 1) == 0)
+                LastHoleSideRepairRetiredNoNearAcceptCount++;
+            else if ((evidence & 2) == 0)
+                LastHoleSideRepairRetiredSignMismatchCount++;
+            else if ((evidence & 4) == 0)
+            {
+                LastHoleSideRepairRetiredPlaneMismatchCount++;
+                RecordPrimaryPlaneHoleDistanceBin(closestPlaneDistanceVoxels);
+            }
+            else if ((evidence & 8) == 0)
+                LastHoleSideRepairRetiredTsdfDeltaCount++;
+            else
+                LastHoleSideRepairRetiredExpiredAfterPassCount++;
+            LastHoleSideRepairPlaneRetiredCount++;
+            LastProvisionalTsdfRetiredCount++;
+            LastProvisionalTsdfRetiredExpiredCount++;
+        }
+    }
+
+    private void RecordPrimaryPlaneHoleDistanceBin(float distanceVoxels)
+    {
+        if (distanceVoxels < 0.5f)
+            LastHoleSideRepairPlaneDistance0ToHalfCount++;
+        else if (distanceVoxels < 0.75f)
+            LastHoleSideRepairPlaneDistanceHalfTo075Count++;
+        else if (distanceVoxels < 1f)
+            LastHoleSideRepairPlaneDistance075To1Count++;
+        else if (distanceVoxels < 1.5f)
+            LastHoleSideRepairPlaneDistance1To15Count++;
+        else if (distanceVoxels < 2f)
+            LastHoleSideRepairPlaneDistance15To2Count++;
+        else
+            LastHoleSideRepairPlaneDistanceOver2Count++;
+    }
+
+    private bool TryBuildPrimaryPlaneHoleBand(
+        int candidateIndex,
+        int desiredSign,
+        out List<HoleSideRepairProposal> band)
+    {
+        band = null;
+        IndexToVoxel(candidateIndex, out int cx, out int cy, out int cz);
+        int radius = Mathf.Clamp(primaryPlaneHoleAnchorRadiusVoxels, 1, 4);
+        int requiredAnchors = Mathf.Clamp(minPrimaryPlaneHoleAnchors, 3, 16);
+        List<Vector3> points = new List<Vector3>(requiredAnchors * 2);
+        List<Vector3> normals = new List<Vector3>(requiredAnchors * 2);
+        HashSet<long> observations = new HashSet<long>();
+        Vector3 referenceNormal = Vector3.zero;
+
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int x = cx + dx;
+            int y = cy + dy;
+            int z = cz + dz;
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if (_weights[index] < minSurfaceCornerWeight ||
+                VoxelIsDirtyQuarantined(index) ||
+                VoxelHasPendingTsdfCorrection(index) ||
+                HasProvisionalTsdfMarker(index) ||
+                !_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) ||
+                !IsPrimaryPlaneHoleAnchorOperation(provenance.LastOperation) ||
+                !Finite(provenance.SurfacePoint) ||
+                !Finite(provenance.SurfaceNormal) ||
+                provenance.SurfaceNormal.sqrMagnitude < 0.25f)
+            {
+                continue;
+            }
+
+            long observation = ((long)provenance.Capture << 32) ^ (uint)provenance.Sample;
+            if (!observations.Add(observation))
+                continue;
+            Vector3 normal = provenance.SurfaceNormal.normalized;
+            if (referenceNormal == Vector3.zero)
+                referenceNormal = normal;
+            if (Vector3.Dot(normal, referenceNormal) < 0f)
+                normal = -normal;
+            if (Vector3.Dot(normal, referenceNormal) < Mathf.Clamp01(minPrimaryPlaneHoleNormalDot))
+                continue;
+            points.Add(provenance.SurfacePoint);
+            normals.Add(normal);
+        }
+
+        if (points.Count < requiredAnchors)
+            return false;
+
+        Vector3 planePoint = Vector3.zero;
+        Vector3 planeNormal = Vector3.zero;
+        for (int i = 0; i < points.Count; i++)
+        {
+            planePoint += points[i];
+            planeNormal += normals[i];
+        }
+        planePoint /= points.Count;
+        if (planeNormal.sqrMagnitude < 0.25f)
+            return false;
+        planeNormal.Normalize();
+
+        float maxResidual = 0f;
+        for (int i = 0; i < points.Count; i++)
+            maxResidual = Mathf.Max(maxResidual, Mathf.Abs(Vector3.Dot(points[i] - planePoint, planeNormal)));
+        if (maxResidual > Mathf.Max(0.001f, maxPrimaryPlaneHoleResidualMeters))
+            return false;
+
+        Vector3 candidateCenter = VoxelCenter(cx, cy, cz);
+        float candidateDistance = Vector3.Dot(candidateCenter - planePoint, planeNormal);
+        if (Mathf.Abs(candidateDistance) > Mathf.Max(truncationMeters, maxPrimaryPlaneHoleResidualMeters))
+            return false;
+        if (!Mathf.Approximately(candidateDistance, 0f) && Mathf.Sign(candidateDistance) != desiredSign)
+            planeNormal = -planeNormal;
+
+        int axis = 0;
+        Vector3 absNormal = new Vector3(Mathf.Abs(planeNormal.x), Mathf.Abs(planeNormal.y), Mathf.Abs(planeNormal.z));
+        if (absNormal.y > absNormal.x && absNormal.y >= absNormal.z)
+            axis = 1;
+        else if (absNormal.z > absNormal.x && absNormal.z > absNormal.y)
+            axis = 2;
+
+        int bandRadius = Mathf.Clamp(primaryPlaneHoleBandRadiusVoxels, 0, 2);
+        band = new List<HoleSideRepairProposal>(bandRadius * 2 + 1);
+        for (int offset = -bandRadius; offset <= bandRadius; offset++)
+        {
+            int x = cx + (axis == 0 ? offset : 0);
+            int y = cy + (axis == 1 ? offset : 0);
+            int z = cz + (axis == 2 ? offset : 0);
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if ((_weights[index] > 0 && index != candidateIndex) || NeighborhoodTouchesDirtyOrPending(x, y, z, 1))
+                continue;
+            float signedDistance = Vector3.Dot(VoxelCenter(x, y, z) - planePoint, planeNormal);
+            float value = Mathf.Clamp(signedDistance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+            if (index == candidateIndex && Mathf.Abs(value) < 0.01f)
+                value = desiredSign * Mathf.Max(0.01f, holeSideRepairAbsTsdf);
+            if (!Mathf.Approximately(value, 0f))
+                band.Add(new HoleSideRepairProposal { Index = index, Tsdf = value });
+        }
+        return band.Count > 0;
+    }
+
+    private static bool IsPrimaryPlaneHoleAnchorOperation(string operation)
+    {
+        return operation == "atomic_accept_band" ||
+               operation == "integrate" ||
+               operation == "strong_current_promote" ||
+               operation == "guarded_replace" ||
+               operation == "replace" ||
+               operation == "v08_direct_diag";
+    }
+
+    private bool WouldHoleRepairCreateMultipleZeroCrossings(
+        int candidateIndex,
+        float candidateTsdf,
+        Dictionary<int, HoleSideRepairProposal> proposals)
+    {
+        IndexToVoxel(candidateIndex, out int cx, out int cy, out int cz);
+        int radius = Mathf.Clamp(holeRepairZeroCrossingCheckRadiusVoxels, 2, 8);
+        for (int axis = 0; axis < 3; axis++)
+        {
+            int transitions = 0;
+            int previousSign = 0;
+            for (int offset = -radius; offset <= radius; offset++)
+            {
+                int x = cx + (axis == 0 ? offset : 0);
+                int y = cy + (axis == 1 ? offset : 0);
+                int z = cz + (axis == 2 ? offset : 0);
+                if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                    continue;
+
+                int index = Index(x, y, z);
+                float value;
+                bool supported;
+                if (index == candidateIndex)
+                {
+                    value = candidateTsdf;
+                    supported = true;
+                }
+                else if (proposals != null && proposals.TryGetValue(index, out HoleSideRepairProposal simulated))
+                {
+                    value = simulated.Tsdf;
+                    supported = true;
+                }
+                else
+                {
+                    value = _tsdf[index];
+                    supported = _weights[index] > 0;
+                }
+
+                if (!supported || Mathf.Approximately(value, 0f))
+                    continue;
+                int sign = value > 0f ? 1 : -1;
+                if (previousSign != 0 && sign != previousSign)
+                    transitions++;
+                previousSign = sign;
+            }
+
+            if (transitions > 1)
+                return true;
+        }
+        return false;
+    }
+
+    private bool HasHoleRepairCellTopology(
+        int x,
+        int y,
+        int z,
+        int desiredSign,
+        float maxAbs,
+        int requiredBridgingCells,
+        int requiredOpposite,
+        int requiredExisting)
+    {
+        int bridgingCells = 0;
+        int desiredSupport = 0;
+        int existingSupport = 0;
+        for (int oz = -1; oz <= 0; oz++)
+        for (int oy = -1; oy <= 0; oy++)
+        for (int ox = -1; ox <= 0; ox++)
+        {
+            int cellX = x + ox;
+            int cellY = y + oy;
+            int cellZ = z + oz;
+            if (cellX < 0 || cellY < 0 || cellZ < 0 ||
+                cellX >= _dimX - 1 || cellY >= _dimY - 1 || cellZ >= _dimZ - 1)
+                continue;
+
+            int cellPositive = 0;
+            int cellNegative = 0;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int vx = cellX + ((corner & 1) != 0 ? 1 : 0);
+                int vy = cellY + ((corner & 2) != 0 ? 1 : 0);
+                int vz = cellZ + ((corner & 4) != 0 ? 1 : 0);
+                if (vx == x && vy == y && vz == z)
+                    continue;
+                int neighbor = Index(vx, vy, vz);
+                if (_weights[neighbor] < minSurfaceCornerWeight || Mathf.Abs(_tsdf[neighbor]) > maxAbs ||
+                    VoxelIsDirtyQuarantined(neighbor) || VoxelHasPendingTsdfCorrection(neighbor) ||
+                    !IsAllowedContinuitySupportSource(neighbor))
+                {
+                    continue;
+                }
+                if (_tsdf[neighbor] >= 0f)
+                    cellPositive++;
+                else
+                    cellNegative++;
+            }
+
+            if (cellPositive > 0 && cellNegative > 0)
+                bridgingCells++;
+            if (desiredSign > 0)
+            {
+                desiredSupport += cellPositive;
+                existingSupport += cellNegative;
+            }
+            else
+            {
+                desiredSupport += cellNegative;
+                existingSupport += cellPositive;
+            }
+        }
+
+        return bridgingCells >= requiredBridgingCells &&
+               desiredSupport >= requiredOpposite &&
+               existingSupport >= requiredExisting;
     }
 
     private void FillCleanTsdfContinuityGaps()
@@ -9304,10 +12494,47 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                _provisionalTsdf[index] != 0;
     }
 
+    private bool UseLegacyMeshExtraction =>
+        useLegacyTsdfMeshDisplay && (!useStage03ACleanIsoSurface || useV09LegacyExtractorForStage03A);
+
+    private bool AllowRelaxedMeshExtraction => relaxSurfaceExtractionNearZero && !useStage03ACleanIsoSurface;
+
+    private bool IsCleanMeshTsdfVoxel(int index)
+    {
+        if (_tsdf == null || _weights == null || index < 0 || index >= _tsdf.Length || index >= _weights.Length)
+            return false;
+        if (_weights[index] < minSurfaceCornerWeight || float.IsNaN(_tsdf[index]) || float.IsInfinity(_tsdf[index]))
+            return false;
+        if (!useStage03ACleanIsoSurface)
+            return true;
+        if (HasProvisionalTsdfMarker(index) || VoxelHasPendingTsdfCorrection(index) || VoxelIsDirtyQuarantined(index))
+            return false;
+        if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+            return !requireCleanMeshVoxelProvenance;
+
+        string operation = provenance.LastOperation;
+        if (string.IsNullOrEmpty(operation) || operation == "unknown")
+            return false;
+        if (operation == "provisional_support" || operation == "strong_sample_seed" ||
+            operation == "cleanup_neighbor" || operation == "old_clean_decay" ||
+            operation == "old_clean_clear")
+        {
+            return false;
+        }
+        if (!allowVerifiedContinuityInCleanMesh &&
+            (operation == "continuity_fill" || operation == "boundary_no_tsdf_fill"))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     private static bool IsStableProvisionalContinuityOperation(string operation)
     {
         return operation == "provisional_support" ||
-               operation == "strong_sample_seed";
+               operation == "strong_sample_seed" ||
+               operation == "primary_plane_hole_band";
     }
 
     private static int CountBits3(int value)
@@ -9421,7 +12648,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             int index = Index(vx, vy, vz);
             cornerPositions[i] = VoxelCenter(vx, vy, vz);
             cornerValues[i] = _tsdf[index];
-            cornerWeights[i] = _weights[index];
+            cornerWeights[i] = useStage03ACleanIsoSurface && !useV09ExactCornerEligibilityForDiagnosis
+                ? (IsCleanMeshTsdfVoxel(index) ? _weights[index] : (byte)0)
+                : _weights[index];
 
             if (cornerWeights[i] >= minSurfaceCornerWeight)
             {
@@ -9614,7 +12843,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         for (int i = 0; i < 8; i++)
         {
             int index = Index(x + CornerOffsetX[i], y + CornerOffsetY[i], z + CornerOffsetZ[i]);
-            int weight = _weights[index];
+            int weight = IsCleanMeshTsdfVoxel(index) ? _weights[index] : 0;
             if (weight < minSurfaceCornerWeight)
                 continue;
 
@@ -9634,7 +12863,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return false;
         if (supportedCorners >= Mathf.Max(2, minStrictSurfaceSupportedCorners) && hasPositive && hasNegative)
             return true;
-        return relaxSurfaceExtractionNearZero &&
+        return AllowRelaxedMeshExtraction &&
                supportedCorners >= Mathf.Max(2, minRelaxedSurfaceSupportedCorners) &&
                nearZeroCorners >= Mathf.Max(1, minRelaxedNearZeroCorners);
     }
@@ -9648,7 +12877,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (a < 0 || b < 0 || a >= _tsdf.Length || b >= _tsdf.Length)
             return false;
-        if (_weights[a] < minSurfaceCornerWeight || _weights[b] < minSurfaceCornerWeight)
+        if (useStage03ACleanIsoSurface && !useV09ExactCornerEligibilityForDiagnosis
+            ? (!IsCleanMeshTsdfVoxel(a) || !IsCleanMeshTsdfVoxel(b))
+            : (_weights[a] < minSurfaceCornerWeight || _weights[b] < minSurfaceCornerWeight))
             return false;
 
         float va = _tsdf[a];
@@ -9660,13 +12891,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (a < 0 || b < 0 || a >= _tsdf.Length || b >= _tsdf.Length)
             return SurfaceEdgeKind.None;
-        if (_weights[a] < minSurfaceCornerWeight || _weights[b] < minSurfaceCornerWeight)
+        if (!IsCleanMeshTsdfVoxel(a) || !IsCleanMeshTsdfVoxel(b))
             return SurfaceEdgeKind.None;
         float va = _tsdf[a];
         float vb = _tsdf[b];
         if ((va < 0f && vb > 0f) || (va > 0f && vb < 0f))
             return SurfaceEdgeKind.Strict;
-        if (relaxSurfaceExtractionNearZero && IsRelaxedSurfaceEdge(va, vb))
+        if (AllowRelaxedMeshExtraction && IsRelaxedSurfaceEdge(va, vb))
             return SurfaceEdgeKind.Relaxed;
         return SurfaceEdgeKind.None;
     }
@@ -9892,7 +13123,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         for (int i = 0; i < 8; i++)
         {
             int index = Index(x + CornerOffsetX[i], y + CornerOffsetY[i], z + CornerOffsetZ[i]);
-            if (_weights[index] < minSurfaceCornerWeight)
+            if (!IsCleanMeshTsdfVoxel(index))
                 continue;
 
             supportedCorners++;
@@ -9960,7 +13191,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             LastRejectedWeakQuadCount++;
             return;
         }
-        if (!useLegacyTsdfMeshDisplay && rejectStretchedExtractedQuads && IsStretchedExtractedQuad(a, b, c, d, vertices))
+        if (!UseLegacyMeshExtraction && rejectStretchedExtractedQuads && IsStretchedExtractedQuad(a, b, c, d, vertices))
         {
             LastRejectedWeakQuadCount++;
             return;
@@ -10650,6 +13881,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAddedBoundaryBridgeCount = 0;
         LastRejectedBoundaryBridgeCount = 0;
         LastHeldDisplayTriangleCount = 0;
+        LastCommittedMeshHoldSpatialCount = 0;
+        LastCommittedMeshHoldTriangleCount = 0;
+        LastCommittedMeshGrowthTriangleCount = 0;
         LastTsdfContinuityCandidateCount = 0;
         LastTsdfContinuityFilledCount = 0;
         LastTsdfContinuitySameSignFilledCount = 0;
@@ -12507,6 +15741,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return camera != null ? camera.transform.position : transform.position;
     }
 
+    private Vector3 GetCameraForward()
+    {
+        if (volumeAnchor != null)
+            return volumeAnchor.forward;
+        Camera camera = Camera.main;
+        return camera != null ? camera.transform.forward : transform.forward;
+    }
+
     private void ResolveRefs()
     {
         if (rawDepthSource == null)
@@ -12591,6 +15833,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _wireObject.SetActive(showMeshEdgeWireOverlay || showPlanarCoverWireOverlay);
         EnsureDirtyTsdfEvidenceObjects();
         EnsureRawDepthDebugObjects();
+        EnsureHoleBoundaryDiagnosticObjects();
         ApplyRawDepthDebugDisplayMode();
         EnsureDiagnosticHud();
     }
@@ -12599,10 +15842,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         bool coverageOverlay = enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay;
         bool hideMeshForCoverage = coverageOverlay && hideMeshWhenRawCoverageGridOverlay;
+        bool hideMeshForHoleDiagnosis = showHoleBoundaryDiagnosis && hideMeshWhileShowingHoleBoundaryDiagnosis && !showMeshBehindLayerDiagnostics;
+        bool layerWireOnly = showHoleBoundaryDiagnosis && showMeshBehindLayerDiagnostics && showMeshAsWireOnlyBehindLayerDiagnostics;
         if (_meshRenderer != null)
-            _meshRenderer.enabled = !showRawDepthDebugView && !hideMeshForCoverage && (showPlanarCoverSurfaceFill || !renderStableCellsAsPlanarMeshCover || !showPlanarCoverWireOverlay);
+            _meshRenderer.enabled = !showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis && !layerWireOnly && (showPlanarCoverSurfaceFill || !renderStableCellsAsPlanarMeshCover || !showPlanarCoverWireOverlay);
         if (_wireObject != null)
-            _wireObject.SetActive(!showRawDepthDebugView && !hideMeshForCoverage && (showMeshEdgeWireOverlay || showPlanarCoverWireOverlay));
+            _wireObject.SetActive(!showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis && (layerWireOnly || showMeshEdgeWireOverlay || showPlanarCoverWireOverlay));
         if (_rawDepthDebugObject != null)
             _rawDepthDebugObject.SetActive((showRawDepthDebugView || coverageOverlay) && LastRawDepthDebugRenderedCount > 0);
     }
@@ -12681,6 +15926,41 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _rawDepthDebugObject.SetActive((showRawDepthDebugView || (enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay)) && LastRawDepthDebugRenderedCount > 0);
     }
 
+    private void EnsureHoleBoundaryDiagnosticObjects()
+    {
+        if (_holeBoundaryDiagnosticObject == null)
+            _holeBoundaryDiagnosticObject = new GameObject("[ScanCover] Hole Boundary Diagnosis");
+
+        if (forceWorldSpaceDisplay)
+        {
+            _holeBoundaryDiagnosticObject.transform.SetParent(null, true);
+            _holeBoundaryDiagnosticObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _holeBoundaryDiagnosticObject.transform.localScale = Vector3.one;
+        }
+        else if (_holeBoundaryDiagnosticObject.transform.parent != displayRoot)
+        {
+            _holeBoundaryDiagnosticObject.transform.SetParent(displayRoot, false);
+        }
+
+        if (_holeBoundaryDiagnosticMeshFilter == null)
+            _holeBoundaryDiagnosticMeshFilter = _holeBoundaryDiagnosticObject.GetComponent<MeshFilter>();
+        if (_holeBoundaryDiagnosticMeshFilter == null)
+            _holeBoundaryDiagnosticMeshFilter = _holeBoundaryDiagnosticObject.AddComponent<MeshFilter>();
+        if (_holeBoundaryDiagnosticRenderer == null)
+            _holeBoundaryDiagnosticRenderer = _holeBoundaryDiagnosticObject.GetComponent<MeshRenderer>();
+        if (_holeBoundaryDiagnosticRenderer == null)
+            _holeBoundaryDiagnosticRenderer = _holeBoundaryDiagnosticObject.AddComponent<MeshRenderer>();
+        if (_holeBoundaryDiagnosticMesh == null)
+        {
+            _holeBoundaryDiagnosticMesh = new Mesh { name = "ScanCover_HoleBoundaryDiagnosis" };
+            _holeBoundaryDiagnosticMesh.indexFormat = IndexFormat.UInt32;
+        }
+
+        _holeBoundaryDiagnosticMeshFilter.sharedMesh = _holeBoundaryDiagnosticMesh;
+        _holeBoundaryDiagnosticRenderer.sharedMaterial = ResolveRawDepthDebugMaterial();
+        _holeBoundaryDiagnosticObject.SetActive(showHoleBoundaryDiagnosis && _holeBoundaryDiagnosticMesh.vertexCount > 0);
+    }
+
     private void EnsureDiagnosticHud()
     {
         if (!showDiagnosticHud)
@@ -12733,6 +16013,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _hudText.color = hudHealthyColor;
         _hudText.raycastTarget = false;
         _hudText.text = "TSDF HUD";
+    }
+
+    private string DominantHoleCauseText()
+    {
+        int[] counts =
+        {
+            LastHoleCauseNoRawCount, LastHoleCausePendingCount, LastHoleCauseNoBandCount, LastHoleCauseNoZeroCrossCount,
+            LastHoleCauseVertexRejectCount, LastHoleCauseQuadRejectCount, LastHoleCauseClearedCount,
+            LastHoleCauseLocalOffsetCount, LastHoleCauseCrossFrameCount
+        };
+        string[] names = { "NO_RAW", "PENDING", "NO_BAND", "NO_ZERO", "VERTEX", "QUAD", "CLEARED", "LOCAL", "XFRAME" };
+        int best = 0;
+        for (int i = 1; i < counts.Length; i++)
+            if (counts[i] > counts[best])
+                best = i;
+        return names[best] + "=" + counts[best];
     }
 
     private void UpdateDiagnosticHud()
@@ -12844,14 +16140,32 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         string detailText = separateComplexDetailCandidates ? (promoteComplexDetailCandidatesToMesh ? "promote" : "hold") + ":" + minDetailCandidateFrames + "/" + minDetailCandidateNeighborSurfaceCells + "/" + minDetailPromotionNeighborSurfaceCells : "off";
         string supportGateText = gateTsdfWritesByDepthSupport ? minTsdfDepthCheckedNeighbors + "/" + minTsdfDepthConsistencyRatio.ToString("0.00") : "off";
         bool guardedMeshPreview = showExtractedSurfaceMesh && !useFallbackMeshWhenTsdfExtractionEmpty;
-        bool strictMeshPreview = guardedMeshPreview && !relaxSurfaceExtractionNearZero;
+        bool strictMeshPreview = guardedMeshPreview && !AllowRelaxedMeshExtraction;
         string displayModeText = LastMeshUsedExtractedTsdf
-            ? (useLegacyTsdfMeshDisplay ? "TSDF EXTRACTION" : (strictMeshPreview ? "STRICT TSDF PREVIEW" : (guardedMeshPreview ? "GUARDED TSDF PREVIEW" : "TSDF EXTRACTION")))
+            ? (useAtomicObservationTsdfBands ? "ATOMIC A/P/R VOXEL-PROJ" : (useStage03ACleanIsoSurface ? (useV08DirectBandWriteForDiagnosis ? "03A V0.8 WRITE / V0.9 MESH" : (UseLegacyMeshExtraction ? (useV09ExactCornerEligibilityForDiagnosis ? "03A V0.9 EXACT DIAG" : "03A CLEAN / V0.9 EXTRACT") : "STAGE 03A CLEAN TSDF")) : (UseLegacyMeshExtraction ? "TSDF EXTRACTION" : (strictMeshPreview ? "STRICT TSDF PREVIEW" : (guardedMeshPreview ? "GUARDED TSDF PREVIEW" : "TSDF EXTRACTION")))))
             : (renderStableCellsAsPlanarMeshCover ? "LIGHT TSDF COVER" : "FALLBACK RAW CELLS");
+        if (useStage03ACleanIsoSurface)
+        {
+            bool meshVisible = _meshRenderer != null && _meshRenderer.enabled;
+            bool wireVisible = _wireObject != null && _wireObject.activeSelf;
+            bool meshReady = LastMeshTriangleCount > 0 && (meshVisible || wireVisible);
+            _hudText.color = meshReady ? hudHealthyColor : hudWarningColor;
+            _hudText.text =
+                "ScanCover STAGE 03A\n" +
+                $"State : {(_captureRoutine != null ? "FUSING" : "READY")} / {(meshReady ? "MESH READY" : likelyCause)}  f={LastRawFrameIndex}/{IntegratedFrameCount}\n" +
+                $"Input : {LastIntegratedSampleCount}/{LastInputSampleCount} {acceptRatio:P0}  updated={LastUpdatedVoxelCount}\n" +
+                $"Bands : A/P={LastAtomicAcceptedBandVoxelWriteCount}/{LastAtomicProvisionalBandVoxelWriteCount}  up/down={LastAtomicPromotedProvisionalVoxelCount}/{LastAtomicRetiredProvisionalVoxelCount}\n" +
+                $"Holes : band/ok/drop={LastHoleSideRepairPlaneBandVoxelCount}/{LastHoleSideRepairPlaneConfirmedCount}/{LastHoleSideRepairPlaneRetiredCount}  N/S/P/T={LastHoleSideRepairRetiredNoNearAcceptCount}/{LastHoleSideRepairRetiredSignMismatchCount}/{LastHoleSideRepairRetiredPlaneMismatchCount}/{LastHoleSideRepairRetiredTsdfDeltaCount}\n" +
+                $"Pdist : .5/.75/1/1.5/2+={LastHoleSideRepairPlaneDistance0ToHalfCount}/{LastHoleSideRepairPlaneDistanceHalfTo075Count}/{LastHoleSideRepairPlaneDistance075To1Count}/{LastHoleSideRepairPlaneDistance1To15Count}/{LastHoleSideRepairPlaneDistance15To2Count + LastHoleSideRepairPlaneDistanceOver2Count}\n" +
+                $"Commit: old/new/keep={LastCommittedMeshBlockCount}/{LastCandidateMeshBlockCount}/{LastRetainedCommittedMeshBlockCount} hold={LastHeldDisplayTriangleCount} grow={LastCommittedMeshGrowthTriangleCount}\n" +
+                $"Mesh  : tris={LastMeshTriangleCount} wire={LastWireSegmentCount} vis={(meshVisible ? 1 : 0)}/{(wireVisible ? 1 : 0)}  log={(string.IsNullOrEmpty(_lastHoleDiagnosticPath) ? "off" : Path.GetFileName(_lastHoleDiagnosticPath))}";
+            return;
+        }
         _hudText.text =
             "ScanCover SAFEHUD\n" +
             $"State : {(_captureRoutine != null ? "FUSING" : "READY")} / {likelyCause}\n" +
             $"Mode  : {displayModeText} f={LastRawFrameIndex} fused={IntegratedFrameCount} in={LastIntegratedSampleCount}/{LastInputSampleCount} {acceptRatio:P0}\n" +
+            $"03A   : scan/cand/vert={LastSurfaceCellScanCount}/{LastStrictSurfaceCellCandidateCount}/{LastBuiltSurfaceCellVertexCount} quad/add={LastSurfaceQuadCandidateCount}/{LastAddedSurfaceQuadCount} tris={LastMeshTriangleCount} vis={(_meshRenderer != null && _meshRenderer.enabled ? 1 : 0)}/{(_wireObject != null && _wireObject.activeSelf ? 1 : 0)}\n" +
             $"Vote  : {observationVoteMode} A/P/R={_auditVoteAcceptCount}/{_auditVotePendingCount}/{_auditVoteRejectCount} blocked={_auditVoteEnforcedRejectCount}\n" +
             $"Entry : strongA={LastVoteStrongCurrentAcceptCount} same/cross={LastVoteSameFrameConflictRejectCount}/{LastVoteCrossFrameCleanConflictRejectCount} pending={LastVotePendingHoldCount}/{LastVotePendingConfirmedWriteCount}\n" +
             $"Formal: ok/block/prov={LastFormalIntegrateWriteCount}/{LastFormalIntegrateBlockedCount}/{LastFormalIntegrateProvisionalCount} strongBlock={LastFormalIntegrateBlockStrongCurrentHistoryCount}\n" +
