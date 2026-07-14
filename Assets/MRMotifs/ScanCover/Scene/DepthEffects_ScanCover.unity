@@ -9067,9 +9067,13 @@ MonoBehaviour:
   hideSourcePreview: 1
   forceRawRefreshOnSnapshot: 1
   waitForRawFrameTimeoutSeconds: 0.85
+  useFixedIntegratedFrameBatch: 1
+  targetIntegratedFramesPerTrigger: 12
+  maxRawFramesConsumedPerBatch: 96
+  maxConsecutiveRawFrameTimeouts: 12
   fusionBurstDurationSeconds: 2
   maxFusionFramesPerTrigger: 24
-  rebuildMeshAfterFusionBurstOnly: 0
+  rebuildMeshAfterFusionBurstOnly: 1
   voxelSizeMeters: 0.065
   truncationMeters: 0.195
   volumeSizeMeters: {x: 12, y: 4, z: 12}

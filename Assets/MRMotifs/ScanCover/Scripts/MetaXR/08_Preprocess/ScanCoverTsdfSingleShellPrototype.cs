@@ -26,9 +26,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool hideSourcePreview = true;
     [SerializeField] private bool forceRawRefreshOnSnapshot = true;
     [SerializeField, Min(0.05f)] private float waitForRawFrameTimeoutSeconds = 0.85f;
+    [SerializeField] private bool useFixedIntegratedFrameBatch = true;
+    [SerializeField, Min(1)] private int targetIntegratedFramesPerTrigger = 12;
+    [SerializeField, Min(1)] private int maxRawFramesConsumedPerBatch = 96;
+    [SerializeField, Min(1)] private int maxConsecutiveRawFrameTimeouts = 12;
     [SerializeField, Min(0.05f)] private float fusionBurstDurationSeconds = 2.0f;
     [SerializeField, Min(1)] private int maxFusionFramesPerTrigger = 24;
-    [SerializeField] private bool rebuildMeshAfterFusionBurstOnly = false;
+    [SerializeField] private bool rebuildMeshAfterFusionBurstOnly = true;
 
     [Header("Distilled TSDF Shell Parameters")]
     [SerializeField, Min(0.02f)] private float voxelSizeMeters = 0.065f;
@@ -115,11 +119,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0, 4)] private int freeSpaceEvidenceClearWeight = 1;
     [SerializeField, Range(0.5f, 1f)] private float freeSpaceEvidenceClearTsdf = 0.85f;
     [SerializeField] private bool protectSameFrameSurfaceFromClearing = true;
+    [SerializeField] private bool protectZeroCrossFromDestructiveClearing = true;
 
     [Header("Surface Extraction")]
     [SerializeField] private bool rebuildMeshAfterEachCapture = true;
     [SerializeField] private bool showExtractedSurfaceMesh = true;
     [SerializeField] private bool useLegacyTsdfMeshDisplay = true;
+    [Header("QuestRoomScan Surface Nets Shadow (Compare Only)")]
+    [SerializeField] private bool enableQuestRoomScanSurfaceNetsShadow = true;
+    [SerializeField, Range(1, 8)] private int questRoomScanShadowMinWeight = 1;
+    [SerializeField] private bool questRoomScanShadowTreatSaturatedNegativeAsEmpty = true;
     [Header("Stage 03A Clean TSDF Iso-Surface")]
     [SerializeField] private bool useStage03ACleanIsoSurface = true;
     [SerializeField] private bool useV09LegacyExtractorForStage03A = true;
@@ -127,6 +136,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool useV08DirectBandWriteForDiagnosis = true;
     [SerializeField] private bool requireCleanMeshVoxelProvenance = true;
     [SerializeField] private bool allowVerifiedContinuityInCleanMesh = true;
+    [SerializeField] private bool preserveMatureCleanBackingUnderAtomicProvisional = true;
+    [SerializeField, Range(1, 64)] private int minAtomicProvisionalMatureBackingWeight = 5;
+    [SerializeField] private bool arbitrateRestoredAtomicBackingLayerConflicts = true;
+    [SerializeField] private bool arbitrateAllNewbornLayerConflicts = true;
     [Header("Hard TSDF Write Audit")]
     [SerializeField] private bool enableHardTsdfWriteAudit = true;
     [SerializeField] private bool writeHardTsdfAuditOnCapture = true;
@@ -175,6 +188,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool useAtomicObservationTsdfBands = true;
     [SerializeField, Range(0.05f, 0.5f)] private float atomicProvisionalBandWeightScale = 0.2f;
     [SerializeField, Range(1, 4)] private int atomicProvisionalBandMaxWeight = 2;
+    [SerializeField] private bool gateFormalAcceptByStableSignCompatibility = true;
+    [SerializeField, Range(0.5f, 0.9f)] private float formalAcceptMixedConflictPendingThreshold = 0.5f;
+    [SerializeField] private bool gateFormalMixedBySequentialTopology = true;
     [SerializeField, Range(0.5f, 1.25f)] private float projectiveVoxelCenterRadiusScale = 0.9f;
     [Header("Accepted Sign Recovery")]
     [SerializeField] private bool enableAcceptedSignRecovery = true;
@@ -182,12 +198,33 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(1, 6)] private int acceptedSignRecoveryMinNeighborSupport = 2;
     [SerializeField, Range(0.05f, 0.6f)] private float acceptedSignRecoveryMaxAbsTsdf = 0.35f;
     [SerializeField, Range(1, 16)] private int acceptedSignRecoveryOldWeightCap = 4;
+    [Header("Precision Hole Routes")]
+    [SerializeField] private bool enableNoZeroCrossHistoryRecovery = true;
+    [SerializeField, Range(1, 8)] private int minNoZeroCrossLifecycleRebuilds = 3;
+    [SerializeField, Range(1, 2048)] private int maxNoZeroCrossRecoveriesPerRebuild = 256;
+    [SerializeField, Range(0.02f, 0.4f)] private float noZeroCrossRecoveryAbsTsdf = 0.12f;
+    [SerializeField] private bool enablePendingHolePromotion = true;
+    [SerializeField, Range(1, 8)] private int minPendingHoleLifecycleRebuilds = 2;
+    [SerializeField, Range(1, 2048)] private int maxPendingHolePromotionsPerRebuild = 256;
+    [SerializeField, Range(1, 6)] private int minPendingHoleNeighborSupport = 2;
+    [SerializeField, Range(2, 4)] private int minPrecisionHolePatchVoxels = 2;
+    [SerializeField, Range(2, 4)] private int maxPrecisionHolePatchVoxels = 4;
+    [Header("Shadow Block Replay (Compare Only)")]
+    [SerializeField] private bool enableShadowBlockReplay = true;
+    [SerializeField, Range(4, 16)] private int shadowReplayBlockSizeVoxels = 8;
+    [SerializeField, Range(64, 1024)] private int maxShadowObservationsPerBlock = 384;
+    [SerializeField, Range(256, 4096)] private int maxShadowReplayObservationsPerEvaluation = 2048;
+    [SerializeField, Range(32, 512)] private int maxShadowJournalBlocks = 192;
+    [SerializeField, Range(16, 512)] private int maxShadowProblemQueueBlocks = 128;
+    [SerializeField, Range(1, 8)] private int maxShadowReplayBlocksPerRebuild = 2;
+    [SerializeField, Range(2, 12)] private int minShadowProblemConsecutiveRebuilds = 3;
     [Header("Hole Boundary Diagnosis")]
     [SerializeField] private bool showHoleBoundaryDiagnosis = true;
     [SerializeField] private bool hideMeshWhileShowingHoleBoundaryDiagnosis = true;
     [SerializeField, Range(128, 12000)] private int maxHoleBoundaryMarkers = 4000;
     [SerializeField, Range(0.005f, 0.08f)] private float holeBoundaryMarkerSizeMeters = 0.025f;
     [SerializeField, Range(8, 600)] private int holeBoundaryRetiredMemoryFrames = 180;
+    [SerializeField, Range(512, 50000)] private int maxHoleCellLifecycleRecords = 12000;
     [SerializeField] private Color holeBoundaryWaitingColor = new Color(0.05f, 0.45f, 1f, 1f);
     [SerializeField] private Color holeBoundaryRetiredColor = new Color(0.9f, 0.05f, 1f, 1f);
     [SerializeField] private Color holeBoundaryNoBandColor = new Color(1f, 0.85f, 0.02f, 1f);
@@ -247,6 +284,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.8f, 1f)] private float minCommittedMeshTriangleRetention = 0.90f;
     [SerializeField] private bool absorbNewBlocksFromHeldCandidate = false;
     [SerializeField, Range(256, 20000)] private int maxHeldCandidateTrianglesToAbsorb = 6000;
+    [SerializeField] private bool retainRecoveredPendingCommittedFaces = true;
+    [SerializeField, Range(0, 2)] private int recoveredPendingFaceRetentionNeighborCells = 1;
+    [SerializeField, Range(64, 20000)] private int maxRecoveredPendingRetainedTriangles = 4000;
+    [SerializeField, Range(4, 8)] private int minRecoveredPendingObservedCorners = 6;
+    [SerializeField, Range(0.005f, 0.25f)] private float recoveredPendingVertexWeldToleranceVoxelScale = 0.05f;
+    [Header("Stable Incremental Quad Shadow")]
+    [SerializeField] private bool enableStableIncrementalQuadShadow = true;
+    [SerializeField, Range(2, 6)] private int stableQuadShadowPromoteRebuilds = 2;
+    [SerializeField, Range(1, 6)] private int stableQuadShadowRetainMissingRebuilds = 2;
+    [SerializeField, Range(0f, 1f)] private float stableQuadHeldContradictionMinAbsTsdf = 0.08f;
+    [SerializeField] private bool retainMatureProvisionalHeldFaces = true;
+    [SerializeField, Range(2, 4)] private int newbornPholdPreferredConfirmRebuilds = 2;
+    [SerializeField] private bool enableNewbornPholdReplacementProbation = true;
     [SerializeField] private bool requireMainShellPromotionGate = true;
     [SerializeField, Range(1, 24)] private int minMainShellFusedFrames = 8;
     [SerializeField, Range(1, 3)] private int mainShellNeighborRadiusCells = 1;
@@ -578,6 +628,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private Mesh _wireMesh;
     private Material _wireRuntimeMaterial;
     private Coroutine _captureRoutine;
+    private int _activeCaptureBatchTargetFrames;
+    private int _activeCaptureBatchIntegratedFrames;
+    private int _activeCaptureBatchUniqueRawFrames;
+    private int _activeCaptureBatchTimeouts;
     private GameObject _hudRoot;
     private Canvas _hudCanvas;
     private Text _hudText;
@@ -628,12 +682,139 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private int _lastLayerDuplicateRayCount;
     private int _lastLayerAmbiguousRayCount;
     private int _lastHoleDiagnosticRowCount;
+    private readonly Dictionary<Vector3Int, ShadowBlockJournal> _shadowBlockJournals = new Dictionary<Vector3Int, ShadowBlockJournal>(192);
+    private readonly Queue<Vector3Int> _shadowProblemBlockQueue = new Queue<Vector3Int>(128);
+    private readonly HashSet<Vector3Int> _shadowProblemBlockSet = new HashSet<Vector3Int>();
+    private readonly Dictionary<int, FormalTopologyVoxelState> _formalMixedTopologyVoxels = new Dictionary<int, FormalTopologyVoxelState>(64);
+    private readonly HashSet<Vector3Int> _formalMixedTopologyCells = new HashSet<Vector3Int>();
+    private StringBuilder _shadowReplayRows;
+    private int _shadowObservationSequence;
+    private int _shadowJournalDroppedObservations;
+    public int LastShadowJournalBlockCount { get; private set; }
+    public int LastShadowJournalObservationCount { get; private set; }
+    public int LastShadowProblemQueueCount { get; private set; }
+    public int LastShadowReplayEvaluatedCount { get; private set; }
+    public int LastShadowReplayImprovedCount { get; private set; }
+    public int LastShadowReplayRegressedCount { get; private set; }
+    public int LastShadowReplayAcceptOnlyImprovedCount { get; private set; }
+    public int LastShadowReplayAcceptOnlyRegressedCount { get; private set; }
+    public int LastShadowReplayClearOnlyImprovedCount { get; private set; }
+    public int LastShadowReplayClearOnlyRegressedCount { get; private set; }
+    public int LastShadowReplayFullImprovedCount { get; private set; }
+    public int LastShadowReplayFullRegressedCount { get; private set; }
+    public int LastShadowReplayAlignedImprovedCount { get; private set; }
+    public int LastShadowReplayAlignedRegressedCount { get; private set; }
+    public int LastShadowReplayMixedImprovedCount { get; private set; }
+    public int LastShadowReplayMixedRegressedCount { get; private set; }
+    public int LastShadowReplayConflictImprovedCount { get; private set; }
+    public int LastShadowReplayConflictRegressedCount { get; private set; }
+    public int LastShadowReplayNewSpaceImprovedCount { get; private set; }
+    public int LastShadowReplayNewSpaceRegressedCount { get; private set; }
+    public int LastShadowReplayAlignedObservationCount { get; private set; }
+    public int LastShadowReplayMixedObservationCount { get; private set; }
+    public int LastShadowReplayConflictObservationCount { get; private set; }
+    public int LastShadowReplayNewSpaceObservationCount { get; private set; }
+    public int LastShadowReplayMixedConflict0To25ObservationCount { get; private set; }
+    public int LastShadowReplayMixedConflict0To25ImprovedCount { get; private set; }
+    public int LastShadowReplayMixedConflict0To25RegressedCount { get; private set; }
+    public int LastShadowReplayMixedConflict25To50ObservationCount { get; private set; }
+    public int LastShadowReplayMixedConflict25To50ImprovedCount { get; private set; }
+    public int LastShadowReplayMixedConflict25To50RegressedCount { get; private set; }
+    public int LastShadowReplayMixedConflict50To75ObservationCount { get; private set; }
+    public int LastShadowReplayMixedConflict50To75ImprovedCount { get; private set; }
+    public int LastShadowReplayMixedConflict50To75RegressedCount { get; private set; }
+    public int LastShadowReplayMixedConflict75To100ObservationCount { get; private set; }
+    public int LastShadowReplayMixedConflict75To100ImprovedCount { get; private set; }
+    public int LastShadowReplayMixedConflict75To100RegressedCount { get; private set; }
+    public int LastShadowReplayMixedDestructiveObservationCount { get; private set; }
+    public int LastShadowReplayMixedDestructiveImprovedCount { get; private set; }
+    public int LastShadowReplayMixedDestructiveRegressedCount { get; private set; }
+    public int LastShadowReplayMixedConstructiveObservationCount { get; private set; }
+    public int LastShadowReplayMixedConstructiveImprovedCount { get; private set; }
+    public int LastShadowReplayMixedConstructiveRegressedCount { get; private set; }
+    public int LastShadowReplayMixedNeutralObservationCount { get; private set; }
+    public int LastShadowReplayMixedNeutralImprovedCount { get; private set; }
+    public int LastShadowReplayMixedNeutralRegressedCount { get; private set; }
+    public int LastShadowReplayMixedDestroyedZeroCrossCellCount { get; private set; }
+    public int LastShadowReplayMixedCreatedZeroCrossCellCount { get; private set; }
+    public int LastShadowReplayClearDestructiveVoxelCount { get; private set; }
+    public int LastShadowReplayClearDestructiveImprovedCount { get; private set; }
+    public int LastShadowReplayClearDestructiveRegressedCount { get; private set; }
+    public int LastShadowReplayClearConstructiveVoxelCount { get; private set; }
+    public int LastShadowReplayClearConstructiveImprovedCount { get; private set; }
+    public int LastShadowReplayClearConstructiveRegressedCount { get; private set; }
+    public int LastShadowReplayClearNeutralVoxelCount { get; private set; }
+    public int LastShadowReplayClearNeutralImprovedCount { get; private set; }
+    public int LastShadowReplayClearNeutralRegressedCount { get; private set; }
+    public int LastShadowReplayClearDestroyedZeroCrossCellCount { get; private set; }
+    public int LastShadowReplayClearCreatedZeroCrossCellCount { get; private set; }
+    public int LastShadowReplayMixedVoxelVetoObservationCount { get; private set; }
+    public int LastShadowReplayMixedVoxelVetoBlockedVoxelCount { get; private set; }
+    public int LastShadowReplayMixedVoxelVetoAvoidedDestroyedCellCount { get; private set; }
+    public int LastShadowReplayMixedVoxelVetoImprovedCount { get; private set; }
+    public int LastShadowReplayMixedVoxelVetoRegressedCount { get; private set; }
+    public int LastShadowReplayMixedObsPendingAcceptedCount { get; private set; }
+    public int LastShadowReplayMixedObsPendingDowngradedCount { get; private set; }
+    public int LastShadowReplayMixedObsPendingAvoidedDestroyedCellCount { get; private set; }
+    public int LastShadowReplayMixedObsPendingImprovedCount { get; private set; }
+    public int LastShadowReplayMixedObsPendingRegressedCount { get; private set; }
     public int LastHoleSideRepairCandidateCount { get; private set; }
     public int LastHoleSideRepairAppliedCount { get; private set; }
     public int LastHoleSideRepairBlockedSupportCount { get; private set; }
     public int LastHoleSideRepairBlockedDirtyCount { get; private set; }
     public int LastHoleSideRepairBlockedMultiZeroCount { get; private set; }
     public int LastHoleSideRepairBlockedPlaneCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneAnchorCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneDegenerateNormalCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneResidualCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneCandidateDistanceCount { get; private set; }
+    public int LastHoleSideRepairBlockedPlaneEmptyBandCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorScannedCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorAcceptedCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedNoWeightCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedDirtyPendingCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedNoProvenanceCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedOperationCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedGeometryCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedDuplicateCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorRejectedNormalCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailWeighted0Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailWeighted1To3Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailWeighted4PlusCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailAccepted0Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailAccepted1Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailAccepted2Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailAccepted3Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailAccepted4PlusCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailDeficit1Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailDeficit2Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorFailDeficit3PlusCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestNoWeightCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestDirtyPendingCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestNoProvenanceCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestOperationCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestGeometryCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestDuplicateCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1ClosestNormalCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1DirtyHasQuarantinedCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1DirtyHasPendingCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1DirtyHasProvisionalCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall0To002Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall002To005Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall005To01Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShortfallOver01Count { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShadowValidCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDegenerateCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedResidualCount { get; private set; }
+    public int LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDistanceCount { get; private set; }
+    public int LastHoleSideRepairPlaneResidualOver1To125Count { get; private set; }
+    public int LastHoleSideRepairPlaneResidualOver125To15Count { get; private set; }
+    public int LastHoleSideRepairPlaneResidualOver15To2Count { get; private set; }
+    public int LastHoleSideRepairPlaneResidualOver2Count { get; private set; }
+    public int LastHoleSideRepairPlaneCandidateDistanceOver1To125Count { get; private set; }
+    public int LastHoleSideRepairPlaneCandidateDistanceOver125To15Count { get; private set; }
+    public int LastHoleSideRepairPlaneCandidateDistanceOver15To2Count { get; private set; }
+    public int LastHoleSideRepairPlaneCandidateDistanceOver2Count { get; private set; }
     public int LastHoleSideRepairPlaneBandVoxelCount { get; private set; }
     public int LastHoleSideRepairPlaneConfirmedCount { get; private set; }
     public int LastHoleSideRepairPlaneRetiredCount { get; private set; }
@@ -651,6 +832,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastAtomicAcceptDuplicateCandidateCount { get; private set; }
     public int LastAtomicAcceptDuplicateDowngradeCount { get; private set; }
     public int LastAtomicAcceptDuplicateSameSurfaceCount { get; private set; }
+    public int LastFormalAcceptCompatibilityCheckedCount { get; private set; }
+    public int LastFormalAcceptCompatibilityAlignedCount { get; private set; }
+    public int LastFormalAcceptCompatibilityMixedLowCount { get; private set; }
+    public int LastFormalAcceptCompatibilityMixedObserveCount { get; private set; }
+    public int LastFormalAcceptCompatibilityMixedDowngradedCount { get; private set; }
+    public int LastFormalAcceptCompatibilityConflictDowngradedCount { get; private set; }
+    public int LastFormalAcceptCompatibilityNewSpaceCount { get; private set; }
+    public int LastFormalAcceptCompatibilityCriticalConflictCount { get; private set; }
+    public int LastFormalMixedTopologyCheckedCount { get; private set; }
+    public int LastFormalMixedTopologyDowngradedCount { get; private set; }
+    public int LastFormalMixedTopologyProtectedZeroCrossCellCount { get; private set; }
     public int LastDuplicateLayerCleanupQueuedCount { get; private set; }
     public int LastDuplicateLayerCleanupDecayedCount { get; private set; }
     public int LastDuplicateLayerCleanupClearedCount { get; private set; }
@@ -692,6 +884,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private readonly Dictionary<int, byte> _primaryPlaneHoleAcceptEvidence = new Dictionary<int, byte>();
     private readonly Dictionary<int, float> _primaryPlaneHoleMinPlaneDistanceVoxels = new Dictionary<int, float>();
     private int _pendingPrimaryPlaneHoleAcceptConfirmedCount;
+    private static readonly string[] PlaneAnchorNormalShortfallLabels =
+    {
+        "0_0p02",
+        "0p02_0p05",
+        "0p05_0p1",
+        "over_0p1"
+    };
+    private readonly int[] _planeAnchorDeficit1NormalShadowPlaneValidByShortfall = new int[4];
+    private readonly int[] _planeAnchorDeficit1NormalShadowBandEmptyByShortfall = new int[4];
+    private readonly int[] _planeAnchorDeficit1NormalShadowTargetNoZeroByShortfall = new int[4];
+    private readonly int[] _planeAnchorDeficit1NormalShadowMultiZeroByShortfall = new int[4];
+    private readonly int[] _planeAnchorDeficit1NormalShadowNetTopologyByShortfall = new int[4];
+    private readonly int[] _planeAnchorDeficit1NormalShadowSafeByShortfall = new int[4];
+    private int _planeAnchorDeficit1NormalShadowSafeCreatedZeroCellCount;
+    private int _planeAnchorDeficit1NormalShadowBlockedDestroyedZeroCellCount;
     private readonly HashSet<Vector3Int> _committedMeshBlocks = new HashSet<Vector3Int>();
     private readonly HashSet<Vector3Int> _candidateMeshBlocks = new HashSet<Vector3Int>();
     private byte[] _oldCleanConflictHits;
@@ -699,6 +906,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private byte[] _freeSpaceEvidenceHits;
     private int[] _freeSpaceEvidenceLastFrame;
     private int[] _cellVertexIndices;
+    private ushort[] _questRoomScanShadowCellFlags;
+    private const ushort QrsShadowCellActiveFlag = 1 << 0;
+    private const ushort QrsShadowCellAddedFlag = 1 << 1;
+    private const ushort QrsShadowCellUnknownAssistedFlag = 1 << 2;
+    private const ushort QrsShadowCellSingleWeightFlag = 1 << 3;
+    private const ushort QrsShadowCellPendingObservationFlag = 1 << 4;
+    private const ushort QrsShadowCellRejectedObservationFlag = 1 << 5;
+    private const ushort QrsShadowCellConflictHistoryFlag = 1 << 6;
+    private const ushort QrsShadowCellDirtyQuarantinedFlag = 1 << 7;
+    private const ushort QrsShadowCellPendingTsdfCorrectionFlag = 1 << 8;
+    private const ushort QrsShadowCellProvisionalFlag = 1 << 9;
     private byte[] _detailCandidateCellHits;
     private int[] _detailCandidateCellLastFrame;
     private readonly List<Vector3> _fallbackSurfacePoints = new List<Vector3>(12000);
@@ -728,6 +946,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     public int IntegratedFrameCount { get; private set; }
     public int LastRawFrameIndex { get; private set; } = -1;
+    public bool IsCaptureBatchActive => _captureRoutine != null;
+    public int LastCaptureBatchTargetFrames { get; private set; }
+    public int LastCaptureBatchIntegratedFrames { get; private set; }
+    public int LastCaptureBatchUniqueRawFrames { get; private set; }
+    public int LastCaptureBatchTimeoutCount { get; private set; }
+    public int LastCaptureBatchMeshRebuildCount { get; private set; }
+    public bool LastCaptureBatchComplete { get; private set; }
+    public int LastCaptureBatchAtomicProvisionalPromotionCount { get; private set; }
+    public int LastCaptureBatchStrongProvisionalPromotionCount { get; private set; }
+    public bool LastRebaselineValid { get; private set; }
+    public int LastRebaselineWeightedVoxelCount { get; private set; }
+    public int LastRebaselineWeight1VoxelCount { get; private set; }
+    public int LastRebaselineWeight2To3VoxelCount { get; private set; }
+    public int LastRebaselineWeight4PlusVoxelCount { get; private set; }
+    public int LastRebaselineNewHoleCellCount { get; private set; }
+    public int LastRebaselineRecoveredHoleCellCount { get; private set; }
     public int LastInputSampleCount { get; private set; }
     public int LastIntegratedSampleCount { get; private set; }
     public int LastUpdatedVoxelCount { get; private set; }
@@ -843,6 +1077,32 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastAcceptedSignRecoveryCandidateCount { get; private set; }
     public int LastAcceptedSignRecoveryNeighborBlockedCount { get; private set; }
     public int LastAcceptedSignRecoveryAppliedCount { get; private set; }
+    public int LastNoZeroCrossRouteCandidateCount { get; private set; }
+    public int LastNoZeroCrossRouteAppliedCount { get; private set; }
+    public int LastNoZeroCrossRouteBlockedHistoryCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerDirtyPendingCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerMissingArraysCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerNoDesiredCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerOppositeDominatesCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerTsdfMagnitudeCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCornerEligibleCount { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCandidate0Count { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCandidate1Count { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCandidate2Count { get; private set; }
+    public int LastNoZeroCrossRouteHistoryCandidate3PlusCount { get; private set; }
+    public int LastNoZeroCrossRouteBlockedTopologyCount { get; private set; }
+    public int LastNoZeroCrossRouteRetainedEvidenceCount { get; private set; }
+    public int LastNoZeroCrossRouteAcceptedFallbackCount { get; private set; }
+    public int LastPendingHoleRouteCandidateCount { get; private set; }
+    public int LastPendingHoleRouteAppliedCount { get; private set; }
+    public int LastPendingHoleRouteBlockedEvidenceCount { get; private set; }
+    public int LastPendingHoleRouteBlockedTopologyCount { get; private set; }
+    public int LastPendingHoleRouteAcceptedEvidenceCount { get; private set; }
+    public int LastPendingHoleRouteCellEvidenceCount { get; private set; }
+    public int LastPendingHoleRouteNeighborEvidenceCount { get; private set; }
+    public int LastPrecisionHolePatchAppliedCount { get; private set; }
+    public int LastPrecisionHolePatchVoxelCount { get; private set; }
+    public int LastPrecisionHolePatchBlockedNetTopologyCount { get; private set; }
     public int LastHoleCauseVertexRejectCount { get; private set; }
     public int LastHoleCauseQuadRejectCount { get; private set; }
     public int LastHoleCauseClearedCount { get; private set; }
@@ -906,6 +1166,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastFreeSpaceEvidenceClearedCount { get; private set; }
     public int LastFreeSpaceEvidenceBlockedHighWeightCount { get; private set; }
     public int LastFreeSpaceEvidenceBlockedSameFrameCount { get; private set; }
+    public int LastFreeSpaceEvidenceBlockedTopologyCount { get; private set; }
+    public int LastFreeSpaceEvidenceProtectedZeroCrossCellCount { get; private set; }
     public int LastFreeSpaceEvidenceDuplicateFrameCount { get; private set; }
     public int LastFreeSpaceEvidenceCancelledBySurfaceCount { get; private set; }
     public int LastNeighborFilledSampleCount { get; private set; }
@@ -944,6 +1206,61 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRejectedNoEdgeCellCount { get; private set; }
     public int LastRejectedEdgeCountCellCount { get; private set; }
     public int LastSurfaceQuadCandidateCount { get; private set; }
+    public int LastQuestRoomScanShadowCellScanCount { get; private set; }
+    public int LastQuestRoomScanShadowActiveCellCount { get; private set; }
+    public int LastQuestRoomScanShadowSharedFormalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowFormalOnlyCellCount { get; private set; }
+    public int LastQuestRoomScanShadowUnknownAssistedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAllObservedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowSingleWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowPendingObservationCellCount { get; private set; }
+    public int LastQuestRoomScanShadowRejectedObservationCellCount { get; private set; }
+    public int LastQuestRoomScanShadowConflictHistoryCellCount { get; private set; }
+    public int LastQuestRoomScanShadowDirtyPendingProvisionalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowDirtyQuarantinedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowPendingTsdfCorrectionCellCount { get; private set; }
+    public int LastQuestRoomScanShadowProvisionalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowGoodCrossingCount { get; private set; }
+    public int LastQuestRoomScanShadowBadCrossingCount { get; private set; }
+    public int LastQuestRoomScanShadowQuadCount { get; private set; }
+    public int LastQuestRoomScanShadowQuadAllFormalCellsCount { get; private set; }
+    public int LastQuestRoomScanShadowQuadUsesAddedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedUnknownAssistedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedAllObservedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedSingleWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedPendingObservationCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedRejectedObservationCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedConflictHistoryCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedDirtyPendingProvisionalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedDirtyQuarantinedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedPendingTsdfCorrectionCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedProvisionalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedPolicyRiskCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedEvidenceLimitedCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedStrongSafeCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightCellCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadUnknownAssistedCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadSingleWeightCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadPendingObservationCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadRejectedObservationCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadConflictHistoryCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadDirtyPendingProvisionalCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadDirtyQuarantinedCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadPendingTsdfCorrectionCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadProvisionalCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadPolicyRiskCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadEvidenceLimitedCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedQuadStrongSafeCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalQuadCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightQuadCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightQuadCount { get; private set; }
+    public int LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightQuadCount { get; private set; }
     public int LastPrePruneMeshTriangleCount { get; private set; }
     public int LastPostComponentMeshTriangleCount { get; private set; }
     public int LastPostBridgeMeshTriangleCount { get; private set; }
@@ -964,12 +1281,112 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastCommittedMeshHoldSpatialCount { get; private set; }
     public int LastCommittedMeshHoldTriangleCount { get; private set; }
     public int LastCommittedMeshGrowthTriangleCount { get; private set; }
+    public int LastRecoveredPendingRetentionCellCount { get; private set; }
+    public int LastRecoveredPendingRetainedTriangleCount { get; private set; }
+    public int LastRecoveredPendingDuplicateTriangleCount { get; private set; }
+    public int LastRecoveredPendingRetentionBudgetCount { get; private set; }
+    public int LastRecoveredPendingWeldedVertexCount { get; private set; }
+    public int LastRecoveredPendingAddedVertexCount { get; private set; }
+    public int LastRecoveredPendingDegenerateTriangleCount { get; private set; }
+    public int LastRecoveredPendingBoundaryEdgesBefore { get; private set; }
+    public int LastRecoveredPendingBoundaryEdgesAfter { get; private set; }
+    public int LastRecoveredPendingNonManifoldEdgesBefore { get; private set; }
+    public int LastRecoveredPendingNonManifoldEdgesAfter { get; private set; }
+    public int LastRecoveredPendingSixCornerCellCount { get; private set; }
+    public int LastRecoveredPendingSevenCornerCellCount { get; private set; }
+    public int LastRecoveredPendingEightCornerCellCount { get; private set; }
+    public int LastRecoveredPendingTopologyBlockedTriangleCount { get; private set; }
     public int LastDiagMeshComponentCount { get; private set; }
     public int LastDiagLargestComponentTriangles { get; private set; }
     public int LastDiagBoundaryEdgeCount { get; private set; }
     public int LastDiagNonManifoldEdgeCount { get; private set; }
     public int LastDiagNormalPatchCount { get; private set; }
     public int LastDiagSuspectPatchCount { get; private set; }
+    public int LastStableQuadAuditUniqueCount { get; private set; }
+    public int LastStableQuadAuditDuplicateKeyCount { get; private set; }
+    public int LastStableQuadAuditReverseWindingDuplicateCount { get; private set; }
+    public int LastStableQuadAuditLogicalEdgeCount { get; private set; }
+    public int LastStableQuadAuditBoundaryEdgeCount { get; private set; }
+    public int LastStableQuadAuditManifoldEdgeCount { get; private set; }
+    public int LastStableQuadAuditConflictEdgeCount { get; private set; }
+    public int LastStableQuadAuditCompetingLayerEdgeCount { get; private set; }
+    public int LastStableQuadAuditMaxQuadsPerEdge { get; private set; }
+    public int LastStableQuadAuditDoubleSidedFalsePositiveEdgeCount { get; private set; }
+    public int LastStableQuadAuditPersistedCount { get; private set; }
+    public int LastStableQuadAuditAddedCount { get; private set; }
+    public int LastStableQuadAuditRemovedCount { get; private set; }
+    public int LastStableQuadAuditWindingChangedCount { get; private set; }
+    public int LastStableQuadShadowCandidateCount { get; private set; }
+    public int LastStableQuadShadowCommittedCount { get; private set; }
+    public int LastStableQuadShadowPromotedCount { get; private set; }
+    public int LastStableQuadShadowHeldMissingCount { get; private set; }
+    public int LastStableQuadShadowRetiredCount { get; private set; }
+    public int LastStableQuadShadowWindingConflictCount { get; private set; }
+    public int LastStableQuadShadowConflictResolvedEdgeCount { get; private set; }
+    public int LastStableQuadShadowConflictBlockedQuadCount { get; private set; }
+    public int LastStableQuadShadowOutputQuadCount { get; private set; }
+    public int LastStableQuadHeldSafeCount { get; private set; }
+    public int LastStableQuadHeldUncertainCount { get; private set; }
+    public int LastStableQuadHeldContradictedCount { get; private set; }
+    public int LastStableQuadHeldTypeProvisionalNotPromotedCount { get; private set; }
+    public int LastStableQuadHeldTypeNearZeroJitterCount { get; private set; }
+    public int LastStableQuadHeldTypeConfirmedContradictionCount { get; private set; }
+    public int LastStableQuadHeldTypeCleanAssemblyLossCount { get; private set; }
+    public int LastStableQuadHeldTypeOtherUnsettledCount { get; private set; }
+    public int LastAtomicProvisionalMatureBackingPreservedCount { get; private set; }
+    public int LastAtomicProvisionalMatureBackingWeakBlockedCount { get; private set; }
+    public int LastAtomicProvisionalNonAtomicBlockedCount { get; private set; }
+    public int LastAtomicProvisionalBackingProvenanceBlockedCount { get; private set; }
+    public int LastAtomicProvisionalBackingRestoredCellCount { get; private set; }
+    public int LastAtomicProvisionalBackingRestoredQuadCount { get; private set; }
+    public int LastAtomicProvisionalBackingRestoredBoundaryEdgeCount { get; private set; }
+    public int LastAtomicProvisionalBackingRestoredConflictEdgeCount { get; private set; }
+    public int LastAtomicProvisionalBackingPlaneAnchorAllowedCount { get; private set; }
+    public int LastAtomicRestoredArbitrationCandidateCount { get; private set; }
+    public int LastAtomicRestoredArbitrationAcceptedCount { get; private set; }
+    public int LastAtomicRestoredArbitrationBlockedLayerCount { get; private set; }
+    public int LastAtomicRestoredArbitrationBlockedTopologyCount { get; private set; }
+    public int LastAtomicRestoredArbitrationBlockedWindingCount { get; private set; }
+    public int LastNewbornArbitrationPersistedFirstCount { get; private set; }
+    public int LastNewbornArbitrationCandidateCount { get; private set; }
+    public int LastNewbornArbitrationAcceptedCount { get; private set; }
+    public int LastNewbornArbitrationBlockedLayerCount { get; private set; }
+    public int LastNewbornArbitrationBlockedTopologyCount { get; private set; }
+    public int LastNewbornArbitrationBlockedWindingCount { get; private set; }
+    public int LastProvisionalHeldRetentionScannedCount { get; private set; }
+    public int LastProvisionalHeldRetentionCandidateCount { get; private set; }
+    public int LastProvisionalHeldRetentionAcceptedCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedMaturityCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedExpiredCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedCorrectionCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedContradictionCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedGeometryCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedLayerCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedTopologyCount { get; private set; }
+    public int LastProvisionalHeldRetentionBlockedWindingCount { get; private set; }
+    public int LastProvisionalHeldRetentionBoundaryEdgeCount { get; private set; }
+    public int LastProvisionalHeldRetentionConflictEdgeCount { get; private set; }
+    public int LastNewbornPholdCompetitionBlockedNewbornCount { get; private set; }
+    public int LastNewbornPholdCompetitionPairCount { get; private set; }
+    public int LastNewbornPholdCompetitionFullyResolvableCount { get; private set; }
+    public int LastNewbornPholdCompetitionNewbornPreferredCount { get; private set; }
+    public int LastNewbornPholdCompetitionPholdPreferredCount { get; private set; }
+    public int LastNewbornPholdCompetitionAmbiguousCount { get; private set; }
+    public int LastNewbornPholdReplacementPendingCount { get; private set; }
+    public int LastNewbornPholdReplacementAppliedCount { get; private set; }
+    public int LastNewbornPholdReplacementRemovedPholdCount { get; private set; }
+    public int LastNewbornPholdReplacementRollbackCount { get; private set; }
+    public int LastProvisionalHeldRetentionReplacedCount { get; private set; }
+    public int LastNewbornPholdProbationPendingCount { get; private set; }
+    public int LastNewbornPholdProbationConfirmedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackTransactionCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackCandidateCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackAcceptedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackContradictionBlockedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackGeometryBlockedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackLayerBlockedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackTopologyBlockedCount { get; private set; }
+    public int LastNewbornPholdProbationRollbackWindingBlockedCount { get; private set; }
     public float LastDiagWorstPatchScore { get; private set; }
     public int LastDiagWorstPatchTriangles { get; private set; }
     public float LastDiagWorstPatchBoundaryRatio { get; private set; }
@@ -1501,6 +1918,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float _auditMaxSnapshotLatencyMs;
     private readonly Dictionary<int, VoxelAuditLifecycle> _voxelAuditLifecycle = new Dictionary<int, VoxelAuditLifecycle>(4096);
     private readonly Dictionary<int, VoxelWriteProvenance> _voxelWriteProvenance = new Dictionary<int, VoxelWriteProvenance>(32768);
+    private readonly Dictionary<Vector3Int, HoleCellLifecycle> _holeCellLifecycles = new Dictionary<Vector3Int, HoleCellLifecycle>(4096);
+    private readonly HashSet<Vector3Int> _activeHoleLifecycleCells = new HashSet<Vector3Int>();
+    private int _holeLifecycleRebuildSequence;
     private readonly Dictionary<int, int> _duplicateLayerCleanupEvidence = new Dictionary<int, int>();
     private readonly List<Vector2> _layerHoleTrendSamples = new List<Vector2>(24);
     private int _lastLayerHoleTrendIntegratedFrame = -1;
@@ -1515,6 +1935,211 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private readonly HashSet<int> _captureAuditVoxels = new HashSet<int>();
     private readonly HashSet<int> _auditSuspectMeshVoxels = new HashSet<int>();
     private readonly HashSet<int> _auditPureGeometryMeshVoxels = new HashSet<int>();
+    private readonly Dictionary<StableQuadKey, StableQuadAuditRecord> _stableQuadAuditRecords = new Dictionary<StableQuadKey, StableQuadAuditRecord>(8192);
+    private readonly Dictionary<StableQuadKey, StableQuadAuditRecord> _previousStableQuadAuditRecords = new Dictionary<StableQuadKey, StableQuadAuditRecord>(8192);
+    private readonly Dictionary<ulong, List<StableQuadKey>> _stableQuadAuditEdges = new Dictionary<ulong, List<StableQuadKey>>(16384);
+    private readonly HashSet<StableQuadKey> _lastStableQuadAdded = new HashSet<StableQuadKey>();
+    private readonly HashSet<StableQuadKey> _lastStableQuadRemoved = new HashSet<StableQuadKey>();
+    private readonly HashSet<StableQuadKey> _lastStableQuadWindingChanged = new HashSet<StableQuadKey>();
+    private readonly Dictionary<StableQuadKey, StableQuadShadowState> _stableQuadShadowStates = new Dictionary<StableQuadKey, StableQuadShadowState>(8192);
+    private readonly HashSet<StableQuadKey> _stableQuadShadowObserved = new HashSet<StableQuadKey>();
+    private readonly HashSet<StableQuadKey> _stableQuadShadowConflictBlocked = new HashSet<StableQuadKey>();
+    private readonly List<StableQuadHeldEvidenceRecord> _stableQuadHeldEvidenceRecords = new List<StableQuadHeldEvidenceRecord>(2048);
+    private readonly Dictionary<int, ProvisionalPromotionBlockState> _provisionalPromotionBlockStates = new Dictionary<int, ProvisionalPromotionBlockState>(4096);
+    private readonly HashSet<int> _atomicProvisionalMatureBackingPreserved = new HashSet<int>();
+    private readonly HashSet<int> _atomicProvisionalMatureBackingWeakBlocked = new HashSet<int>();
+    private readonly HashSet<int> _atomicProvisionalNonAtomicBlocked = new HashSet<int>();
+    private readonly HashSet<int> _atomicProvisionalBackingProvenanceBlocked = new HashSet<int>();
+    private readonly HashSet<int> _atomicProvisionalBackingRestoredVertexIndices = new HashSet<int>();
+    private readonly HashSet<int> _atomicProvisionalBackingPlaneAnchorAllowed = new HashSet<int>();
+    private readonly HashSet<StableQuadKey> _deferredArbitratedQuadKeys = new HashSet<StableQuadKey>();
+    private readonly HashSet<StableQuadKey> _heldProvisionalRetainedKeys = new HashSet<StableQuadKey>();
+    private readonly Dictionary<StableQuadKey, int> _forcedStableQuadAuditWindings = new Dictionary<StableQuadKey, int>(512);
+    private readonly List<NewbornPholdCompetitionRecord> _newbornPholdCompetitionRecords = new List<NewbornPholdCompetitionRecord>(1024);
+    private readonly Dictionary<StableQuadKey, NewbornPholdPreferredState> _newbornPholdPreferredStates = new Dictionary<StableQuadKey, NewbornPholdPreferredState>(512);
+    private readonly HashSet<StableQuadKey> _newbornPholdPreferredObserved = new HashSet<StableQuadKey>();
+    private readonly Dictionary<StableQuadKey, NewbornPholdReplacementProbationState> _newbornPholdReplacementProbations = new Dictionary<StableQuadKey, NewbornPholdReplacementProbationState>(128);
+    private readonly HashSet<StableQuadKey> _naturallyObservedStableQuadKeys = new HashSet<StableQuadKey>();
+    private readonly List<NewbornPholdProbationEventRecord> _newbornPholdProbationEvents = new List<NewbornPholdProbationEventRecord>(256);
+    private int _newbornPholdCompetitionRebuildSequence;
+    private bool _stableQuadTrianglesNeedRebuild;
+    private bool _lastBuiltCellRestoredByAtomicProvisionalBacking;
+    private readonly List<DeferredArbitratedQuad> _deferredArbitratedQuads = new List<DeferredArbitratedQuad>(4096);
+
+    private struct StableQuadKey : System.IEquatable<StableQuadKey>
+    {
+        public int X;
+        public int Y;
+        public int Z;
+        public byte Axis;
+
+        public bool Equals(StableQuadKey other)
+        {
+            return X == other.X && Y == other.Y && Z == other.Z && Axis == other.Axis;
+        }
+
+        public override bool Equals(object obj)
+        {
+            return obj is StableQuadKey other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = X;
+                hash = hash * 397 ^ Y;
+                hash = hash * 397 ^ Z;
+                hash = hash * 397 ^ Axis;
+                return hash;
+            }
+        }
+    }
+
+    private struct StableQuadAuditRecord
+    {
+        public StableQuadKey Key;
+        public int A;
+        public int B;
+        public int C;
+        public int D;
+        public int Winding;
+        public int ProvisionalCorners;
+        public int PendingCorners;
+        public int DirtyCorners;
+        public Vector3 Center;
+        public Vector3 Normal;
+        public bool RestoredByAtomicProvisionalBacking;
+    }
+
+    private struct StableQuadShadowState
+    {
+        public int ConsecutivePresent;
+        public int ConsecutiveMissing;
+        public int TotalPresent;
+        public int Winding;
+        public bool Committed;
+    }
+
+    private struct StableQuadHeldEvidenceRecord
+    {
+        public StableQuadKey Key;
+        public int MissingRebuilds;
+        public int TotalPresent;
+        public int PreviousWinding;
+        public int CurrentWinding;
+        public float TsdfA;
+        public float TsdfB;
+        public int WeightA;
+        public int WeightB;
+        public bool CleanA;
+        public bool CleanB;
+        public bool ProvisionalA;
+        public bool ProvisionalB;
+        public bool PendingA;
+        public bool PendingB;
+        public bool DirtyA;
+        public bool DirtyB;
+        public string Classification;
+        public string Reason;
+        public string PromotionBlockerA;
+        public string PromotionBlockerB;
+        public int PromotionBlockerAgeA;
+        public int PromotionBlockerAgeB;
+    }
+
+    private struct ProvisionalPromotionBlockState
+    {
+        public byte ReasonCode;
+        public int Frame;
+    }
+
+    private struct DeferredArbitratedQuad
+    {
+        public StableQuadKey Key;
+        public int A;
+        public int B;
+        public int C;
+        public int D;
+        public int Priority;
+        public int Winding;
+        public bool Restored;
+        public bool Newborn;
+        public bool HeldProvisional;
+        public bool ProbationRollback;
+        public StableQuadKey ProbationOwnerKey;
+    }
+
+    private struct NewbornPholdCompetitionRecord
+    {
+        public StableQuadKey NewbornKey;
+        public StableQuadKey PholdKey;
+        public int SharedConflictEdges;
+        public int CandidateConflictEdges;
+        public int CandidateConflictEdgesWithPhold;
+        public int DistinctPholdBlockers;
+        public bool FullyPholdResolvable;
+        public int SwapBoundaryDelta;
+        public int NewbornWinding;
+        public int NewbornMinWeight;
+        public float NewbornMinAbsTsdf;
+        public int NewbornProvisionalEndpoints;
+        public int NewbornPendingEndpoints;
+        public int NewbornDirtyEndpoints;
+        public bool NewbornRestored;
+        public int NewbornTotalPresent;
+        public bool NewbornCommitted;
+        public int PholdHistoricalWinding;
+        public int PholdCurrentWinding;
+        public int PholdMinWeight;
+        public float PholdMinAbsTsdf;
+        public int PholdProvisionalEndpoints;
+        public int PholdPendingEndpoints;
+        public int PholdDirtyEndpoints;
+        public int PholdTotalPresent;
+        public int PholdMissingRebuilds;
+        public string Recommendation;
+        public int PreferredConsecutive;
+        public string ReplacementStatus;
+    }
+
+    private struct NewbornPholdPreferredState
+    {
+        public int ConsecutivePreferred;
+        public int LastRebuildSequence;
+        public int BlockerSignature;
+    }
+
+    private struct NewbornPholdCompetitionDecision
+    {
+        public bool HasPholdCompetition;
+        public bool NewbornPreferred;
+        public bool FullyPholdResolvable;
+        public int BlockerSignature;
+        public List<StableQuadKey> PholdBlockers;
+    }
+
+    private struct NewbornPholdProbationBackup
+    {
+        public StableQuadKey Key;
+        public int HistoricalWinding;
+        public StableQuadShadowState ShadowState;
+    }
+
+    private struct NewbornPholdReplacementProbationState
+    {
+        public StableQuadKey NewbornKey;
+        public int NewbornWinding;
+        public int StartedRebuildSequence;
+        public List<NewbornPholdProbationBackup> PholdBackups;
+    }
+
+    private struct NewbornPholdProbationEventRecord
+    {
+        public StableQuadKey NewbornKey;
+        public StableQuadKey PholdKey;
+        public string EventName;
+    }
     private int _auditMeshAssociatedVoxelCount;
     private int _auditRecurrentAfterReplaceCount;
     private int _auditLikelyDepthInstabilityCount;
@@ -1592,6 +2217,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public int OldWeight;
         public float Tsdf;
         public int Weight;
+    }
+
+    private struct HoleCellLifecycle
+    {
+        public int FirstFrame;
+        public int LastFrame;
+        public int FirstCapture;
+        public int LastCapture;
+        public int FirstRebuild;
+        public int LastRebuild;
+        public int SeenRebuilds;
+        public int ConsecutiveRebuilds;
+        public int MaxConsecutiveRebuilds;
+        public int CauseTransitions;
+        public int RecoveryCount;
+        public int LastRecoveryCapture;
+        public HoleSupportCause FirstCause;
+        public HoleSupportCause LastCause;
+        public bool Active;
+        public bool PositiveOnly;
+        public bool NegativeOnly;
+        public int FirstWriteSequence;
+        public int LastWriteSequence;
     }
 
     private void ResetStrongSampleSeedTemporaryBlockDiagnostics()
@@ -1825,6 +2473,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             pruneDanglingExtractedMeshTriangles = false;
             pruneSpikePatchTriangles = false;
             showMeshTumorSuspectOverlay = false;
+            retainRecoveredPendingCommittedFaces = true;
+            recoveredPendingFaceRetentionNeighborCells = 1;
+            maxRecoveredPendingRetainedTriangles = Mathf.Max(4000, maxRecoveredPendingRetainedTriangles);
+            minRecoveredPendingObservedCorners = 6;
+            recoveredPendingVertexWeldToleranceVoxelScale = 0.08f;
+            enableStableIncrementalQuadShadow = true;
+            stableQuadShadowPromoteRebuilds = 2;
+            stableQuadShadowRetainMissingRebuilds = 2;
         }
     }
 
@@ -1867,6 +2523,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (_confidenceAuditRows != null)
             EndConfidenceAuditCapture(_confidenceAuditIntegratedFrames, "component disabled");
+        _captureRoutine = null;
+        _activeCaptureBatchTargetFrames = 0;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
     }
 
     private void OnDestroy()
@@ -1933,7 +2594,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         ResolveRefs();
         if (_captureRoutine != null)
-            StopCoroutine(_captureRoutine);
+        {
+            if (debugLog)
+                Debug.Log("[ScanCoverTsdfSingleShellPrototype] Capture batch already active; repeated trigger ignored.", this);
+            return;
+        }
         _captureRoutine = StartCoroutine(CaptureRawSnapshotAndIntegrateRoutine());
     }
 
@@ -1992,10 +2657,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _provisionalTsdf = null;
         _provisionalTsdfLastFrame = null;
         _provisionalTsdfHits = null;
+        _provisionalPromotionBlockStates.Clear();
         _oldCleanConflictHits = null;
         _oldCleanConflictLastFrame = null;
         _freeSpaceEvidenceHits = null;
         _freeSpaceEvidenceLastFrame = null;
+        _questRoomScanShadowCellFlags = null;
         _cellVertexIndices = null;
         _detailCandidateCellHits = null;
         _detailCandidateCellLastFrame = null;
@@ -2007,6 +2674,23 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
         _voxelWriteSequence = 0;
+        _holeCellLifecycles.Clear();
+        _activeHoleLifecycleCells.Clear();
+        _previousStableQuadAuditRecords.Clear();
+        _stableQuadAuditRecords.Clear();
+        _stableQuadAuditEdges.Clear();
+        _stableQuadShadowStates.Clear();
+        _newbornPholdPreferredStates.Clear();
+        _newbornPholdPreferredObserved.Clear();
+        _newbornPholdReplacementProbations.Clear();
+        _naturallyObservedStableQuadKeys.Clear();
+        _newbornPholdCompetitionRebuildSequence = 0;
+        _holeLifecycleRebuildSequence = 0;
+        _shadowBlockJournals.Clear();
+        _shadowProblemBlockQueue.Clear();
+        _shadowProblemBlockSet.Clear();
+        _shadowObservationSequence = 0;
+        _shadowJournalDroppedObservations = 0;
         _captureAuditVoxels.Clear();
         _surfaceChunkOrder.Clear();
         _dirtyTsdfEvidence.Clear();
@@ -2050,6 +2734,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAtomicAcceptDuplicateCandidateCount = 0;
         LastAtomicAcceptDuplicateDowngradeCount = 0;
         LastAtomicAcceptDuplicateSameSurfaceCount = 0;
+        LastFormalAcceptCompatibilityCheckedCount = 0;
+        LastFormalAcceptCompatibilityAlignedCount = 0;
+        LastFormalAcceptCompatibilityMixedLowCount = 0;
+        LastFormalAcceptCompatibilityMixedObserveCount = 0;
+        LastFormalAcceptCompatibilityMixedDowngradedCount = 0;
+        LastFormalAcceptCompatibilityConflictDowngradedCount = 0;
+        LastFormalAcceptCompatibilityNewSpaceCount = 0;
+        LastFormalAcceptCompatibilityCriticalConflictCount = 0;
+        LastFormalMixedTopologyCheckedCount = 0;
+        LastFormalMixedTopologyDowngradedCount = 0;
+        LastFormalMixedTopologyProtectedZeroCrossCellCount = 0;
         LastAtomicPromotedProvisionalVoxelCount = 0;
         LastAtomicRetiredProvisionalVoxelCount = 0;
         LastHoleBoundaryWaitingCount = 0;
@@ -2113,11 +2808,45 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastCommittedMeshHoldSpatialCount = 0;
         LastCommittedMeshHoldTriangleCount = 0;
         LastCommittedMeshGrowthTriangleCount = 0;
+        LastRecoveredPendingRetentionCellCount = 0;
+        LastRecoveredPendingRetainedTriangleCount = 0;
+        LastRecoveredPendingDuplicateTriangleCount = 0;
+        LastRecoveredPendingRetentionBudgetCount = 0;
+        LastRecoveredPendingWeldedVertexCount = 0;
+        LastRecoveredPendingAddedVertexCount = 0;
+        LastRecoveredPendingDegenerateTriangleCount = 0;
+        LastRecoveredPendingBoundaryEdgesBefore = 0;
+        LastRecoveredPendingBoundaryEdgesAfter = 0;
+        LastRecoveredPendingNonManifoldEdgesBefore = 0;
+        LastRecoveredPendingNonManifoldEdgesAfter = 0;
+        LastRecoveredPendingSixCornerCellCount = 0;
+        LastRecoveredPendingSevenCornerCellCount = 0;
+        LastRecoveredPendingEightCornerCellCount = 0;
+        LastRecoveredPendingTopologyBlockedTriangleCount = 0;
         _committedMeshBlocks.Clear();
         _candidateMeshBlocks.Clear();
         ResetExtractionDiagnostics();
         IntegratedFrameCount = 0;
         LastRawFrameIndex = -1;
+        LastCaptureBatchTargetFrames = 0;
+        LastCaptureBatchIntegratedFrames = 0;
+        LastCaptureBatchUniqueRawFrames = 0;
+        LastCaptureBatchTimeoutCount = 0;
+        LastCaptureBatchMeshRebuildCount = 0;
+        LastCaptureBatchComplete = false;
+        LastCaptureBatchAtomicProvisionalPromotionCount = 0;
+        LastCaptureBatchStrongProvisionalPromotionCount = 0;
+        LastRebaselineValid = false;
+        LastRebaselineWeightedVoxelCount = 0;
+        LastRebaselineWeight1VoxelCount = 0;
+        LastRebaselineWeight2To3VoxelCount = 0;
+        LastRebaselineWeight4PlusVoxelCount = 0;
+        LastRebaselineNewHoleCellCount = 0;
+        LastRebaselineRecoveredHoleCellCount = 0;
+        _activeCaptureBatchTargetFrames = 0;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
         LastInputSampleCount = 0;
         LastIntegratedSampleCount = 0;
         LastUpdatedVoxelCount = 0;
@@ -2179,6 +2908,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int cellCount = cellX * cellY * cellZ;
         if (_cellVertexIndices == null || _cellVertexIndices.Length != cellCount)
             _cellVertexIndices = new int[cellCount];
+        if (_questRoomScanShadowCellFlags == null || _questRoomScanShadowCellFlags.Length != cellCount)
+            _questRoomScanShadowCellFlags = new ushort[cellCount];
         if (_detailCandidateCellHits == null || _detailCandidateCellHits.Length != cellCount)
             _detailCandidateCellHits = new byte[cellCount];
         if (_detailCandidateCellLastFrame == null || _detailCandidateCellLastFrame.Length != cellCount)
@@ -2194,12 +2925,72 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         List<int> triangles = new List<int>(Mathf.Min(maxSurfaceVertices * 3, cellCount * 6));
         List<Color> colors = new List<Color>(Mathf.Min(maxSurfaceVertices, cellCount));
         ResetExtractionDiagnostics();
+        ResetStableQuadTopologyAudit();
         LastHoleSideRepairCandidateCount = 0;
         LastHoleSideRepairAppliedCount = 0;
         LastHoleSideRepairBlockedSupportCount = 0;
         LastHoleSideRepairBlockedDirtyCount = 0;
         LastHoleSideRepairBlockedMultiZeroCount = 0;
         LastHoleSideRepairBlockedPlaneCount = 0;
+        LastHoleSideRepairBlockedPlaneAnchorCount = 0;
+        LastHoleSideRepairBlockedPlaneDegenerateNormalCount = 0;
+        LastHoleSideRepairBlockedPlaneResidualCount = 0;
+        LastHoleSideRepairBlockedPlaneCandidateDistanceCount = 0;
+        LastHoleSideRepairBlockedPlaneEmptyBandCount = 0;
+        LastHoleSideRepairPlaneAnchorScannedCount = 0;
+        LastHoleSideRepairPlaneAnchorAcceptedCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedNoWeightCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedDirtyPendingCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedNoProvenanceCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedOperationCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedGeometryCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedDuplicateCount = 0;
+        LastHoleSideRepairPlaneAnchorRejectedNormalCount = 0;
+        LastHoleSideRepairPlaneAnchorFailWeighted0Count = 0;
+        LastHoleSideRepairPlaneAnchorFailWeighted1To3Count = 0;
+        LastHoleSideRepairPlaneAnchorFailWeighted4PlusCount = 0;
+        LastHoleSideRepairPlaneAnchorFailAccepted0Count = 0;
+        LastHoleSideRepairPlaneAnchorFailAccepted1Count = 0;
+        LastHoleSideRepairPlaneAnchorFailAccepted2Count = 0;
+        LastHoleSideRepairPlaneAnchorFailAccepted3Count = 0;
+        LastHoleSideRepairPlaneAnchorFailAccepted4PlusCount = 0;
+        LastHoleSideRepairPlaneAnchorFailDeficit1Count = 0;
+        LastHoleSideRepairPlaneAnchorFailDeficit2Count = 0;
+        LastHoleSideRepairPlaneAnchorFailDeficit3PlusCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestNoWeightCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestDirtyPendingCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestNoProvenanceCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestOperationCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestGeometryCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestDuplicateCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1ClosestNormalCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasQuarantinedCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasPendingCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasProvisionalCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall0To002Count = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall002To005Count = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall005To01Count = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfallOver01Count = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShadowValidCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDegenerateCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedResidualCount = 0;
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDistanceCount = 0;
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowPlaneValidByShortfall, 0, _planeAnchorDeficit1NormalShadowPlaneValidByShortfall.Length);
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowBandEmptyByShortfall, 0, _planeAnchorDeficit1NormalShadowBandEmptyByShortfall.Length);
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowTargetNoZeroByShortfall, 0, _planeAnchorDeficit1NormalShadowTargetNoZeroByShortfall.Length);
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowMultiZeroByShortfall, 0, _planeAnchorDeficit1NormalShadowMultiZeroByShortfall.Length);
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowNetTopologyByShortfall, 0, _planeAnchorDeficit1NormalShadowNetTopologyByShortfall.Length);
+        System.Array.Clear(_planeAnchorDeficit1NormalShadowSafeByShortfall, 0, _planeAnchorDeficit1NormalShadowSafeByShortfall.Length);
+        _planeAnchorDeficit1NormalShadowSafeCreatedZeroCellCount = 0;
+        _planeAnchorDeficit1NormalShadowBlockedDestroyedZeroCellCount = 0;
+        LastHoleSideRepairPlaneResidualOver1To125Count = 0;
+        LastHoleSideRepairPlaneResidualOver125To15Count = 0;
+        LastHoleSideRepairPlaneResidualOver15To2Count = 0;
+        LastHoleSideRepairPlaneResidualOver2Count = 0;
+        LastHoleSideRepairPlaneCandidateDistanceOver1To125Count = 0;
+        LastHoleSideRepairPlaneCandidateDistanceOver125To15Count = 0;
+        LastHoleSideRepairPlaneCandidateDistanceOver15To2Count = 0;
+        LastHoleSideRepairPlaneCandidateDistanceOver2Count = 0;
         LastHoleSideRepairPlaneBandVoxelCount = 0;
         LastHoleSideRepairPlaneConfirmedCount = _pendingPrimaryPlaneHoleAcceptConfirmedCount;
         _pendingPrimaryPlaneHoleAcceptConfirmedCount = 0;
@@ -2215,6 +3006,32 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastHoleSideRepairPlaneDistance1To15Count = 0;
         LastHoleSideRepairPlaneDistance15To2Count = 0;
         LastHoleSideRepairPlaneDistanceOver2Count = 0;
+        LastNoZeroCrossRouteCandidateCount = 0;
+        LastNoZeroCrossRouteAppliedCount = 0;
+        LastNoZeroCrossRouteBlockedHistoryCount = 0;
+        LastNoZeroCrossRouteHistoryCornerDirtyPendingCount = 0;
+        LastNoZeroCrossRouteHistoryCornerMissingArraysCount = 0;
+        LastNoZeroCrossRouteHistoryCornerNoDesiredCount = 0;
+        LastNoZeroCrossRouteHistoryCornerOppositeDominatesCount = 0;
+        LastNoZeroCrossRouteHistoryCornerTsdfMagnitudeCount = 0;
+        LastNoZeroCrossRouteHistoryCornerEligibleCount = 0;
+        LastNoZeroCrossRouteHistoryCandidate0Count = 0;
+        LastNoZeroCrossRouteHistoryCandidate1Count = 0;
+        LastNoZeroCrossRouteHistoryCandidate2Count = 0;
+        LastNoZeroCrossRouteHistoryCandidate3PlusCount = 0;
+        LastNoZeroCrossRouteBlockedTopologyCount = 0;
+        LastNoZeroCrossRouteRetainedEvidenceCount = 0;
+        LastNoZeroCrossRouteAcceptedFallbackCount = 0;
+        LastPendingHoleRouteCandidateCount = 0;
+        LastPendingHoleRouteAppliedCount = 0;
+        LastPendingHoleRouteBlockedEvidenceCount = 0;
+        LastPendingHoleRouteBlockedTopologyCount = 0;
+        LastPendingHoleRouteAcceptedEvidenceCount = 0;
+        LastPendingHoleRouteCellEvidenceCount = 0;
+        LastPendingHoleRouteNeighborEvidenceCount = 0;
+        LastPrecisionHolePatchAppliedCount = 0;
+        LastPrecisionHolePatchVoxelCount = 0;
+        LastPrecisionHolePatchBlockedNetTopologyCount = 0;
         LastDuplicateLayerCleanupQueuedCount = _duplicateLayerCleanupEvidence.Count;
         LastDuplicateLayerCleanupDecayedCount = 0;
         LastDuplicateLayerCleanupClearedCount = 0;
@@ -2226,6 +3043,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         AuditUntrackedTsdfWrites("retire");
         CleanupConfirmedDuplicateLayers();
         FillCleanTsdfContinuityGaps();
+        RepairPrecisionHoleRoutes();
         RepairGuardedHoleSides();
         AuditUntrackedTsdfWrites("continuity");
 
@@ -2250,12 +3068,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
                         int vertexIndex = vertices.Count;
                         vertices.Add(vertex);
+                        if (_lastBuiltCellRestoredByAtomicProvisionalBacking)
+                            _atomicProvisionalBackingRestoredVertexIndices.Add(vertexIndex);
                         colors.Add(cleanCoverCellColor);
                         _cellVertexIndices[CellIndex(x, y, z, cellX, cellY)] = vertexIndex;
                         LastBuiltSurfaceCellVertexCount++;
                     }
                 }
             }
+
+            EvaluateQuestRoomScanSurfaceNetsShadow(cellX, cellY, cellZ);
 
             for (int z = 0; z < _dimZ; z++)
             {
@@ -2264,6 +3086,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     for (int x = 0; x < _dimX; x++)
                     {
                         int xIndex = Index(x, y, z);
+                        CountQuestRoomScanShadowQuadsAtVoxel(x, y, z, xIndex, cellX, cellY, cellZ);
                         if (UseLegacyMeshExtraction)
                         {
                             if (x + 1 < _dimX && IsLegacySignChange(xIndex, Index(x + 1, y, z)))
@@ -2303,6 +3126,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     }
                 }
             }
+            ResolveNewbornPholdReplacementProbations(cellX, cellY, vertices);
+            QueueMatureProvisionalHeldFaces(cellX, cellY, vertices);
+            FlushDeferredArbitratedQuads(vertices, triangles);
+            FinalizeStableQuadTopologyAudit(triangles);
             RebuildHoleBoundaryDiagnostic(cellX, cellY, cellZ, vertices.Count, triangles);
         }
 
@@ -2336,6 +3163,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             }
         }
 
+        RetainRecoveredPendingFaces(vertices, triangles, colors);
         AnalyzeMeshDiagnostics(vertices, triangles);
         ApplyMeshTumorSuspectOverlay(vertices, triangles, colors);
         AuditUntrackedTsdfWrites("extraction");
@@ -2491,6 +3319,359 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return retained;
     }
 
+    private void RetainRecoveredPendingFaces(
+        List<Vector3> candidateVertices,
+        List<int> candidateTriangles,
+        List<Color> candidateColors)
+    {
+        LastRecoveredPendingRetentionCellCount = 0;
+        LastRecoveredPendingRetainedTriangleCount = 0;
+        LastRecoveredPendingDuplicateTriangleCount = 0;
+        LastRecoveredPendingRetentionBudgetCount = 0;
+        LastRecoveredPendingWeldedVertexCount = 0;
+        LastRecoveredPendingAddedVertexCount = 0;
+        LastRecoveredPendingDegenerateTriangleCount = 0;
+        LastRecoveredPendingBoundaryEdgesBefore = 0;
+        LastRecoveredPendingBoundaryEdgesAfter = 0;
+        LastRecoveredPendingNonManifoldEdgesBefore = 0;
+        LastRecoveredPendingNonManifoldEdgesAfter = 0;
+        LastRecoveredPendingSixCornerCellCount = 0;
+        LastRecoveredPendingSevenCornerCellCount = 0;
+        LastRecoveredPendingEightCornerCellCount = 0;
+        LastRecoveredPendingTopologyBlockedTriangleCount = 0;
+        if (!retainRecoveredPendingCommittedFaces ||
+            _mesh == null || _mesh.vertexCount <= 0 || _mesh.triangles == null || _mesh.triangles.Length < 3 ||
+            _holeCellLifecycles.Count <= 0)
+        {
+            return;
+        }
+
+        HashSet<Vector3Int> protectedCells = new HashSet<Vector3Int>();
+        foreach (KeyValuePair<Vector3Int, HoleCellLifecycle> entry in _holeCellLifecycles)
+        {
+            HoleCellLifecycle lifecycle = entry.Value;
+            if (!lifecycle.Active || lifecycle.RecoveryCount <= 0 || lifecycle.LastCause != HoleSupportCause.Pending)
+                continue;
+            if (!CellHasSafeRawZeroCrossForRetention(entry.Key.x, entry.Key.y, entry.Key.z, out int supportedCorners))
+                continue;
+            protectedCells.Add(entry.Key);
+            if (supportedCorners == 6)
+                LastRecoveredPendingSixCornerCellCount++;
+            else if (supportedCorners == 7)
+                LastRecoveredPendingSevenCornerCellCount++;
+            else if (supportedCorners >= 8)
+                LastRecoveredPendingEightCornerCellCount++;
+        }
+        LastRecoveredPendingRetentionCellCount = protectedCells.Count;
+        if (protectedCells.Count <= 0)
+            return;
+
+        CountMeshEdgeTopology(
+            candidateTriangles,
+            out int boundaryEdgesBefore,
+            out int nonManifoldEdgesBefore);
+        LastRecoveredPendingBoundaryEdgesBefore = boundaryEdgesBefore;
+        LastRecoveredPendingNonManifoldEdgesBefore = nonManifoldEdgesBefore;
+        Dictionary<ulong, int> retainedEdgeUse = BuildMeshEdgeUseCounts(candidateTriangles);
+        HashSet<Vector3Int> retainedTriangleKeys = BuildOrientedTriangleKeys(candidateTriangles);
+
+        HashSet<Vector3Int> candidateTriangleCells = new HashSet<Vector3Int>();
+        for (int i = 0; i + 2 < candidateTriangles.Count; i += 3)
+        {
+            int ia = candidateTriangles[i];
+            int ib = candidateTriangles[i + 1];
+            int ic = candidateTriangles[i + 2];
+            if (!TriangleIndicesAreValid(ia, ib, ic, candidateVertices.Count))
+                continue;
+            Vector3 centroid = (candidateVertices[ia] + candidateVertices[ib] + candidateVertices[ic]) / 3f;
+            if (TryWorldPointToSurfaceCell(centroid, out Vector3Int cell))
+                candidateTriangleCells.Add(cell);
+        }
+
+        Vector3[] oldVertices = _mesh.vertices;
+        int[] oldTriangles = _mesh.triangles;
+        Color[] oldColors = _mesh.colors;
+        int triangleBudget = Mathf.Max(64, maxRecoveredPendingRetainedTriangles);
+        int neighborRadius = Mathf.Clamp(recoveredPendingFaceRetentionNeighborCells, 0, 2);
+        float weldTolerance = Mathf.Max(0.00001f,
+            voxelSizeMeters * Mathf.Clamp(recoveredPendingVertexWeldToleranceVoxelScale, 0.005f, 0.25f));
+        Dictionary<Vector3Int, List<int>> weldBins = BuildVertexWeldBins(candidateVertices, weldTolerance);
+        Dictionary<int, int> oldVertexRemap = new Dictionary<int, int>();
+        for (int i = 0; i + 2 < oldTriangles.Length; i += 3)
+        {
+            int ia = oldTriangles[i];
+            int ib = oldTriangles[i + 1];
+            int ic = oldTriangles[i + 2];
+            if (!TriangleIndicesAreValid(ia, ib, ic, oldVertices.Length))
+                continue;
+            Vector3 centroid = (oldVertices[ia] + oldVertices[ib] + oldVertices[ic]) / 3f;
+            if (!TryWorldPointToSurfaceCell(centroid, out Vector3Int cell) ||
+                !CellOrNeighborIsProtected(cell, protectedCells, neighborRadius))
+            {
+                continue;
+            }
+            if (candidateTriangleCells.Contains(cell))
+            {
+                LastRecoveredPendingDuplicateTriangleCount++;
+                continue;
+            }
+            if (LastRecoveredPendingRetainedTriangleCount >= triangleBudget)
+            {
+                LastRecoveredPendingRetentionBudgetCount++;
+                continue;
+            }
+
+            int ra = FindOrAddRetainedWeldedVertex(ia, oldVertices, oldColors, candidateVertices, candidateColors, oldVertexRemap, weldBins, weldTolerance);
+            int rb = FindOrAddRetainedWeldedVertex(ib, oldVertices, oldColors, candidateVertices, candidateColors, oldVertexRemap, weldBins, weldTolerance);
+            int rc = FindOrAddRetainedWeldedVertex(ic, oldVertices, oldColors, candidateVertices, candidateColors, oldVertexRemap, weldBins, weldTolerance);
+            if (ra < 0 || rb < 0 || rc < 0)
+            {
+                LastRecoveredPendingRetentionBudgetCount++;
+                continue;
+            }
+            if (ra == rb || rb == rc || rc == ra ||
+                Vector3.Cross(candidateVertices[rb] - candidateVertices[ra], candidateVertices[rc] - candidateVertices[ra]).sqrMagnitude <= 0.0000000001f)
+            {
+                LastRecoveredPendingDegenerateTriangleCount++;
+                continue;
+            }
+            Vector3Int triangleKey = OrientedTriangleKey(ra, rb, rc);
+            if (retainedTriangleKeys.Contains(triangleKey))
+            {
+                LastRecoveredPendingDuplicateTriangleCount++;
+                continue;
+            }
+            int manifoldUseLimit = doubleSidedTriangles ? 4 : 2;
+            if (GetEdgeUseCount(retainedEdgeUse, ra, rb) >= manifoldUseLimit ||
+                GetEdgeUseCount(retainedEdgeUse, rb, rc) >= manifoldUseLimit ||
+                GetEdgeUseCount(retainedEdgeUse, rc, ra) >= manifoldUseLimit)
+            {
+                LastRecoveredPendingTopologyBlockedTriangleCount++;
+                continue;
+            }
+            candidateTriangles.Add(ra);
+            candidateTriangles.Add(rb);
+            candidateTriangles.Add(rc);
+            retainedTriangleKeys.Add(triangleKey);
+            AddEdgeUse(retainedEdgeUse, ra, rb);
+            AddEdgeUse(retainedEdgeUse, rb, rc);
+            AddEdgeUse(retainedEdgeUse, rc, ra);
+            LastRecoveredPendingRetainedTriangleCount++;
+        }
+
+        CountMeshEdgeTopology(
+            candidateTriangles,
+            out int boundaryEdgesAfter,
+            out int nonManifoldEdgesAfter);
+        LastRecoveredPendingBoundaryEdgesAfter = boundaryEdgesAfter;
+        LastRecoveredPendingNonManifoldEdgesAfter = nonManifoldEdgesAfter;
+    }
+
+    private bool CellHasSafeRawZeroCrossForRetention(
+        int cellX,
+        int cellY,
+        int cellZ,
+        out int supportedCorners)
+    {
+        supportedCorners = 0;
+        if (_tsdf == null || _weights == null ||
+            cellX < 0 || cellY < 0 || cellZ < 0 ||
+            cellX >= _dimX - 1 || cellY >= _dimY - 1 || cellZ >= _dimZ - 1)
+        {
+            return false;
+        }
+        bool positive = false;
+        bool negative = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(
+                cellX + CornerOffsetX[corner],
+                cellY + CornerOffsetY[corner],
+                cellZ + CornerOffsetZ[corner]);
+            float value = _tsdf[index];
+            if (float.IsNaN(value) || float.IsInfinity(value) || VoxelIsDirtyQuarantined(index))
+                return false;
+            if (_weights[index] < minSurfaceCornerWeight)
+                continue;
+            supportedCorners++;
+            positive |= value > 0f;
+            negative |= value < 0f;
+        }
+        return supportedCorners >= Mathf.Clamp(minRecoveredPendingObservedCorners, 4, 8) && positive && negative;
+    }
+
+    private Dictionary<Vector3Int, List<int>> BuildVertexWeldBins(List<Vector3> vertices, float tolerance)
+    {
+        Dictionary<Vector3Int, List<int>> bins = new Dictionary<Vector3Int, List<int>>(vertices.Count);
+        for (int i = 0; i < vertices.Count; i++)
+            AddVertexToWeldBin(bins, VertexWeldBin(vertices[i], tolerance), i);
+        return bins;
+    }
+
+    private int FindOrAddRetainedWeldedVertex(
+        int oldIndex,
+        Vector3[] oldVertices,
+        Color[] oldColors,
+        List<Vector3> vertices,
+        List<Color> colors,
+        Dictionary<int, int> oldVertexRemap,
+        Dictionary<Vector3Int, List<int>> weldBins,
+        float tolerance)
+    {
+        if (oldVertexRemap.TryGetValue(oldIndex, out int remapped))
+            return remapped;
+
+        Vector3 point = oldVertices[oldIndex];
+        Vector3Int centerBin = VertexWeldBin(point, tolerance);
+        float maxDistanceSq = tolerance * tolerance;
+        float bestDistanceSq = maxDistanceSq;
+        int best = -1;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            Vector3Int key = new Vector3Int(centerBin.x + dx, centerBin.y + dy, centerBin.z + dz);
+            if (!weldBins.TryGetValue(key, out List<int> candidates))
+                continue;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                int candidate = candidates[i];
+                float distanceSq = (vertices[candidate] - point).sqrMagnitude;
+                if (distanceSq <= bestDistanceSq)
+                {
+                    bestDistanceSq = distanceSq;
+                    best = candidate;
+                }
+            }
+        }
+
+        if (best >= 0)
+        {
+            oldVertexRemap[oldIndex] = best;
+            LastRecoveredPendingWeldedVertexCount++;
+            return best;
+        }
+        if (vertices.Count >= maxSurfaceVertices)
+            return -1;
+
+        int added = vertices.Count;
+        vertices.Add(point);
+        colors.Add(oldColors != null && oldColors.Length == oldVertices.Length
+            ? oldColors[oldIndex]
+            : cleanCoverCellColor);
+        oldVertexRemap[oldIndex] = added;
+        AddVertexToWeldBin(weldBins, centerBin, added);
+        LastRecoveredPendingAddedVertexCount++;
+        return added;
+    }
+
+    private static Vector3Int VertexWeldBin(Vector3 point, float tolerance)
+    {
+        float inverse = 1f / Mathf.Max(0.00001f, tolerance);
+        return new Vector3Int(
+            Mathf.FloorToInt(point.x * inverse),
+            Mathf.FloorToInt(point.y * inverse),
+            Mathf.FloorToInt(point.z * inverse));
+    }
+
+    private static void AddVertexToWeldBin(Dictionary<Vector3Int, List<int>> bins, Vector3Int key, int vertexIndex)
+    {
+        if (!bins.TryGetValue(key, out List<int> indices))
+        {
+            indices = new List<int>(2);
+            bins[key] = indices;
+        }
+        indices.Add(vertexIndex);
+    }
+
+    private void CountMeshEdgeTopology(List<int> triangles, out int boundaryEdges, out int nonManifoldEdges)
+    {
+        Dictionary<ulong, int> edgeUse = BuildMeshEdgeUseCounts(triangles);
+        boundaryEdges = 0;
+        nonManifoldEdges = 0;
+        int boundaryUseLimit = doubleSidedTriangles ? 2 : 1;
+        int manifoldUseLimit = doubleSidedTriangles ? 4 : 2;
+        foreach (int count in edgeUse.Values)
+        {
+            if (count <= boundaryUseLimit)
+                boundaryEdges++;
+            else if (count > manifoldUseLimit)
+                nonManifoldEdges++;
+        }
+    }
+
+    private static Dictionary<ulong, int> BuildMeshEdgeUseCounts(List<int> triangles)
+    {
+        Dictionary<ulong, int> edgeUse = new Dictionary<ulong, int>(triangles.Count);
+        for (int i = 0; i + 2 < triangles.Count; i += 3)
+        {
+            int a = triangles[i];
+            int b = triangles[i + 1];
+            int c = triangles[i + 2];
+            if (a == b || b == c || c == a)
+                continue;
+            AddEdgeUse(edgeUse, a, b);
+            AddEdgeUse(edgeUse, b, c);
+            AddEdgeUse(edgeUse, c, a);
+        }
+        return edgeUse;
+    }
+
+    private static HashSet<Vector3Int> BuildOrientedTriangleKeys(List<int> triangles)
+    {
+        HashSet<Vector3Int> keys = new HashSet<Vector3Int>();
+        for (int i = 0; i + 2 < triangles.Count; i += 3)
+        {
+            int a = triangles[i];
+            int b = triangles[i + 1];
+            int c = triangles[i + 2];
+            if (a != b && b != c && c != a)
+                keys.Add(OrientedTriangleKey(a, b, c));
+        }
+        return keys;
+    }
+
+    private static Vector3Int OrientedTriangleKey(int a, int b, int c)
+    {
+        if (a <= b && a <= c)
+            return new Vector3Int(a, b, c);
+        if (b <= a && b <= c)
+            return new Vector3Int(b, c, a);
+        return new Vector3Int(c, a, b);
+    }
+
+    private bool TryWorldPointToSurfaceCell(Vector3 point, out Vector3Int cell)
+    {
+        float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+        Vector3 local = (point - _volumeOriginWorld) / voxel - Vector3.one * 0.5f;
+        cell = new Vector3Int(
+            Mathf.FloorToInt(local.x),
+            Mathf.FloorToInt(local.y),
+            Mathf.FloorToInt(local.z));
+        return cell.x >= 0 && cell.y >= 0 && cell.z >= 0 &&
+               cell.x < _dimX - 1 && cell.y < _dimY - 1 && cell.z < _dimZ - 1;
+    }
+
+    private static bool CellOrNeighborIsProtected(
+        Vector3Int cell,
+        HashSet<Vector3Int> protectedCells,
+        int radius)
+    {
+        for (int dz = -radius; dz <= radius; dz++)
+        for (int dy = -radius; dy <= radius; dy++)
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            if (protectedCells.Contains(new Vector3Int(cell.x + dx, cell.y + dy, cell.z + dz)))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool TriangleIndicesAreValid(int a, int b, int c, int vertexCount)
+    {
+        return a >= 0 && b >= 0 && c >= 0 && a < vertexCount && b < vertexCount && c < vertexCount;
+    }
+
     private int AbsorbNewBlocksFromHeldCandidate(
         List<Vector3> candidateVertices,
         List<int> candidateTriangles,
@@ -2588,6 +3769,32 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         EnsureObjects();
         BeginConfidenceAuditCapture();
 
+        bool fixedFrameBatch = useFixedIntegratedFrameBatch;
+        int targetFrames = fixedFrameBatch
+            ? Mathf.Max(1, targetIntegratedFramesPerTrigger)
+            : Mathf.Max(1, maxFusionFramesPerTrigger);
+        int maxConsumedFrames = Mathf.Max(targetFrames, maxRawFramesConsumedPerBatch);
+        int maxTimeouts = Mathf.Max(1, maxConsecutiveRawFrameTimeouts);
+        _activeCaptureBatchTargetFrames = targetFrames;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
+        LastCaptureBatchTargetFrames = targetFrames;
+        LastCaptureBatchIntegratedFrames = 0;
+        LastCaptureBatchUniqueRawFrames = 0;
+        LastCaptureBatchTimeoutCount = 0;
+        LastCaptureBatchMeshRebuildCount = 0;
+        LastCaptureBatchComplete = false;
+        LastCaptureBatchAtomicProvisionalPromotionCount = 0;
+        LastCaptureBatchStrongProvisionalPromotionCount = 0;
+        LastRebaselineValid = false;
+        LastRebaselineWeightedVoxelCount = 0;
+        LastRebaselineWeight1VoxelCount = 0;
+        LastRebaselineWeight2To3VoxelCount = 0;
+        LastRebaselineWeight4PlusVoxelCount = 0;
+        LastRebaselineNewHoleCellCount = 0;
+        LastRebaselineRecoveredHoleCellCount = 0;
+
         if (rawDepthSource == null)
         {
             Warn("Raw depth source is missing.");
@@ -2599,35 +3806,43 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         rawDepthSource.enabled = true;
         SuppressSourcePreview();
 
-        int lastAcceptedFrame = int.MinValue;
         int integratedFrames = 0;
+        int uniqueRawFrames = 0;
+        int consecutiveTimeouts = 0;
+        HashSet<int> consumedFrameIndices = new HashSet<int>();
         float burstStart = Time.unscaledTime;
         float burstDuration = Mathf.Max(0.05f, fusionBurstDurationSeconds);
-        int maxFrames = Mathf.Max(1, maxFusionFramesPerTrigger);
 
-        while (Time.unscaledTime - burstStart < burstDuration && integratedFrames < maxFrames)
+        while (integratedFrames < targetFrames)
         {
+            if (!fixedFrameBatch && Time.unscaledTime - burstStart >= burstDuration)
+                break;
+            if (fixedFrameBatch && (uniqueRawFrames >= maxConsumedFrames || consecutiveTimeouts >= maxTimeouts))
+                break;
+
             if (forceRawRefreshOnSnapshot && !rawDepthSource.HasPendingReadback)
                 rawDepthSource.RefreshNow(forcePreprocessorRefresh: true);
 
             float frameStart = Time.unscaledTime;
             bool integratedThisFrame = false;
+            bool consumedUniqueFrame = false;
             while (Time.unscaledTime - frameStart < waitForRawFrameTimeoutSeconds)
             {
                 if (!rawDepthSource.HasPendingReadback &&
                     rawDepthSource.TryGetLatestRawDepthFrameSnapshot(out ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot ready) &&
                     ready.worldPositions != null &&
                     ready.worldPositions.Length > 0 &&
-                    ready.frameIndex != lastAcceptedFrame)
+                    consumedFrameIndices.Add(ready.frameIndex))
                 {
+                    consumedUniqueFrame = true;
+                    uniqueRawFrames++;
                     integratedThisFrame = IntegrateSnapshot(ready);
+                    LastCaptureBatchAtomicProvisionalPromotionCount += LastAtomicPromotedProvisionalVoxelCount;
+                    LastCaptureBatchStrongProvisionalPromotionCount += LastStrongCurrentProvisionalPromotedCount;
                     // A fully gated frame is still consumed; do not repeatedly reprocess it.
-                    lastAcceptedFrame = ready.frameIndex;
                     if (integratedThisFrame)
-                    {
                         integratedFrames++;
-                    }
-                    if (integratedThisFrame && rebuildMeshAfterEachCapture && !rebuildMeshAfterFusionBurstOnly)
+                    if (!fixedFrameBatch && integratedThisFrame && rebuildMeshAfterEachCapture && !rebuildMeshAfterFusionBurstOnly)
                         RebuildMesh();
                     break;
                 }
@@ -2635,29 +3850,63 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 yield return null;
             }
 
-            if (!integratedThisFrame)
+            if (consumedUniqueFrame)
+                consecutiveTimeouts = 0;
+            else
+                consecutiveTimeouts++;
+
+            _activeCaptureBatchIntegratedFrames = integratedFrames;
+            _activeCaptureBatchUniqueRawFrames = uniqueRawFrames;
+            _activeCaptureBatchTimeouts = consecutiveTimeouts;
+
+            if (!consumedUniqueFrame || !integratedThisFrame)
                 yield return null;
         }
 
-        if (integratedFrames <= 0)
+        if (!fixedFrameBatch && integratedFrames <= 0)
         {
             bool integratedLatest = IntegrateLatestRawSnapshot();
             if (integratedLatest)
                 integratedFrames = 1;
         }
 
-        if (rebuildMeshAfterEachCapture && (rebuildMeshAfterFusionBurstOnly || integratedFrames <= 0))
+        LastCaptureBatchIntegratedFrames = integratedFrames;
+        LastCaptureBatchUniqueRawFrames = uniqueRawFrames;
+        LastCaptureBatchTimeoutCount = consecutiveTimeouts;
+        LastCaptureBatchComplete = fixedFrameBatch
+            ? integratedFrames >= targetFrames
+            : integratedFrames > 0;
+
+        if (fixedFrameBatch && rebuildMeshAfterEachCapture && integratedFrames > 0)
+        {
             RebuildMesh();
+            LastCaptureBatchMeshRebuildCount = 1;
+        }
+        else if (!fixedFrameBatch && rebuildMeshAfterEachCapture && (rebuildMeshAfterFusionBurstOnly || integratedFrames <= 0))
+        {
+            RebuildMesh();
+            LastCaptureBatchMeshRebuildCount = 1;
+        }
+        UpdateRebaselineDiagnostics();
 
         if (debugLog)
         {
             Debug.Log(
-                $"[ScanCoverTsdfSingleShellPrototype] Fusion trigger complete: integratedFrames={integratedFrames} totalFrames={IntegratedFrameCount} fallbackSamples={_fallbackSurfacePoints.Count} vertices={LastMeshVertexCount} triangles={LastMeshTriangleCount}",
+                $"[ScanCoverTsdfSingleShellPrototype] Capture batch complete={LastCaptureBatchComplete}: integratedFrames={integratedFrames}/{targetFrames} uniqueRawFrames={uniqueRawFrames} timeouts={consecutiveTimeouts} meshRebuilds={LastCaptureBatchMeshRebuildCount} totalFrames={IntegratedFrameCount} fallbackSamples={_fallbackSurfacePoints.Count} vertices={LastMeshVertexCount} triangles={LastMeshTriangleCount}",
                 this);
         }
 
-        EndConfidenceAuditCapture(integratedFrames, integratedFrames > 0 ? "complete" : "no integrated frame");
+        string status = LastCaptureBatchComplete
+            ? "complete"
+            : integratedFrames > 0
+                ? "partial_batch"
+                : "no_integrated_frame";
+        EndConfidenceAuditCapture(integratedFrames, status);
         _captureRoutine = null;
+        _activeCaptureBatchTargetFrames = 0;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
     }
 
     private bool IntegrateSnapshot(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
@@ -2775,13 +4024,56 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 {
                     observationVote = ObservationVoteState.Pending;
                     LastAtomicAcceptDuplicateDowngradeCount++;
-                    SetObservationVote(
-                        ObservationVoteState.Pending,
-                        _auditVoteScore,
-                        string.IsNullOrEmpty(_auditVoteReasons)
-                            ? "duplicate_layer_guard"
-                            : _auditVoteReasons + "+duplicate_layer_guard",
-                        true);
+                    DowngradeCurrentObservationVoteToPending("duplicate_layer_guard");
+                }
+                if (observationVote == ObservationVoteState.Accept && gateFormalAcceptByStableSignCompatibility)
+                {
+                    ShadowAcceptCompatibilityInfo compatibility = ClassifyFormalAcceptCompatibility(
+                        cameraPosition, point, normal, halfBandSteps);
+                    LastFormalAcceptCompatibilityCheckedCount++;
+                    if (compatibility.CriticalConflictVoxels > 0)
+                        LastFormalAcceptCompatibilityCriticalConflictCount++;
+                    switch (compatibility.Compatibility)
+                    {
+                        case ShadowAcceptCompatibility.Aligned:
+                            LastFormalAcceptCompatibilityAlignedCount++;
+                            break;
+                        case ShadowAcceptCompatibility.NewSpace:
+                            LastFormalAcceptCompatibilityNewSpaceCount++;
+                            break;
+                        case ShadowAcceptCompatibility.Mixed:
+                            if (compatibility.ConflictRatio > Mathf.Clamp(formalAcceptMixedConflictPendingThreshold, 0.5f, 0.9f))
+                            {
+                                observationVote = ObservationVoteState.Pending;
+                                LastFormalAcceptCompatibilityMixedDowngradedCount++;
+                                DowngradeCurrentObservationVoteToPending("formal_accept_mixed_conflict_gate");
+                                break;
+                            }
+                            if (gateFormalMixedBySequentialTopology)
+                            {
+                                LastFormalMixedTopologyCheckedCount++;
+                                if (WouldFormalMixedObservationDestroyZeroCross(
+                                        cameraPosition, point, normal, sampleWeight, halfBandSteps,
+                                        out int destroyedZeroCells))
+                                {
+                                    observationVote = ObservationVoteState.Pending;
+                                    LastFormalMixedTopologyDowngradedCount++;
+                                    LastFormalMixedTopologyProtectedZeroCrossCellCount += destroyedZeroCells;
+                                    DowngradeCurrentObservationVoteToPending("formal_accept_mixed_topology_gate");
+                                    break;
+                                }
+                            }
+                            if (compatibility.ConflictRatio <= 0.25f)
+                                LastFormalAcceptCompatibilityMixedLowCount++;
+                            else
+                                LastFormalAcceptCompatibilityMixedObserveCount++;
+                            break;
+                        case ShadowAcceptCompatibility.Conflict:
+                            observationVote = ObservationVoteState.Pending;
+                            LastFormalAcceptCompatibilityConflictDowngradedCount++;
+                            DowngradeCurrentObservationVoteToPending("formal_accept_sign_conflict_gate");
+                            break;
+                    }
                 }
                 MarkSurfaceObservationState(point, observationVote == ObservationVoteState.Accept ? (byte)3 : observationVote == ObservationVoteState.Pending ? (byte)2 : (byte)4);
                 if (observationVote == ObservationVoteState.Accept)
@@ -2789,6 +4081,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (observationVote == ObservationVoteState.Reject &&
                     (useAtomicObservationTsdfBands || enforceObservationWriteGate || observationVoteMode == ObservationVoteMode.RejectOnly))
                 {
+                    RecordShadowBlockObservation(cameraPosition, point, normal, sampleWeight, halfBandSteps, observationVote, false);
                     MarkRejectedObservationBand(cameraPosition, point, normal, halfBandSteps);
                     TryMetabolizeOldCleanTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps);
                     RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
@@ -2861,9 +4154,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 _activeAtomicBandWrite = useAtomicObservationTsdfBands;
                 _activeAtomicBandVote = observationVote;
                 _activeSurfaceObservationState = observationVote == ObservationVoteState.Accept ? (byte)3 : (byte)2;
+                bool allowClearingRay = observationVote == ObservationVoteState.Accept && ShouldCarveFreeSpaceAtPixel(x, y, stride);
+                RecordShadowBlockObservation(cameraPosition, point, normal, sampleWeight, halfBandSteps, observationVote, allowClearingRay);
                 try
                 {
-                    bool allowClearingRay = observationVote == ObservationVoteState.Accept && ShouldCarveFreeSpaceAtPixel(x, y, stride);
                     touchedDenseTsdf = useProjectiveTsdfIntegration
                         ? IntegrateProjectiveTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps, allowClearingRay)
                         : IntegrateNormalTsdfBand(point, normal, sampleWeight, halfBandSteps);
@@ -2950,6 +4244,73 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _lastLayerDuplicateRayCount = 0;
         _lastLayerAmbiguousRayCount = 0;
         _lastHoleDiagnosticRowCount = 0;
+        LastShadowReplayEvaluatedCount = 0;
+        LastShadowReplayImprovedCount = 0;
+        LastShadowReplayRegressedCount = 0;
+        LastShadowReplayAcceptOnlyImprovedCount = 0;
+        LastShadowReplayAcceptOnlyRegressedCount = 0;
+        LastShadowReplayClearOnlyImprovedCount = 0;
+        LastShadowReplayClearOnlyRegressedCount = 0;
+        LastShadowReplayFullImprovedCount = 0;
+        LastShadowReplayFullRegressedCount = 0;
+        LastShadowReplayAlignedImprovedCount = 0;
+        LastShadowReplayAlignedRegressedCount = 0;
+        LastShadowReplayMixedImprovedCount = 0;
+        LastShadowReplayMixedRegressedCount = 0;
+        LastShadowReplayConflictImprovedCount = 0;
+        LastShadowReplayConflictRegressedCount = 0;
+        LastShadowReplayNewSpaceImprovedCount = 0;
+        LastShadowReplayNewSpaceRegressedCount = 0;
+        LastShadowReplayAlignedObservationCount = 0;
+        LastShadowReplayMixedObservationCount = 0;
+        LastShadowReplayConflictObservationCount = 0;
+        LastShadowReplayNewSpaceObservationCount = 0;
+        LastShadowReplayMixedConflict0To25ObservationCount = 0;
+        LastShadowReplayMixedConflict0To25ImprovedCount = 0;
+        LastShadowReplayMixedConflict0To25RegressedCount = 0;
+        LastShadowReplayMixedConflict25To50ObservationCount = 0;
+        LastShadowReplayMixedConflict25To50ImprovedCount = 0;
+        LastShadowReplayMixedConflict25To50RegressedCount = 0;
+        LastShadowReplayMixedConflict50To75ObservationCount = 0;
+        LastShadowReplayMixedConflict50To75ImprovedCount = 0;
+        LastShadowReplayMixedConflict50To75RegressedCount = 0;
+        LastShadowReplayMixedConflict75To100ObservationCount = 0;
+        LastShadowReplayMixedConflict75To100ImprovedCount = 0;
+        LastShadowReplayMixedConflict75To100RegressedCount = 0;
+        LastShadowReplayMixedDestructiveObservationCount = 0;
+        LastShadowReplayMixedDestructiveImprovedCount = 0;
+        LastShadowReplayMixedDestructiveRegressedCount = 0;
+        LastShadowReplayMixedConstructiveObservationCount = 0;
+        LastShadowReplayMixedConstructiveImprovedCount = 0;
+        LastShadowReplayMixedConstructiveRegressedCount = 0;
+        LastShadowReplayMixedNeutralObservationCount = 0;
+        LastShadowReplayMixedNeutralImprovedCount = 0;
+        LastShadowReplayMixedNeutralRegressedCount = 0;
+        LastShadowReplayMixedDestroyedZeroCrossCellCount = 0;
+        LastShadowReplayMixedCreatedZeroCrossCellCount = 0;
+        LastShadowReplayClearDestructiveVoxelCount = 0;
+        LastShadowReplayClearDestructiveImprovedCount = 0;
+        LastShadowReplayClearDestructiveRegressedCount = 0;
+        LastShadowReplayClearConstructiveVoxelCount = 0;
+        LastShadowReplayClearConstructiveImprovedCount = 0;
+        LastShadowReplayClearConstructiveRegressedCount = 0;
+        LastShadowReplayClearNeutralVoxelCount = 0;
+        LastShadowReplayClearNeutralImprovedCount = 0;
+        LastShadowReplayClearNeutralRegressedCount = 0;
+        LastShadowReplayClearDestroyedZeroCrossCellCount = 0;
+        LastShadowReplayClearCreatedZeroCrossCellCount = 0;
+        LastShadowReplayMixedVoxelVetoObservationCount = 0;
+        LastShadowReplayMixedVoxelVetoBlockedVoxelCount = 0;
+        LastShadowReplayMixedVoxelVetoAvoidedDestroyedCellCount = 0;
+        LastShadowReplayMixedVoxelVetoImprovedCount = 0;
+        LastShadowReplayMixedVoxelVetoRegressedCount = 0;
+        LastShadowReplayMixedObsPendingAcceptedCount = 0;
+        LastShadowReplayMixedObsPendingDowngradedCount = 0;
+        LastShadowReplayMixedObsPendingAvoidedDestroyedCellCount = 0;
+        LastShadowReplayMixedObsPendingImprovedCount = 0;
+        LastShadowReplayMixedObsPendingRegressedCount = 0;
+        _shadowReplayRows = new StringBuilder(4096);
+        _shadowReplayRows.AppendLine("capture,export_frame,replay_mode,block_x,block_y,block_z,observations,accept,selected_accept,pending,reject,clearing,selected_clear_voxels,current_supported,current_zero,current_one_sided,current_unknown,shadow_supported,shadow_zero,shadow_one_sided,shadow_unknown,shadow_pending_voxels,improved,regressed,topology_destroyed_zero_cells,topology_created_zero_cells,strategy_blocked_voxels,strategy_downgraded_observations");
     }
 
     private void EndSurfaceProfileDiagnostics(int integratedFrames, string status)
@@ -2964,24 +4325,172 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             string timestamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", AuditCulture);
             string stem = $"surface_profile_{timestamp}_{_surfaceDiagnosticCaptureIndex:D3}";
             string holePath = Path.Combine(directory, stem + "_holes.csv");
+            string holeLifecyclePath = Path.Combine(directory, stem + "_hole_cell_lifecycle.csv");
             string rayPath = Path.Combine(directory, stem + "_rays.csv");
             string layerPath = Path.Combine(directory, stem + "_layers.csv");
             string pairPath = Path.Combine(directory, stem + "_layer_pairs.csv");
+            string shadowPath = Path.Combine(directory, stem + "_shadow_blocks.csv");
+            string quadTopologyPath = Path.Combine(directory, stem + "_quad_topology.csv");
+            string quadHeldEvidencePath = Path.Combine(directory, stem + "_quad_shadow_held_evidence.csv");
+            string newbornPholdCompetitionPath = Path.Combine(directory, stem + "_newborn_phold_competition.csv");
+            string newbornPholdProbationPath = Path.Combine(directory, stem + "_newborn_phold_probation.csv");
             string summaryPath = Path.Combine(directory, stem + "_summary.txt");
 
             StringBuilder holes = BuildHoleProfileCsv();
+            StringBuilder holeLifecycle = BuildHoleCellLifecycleCsv();
             BuildLayerProfileCsv(out StringBuilder rays, out StringBuilder layers, out StringBuilder pairs);
             File.WriteAllText(holePath, holes.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(holeLifecyclePath, holeLifecycle.ToString(), new UTF8Encoding(false));
             File.WriteAllText(rayPath, rays.ToString(), new UTF8Encoding(false));
             File.WriteAllText(layerPath, layers.ToString(), new UTF8Encoding(false));
             File.WriteAllText(pairPath, pairs.ToString(), new UTF8Encoding(false));
+            File.WriteAllText(shadowPath, _shadowReplayRows != null ? _shadowReplayRows.ToString() : string.Empty, new UTF8Encoding(false));
+            File.WriteAllText(quadTopologyPath, BuildStableQuadTopologyAuditCsv().ToString(), new UTF8Encoding(false));
+            File.WriteAllText(quadHeldEvidencePath, BuildStableQuadHeldEvidenceCsv().ToString(), new UTF8Encoding(false));
+            File.WriteAllText(newbornPholdCompetitionPath, BuildNewbornPholdCompetitionCsv().ToString(), new UTF8Encoding(false));
+            File.WriteAllText(newbornPholdProbationPath, BuildNewbornPholdProbationCsv().ToString(), new UTF8Encoding(false));
 
             StringBuilder summary = new StringBuilder(512);
             summary.AppendLine("ScanCover TSDF surface profile");
             summary.AppendLine("status=" + status);
             summary.AppendLine("capture=" + _surfaceDiagnosticCaptureIndex);
             summary.AppendLine("integrated_frames=" + integratedFrames);
+            AppendCaptureBatchSummary(summary);
             summary.AppendLine("hole_rows=" + _lastHoleDiagnosticRowCount);
+            summary.AppendLine("hole_lifecycle_cells=" + _holeCellLifecycles.Count);
+            summary.AppendLine("hole_lifecycle_active=" + CountActiveHoleCellLifecycles());
+            summary.AppendLine("hole_lifecycle_recovered=" + CountRecoveredHoleCellLifecycles());
+            summary.AppendLine("stable_quad_audit_compare_only=1");
+            summary.AppendLine("stable_quad_audit_double_sided_render=" + (doubleSidedTriangles ? 1 : 0));
+            summary.AppendLine("stable_quad_audit_unique_quads=" + LastStableQuadAuditUniqueCount);
+            summary.AppendLine("stable_quad_audit_duplicate_keys=" + LastStableQuadAuditDuplicateKeyCount);
+            summary.AppendLine("stable_quad_audit_reverse_winding_duplicates=" + LastStableQuadAuditReverseWindingDuplicateCount);
+            summary.AppendLine("stable_quad_audit_logical_edges=" + LastStableQuadAuditLogicalEdgeCount);
+            summary.AppendLine("stable_quad_audit_boundary_edges=" + LastStableQuadAuditBoundaryEdgeCount);
+            summary.AppendLine("stable_quad_audit_manifold_edges=" + LastStableQuadAuditManifoldEdgeCount);
+            summary.AppendLine("stable_quad_audit_conflict_edges_gt2=" + LastStableQuadAuditConflictEdgeCount);
+            summary.AppendLine("stable_quad_audit_competing_layer_edges=" + LastStableQuadAuditCompetingLayerEdgeCount);
+            summary.AppendLine("stable_quad_audit_max_quads_per_edge=" + LastStableQuadAuditMaxQuadsPerEdge);
+            summary.AppendLine("stable_quad_audit_double_sided_false_positive_edges=" + LastStableQuadAuditDoubleSidedFalsePositiveEdgeCount);
+            summary.AppendLine("stable_quad_audit_persisted=" + LastStableQuadAuditPersistedCount);
+            summary.AppendLine("stable_quad_audit_added=" + LastStableQuadAuditAddedCount);
+            summary.AppendLine("stable_quad_audit_removed=" + LastStableQuadAuditRemovedCount);
+            summary.AppendLine("stable_quad_audit_winding_changed=" + LastStableQuadAuditWindingChangedCount);
+            summary.AppendLine("stable_quad_shadow_compare_only=1");
+            summary.AppendLine("stable_quad_shadow_promote_rebuilds=" + Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6));
+            summary.AppendLine("stable_quad_shadow_retain_missing_rebuilds=" + Mathf.Clamp(stableQuadShadowRetainMissingRebuilds, 1, 6));
+            summary.AppendLine("stable_quad_shadow_candidates=" + LastStableQuadShadowCandidateCount);
+            summary.AppendLine("stable_quad_shadow_committed=" + LastStableQuadShadowCommittedCount);
+            summary.AppendLine("stable_quad_shadow_promoted=" + LastStableQuadShadowPromotedCount);
+            summary.AppendLine("stable_quad_shadow_held_missing=" + LastStableQuadShadowHeldMissingCount);
+            summary.AppendLine("stable_quad_shadow_retired=" + LastStableQuadShadowRetiredCount);
+            summary.AppendLine("stable_quad_shadow_winding_conflicts=" + LastStableQuadShadowWindingConflictCount);
+            summary.AppendLine("stable_quad_shadow_conflict_edges_resolved=" + LastStableQuadShadowConflictResolvedEdgeCount);
+            summary.AppendLine("stable_quad_shadow_conflict_quads_blocked=" + LastStableQuadShadowConflictBlockedQuadCount);
+            summary.AppendLine("stable_quad_shadow_output_quads=" + LastStableQuadShadowOutputQuadCount);
+            summary.AppendLine("stable_quad_held_safe=" + LastStableQuadHeldSafeCount);
+            summary.AppendLine("stable_quad_held_uncertain=" + LastStableQuadHeldUncertainCount);
+            summary.AppendLine("stable_quad_held_contradicted=" + LastStableQuadHeldContradictedCount);
+            summary.AppendLine("stable_quad_held_type_provisional_not_promoted=" + LastStableQuadHeldTypeProvisionalNotPromotedCount);
+            summary.AppendLine("stable_quad_held_type_near_zero_jitter=" + LastStableQuadHeldTypeNearZeroJitterCount);
+            summary.AppendLine("stable_quad_held_type_confirmed_contradiction=" + LastStableQuadHeldTypeConfirmedContradictionCount);
+            summary.AppendLine("stable_quad_held_type_clean_assembly_loss=" + LastStableQuadHeldTypeCleanAssemblyLossCount);
+            summary.AppendLine("stable_quad_held_type_other_unsettled=" + LastStableQuadHeldTypeOtherUnsettledCount);
+            summary.AppendLine("stable_quad_held_dominant_type=" + GetStableQuadHeldDominantType());
+            summary.AppendLine("stable_quad_held_contradiction_min_abs_tsdf=" + stableQuadHeldContradictionMinAbsTsdf.ToString(AuditCulture));
+            summary.AppendLine("atomic_provisional_mature_backing_preserve_enabled=" + (preserveMatureCleanBackingUnderAtomicProvisional ? 1 : 0));
+            summary.AppendLine("atomic_provisional_mature_backing_min_weight=" + Mathf.Max(minSurfaceCornerWeight, minAtomicProvisionalMatureBackingWeight));
+            summary.AppendLine("atomic_provisional_mature_backing_preserved=" + LastAtomicProvisionalMatureBackingPreservedCount);
+            summary.AppendLine("atomic_provisional_mature_backing_weak_blocked=" + LastAtomicProvisionalMatureBackingWeakBlockedCount);
+            summary.AppendLine("atomic_provisional_non_atomic_blocked=" + LastAtomicProvisionalNonAtomicBlockedCount);
+            summary.AppendLine("atomic_provisional_backing_provenance_blocked=" + LastAtomicProvisionalBackingProvenanceBlockedCount);
+            summary.AppendLine("atomic_provisional_backing_restored_cells=" + LastAtomicProvisionalBackingRestoredCellCount);
+            summary.AppendLine("atomic_provisional_backing_restored_quads=" + LastAtomicProvisionalBackingRestoredQuadCount);
+            summary.AppendLine("atomic_provisional_backing_restored_boundary_edges=" + LastAtomicProvisionalBackingRestoredBoundaryEdgeCount);
+            summary.AppendLine("atomic_provisional_backing_restored_conflict_edges=" + LastAtomicProvisionalBackingRestoredConflictEdgeCount);
+            summary.AppendLine("atomic_provisional_backing_plane_anchor_allowed=" + LastAtomicProvisionalBackingPlaneAnchorAllowedCount);
+            summary.AppendLine("atomic_restored_arbitration_enabled=" +
+                ((arbitrateAllNewbornLayerConflicts || arbitrateRestoredAtomicBackingLayerConflicts) ? 1 : 0));
+            summary.AppendLine("atomic_restored_arbitration_candidates=" + LastAtomicRestoredArbitrationCandidateCount);
+            summary.AppendLine("atomic_restored_arbitration_accepted=" + LastAtomicRestoredArbitrationAcceptedCount);
+            summary.AppendLine("atomic_restored_arbitration_blocked_layer=" + LastAtomicRestoredArbitrationBlockedLayerCount);
+            summary.AppendLine("atomic_restored_arbitration_blocked_topology=" + LastAtomicRestoredArbitrationBlockedTopologyCount);
+            summary.AppendLine("atomic_restored_arbitration_blocked_winding=" + LastAtomicRestoredArbitrationBlockedWindingCount);
+            summary.AppendLine("atomic_restored_arbitration_reconcile_delta=" +
+                (LastAtomicRestoredArbitrationCandidateCount -
+                 LastAtomicRestoredArbitrationAcceptedCount -
+                 LastAtomicRestoredArbitrationBlockedLayerCount -
+                 LastAtomicRestoredArbitrationBlockedTopologyCount -
+                 LastAtomicRestoredArbitrationBlockedWindingCount));
+            summary.AppendLine("newborn_arbitration_enabled=" + (arbitrateAllNewbornLayerConflicts ? 1 : 0));
+            summary.AppendLine("newborn_arbitration_persisted_first=" + LastNewbornArbitrationPersistedFirstCount);
+            summary.AppendLine("newborn_arbitration_candidates=" + LastNewbornArbitrationCandidateCount);
+            summary.AppendLine("newborn_arbitration_accepted=" + LastNewbornArbitrationAcceptedCount);
+            summary.AppendLine("newborn_arbitration_blocked_layer=" + LastNewbornArbitrationBlockedLayerCount);
+            summary.AppendLine("newborn_arbitration_blocked_topology=" + LastNewbornArbitrationBlockedTopologyCount);
+            summary.AppendLine("newborn_arbitration_blocked_winding=" + LastNewbornArbitrationBlockedWindingCount);
+            summary.AppendLine("newborn_arbitration_reconcile_delta=" +
+                (LastNewbornArbitrationCandidateCount -
+                 LastNewbornArbitrationAcceptedCount -
+                 LastNewbornArbitrationBlockedLayerCount -
+                 LastNewbornArbitrationBlockedTopologyCount -
+                 LastNewbornArbitrationBlockedWindingCount));
+            summary.AppendLine("provisional_held_retention_enabled=" + (retainMatureProvisionalHeldFaces ? 1 : 0));
+            summary.AppendLine("provisional_held_retention_scanned=" + LastProvisionalHeldRetentionScannedCount);
+            summary.AppendLine("provisional_held_retention_candidates=" + LastProvisionalHeldRetentionCandidateCount);
+            summary.AppendLine("provisional_held_retention_accepted=" + LastProvisionalHeldRetentionAcceptedCount);
+            summary.AppendLine("provisional_held_retention_blocked_maturity=" + LastProvisionalHeldRetentionBlockedMaturityCount);
+            summary.AppendLine("provisional_held_retention_blocked_expired=" + LastProvisionalHeldRetentionBlockedExpiredCount);
+            summary.AppendLine("provisional_held_retention_blocked_correction=" + LastProvisionalHeldRetentionBlockedCorrectionCount);
+            summary.AppendLine("provisional_held_retention_blocked_contradiction=" + LastProvisionalHeldRetentionBlockedContradictionCount);
+            summary.AppendLine("provisional_held_retention_blocked_geometry=" + LastProvisionalHeldRetentionBlockedGeometryCount);
+            summary.AppendLine("provisional_held_retention_blocked_layer=" + LastProvisionalHeldRetentionBlockedLayerCount);
+            summary.AppendLine("provisional_held_retention_blocked_topology=" + LastProvisionalHeldRetentionBlockedTopologyCount);
+            summary.AppendLine("provisional_held_retention_blocked_winding=" + LastProvisionalHeldRetentionBlockedWindingCount);
+            summary.AppendLine("provisional_held_retention_boundary_edges=" + LastProvisionalHeldRetentionBoundaryEdgeCount);
+            summary.AppendLine("provisional_held_retention_conflict_edges=" + LastProvisionalHeldRetentionConflictEdgeCount);
+            summary.AppendLine("provisional_held_retention_candidate_reconcile_delta=" +
+                (LastProvisionalHeldRetentionCandidateCount -
+                 LastProvisionalHeldRetentionAcceptedCount -
+                 LastProvisionalHeldRetentionBlockedLayerCount -
+                 LastProvisionalHeldRetentionBlockedTopologyCount -
+                 LastProvisionalHeldRetentionBlockedWindingCount));
+            summary.AppendLine("newborn_phold_competition_blocked_newborns=" + LastNewbornPholdCompetitionBlockedNewbornCount);
+            summary.AppendLine("newborn_phold_competition_pairs=" + LastNewbornPholdCompetitionPairCount);
+            summary.AppendLine("newborn_phold_competition_fully_resolvable=" + LastNewbornPholdCompetitionFullyResolvableCount);
+            summary.AppendLine("newborn_phold_competition_newborn_preferred=" + LastNewbornPholdCompetitionNewbornPreferredCount);
+            summary.AppendLine("newborn_phold_competition_phold_preferred=" + LastNewbornPholdCompetitionPholdPreferredCount);
+            summary.AppendLine("newborn_phold_competition_ambiguous=" + LastNewbornPholdCompetitionAmbiguousCount);
+            summary.AppendLine("newborn_phold_competition_reconcile_delta=" +
+                (LastNewbornPholdCompetitionBlockedNewbornCount -
+                 LastNewbornPholdCompetitionNewbornPreferredCount -
+                 LastNewbornPholdCompetitionPholdPreferredCount -
+                 LastNewbornPholdCompetitionAmbiguousCount));
+            summary.AppendLine("newborn_phold_replacement_confirm_rebuilds=" + Mathf.Clamp(newbornPholdPreferredConfirmRebuilds, 2, 4));
+            summary.AppendLine("newborn_phold_replacement_pending=" + LastNewbornPholdReplacementPendingCount);
+            summary.AppendLine("newborn_phold_replacement_applied=" + LastNewbornPholdReplacementAppliedCount);
+            summary.AppendLine("newborn_phold_replacement_removed_phold=" + LastNewbornPholdReplacementRemovedPholdCount);
+            summary.AppendLine("newborn_phold_replacement_rollback=" + LastNewbornPholdReplacementRollbackCount);
+            summary.AppendLine("provisional_held_retention_replaced=" + LastProvisionalHeldRetentionReplacedCount);
+            summary.AppendLine("provisional_held_retention_final=" +
+                Mathf.Max(0, LastProvisionalHeldRetentionAcceptedCount - LastProvisionalHeldRetentionReplacedCount));
+            summary.AppendLine("newborn_phold_probation_enabled=" + (enableNewbornPholdReplacementProbation ? 1 : 0));
+            summary.AppendLine("newborn_phold_probation_pending=" + LastNewbornPholdProbationPendingCount);
+            summary.AppendLine("newborn_phold_probation_confirmed=" + LastNewbornPholdProbationConfirmedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_transactions=" + LastNewbornPholdProbationRollbackTransactionCount);
+            summary.AppendLine("newborn_phold_probation_rollback_candidates=" + LastNewbornPholdProbationRollbackCandidateCount);
+            summary.AppendLine("newborn_phold_probation_rollback_accepted=" + LastNewbornPholdProbationRollbackAcceptedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_blocked_contradiction=" + LastNewbornPholdProbationRollbackContradictionBlockedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_blocked_geometry=" + LastNewbornPholdProbationRollbackGeometryBlockedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_blocked_layer=" + LastNewbornPholdProbationRollbackLayerBlockedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_blocked_topology=" + LastNewbornPholdProbationRollbackTopologyBlockedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_blocked_winding=" + LastNewbornPholdProbationRollbackWindingBlockedCount);
+            summary.AppendLine("newborn_phold_probation_rollback_candidate_reconcile_delta=" +
+                (LastNewbornPholdProbationRollbackCandidateCount -
+                 LastNewbornPholdProbationRollbackAcceptedCount -
+                 LastNewbornPholdProbationRollbackLayerBlockedCount -
+                 LastNewbornPholdProbationRollbackTopologyBlockedCount -
+                 LastNewbornPholdProbationRollbackWindingBlockedCount));
             summary.AppendLine("ray_no_zero=" + _lastLayerNoZeroRayCount);
             summary.AppendLine("ray_single_zero=" + _lastLayerSingleZeroRayCount);
             summary.AppendLine("ray_multi_zero=" + _lastLayerMultiZeroRayCount);
@@ -3004,6 +4513,75 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("hole_repair_block_dirty=" + LastHoleSideRepairBlockedDirtyCount);
             summary.AppendLine("hole_repair_block_multizero=" + LastHoleSideRepairBlockedMultiZeroCount);
             summary.AppendLine("hole_repair_block_plane=" + LastHoleSideRepairBlockedPlaneCount);
+            summary.AppendLine("hole_repair_block_plane_anchor_count=" + LastHoleSideRepairBlockedPlaneAnchorCount);
+            summary.AppendLine("hole_repair_block_plane_degenerate_normal=" + LastHoleSideRepairBlockedPlaneDegenerateNormalCount);
+            summary.AppendLine("hole_repair_block_plane_residual=" + LastHoleSideRepairBlockedPlaneResidualCount);
+            summary.AppendLine("hole_repair_block_plane_candidate_distance=" + LastHoleSideRepairBlockedPlaneCandidateDistanceCount);
+            summary.AppendLine("hole_repair_block_plane_empty_band=" + LastHoleSideRepairBlockedPlaneEmptyBandCount);
+            summary.AppendLine("hole_repair_plane_anchor_radius_voxels=" + Mathf.Clamp(primaryPlaneHoleAnchorRadiusVoxels, 1, 4));
+            summary.AppendLine("hole_repair_plane_anchor_required=" + Mathf.Clamp(minPrimaryPlaneHoleAnchors, 3, 16));
+            summary.AppendLine("hole_repair_plane_anchor_min_weight=" + minSurfaceCornerWeight.ToString(AuditCulture));
+            summary.AppendLine("hole_repair_plane_anchor_min_normal_dot=" + Mathf.Clamp01(minPrimaryPlaneHoleNormalDot).ToString("R", AuditCulture));
+            summary.AppendLine("hole_repair_plane_residual_limit_meters=" + Mathf.Max(0.001f, maxPrimaryPlaneHoleResidualMeters).ToString("R", AuditCulture));
+            summary.AppendLine("hole_repair_plane_candidate_distance_limit_meters=" + Mathf.Max(truncationMeters, maxPrimaryPlaneHoleResidualMeters).ToString("R", AuditCulture));
+            summary.AppendLine("hole_repair_plane_anchor_scanned=" + LastHoleSideRepairPlaneAnchorScannedCount);
+            summary.AppendLine("hole_repair_plane_anchor_accepted=" + LastHoleSideRepairPlaneAnchorAcceptedCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_no_weight=" + LastHoleSideRepairPlaneAnchorRejectedNoWeightCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_dirty_pending=" + LastHoleSideRepairPlaneAnchorRejectedDirtyPendingCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_no_provenance=" + LastHoleSideRepairPlaneAnchorRejectedNoProvenanceCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_operation=" + LastHoleSideRepairPlaneAnchorRejectedOperationCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_geometry=" + LastHoleSideRepairPlaneAnchorRejectedGeometryCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_duplicate=" + LastHoleSideRepairPlaneAnchorRejectedDuplicateCount);
+            summary.AppendLine("hole_repair_plane_anchor_reject_normal=" + LastHoleSideRepairPlaneAnchorRejectedNormalCount);
+            summary.AppendLine("hole_repair_plane_anchor_fail_weighted_0=" + LastHoleSideRepairPlaneAnchorFailWeighted0Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_weighted_1_3=" + LastHoleSideRepairPlaneAnchorFailWeighted1To3Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_weighted_4_plus=" + LastHoleSideRepairPlaneAnchorFailWeighted4PlusCount);
+            summary.AppendLine("hole_repair_plane_anchor_fail_accepted_0=" + LastHoleSideRepairPlaneAnchorFailAccepted0Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_accepted_1=" + LastHoleSideRepairPlaneAnchorFailAccepted1Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_accepted_2=" + LastHoleSideRepairPlaneAnchorFailAccepted2Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_accepted_3=" + LastHoleSideRepairPlaneAnchorFailAccepted3Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_accepted_4_plus=" + LastHoleSideRepairPlaneAnchorFailAccepted4PlusCount);
+            summary.AppendLine("hole_repair_plane_anchor_fail_deficit_1=" + LastHoleSideRepairPlaneAnchorFailDeficit1Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_deficit_2=" + LastHoleSideRepairPlaneAnchorFailDeficit2Count);
+            summary.AppendLine("hole_repair_plane_anchor_fail_deficit_3_plus=" + LastHoleSideRepairPlaneAnchorFailDeficit3PlusCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_no_weight=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestNoWeightCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_dirty_pending=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestDirtyPendingCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_no_provenance=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestNoProvenanceCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_operation=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestOperationCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_geometry=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestGeometryCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_duplicate=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestDuplicateCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_closest_normal=" + LastHoleSideRepairPlaneAnchorDeficit1ClosestNormalCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_dirty_has_quarantined=" + LastHoleSideRepairPlaneAnchorDeficit1DirtyHasQuarantinedCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_dirty_has_pending=" + LastHoleSideRepairPlaneAnchorDeficit1DirtyHasPendingCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_dirty_has_provisional=" + LastHoleSideRepairPlaneAnchorDeficit1DirtyHasProvisionalCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shortfall_0_0p02=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall0To002Count);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shortfall_0p02_0p05=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall002To005Count);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shortfall_0p05_0p1=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall005To01Count);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shortfall_over_0p1=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShortfallOver01Count);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_valid=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShadowValidCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_block_degenerate=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDegenerateCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_block_residual=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedResidualCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_block_distance=" + LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDistanceCount);
+            for (int shortfallBucket = 0; shortfallBucket < PlaneAnchorNormalShortfallLabels.Length; shortfallBucket++)
+            {
+                string shortfallLabel = PlaneAnchorNormalShortfallLabels[shortfallBucket];
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_plane_valid=" + _planeAnchorDeficit1NormalShadowPlaneValidByShortfall[shortfallBucket]);
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_block_band_empty=" + _planeAnchorDeficit1NormalShadowBandEmptyByShortfall[shortfallBucket]);
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_block_target_no_zero=" + _planeAnchorDeficit1NormalShadowTargetNoZeroByShortfall[shortfallBucket]);
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_block_multi_zero=" + _planeAnchorDeficit1NormalShadowMultiZeroByShortfall[shortfallBucket]);
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_block_net_topology=" + _planeAnchorDeficit1NormalShadowNetTopologyByShortfall[shortfallBucket]);
+                summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_" + shortfallLabel + "_safe=" + _planeAnchorDeficit1NormalShadowSafeByShortfall[shortfallBucket]);
+            }
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_safe_created_zero_cells=" + _planeAnchorDeficit1NormalShadowSafeCreatedZeroCellCount);
+            summary.AppendLine("hole_repair_plane_anchor_deficit1_normal_shadow_blocked_destroyed_zero_cells=" + _planeAnchorDeficit1NormalShadowBlockedDestroyedZeroCellCount);
+            summary.AppendLine("hole_repair_plane_residual_over_1_1p25x=" + LastHoleSideRepairPlaneResidualOver1To125Count);
+            summary.AppendLine("hole_repair_plane_residual_over_1p25_1p5x=" + LastHoleSideRepairPlaneResidualOver125To15Count);
+            summary.AppendLine("hole_repair_plane_residual_over_1p5_2x=" + LastHoleSideRepairPlaneResidualOver15To2Count);
+            summary.AppendLine("hole_repair_plane_residual_over_2x=" + LastHoleSideRepairPlaneResidualOver2Count);
+            summary.AppendLine("hole_repair_plane_candidate_distance_over_1_1p25x=" + LastHoleSideRepairPlaneCandidateDistanceOver1To125Count);
+            summary.AppendLine("hole_repair_plane_candidate_distance_over_1p25_1p5x=" + LastHoleSideRepairPlaneCandidateDistanceOver125To15Count);
+            summary.AppendLine("hole_repair_plane_candidate_distance_over_1p5_2x=" + LastHoleSideRepairPlaneCandidateDistanceOver15To2Count);
+            summary.AppendLine("hole_repair_plane_candidate_distance_over_2x=" + LastHoleSideRepairPlaneCandidateDistanceOver2Count);
             summary.AppendLine("hole_repair_plane_band_voxels=" + LastHoleSideRepairPlaneBandVoxelCount);
             summary.AppendLine("hole_repair_plane_confirmed=" + LastHoleSideRepairPlaneConfirmedCount);
             summary.AppendLine("hole_repair_plane_retired=" + LastHoleSideRepairPlaneRetiredCount);
@@ -3018,15 +4596,182 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("hole_repair_plane_distance_1_1p5_vox=" + LastHoleSideRepairPlaneDistance1To15Count);
             summary.AppendLine("hole_repair_plane_distance_1p5_2_vox=" + LastHoleSideRepairPlaneDistance15To2Count);
             summary.AppendLine("hole_repair_plane_distance_over_2_vox=" + LastHoleSideRepairPlaneDistanceOver2Count);
+            summary.AppendLine("hole_route_nzc_candidate=" + LastNoZeroCrossRouteCandidateCount);
+            summary.AppendLine("hole_route_nzc_applied=" + LastNoZeroCrossRouteAppliedCount);
+            summary.AppendLine("hole_route_nzc_block_history=" + LastNoZeroCrossRouteBlockedHistoryCount);
+            summary.AppendLine("hole_route_nzc_history_corner_dirty_pending=" + LastNoZeroCrossRouteHistoryCornerDirtyPendingCount);
+            summary.AppendLine("hole_route_nzc_history_corner_missing_arrays=" + LastNoZeroCrossRouteHistoryCornerMissingArraysCount);
+            summary.AppendLine("hole_route_nzc_history_corner_no_desired=" + LastNoZeroCrossRouteHistoryCornerNoDesiredCount);
+            summary.AppendLine("hole_route_nzc_history_corner_opposite_dominates=" + LastNoZeroCrossRouteHistoryCornerOppositeDominatesCount);
+            summary.AppendLine("hole_route_nzc_history_corner_tsdf_magnitude=" + LastNoZeroCrossRouteHistoryCornerTsdfMagnitudeCount);
+            summary.AppendLine("hole_route_nzc_history_corner_eligible=" + LastNoZeroCrossRouteHistoryCornerEligibleCount);
+            summary.AppendLine("hole_route_nzc_history_candidate_0=" + LastNoZeroCrossRouteHistoryCandidate0Count);
+            summary.AppendLine("hole_route_nzc_history_candidate_1=" + LastNoZeroCrossRouteHistoryCandidate1Count);
+            summary.AppendLine("hole_route_nzc_history_candidate_2=" + LastNoZeroCrossRouteHistoryCandidate2Count);
+            summary.AppendLine("hole_route_nzc_history_candidate_3_plus=" + LastNoZeroCrossRouteHistoryCandidate3PlusCount);
+            summary.AppendLine("hole_route_nzc_block_topology=" + LastNoZeroCrossRouteBlockedTopologyCount);
+            summary.AppendLine("hole_route_nzc_evidence_retained=" + LastNoZeroCrossRouteRetainedEvidenceCount);
+            summary.AppendLine("hole_route_nzc_evidence_accept_fallback=" + LastNoZeroCrossRouteAcceptedFallbackCount);
+            summary.AppendLine("hole_route_pending_candidate=" + LastPendingHoleRouteCandidateCount);
+            summary.AppendLine("hole_route_pending_applied=" + LastPendingHoleRouteAppliedCount);
+            summary.AppendLine("hole_route_pending_block_evidence=" + LastPendingHoleRouteBlockedEvidenceCount);
+            summary.AppendLine("hole_route_pending_block_topology=" + LastPendingHoleRouteBlockedTopologyCount);
+            summary.AppendLine("hole_route_pending_evidence_accept=" + LastPendingHoleRouteAcceptedEvidenceCount);
+            summary.AppendLine("hole_route_pending_evidence_cell=" + LastPendingHoleRouteCellEvidenceCount);
+            summary.AppendLine("hole_route_pending_evidence_neighbor=" + LastPendingHoleRouteNeighborEvidenceCount);
+            summary.AppendLine("hole_atomic_patch_applied=" + LastPrecisionHolePatchAppliedCount);
+            summary.AppendLine("hole_atomic_patch_voxels=" + LastPrecisionHolePatchVoxelCount);
+            summary.AppendLine("hole_atomic_patch_block_net_topology=" + LastPrecisionHolePatchBlockedNetTopologyCount);
+            int shadowObservationCount = 0;
+            foreach (ShadowBlockJournal journal in _shadowBlockJournals.Values)
+                shadowObservationCount += journal.Observations.Count;
+            LastShadowJournalBlockCount = _shadowBlockJournals.Count;
+            LastShadowJournalObservationCount = shadowObservationCount;
+            LastShadowProblemQueueCount = _shadowProblemBlockQueue.Count;
+            summary.AppendLine("shadow_journal_blocks=" + LastShadowJournalBlockCount);
+            summary.AppendLine("shadow_journal_observations=" + LastShadowJournalObservationCount);
+            summary.AppendLine("shadow_journal_dropped=" + _shadowJournalDroppedObservations);
+            summary.AppendLine("shadow_problem_queue=" + LastShadowProblemQueueCount);
+            summary.AppendLine("shadow_replay_mode=sequential_mixed_policy_split");
+            summary.AppendLine("shadow_replay_evaluated=" + LastShadowReplayEvaluatedCount);
+            summary.AppendLine("shadow_replay_improved=" + LastShadowReplayImprovedCount);
+            summary.AppendLine("shadow_replay_regressed=" + LastShadowReplayRegressedCount);
+            summary.AppendLine("shadow_replay_a_only_improved=" + LastShadowReplayAcceptOnlyImprovedCount);
+            summary.AppendLine("shadow_replay_a_only_regressed=" + LastShadowReplayAcceptOnlyRegressedCount);
+            summary.AppendLine("shadow_replay_clear_only_improved=" + LastShadowReplayClearOnlyImprovedCount);
+            summary.AppendLine("shadow_replay_clear_only_regressed=" + LastShadowReplayClearOnlyRegressedCount);
+            summary.AppendLine("shadow_replay_a_plus_clear_improved=" + LastShadowReplayFullImprovedCount);
+            summary.AppendLine("shadow_replay_a_plus_clear_regressed=" + LastShadowReplayFullRegressedCount);
+            summary.AppendLine("shadow_replay_a_aligned_observations=" + LastShadowReplayAlignedObservationCount);
+            summary.AppendLine("shadow_replay_a_aligned_improved=" + LastShadowReplayAlignedImprovedCount);
+            summary.AppendLine("shadow_replay_a_aligned_regressed=" + LastShadowReplayAlignedRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_observations=" + LastShadowReplayMixedObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_improved=" + LastShadowReplayMixedImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_regressed=" + LastShadowReplayMixedRegressedCount);
+            summary.AppendLine("shadow_replay_a_conflict_observations=" + LastShadowReplayConflictObservationCount);
+            summary.AppendLine("shadow_replay_a_conflict_improved=" + LastShadowReplayConflictImprovedCount);
+            summary.AppendLine("shadow_replay_a_conflict_regressed=" + LastShadowReplayConflictRegressedCount);
+            summary.AppendLine("shadow_replay_a_new_space_observations=" + LastShadowReplayNewSpaceObservationCount);
+            summary.AppendLine("shadow_replay_a_new_space_improved=" + LastShadowReplayNewSpaceImprovedCount);
+            summary.AppendLine("shadow_replay_a_new_space_regressed=" + LastShadowReplayNewSpaceRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_0_25_observations=" + LastShadowReplayMixedConflict0To25ObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_0_25_improved=" + LastShadowReplayMixedConflict0To25ImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_0_25_regressed=" + LastShadowReplayMixedConflict0To25RegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_25_50_observations=" + LastShadowReplayMixedConflict25To50ObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_25_50_improved=" + LastShadowReplayMixedConflict25To50ImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_25_50_regressed=" + LastShadowReplayMixedConflict25To50RegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_50_75_observations=" + LastShadowReplayMixedConflict50To75ObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_50_75_improved=" + LastShadowReplayMixedConflict50To75ImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_50_75_regressed=" + LastShadowReplayMixedConflict50To75RegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_75_100_observations=" + LastShadowReplayMixedConflict75To100ObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_75_100_improved=" + LastShadowReplayMixedConflict75To100ImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_conflict_75_100_regressed=" + LastShadowReplayMixedConflict75To100RegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_destructive_observations=" + LastShadowReplayMixedDestructiveObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_destructive_improved=" + LastShadowReplayMixedDestructiveImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_destructive_regressed=" + LastShadowReplayMixedDestructiveRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_constructive_observations=" + LastShadowReplayMixedConstructiveObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_constructive_improved=" + LastShadowReplayMixedConstructiveImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_constructive_regressed=" + LastShadowReplayMixedConstructiveRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_neutral_observations=" + LastShadowReplayMixedNeutralObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_neutral_improved=" + LastShadowReplayMixedNeutralImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_neutral_regressed=" + LastShadowReplayMixedNeutralRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_destroyed_zero_cells=" + LastShadowReplayMixedDestroyedZeroCrossCellCount);
+            summary.AppendLine("shadow_replay_a_mixed_created_zero_cells=" + LastShadowReplayMixedCreatedZeroCrossCellCount);
+            summary.AppendLine("shadow_replay_clear_destructive_voxels=" + LastShadowReplayClearDestructiveVoxelCount);
+            summary.AppendLine("shadow_replay_clear_destructive_improved=" + LastShadowReplayClearDestructiveImprovedCount);
+            summary.AppendLine("shadow_replay_clear_destructive_regressed=" + LastShadowReplayClearDestructiveRegressedCount);
+            summary.AppendLine("shadow_replay_clear_constructive_voxels=" + LastShadowReplayClearConstructiveVoxelCount);
+            summary.AppendLine("shadow_replay_clear_constructive_improved=" + LastShadowReplayClearConstructiveImprovedCount);
+            summary.AppendLine("shadow_replay_clear_constructive_regressed=" + LastShadowReplayClearConstructiveRegressedCount);
+            summary.AppendLine("shadow_replay_clear_neutral_voxels=" + LastShadowReplayClearNeutralVoxelCount);
+            summary.AppendLine("shadow_replay_clear_neutral_improved=" + LastShadowReplayClearNeutralImprovedCount);
+            summary.AppendLine("shadow_replay_clear_neutral_regressed=" + LastShadowReplayClearNeutralRegressedCount);
+            summary.AppendLine("shadow_replay_clear_destroyed_zero_cells=" + LastShadowReplayClearDestroyedZeroCrossCellCount);
+            summary.AppendLine("shadow_replay_clear_created_zero_cells=" + LastShadowReplayClearCreatedZeroCrossCellCount);
+            summary.AppendLine("shadow_replay_a_mixed_voxel_veto_observations=" + LastShadowReplayMixedVoxelVetoObservationCount);
+            summary.AppendLine("shadow_replay_a_mixed_voxel_veto_blocked_voxels=" + LastShadowReplayMixedVoxelVetoBlockedVoxelCount);
+            summary.AppendLine("shadow_replay_a_mixed_voxel_veto_avoided_destroyed_zero_cells=" + LastShadowReplayMixedVoxelVetoAvoidedDestroyedCellCount);
+            summary.AppendLine("shadow_replay_a_mixed_voxel_veto_improved=" + LastShadowReplayMixedVoxelVetoImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_voxel_veto_regressed=" + LastShadowReplayMixedVoxelVetoRegressedCount);
+            summary.AppendLine("shadow_replay_a_mixed_obs_pending_accepted=" + LastShadowReplayMixedObsPendingAcceptedCount);
+            summary.AppendLine("shadow_replay_a_mixed_obs_pending_downgraded=" + LastShadowReplayMixedObsPendingDowngradedCount);
+            summary.AppendLine("shadow_replay_a_mixed_obs_pending_avoided_destroyed_zero_cells=" + LastShadowReplayMixedObsPendingAvoidedDestroyedCellCount);
+            summary.AppendLine("shadow_replay_a_mixed_obs_pending_improved=" + LastShadowReplayMixedObsPendingImprovedCount);
+            summary.AppendLine("shadow_replay_a_mixed_obs_pending_regressed=" + LastShadowReplayMixedObsPendingRegressedCount);
             summary.AppendLine("mesh_commit_blocks=" + LastCommittedMeshBlockCount);
             summary.AppendLine("mesh_candidate_blocks=" + LastCandidateMeshBlockCount);
             summary.AppendLine("mesh_retained_commit_blocks=" + LastRetainedCommittedMeshBlockCount);
             summary.AppendLine("mesh_hold_spatial=" + LastCommittedMeshHoldSpatialCount);
             summary.AppendLine("mesh_hold_triangles=" + LastCommittedMeshHoldTriangleCount);
             summary.AppendLine("mesh_growth_triangles=" + LastCommittedMeshGrowthTriangleCount);
+            summary.AppendLine("recovered_pending_retention_cells=" + LastRecoveredPendingRetentionCellCount);
+            summary.AppendLine("recovered_pending_retained_triangles=" + LastRecoveredPendingRetainedTriangleCount);
+            summary.AppendLine("recovered_pending_duplicate_triangles=" + LastRecoveredPendingDuplicateTriangleCount);
+            summary.AppendLine("recovered_pending_retention_budget_blocked=" + LastRecoveredPendingRetentionBudgetCount);
+            summary.AppendLine("recovered_pending_min_observed_corners=" + Mathf.Clamp(minRecoveredPendingObservedCorners, 4, 8));
+            summary.AppendLine("recovered_pending_weld_tolerance_voxel_scale=" + AuditFloat(recoveredPendingVertexWeldToleranceVoxelScale));
+            summary.AppendLine("recovered_pending_welded_vertices=" + LastRecoveredPendingWeldedVertexCount);
+            summary.AppendLine("recovered_pending_added_vertices=" + LastRecoveredPendingAddedVertexCount);
+            summary.AppendLine("recovered_pending_degenerate_triangles=" + LastRecoveredPendingDegenerateTriangleCount);
+            summary.AppendLine("recovered_pending_boundary_edges_before=" + LastRecoveredPendingBoundaryEdgesBefore);
+            summary.AppendLine("recovered_pending_boundary_edges_after=" + LastRecoveredPendingBoundaryEdgesAfter);
+            summary.AppendLine("recovered_pending_nonmanifold_edges_before=" + LastRecoveredPendingNonManifoldEdgesBefore);
+            summary.AppendLine("recovered_pending_nonmanifold_edges_after=" + LastRecoveredPendingNonManifoldEdgesAfter);
+            summary.AppendLine("recovered_pending_cells_observed_6=" + LastRecoveredPendingSixCornerCellCount);
+            summary.AppendLine("recovered_pending_cells_observed_7=" + LastRecoveredPendingSevenCornerCellCount);
+            summary.AppendLine("recovered_pending_cells_observed_8=" + LastRecoveredPendingEightCornerCellCount);
+            summary.AppendLine("recovered_pending_topology_blocked_triangles=" + LastRecoveredPendingTopologyBlockedTriangleCount);
+            summary.AppendLine("qrs_shadow_enabled=" + (enableQuestRoomScanSurfaceNetsShadow ? 1 : 0));
+            summary.AppendLine("qrs_shadow_compare_only=1");
+            summary.AppendLine("qrs_shadow_min_weight=" + Mathf.Max(1, questRoomScanShadowMinWeight));
+            summary.AppendLine("qrs_shadow_saturated_negative_empty=" + (questRoomScanShadowTreatSaturatedNegativeAsEmpty ? 1 : 0));
+            summary.AppendLine("formal_surface_cells_active=" + LastBuiltSurfaceCellVertexCount);
+            summary.AppendLine("formal_surface_quads_added=" + LastAddedSurfaceQuadCount);
+            summary.AppendLine("formal_surface_vertex_cap_reached=" + (LastBuiltSurfaceCellVertexCount >= Mathf.Max(0, maxSurfaceVertices) ? 1 : 0));
+            summary.AppendLine("qrs_shadow_cells_scanned=" + LastQuestRoomScanShadowCellScanCount);
+            summary.AppendLine("qrs_shadow_cells_active=" + LastQuestRoomScanShadowActiveCellCount);
+            summary.AppendLine("qrs_shadow_cells_shared_formal=" + LastQuestRoomScanShadowSharedFormalCellCount);
+            summary.AppendLine("qrs_shadow_cells_added_vs_formal=" + LastQuestRoomScanShadowAddedCellCount);
+            summary.AppendLine("qrs_shadow_cells_formal_only=" + LastQuestRoomScanShadowFormalOnlyCellCount);
+            summary.AppendLine("qrs_shadow_cells_unknown_assisted=" + LastQuestRoomScanShadowUnknownAssistedCellCount);
+            summary.AppendLine("qrs_shadow_cells_all_observed=" + LastQuestRoomScanShadowAllObservedCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_single_weight=" + LastQuestRoomScanShadowSingleWeightCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_obs_pending=" + LastQuestRoomScanShadowPendingObservationCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_obs_rejected=" + LastQuestRoomScanShadowRejectedObservationCellCount);
+            summary.AppendLine("qrs_shadow_obs_pending_definition=latest_observation_state_2_pending_or_mixed");
+            summary.AppendLine("qrs_shadow_obs_rejected_definition=latest_observation_state_4_rejected_or_conflict");
+            summary.AppendLine("qrs_shadow_cells_touch_conflict_history=" + LastQuestRoomScanShadowConflictHistoryCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_dirty_pending_provisional=" + LastQuestRoomScanShadowDirtyPendingProvisionalCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_dirty_quarantined=" + LastQuestRoomScanShadowDirtyQuarantinedCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_pending_tsdf_correction=" + LastQuestRoomScanShadowPendingTsdfCorrectionCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_provisional=" + LastQuestRoomScanShadowProvisionalCellCount);
+            summary.AppendLine("qrs_shadow_good_crossings=" + LastQuestRoomScanShadowGoodCrossingCount);
+            summary.AppendLine("qrs_shadow_bad_unknown_crossings=" + LastQuestRoomScanShadowBadCrossingCount);
+            summary.AppendLine("qrs_shadow_quads=" + LastQuestRoomScanShadowQuadCount);
+            summary.AppendLine("qrs_shadow_quads_all_formal_cells=" + LastQuestRoomScanShadowQuadAllFormalCellsCount);
+            summary.AppendLine("qrs_shadow_quads_using_added_cells=" + LastQuestRoomScanShadowQuadUsesAddedCellCount);
+            summary.AppendLine("qrs_shadow_quad_delta_vs_formal=" + (LastQuestRoomScanShadowQuadCount - LastAddedSurfaceQuadCount));
+            AppendQuestRoomScanAddedRiskSummary(summary);
             summary.AppendLine("accept_duplicate_candidates=" + LastAtomicAcceptDuplicateCandidateCount);
             summary.AppendLine("accept_duplicate_downgraded=" + LastAtomicAcceptDuplicateDowngradeCount);
             summary.AppendLine("accept_duplicate_same_surface=" + LastAtomicAcceptDuplicateSameSurfaceCount);
+            summary.AppendLine("accept_compatibility_gate_enabled=" + (gateFormalAcceptByStableSignCompatibility ? 1 : 0));
+            summary.AppendLine("accept_compatibility_mixed_pending_threshold=" + AuditFloat(formalAcceptMixedConflictPendingThreshold));
+            summary.AppendLine("accept_compatibility_checked=" + LastFormalAcceptCompatibilityCheckedCount);
+            summary.AppendLine("accept_compatibility_aligned=" + LastFormalAcceptCompatibilityAlignedCount);
+            summary.AppendLine("accept_compatibility_mixed_low=" + LastFormalAcceptCompatibilityMixedLowCount);
+            summary.AppendLine("accept_compatibility_mixed_observe=" + LastFormalAcceptCompatibilityMixedObserveCount);
+            summary.AppendLine("accept_compatibility_mixed_downgraded=" + LastFormalAcceptCompatibilityMixedDowngradedCount);
+            summary.AppendLine("accept_compatibility_conflict_downgraded=" + LastFormalAcceptCompatibilityConflictDowngradedCount);
+            summary.AppendLine("accept_compatibility_new_space=" + LastFormalAcceptCompatibilityNewSpaceCount);
+            summary.AppendLine("accept_compatibility_critical_conflict=" + LastFormalAcceptCompatibilityCriticalConflictCount);
+            summary.AppendLine("formal_mixed_topology_gate_enabled=" + (gateFormalMixedBySequentialTopology ? 1 : 0));
+            summary.AppendLine("formal_mixed_topology_checked=" + LastFormalMixedTopologyCheckedCount);
+            summary.AppendLine("formal_mixed_topology_downgraded=" + LastFormalMixedTopologyDowngradedCount);
+            summary.AppendLine("formal_mixed_topology_protected_zero_cells=" + LastFormalMixedTopologyProtectedZeroCrossCellCount);
+            summary.AppendLine("formal_clear_topology_guard_enabled=" + (protectZeroCrossFromDestructiveClearing ? 1 : 0));
+            summary.AppendLine("formal_clear_blocked_topology=" + LastFreeSpaceEvidenceBlockedTopologyCount);
+            summary.AppendLine("formal_clear_protected_zero_cells=" + LastFreeSpaceEvidenceProtectedZeroCrossCellCount);
             summary.AppendLine("duplicate_cleanup_queued=" + LastDuplicateLayerCleanupQueuedCount);
             summary.AppendLine("duplicate_cleanup_decayed=" + LastDuplicateLayerCleanupDecayedCount);
             summary.AppendLine("duplicate_cleanup_cleared=" + LastDuplicateLayerCleanupClearedCount);
@@ -3095,6 +4840,92 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _lastHoleDiagnosticRowCount++;
         }
         return csv;
+    }
+
+    private StringBuilder BuildHoleCellLifecycleCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(4096, _holeCellLifecycles.Count * 640));
+        csv.Append("capture,export_frame,cell_x,cell_y,cell_z,world_x,world_y,world_z,active,first_frame,last_frame,first_capture,last_capture,first_rebuild,last_rebuild,seen_rebuilds,consecutive_rebuilds,max_consecutive_rebuilds,cause_transitions,recovery_count,last_recovery_capture,first_cause,last_cause,positive_only,negative_only,first_write_sequence,last_write_sequence");
+        for (int corner = 0; corner < 8; corner++)
+        {
+            csv.Append(",c").Append(corner).Append("_sign,c").Append(corner).Append("_tsdf,c").Append(corner)
+                .Append("_weight,c").Append(corner).Append("_operation,c").Append(corner).Append("_sequence,c")
+                .Append(corner).Append("_visit_flags,c").Append(corner).Append("_accepted_pos_seq,c")
+                .Append(corner).Append("_accepted_neg_seq,c").Append(corner).Append("_retained_pos_seq,c")
+                .Append(corner).Append("_retained_neg_seq");
+        }
+        csv.AppendLine();
+
+        List<Vector3Int> keys = new List<Vector3Int>(_holeCellLifecycles.Keys);
+        keys.Sort((a, b) =>
+        {
+            int z = a.z.CompareTo(b.z);
+            if (z != 0) return z;
+            int y = a.y.CompareTo(b.y);
+            return y != 0 ? y : a.x.CompareTo(b.x);
+        });
+        for (int i = 0; i < keys.Count; i++)
+        {
+            Vector3Int key = keys[i];
+            HoleCellLifecycle lifecycle = _holeCellLifecycles[key];
+            if (key.x < 0 || key.y < 0 || key.z < 0 || key.x >= _dimX - 1 || key.y >= _dimY - 1 || key.z >= _dimZ - 1)
+                continue;
+            Vector3 center = CellCenter(key.x, key.y, key.z);
+            csv.Append(_surfaceDiagnosticCaptureIndex).Append(',').Append(IntegratedFrameCount).Append(',')
+                .Append(key.x).Append(',').Append(key.y).Append(',').Append(key.z).Append(',')
+                .Append(AuditFloat(center.x)).Append(',').Append(AuditFloat(center.y)).Append(',').Append(AuditFloat(center.z)).Append(',')
+                .Append(lifecycle.Active ? 1 : 0).Append(',')
+                .Append(lifecycle.FirstFrame).Append(',').Append(lifecycle.LastFrame).Append(',')
+                .Append(lifecycle.FirstCapture).Append(',').Append(lifecycle.LastCapture).Append(',')
+                .Append(lifecycle.FirstRebuild).Append(',').Append(lifecycle.LastRebuild).Append(',')
+                .Append(lifecycle.SeenRebuilds).Append(',').Append(lifecycle.ConsecutiveRebuilds).Append(',').Append(lifecycle.MaxConsecutiveRebuilds).Append(',')
+                .Append(lifecycle.CauseTransitions).Append(',').Append(lifecycle.RecoveryCount).Append(',').Append(lifecycle.LastRecoveryCapture).Append(',')
+                .Append(lifecycle.FirstCause).Append(',').Append(lifecycle.LastCause).Append(',')
+                .Append(lifecycle.PositiveOnly ? 1 : 0).Append(',').Append(lifecycle.NegativeOnly ? 1 : 0).Append(',')
+                .Append(lifecycle.FirstWriteSequence).Append(',').Append(lifecycle.LastWriteSequence);
+            for (int corner = 0; corner < 8; corner++)
+                AppendHoleCellLifecycleCorner(csv, key.x, key.y, key.z, corner);
+            csv.AppendLine();
+        }
+        return csv;
+    }
+
+    private void AppendHoleCellLifecycleCorner(StringBuilder csv, int x, int y, int z, int corner)
+    {
+        int vx = x + ((corner & 1) != 0 ? 1 : 0);
+        int vy = y + ((corner & 2) != 0 ? 1 : 0);
+        int vz = z + ((corner & 4) != 0 ? 1 : 0);
+        int index = Index(vx, vy, vz);
+        float tsdf = _tsdf != null && index < _tsdf.Length ? _tsdf[index] : 0f;
+        int weight = _weights != null && index < _weights.Length ? _weights[index] : 0;
+        string sign = weight <= 0 ? "EMPTY" : (tsdf > 0f ? "POS" : (tsdf < 0f ? "NEG" : "ZERO"));
+        bool hasProvenance = _voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance);
+        csv.Append(',').Append(sign).Append(',').Append(AuditFloat(tsdf)).Append(',').Append(weight).Append(',')
+            .Append(hasProvenance ? provenance.LastOperation : "untracked").Append(',')
+            .Append(hasProvenance ? provenance.WriteSequence : 0).Append(',')
+            .Append(_surfaceBandVisitFlags != null ? _surfaceBandVisitFlags[index] : 0).Append(',')
+            .Append(_acceptedPositiveLastSequence != null ? _acceptedPositiveLastSequence[index] : 0).Append(',')
+            .Append(_acceptedNegativeLastSequence != null ? _acceptedNegativeLastSequence[index] : 0).Append(',')
+            .Append(_acceptedPositiveRetainedLastSequence != null ? _acceptedPositiveRetainedLastSequence[index] : 0).Append(',')
+            .Append(_acceptedNegativeRetainedLastSequence != null ? _acceptedNegativeRetainedLastSequence[index] : 0);
+    }
+
+    private int CountActiveHoleCellLifecycles()
+    {
+        int count = 0;
+        foreach (HoleCellLifecycle lifecycle in _holeCellLifecycles.Values)
+            if (lifecycle.Active)
+                count++;
+        return count;
+    }
+
+    private int CountRecoveredHoleCellLifecycles()
+    {
+        int count = 0;
+        foreach (HoleCellLifecycle lifecycle in _holeCellLifecycles.Values)
+            if (lifecycle.RecoveryCount > 0)
+                count++;
+        return count;
     }
 
     private void BuildLayerProfileCsv(out StringBuilder rays, out StringBuilder layers, out StringBuilder pairs)
@@ -3324,6 +5155,99 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 return false;
         }
         return exit >= Mathf.Max(0f, enter);
+    }
+
+    private void UpdateRebaselineDiagnostics()
+    {
+        LastRebaselineWeightedVoxelCount = 0;
+        LastRebaselineWeight1VoxelCount = 0;
+        LastRebaselineWeight2To3VoxelCount = 0;
+        LastRebaselineWeight4PlusVoxelCount = 0;
+        if (_weights != null)
+        {
+            for (int i = 0; i < _weights.Length; i++)
+            {
+                int weight = _weights[i];
+                if (weight <= 0)
+                    continue;
+                LastRebaselineWeightedVoxelCount++;
+                if (weight == 1)
+                    LastRebaselineWeight1VoxelCount++;
+                else if (weight <= 3)
+                    LastRebaselineWeight2To3VoxelCount++;
+                else
+                    LastRebaselineWeight4PlusVoxelCount++;
+            }
+        }
+
+        LastRebaselineNewHoleCellCount = 0;
+        LastRebaselineRecoveredHoleCellCount = 0;
+        foreach (HoleCellLifecycle lifecycle in _holeCellLifecycles.Values)
+        {
+            if (lifecycle.FirstCapture == _surfaceDiagnosticCaptureIndex)
+                LastRebaselineNewHoleCellCount++;
+            if (lifecycle.LastRecoveryCapture == _surfaceDiagnosticCaptureIndex)
+                LastRebaselineRecoveredHoleCellCount++;
+        }
+
+        LastRebaselineValid =
+            useFixedIntegratedFrameBatch &&
+            LastCaptureBatchComplete &&
+            LastCaptureBatchTargetFrames >= 12 &&
+            LastCaptureBatchIntegratedFrames == LastCaptureBatchTargetFrames &&
+            LastCaptureBatchUniqueRawFrames >= LastCaptureBatchIntegratedFrames &&
+            LastCaptureBatchMeshRebuildCount == 1;
+    }
+
+    private void AppendCaptureBatchSummary(StringBuilder summary)
+    {
+        summary.AppendLine("capture_mode=" + (useFixedIntegratedFrameBatch ? "fixed_integrated_frame_batch" : "legacy_timed_burst"));
+        summary.AppendLine("capture_target_integrated_frames=" + LastCaptureBatchTargetFrames);
+        summary.AppendLine("capture_unique_raw_frames=" + LastCaptureBatchUniqueRawFrames);
+        summary.AppendLine("capture_batch_integrated_frames=" + LastCaptureBatchIntegratedFrames);
+        summary.AppendLine("capture_batch_timeout_count=" + LastCaptureBatchTimeoutCount);
+        summary.AppendLine("capture_batch_mesh_rebuilds=" + LastCaptureBatchMeshRebuildCount);
+        summary.AppendLine("capture_batch_complete=" + (LastCaptureBatchComplete ? 1 : 0));
+        summary.AppendLine("capture_batch_reconcile_delta=" + (LastCaptureBatchIntegratedFrames - LastCaptureBatchTargetFrames));
+        int integratedFrames = Mathf.Max(1, LastCaptureBatchIntegratedFrames);
+        int pendingPromotionEvents = LastCaptureBatchAtomicProvisionalPromotionCount +
+                                     LastCaptureBatchStrongProvisionalPromotionCount +
+                                     LastPendingHoleRouteAppliedCount;
+        summary.AppendLine("rebaseline_valid=" + (LastRebaselineValid ? 1 : 0));
+        summary.AppendLine("rebaseline_valid_definition=fixed_batch_complete_target_at_least_12_unique_raw_ge_integrated_single_mesh_rebuild");
+        summary.AppendLine("rebaseline_weighted_voxels=" + LastRebaselineWeightedVoxelCount);
+        summary.AppendLine("rebaseline_voxel_weight_1=" + LastRebaselineWeight1VoxelCount);
+        summary.AppendLine("rebaseline_voxel_weight_2_3=" + LastRebaselineWeight2To3VoxelCount);
+        summary.AppendLine("rebaseline_voxel_weight_4_plus=" + LastRebaselineWeight4PlusVoxelCount);
+        summary.AppendLine("rebaseline_weight_bucket_reconcile_delta=" +
+                           (LastRebaselineWeightedVoxelCount -
+                            LastRebaselineWeight1VoxelCount -
+                            LastRebaselineWeight2To3VoxelCount -
+                            LastRebaselineWeight4PlusVoxelCount));
+        summary.AppendLine("rebaseline_voxel_weight_1_share=" + AuditFloat(LastRebaselineWeightedVoxelCount > 0 ? (float)LastRebaselineWeight1VoxelCount / LastRebaselineWeightedVoxelCount : 0f));
+        summary.AppendLine("rebaseline_voxel_weight_2_3_share=" + AuditFloat(LastRebaselineWeightedVoxelCount > 0 ? (float)LastRebaselineWeight2To3VoxelCount / LastRebaselineWeightedVoxelCount : 0f));
+        summary.AppendLine("rebaseline_voxel_weight_4_plus_share=" + AuditFloat(LastRebaselineWeightedVoxelCount > 0 ? (float)LastRebaselineWeight4PlusVoxelCount / LastRebaselineWeightedVoxelCount : 0f));
+        summary.AppendLine("rebaseline_new_hole_cells=" + LastRebaselineNewHoleCellCount);
+        summary.AppendLine("rebaseline_recovered_hole_cells=" + LastRebaselineRecoveredHoleCellCount);
+        summary.AppendLine("rebaseline_new_holes_per_integrated_frame=" + AuditFloat((float)LastRebaselineNewHoleCellCount / integratedFrames));
+        summary.AppendLine("rebaseline_recovered_holes_per_integrated_frame=" + AuditFloat((float)LastRebaselineRecoveredHoleCellCount / integratedFrames));
+        summary.AppendLine("rebaseline_batch_atomic_provisional_promotions=" + LastCaptureBatchAtomicProvisionalPromotionCount);
+        summary.AppendLine("rebaseline_batch_strong_provisional_promotions=" + LastCaptureBatchStrongProvisionalPromotionCount);
+        summary.AppendLine("rebaseline_pending_hole_promotions=" + LastPendingHoleRouteAppliedCount);
+        summary.AppendLine("rebaseline_pending_promotion_events=" + pendingPromotionEvents);
+        summary.AppendLine("rebaseline_pending_promotions_per_integrated_frame=" + AuditFloat((float)pendingPromotionEvents / integratedFrames));
+        summary.AppendLine("rebaseline_qrs_mature_cells=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount);
+        summary.AppendLine("rebaseline_qrs_mature_cells_per_integrated_frame=" + AuditFloat((float)LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount / integratedFrames));
+        summary.AppendLine("rebaseline_qrs_mature_quads=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount);
+        summary.AppendLine("rebaseline_qrs_mature_quads_per_integrated_frame=" + AuditFloat((float)LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_improved_per_integrated_frame=" + AuditFloat((float)LastShadowReplayImprovedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_regressed_per_integrated_frame=" + AuditFloat((float)LastShadowReplayRegressedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_a_only_improved_per_integrated_frame=" + AuditFloat((float)LastShadowReplayAcceptOnlyImprovedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_a_only_regressed_per_integrated_frame=" + AuditFloat((float)LastShadowReplayAcceptOnlyRegressedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_clear_only_improved_per_integrated_frame=" + AuditFloat((float)LastShadowReplayClearOnlyImprovedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_clear_only_regressed_per_integrated_frame=" + AuditFloat((float)LastShadowReplayClearOnlyRegressedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_a_plus_clear_improved_per_integrated_frame=" + AuditFloat((float)LastShadowReplayFullImprovedCount / integratedFrames));
+        summary.AppendLine("rebaseline_shadow_a_plus_clear_regressed_per_integrated_frame=" + AuditFloat((float)LastShadowReplayFullRegressedCount / integratedFrames));
     }
 
     private void BeginConfidenceAuditCapture()
@@ -3596,6 +5520,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         {
             _provisionalTsdf[index] = 0;
             _provisionalTsdfLastFrame[index] = int.MinValue;
+            _provisionalPromotionBlockStates.Remove(index);
             if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
                 _provisionalTsdfHits[index] = 0;
             return;
@@ -3603,6 +5528,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         _provisionalTsdf[index] = 0;
         _provisionalTsdfLastFrame[index] = int.MinValue;
+        _provisionalPromotionBlockStates.Remove(index);
         if (_provisionalTsdfHits != null && index < _provisionalTsdfHits.Length)
             _provisionalTsdfHits[index] = 0;
         LastProvisionalTsdfConfirmedCount++;
@@ -3972,6 +5898,26 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     _auditVoteEnforcedRejectCount++;
                 break;
         }
+    }
+
+    private void DowngradeCurrentObservationVoteToPending(string reason)
+    {
+        if (_auditVoteState == ObservationVoteState.Accept)
+        {
+            _auditVoteAcceptCount = Mathf.Max(0, _auditVoteAcceptCount - 1);
+            _auditVotePendingCount++;
+        }
+        else if (_auditVoteState != ObservationVoteState.Pending)
+        {
+            return;
+        }
+
+        _auditVoteState = ObservationVoteState.Pending;
+        string safeReason = string.IsNullOrEmpty(reason) ? "accept_downgraded" : reason.Replace(',', '|');
+        _auditVoteReasons = string.IsNullOrEmpty(_auditVoteReasons) || _auditVoteReasons == "unassessed"
+            ? safeReason
+            : _auditVoteReasons + "+" + safeReason;
+        _auditVoteEnforced = true;
     }
 
     private Vector3Int VoteHistoryKey(Vector3 point)
@@ -4698,6 +6644,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("status=" + status);
             summary.AppendLine("capture=" + _confidenceAuditCaptureIndex);
             summary.AppendLine("integrated_frames=" + integratedFrames);
+            AppendCaptureBatchSummary(summary);
             summary.AppendLine("observed_frames=" + _confidenceAuditIntegratedFrames);
             summary.AppendLine("rows=" + _confidenceAuditRowCount);
             summary.AppendLine("dropped_rows=" + _confidenceAuditDroppedRows);
@@ -4925,6 +6872,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("free_space_evidence_cleared=" + LastFreeSpaceEvidenceClearedCount);
             summary.AppendLine("free_space_evidence_block_high_weight=" + LastFreeSpaceEvidenceBlockedHighWeightCount);
             summary.AppendLine("free_space_evidence_block_same_frame=" + LastFreeSpaceEvidenceBlockedSameFrameCount);
+            summary.AppendLine("free_space_evidence_topology_guard_enabled=" + (protectZeroCrossFromDestructiveClearing ? 1 : 0));
+            summary.AppendLine("free_space_evidence_block_topology=" + LastFreeSpaceEvidenceBlockedTopologyCount);
+            summary.AppendLine("free_space_evidence_protected_zero_cells=" + LastFreeSpaceEvidenceProtectedZeroCrossCellCount);
             summary.AppendLine("free_space_evidence_duplicate_frame=" + LastFreeSpaceEvidenceDuplicateFrameCount);
             summary.AppendLine("free_space_evidence_cancelled_by_surface=" + LastFreeSpaceEvidenceCancelledBySurfaceCount);
             summary.AppendLine("free_space_evidence_min_frames=" + Mathf.Clamp(minFreeSpaceEvidenceFrames, 2, 8));
@@ -4950,6 +6900,37 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("dirty_band_repair_block_residual=" + LastDirtyTsdfBandRepairBlockedResidualCount);
             summary.AppendLine("dirty_active=" + LastDirtyTsdfActiveCount);
             summary.AppendLine("mesh_triangles=" + LastMeshTriangleCount);
+            summary.AppendLine("qrs_shadow_enabled=" + (enableQuestRoomScanSurfaceNetsShadow ? 1 : 0));
+            summary.AppendLine("qrs_shadow_compare_only=1");
+            summary.AppendLine("qrs_shadow_min_weight=" + Mathf.Max(1, questRoomScanShadowMinWeight));
+            summary.AppendLine("qrs_shadow_saturated_negative_empty=" + (questRoomScanShadowTreatSaturatedNegativeAsEmpty ? 1 : 0));
+            summary.AppendLine("formal_surface_cells_active=" + LastBuiltSurfaceCellVertexCount);
+            summary.AppendLine("formal_surface_quads_added=" + LastAddedSurfaceQuadCount);
+            summary.AppendLine("formal_surface_vertex_cap_reached=" + (LastBuiltSurfaceCellVertexCount >= Mathf.Max(0, maxSurfaceVertices) ? 1 : 0));
+            summary.AppendLine("qrs_shadow_cells_scanned=" + LastQuestRoomScanShadowCellScanCount);
+            summary.AppendLine("qrs_shadow_cells_active=" + LastQuestRoomScanShadowActiveCellCount);
+            summary.AppendLine("qrs_shadow_cells_shared_formal=" + LastQuestRoomScanShadowSharedFormalCellCount);
+            summary.AppendLine("qrs_shadow_cells_added_vs_formal=" + LastQuestRoomScanShadowAddedCellCount);
+            summary.AppendLine("qrs_shadow_cells_formal_only=" + LastQuestRoomScanShadowFormalOnlyCellCount);
+            summary.AppendLine("qrs_shadow_cells_unknown_assisted=" + LastQuestRoomScanShadowUnknownAssistedCellCount);
+            summary.AppendLine("qrs_shadow_cells_all_observed=" + LastQuestRoomScanShadowAllObservedCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_single_weight=" + LastQuestRoomScanShadowSingleWeightCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_obs_pending=" + LastQuestRoomScanShadowPendingObservationCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_obs_rejected=" + LastQuestRoomScanShadowRejectedObservationCellCount);
+            summary.AppendLine("qrs_shadow_obs_pending_definition=latest_observation_state_2_pending_or_mixed");
+            summary.AppendLine("qrs_shadow_obs_rejected_definition=latest_observation_state_4_rejected_or_conflict");
+            summary.AppendLine("qrs_shadow_cells_touch_conflict_history=" + LastQuestRoomScanShadowConflictHistoryCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_dirty_pending_provisional=" + LastQuestRoomScanShadowDirtyPendingProvisionalCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_dirty_quarantined=" + LastQuestRoomScanShadowDirtyQuarantinedCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_pending_tsdf_correction=" + LastQuestRoomScanShadowPendingTsdfCorrectionCellCount);
+            summary.AppendLine("qrs_shadow_cells_touch_provisional=" + LastQuestRoomScanShadowProvisionalCellCount);
+            summary.AppendLine("qrs_shadow_good_crossings=" + LastQuestRoomScanShadowGoodCrossingCount);
+            summary.AppendLine("qrs_shadow_bad_unknown_crossings=" + LastQuestRoomScanShadowBadCrossingCount);
+            summary.AppendLine("qrs_shadow_quads=" + LastQuestRoomScanShadowQuadCount);
+            summary.AppendLine("qrs_shadow_quads_all_formal_cells=" + LastQuestRoomScanShadowQuadAllFormalCellsCount);
+            summary.AppendLine("qrs_shadow_quads_using_added_cells=" + LastQuestRoomScanShadowQuadUsesAddedCellCount);
+            summary.AppendLine("qrs_shadow_quad_delta_vs_formal=" + (LastQuestRoomScanShadowQuadCount - LastAddedSurfaceQuadCount));
+            AppendQuestRoomScanAddedRiskSummary(summary);
             summary.AppendLine("island_cause_components=" + LastIslandCauseComponentCount);
             summary.AppendLine("island_cause_boundary_voxels=" + LastIslandCauseBoundaryVoxelCount);
             summary.AppendLine("island_cause_no_tsdf=" + LastIslandCauseNoTsdfCount);
@@ -5972,6 +7953,108 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public float Tsdf;
     }
 
+    private struct PrecisionHolePatchCandidate
+    {
+        public int Index;
+        public float Tsdf;
+        public int Evidence;
+        public int EvidenceKind;
+    }
+
+    private struct ShadowBlockObservation
+    {
+        public int Sequence;
+        public int Frame;
+        public Vector3 Camera;
+        public Vector3 Surface;
+        public Vector3 Normal;
+        public float Weight;
+        public int HalfBandSteps;
+        public ObservationVoteState Vote;
+        public bool Projective;
+        public bool Clearing;
+    }
+
+    private struct FormalTopologyVoxelState
+    {
+        public float Tsdf;
+        public float Weight;
+    }
+
+    private enum PrimaryPlaneHoleRejectReason
+    {
+        None,
+        AnchorCount,
+        DegenerateNormal,
+        Residual,
+        CandidateDistance,
+        EmptyBand
+    }
+
+    private enum ShadowAcceptCompatibility
+    {
+        Aligned,
+        Mixed,
+        Conflict,
+        NewSpace
+    }
+
+    private enum ShadowTopologyImpact
+    {
+        Destructive,
+        Constructive,
+        Neutral
+    }
+
+    private enum ShadowTopologyReplayMode
+    {
+        All,
+        DestructiveOnly,
+        ConstructiveOnly,
+        NeutralOnly
+    }
+
+    private struct ShadowAcceptCompatibilityInfo
+    {
+        public ShadowAcceptCompatibility Compatibility;
+        public int AlignedVoxels;
+        public int ConflictingVoxels;
+        public int OverlapVoxels;
+        public int CriticalConflictVoxels;
+
+        public float ConflictRatio
+        {
+            get
+            {
+                int comparable = AlignedVoxels + ConflictingVoxels;
+                return comparable > 0 ? (float)ConflictingVoxels / comparable : 0f;
+            }
+        }
+    }
+
+    private sealed class ShadowBlockJournal
+    {
+        public readonly List<ShadowBlockObservation> Observations = new List<ShadowBlockObservation>(384);
+        public int ReplaceCursor;
+        public int LastSequence;
+    }
+
+    private struct ShadowBlockMetrics
+    {
+        public int SupportedCells;
+        public int ZeroCrossCells;
+        public int OneSidedCells;
+        public int UnknownCells;
+        public int PendingVoxels;
+    }
+
+    private struct ShadowClearingReplayResult
+    {
+        public int AppliedVoxels;
+        public int DestroyedZeroCrossCells;
+        public int CreatedZeroCrossCells;
+    }
+
     private void RebuildHoleBoundaryDiagnostic(int cellX, int cellY, int cellZ, int meshVertexCount, List<int> meshTriangles)
     {
         LastHoleCauseNoRawCount = 0;
@@ -6010,6 +8093,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastSecondaryLayerDiagnosticMarkerCount = 0;
         LastUnclassifiedLayerDiagnosticMarkerCount = 0;
         LastConfirmedSecondaryLayerVoxelCount = 0;
+        _holeLifecycleRebuildSequence++;
+        _activeHoleLifecycleCells.Clear();
         EnsureHoleBoundaryDiagnosticObjects();
         if (_holeBoundaryDiagnosticMesh == null)
             return;
@@ -6067,6 +8152,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     }
                     if (cause == HoleSupportCause.NoZeroCross && !positiveOnly && !negativeOnly)
                         LastMissingSideInvalidCount += 2;
+                    UpdateHoleCellLifecycle(x, y, z, cause, positiveOnly, negativeOnly);
                     switch (cause)
                     {
                         case HoleSupportCause.NoRaw:
@@ -6138,6 +8224,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 }
             }
         }
+        FinalizeHoleCellLifecycleRebuild();
 
         if (showGlobalPairedLayerDiagnostics)
         {
@@ -6180,6 +8267,89 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _holeBoundaryDiagnosticMesh.SetTriangles(triangles, 0, true);
         _holeBoundaryDiagnosticMesh.RecalculateBounds();
         _holeBoundaryDiagnosticObject.SetActive(true);
+    }
+
+    private void UpdateHoleCellLifecycle(
+        int x,
+        int y,
+        int z,
+        HoleSupportCause cause,
+        bool positiveOnly,
+        bool negativeOnly)
+    {
+        Vector3Int key = new Vector3Int(x, y, z);
+        _activeHoleLifecycleCells.Add(key);
+        bool exists = _holeCellLifecycles.TryGetValue(key, out HoleCellLifecycle lifecycle);
+        if (!exists && _holeCellLifecycles.Count >= Mathf.Max(512, maxHoleCellLifecycleRecords))
+            return;
+
+        GetHoleCellWriteSequenceRange(x, y, z, out int firstWriteSequence, out int lastWriteSequence);
+        if (!exists)
+        {
+            lifecycle.FirstFrame = LastRawFrameIndex;
+            lifecycle.FirstCapture = _surfaceDiagnosticCaptureIndex;
+            lifecycle.FirstRebuild = _holeLifecycleRebuildSequence;
+            lifecycle.FirstCause = cause;
+            lifecycle.FirstWriteSequence = firstWriteSequence;
+        }
+        else
+        {
+            if (lifecycle.LastCause != cause)
+                lifecycle.CauseTransitions++;
+        }
+
+        lifecycle.LastFrame = LastRawFrameIndex;
+        lifecycle.LastCapture = _surfaceDiagnosticCaptureIndex;
+        lifecycle.LastRebuild = _holeLifecycleRebuildSequence;
+        lifecycle.SeenRebuilds++;
+        lifecycle.ConsecutiveRebuilds = lifecycle.Active ? lifecycle.ConsecutiveRebuilds + 1 : 1;
+        lifecycle.MaxConsecutiveRebuilds = Mathf.Max(lifecycle.MaxConsecutiveRebuilds, lifecycle.ConsecutiveRebuilds);
+        lifecycle.LastCause = cause;
+        lifecycle.Active = true;
+        lifecycle.PositiveOnly = positiveOnly;
+        lifecycle.NegativeOnly = negativeOnly;
+        if (lifecycle.FirstWriteSequence <= 0 && firstWriteSequence > 0)
+            lifecycle.FirstWriteSequence = firstWriteSequence;
+        lifecycle.LastWriteSequence = Mathf.Max(lifecycle.LastWriteSequence, lastWriteSequence);
+        _holeCellLifecycles[key] = lifecycle;
+    }
+
+    private void FinalizeHoleCellLifecycleRebuild()
+    {
+        if (_holeCellLifecycles.Count <= 0)
+            return;
+        List<Vector3Int> keys = new List<Vector3Int>(_holeCellLifecycles.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            Vector3Int key = keys[i];
+            HoleCellLifecycle lifecycle = _holeCellLifecycles[key];
+            if (lifecycle.Active && !_activeHoleLifecycleCells.Contains(key))
+            {
+                lifecycle.Active = false;
+                lifecycle.RecoveryCount++;
+                lifecycle.LastRecoveryCapture = _surfaceDiagnosticCaptureIndex;
+                lifecycle.ConsecutiveRebuilds = 0;
+                _holeCellLifecycles[key] = lifecycle;
+            }
+        }
+    }
+
+    private void GetHoleCellWriteSequenceRange(int x, int y, int z, out int first, out int last)
+    {
+        first = int.MaxValue;
+        last = 0;
+        for (int dz = 0; dz <= 1; dz++)
+        for (int dy = 0; dy <= 1; dy++)
+        for (int dx = 0; dx <= 1; dx++)
+        {
+            int index = Index(x + dx, y + dy, z + dz);
+            if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) || provenance.WriteSequence <= 0)
+                continue;
+            first = Mathf.Min(first, provenance.WriteSequence);
+            last = Mathf.Max(last, provenance.WriteSequence);
+        }
+        if (first == int.MaxValue)
+            first = 0;
     }
 
     private void AppendGlobalPairedLayerDiagnosticCandidates(
@@ -7538,22 +9708,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (!promoteStrongCurrentProvisionalToFormal)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("disabled");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "disabled");
             return false;
         }
         if (!AuditVoteHasExactTag("strong_current_clean"))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("tag");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "tag");
             return false;
         }
         if (_provisionalTsdf == null || _provisionalTsdfLastFrame == null || _provisionalTsdfHits == null)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("storage");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "storage");
             return false;
         }
         if (index < 0 || index >= _tsdf.Length || index >= _weights.Length || index >= _provisionalTsdf.Length || index >= _provisionalTsdfHits.Length)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("invalid");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "invalid");
             return false;
         }
         if (_provisionalTsdf[index] == 0)
@@ -7561,7 +9731,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             string noProvisionalReason = Mathf.Abs(sampleTsdf) <= Mathf.Clamp01(provisionalTsdfNearSurfaceAbs)
                 ? "no_provisional_near_surface"
                 : "no_provisional_far_band";
-            RecordStrongCurrentProvisionalPromotionBlock(noProvisionalReason);
+            RecordStrongCurrentProvisionalPromotionBlock(index, noProvisionalReason);
             return false;
         }
 
@@ -7569,47 +9739,47 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int hits = _provisionalTsdfHits[index];
         if (hits < requiredHits)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("hits");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "hits");
             return false;
         }
 
         int requiredWeight = Mathf.Clamp(minStrongCurrentProvisionalWeight, 1, 8);
         if (oldWeight < requiredWeight)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("weight");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "weight");
             return false;
         }
 
         int requiredBandHistory = Mathf.Clamp(minStrongCurrentProvisionalBandHistory, 0, 16);
         if (requiredBandHistory > 0 && _auditBandHistoryCount < requiredBandHistory)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("band_history");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "band_history");
             return false;
         }
 
         float requiredAgreement = Mathf.Clamp01(minStrongCurrentProvisionalHistoryAgreement);
         if (requiredAgreement > 0f && _auditHistoryAgreement >= 0f && _auditHistoryAgreement < requiredAgreement)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("agreement");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "agreement");
             return false;
         }
 
         if (FormalCleanHasHistoryMismatch())
         {
-            RecordStrongCurrentProvisionalPromotionBlock("clean_history");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "clean_history");
             return false;
         }
 
         if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("dirty_pending");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "dirty_pending");
             return false;
         }
 
         if (_auditSameFrameDepthDeltaMeters >= 0f &&
             _auditSameFrameDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateSameFrameDepthDeltaMeters))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("same_frame");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "same_frame");
             return false;
         }
 
@@ -7617,7 +9787,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _auditCrossFrameCleanDepthDeltaMeters >= 0f &&
             _auditCrossFrameCleanDepthDeltaMeters >= Mathf.Max(0.001f, maxFormalIntegrateCrossFrameDepthDeltaMeters))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("cross_frame");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "cross_frame");
             return false;
         }
 
@@ -7625,25 +9795,25 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Mathf.Sign(oldTsdf) != Mathf.Sign(sampleTsdf) &&
             Mathf.Abs(oldTsdf - sampleTsdf) >= tsdfConflictThreshold)
         {
-            RecordStrongCurrentProvisionalPromotionBlock("conflict");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "conflict");
             return false;
         }
 
         if (!HasProvisionalPlaneCompatibility(index, sampleTsdf))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("plane");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "plane");
             return false;
         }
 
         if (!HasStrongCurrentPromotionLocalSupport(index, sampleTsdf))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("local");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "local");
             return false;
         }
 
         if (WouldStrongCurrentPromotionCreateDoubleLayer(index, sampleTsdf))
         {
-            RecordStrongCurrentProvisionalPromotionBlock("double_layer");
+            RecordStrongCurrentProvisionalPromotionBlock(index, "double_layer");
             return false;
         }
 
@@ -7776,9 +9946,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
     }
 
-    private void RecordStrongCurrentProvisionalPromotionBlock(string reason)
+    private void RecordStrongCurrentProvisionalPromotionBlock(int index, string reason)
     {
         LastStrongCurrentProvisionalPromotionBlockedCount++;
+        if (HasProvisionalTsdfMarker(index))
+        {
+            _provisionalPromotionBlockStates[index] = new ProvisionalPromotionBlockState
+            {
+                ReasonCode = StableProvisionalPromotionBlockReasonCode(reason),
+                Frame = LastRawFrameIndex
+            };
+        }
         switch (reason)
         {
             case "disabled":
@@ -7840,6 +10018,59 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             case "double_layer":
                 LastStrongCurrentPromotionDoubleLayerBlockCount++;
                 break;
+        }
+    }
+
+    private static byte StableProvisionalPromotionBlockReasonCode(string reason)
+    {
+        switch (reason)
+        {
+            case "disabled": return 1;
+            case "tag": return 2;
+            case "storage": return 3;
+            case "invalid": return 4;
+            case "hits": return 5;
+            case "weight": return 6;
+            case "band_history": return 7;
+            case "agreement": return 8;
+            case "clean_history": return 9;
+            case "dirty_pending": return 10;
+            case "same_frame": return 11;
+            case "cross_frame": return 12;
+            case "conflict": return 13;
+            case "local": return 14;
+            case "plane": return 15;
+            case "double_layer": return 16;
+            case "no_provisional_near_surface": return 17;
+            case "no_provisional_far_band": return 18;
+            default: return 255;
+        }
+    }
+
+    private static string StableProvisionalPromotionBlockReasonName(byte code)
+    {
+        switch (code)
+        {
+            case 1: return "disabled";
+            case 2: return "missing_strong_current_clean_tag";
+            case 3: return "storage_unavailable";
+            case 4: return "invalid_voxel";
+            case 5: return "insufficient_hits";
+            case 6: return "insufficient_weight";
+            case 7: return "insufficient_band_history";
+            case 8: return "history_agreement";
+            case 9: return "clean_history_mismatch";
+            case 10: return "dirty_or_pending";
+            case 11: return "same_frame_depth_conflict";
+            case 12: return "cross_frame_depth_conflict";
+            case 13: return "tsdf_sign_conflict";
+            case 14: return "insufficient_local_support";
+            case 15: return "plane_incompatible";
+            case 16: return "double_layer_risk";
+            case 17: return "not_provisional_near_surface";
+            case 18: return "not_provisional_far_band";
+            case 0: return "no_promotion_attempt_recorded";
+            default: return "other";
         }
     }
 
@@ -9967,6 +12198,74 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return true;
     }
 
+    private void RecordShadowBlockObservation(
+        Vector3 cameraPosition,
+        Vector3 surfacePoint,
+        Vector3 normal,
+        float weight,
+        int halfBandSteps,
+        ObservationVoteState vote,
+        bool clearing)
+    {
+        if (!enableShadowBlockReplay || !TryWorldToVoxel(surfacePoint, out int vx, out int vy, out int vz))
+            return;
+
+        int size = Mathf.Clamp(shadowReplayBlockSizeVoxels, 4, 16);
+        Vector3Int key = new Vector3Int(vx / size, vy / size, vz / size);
+        if (!_shadowBlockJournals.TryGetValue(key, out ShadowBlockJournal journal))
+        {
+            if (_shadowBlockJournals.Count >= Mathf.Max(32, maxShadowJournalBlocks))
+                EvictOldestShadowBlockJournal();
+            journal = new ShadowBlockJournal();
+            _shadowBlockJournals[key] = journal;
+        }
+
+        ShadowBlockObservation observation = new ShadowBlockObservation
+        {
+            Sequence = ++_shadowObservationSequence,
+            Frame = LastRawFrameIndex,
+            Camera = cameraPosition,
+            Surface = surfacePoint,
+            Normal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.up,
+            Weight = Mathf.Max(0f, weight),
+            HalfBandSteps = Mathf.Max(1, halfBandSteps),
+            Vote = vote,
+            Projective = useProjectiveTsdfIntegration,
+            Clearing = clearing
+        };
+
+        int capacity = Mathf.Max(64, maxShadowObservationsPerBlock);
+        if (journal.Observations.Count < capacity)
+            journal.Observations.Add(observation);
+        else
+        {
+            journal.Observations[journal.ReplaceCursor] = observation;
+            journal.ReplaceCursor = (journal.ReplaceCursor + 1) % capacity;
+            _shadowJournalDroppedObservations++;
+        }
+        journal.LastSequence = observation.Sequence;
+    }
+
+    private void EvictOldestShadowBlockJournal()
+    {
+        Vector3Int oldestKey = default;
+        int oldestSequence = int.MaxValue;
+        bool found = false;
+        foreach (KeyValuePair<Vector3Int, ShadowBlockJournal> pair in _shadowBlockJournals)
+        {
+            if (!found || pair.Value.LastSequence < oldestSequence)
+            {
+                found = true;
+                oldestKey = pair.Key;
+                oldestSequence = pair.Value.LastSequence;
+            }
+        }
+        if (!found)
+            return;
+        _shadowBlockJournals.Remove(oldestKey);
+        _shadowProblemBlockSet.Remove(oldestKey);
+    }
+
     private bool ShouldCarveFreeSpaceAtPixel(int x, int y, int stride)
     {
         if (!enableProjectiveFreeSpaceCarving)
@@ -10252,9 +12551,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int clearWeight = Mathf.Clamp(freeSpaceEvidenceClearWeight, 0, 4);
         bool commitClear = candidateWeight <= clearWeight &&
                            candidateTsdf >= Mathf.Clamp01(freeSpaceEvidenceClearTsdf);
+        float finalTsdf = commitClear ? 1f : candidateTsdf;
+        int finalWeight = commitClear ? 0 : Mathf.Max(1, candidateWeight);
 
-        _tsdf[index] = candidateTsdf;
-        _weights[index] = (byte)(commitClear ? 0 : Mathf.Max(1, candidateWeight));
+        if (protectZeroCrossFromDestructiveClearing &&
+            WouldCarveDestroyCleanZeroCross(index, finalTsdf, finalWeight, out int destroyedZeroCells))
+        {
+            LastFreeSpaceEvidenceBlockedTopologyCount++;
+            LastFreeSpaceEvidenceProtectedZeroCrossCellCount += destroyedZeroCells;
+            return;
+        }
+
+        _tsdf[index] = finalTsdf;
+        _weights[index] = (byte)finalWeight;
         LastFreeSpaceEvidenceAppliedCount++;
         if (commitClear)
         {
@@ -10276,6 +12585,52 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
         RecordContributionLedger(index, "free_space_carve", oldTsdf, oldWeight, 1f, carveWeight, _tsdf[index], _weights[index]);
         LastCarvedFreeSpaceVoxelCount++;
+    }
+
+    private bool WouldCarveDestroyCleanZeroCross(
+        int voxelIndex, float afterTsdf, int afterWeight, out int destroyedZeroCells)
+    {
+        destroyedZeroCells = 0;
+        IndexToVoxel(voxelIndex, out int voxelX, out int voxelY, out int voxelZ);
+        for (int cellZ = voxelZ - 1; cellZ <= voxelZ; cellZ++)
+        for (int cellY = voxelY - 1; cellY <= voxelY; cellY++)
+        for (int cellX = voxelX - 1; cellX <= voxelX; cellX++)
+        {
+            if (cellX < 0 || cellY < 0 || cellZ < 0 ||
+                cellX >= _dimX - 1 || cellY >= _dimY - 1 || cellZ >= _dimZ - 1)
+                continue;
+            bool before = CleanCellHasZeroCross(cellX, cellY, cellZ, -1, 0f, 0);
+            if (!before)
+                continue;
+            bool after = CleanCellHasZeroCross(
+                cellX, cellY, cellZ,
+                voxelIndex, afterTsdf, afterWeight);
+            if (!after)
+                destroyedZeroCells++;
+        }
+        return destroyedZeroCells > 0;
+    }
+
+    private bool CleanCellHasZeroCross(
+        int cellX, int cellY, int cellZ,
+        int overrideIndex, float overrideTsdf, int overrideWeight)
+    {
+        bool positive = false;
+        bool negative = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(
+                cellX + CornerOffsetX[corner],
+                cellY + CornerOffsetY[corner],
+                cellZ + CornerOffsetZ[corner]);
+            int weight = index == overrideIndex ? overrideWeight : _weights[index];
+            if (weight < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                continue;
+            float value = index == overrideIndex ? overrideTsdf : _tsdf[index];
+            positive |= value > 0f;
+            negative |= value < 0f;
+        }
+        return positive && negative;
     }
 
     private bool IsConfirmedSameFrameSurfaceWrite(int index, VoxelWriteProvenance provenance)
@@ -10350,6 +12705,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastFreeSpaceEvidenceClearedCount = 0;
         LastFreeSpaceEvidenceBlockedHighWeightCount = 0;
         LastFreeSpaceEvidenceBlockedSameFrameCount = 0;
+        LastFreeSpaceEvidenceBlockedTopologyCount = 0;
+        LastFreeSpaceEvidenceProtectedZeroCrossCellCount = 0;
         LastFreeSpaceEvidenceDuplicateFrameCount = 0;
         LastFreeSpaceEvidenceCancelledBySurfaceCount = 0;
     }
@@ -11430,6 +13787,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
         _voxelWriteSequence = 0;
+        _holeCellLifecycles.Clear();
+        _activeHoleLifecycleCells.Clear();
+        _previousStableQuadAuditRecords.Clear();
+        _stableQuadAuditRecords.Clear();
+        _stableQuadAuditEdges.Clear();
+        _stableQuadShadowStates.Clear();
+        _newbornPholdPreferredStates.Clear();
+        _newbornPholdPreferredObserved.Clear();
+        _newbornPholdReplacementProbations.Clear();
+        _naturallyObservedStableQuadKeys.Clear();
+        _newbornPholdCompetitionRebuildSequence = 0;
+        _holeLifecycleRebuildSequence = 0;
         _captureAuditVoxels.Clear();
         _tsdf = new float[count];
         _weights = new byte[count];
@@ -11461,6 +13830,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _provisionalTsdf = new byte[count];
         _provisionalTsdfLastFrame = new int[count];
         _provisionalTsdfHits = new byte[count];
+        _provisionalPromotionBlockStates.Clear();
         _oldCleanConflictHits = new byte[count];
         _oldCleanConflictLastFrame = new int[count];
         _freeSpaceEvidenceHits = new byte[count];
@@ -11502,6 +13872,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         byte[] cornerWeights,
         out Vector3 vertex)
     {
+        _lastBuiltCellRestoredByAtomicProvisionalBacking = false;
         if (UseLegacyMeshExtraction)
             return TryBuildLegacyCellVertex(x, y, z, cornerPositions, cornerValues, cornerWeights, out vertex);
 
@@ -11629,6 +14000,2369 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return Finite(vertex);
     }
 
+    private void EvaluateQuestRoomScanSurfaceNetsShadow(int cellX, int cellY, int cellZ)
+    {
+        if (_questRoomScanShadowCellFlags == null)
+            return;
+
+        System.Array.Clear(_questRoomScanShadowCellFlags, 0, _questRoomScanShadowCellFlags.Length);
+        if (!enableQuestRoomScanSurfaceNetsShadow)
+            return;
+
+        bool[] shadowCornerUnknown = new bool[8];
+        float[] shadowCornerValues = new float[8];
+        for (int z = 0; z < cellZ; z++)
+        for (int y = 0; y < cellY; y++)
+        for (int x = 0; x < cellX; x++)
+        {
+            int cellIndex = CellIndex(x, y, z, cellX, cellY);
+            bool formalActive = _cellVertexIndices[cellIndex] >= 0;
+            LastQuestRoomScanShadowCellScanCount++;
+
+            bool shadowActive = TryClassifyQuestRoomScanShadowCell(
+                x,
+                y,
+                z,
+                out int goodCrossings,
+                out int badCrossings,
+                out bool touchesSingleWeight,
+                out bool touchesPendingObservation,
+                out bool touchesRejectedObservation,
+                out bool touchesConflictHistory,
+                out bool touchesDirtyQuarantined,
+                out bool touchesPendingTsdfCorrection,
+                out bool touchesProvisional,
+                shadowCornerUnknown,
+                shadowCornerValues);
+
+            if (!shadowActive)
+            {
+                if (formalActive)
+                    LastQuestRoomScanShadowFormalOnlyCellCount++;
+                continue;
+            }
+
+            ushort shadowFlags = QrsShadowCellActiveFlag;
+            if (!formalActive)
+                shadowFlags |= QrsShadowCellAddedFlag;
+            if (badCrossings > 0)
+                shadowFlags |= QrsShadowCellUnknownAssistedFlag;
+            if (touchesSingleWeight)
+                shadowFlags |= QrsShadowCellSingleWeightFlag;
+            if (touchesPendingObservation)
+                shadowFlags |= QrsShadowCellPendingObservationFlag;
+            if (touchesRejectedObservation)
+                shadowFlags |= QrsShadowCellRejectedObservationFlag;
+            if (touchesConflictHistory)
+                shadowFlags |= QrsShadowCellConflictHistoryFlag;
+            if (touchesDirtyQuarantined)
+                shadowFlags |= QrsShadowCellDirtyQuarantinedFlag;
+            if (touchesPendingTsdfCorrection)
+                shadowFlags |= QrsShadowCellPendingTsdfCorrectionFlag;
+            if (touchesProvisional)
+                shadowFlags |= QrsShadowCellProvisionalFlag;
+            _questRoomScanShadowCellFlags[cellIndex] = shadowFlags;
+            LastQuestRoomScanShadowActiveCellCount++;
+            LastQuestRoomScanShadowGoodCrossingCount += goodCrossings;
+            LastQuestRoomScanShadowBadCrossingCount += badCrossings;
+            if (formalActive)
+                LastQuestRoomScanShadowSharedFormalCellCount++;
+            else
+            {
+                LastQuestRoomScanShadowAddedCellCount++;
+                if (badCrossings > 0)
+                    LastQuestRoomScanShadowAddedUnknownAssistedCellCount++;
+                else
+                    LastQuestRoomScanShadowAddedAllObservedCellCount++;
+                if (touchesSingleWeight)
+                    LastQuestRoomScanShadowAddedSingleWeightCellCount++;
+                if (touchesPendingObservation)
+                    LastQuestRoomScanShadowAddedPendingObservationCellCount++;
+                if (touchesRejectedObservation)
+                    LastQuestRoomScanShadowAddedRejectedObservationCellCount++;
+                if (touchesConflictHistory)
+                    LastQuestRoomScanShadowAddedConflictHistoryCellCount++;
+                bool touchesDirtyPendingProvisional = touchesDirtyQuarantined ||
+                                                      touchesPendingTsdfCorrection ||
+                                                      touchesProvisional;
+                if (touchesDirtyPendingProvisional)
+                    LastQuestRoomScanShadowAddedDirtyPendingProvisionalCellCount++;
+                if (touchesDirtyQuarantined)
+                    LastQuestRoomScanShadowAddedDirtyQuarantinedCellCount++;
+                if (touchesPendingTsdfCorrection)
+                    LastQuestRoomScanShadowAddedPendingTsdfCorrectionCellCount++;
+                if (touchesProvisional)
+                    LastQuestRoomScanShadowAddedProvisionalCellCount++;
+
+                bool policyRisk = touchesPendingObservation ||
+                                  touchesRejectedObservation ||
+                                  touchesConflictHistory ||
+                                  touchesDirtyQuarantined ||
+                                  touchesPendingTsdfCorrection;
+                if (policyRisk)
+                    LastQuestRoomScanShadowAddedPolicyRiskCellCount++;
+                else if (badCrossings > 0 || touchesSingleWeight || touchesProvisional)
+                    LastQuestRoomScanShadowAddedEvidenceLimitedCellCount++;
+                else
+                    LastQuestRoomScanShadowAddedStrongSafeCellCount++;
+
+                if (!policyRisk && touchesProvisional)
+                {
+                    LastQuestRoomScanShadowAddedCleanProvisionalCellCount++;
+                    if (badCrossings <= 0)
+                    {
+                        if (touchesSingleWeight)
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightCellCount++;
+                        else
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount++;
+                    }
+                    else if (touchesSingleWeight)
+                    {
+                        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightCellCount++;
+                    }
+                    else
+                    {
+                        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightCellCount++;
+                    }
+                }
+            }
+            if (badCrossings > 0)
+                LastQuestRoomScanShadowUnknownAssistedCellCount++;
+            else
+                LastQuestRoomScanShadowAllObservedCellCount++;
+            if (touchesSingleWeight)
+                LastQuestRoomScanShadowSingleWeightCellCount++;
+            if (touchesPendingObservation)
+                LastQuestRoomScanShadowPendingObservationCellCount++;
+            if (touchesRejectedObservation)
+                LastQuestRoomScanShadowRejectedObservationCellCount++;
+            if (touchesConflictHistory)
+                LastQuestRoomScanShadowConflictHistoryCellCount++;
+            bool touchesAnyDirtyPendingProvisional = touchesDirtyQuarantined ||
+                                                     touchesPendingTsdfCorrection ||
+                                                     touchesProvisional;
+            if (touchesAnyDirtyPendingProvisional)
+                LastQuestRoomScanShadowDirtyPendingProvisionalCellCount++;
+            if (touchesDirtyQuarantined)
+                LastQuestRoomScanShadowDirtyQuarantinedCellCount++;
+            if (touchesPendingTsdfCorrection)
+                LastQuestRoomScanShadowPendingTsdfCorrectionCellCount++;
+            if (touchesProvisional)
+                LastQuestRoomScanShadowProvisionalCellCount++;
+        }
+
+    }
+
+    private void AppendQuestRoomScanAddedRiskSummary(StringBuilder summary)
+    {
+        summary.AppendLine("qrs_shadow_added_cells_unknown_assisted=" + LastQuestRoomScanShadowAddedUnknownAssistedCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_all_observed=" + LastQuestRoomScanShadowAddedAllObservedCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_single_weight=" + LastQuestRoomScanShadowAddedSingleWeightCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_obs_pending=" + LastQuestRoomScanShadowAddedPendingObservationCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_obs_rejected=" + LastQuestRoomScanShadowAddedRejectedObservationCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_conflict_history=" + LastQuestRoomScanShadowAddedConflictHistoryCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_dirty_pending_provisional=" + LastQuestRoomScanShadowAddedDirtyPendingProvisionalCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_dirty_quarantined=" + LastQuestRoomScanShadowAddedDirtyQuarantinedCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_pending_tsdf_correction=" + LastQuestRoomScanShadowAddedPendingTsdfCorrectionCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_touch_provisional=" + LastQuestRoomScanShadowAddedProvisionalCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_policy_risk_definition=obs_pending_or_rejected_or_conflict_history_or_dirty_quarantined_or_pending_tsdf_correction");
+        summary.AppendLine("qrs_shadow_added_cells_evidence_limited_definition=no_policy_risk_and_unknown_assisted_or_single_weight_or_provisional");
+        summary.AppendLine("qrs_shadow_added_cells_strong_safe_definition=no_policy_risk_and_all_observed_and_not_single_weight_and_not_provisional");
+        summary.AppendLine("qrs_shadow_added_cells_policy_risk=" + LastQuestRoomScanShadowAddedPolicyRiskCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_evidence_limited=" + LastQuestRoomScanShadowAddedEvidenceLimitedCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_strong_safe=" + LastQuestRoomScanShadowAddedStrongSafeCellCount);
+        summary.AppendLine("qrs_shadow_added_cells_tier_reconcile_delta=" +
+                           (LastQuestRoomScanShadowAddedCellCount -
+                            LastQuestRoomScanShadowAddedPolicyRiskCellCount -
+                            LastQuestRoomScanShadowAddedEvidenceLimitedCellCount -
+                            LastQuestRoomScanShadowAddedStrongSafeCellCount));
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells=" + LastQuestRoomScanShadowAddedCleanProvisionalCellCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells_all_observed_multi_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells_all_observed_single_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightCellCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells_unknown_assisted_multi_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightCellCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells_unknown_assisted_single_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightCellCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_cells_profile_reconcile_delta=" +
+                           (LastQuestRoomScanShadowAddedCleanProvisionalCellCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightCellCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightCellCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightCellCount));
+        summary.AppendLine("qrs_shadow_added_quads_unknown_assisted=" + LastQuestRoomScanShadowAddedQuadUnknownAssistedCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_single_weight=" + LastQuestRoomScanShadowAddedQuadSingleWeightCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_obs_pending=" + LastQuestRoomScanShadowAddedQuadPendingObservationCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_obs_rejected=" + LastQuestRoomScanShadowAddedQuadRejectedObservationCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_conflict_history=" + LastQuestRoomScanShadowAddedQuadConflictHistoryCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_dirty_pending_provisional=" + LastQuestRoomScanShadowAddedQuadDirtyPendingProvisionalCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_dirty_quarantined=" + LastQuestRoomScanShadowAddedQuadDirtyQuarantinedCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_pending_tsdf_correction=" + LastQuestRoomScanShadowAddedQuadPendingTsdfCorrectionCount);
+        summary.AppendLine("qrs_shadow_added_quads_touch_provisional=" + LastQuestRoomScanShadowAddedQuadProvisionalCount);
+        summary.AppendLine("qrs_shadow_added_quads_policy_risk_definition=any_added_cell_obs_pending_or_rejected_or_conflict_history_or_dirty_quarantined_or_pending_tsdf_correction");
+        summary.AppendLine("qrs_shadow_added_quads_evidence_limited_definition=no_policy_risk_and_any_added_cell_unknown_assisted_or_single_weight_or_provisional");
+        summary.AppendLine("qrs_shadow_added_quads_strong_safe_definition=no_policy_risk_and_all_added_cells_observed_not_single_weight_not_provisional");
+        summary.AppendLine("qrs_shadow_added_quads_policy_risk=" + LastQuestRoomScanShadowAddedQuadPolicyRiskCount);
+        summary.AppendLine("qrs_shadow_added_quads_evidence_limited=" + LastQuestRoomScanShadowAddedQuadEvidenceLimitedCount);
+        summary.AppendLine("qrs_shadow_added_quads_strong_safe=" + LastQuestRoomScanShadowAddedQuadStrongSafeCount);
+        summary.AppendLine("qrs_shadow_added_quads_tier_reconcile_delta=" +
+                           (LastQuestRoomScanShadowQuadUsesAddedCellCount -
+                            LastQuestRoomScanShadowAddedQuadPolicyRiskCount -
+                            LastQuestRoomScanShadowAddedQuadEvidenceLimitedCount -
+                            LastQuestRoomScanShadowAddedQuadStrongSafeCount));
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads=" + LastQuestRoomScanShadowAddedCleanProvisionalQuadCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads_all_observed_multi_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads_all_observed_single_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightQuadCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads_unknown_assisted_multi_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightQuadCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads_unknown_assisted_single_weight=" + LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightQuadCount);
+        summary.AppendLine("qrs_shadow_added_clean_provisional_quads_profile_reconcile_delta=" +
+                           (LastQuestRoomScanShadowAddedCleanProvisionalQuadCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightQuadCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightQuadCount -
+                            LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightQuadCount));
+    }
+
+    private bool TryClassifyQuestRoomScanShadowCell(
+        int x,
+        int y,
+        int z,
+        out int goodCrossings,
+        out int badCrossings,
+        out bool touchesSingleWeight,
+        out bool touchesPendingObservation,
+        out bool touchesRejectedObservation,
+        out bool touchesConflictHistory,
+        out bool touchesDirtyQuarantined,
+        out bool touchesPendingTsdfCorrection,
+        out bool touchesProvisional,
+        bool[] cornerUnknown,
+        float[] cornerValues)
+    {
+        int crossingCount = 0;
+        badCrossings = 0;
+        touchesSingleWeight = false;
+        touchesPendingObservation = false;
+        touchesRejectedObservation = false;
+        touchesConflictHistory = false;
+        touchesDirtyQuarantined = false;
+        touchesPendingTsdfCorrection = false;
+        touchesProvisional = false;
+
+        int minWeight = Mathf.Max(1, questRoomScanShadowMinWeight);
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(x + CornerOffsetX[corner], y + CornerOffsetY[corner], z + CornerOffsetZ[corner]);
+            bool saturatedNegativeEmpty = questRoomScanShadowTreatSaturatedNegativeAsEmpty && _tsdf[index] <= -0.99f;
+            bool unknown = _weights[index] < minWeight || saturatedNegativeEmpty;
+            cornerUnknown[corner] = unknown;
+            cornerValues[corner] = unknown ? 0f : _tsdf[index];
+
+            if (!unknown && _weights[index] < Mathf.Max(minWeight + 1, minSurfaceCornerWeight))
+                touchesSingleWeight = true;
+        }
+
+        for (int edge = 0; edge < 12; edge++)
+        {
+            int a = CubeEdges[edge, 0];
+            int b = CubeEdges[edge, 1];
+            bool crosses = (cornerValues[a] < 0f) != (cornerValues[b] < 0f);
+            if (!crosses)
+                continue;
+            crossingCount++;
+            if (cornerUnknown[a] || cornerUnknown[b])
+                badCrossings++;
+        }
+
+        goodCrossings = crossingCount - badCrossings;
+        bool active = crossingCount >= 3 && goodCrossings > 0;
+        if (!active)
+            return false;
+
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(x + CornerOffsetX[corner], y + CornerOffsetY[corner], z + CornerOffsetZ[corner]);
+            if (_surfaceObservationState != null && index < _surfaceObservationState.Length)
+            {
+                byte observationState = _surfaceObservationState[index];
+                touchesPendingObservation |= observationState == 2;
+                touchesRejectedObservation |= observationState == 4;
+            }
+            touchesConflictHistory |=
+                (_oldCleanConflictHits != null && index < _oldCleanConflictHits.Length && _oldCleanConflictHits[index] > 0) ||
+                (_voxelAuditLifecycle.TryGetValue(index, out VoxelAuditLifecycle lifecycle) && lifecycle.ConflictCount > 0);
+            touchesDirtyQuarantined |= VoxelIsDirtyQuarantined(index);
+            touchesPendingTsdfCorrection |= VoxelHasPendingTsdfCorrection(index);
+            touchesProvisional |= HasProvisionalTsdfMarker(index);
+        }
+        return true;
+    }
+
+    private void CountQuestRoomScanShadowQuadsAtVoxel(
+        int x,
+        int y,
+        int z,
+        int index,
+        int cellX,
+        int cellY,
+        int cellZ)
+    {
+        if (!enableQuestRoomScanSurfaceNetsShadow || _questRoomScanShadowCellFlags == null)
+            return;
+        if (x + 1 < _dimX && QuestRoomScanShadowSignChange(index, Index(x + 1, y, z)))
+            CountQuestRoomScanShadowQuadAroundXEdge(x, y, z, cellX, cellY, cellZ);
+        if (y + 1 < _dimY && QuestRoomScanShadowSignChange(index, Index(x, y + 1, z)))
+            CountQuestRoomScanShadowQuadAroundYEdge(x, y, z, cellX, cellY, cellZ);
+        if (z + 1 < _dimZ && QuestRoomScanShadowSignChange(index, Index(x, y, z + 1)))
+            CountQuestRoomScanShadowQuadAroundZEdge(x, y, z, cellX, cellY, cellZ);
+    }
+
+    private bool QuestRoomScanShadowSignChange(int indexA, int indexB)
+    {
+        float valueA = QuestRoomScanShadowSample(indexA);
+        float valueB = QuestRoomScanShadowSample(indexB);
+        return (valueA < 0f) != (valueB < 0f);
+    }
+
+    private float QuestRoomScanShadowSample(int index)
+    {
+        int minWeight = Mathf.Max(1, questRoomScanShadowMinWeight);
+        if (_weights[index] < minWeight)
+            return 0f;
+        if (questRoomScanShadowTreatSaturatedNegativeAsEmpty && _tsdf[index] <= -0.99f)
+            return 0f;
+        return _tsdf[index];
+    }
+
+    private void CountQuestRoomScanShadowQuadAroundXEdge(int x, int y, int z, int cellX, int cellY, int cellZ)
+    {
+        if (y <= 0 || z <= 0 || x >= cellX)
+            return;
+        RecordQuestRoomScanShadowQuad(
+            CellIndex(x, y, z, cellX, cellY),
+            CellIndex(x, y - 1, z, cellX, cellY),
+            CellIndex(x, y - 1, z - 1, cellX, cellY),
+            CellIndex(x, y, z - 1, cellX, cellY));
+    }
+
+    private void CountQuestRoomScanShadowQuadAroundYEdge(int x, int y, int z, int cellX, int cellY, int cellZ)
+    {
+        if (x <= 0 || z <= 0 || y >= cellY)
+            return;
+        RecordQuestRoomScanShadowQuad(
+            CellIndex(x, y, z, cellX, cellY),
+            CellIndex(x, y, z - 1, cellX, cellY),
+            CellIndex(x - 1, y, z - 1, cellX, cellY),
+            CellIndex(x - 1, y, z, cellX, cellY));
+    }
+
+    private void CountQuestRoomScanShadowQuadAroundZEdge(int x, int y, int z, int cellX, int cellY, int cellZ)
+    {
+        if (x <= 0 || y <= 0 || z >= cellZ)
+            return;
+        RecordQuestRoomScanShadowQuad(
+            CellIndex(x, y, z, cellX, cellY),
+            CellIndex(x - 1, y, z, cellX, cellY),
+            CellIndex(x - 1, y - 1, z, cellX, cellY),
+            CellIndex(x, y - 1, z, cellX, cellY));
+    }
+
+    private void RecordQuestRoomScanShadowQuad(int a, int b, int c, int d)
+    {
+        ushort flagsA = _questRoomScanShadowCellFlags[a];
+        ushort flagsB = _questRoomScanShadowCellFlags[b];
+        ushort flagsC = _questRoomScanShadowCellFlags[c];
+        ushort flagsD = _questRoomScanShadowCellFlags[d];
+        if ((flagsA & QrsShadowCellActiveFlag) == 0 ||
+            (flagsB & QrsShadowCellActiveFlag) == 0 ||
+            (flagsC & QrsShadowCellActiveFlag) == 0 ||
+            (flagsD & QrsShadowCellActiveFlag) == 0)
+        {
+            return;
+        }
+
+        LastQuestRoomScanShadowQuadCount++;
+        bool allFormal = _cellVertexIndices[a] >= 0 &&
+                         _cellVertexIndices[b] >= 0 &&
+                         _cellVertexIndices[c] >= 0 &&
+                         _cellVertexIndices[d] >= 0;
+        if (allFormal)
+            LastQuestRoomScanShadowQuadAllFormalCellsCount++;
+        else
+        {
+            LastQuestRoomScanShadowQuadUsesAddedCellCount++;
+            ushort addedFlags = 0;
+            if ((flagsA & QrsShadowCellAddedFlag) != 0)
+                addedFlags |= flagsA;
+            if ((flagsB & QrsShadowCellAddedFlag) != 0)
+                addedFlags |= flagsB;
+            if ((flagsC & QrsShadowCellAddedFlag) != 0)
+                addedFlags |= flagsC;
+            if ((flagsD & QrsShadowCellAddedFlag) != 0)
+                addedFlags |= flagsD;
+            bool allAddedProvisional =
+                ((flagsA & QrsShadowCellAddedFlag) == 0 || (flagsA & QrsShadowCellProvisionalFlag) != 0) &&
+                ((flagsB & QrsShadowCellAddedFlag) == 0 || (flagsB & QrsShadowCellProvisionalFlag) != 0) &&
+                ((flagsC & QrsShadowCellAddedFlag) == 0 || (flagsC & QrsShadowCellProvisionalFlag) != 0) &&
+                ((flagsD & QrsShadowCellAddedFlag) == 0 || (flagsD & QrsShadowCellProvisionalFlag) != 0);
+
+            bool unknownAssisted = (addedFlags & QrsShadowCellUnknownAssistedFlag) != 0;
+            bool singleWeight = (addedFlags & QrsShadowCellSingleWeightFlag) != 0;
+            bool pendingObservation = (addedFlags & QrsShadowCellPendingObservationFlag) != 0;
+            bool rejectedObservation = (addedFlags & QrsShadowCellRejectedObservationFlag) != 0;
+            bool conflictHistory = (addedFlags & QrsShadowCellConflictHistoryFlag) != 0;
+            bool dirtyQuarantined = (addedFlags & QrsShadowCellDirtyQuarantinedFlag) != 0;
+            bool pendingTsdfCorrection = (addedFlags & QrsShadowCellPendingTsdfCorrectionFlag) != 0;
+            bool provisional = (addedFlags & QrsShadowCellProvisionalFlag) != 0;
+            bool dirtyPendingProvisional = dirtyQuarantined || pendingTsdfCorrection || provisional;
+            if (unknownAssisted)
+                LastQuestRoomScanShadowAddedQuadUnknownAssistedCount++;
+            if (singleWeight)
+                LastQuestRoomScanShadowAddedQuadSingleWeightCount++;
+            if (pendingObservation)
+                LastQuestRoomScanShadowAddedQuadPendingObservationCount++;
+            if (rejectedObservation)
+                LastQuestRoomScanShadowAddedQuadRejectedObservationCount++;
+            if (conflictHistory)
+                LastQuestRoomScanShadowAddedQuadConflictHistoryCount++;
+            if (dirtyPendingProvisional)
+                LastQuestRoomScanShadowAddedQuadDirtyPendingProvisionalCount++;
+            if (dirtyQuarantined)
+                LastQuestRoomScanShadowAddedQuadDirtyQuarantinedCount++;
+            if (pendingTsdfCorrection)
+                LastQuestRoomScanShadowAddedQuadPendingTsdfCorrectionCount++;
+            if (provisional)
+                LastQuestRoomScanShadowAddedQuadProvisionalCount++;
+
+            bool policyRisk = pendingObservation ||
+                              rejectedObservation ||
+                              conflictHistory ||
+                              dirtyQuarantined ||
+                              pendingTsdfCorrection;
+            if (policyRisk)
+                LastQuestRoomScanShadowAddedQuadPolicyRiskCount++;
+            else if (unknownAssisted || singleWeight || provisional)
+                LastQuestRoomScanShadowAddedQuadEvidenceLimitedCount++;
+            else
+                LastQuestRoomScanShadowAddedQuadStrongSafeCount++;
+
+            if (!policyRisk && allAddedProvisional)
+            {
+                LastQuestRoomScanShadowAddedCleanProvisionalQuadCount++;
+                if (!unknownAssisted)
+                {
+                    if (singleWeight)
+                        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightQuadCount++;
+                    else
+                        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount++;
+                }
+                else if (singleWeight)
+                {
+                    LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightQuadCount++;
+                }
+                else
+                {
+                    LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightQuadCount++;
+                }
+            }
+        }
+    }
+
+    private void RepairPrecisionHoleRoutes()
+    {
+        if (_tsdf == null || _weights == null || _activeHoleLifecycleCells.Count == 0)
+            return;
+
+        int noZeroBudget = Mathf.Max(1, maxNoZeroCrossRecoveriesPerRebuild);
+        int pendingBudget = Mathf.Max(1, maxPendingHolePromotionsPerRebuild);
+        foreach (Vector3Int cell in _activeHoleLifecycleCells)
+        {
+            if (!_holeCellLifecycles.TryGetValue(cell, out HoleCellLifecycle lifecycle) || !lifecycle.Active)
+                continue;
+
+            if (enableShadowBlockReplay &&
+                lifecycle.ConsecutiveRebuilds >= Mathf.Max(2, minShadowProblemConsecutiveRebuilds))
+            {
+                EnqueueShadowProblemBlock(cell);
+            }
+
+            if (enableNoZeroCrossHistoryRecovery && noZeroBudget > 0 &&
+                lifecycle.LastCause == HoleSupportCause.NoZeroCross &&
+                lifecycle.ConsecutiveRebuilds >= Mathf.Max(1, minNoZeroCrossLifecycleRebuilds))
+            {
+                LastNoZeroCrossRouteCandidateCount++;
+                if (TryRecoverNoZeroCrossCell(cell.x, cell.y, cell.z))
+                {
+                    LastNoZeroCrossRouteAppliedCount++;
+                    noZeroBudget--;
+                }
+            }
+            else if (enablePendingHolePromotion && pendingBudget > 0 &&
+                     lifecycle.LastCause == HoleSupportCause.Pending &&
+                     lifecycle.ConsecutiveRebuilds >= Mathf.Max(1, minPendingHoleLifecycleRebuilds))
+            {
+                LastPendingHoleRouteCandidateCount++;
+                if (TryPromotePendingHoleCell(cell.x, cell.y, cell.z))
+                {
+                    LastPendingHoleRouteAppliedCount++;
+                    pendingBudget--;
+                }
+            }
+
+            if (noZeroBudget <= 0 && pendingBudget <= 0 && !enableShadowBlockReplay)
+                break;
+        }
+
+        EvaluateShadowReplayQueue();
+    }
+
+    private bool TryRecoverNoZeroCrossCell(int cellX, int cellY, int cellZ)
+    {
+        if (!TryGetFormalCellSignState(cellX, cellY, cellZ, out bool hasPositive, out bool hasNegative) ||
+            hasPositive == hasNegative)
+        {
+            LastNoZeroCrossRouteBlockedTopologyCount++;
+            return false;
+        }
+
+        bool recoverPositive = hasNegative;
+        List<PrecisionHolePatchCandidate> candidates = new List<PrecisionHolePatchCandidate>(8);
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(cellX + CornerOffsetX[corner], cellY + CornerOffsetY[corner], cellZ + CornerOffsetZ[corner]);
+            if (VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index) || HasProvisionalTsdfMarker(index))
+            {
+                LastNoZeroCrossRouteHistoryCornerDirtyPendingCount++;
+                continue;
+            }
+            int[] desiredRetained = recoverPositive ? _acceptedPositiveRetainedLastSequence : _acceptedNegativeRetainedLastSequence;
+            int[] desiredAccepted = recoverPositive ? _acceptedPositiveLastSequence : _acceptedNegativeLastSequence;
+            int[] opposite = recoverPositive ? _acceptedNegativeLastSequence : _acceptedPositiveLastSequence;
+            if (desiredRetained == null || desiredAccepted == null || opposite == null)
+            {
+                LastNoZeroCrossRouteHistoryCornerMissingArraysCount++;
+                continue;
+            }
+            int retainedSequence = desiredRetained[index];
+            int acceptedSequence = desiredAccepted[index];
+            int oppositeSequence = opposite[index];
+            if (retainedSequence == int.MinValue && acceptedSequence == int.MinValue)
+            {
+                LastNoZeroCrossRouteHistoryCornerNoDesiredCount++;
+                continue;
+            }
+            bool retainedEvidence = retainedSequence != int.MinValue && retainedSequence > oppositeSequence;
+            bool acceptedFallback = acceptedSequence != int.MinValue && acceptedSequence > oppositeSequence;
+            if (!retainedEvidence && !acceptedFallback)
+            {
+                LastNoZeroCrossRouteHistoryCornerOppositeDominatesCount++;
+                continue;
+            }
+            if (_weights[index] > 0 && Mathf.Abs(_tsdf[index]) > Mathf.Clamp01(acceptedSignRecoveryMaxAbsTsdf))
+            {
+                LastNoZeroCrossRouteHistoryCornerTsdfMagnitudeCount++;
+                continue;
+            }
+            LastNoZeroCrossRouteHistoryCornerEligibleCount++;
+            candidates.Add(new PrecisionHolePatchCandidate
+            {
+                Index = index,
+                Tsdf = (recoverPositive ? 1f : -1f) * Mathf.Clamp(noZeroCrossRecoveryAbsTsdf, 0.02f, 0.4f),
+                Evidence = retainedEvidence ? desiredRetained[index] : desiredAccepted[index],
+                EvidenceKind = retainedEvidence ? 1 : 2
+            });
+        }
+
+        if (candidates.Count < Mathf.Clamp(minPrecisionHolePatchVoxels, 2, 4))
+        {
+            LastNoZeroCrossRouteBlockedHistoryCount++;
+            if (candidates.Count <= 0)
+                LastNoZeroCrossRouteHistoryCandidate0Count++;
+            else if (candidates.Count == 1)
+                LastNoZeroCrossRouteHistoryCandidate1Count++;
+            else if (candidates.Count == 2)
+                LastNoZeroCrossRouteHistoryCandidate2Count++;
+            else
+                LastNoZeroCrossRouteHistoryCandidate3PlusCount++;
+            return false;
+        }
+
+        candidates.Sort((a, b) => b.Evidence.CompareTo(a.Evidence));
+        if (!TryBuildValidatedPrecisionHolePatch(cellX, cellY, cellZ, candidates, out Dictionary<int, HoleSideRepairProposal> patch))
+        {
+            LastNoZeroCrossRouteBlockedTopologyCount++;
+            return false;
+        }
+
+        foreach (PrecisionHolePatchCandidate candidate in candidates)
+        {
+            if (!patch.TryGetValue(candidate.Index, out HoleSideRepairProposal proposal))
+                continue;
+            float oldTsdf = _tsdf[candidate.Index];
+            int oldWeight = _weights[candidate.Index];
+            _tsdf[candidate.Index] = proposal.Tsdf;
+            _weights[candidate.Index] = (byte)Mathf.Max(minSurfaceCornerWeight, Mathf.Min(oldWeight, acceptedSignRecoveryOldWeightCap));
+            RecordContributionLedger(candidate.Index, "hole_nzc_atomic_patch", oldTsdf, oldWeight, proposal.Tsdf, 1f, proposal.Tsdf, _weights[candidate.Index]);
+        }
+        LastPrecisionHolePatchAppliedCount++;
+        LastPrecisionHolePatchVoxelCount += patch.Count;
+        if (candidates[0].EvidenceKind == 1)
+            LastNoZeroCrossRouteRetainedEvidenceCount++;
+        else
+            LastNoZeroCrossRouteAcceptedFallbackCount++;
+        return true;
+    }
+
+    private void EnqueueShadowProblemBlock(Vector3Int cell)
+    {
+        int size = Mathf.Clamp(shadowReplayBlockSizeVoxels, 4, 16);
+        Vector3Int key = new Vector3Int(cell.x / size, cell.y / size, cell.z / size);
+        if (!_shadowBlockJournals.ContainsKey(key) || _shadowProblemBlockSet.Contains(key))
+            return;
+        int capacity = Mathf.Max(16, maxShadowProblemQueueBlocks);
+        while (_shadowProblemBlockQueue.Count >= capacity)
+        {
+            Vector3Int dropped = _shadowProblemBlockQueue.Dequeue();
+            _shadowProblemBlockSet.Remove(dropped);
+        }
+        _shadowProblemBlockQueue.Enqueue(key);
+        _shadowProblemBlockSet.Add(key);
+    }
+
+    private void EvaluateShadowReplayQueue()
+    {
+        if (!enableShadowBlockReplay || _shadowProblemBlockQueue.Count == 0)
+            return;
+        int budget = Mathf.Max(1, maxShadowReplayBlocksPerRebuild);
+        while (budget-- > 0 && _shadowProblemBlockQueue.Count > 0)
+        {
+            Vector3Int key = _shadowProblemBlockQueue.Dequeue();
+            _shadowProblemBlockSet.Remove(key);
+            EvaluateShadowReplayBlock(key);
+        }
+        LastShadowProblemQueueCount = _shadowProblemBlockQueue.Count;
+    }
+
+    private void EvaluateShadowReplayBlock(Vector3Int key)
+    {
+        int blockSize = Mathf.Clamp(shadowReplayBlockSizeVoxels, 4, 16);
+        int minX = Mathf.Max(0, key.x * blockSize - 1);
+        int minY = Mathf.Max(0, key.y * blockSize - 1);
+        int minZ = Mathf.Max(0, key.z * blockSize - 1);
+        int maxX = Mathf.Min(_dimX - 1, (key.x + 1) * blockSize);
+        int maxY = Mathf.Min(_dimY - 1, (key.y + 1) * blockSize);
+        int maxZ = Mathf.Min(_dimZ - 1, (key.z + 1) * blockSize);
+        int sx = maxX - minX + 1;
+        int sy = maxY - minY + 1;
+        int sz = maxZ - minZ + 1;
+        if (sx < 2 || sy < 2 || sz < 2)
+            return;
+
+        List<ShadowBlockObservation> observations = new List<ShadowBlockObservation>(1024);
+        for (int z = key.z - 1; z <= key.z + 1; z++)
+        for (int y = key.y - 1; y <= key.y + 1; y++)
+        for (int x = key.x - 1; x <= key.x + 1; x++)
+        {
+            if (_shadowBlockJournals.TryGetValue(new Vector3Int(x, y, z), out ShadowBlockJournal journal))
+                observations.AddRange(journal.Observations);
+        }
+        if (observations.Count == 0)
+            return;
+        observations.Sort((a, b) => a.Sequence.CompareTo(b.Sequence));
+        int replayObservationCap = Mathf.Max(256, maxShadowReplayObservationsPerEvaluation);
+        if (observations.Count > replayObservationCap)
+            observations.RemoveRange(0, observations.Count - replayObservationCap);
+
+        int voxelCount = sx * sy * sz;
+        float[] baselineTsdf = new float[voxelCount];
+        float[] baselineWeight = new float[voxelCount];
+        float[] baselinePendingTsdf = new float[voxelCount];
+        float[] baselinePendingWeight = new float[voxelCount];
+        InitializeShadowFromCurrentSnapshot(
+            minX, minY, minZ, sx, sy, sz,
+            baselineTsdf, baselineWeight,
+            baselinePendingTsdf, baselinePendingWeight);
+
+        float[] acceptOnlyTsdf = (float[])baselineTsdf.Clone();
+        float[] acceptOnlyWeight = (float[])baselineWeight.Clone();
+        float[] acceptOnlyPendingTsdf = (float[])baselinePendingTsdf.Clone();
+        float[] acceptOnlyPendingWeight = (float[])baselinePendingWeight.Clone();
+        float[] clearOnlyTsdf = (float[])baselineTsdf.Clone();
+        float[] clearOnlyWeight = (float[])baselineWeight.Clone();
+        float[] clearOnlyPendingTsdf = (float[])baselinePendingTsdf.Clone();
+        float[] clearOnlyPendingWeight = (float[])baselinePendingWeight.Clone();
+        float[] clearDestructiveTsdf = (float[])baselineTsdf.Clone();
+        float[] clearDestructiveWeight = (float[])baselineWeight.Clone();
+        float[] clearConstructiveTsdf = (float[])baselineTsdf.Clone();
+        float[] clearConstructiveWeight = (float[])baselineWeight.Clone();
+        float[] clearNeutralTsdf = (float[])baselineTsdf.Clone();
+        float[] clearNeutralWeight = (float[])baselineWeight.Clone();
+        float[] fullTsdf = (float[])baselineTsdf.Clone();
+        float[] fullWeight = (float[])baselineWeight.Clone();
+        float[] fullPendingTsdf = (float[])baselinePendingTsdf.Clone();
+        float[] fullPendingWeight = (float[])baselinePendingWeight.Clone();
+        float[] alignedTsdf = (float[])baselineTsdf.Clone();
+        float[] alignedWeight = (float[])baselineWeight.Clone();
+        float[] mixedTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedWeight = (float[])baselineWeight.Clone();
+        float[] mixedDestructiveTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedDestructiveWeight = (float[])baselineWeight.Clone();
+        float[] mixedConstructiveTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedConstructiveWeight = (float[])baselineWeight.Clone();
+        float[] mixedNeutralTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedNeutralWeight = (float[])baselineWeight.Clone();
+        float[] mixedVoxelVetoTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedVoxelVetoWeight = (float[])baselineWeight.Clone();
+        float[] mixedObsPendingTsdf = (float[])baselineTsdf.Clone();
+        float[] mixedObsPendingWeight = (float[])baselineWeight.Clone();
+        float[] mixedObsPendingBandTsdf = (float[])baselinePendingTsdf.Clone();
+        float[] mixedObsPendingBandWeight = (float[])baselinePendingWeight.Clone();
+        float[] topologyScratchTsdf = new float[voxelCount];
+        float[] topologyScratchWeight = new float[voxelCount];
+        float[] conflictTsdf = (float[])baselineTsdf.Clone();
+        float[] conflictWeight = (float[])baselineWeight.Clone();
+        float[] newSpaceTsdf = (float[])baselineTsdf.Clone();
+        float[] newSpaceWeight = (float[])baselineWeight.Clone();
+        float[] mixedConflict0To25Tsdf = (float[])baselineTsdf.Clone();
+        float[] mixedConflict0To25Weight = (float[])baselineWeight.Clone();
+        float[] mixedConflict25To50Tsdf = (float[])baselineTsdf.Clone();
+        float[] mixedConflict25To50Weight = (float[])baselineWeight.Clone();
+        float[] mixedConflict50To75Tsdf = (float[])baselineTsdf.Clone();
+        float[] mixedConflict50To75Weight = (float[])baselineWeight.Clone();
+        float[] mixedConflict75To100Tsdf = (float[])baselineTsdf.Clone();
+        float[] mixedConflict75To100Weight = (float[])baselineWeight.Clone();
+
+        int acceptCount = 0;
+        int pendingCount = 0;
+        int rejectCount = 0;
+        int clearingCount = 0;
+        int alignedCount = 0;
+        int mixedCount = 0;
+        int conflictCount = 0;
+        int newSpaceCount = 0;
+        int mixedConflict0To25Count = 0;
+        int mixedConflict25To50Count = 0;
+        int mixedConflict50To75Count = 0;
+        int mixedConflict75To100Count = 0;
+        int mixedDestructiveCount = 0;
+        int mixedConstructiveCount = 0;
+        int mixedNeutralCount = 0;
+        int mixedDestroyedZeroCellCount = 0;
+        int mixedCreatedZeroCellCount = 0;
+        int mixedDestructiveDestroyedZeroCellCount = 0;
+        int mixedDestructiveCreatedZeroCellCount = 0;
+        int mixedConstructiveDestroyedZeroCellCount = 0;
+        int mixedConstructiveCreatedZeroCellCount = 0;
+        int mixedVoxelVetoObservationCount = 0;
+        int mixedVoxelVetoBlockedVoxelCount = 0;
+        int mixedVoxelVetoAvoidedDestroyedZeroCellCount = 0;
+        int mixedObsPendingAcceptedCount = 0;
+        int mixedObsPendingDowngradedCount = 0;
+        int mixedObsPendingAvoidedDestroyedZeroCellCount = 0;
+        int clearAllVoxelCount = 0;
+        int clearDestructiveVoxelCount = 0;
+        int clearConstructiveVoxelCount = 0;
+        int clearNeutralVoxelCount = 0;
+        int clearDestroyedZeroCellCount = 0;
+        int clearCreatedZeroCellCount = 0;
+        int clearDestructiveDestroyedZeroCellCount = 0;
+        int clearDestructiveCreatedZeroCellCount = 0;
+        int clearConstructiveDestroyedZeroCellCount = 0;
+        int clearConstructiveCreatedZeroCellCount = 0;
+        for (int i = 0; i < observations.Count; i++)
+        {
+            ShadowBlockObservation observation = observations[i];
+            if (observation.Vote == ObservationVoteState.Reject)
+            {
+                rejectCount++;
+                continue;
+            }
+            if (observation.Vote == ObservationVoteState.Accept)
+            {
+                acceptCount++;
+                if (observation.Clearing && observation.Projective)
+                    clearingCount++;
+                ReplayShadowObservation(
+                    observation,
+                    minX, minY, minZ,
+                    sx, sy, sz,
+                    acceptOnlyTsdf, acceptOnlyWeight,
+                    acceptOnlyPendingTsdf, acceptOnlyPendingWeight,
+                    true, false);
+                ShadowAcceptCompatibilityInfo compatibility = ClassifyShadowAcceptCompatibility(
+                    observation,
+                    minX, minY, minZ,
+                    sx, sy, sz,
+                    baselineTsdf, baselineWeight);
+                switch (compatibility.Compatibility)
+                {
+                    case ShadowAcceptCompatibility.Aligned:
+                        alignedCount++;
+                        ReplayShadowObservation(
+                            observation, minX, minY, minZ, sx, sy, sz,
+                            alignedTsdf, alignedWeight, baselinePendingTsdf, baselinePendingWeight,
+                            true, false);
+                        break;
+                    case ShadowAcceptCompatibility.Mixed:
+                        mixedCount++;
+                        ReplayShadowObservation(
+                            observation, minX, minY, minZ, sx, sy, sz,
+                            mixedTsdf, mixedWeight, baselinePendingTsdf, baselinePendingWeight,
+                            true, false);
+                        mixedVoxelVetoObservationCount++;
+                        ReplayShadowObservationWithTopologyVeto(
+                            observation,
+                            minX, minY, minZ, sx, sy, sz,
+                            mixedVoxelVetoTsdf, mixedVoxelVetoWeight,
+                            out int blockedMixedVoxels, out int avoidedMixedDestroyedZeroCells);
+                        mixedVoxelVetoBlockedVoxelCount += blockedMixedVoxels;
+                        mixedVoxelVetoAvoidedDestroyedZeroCellCount += avoidedMixedDestroyedZeroCells;
+
+                        ShadowTopologyImpact sequentialObservationImpact = ClassifyShadowObservationTopologyImpact(
+                            observation,
+                            minX, minY, minZ, sx, sy, sz,
+                            mixedObsPendingTsdf, mixedObsPendingWeight,
+                            mixedObsPendingBandTsdf, mixedObsPendingBandWeight,
+                            topologyScratchTsdf, topologyScratchWeight,
+                            out int sequentialDestroyedZeroCells, out int sequentialCreatedZeroCells);
+                        if (sequentialObservationImpact == ShadowTopologyImpact.Destructive)
+                        {
+                            mixedObsPendingDowngradedCount++;
+                            mixedObsPendingAvoidedDestroyedZeroCellCount += sequentialDestroyedZeroCells;
+                            ShadowBlockObservation pendingMixedObservation = observation;
+                            pendingMixedObservation.Vote = ObservationVoteState.Pending;
+                            ReplayShadowObservation(
+                                pendingMixedObservation, minX, minY, minZ, sx, sy, sz,
+                                mixedObsPendingTsdf, mixedObsPendingWeight,
+                                mixedObsPendingBandTsdf, mixedObsPendingBandWeight,
+                                true, false);
+                        }
+                        else
+                        {
+                            mixedObsPendingAcceptedCount++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedObsPendingTsdf, mixedObsPendingWeight,
+                                mixedObsPendingBandTsdf, mixedObsPendingBandWeight,
+                                true, false);
+                        }
+                        ShadowTopologyImpact topologyImpact = ClassifyShadowObservationTopologyImpact(
+                            observation,
+                            minX, minY, minZ, sx, sy, sz,
+                            baselineTsdf, baselineWeight,
+                            baselinePendingTsdf, baselinePendingWeight,
+                            topologyScratchTsdf, topologyScratchWeight,
+                            out int destroyedZeroCells, out int createdZeroCells);
+                        mixedDestroyedZeroCellCount += destroyedZeroCells;
+                        mixedCreatedZeroCellCount += createdZeroCells;
+                        if (topologyImpact == ShadowTopologyImpact.Destructive)
+                        {
+                            mixedDestructiveCount++;
+                            mixedDestructiveDestroyedZeroCellCount += destroyedZeroCells;
+                            mixedDestructiveCreatedZeroCellCount += createdZeroCells;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedDestructiveTsdf, mixedDestructiveWeight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        else if (topologyImpact == ShadowTopologyImpact.Constructive)
+                        {
+                            mixedConstructiveCount++;
+                            mixedConstructiveDestroyedZeroCellCount += destroyedZeroCells;
+                            mixedConstructiveCreatedZeroCellCount += createdZeroCells;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedConstructiveTsdf, mixedConstructiveWeight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        else
+                        {
+                            mixedNeutralCount++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedNeutralTsdf, mixedNeutralWeight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        if (compatibility.ConflictRatio <= 0.25f)
+                        {
+                            mixedConflict0To25Count++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedConflict0To25Tsdf, mixedConflict0To25Weight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        else if (compatibility.ConflictRatio <= 0.5f)
+                        {
+                            mixedConflict25To50Count++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedConflict25To50Tsdf, mixedConflict25To50Weight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        else if (compatibility.ConflictRatio <= 0.75f)
+                        {
+                            mixedConflict50To75Count++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedConflict50To75Tsdf, mixedConflict50To75Weight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        else
+                        {
+                            mixedConflict75To100Count++;
+                            ReplayShadowObservation(
+                                observation, minX, minY, minZ, sx, sy, sz,
+                                mixedConflict75To100Tsdf, mixedConflict75To100Weight, baselinePendingTsdf, baselinePendingWeight,
+                                true, false);
+                        }
+                        break;
+                    case ShadowAcceptCompatibility.Conflict:
+                        conflictCount++;
+                        ReplayShadowObservation(
+                            observation, minX, minY, minZ, sx, sy, sz,
+                            conflictTsdf, conflictWeight, baselinePendingTsdf, baselinePendingWeight,
+                            true, false);
+                        break;
+                    case ShadowAcceptCompatibility.NewSpace:
+                        newSpaceCount++;
+                        ReplayShadowObservation(
+                            observation, minX, minY, minZ, sx, sy, sz,
+                            newSpaceTsdf, newSpaceWeight, baselinePendingTsdf, baselinePendingWeight,
+                            true, false);
+                        break;
+                }
+                if (observation.Clearing && observation.Projective)
+                {
+                    ShadowClearingReplayResult clearAllResult = ReplayShadowClearing(
+                        observation,
+                        minX, minY, minZ,
+                        sx, sy, sz,
+                        clearOnlyTsdf, clearOnlyWeight);
+                    clearAllVoxelCount += clearAllResult.AppliedVoxels;
+                    ShadowClearingReplayResult clearDestructiveResult = ReplayShadowClearing(
+                        observation,
+                        minX, minY, minZ,
+                        sx, sy, sz,
+                        clearDestructiveTsdf, clearDestructiveWeight,
+                        ShadowTopologyReplayMode.DestructiveOnly,
+                        baselineTsdf, baselineWeight);
+                    clearDestructiveVoxelCount += clearDestructiveResult.AppliedVoxels;
+                    clearDestructiveDestroyedZeroCellCount += clearDestructiveResult.DestroyedZeroCrossCells;
+                    clearDestructiveCreatedZeroCellCount += clearDestructiveResult.CreatedZeroCrossCells;
+                    clearDestroyedZeroCellCount += clearDestructiveResult.DestroyedZeroCrossCells;
+                    clearCreatedZeroCellCount += clearDestructiveResult.CreatedZeroCrossCells;
+                    ShadowClearingReplayResult clearConstructiveResult = ReplayShadowClearing(
+                        observation,
+                        minX, minY, minZ,
+                        sx, sy, sz,
+                        clearConstructiveTsdf, clearConstructiveWeight,
+                        ShadowTopologyReplayMode.ConstructiveOnly,
+                        baselineTsdf, baselineWeight);
+                    clearConstructiveVoxelCount += clearConstructiveResult.AppliedVoxels;
+                    clearConstructiveDestroyedZeroCellCount += clearConstructiveResult.DestroyedZeroCrossCells;
+                    clearConstructiveCreatedZeroCellCount += clearConstructiveResult.CreatedZeroCrossCells;
+                    clearDestroyedZeroCellCount += clearConstructiveResult.DestroyedZeroCrossCells;
+                    clearCreatedZeroCellCount += clearConstructiveResult.CreatedZeroCrossCells;
+                    ShadowClearingReplayResult clearNeutralResult = ReplayShadowClearing(
+                        observation,
+                        minX, minY, minZ,
+                        sx, sy, sz,
+                        clearNeutralTsdf, clearNeutralWeight,
+                        ShadowTopologyReplayMode.NeutralOnly,
+                        baselineTsdf, baselineWeight);
+                    clearNeutralVoxelCount += clearNeutralResult.AppliedVoxels;
+                }
+            }
+            else
+                pendingCount++;
+            ReplayShadowObservation(
+                observation,
+                minX, minY, minZ,
+                sx, sy, sz,
+                fullTsdf, fullWeight,
+                fullPendingTsdf, fullPendingWeight,
+                true, true);
+        }
+
+        ShadowBlockMetrics current = MeasureCurrentShadowBlock(key, blockSize);
+        ShadowBlockMetrics acceptOnly = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            acceptOnlyTsdf, acceptOnlyWeight, acceptOnlyPendingWeight);
+        ShadowBlockMetrics clearOnly = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            clearOnlyTsdf, clearOnlyWeight, clearOnlyPendingWeight);
+        ShadowBlockMetrics clearDestructive = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            clearDestructiveTsdf, clearDestructiveWeight, baselinePendingWeight);
+        ShadowBlockMetrics clearConstructive = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            clearConstructiveTsdf, clearConstructiveWeight, baselinePendingWeight);
+        ShadowBlockMetrics clearNeutral = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            clearNeutralTsdf, clearNeutralWeight, baselinePendingWeight);
+        ShadowBlockMetrics full = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            fullTsdf, fullWeight, fullPendingWeight);
+        ShadowBlockMetrics aligned = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            alignedTsdf, alignedWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixed = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedTsdf, mixedWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedDestructive = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedDestructiveTsdf, mixedDestructiveWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedConstructive = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedConstructiveTsdf, mixedConstructiveWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedNeutral = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedNeutralTsdf, mixedNeutralWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedVoxelVeto = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedVoxelVetoTsdf, mixedVoxelVetoWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedObsPending = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedObsPendingTsdf, mixedObsPendingWeight, mixedObsPendingBandWeight);
+        ShadowBlockMetrics conflict = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            conflictTsdf, conflictWeight, baselinePendingWeight);
+        ShadowBlockMetrics newSpace = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            newSpaceTsdf, newSpaceWeight, baselinePendingWeight);
+        ShadowBlockMetrics mixedConflict0To25 = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedConflict0To25Tsdf, mixedConflict0To25Weight, baselinePendingWeight);
+        ShadowBlockMetrics mixedConflict25To50 = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedConflict25To50Tsdf, mixedConflict25To50Weight, baselinePendingWeight);
+        ShadowBlockMetrics mixedConflict50To75 = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedConflict50To75Tsdf, mixedConflict50To75Weight, baselinePendingWeight);
+        ShadowBlockMetrics mixedConflict75To100 = MeasureShadowBlock(
+            key, blockSize, minX, minY, minZ, sx, sy, sz,
+            mixedConflict75To100Tsdf, mixedConflict75To100Weight, baselinePendingWeight);
+
+        bool acceptOnlyImproved = ShadowReplayImproved(current, acceptOnly);
+        bool acceptOnlyRegressed = ShadowReplayRegressed(current, acceptOnly);
+        bool clearOnlyImproved = ShadowReplayImproved(current, clearOnly);
+        bool clearOnlyRegressed = ShadowReplayRegressed(current, clearOnly);
+        bool clearDestructiveImproved = ShadowReplayImproved(current, clearDestructive);
+        bool clearDestructiveRegressed = ShadowReplayRegressed(current, clearDestructive);
+        bool clearConstructiveImproved = ShadowReplayImproved(current, clearConstructive);
+        bool clearConstructiveRegressed = ShadowReplayRegressed(current, clearConstructive);
+        bool clearNeutralImproved = ShadowReplayImproved(current, clearNeutral);
+        bool clearNeutralRegressed = ShadowReplayRegressed(current, clearNeutral);
+        bool fullImproved = ShadowReplayImproved(current, full);
+        bool fullRegressed = ShadowReplayRegressed(current, full);
+        bool alignedImproved = ShadowReplayImproved(current, aligned);
+        bool alignedRegressed = ShadowReplayRegressed(current, aligned);
+        bool mixedImproved = ShadowReplayImproved(current, mixed);
+        bool mixedRegressed = ShadowReplayRegressed(current, mixed);
+        bool mixedDestructiveImproved = ShadowReplayImproved(current, mixedDestructive);
+        bool mixedDestructiveRegressed = ShadowReplayRegressed(current, mixedDestructive);
+        bool mixedConstructiveImproved = ShadowReplayImproved(current, mixedConstructive);
+        bool mixedConstructiveRegressed = ShadowReplayRegressed(current, mixedConstructive);
+        bool mixedNeutralImproved = ShadowReplayImproved(current, mixedNeutral);
+        bool mixedNeutralRegressed = ShadowReplayRegressed(current, mixedNeutral);
+        bool mixedVoxelVetoImproved = ShadowReplayImproved(current, mixedVoxelVeto);
+        bool mixedVoxelVetoRegressed = ShadowReplayRegressed(current, mixedVoxelVeto);
+        bool mixedObsPendingImproved = ShadowReplayImproved(current, mixedObsPending);
+        bool mixedObsPendingRegressed = ShadowReplayRegressed(current, mixedObsPending);
+        bool conflictImproved = ShadowReplayImproved(current, conflict);
+        bool conflictRegressed = ShadowReplayRegressed(current, conflict);
+        bool newSpaceImproved = ShadowReplayImproved(current, newSpace);
+        bool newSpaceRegressed = ShadowReplayRegressed(current, newSpace);
+        bool mixedConflict0To25Improved = ShadowReplayImproved(current, mixedConflict0To25);
+        bool mixedConflict0To25Regressed = ShadowReplayRegressed(current, mixedConflict0To25);
+        bool mixedConflict25To50Improved = ShadowReplayImproved(current, mixedConflict25To50);
+        bool mixedConflict25To50Regressed = ShadowReplayRegressed(current, mixedConflict25To50);
+        bool mixedConflict50To75Improved = ShadowReplayImproved(current, mixedConflict50To75);
+        bool mixedConflict50To75Regressed = ShadowReplayRegressed(current, mixedConflict50To75);
+        bool mixedConflict75To100Improved = ShadowReplayImproved(current, mixedConflict75To100);
+        bool mixedConflict75To100Regressed = ShadowReplayRegressed(current, mixedConflict75To100);
+
+        LastShadowReplayEvaluatedCount++;
+        if (acceptOnlyImproved) LastShadowReplayAcceptOnlyImprovedCount++;
+        if (acceptOnlyRegressed) LastShadowReplayAcceptOnlyRegressedCount++;
+        if (clearOnlyImproved) LastShadowReplayClearOnlyImprovedCount++;
+        if (clearOnlyRegressed) LastShadowReplayClearOnlyRegressedCount++;
+        if (clearDestructiveImproved) LastShadowReplayClearDestructiveImprovedCount++;
+        if (clearDestructiveRegressed) LastShadowReplayClearDestructiveRegressedCount++;
+        if (clearConstructiveImproved) LastShadowReplayClearConstructiveImprovedCount++;
+        if (clearConstructiveRegressed) LastShadowReplayClearConstructiveRegressedCount++;
+        if (clearNeutralImproved) LastShadowReplayClearNeutralImprovedCount++;
+        if (clearNeutralRegressed) LastShadowReplayClearNeutralRegressedCount++;
+        if (fullImproved) LastShadowReplayFullImprovedCount++;
+        if (fullRegressed) LastShadowReplayFullRegressedCount++;
+        if (fullImproved) LastShadowReplayImprovedCount++;
+        if (fullRegressed) LastShadowReplayRegressedCount++;
+        if (alignedImproved) LastShadowReplayAlignedImprovedCount++;
+        if (alignedRegressed) LastShadowReplayAlignedRegressedCount++;
+        if (mixedImproved) LastShadowReplayMixedImprovedCount++;
+        if (mixedRegressed) LastShadowReplayMixedRegressedCount++;
+        if (mixedDestructiveImproved) LastShadowReplayMixedDestructiveImprovedCount++;
+        if (mixedDestructiveRegressed) LastShadowReplayMixedDestructiveRegressedCount++;
+        if (mixedConstructiveImproved) LastShadowReplayMixedConstructiveImprovedCount++;
+        if (mixedConstructiveRegressed) LastShadowReplayMixedConstructiveRegressedCount++;
+        if (mixedNeutralImproved) LastShadowReplayMixedNeutralImprovedCount++;
+        if (mixedNeutralRegressed) LastShadowReplayMixedNeutralRegressedCount++;
+        if (mixedVoxelVetoImproved) LastShadowReplayMixedVoxelVetoImprovedCount++;
+        if (mixedVoxelVetoRegressed) LastShadowReplayMixedVoxelVetoRegressedCount++;
+        if (mixedObsPendingImproved) LastShadowReplayMixedObsPendingImprovedCount++;
+        if (mixedObsPendingRegressed) LastShadowReplayMixedObsPendingRegressedCount++;
+        if (conflictImproved) LastShadowReplayConflictImprovedCount++;
+        if (conflictRegressed) LastShadowReplayConflictRegressedCount++;
+        if (newSpaceImproved) LastShadowReplayNewSpaceImprovedCount++;
+        if (newSpaceRegressed) LastShadowReplayNewSpaceRegressedCount++;
+        LastShadowReplayAlignedObservationCount += alignedCount;
+        LastShadowReplayMixedObservationCount += mixedCount;
+        LastShadowReplayConflictObservationCount += conflictCount;
+        LastShadowReplayNewSpaceObservationCount += newSpaceCount;
+        if (mixedConflict0To25Improved) LastShadowReplayMixedConflict0To25ImprovedCount++;
+        if (mixedConflict0To25Regressed) LastShadowReplayMixedConflict0To25RegressedCount++;
+        if (mixedConflict25To50Improved) LastShadowReplayMixedConflict25To50ImprovedCount++;
+        if (mixedConflict25To50Regressed) LastShadowReplayMixedConflict25To50RegressedCount++;
+        if (mixedConflict50To75Improved) LastShadowReplayMixedConflict50To75ImprovedCount++;
+        if (mixedConflict50To75Regressed) LastShadowReplayMixedConflict50To75RegressedCount++;
+        if (mixedConflict75To100Improved) LastShadowReplayMixedConflict75To100ImprovedCount++;
+        if (mixedConflict75To100Regressed) LastShadowReplayMixedConflict75To100RegressedCount++;
+        LastShadowReplayMixedConflict0To25ObservationCount += mixedConflict0To25Count;
+        LastShadowReplayMixedConflict25To50ObservationCount += mixedConflict25To50Count;
+        LastShadowReplayMixedConflict50To75ObservationCount += mixedConflict50To75Count;
+        LastShadowReplayMixedConflict75To100ObservationCount += mixedConflict75To100Count;
+        LastShadowReplayMixedDestructiveObservationCount += mixedDestructiveCount;
+        LastShadowReplayMixedConstructiveObservationCount += mixedConstructiveCount;
+        LastShadowReplayMixedNeutralObservationCount += mixedNeutralCount;
+        LastShadowReplayMixedDestroyedZeroCrossCellCount += mixedDestroyedZeroCellCount;
+        LastShadowReplayMixedCreatedZeroCrossCellCount += mixedCreatedZeroCellCount;
+        LastShadowReplayClearDestructiveVoxelCount += clearDestructiveVoxelCount;
+        LastShadowReplayClearConstructiveVoxelCount += clearConstructiveVoxelCount;
+        LastShadowReplayClearNeutralVoxelCount += clearNeutralVoxelCount;
+        LastShadowReplayClearDestroyedZeroCrossCellCount += clearDestroyedZeroCellCount;
+        LastShadowReplayClearCreatedZeroCrossCellCount += clearCreatedZeroCellCount;
+        LastShadowReplayMixedVoxelVetoObservationCount += mixedVoxelVetoObservationCount;
+        LastShadowReplayMixedVoxelVetoBlockedVoxelCount += mixedVoxelVetoBlockedVoxelCount;
+        LastShadowReplayMixedVoxelVetoAvoidedDestroyedCellCount += mixedVoxelVetoAvoidedDestroyedZeroCellCount;
+        LastShadowReplayMixedObsPendingAcceptedCount += mixedObsPendingAcceptedCount;
+        LastShadowReplayMixedObsPendingDowngradedCount += mixedObsPendingDowngradedCount;
+        LastShadowReplayMixedObsPendingAvoidedDestroyedCellCount += mixedObsPendingAvoidedDestroyedZeroCellCount;
+
+        if (_shadowReplayRows == null)
+        {
+            _shadowReplayRows = new StringBuilder(4096);
+            _shadowReplayRows.AppendLine("capture,export_frame,replay_mode,block_x,block_y,block_z,observations,accept,selected_accept,pending,reject,clearing,selected_clear_voxels,current_supported,current_zero,current_one_sided,current_unknown,shadow_supported,shadow_zero,shadow_one_sided,shadow_unknown,shadow_pending_voxels,improved,regressed,topology_destroyed_zero_cells,topology_created_zero_cells,strategy_blocked_voxels,strategy_downgraded_observations");
+        }
+        AppendShadowReplayRow("A_ONLY", key, observations.Count, acceptCount, acceptCount, pendingCount, rejectCount, clearingCount, 0,
+            current, acceptOnly, acceptOnlyImproved, acceptOnlyRegressed);
+        AppendShadowReplayRow("CLEAR_ONLY", key, observations.Count, acceptCount, 0, pendingCount, rejectCount, clearingCount, clearAllVoxelCount,
+            current, clearOnly, clearOnlyImproved, clearOnlyRegressed,
+            clearDestroyedZeroCellCount, clearCreatedZeroCellCount);
+        AppendShadowReplayRow("A_PLUS_CLEAR", key, observations.Count, acceptCount, acceptCount, pendingCount, rejectCount, clearingCount, 0,
+            current, full, fullImproved, fullRegressed);
+        AppendShadowReplayRow("A_ALIGNED", key, observations.Count, acceptCount, alignedCount, pendingCount, rejectCount, clearingCount, 0,
+            current, aligned, alignedImproved, alignedRegressed);
+        AppendShadowReplayRow("A_MIXED", key, observations.Count, acceptCount, mixedCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixed, mixedImproved, mixedRegressed,
+            mixedDestroyedZeroCellCount, mixedCreatedZeroCellCount);
+        AppendShadowReplayRow("A_CONFLICT", key, observations.Count, acceptCount, conflictCount, pendingCount, rejectCount, clearingCount, 0,
+            current, conflict, conflictImproved, conflictRegressed);
+        AppendShadowReplayRow("A_NEW_SPACE", key, observations.Count, acceptCount, newSpaceCount, pendingCount, rejectCount, clearingCount, 0,
+            current, newSpace, newSpaceImproved, newSpaceRegressed);
+        AppendShadowReplayRow("A_MIXED_C0_25", key, observations.Count, acceptCount, mixedConflict0To25Count, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedConflict0To25, mixedConflict0To25Improved, mixedConflict0To25Regressed);
+        AppendShadowReplayRow("A_MIXED_C25_50", key, observations.Count, acceptCount, mixedConflict25To50Count, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedConflict25To50, mixedConflict25To50Improved, mixedConflict25To50Regressed);
+        AppendShadowReplayRow("A_MIXED_C50_75", key, observations.Count, acceptCount, mixedConflict50To75Count, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedConflict50To75, mixedConflict50To75Improved, mixedConflict50To75Regressed);
+        AppendShadowReplayRow("A_MIXED_C75_100", key, observations.Count, acceptCount, mixedConflict75To100Count, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedConflict75To100, mixedConflict75To100Improved, mixedConflict75To100Regressed);
+        AppendShadowReplayRow("A_MIXED_DESTRUCTIVE", key, observations.Count, acceptCount, mixedDestructiveCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedDestructive, mixedDestructiveImproved, mixedDestructiveRegressed,
+            mixedDestructiveDestroyedZeroCellCount, mixedDestructiveCreatedZeroCellCount);
+        AppendShadowReplayRow("A_MIXED_CONSTRUCTIVE", key, observations.Count, acceptCount, mixedConstructiveCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedConstructive, mixedConstructiveImproved, mixedConstructiveRegressed,
+            mixedConstructiveDestroyedZeroCellCount, mixedConstructiveCreatedZeroCellCount);
+        AppendShadowReplayRow("A_MIXED_NEUTRAL", key, observations.Count, acceptCount, mixedNeutralCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedNeutral, mixedNeutralImproved, mixedNeutralRegressed);
+        AppendShadowReplayRow("CLEAR_DESTRUCTIVE", key, observations.Count, acceptCount, 0, pendingCount, rejectCount, clearingCount, clearDestructiveVoxelCount,
+            current, clearDestructive, clearDestructiveImproved, clearDestructiveRegressed,
+            clearDestructiveDestroyedZeroCellCount, clearDestructiveCreatedZeroCellCount);
+        AppendShadowReplayRow("CLEAR_CONSTRUCTIVE", key, observations.Count, acceptCount, 0, pendingCount, rejectCount, clearingCount, clearConstructiveVoxelCount,
+            current, clearConstructive, clearConstructiveImproved, clearConstructiveRegressed,
+            clearConstructiveDestroyedZeroCellCount, clearConstructiveCreatedZeroCellCount);
+        AppendShadowReplayRow("CLEAR_NEUTRAL", key, observations.Count, acceptCount, 0, pendingCount, rejectCount, clearingCount, clearNeutralVoxelCount,
+            current, clearNeutral, clearNeutralImproved, clearNeutralRegressed);
+        AppendShadowReplayRow("A_MIXED_VOXEL_VETO", key, observations.Count, acceptCount, mixedVoxelVetoObservationCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedVoxelVeto, mixedVoxelVetoImproved, mixedVoxelVetoRegressed,
+            mixedVoxelVetoAvoidedDestroyedZeroCellCount, 0,
+            mixedVoxelVetoBlockedVoxelCount, 0);
+        AppendShadowReplayRow("A_MIXED_OBS_PENDING", key, observations.Count, acceptCount, mixedObsPendingAcceptedCount, pendingCount, rejectCount, clearingCount, 0,
+            current, mixedObsPending, mixedObsPendingImproved, mixedObsPendingRegressed,
+            mixedObsPendingAvoidedDestroyedZeroCellCount, 0,
+            0, mixedObsPendingDowngradedCount);
+    }
+
+    private static bool ShadowReplayImproved(ShadowBlockMetrics current, ShadowBlockMetrics replayed)
+    {
+        return replayed.ZeroCrossCells > current.ZeroCrossCells &&
+               replayed.OneSidedCells <= current.OneSidedCells;
+    }
+
+    private static bool ShadowReplayRegressed(ShadowBlockMetrics current, ShadowBlockMetrics replayed)
+    {
+        return replayed.ZeroCrossCells < current.ZeroCrossCells ||
+               replayed.OneSidedCells > current.OneSidedCells;
+    }
+
+    private void AppendShadowReplayRow(
+        string replayMode,
+        Vector3Int key,
+        int observationCount,
+        int acceptCount,
+        int selectedAcceptCount,
+        int pendingCount,
+        int rejectCount,
+        int clearingCount,
+        int selectedClearVoxelCount,
+        ShadowBlockMetrics current,
+        ShadowBlockMetrics replayed,
+        bool improved,
+        bool regressed,
+        int topologyDestroyedZeroCells = 0,
+        int topologyCreatedZeroCells = 0,
+        int strategyBlockedVoxels = 0,
+        int strategyDowngradedObservations = 0)
+    {
+        _shadowReplayRows.Append(_surfaceDiagnosticCaptureIndex).Append(',')
+            .Append(LastRawFrameIndex).Append(',')
+            .Append(replayMode).Append(',')
+            .Append(key.x).Append(',').Append(key.y).Append(',').Append(key.z).Append(',')
+            .Append(observationCount).Append(',').Append(acceptCount).Append(',').Append(selectedAcceptCount).Append(',').Append(pendingCount).Append(',').Append(rejectCount).Append(',').Append(clearingCount).Append(',').Append(selectedClearVoxelCount).Append(',')
+            .Append(current.SupportedCells).Append(',').Append(current.ZeroCrossCells).Append(',').Append(current.OneSidedCells).Append(',').Append(current.UnknownCells).Append(',')
+            .Append(replayed.SupportedCells).Append(',').Append(replayed.ZeroCrossCells).Append(',').Append(replayed.OneSidedCells).Append(',').Append(replayed.UnknownCells).Append(',')
+            .Append(replayed.PendingVoxels).Append(',').Append(improved ? 1 : 0).Append(',').Append(regressed ? 1 : 0).Append(',')
+            .Append(topologyDestroyedZeroCells).Append(',').Append(topologyCreatedZeroCells).Append(',')
+            .Append(strategyBlockedVoxels).Append(',').Append(strategyDowngradedObservations).AppendLine();
+    }
+
+    private void InitializeShadowFromCurrentSnapshot(
+        int minX, int minY, int minZ,
+        int sx, int sy, int sz,
+        float[] tsdf, float[] weights,
+        float[] pendingTsdf, float[] pendingWeights)
+    {
+        for (int z = minZ; z < minZ + sz; z++)
+        for (int y = minY; y < minY + sy; y++)
+        for (int x = minX; x < minX + sx; x++)
+        {
+            int localIndex = ShadowLocalIndex(x, y, z, minX, minY, minZ, sx, sy);
+            int volumeIndex = Index(x, y, z);
+            tsdf[localIndex] = 1f;
+            pendingTsdf[localIndex] = 1f;
+
+            if (_weights != null &&
+                volumeIndex >= 0 && volumeIndex < _weights.Length &&
+                _weights[volumeIndex] >= minSurfaceCornerWeight &&
+                IsCleanMeshTsdfVoxel(volumeIndex))
+            {
+                tsdf[localIndex] = _tsdf[volumeIndex];
+                weights[localIndex] = _weights[volumeIndex];
+            }
+
+            if (_atomicProvisionalBandWeight != null &&
+                _atomicProvisionalBandTsdf != null &&
+                volumeIndex >= 0 &&
+                volumeIndex < _atomicProvisionalBandWeight.Length &&
+                _atomicProvisionalBandWeight[volumeIndex] > 0)
+            {
+                pendingTsdf[localIndex] = _atomicProvisionalBandTsdf[volumeIndex];
+                pendingWeights[localIndex] = _atomicProvisionalBandWeight[volumeIndex];
+            }
+        }
+    }
+
+    private bool WouldFormalMixedObservationDestroyZeroCross(
+        Vector3 cameraPosition,
+        Vector3 surfacePoint,
+        Vector3 normal,
+        float observationWeight,
+        int halfBandSteps,
+        out int destroyedZeroCells)
+    {
+        destroyedZeroCells = 0;
+        _formalMixedTopologyVoxels.Clear();
+        _formalMixedTopologyCells.Clear();
+
+        if (useProjectiveTsdfIntegration)
+        {
+            Vector3 toSurface = surfacePoint - cameraPosition;
+            float surfaceDepth = toSurface.magnitude;
+            if (!Finite(toSurface) || surfaceDepth <= 0.0001f)
+                return false;
+            Vector3 direction = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - halfBandSteps * voxel);
+            float endDepth = surfaceDepth + halfBandSteps * voxel;
+            Vector3 segmentStart = cameraPosition + direction * startDepth;
+            Vector3 segmentEnd = cameraPosition + direction * endDepth;
+            float lateralRadius = voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f);
+            Vector3 boundsMin = Vector3.Min(segmentStart, segmentEnd) - Vector3.one * lateralRadius;
+            Vector3 boundsMax = Vector3.Max(segmentStart, segmentEnd) + Vector3.one * lateralRadius;
+            Vector3 minGrid = (boundsMin - _volumeOriginWorld) / voxel;
+            Vector3 maxGrid = (boundsMax - _volumeOriginWorld) / voxel;
+            int minX = Mathf.Clamp(Mathf.FloorToInt(minGrid.x), 0, _dimX - 1);
+            int minY = Mathf.Clamp(Mathf.FloorToInt(minGrid.y), 0, _dimY - 1);
+            int minZ = Mathf.Clamp(Mathf.FloorToInt(minGrid.z), 0, _dimZ - 1);
+            int maxX = Mathf.Clamp(Mathf.CeilToInt(maxGrid.x), 0, _dimX - 1);
+            int maxY = Mathf.Clamp(Mathf.CeilToInt(maxGrid.y), 0, _dimY - 1);
+            int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxGrid.z), 0, _dimZ - 1);
+            float lateralRadiusSq = lateralRadius * lateralRadius;
+            float depthEpsilon = voxel * 0.5f;
+
+            for (int z = minZ; z <= maxZ; z++)
+            for (int y = minY; y <= maxY; y++)
+            for (int x = minX; x <= maxX; x++)
+            {
+                Vector3 center = VoxelCenter(x, y, z);
+                float depth = Vector3.Dot(center - cameraPosition, direction);
+                if (depth < startDepth - depthEpsilon || depth > endDepth + depthEpsilon)
+                    continue;
+                Vector3 projected = cameraPosition + direction * depth;
+                if ((center - projected).sqrMagnitude > lateralRadiusSq)
+                    continue;
+                float sampleTsdf = Mathf.Clamp(
+                    (surfaceDepth - depth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateFormalMixedTopologyCandidate(x, y, z, sampleTsdf, observationWeight);
+            }
+        }
+        else
+        {
+            Vector3 stableNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.up;
+            for (int step = -halfBandSteps; step <= halfBandSteps; step++)
+            {
+                float distance = step * voxelSizeMeters;
+                Vector3 world = surfacePoint + stableNormal * distance;
+                if (!TryWorldToVoxel(world, out int x, out int y, out int z))
+                    continue;
+                float sampleTsdf = Mathf.Clamp(
+                    distance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateFormalMixedTopologyCandidate(x, y, z, sampleTsdf, observationWeight);
+            }
+        }
+
+        foreach (Vector3Int cell in _formalMixedTopologyCells)
+        {
+            if (!CleanCellHasZeroCross(cell.x, cell.y, cell.z, -1, 0f, 0))
+                continue;
+            if (!FormalSimulatedCellHasZeroCross(cell.x, cell.y, cell.z))
+                destroyedZeroCells++;
+        }
+        return destroyedZeroCells > 0;
+    }
+
+    private void AccumulateFormalMixedTopologyCandidate(
+        int x, int y, int z, float sampleTsdf, float observationWeight)
+    {
+        int index = Index(x, y, z);
+        if (!_formalMixedTopologyVoxels.TryGetValue(index, out FormalTopologyVoxelState state))
+        {
+            if (_weights[index] >= minSurfaceCornerWeight && IsCleanMeshTsdfVoxel(index))
+            {
+                state.Tsdf = _tsdf[index];
+                state.Weight = _weights[index];
+            }
+            else
+            {
+                state.Tsdf = 1f;
+                state.Weight = 0f;
+            }
+        }
+        float safeWeight = Mathf.Max(0.01f, observationWeight);
+        float combined = state.Weight + safeWeight;
+        state.Tsdf = (state.Tsdf * state.Weight + sampleTsdf * safeWeight) / combined;
+        state.Weight = Mathf.Min(255f, combined);
+        _formalMixedTopologyVoxels[index] = state;
+
+        for (int cellZ = z - 1; cellZ <= z; cellZ++)
+        for (int cellY = y - 1; cellY <= y; cellY++)
+        for (int cellX = x - 1; cellX <= x; cellX++)
+        {
+            if (cellX < 0 || cellY < 0 || cellZ < 0 ||
+                cellX >= _dimX - 1 || cellY >= _dimY - 1 || cellZ >= _dimZ - 1)
+                continue;
+            _formalMixedTopologyCells.Add(new Vector3Int(cellX, cellY, cellZ));
+        }
+    }
+
+    private bool FormalSimulatedCellHasZeroCross(int cellX, int cellY, int cellZ)
+    {
+        bool positive = false;
+        bool negative = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(
+                cellX + CornerOffsetX[corner],
+                cellY + CornerOffsetY[corner],
+                cellZ + CornerOffsetZ[corner]);
+            if (_formalMixedTopologyVoxels.TryGetValue(index, out FormalTopologyVoxelState state))
+            {
+                if (state.Weight < minSurfaceCornerWeight)
+                    continue;
+                positive |= state.Tsdf > 0f;
+                negative |= state.Tsdf < 0f;
+            }
+            else
+            {
+                if (_weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                    continue;
+                positive |= _tsdf[index] > 0f;
+                negative |= _tsdf[index] < 0f;
+            }
+        }
+        return positive && negative;
+    }
+
+    private ShadowAcceptCompatibilityInfo ClassifyFormalAcceptCompatibility(
+        Vector3 cameraPosition,
+        Vector3 surfacePoint,
+        Vector3 normal,
+        int halfBandSteps)
+    {
+        int aligned = 0;
+        int conflicting = 0;
+        int overlap = 0;
+        int criticalConflicting = 0;
+
+        if (useProjectiveTsdfIntegration)
+        {
+            Vector3 toSurface = surfacePoint - cameraPosition;
+            float surfaceDepth = toSurface.magnitude;
+            if (!Finite(toSurface) || surfaceDepth <= 0.0001f)
+                return new ShadowAcceptCompatibilityInfo { Compatibility = ShadowAcceptCompatibility.NewSpace };
+
+            Vector3 direction = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - halfBandSteps * voxel);
+            float endDepth = surfaceDepth + halfBandSteps * voxel;
+            Vector3 segmentStart = cameraPosition + direction * startDepth;
+            Vector3 segmentEnd = cameraPosition + direction * endDepth;
+            float lateralRadius = voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f);
+            Vector3 boundsMin = Vector3.Min(segmentStart, segmentEnd) - Vector3.one * lateralRadius;
+            Vector3 boundsMax = Vector3.Max(segmentStart, segmentEnd) + Vector3.one * lateralRadius;
+            Vector3 minGrid = (boundsMin - _volumeOriginWorld) / voxel;
+            Vector3 maxGrid = (boundsMax - _volumeOriginWorld) / voxel;
+            int minX = Mathf.Clamp(Mathf.FloorToInt(minGrid.x), 0, _dimX - 1);
+            int minY = Mathf.Clamp(Mathf.FloorToInt(minGrid.y), 0, _dimY - 1);
+            int minZ = Mathf.Clamp(Mathf.FloorToInt(minGrid.z), 0, _dimZ - 1);
+            int maxX = Mathf.Clamp(Mathf.CeilToInt(maxGrid.x), 0, _dimX - 1);
+            int maxY = Mathf.Clamp(Mathf.CeilToInt(maxGrid.y), 0, _dimY - 1);
+            int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxGrid.z), 0, _dimZ - 1);
+            float lateralRadiusSq = lateralRadius * lateralRadius;
+            float depthEpsilon = voxel * 0.5f;
+
+            for (int z = minZ; z <= maxZ; z++)
+            for (int y = minY; y <= maxY; y++)
+            for (int x = minX; x <= maxX; x++)
+            {
+                Vector3 center = VoxelCenter(x, y, z);
+                float depth = Vector3.Dot(center - cameraPosition, direction);
+                if (depth < startDepth - depthEpsilon || depth > endDepth + depthEpsilon)
+                    continue;
+                Vector3 projected = cameraPosition + direction * depth;
+                if ((center - projected).sqrMagnitude > lateralRadiusSq)
+                    continue;
+                float sampleTsdf = Mathf.Clamp((surfaceDepth - depth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateFormalAcceptSignCompatibility(
+                    x, y, z, sampleTsdf,
+                    ref aligned, ref conflicting, ref overlap, ref criticalConflicting);
+            }
+        }
+        else
+        {
+            Vector3 stableNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.up;
+            for (int step = -halfBandSteps; step <= halfBandSteps; step++)
+            {
+                float distance = step * voxelSizeMeters;
+                Vector3 world = surfacePoint + stableNormal * distance;
+                if (!TryWorldToVoxel(world, out int x, out int y, out int z))
+                    continue;
+                float sampleTsdf = Mathf.Clamp(distance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateFormalAcceptSignCompatibility(
+                    x, y, z, sampleTsdf,
+                    ref aligned, ref conflicting, ref overlap, ref criticalConflicting);
+            }
+        }
+
+        return BuildShadowAcceptCompatibilityInfo(aligned, conflicting, overlap, criticalConflicting);
+    }
+
+    private void AccumulateFormalAcceptSignCompatibility(
+        int x, int y, int z,
+        float observationTsdf,
+        ref int aligned,
+        ref int conflicting,
+        ref int overlap,
+        ref int criticalConflicting)
+    {
+        int index = Index(x, y, z);
+        if (_weights == null || _tsdf == null || index < 0 || index >= _weights.Length ||
+            _weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+            return;
+
+        overlap++;
+        float product = _tsdf[index] * observationTsdf;
+        if (product < 0f)
+        {
+            conflicting++;
+            if (FormalVoxelSupportsZeroCross(x, y, z))
+                criticalConflicting++;
+        }
+        else if (product > 0f)
+            aligned++;
+    }
+
+    private ShadowAcceptCompatibilityInfo ClassifyShadowAcceptCompatibility(
+        ShadowBlockObservation observation,
+        int minX, int minY, int minZ,
+        int sx, int sy, int sz,
+        float[] baselineTsdf, float[] baselineWeight)
+    {
+        int aligned = 0;
+        int conflicting = 0;
+        int overlap = 0;
+
+        if (observation.Projective)
+        {
+            Vector3 toSurface = observation.Surface - observation.Camera;
+            float surfaceDepth = toSurface.magnitude;
+            if (surfaceDepth <= 0.0001f)
+                return new ShadowAcceptCompatibilityInfo { Compatibility = ShadowAcceptCompatibility.NewSpace };
+            Vector3 direction = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - observation.HalfBandSteps * voxel);
+            float endDepth = surfaceDepth + observation.HalfBandSteps * voxel;
+            float lateralRadiusSq = Mathf.Pow(voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f), 2f);
+
+            for (int z = minZ; z < minZ + sz; z++)
+            for (int y = minY; y < minY + sy; y++)
+            for (int x = minX; x < minX + sx; x++)
+            {
+                Vector3 center = VoxelCenter(x, y, z);
+                float depth = Vector3.Dot(center - observation.Camera, direction);
+                if (depth < startDepth - voxel * 0.5f || depth > endDepth + voxel * 0.5f)
+                    continue;
+                Vector3 projected = observation.Camera + direction * depth;
+                if ((center - projected).sqrMagnitude > lateralRadiusSq)
+                    continue;
+                float value = Mathf.Clamp((surfaceDepth - depth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateShadowSignCompatibility(
+                    x, y, z, value,
+                    minX, minY, minZ, sx, sy, sz,
+                    baselineTsdf, baselineWeight,
+                    ref aligned, ref conflicting, ref overlap);
+            }
+        }
+        else
+        {
+            for (int step = -observation.HalfBandSteps; step <= observation.HalfBandSteps; step++)
+            {
+                float distance = step * voxelSizeMeters;
+                Vector3 world = observation.Surface + observation.Normal * distance;
+                if (!TryWorldToVoxel(world, out int x, out int y, out int z) ||
+                    x < minX || y < minY || z < minZ || x >= minX + sx || y >= minY + sy || z >= minZ + sz)
+                    continue;
+                float value = Mathf.Clamp(distance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                AccumulateShadowSignCompatibility(
+                    x, y, z, value,
+                    minX, minY, minZ, sx, sy, sz,
+                    baselineTsdf, baselineWeight,
+                    ref aligned, ref conflicting, ref overlap);
+            }
+        }
+
+        return BuildShadowAcceptCompatibilityInfo(aligned, conflicting, overlap, 0);
+    }
+
+    private static ShadowAcceptCompatibilityInfo BuildShadowAcceptCompatibilityInfo(
+        int aligned,
+        int conflicting,
+        int overlap,
+        int criticalConflicting)
+    {
+        ShadowAcceptCompatibilityInfo result = new ShadowAcceptCompatibilityInfo
+        {
+            AlignedVoxels = aligned,
+            ConflictingVoxels = conflicting,
+            OverlapVoxels = overlap,
+            CriticalConflictVoxels = criticalConflicting
+        };
+        if (overlap == 0)
+            result.Compatibility = ShadowAcceptCompatibility.NewSpace;
+        else if (conflicting == 0)
+            result.Compatibility = ShadowAcceptCompatibility.Aligned;
+        else if (aligned == 0)
+            result.Compatibility = ShadowAcceptCompatibility.Conflict;
+        else
+            result.Compatibility = ShadowAcceptCompatibility.Mixed;
+        return result;
+    }
+
+    private void AccumulateShadowSignCompatibility(
+        int x, int y, int z, float observationTsdf,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float[] baselineTsdf, float[] baselineWeight,
+        ref int aligned, ref int conflicting, ref int overlap)
+    {
+        int index = ShadowLocalIndex(x, y, z, minX, minY, minZ, sx, sy);
+        if (index < 0 || index >= baselineWeight.Length || baselineWeight[index] < minSurfaceCornerWeight)
+            return;
+
+        overlap++;
+        float product = baselineTsdf[index] * observationTsdf;
+        if (product < 0f)
+            conflicting++;
+        else if (product > 0f)
+            aligned++;
+    }
+
+    private bool FormalVoxelSupportsZeroCross(int voxelX, int voxelY, int voxelZ)
+    {
+        for (int cellZ = voxelZ - 1; cellZ <= voxelZ; cellZ++)
+        for (int cellY = voxelY - 1; cellY <= voxelY; cellY++)
+        for (int cellX = voxelX - 1; cellX <= voxelX; cellX++)
+        {
+            if (cellX < 0 || cellY < 0 || cellZ < 0 ||
+                cellX >= _dimX - 1 || cellY >= _dimY - 1 || cellZ >= _dimZ - 1)
+                continue;
+
+            bool positive = false;
+            bool negative = false;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int index = Index(
+                    cellX + CornerOffsetX[corner],
+                    cellY + CornerOffsetY[corner],
+                    cellZ + CornerOffsetZ[corner]);
+                if (_weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                    continue;
+                positive |= _tsdf[index] > 0f;
+                negative |= _tsdf[index] < 0f;
+            }
+            if (positive && negative)
+                return true;
+        }
+        return false;
+    }
+
+    private ShadowTopologyImpact ClassifyShadowObservationTopologyImpact(
+        ShadowBlockObservation observation,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float[] baselineTsdf, float[] baselineWeight,
+        float[] baselinePendingTsdf, float[] baselinePendingWeight,
+        float[] scratchTsdf, float[] scratchWeight,
+        out int destroyedZeroCells, out int createdZeroCells)
+    {
+        System.Array.Copy(baselineTsdf, scratchTsdf, baselineTsdf.Length);
+        System.Array.Copy(baselineWeight, scratchWeight, baselineWeight.Length);
+        ReplayShadowObservation(
+            observation,
+            minX, minY, minZ, sx, sy, sz,
+            scratchTsdf, scratchWeight,
+            baselinePendingTsdf, baselinePendingWeight,
+            true, false);
+
+        destroyedZeroCells = 0;
+        createdZeroCells = 0;
+        for (int cellZ = minZ; cellZ < minZ + sz - 1; cellZ++)
+        for (int cellY = minY; cellY < minY + sy - 1; cellY++)
+        for (int cellX = minX; cellX < minX + sx - 1; cellX++)
+        {
+            bool before = ShadowCellHasZeroCross(
+                cellX, cellY, cellZ,
+                minX, minY, minZ, sx, sy,
+                baselineTsdf, baselineWeight);
+            bool after = ShadowCellHasZeroCross(
+                cellX, cellY, cellZ,
+                minX, minY, minZ, sx, sy,
+                scratchTsdf, scratchWeight);
+            if (before && !after)
+                destroyedZeroCells++;
+            else if (!before && after)
+                createdZeroCells++;
+        }
+
+        if (destroyedZeroCells > 0)
+            return ShadowTopologyImpact.Destructive;
+        if (createdZeroCells > 0)
+            return ShadowTopologyImpact.Constructive;
+        return ShadowTopologyImpact.Neutral;
+    }
+
+    private bool ShadowCellHasZeroCross(
+        int cellX, int cellY, int cellZ,
+        int minX, int minY, int minZ, int sx, int sy,
+        float[] tsdf, float[] weights)
+    {
+        bool positive = false;
+        bool negative = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int local = ShadowLocalIndex(
+                cellX + CornerOffsetX[corner],
+                cellY + CornerOffsetY[corner],
+                cellZ + CornerOffsetZ[corner],
+                minX, minY, minZ, sx, sy);
+            if (local < 0 || local >= weights.Length || weights[local] < minSurfaceCornerWeight)
+                continue;
+            positive |= tsdf[local] > 0f;
+            negative |= tsdf[local] < 0f;
+        }
+        return positive && negative;
+    }
+
+    private ShadowTopologyImpact ClassifyShadowVoxelTopologyImpact(
+        int voxelX, int voxelY, int voxelZ,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float afterTsdf, float afterWeight,
+        float[] baselineTsdf, float[] baselineWeight,
+        out int destroyedZeroCells, out int createdZeroCells)
+    {
+        destroyedZeroCells = 0;
+        createdZeroCells = 0;
+        int voxelLocal = ShadowLocalIndex(voxelX, voxelY, voxelZ, minX, minY, minZ, sx, sy);
+        for (int cellZ = voxelZ - 1; cellZ <= voxelZ; cellZ++)
+        for (int cellY = voxelY - 1; cellY <= voxelY; cellY++)
+        for (int cellX = voxelX - 1; cellX <= voxelX; cellX++)
+        {
+            if (cellX < minX || cellY < minY || cellZ < minZ ||
+                cellX + 1 >= minX + sx || cellY + 1 >= minY + sy || cellZ + 1 >= minZ + sz)
+                continue;
+            bool before = ShadowCellHasZeroCross(
+                cellX, cellY, cellZ,
+                minX, minY, minZ, sx, sy,
+                baselineTsdf, baselineWeight);
+            bool after = ShadowCellHasZeroCrossWithOverride(
+                cellX, cellY, cellZ,
+                minX, minY, minZ, sx, sy,
+                baselineTsdf, baselineWeight,
+                voxelLocal, afterTsdf, afterWeight);
+            if (before && !after)
+                destroyedZeroCells++;
+            else if (!before && after)
+                createdZeroCells++;
+        }
+        if (destroyedZeroCells > 0)
+            return ShadowTopologyImpact.Destructive;
+        if (createdZeroCells > 0)
+            return ShadowTopologyImpact.Constructive;
+        return ShadowTopologyImpact.Neutral;
+    }
+
+    private void ReplayShadowObservationWithTopologyVeto(
+        ShadowBlockObservation observation,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float[] tsdf, float[] weights,
+        out int blockedVoxels, out int avoidedDestroyedZeroCells)
+    {
+        blockedVoxels = 0;
+        avoidedDestroyedZeroCells = 0;
+        if (observation.Projective)
+        {
+            Vector3 toSurface = observation.Surface - observation.Camera;
+            float surfaceDepth = toSurface.magnitude;
+            if (surfaceDepth <= 0.0001f)
+                return;
+            Vector3 direction = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - observation.HalfBandSteps * voxel);
+            float endDepth = surfaceDepth + observation.HalfBandSteps * voxel;
+            float lateralRadiusSq = Mathf.Pow(
+                voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f), 2f);
+            for (int z = minZ; z < minZ + sz; z++)
+            for (int y = minY; y < minY + sy; y++)
+            for (int x = minX; x < minX + sx; x++)
+            {
+                Vector3 center = VoxelCenter(x, y, z);
+                float depth = Vector3.Dot(center - observation.Camera, direction);
+                if (depth < startDepth - voxel * 0.5f || depth > endDepth + voxel * 0.5f)
+                    continue;
+                Vector3 projected = observation.Camera + direction * depth;
+                if ((center - projected).sqrMagnitude > lateralRadiusSq)
+                    continue;
+                float value = Mathf.Clamp(
+                    (surfaceDepth - depth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                IntegrateShadowVoxelWithTopologyVeto(
+                    x, y, z,
+                    minX, minY, minZ, sx, sy, sz,
+                    value, observation.Weight,
+                    tsdf, weights,
+                    ref blockedVoxels, ref avoidedDestroyedZeroCells);
+            }
+        }
+        else
+        {
+            for (int step = -observation.HalfBandSteps; step <= observation.HalfBandSteps; step++)
+            {
+                float distance = step * voxelSizeMeters;
+                Vector3 world = observation.Surface + observation.Normal * distance;
+                if (!TryWorldToVoxel(world, out int x, out int y, out int z) ||
+                    x < minX || y < minY || z < minZ ||
+                    x >= minX + sx || y >= minY + sy || z >= minZ + sz)
+                    continue;
+                float value = Mathf.Clamp(
+                    distance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                IntegrateShadowVoxelWithTopologyVeto(
+                    x, y, z,
+                    minX, minY, minZ, sx, sy, sz,
+                    value, observation.Weight,
+                    tsdf, weights,
+                    ref blockedVoxels, ref avoidedDestroyedZeroCells);
+            }
+        }
+    }
+
+    private void IntegrateShadowVoxelWithTopologyVeto(
+        int x, int y, int z,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float value, float observationWeight,
+        float[] tsdf, float[] weights,
+        ref int blockedVoxels, ref int avoidedDestroyedZeroCells)
+    {
+        int index = ShadowLocalIndex(x, y, z, minX, minY, minZ, sx, sy);
+        float safeWeight = Mathf.Max(0.01f, observationWeight);
+        float combined = weights[index] + safeWeight;
+        float afterTsdf = (tsdf[index] * weights[index] + value * safeWeight) / combined;
+        float afterWeight = Mathf.Min(255f, combined);
+        ShadowTopologyImpact impact = ClassifyShadowVoxelTopologyImpact(
+            x, y, z,
+            minX, minY, minZ, sx, sy, sz,
+            afterTsdf, afterWeight,
+            tsdf, weights,
+            out int destroyedZeroCells, out int createdZeroCells);
+        if (impact == ShadowTopologyImpact.Destructive)
+        {
+            blockedVoxels++;
+            avoidedDestroyedZeroCells += destroyedZeroCells;
+            return;
+        }
+        tsdf[index] = afterTsdf;
+        weights[index] = afterWeight;
+    }
+
+    private bool ShadowCellHasZeroCrossWithOverride(
+        int cellX, int cellY, int cellZ,
+        int minX, int minY, int minZ, int sx, int sy,
+        float[] tsdf, float[] weights,
+        int overrideLocal, float overrideTsdf, float overrideWeight)
+    {
+        bool positive = false;
+        bool negative = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int local = ShadowLocalIndex(
+                cellX + CornerOffsetX[corner],
+                cellY + CornerOffsetY[corner],
+                cellZ + CornerOffsetZ[corner],
+                minX, minY, minZ, sx, sy);
+            if (local < 0 || local >= weights.Length)
+                continue;
+            float weight = local == overrideLocal ? overrideWeight : weights[local];
+            if (weight < minSurfaceCornerWeight)
+                continue;
+            float value = local == overrideLocal ? overrideTsdf : tsdf[local];
+            positive |= value > 0f;
+            negative |= value < 0f;
+        }
+        return positive && negative;
+    }
+
+    private void ReplayShadowObservation(
+        ShadowBlockObservation observation,
+        int minX, int minY, int minZ,
+        int sx, int sy, int sz,
+        float[] tsdf, float[] weights,
+        float[] pendingTsdf, float[] pendingWeights,
+        bool replayFusion, bool replayClearing)
+    {
+        if (observation.Projective)
+        {
+            Vector3 toSurface = observation.Surface - observation.Camera;
+            float surfaceDepth = toSurface.magnitude;
+            if (surfaceDepth <= 0.0001f)
+                return;
+            Vector3 direction = toSurface / surfaceDepth;
+            float voxel = Mathf.Max(0.0001f, voxelSizeMeters);
+            float startDepth = Mathf.Max(0.01f, surfaceDepth - observation.HalfBandSteps * voxel);
+            float endDepth = surfaceDepth + observation.HalfBandSteps * voxel;
+            float lateralRadiusSq = Mathf.Pow(voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f), 2f);
+
+            if (replayFusion)
+            {
+                for (int z = minZ; z < minZ + sz; z++)
+                for (int y = minY; y < minY + sy; y++)
+                for (int x = minX; x < minX + sx; x++)
+                {
+                    Vector3 center = VoxelCenter(x, y, z);
+                    float depth = Vector3.Dot(center - observation.Camera, direction);
+                    if (depth < startDepth - voxel * 0.5f || depth > endDepth + voxel * 0.5f)
+                        continue;
+                    Vector3 projected = observation.Camera + direction * depth;
+                    if ((center - projected).sqrMagnitude > lateralRadiusSq)
+                        continue;
+                    float value = Mathf.Clamp((surfaceDepth - depth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                    IntegrateShadowVoxel(x, y, z, minX, minY, minZ, sx, sy, value, observation.Weight,
+                        observation.Vote, tsdf, weights, pendingTsdf, pendingWeights);
+                }
+            }
+            if (replayClearing && observation.Clearing && observation.Vote == ObservationVoteState.Accept)
+                ReplayShadowClearing(observation, minX, minY, minZ, sx, sy, sz, tsdf, weights);
+        }
+        else if (replayFusion)
+        {
+            for (int step = -observation.HalfBandSteps; step <= observation.HalfBandSteps; step++)
+            {
+                float distance = step * voxelSizeMeters;
+                Vector3 world = observation.Surface + observation.Normal * distance;
+                if (!TryWorldToVoxel(world, out int x, out int y, out int z) ||
+                    x < minX || y < minY || z < minZ || x >= minX + sx || y >= minY + sy || z >= minZ + sz)
+                    continue;
+                float value = Mathf.Clamp(distance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+                IntegrateShadowVoxel(x, y, z, minX, minY, minZ, sx, sy, value, observation.Weight,
+                    observation.Vote, tsdf, weights, pendingTsdf, pendingWeights);
+            }
+        }
+    }
+
+    private static int ShadowLocalIndex(int x, int y, int z, int minX, int minY, int minZ, int sx, int sy)
+    {
+        return (x - minX) + sx * ((y - minY) + sy * (z - minZ));
+    }
+
+    private void IntegrateShadowVoxel(
+        int x, int y, int z,
+        int minX, int minY, int minZ, int sx, int sy,
+        float value, float weight, ObservationVoteState vote,
+        float[] tsdf, float[] weights, float[] pendingTsdf, float[] pendingWeights)
+    {
+        int index = ShadowLocalIndex(x, y, z, minX, minY, minZ, sx, sy);
+        float safeWeight = Mathf.Max(0.01f, weight);
+        if (vote == ObservationVoteState.Pending)
+        {
+            float total = pendingWeights[index] + safeWeight;
+            pendingTsdf[index] = (pendingTsdf[index] * pendingWeights[index] + value * safeWeight) / total;
+            pendingWeights[index] = Mathf.Min(atomicProvisionalBandMaxWeight, total);
+            return;
+        }
+        float combined = weights[index] + safeWeight;
+        tsdf[index] = (tsdf[index] * weights[index] + value * safeWeight) / combined;
+        weights[index] = Mathf.Min(255f, combined);
+    }
+
+    private ShadowClearingReplayResult ReplayShadowClearing(
+        ShadowBlockObservation observation,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float[] tsdf, float[] weights,
+        ShadowTopologyReplayMode mode = ShadowTopologyReplayMode.All,
+        float[] baselineTsdf = null, float[] baselineWeight = null)
+    {
+        ShadowClearingReplayResult result = new ShadowClearingReplayResult();
+        Vector3 ray = observation.Surface - observation.Camera;
+        float surfaceDepth = ray.magnitude;
+        if (surfaceDepth <= 0.0001f)
+            return result;
+        Vector3 direction = ray / surfaceDepth;
+        float end = surfaceDepth - Mathf.Max(truncationMeters, voxelSizeMeters);
+        float step = Mathf.Max(0.001f, voxelSizeMeters * 0.75f);
+        int previousIndex = -1;
+        for (float depth = Mathf.Max(0.01f, minDepthMeters); depth < end; depth += step)
+        {
+            Vector3 world = observation.Camera + direction * depth;
+            if (!TryWorldToVoxel(world, out int x, out int y, out int z) ||
+                x < minX || y < minY || z < minZ || x >= minX + sx || y >= minY + sy || z >= minZ + sz)
+                continue;
+            int index = ShadowLocalIndex(x, y, z, minX, minY, minZ, sx, sy);
+            if (index == previousIndex)
+                continue;
+            previousIndex = index;
+            if (weights[index] <= 0f)
+                continue;
+            int destroyedZeroCells = 0;
+            int createdZeroCells = 0;
+            if (mode != ShadowTopologyReplayMode.All)
+            {
+                ShadowTopologyImpact impact = ShadowTopologyImpact.Neutral;
+                if (baselineTsdf != null && baselineWeight != null && baselineWeight[index] > 0f)
+                {
+                    ApplyShadowClearingToValue(
+                        baselineTsdf[index], baselineWeight[index], observation.Weight,
+                        out float baselineAfterTsdf, out float baselineAfterWeight);
+                    impact = ClassifyShadowVoxelTopologyImpact(
+                        x, y, z,
+                        minX, minY, minZ, sx, sy, sz,
+                        baselineAfterTsdf, baselineAfterWeight,
+                        baselineTsdf, baselineWeight,
+                        out destroyedZeroCells, out createdZeroCells);
+                }
+                if ((mode == ShadowTopologyReplayMode.DestructiveOnly && impact != ShadowTopologyImpact.Destructive) ||
+                    (mode == ShadowTopologyReplayMode.ConstructiveOnly && impact != ShadowTopologyImpact.Constructive) ||
+                    (mode == ShadowTopologyReplayMode.NeutralOnly && impact != ShadowTopologyImpact.Neutral))
+                    continue;
+            }
+            ApplyShadowClearingToValue(
+                tsdf[index], weights[index], observation.Weight,
+                out tsdf[index], out weights[index]);
+            result.AppliedVoxels++;
+            result.DestroyedZeroCrossCells += destroyedZeroCells;
+            result.CreatedZeroCrossCells += createdZeroCells;
+        }
+        return result;
+    }
+
+    private void ApplyShadowClearingToValue(
+        float beforeTsdf, float beforeWeight, float observationWeight,
+        out float afterTsdf, out float afterWeight)
+    {
+        float blend = Mathf.Clamp01(freeSpaceCarvingBlend * freeSpaceCarvingWeightScale * observationWeight);
+        afterTsdf = Mathf.Lerp(beforeTsdf, 1f, blend);
+        float candidateWeight = Mathf.Max(0f, beforeWeight - Mathf.Clamp(freeSpaceEvidenceWeightDecay, 1, 4));
+        bool commitClear = candidateWeight <= Mathf.Clamp(freeSpaceEvidenceClearWeight, 0, 4) &&
+                           afterTsdf >= Mathf.Clamp01(freeSpaceEvidenceClearTsdf);
+        afterWeight = commitClear ? 0f : Mathf.Max(1f, candidateWeight);
+        if (commitClear)
+        {
+            afterTsdf = 1f;
+        }
+    }
+
+    private ShadowBlockMetrics MeasureCurrentShadowBlock(Vector3Int key, int blockSize)
+    {
+        int minX = Mathf.Max(0, key.x * blockSize);
+        int minY = Mathf.Max(0, key.y * blockSize);
+        int minZ = Mathf.Max(0, key.z * blockSize);
+        int maxX = Mathf.Min(_dimX - 1, (key.x + 1) * blockSize);
+        int maxY = Mathf.Min(_dimY - 1, (key.y + 1) * blockSize);
+        int maxZ = Mathf.Min(_dimZ - 1, (key.z + 1) * blockSize);
+        ShadowBlockMetrics metrics = new ShadowBlockMetrics();
+        for (int z = minZ; z < maxZ; z++)
+        for (int y = minY; y < maxY; y++)
+        for (int x = minX; x < maxX; x++)
+        {
+            bool positive = false;
+            bool negative = false;
+            bool any = false;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int index = Index(x + CornerOffsetX[corner], y + CornerOffsetY[corner], z + CornerOffsetZ[corner]);
+                if (_weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                    continue;
+                any = true;
+                positive |= _tsdf[index] > 0f;
+                negative |= _tsdf[index] < 0f;
+            }
+            AccumulateShadowCellMetric(any, positive, negative, ref metrics);
+        }
+        return metrics;
+    }
+
+    private ShadowBlockMetrics MeasureShadowBlock(
+        Vector3Int key, int blockSize,
+        int minX, int minY, int minZ, int sx, int sy, int sz,
+        float[] tsdf, float[] weights, float[] pendingWeights)
+    {
+        ShadowBlockMetrics metrics = new ShadowBlockMetrics();
+        for (int i = 0; i < pendingWeights.Length; i++)
+            if (pendingWeights[i] > 0f) metrics.PendingVoxels++;
+        int startX = Mathf.Max(0, key.x * blockSize);
+        int startY = Mathf.Max(0, key.y * blockSize);
+        int startZ = Mathf.Max(0, key.z * blockSize);
+        int endX = Mathf.Min(_dimX - 1, (key.x + 1) * blockSize);
+        int endY = Mathf.Min(_dimY - 1, (key.y + 1) * blockSize);
+        int endZ = Mathf.Min(_dimZ - 1, (key.z + 1) * blockSize);
+        for (int z = startZ; z < endZ; z++)
+        for (int y = startY; y < endY; y++)
+        for (int x = startX; x < endX; x++)
+        {
+            bool positive = false;
+            bool negative = false;
+            bool any = false;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                int local = ShadowLocalIndex(x + CornerOffsetX[corner], y + CornerOffsetY[corner], z + CornerOffsetZ[corner], minX, minY, minZ, sx, sy);
+                if (local < 0 || local >= weights.Length || weights[local] < minSurfaceCornerWeight)
+                    continue;
+                any = true;
+                positive |= tsdf[local] > 0f;
+                negative |= tsdf[local] < 0f;
+            }
+            AccumulateShadowCellMetric(any, positive, negative, ref metrics);
+        }
+        return metrics;
+    }
+
+    private static void AccumulateShadowCellMetric(bool any, bool positive, bool negative, ref ShadowBlockMetrics metrics)
+    {
+        if (!any)
+        {
+            metrics.UnknownCells++;
+            return;
+        }
+        metrics.SupportedCells++;
+        if (positive && negative)
+            metrics.ZeroCrossCells++;
+        else
+            metrics.OneSidedCells++;
+    }
+
+    private bool TryPromotePendingHoleCell(int cellX, int cellY, int cellZ)
+    {
+        if (!TryGetFormalCellSignState(cellX, cellY, cellZ, out bool hasPositive, out bool hasNegative) ||
+            hasPositive == hasNegative)
+        {
+            LastPendingHoleRouteBlockedTopologyCount++;
+            return false;
+        }
+
+        bool needPositive = hasNegative;
+        List<PrecisionHolePatchCandidate> candidates = new List<PrecisionHolePatchCandidate>(8);
+        int cellSupport = CountPendingHoleCellSignSupport(cellX, cellY, cellZ, needPositive);
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(cellX + CornerOffsetX[corner], cellY + CornerOffsetY[corner], cellZ + CornerOffsetZ[corner]);
+            if (!HasProvisionalTsdfMarker(index) || VoxelIsDirtyQuarantined(index) || VoxelHasPendingTsdfCorrection(index))
+                continue;
+            float provisional = _atomicProvisionalBandTsdf[index];
+            if ((needPositive && provisional <= 0f) || (!needPositive && provisional >= 0f))
+                continue;
+
+            int acceptedSequence = needPositive
+                ? (_acceptedPositiveLastSequence != null ? _acceptedPositiveLastSequence[index] : int.MinValue)
+                : (_acceptedNegativeLastSequence != null ? _acceptedNegativeLastSequence[index] : int.MinValue);
+            int neighborSupport = CountPendingHoleSignSupport(index, needPositive);
+            int requiredSupport = Mathf.Max(1, minPendingHoleNeighborSupport);
+            if (acceptedSequence == int.MinValue && cellSupport < requiredSupport && neighborSupport < requiredSupport)
+                continue;
+            int evidenceKind = acceptedSequence != int.MinValue ? 1 : (cellSupport >= requiredSupport ? 2 : 3);
+            int evidence = evidenceKind == 1
+                ? int.MaxValue / 2 + acceptedSequence
+                : (evidenceKind == 2 ? 1000000 + cellSupport : neighborSupport);
+            candidates.Add(new PrecisionHolePatchCandidate
+            {
+                Index = index,
+                Tsdf = provisional,
+                Evidence = evidence,
+                EvidenceKind = evidenceKind
+            });
+        }
+
+        if (candidates.Count < Mathf.Clamp(minPrecisionHolePatchVoxels, 2, 4))
+        {
+            LastPendingHoleRouteBlockedEvidenceCount++;
+            return false;
+        }
+
+        candidates.Sort((a, b) => b.Evidence.CompareTo(a.Evidence));
+        if (!TryBuildValidatedPrecisionHolePatch(cellX, cellY, cellZ, candidates, out Dictionary<int, HoleSideRepairProposal> patch))
+        {
+            LastPendingHoleRouteBlockedTopologyCount++;
+            return false;
+        }
+
+        foreach (PrecisionHolePatchCandidate candidate in candidates)
+        {
+            if (!patch.TryGetValue(candidate.Index, out HoleSideRepairProposal proposal))
+                continue;
+            float oldTsdf = _tsdf[candidate.Index];
+            int oldWeight = _weights[candidate.Index];
+            int provisionalWeight = _atomicProvisionalBandWeight[candidate.Index];
+            _tsdf[candidate.Index] = proposal.Tsdf;
+            _weights[candidate.Index] = (byte)Mathf.Max(minSurfaceCornerWeight, provisionalWeight);
+            RecordContributionLedger(candidate.Index, "hole_pending_atomic_patch", oldTsdf, oldWeight, proposal.Tsdf, provisionalWeight, proposal.Tsdf, _weights[candidate.Index]);
+            ClearAtomicProvisionalBandVoxel(candidate.Index);
+        }
+        LastPrecisionHolePatchAppliedCount++;
+        LastPrecisionHolePatchVoxelCount += patch.Count;
+        if (candidates[0].EvidenceKind == 1)
+            LastPendingHoleRouteAcceptedEvidenceCount++;
+        else if (candidates[0].EvidenceKind == 2)
+            LastPendingHoleRouteCellEvidenceCount++;
+        else
+            LastPendingHoleRouteNeighborEvidenceCount++;
+        return true;
+    }
+
+    private bool TryBuildValidatedPrecisionHolePatch(
+        int cellX,
+        int cellY,
+        int cellZ,
+        List<PrecisionHolePatchCandidate> candidates,
+        out Dictionary<int, HoleSideRepairProposal> patch)
+    {
+        patch = null;
+        int minimum = Mathf.Clamp(minPrecisionHolePatchVoxels, 2, 4);
+        int maximum = Mathf.Clamp(maxPrecisionHolePatchVoxels, minimum, 4);
+        maximum = Mathf.Min(maximum, candidates.Count);
+        int holesBefore = CountSimulatedOneSidedCells(cellX, cellY, cellZ, null);
+
+        for (int count = minimum; count <= maximum; count++)
+        {
+            Dictionary<int, HoleSideRepairProposal> candidatePatch = new Dictionary<int, HoleSideRepairProposal>(count);
+            for (int i = 0; i < count; i++)
+            {
+                PrecisionHolePatchCandidate candidate = candidates[i];
+                candidatePatch[candidate.Index] = new HoleSideRepairProposal
+                {
+                    Index = candidate.Index,
+                    Tsdf = candidate.Tsdf
+                };
+            }
+
+            if (!SimulatedCellHasZeroCrossing(cellX, cellY, cellZ, candidatePatch))
+                continue;
+
+            bool createsMultipleCrossings = false;
+            if (blockHoleRepairThatCreatesMultipleZeroCrossings)
+            {
+                foreach (HoleSideRepairProposal proposal in candidatePatch.Values)
+                {
+                    if (WouldHoleRepairCreateMultipleZeroCrossings(proposal.Index, proposal.Tsdf, candidatePatch))
+                    {
+                        createsMultipleCrossings = true;
+                        break;
+                    }
+                }
+            }
+            if (createsMultipleCrossings)
+                continue;
+
+            int holesAfter = CountSimulatedOneSidedCells(cellX, cellY, cellZ, candidatePatch);
+            if (holesAfter >= holesBefore)
+                continue;
+
+            patch = candidatePatch;
+            return true;
+        }
+
+        LastPrecisionHolePatchBlockedNetTopologyCount++;
+        return false;
+    }
+
+    private int CountSimulatedOneSidedCells(
+        int centerX,
+        int centerY,
+        int centerZ,
+        Dictionary<int, HoleSideRepairProposal> patch)
+    {
+        int count = 0;
+        for (int z = centerZ - 1; z <= centerZ + 1; z++)
+        for (int y = centerY - 1; y <= centerY + 1; y++)
+        for (int x = centerX - 1; x <= centerX + 1; x++)
+        {
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX - 1 || y >= _dimY - 1 || z >= _dimZ - 1)
+                continue;
+            if (TryGetSimulatedCellSignState(x, y, z, patch, out bool positive, out bool negative) && positive != negative)
+                count++;
+        }
+        return count;
+    }
+
+    private bool SimulatedCellHasZeroCrossing(
+        int cellX,
+        int cellY,
+        int cellZ,
+        Dictionary<int, HoleSideRepairProposal> patch)
+    {
+        return TryGetSimulatedCellSignState(cellX, cellY, cellZ, patch, out bool positive, out bool negative) &&
+               positive && negative;
+    }
+
+    private bool TryGetSimulatedCellSignState(
+        int cellX,
+        int cellY,
+        int cellZ,
+        Dictionary<int, HoleSideRepairProposal> patch,
+        out bool hasPositive,
+        out bool hasNegative)
+    {
+        hasPositive = false;
+        hasNegative = false;
+        bool any = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(cellX + CornerOffsetX[corner], cellY + CornerOffsetY[corner], cellZ + CornerOffsetZ[corner]);
+            float value;
+            if (patch != null && patch.TryGetValue(index, out HoleSideRepairProposal proposal))
+            {
+                value = proposal.Tsdf;
+            }
+            else
+            {
+                if (_weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                    continue;
+                value = _tsdf[index];
+            }
+            if (Mathf.Approximately(value, 0f))
+                continue;
+            any = true;
+            hasPositive |= value > 0f;
+            hasNegative |= value < 0f;
+        }
+        return any;
+    }
+
+    private bool TryGetFormalCellSignState(int cellX, int cellY, int cellZ, out bool hasPositive, out bool hasNegative)
+    {
+        hasPositive = false;
+        hasNegative = false;
+        bool any = false;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(cellX + CornerOffsetX[corner], cellY + CornerOffsetY[corner], cellZ + CornerOffsetZ[corner]);
+            if (_weights[index] < minSurfaceCornerWeight || !IsCleanMeshTsdfVoxel(index))
+                continue;
+            any = true;
+            hasPositive |= _tsdf[index] > 0f;
+            hasNegative |= _tsdf[index] < 0f;
+        }
+        return any;
+    }
+
+    private int CountPendingHoleSignSupport(int index, bool positive)
+    {
+        IndexToVoxel(index, out int x, out int y, out int z);
+        int support = 0;
+        int[] dx = { -1, 1, 0, 0, 0, 0 };
+        int[] dy = { 0, 0, -1, 1, 0, 0 };
+        int[] dz = { 0, 0, 0, 0, -1, 1 };
+        for (int i = 0; i < 6; i++)
+        {
+            int nx = x + dx[i];
+            int ny = y + dy[i];
+            int nz = z + dz[i];
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= _dimX || ny >= _dimY || nz >= _dimZ)
+                continue;
+            int neighbor = Index(nx, ny, nz);
+            if (!HasProvisionalTsdfMarker(neighbor))
+                continue;
+            float value = _atomicProvisionalBandTsdf[neighbor];
+            if ((positive && value > 0f) || (!positive && value < 0f))
+                support++;
+        }
+        return support;
+    }
+
+    private int CountPendingHoleCellSignSupport(int cellX, int cellY, int cellZ, bool positive)
+    {
+        int support = 0;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            int index = Index(cellX + CornerOffsetX[corner], cellY + CornerOffsetY[corner], cellZ + CornerOffsetZ[corner]);
+            if (!HasProvisionalTsdfMarker(index))
+                continue;
+            float value = _atomicProvisionalBandTsdf[index];
+            if ((positive && value > 0f) || (!positive && value < 0f))
+                support++;
+        }
+        return support;
+    }
+
     private void RepairGuardedHoleSides()
     {
         if (!enableGuardedHoleSideRepair || _tsdf == null || _weights == null)
@@ -11677,11 +16411,31 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 }
 
                 List<HoleSideRepairProposal> candidateBand = null;
+                PrimaryPlaneHoleRejectReason planeRejectReason = PrimaryPlaneHoleRejectReason.None;
                 bool primaryPlaneValid = usePrimaryPlaneHoleRepair &&
-                    TryBuildPrimaryPlaneHoleBand(index, desiredSign, out candidateBand);
+                    TryBuildPrimaryPlaneHoleBand(
+                        index, desiredSign, x, y, z, out candidateBand, out planeRejectReason);
                 if (usePrimaryPlaneHoleRepair && !primaryPlaneValid)
                 {
                     LastHoleSideRepairBlockedPlaneCount++;
+                    switch (planeRejectReason)
+                    {
+                        case PrimaryPlaneHoleRejectReason.AnchorCount:
+                            LastHoleSideRepairBlockedPlaneAnchorCount++;
+                            break;
+                        case PrimaryPlaneHoleRejectReason.DegenerateNormal:
+                            LastHoleSideRepairBlockedPlaneDegenerateNormalCount++;
+                            break;
+                        case PrimaryPlaneHoleRejectReason.Residual:
+                            LastHoleSideRepairBlockedPlaneResidualCount++;
+                            break;
+                        case PrimaryPlaneHoleRejectReason.CandidateDistance:
+                            LastHoleSideRepairBlockedPlaneCandidateDistanceCount++;
+                            break;
+                        case PrimaryPlaneHoleRejectReason.EmptyBand:
+                            LastHoleSideRepairBlockedPlaneEmptyBandCount++;
+                            break;
+                    }
                     continue;
                 }
 
@@ -11847,9 +16601,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private bool TryBuildPrimaryPlaneHoleBand(
         int candidateIndex,
         int desiredSign,
-        out List<HoleSideRepairProposal> band)
+        int sourceCellX,
+        int sourceCellY,
+        int sourceCellZ,
+        out List<HoleSideRepairProposal> band,
+        out PrimaryPlaneHoleRejectReason rejectReason)
     {
         band = null;
+        rejectReason = PrimaryPlaneHoleRejectReason.None;
         IndexToVoxel(candidateIndex, out int cx, out int cy, out int cz);
         int radius = Mathf.Clamp(primaryPlaneHoleAnchorRadiusVoxels, 1, 4);
         int requiredAnchors = Mathf.Clamp(minPrimaryPlaneHoleAnchors, 3, 16);
@@ -11857,6 +16616,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         List<Vector3> normals = new List<Vector3>(requiredAnchors * 2);
         HashSet<long> observations = new HashSet<long>();
         Vector3 referenceNormal = Vector3.zero;
+        int weightedAnchorCount = 0;
+        bool hadDirtyPendingReject = false;
+        bool hadDirtyQuarantinedReject = false;
+        bool hadPendingTsdfReject = false;
+        bool hadProvisionalReject = false;
+        bool hadNoProvenanceReject = false;
+        bool hadOperationReject = false;
+        bool hadGeometryReject = false;
+        bool hadDuplicateReject = false;
+        bool hadNormalReject = false;
+        float bestRejectedNormalDot = -1f;
+        Vector3 bestRejectedNormalPoint = Vector3.zero;
+        Vector3 bestRejectedNormal = Vector3.zero;
 
         for (int dz = -radius; dz <= radius; dz++)
         for (int dy = -radius; dy <= radius; dy++)
@@ -11868,35 +16640,181 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
                 continue;
             int index = Index(x, y, z);
-            if (_weights[index] < minSurfaceCornerWeight ||
-                VoxelIsDirtyQuarantined(index) ||
-                VoxelHasPendingTsdfCorrection(index) ||
-                HasProvisionalTsdfMarker(index) ||
-                !_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance) ||
-                !IsPrimaryPlaneHoleAnchorOperation(provenance.LastOperation) ||
-                !Finite(provenance.SurfacePoint) ||
+            LastHoleSideRepairPlaneAnchorScannedCount++;
+            if (_weights[index] < minSurfaceCornerWeight)
+            {
+                LastHoleSideRepairPlaneAnchorRejectedNoWeightCount++;
+                continue;
+            }
+            weightedAnchorCount++;
+            bool dirtyQuarantined = VoxelIsDirtyQuarantined(index);
+            bool pendingTsdf = VoxelHasPendingTsdfCorrection(index);
+            bool hasProvisionalMarker = HasProvisionalTsdfMarker(index);
+            bool provisional = hasProvisionalMarker && HasBlockingProvisionalForFormalGeometry(index);
+            if (hasProvisionalMarker && !provisional && _atomicProvisionalBackingPlaneAnchorAllowed.Add(index))
+                LastAtomicProvisionalBackingPlaneAnchorAllowedCount = _atomicProvisionalBackingPlaneAnchorAllowed.Count;
+            if (dirtyQuarantined || pendingTsdf || provisional)
+            {
+                LastHoleSideRepairPlaneAnchorRejectedDirtyPendingCount++;
+                hadDirtyPendingReject = true;
+                hadDirtyQuarantinedReject |= dirtyQuarantined;
+                hadPendingTsdfReject |= pendingTsdf;
+                hadProvisionalReject |= provisional;
+                continue;
+            }
+            if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
+            {
+                LastHoleSideRepairPlaneAnchorRejectedNoProvenanceCount++;
+                hadNoProvenanceReject = true;
+                continue;
+            }
+            if (!IsPrimaryPlaneHoleAnchorOperation(provenance.LastOperation))
+            {
+                LastHoleSideRepairPlaneAnchorRejectedOperationCount++;
+                hadOperationReject = true;
+                continue;
+            }
+            if (!Finite(provenance.SurfacePoint) ||
                 !Finite(provenance.SurfaceNormal) ||
                 provenance.SurfaceNormal.sqrMagnitude < 0.25f)
             {
+                LastHoleSideRepairPlaneAnchorRejectedGeometryCount++;
+                hadGeometryReject = true;
                 continue;
             }
 
             long observation = ((long)provenance.Capture << 32) ^ (uint)provenance.Sample;
             if (!observations.Add(observation))
+            {
+                LastHoleSideRepairPlaneAnchorRejectedDuplicateCount++;
+                hadDuplicateReject = true;
                 continue;
+            }
             Vector3 normal = provenance.SurfaceNormal.normalized;
             if (referenceNormal == Vector3.zero)
                 referenceNormal = normal;
             if (Vector3.Dot(normal, referenceNormal) < 0f)
                 normal = -normal;
-            if (Vector3.Dot(normal, referenceNormal) < Mathf.Clamp01(minPrimaryPlaneHoleNormalDot))
+            float normalDot = Vector3.Dot(normal, referenceNormal);
+            if (normalDot < Mathf.Clamp01(minPrimaryPlaneHoleNormalDot))
+            {
+                LastHoleSideRepairPlaneAnchorRejectedNormalCount++;
+                hadNormalReject = true;
+                if (normalDot > bestRejectedNormalDot)
+                {
+                    bestRejectedNormalDot = normalDot;
+                    bestRejectedNormalPoint = provenance.SurfacePoint;
+                    bestRejectedNormal = normal;
+                }
                 continue;
+            }
             points.Add(provenance.SurfacePoint);
             normals.Add(normal);
+            LastHoleSideRepairPlaneAnchorAcceptedCount++;
         }
 
         if (points.Count < requiredAnchors)
+        {
+            if (weightedAnchorCount <= 0)
+                LastHoleSideRepairPlaneAnchorFailWeighted0Count++;
+            else if (weightedAnchorCount <= 3)
+                LastHoleSideRepairPlaneAnchorFailWeighted1To3Count++;
+            else
+                LastHoleSideRepairPlaneAnchorFailWeighted4PlusCount++;
+
+            if (points.Count <= 0)
+                LastHoleSideRepairPlaneAnchorFailAccepted0Count++;
+            else if (points.Count == 1)
+                LastHoleSideRepairPlaneAnchorFailAccepted1Count++;
+            else if (points.Count == 2)
+                LastHoleSideRepairPlaneAnchorFailAccepted2Count++;
+            else if (points.Count == 3)
+                LastHoleSideRepairPlaneAnchorFailAccepted3Count++;
+            else
+                LastHoleSideRepairPlaneAnchorFailAccepted4PlusCount++;
+
+            int anchorDeficit = requiredAnchors - points.Count;
+            if (anchorDeficit == 1)
+            {
+                LastHoleSideRepairPlaneAnchorFailDeficit1Count++;
+                if (hadNormalReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestNormalCount++;
+                    float normalShortfall = Mathf.Clamp01(minPrimaryPlaneHoleNormalDot) - bestRejectedNormalDot;
+                    int normalShortfallBucket;
+                    if (normalShortfall <= 0.02f)
+                    {
+                        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall0To002Count++;
+                        normalShortfallBucket = 0;
+                    }
+                    else if (normalShortfall <= 0.05f)
+                    {
+                        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall002To005Count++;
+                        normalShortfallBucket = 1;
+                    }
+                    else if (normalShortfall <= 0.1f)
+                    {
+                        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfall005To01Count++;
+                        normalShortfallBucket = 2;
+                    }
+                    else
+                    {
+                        LastHoleSideRepairPlaneAnchorDeficit1NormalShortfallOver01Count++;
+                        normalShortfallBucket = 3;
+                    }
+                    RecordPrimaryPlaneDeficit1NormalShadow(
+                        points,
+                        normals,
+                        bestRejectedNormalPoint,
+                        bestRejectedNormal,
+                        cx,
+                        cy,
+                        cz,
+                        candidateIndex,
+                        desiredSign,
+                        sourceCellX,
+                        sourceCellY,
+                        sourceCellZ,
+                        normalShortfallBucket);
+                }
+                else if (hadDuplicateReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestDuplicateCount++;
+                }
+                else if (hadGeometryReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestGeometryCount++;
+                }
+                else if (hadOperationReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestOperationCount++;
+                }
+                else if (hadNoProvenanceReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestNoProvenanceCount++;
+                }
+                else if (hadDirtyPendingReject)
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestDirtyPendingCount++;
+                    if (hadDirtyQuarantinedReject)
+                        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasQuarantinedCount++;
+                    if (hadPendingTsdfReject)
+                        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasPendingCount++;
+                    if (hadProvisionalReject)
+                        LastHoleSideRepairPlaneAnchorDeficit1DirtyHasProvisionalCount++;
+                }
+                else
+                {
+                    LastHoleSideRepairPlaneAnchorDeficit1ClosestNoWeightCount++;
+                }
+            }
+            else if (anchorDeficit == 2)
+                LastHoleSideRepairPlaneAnchorFailDeficit2Count++;
+            else
+                LastHoleSideRepairPlaneAnchorFailDeficit3PlusCount++;
+            rejectReason = PrimaryPlaneHoleRejectReason.AnchorCount;
             return false;
+        }
 
         Vector3 planePoint = Vector3.zero;
         Vector3 planeNormal = Vector3.zero;
@@ -11907,19 +16825,49 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
         planePoint /= points.Count;
         if (planeNormal.sqrMagnitude < 0.25f)
+        {
+            rejectReason = PrimaryPlaneHoleRejectReason.DegenerateNormal;
             return false;
+        }
         planeNormal.Normalize();
 
         float maxResidual = 0f;
         for (int i = 0; i < points.Count; i++)
             maxResidual = Mathf.Max(maxResidual, Mathf.Abs(Vector3.Dot(points[i] - planePoint, planeNormal)));
-        if (maxResidual > Mathf.Max(0.001f, maxPrimaryPlaneHoleResidualMeters))
+        float residualLimit = Mathf.Max(0.001f, maxPrimaryPlaneHoleResidualMeters);
+        if (maxResidual > residualLimit)
+        {
+            float excessRatio = maxResidual / residualLimit;
+            if (excessRatio <= 1.25f)
+                LastHoleSideRepairPlaneResidualOver1To125Count++;
+            else if (excessRatio <= 1.5f)
+                LastHoleSideRepairPlaneResidualOver125To15Count++;
+            else if (excessRatio <= 2f)
+                LastHoleSideRepairPlaneResidualOver15To2Count++;
+            else
+                LastHoleSideRepairPlaneResidualOver2Count++;
+            rejectReason = PrimaryPlaneHoleRejectReason.Residual;
             return false;
+        }
 
         Vector3 candidateCenter = VoxelCenter(cx, cy, cz);
         float candidateDistance = Vector3.Dot(candidateCenter - planePoint, planeNormal);
-        if (Mathf.Abs(candidateDistance) > Mathf.Max(truncationMeters, maxPrimaryPlaneHoleResidualMeters))
+        float candidateDistanceLimit = Mathf.Max(truncationMeters, maxPrimaryPlaneHoleResidualMeters);
+        float absoluteCandidateDistance = Mathf.Abs(candidateDistance);
+        if (absoluteCandidateDistance > candidateDistanceLimit)
+        {
+            float excessRatio = absoluteCandidateDistance / candidateDistanceLimit;
+            if (excessRatio <= 1.25f)
+                LastHoleSideRepairPlaneCandidateDistanceOver1To125Count++;
+            else if (excessRatio <= 1.5f)
+                LastHoleSideRepairPlaneCandidateDistanceOver125To15Count++;
+            else if (excessRatio <= 2f)
+                LastHoleSideRepairPlaneCandidateDistanceOver15To2Count++;
+            else
+                LastHoleSideRepairPlaneCandidateDistanceOver2Count++;
+            rejectReason = PrimaryPlaneHoleRejectReason.CandidateDistance;
             return false;
+        }
         if (!Mathf.Approximately(candidateDistance, 0f) && Mathf.Sign(candidateDistance) != desiredSign)
             planeNormal = -planeNormal;
 
@@ -11949,7 +16897,170 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (!Mathf.Approximately(value, 0f))
                 band.Add(new HoleSideRepairProposal { Index = index, Tsdf = value });
         }
-        return band.Count > 0;
+        if (band.Count <= 0)
+        {
+            rejectReason = PrimaryPlaneHoleRejectReason.EmptyBand;
+            return false;
+        }
+        return true;
+    }
+
+    private void RecordPrimaryPlaneDeficit1NormalShadow(
+        List<Vector3> points,
+        List<Vector3> normals,
+        Vector3 rejectedPoint,
+        Vector3 rejectedNormal,
+        int candidateX,
+        int candidateY,
+        int candidateZ,
+        int candidateIndex,
+        int desiredSign,
+        int sourceCellX,
+        int sourceCellY,
+        int sourceCellZ,
+        int normalShortfallBucket)
+    {
+        int pointCount = points.Count + 1;
+        Vector3 planePoint = rejectedPoint;
+        Vector3 planeNormal = rejectedNormal;
+        for (int i = 0; i < points.Count; i++)
+        {
+            planePoint += points[i];
+            planeNormal += normals[i];
+        }
+        planePoint /= pointCount;
+        if (planeNormal.sqrMagnitude < 0.25f)
+        {
+            LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDegenerateCount++;
+            return;
+        }
+        planeNormal.Normalize();
+
+        float maxResidual = Mathf.Abs(Vector3.Dot(rejectedPoint - planePoint, planeNormal));
+        for (int i = 0; i < points.Count; i++)
+            maxResidual = Mathf.Max(maxResidual, Mathf.Abs(Vector3.Dot(points[i] - planePoint, planeNormal)));
+        if (maxResidual > Mathf.Max(0.001f, maxPrimaryPlaneHoleResidualMeters))
+        {
+            LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedResidualCount++;
+            return;
+        }
+
+        float signedCandidateDistance = Vector3.Dot(
+            VoxelCenter(candidateX, candidateY, candidateZ) - planePoint,
+            planeNormal);
+        if (Mathf.Abs(signedCandidateDistance) > Mathf.Max(truncationMeters, maxPrimaryPlaneHoleResidualMeters))
+        {
+            LastHoleSideRepairPlaneAnchorDeficit1NormalShadowBlockedDistanceCount++;
+            return;
+        }
+
+        LastHoleSideRepairPlaneAnchorDeficit1NormalShadowValidCount++;
+        normalShortfallBucket = Mathf.Clamp(normalShortfallBucket, 0, PlaneAnchorNormalShortfallLabels.Length - 1);
+        _planeAnchorDeficit1NormalShadowPlaneValidByShortfall[normalShortfallBucket]++;
+
+        if (!Mathf.Approximately(signedCandidateDistance, 0f) && Mathf.Sign(signedCandidateDistance) != desiredSign)
+            planeNormal = -planeNormal;
+
+        int axis = 0;
+        Vector3 absNormal = new Vector3(Mathf.Abs(planeNormal.x), Mathf.Abs(planeNormal.y), Mathf.Abs(planeNormal.z));
+        if (absNormal.y > absNormal.x && absNormal.y >= absNormal.z)
+            axis = 1;
+        else if (absNormal.z > absNormal.x && absNormal.z > absNormal.y)
+            axis = 2;
+
+        int bandRadius = Mathf.Clamp(primaryPlaneHoleBandRadiusVoxels, 0, 2);
+        Dictionary<int, HoleSideRepairProposal> shadowBand = new Dictionary<int, HoleSideRepairProposal>(bandRadius * 2 + 1);
+        for (int offset = -bandRadius; offset <= bandRadius; offset++)
+        {
+            int x = candidateX + (axis == 0 ? offset : 0);
+            int y = candidateY + (axis == 1 ? offset : 0);
+            int z = candidateZ + (axis == 2 ? offset : 0);
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if ((_weights[index] > 0 && index != candidateIndex) || NeighborhoodTouchesDirtyOrPending(x, y, z, 1))
+                continue;
+            float signedDistance = Vector3.Dot(VoxelCenter(x, y, z) - planePoint, planeNormal);
+            float value = Mathf.Clamp(signedDistance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+            if (index == candidateIndex && Mathf.Abs(value) < 0.01f)
+                value = desiredSign * Mathf.Max(0.01f, holeSideRepairAbsTsdf);
+            if (!Mathf.Approximately(value, 0f) && _weights[index] <= 0)
+            {
+                shadowBand[index] = new HoleSideRepairProposal
+                {
+                    Index = index,
+                    Tsdf = value
+                };
+            }
+        }
+
+        if (shadowBand.Count <= 0)
+        {
+            _planeAnchorDeficit1NormalShadowBandEmptyByShortfall[normalShortfallBucket]++;
+            return;
+        }
+
+        if (!SimulatedCellHasZeroCrossing(sourceCellX, sourceCellY, sourceCellZ, shadowBand))
+        {
+            _planeAnchorDeficit1NormalShadowTargetNoZeroByShortfall[normalShortfallBucket]++;
+            return;
+        }
+
+        if (blockHoleRepairThatCreatesMultipleZeroCrossings)
+        {
+            foreach (HoleSideRepairProposal proposal in shadowBand.Values)
+            {
+                if (WouldHoleRepairCreateMultipleZeroCrossings(proposal.Index, proposal.Tsdf, shadowBand))
+                {
+                    _planeAnchorDeficit1NormalShadowMultiZeroByShortfall[normalShortfallBucket]++;
+                    return;
+                }
+            }
+        }
+
+        int oneSidedBefore = CountSimulatedOneSidedCells(sourceCellX, sourceCellY, sourceCellZ, null);
+        int oneSidedAfter = CountSimulatedOneSidedCells(sourceCellX, sourceCellY, sourceCellZ, shadowBand);
+        CountSimulatedZeroCrossingChanges(
+            sourceCellX,
+            sourceCellY,
+            sourceCellZ,
+            shadowBand,
+            out int destroyedZeroCells,
+            out int createdZeroCells);
+        if (oneSidedAfter >= oneSidedBefore || destroyedZeroCells > 0)
+        {
+            _planeAnchorDeficit1NormalShadowNetTopologyByShortfall[normalShortfallBucket]++;
+            _planeAnchorDeficit1NormalShadowBlockedDestroyedZeroCellCount += destroyedZeroCells;
+            return;
+        }
+
+        _planeAnchorDeficit1NormalShadowSafeByShortfall[normalShortfallBucket]++;
+        _planeAnchorDeficit1NormalShadowSafeCreatedZeroCellCount += createdZeroCells;
+    }
+
+    private void CountSimulatedZeroCrossingChanges(
+        int centerX,
+        int centerY,
+        int centerZ,
+        Dictionary<int, HoleSideRepairProposal> patch,
+        out int destroyedZeroCells,
+        out int createdZeroCells)
+    {
+        destroyedZeroCells = 0;
+        createdZeroCells = 0;
+        for (int z = centerZ - 1; z <= centerZ + 1; z++)
+        for (int y = centerY - 1; y <= centerY + 1; y++)
+        for (int x = centerX - 1; x <= centerX + 1; x++)
+        {
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX - 1 || y >= _dimY - 1 || z >= _dimZ - 1)
+                continue;
+            bool before = SimulatedCellHasZeroCrossing(x, y, z, null);
+            bool after = SimulatedCellHasZeroCrossing(x, y, z, patch);
+            if (before && !after)
+                destroyedZeroCells++;
+            else if (!before && after)
+                createdZeroCells++;
+        }
     }
 
     private static bool IsPrimaryPlaneHoleAnchorOperation(string operation)
@@ -12494,6 +17605,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                _provisionalTsdf[index] != 0;
     }
 
+    private bool HasBlockingProvisionalForFormalGeometry(int index)
+    {
+        return HasProvisionalTsdfMarker(index) && !IsCleanMeshTsdfVoxel(index);
+    }
+
     private bool UseLegacyMeshExtraction =>
         useLegacyTsdfMeshDisplay && (!useStage03ACleanIsoSurface || useV09LegacyExtractorForStage03A);
 
@@ -12507,27 +17623,91 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return false;
         if (!useStage03ACleanIsoSurface)
             return true;
-        if (HasProvisionalTsdfMarker(index) || VoxelHasPendingTsdfCorrection(index) || VoxelIsDirtyQuarantined(index))
+        if (VoxelHasPendingTsdfCorrection(index) || VoxelIsDirtyQuarantined(index))
             return false;
+        bool preserveAtomicBacking = false;
+        if (HasProvisionalTsdfMarker(index))
+        {
+            bool hasAtomicCandidate = _atomicProvisionalBandWeight != null &&
+                                      index < _atomicProvisionalBandWeight.Length &&
+                                      _atomicProvisionalBandWeight[index] > 0;
+            if (!preserveMatureCleanBackingUnderAtomicProvisional || !hasAtomicCandidate)
+            {
+                RecordAtomicProvisionalNonAtomicBlock(index);
+                return false;
+            }
+
+            int matureWeight = Mathf.Max(minSurfaceCornerWeight, minAtomicProvisionalMatureBackingWeight);
+            if (_weights[index] < matureWeight)
+            {
+                RecordAtomicProvisionalWeakBackingBlock(index);
+                return false;
+            }
+            preserveAtomicBacking = true;
+        }
         if (!_voxelWriteProvenance.TryGetValue(index, out VoxelWriteProvenance provenance))
-            return !requireCleanMeshVoxelProvenance;
+        {
+            bool allowedWithoutProvenance = !requireCleanMeshVoxelProvenance;
+            if (preserveAtomicBacking)
+            {
+                if (allowedWithoutProvenance)
+                    RecordAtomicProvisionalMatureBackingPreserved(index);
+                else
+                    RecordAtomicProvisionalBackingProvenanceBlock(index);
+            }
+            return allowedWithoutProvenance;
+        }
 
         string operation = provenance.LastOperation;
         if (string.IsNullOrEmpty(operation) || operation == "unknown")
+        {
+            if (preserveAtomicBacking)
+                RecordAtomicProvisionalBackingProvenanceBlock(index);
             return false;
+        }
         if (operation == "provisional_support" || operation == "strong_sample_seed" ||
             operation == "cleanup_neighbor" || operation == "old_clean_decay" ||
             operation == "old_clean_clear")
         {
+            if (preserveAtomicBacking)
+                RecordAtomicProvisionalBackingProvenanceBlock(index);
             return false;
         }
         if (!allowVerifiedContinuityInCleanMesh &&
             (operation == "continuity_fill" || operation == "boundary_no_tsdf_fill"))
         {
+            if (preserveAtomicBacking)
+                RecordAtomicProvisionalBackingProvenanceBlock(index);
             return false;
         }
 
+        if (preserveAtomicBacking)
+            RecordAtomicProvisionalMatureBackingPreserved(index);
         return true;
+    }
+
+    private void RecordAtomicProvisionalMatureBackingPreserved(int index)
+    {
+        if (_atomicProvisionalMatureBackingPreserved.Add(index))
+            LastAtomicProvisionalMatureBackingPreservedCount = _atomicProvisionalMatureBackingPreserved.Count;
+    }
+
+    private void RecordAtomicProvisionalWeakBackingBlock(int index)
+    {
+        if (_atomicProvisionalMatureBackingWeakBlocked.Add(index))
+            LastAtomicProvisionalMatureBackingWeakBlockedCount = _atomicProvisionalMatureBackingWeakBlocked.Count;
+    }
+
+    private void RecordAtomicProvisionalNonAtomicBlock(int index)
+    {
+        if (_atomicProvisionalNonAtomicBlocked.Add(index))
+            LastAtomicProvisionalNonAtomicBlockedCount = _atomicProvisionalNonAtomicBlocked.Count;
+    }
+
+    private void RecordAtomicProvisionalBackingProvenanceBlock(int index)
+    {
+        if (_atomicProvisionalBackingProvenanceBlocked.Add(index))
+            LastAtomicProvisionalBackingProvenanceBlockedCount = _atomicProvisionalBackingProvenanceBlocked.Count;
     }
 
     private static bool IsStableProvisionalContinuityOperation(string operation)
@@ -12635,10 +17815,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         byte[] cornerWeights,
         out Vector3 vertex)
     {
+        _lastBuiltCellRestoredByAtomicProvisionalBacking = false;
         vertex = Vector3.zero;
         bool hasPositive = false;
         bool hasNegative = false;
         int supportedCorners = 0;
+        bool compareOldProvisionalPolicy = useStage03ACleanIsoSurface && !useV09ExactCornerEligibilityForDiagnosis;
+        bool oldHasPositive = false;
+        bool oldHasNegative = false;
+        int oldSupportedCorners = 0;
+        int oldEligibleMask = 0;
 
         for (int i = 0; i < 8; i++)
         {
@@ -12648,9 +17834,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             int index = Index(vx, vy, vz);
             cornerPositions[i] = VoxelCenter(vx, vy, vz);
             cornerValues[i] = _tsdf[index];
-            cornerWeights[i] = useStage03ACleanIsoSurface && !useV09ExactCornerEligibilityForDiagnosis
-                ? (IsCleanMeshTsdfVoxel(index) ? _weights[index] : (byte)0)
-                : _weights[index];
+            bool cleanEligible = !compareOldProvisionalPolicy || IsCleanMeshTsdfVoxel(index);
+            cornerWeights[i] = cleanEligible ? _weights[index] : (byte)0;
+
+            bool oldEligible = cleanEligible && (!compareOldProvisionalPolicy || !HasProvisionalTsdfMarker(index));
+            if (oldEligible && _weights[index] >= minSurfaceCornerWeight)
+            {
+                oldEligibleMask |= 1 << i;
+                oldSupportedCorners++;
+                oldHasNegative |= cornerValues[i] < 0f;
+                oldHasPositive |= cornerValues[i] > 0f;
+            }
 
             if (cornerWeights[i] >= minSurfaceCornerWeight)
             {
@@ -12695,6 +17889,27 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         vertex = sum / count;
+        if (compareOldProvisionalPolicy)
+        {
+            bool oldHasEdge = false;
+            for (int edge = 0; edge < 12 && !oldHasEdge; edge++)
+            {
+                int a = CubeEdges[edge, 0];
+                int b = CubeEdges[edge, 1];
+                if ((oldEligibleMask & (1 << a)) == 0 || (oldEligibleMask & (1 << b)) == 0)
+                    continue;
+                float va = cornerValues[a];
+                float vb = cornerValues[b];
+                oldHasEdge = (va < 0f && vb > 0f) || (va > 0f && vb < 0f);
+            }
+            bool oldWouldBuild = oldSupportedCorners >= Mathf.Max(2, minSurfaceCornerWeight) &&
+                                 oldHasPositive && oldHasNegative && oldHasEdge;
+            if (!oldWouldBuild)
+            {
+                _lastBuiltCellRestoredByAtomicProvisionalBacking = true;
+                LastAtomicProvisionalBackingRestoredCellCount++;
+            }
+        }
         return Finite(vertex);
     }
 
@@ -13142,6 +18357,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (y <= 0 || z <= 0 || x >= cellX)
             return;
         AddQuad(
+            new StableQuadKey { X = x, Y = y, Z = z, Axis = 0 },
             TryGetCellVertex(x, y, z, cellX, cellY),
             TryGetCellVertex(x, y - 1, z, cellX, cellY),
             TryGetCellVertex(x, y - 1, z - 1, cellX, cellY),
@@ -13155,6 +18371,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (x <= 0 || z <= 0 || y >= cellY)
             return;
         AddQuad(
+            new StableQuadKey { X = x, Y = y, Z = z, Axis = 1 },
             TryGetCellVertex(x, y, z, cellX, cellY),
             TryGetCellVertex(x, y, z - 1, cellX, cellY),
             TryGetCellVertex(x - 1, y, z - 1, cellX, cellY),
@@ -13168,6 +18385,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (x <= 0 || y <= 0 || z >= _dimZ - 1)
             return;
         AddQuad(
+            new StableQuadKey { X = x, Y = y, Z = z, Axis = 2 },
             TryGetCellVertex(x, y, z, cellX, cellY),
             TryGetCellVertex(x - 1, y, z, cellX, cellY),
             TryGetCellVertex(x - 1, y - 1, z, cellX, cellY),
@@ -13184,7 +18402,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return _cellVertexIndices[CellIndex(x, y, z, cellX, cellY)];
     }
 
-    private void AddQuad(int a, int b, int c, int d, List<Vector3> vertices, List<int> triangles)
+    private void AddQuad(StableQuadKey key, int a, int b, int c, int d, List<Vector3> vertices, List<int> triangles)
     {
         if (a < 0 || b < 0 || c < 0 || d < 0)
         {
@@ -13197,6 +18415,66 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return;
         }
 
+        _naturallyObservedStableQuadKeys.Add(key);
+
+        bool restored = _atomicProvisionalBackingRestoredVertexIndices.Contains(a) ||
+                        _atomicProvisionalBackingRestoredVertexIndices.Contains(b) ||
+                        _atomicProvisionalBackingRestoredVertexIndices.Contains(c) ||
+                        _atomicProvisionalBackingRestoredVertexIndices.Contains(d);
+        int winding = StableQuadTsdfWinding(key);
+        if (_heldProvisionalRetainedKeys.Contains(key) &&
+            _previousStableQuadAuditRecords.TryGetValue(key, out StableQuadAuditRecord retainedPrevious) &&
+            retainedPrevious.Winding != 0)
+        {
+            winding = retainedPrevious.Winding;
+        }
+        bool hasPrevious = _previousStableQuadAuditRecords.TryGetValue(key, out StableQuadAuditRecord previous);
+        bool windingChanged = hasPrevious && previous.Winding != 0 && winding != 0 && previous.Winding != winding;
+        bool persistedSameLayer = hasPrevious && !windingChanged;
+
+        // A mature face that still describes the same layer is committed first, independent of voxel traversal.
+        // Every genuinely new or winding-changed face waits until that mature base has been assembled.
+        if (arbitrateAllNewbornLayerConflicts && persistedSameLayer)
+        {
+            CommitStableQuad(key, a, b, c, d, vertices, triangles);
+            LastNewbornArbitrationPersistedFirstCount++;
+            return;
+        }
+
+        bool newborn = !persistedSameLayer;
+        bool deferForNewbornArbitration = arbitrateAllNewbornLayerConflicts && newborn;
+        bool deferForRestoredArbitration = !arbitrateAllNewbornLayerConflicts &&
+                                            arbitrateRestoredAtomicBackingLayerConflicts && restored;
+        if (deferForNewbornArbitration || deferForRestoredArbitration)
+        {
+            _deferredArbitratedQuads.Add(new DeferredArbitratedQuad
+            {
+                Key = key,
+                A = a,
+                B = b,
+                C = c,
+                D = d,
+                Priority = StableArbitratedQuadPriority(key),
+                Winding = winding,
+                Restored = restored,
+                Newborn = deferForNewbornArbitration,
+                HeldProvisional = false,
+                ProbationRollback = false
+            });
+            _deferredArbitratedQuadKeys.Add(key);
+            if (restored)
+                LastAtomicRestoredArbitrationCandidateCount++;
+            if (deferForNewbornArbitration)
+                LastNewbornArbitrationCandidateCount++;
+            return;
+        }
+
+        CommitStableQuad(key, a, b, c, d, vertices, triangles);
+    }
+
+    private void CommitStableQuad(StableQuadKey key, int a, int b, int c, int d, List<Vector3> vertices, List<int> triangles)
+    {
+        RecordStableQuadTopologyAudit(key, a, b, c, d, vertices);
         LastAddedSurfaceQuadCount++;
         triangles.Add(a);
         triangles.Add(b);
@@ -13214,6 +18492,1522 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         triangles.Add(d);
         triangles.Add(c);
         triangles.Add(a);
+    }
+
+    private int StableArbitratedQuadPriority(StableQuadKey key)
+    {
+        int priority = 0;
+        if (_stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState state))
+        {
+            if (state.Committed)
+                priority += 1000000;
+            priority += Mathf.Min(999, state.TotalPresent) * 100;
+            priority += Mathf.Min(99, state.ConsecutivePresent);
+        }
+        if (_previousStableQuadAuditRecords.ContainsKey(key))
+            priority += 100000;
+        return priority;
+    }
+
+    private void ResolveNewbornPholdReplacementProbations(int cellX, int cellY, List<Vector3> vertices)
+    {
+        if (!enableNewbornPholdReplacementProbation || _newbornPholdReplacementProbations.Count <= 0)
+        {
+            LastNewbornPholdProbationPendingCount = _newbornPholdReplacementProbations.Count;
+            return;
+        }
+
+        List<StableQuadKey> keys = new List<StableQuadKey>(_newbornPholdReplacementProbations.Keys);
+        int retainMissing = Mathf.Clamp(stableQuadShadowRetainMissingRebuilds, 1, 6);
+        int contradictionWeight = Mathf.Max(minSurfaceCornerWeight, minConflictVoxelWeight);
+        float contradictionAbs = Mathf.Clamp01(stableQuadHeldContradictionMinAbsTsdf);
+        for (int probationIndex = 0; probationIndex < keys.Count; probationIndex++)
+        {
+            StableQuadKey newbornKey = keys[probationIndex];
+            if (!_newbornPholdReplacementProbations.TryGetValue(newbornKey, out NewbornPholdReplacementProbationState probation) ||
+                probation.StartedRebuildSequence >= _newbornPholdCompetitionRebuildSequence)
+                continue;
+
+            bool naturallyPersisted = _naturallyObservedStableQuadKeys.Contains(newbornKey) &&
+                                      StableQuadTsdfWinding(newbornKey) == probation.NewbornWinding &&
+                                      _stableQuadAuditRecords.TryGetValue(newbornKey, out StableQuadAuditRecord current) &&
+                                      current.Winding == probation.NewbornWinding;
+            if (naturallyPersisted)
+            {
+                LastNewbornPholdProbationConfirmedCount++;
+                if (probation.PholdBackups != null)
+                {
+                    for (int i = 0; i < probation.PholdBackups.Count; i++)
+                        RecordNewbornPholdProbationEvent(newbornKey, probation.PholdBackups[i].Key, "confirmed_newborn_persisted");
+                }
+                _newbornPholdReplacementProbations.Remove(newbornKey);
+                continue;
+            }
+
+            LastNewbornPholdProbationRollbackTransactionCount++;
+            if (probation.PholdBackups != null)
+            {
+                for (int backupIndex = 0; backupIndex < probation.PholdBackups.Count; backupIndex++)
+                {
+                    NewbornPholdProbationBackup backup = probation.PholdBackups[backupIndex];
+                    if (!TryGetStableQuadEndpointIndices(backup.Key, out int indexA, out int indexB) ||
+                        VoxelHasPendingTsdfCorrection(indexA) || VoxelHasPendingTsdfCorrection(indexB) ||
+                        VoxelIsDirtyQuarantined(indexA) || VoxelIsDirtyQuarantined(indexB))
+                    {
+                        LastNewbornPholdProbationRollbackContradictionBlockedCount++;
+                        RecordNewbornPholdProbationEvent(newbornKey, backup.Key, "rollback_blocked_correction");
+                        continue;
+                    }
+
+                    float tsdfA = _tsdf[indexA];
+                    float tsdfB = _tsdf[indexB];
+                    int currentWinding = StableQuadTsdfWinding(backup.Key);
+                    bool windingContradiction = currentWinding != 0 && backup.HistoricalWinding != 0 &&
+                                                currentWinding != backup.HistoricalWinding;
+                    bool sameSign = (tsdfA > 0f && tsdfB > 0f) || (tsdfA < 0f && tsdfB < 0f);
+                    bool strongContradiction = sameSign &&
+                                               _weights[indexA] >= contradictionWeight && _weights[indexB] >= contradictionWeight &&
+                                               Mathf.Abs(tsdfA) >= contradictionAbs && Mathf.Abs(tsdfB) >= contradictionAbs;
+                    if (windingContradiction || strongContradiction)
+                    {
+                        LastNewbornPholdProbationRollbackContradictionBlockedCount++;
+                        RecordNewbornPholdProbationEvent(newbornKey, backup.Key, "rollback_blocked_contradiction");
+                        continue;
+                    }
+                    if (!TryGetStableQuadVertices(backup.Key, cellX, cellY, out int a, out int b, out int c, out int d) ||
+                        (!UseLegacyMeshExtraction && rejectStretchedExtractedQuads && IsStretchedExtractedQuad(a, b, c, d, vertices)))
+                    {
+                        LastNewbornPholdProbationRollbackGeometryBlockedCount++;
+                        RecordNewbornPholdProbationEvent(newbornKey, backup.Key, "rollback_blocked_geometry");
+                        continue;
+                    }
+
+                    StableQuadShadowState restoredState = backup.ShadowState;
+                    restoredState.Committed = true;
+                    restoredState.Winding = backup.HistoricalWinding;
+                    restoredState.ConsecutivePresent = 0;
+                    restoredState.ConsecutiveMissing = Mathf.Max(0, retainMissing - 1);
+                    restoredState.TotalPresent = Mathf.Max(restoredState.TotalPresent,
+                        Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6));
+                    _stableQuadShadowStates[backup.Key] = restoredState;
+                    QueueProbationRollbackQuad(newbornKey, backup.Key, a, b, c, d, backup.HistoricalWinding);
+                }
+            }
+            _newbornPholdReplacementProbations.Remove(newbornKey);
+        }
+        LastNewbornPholdProbationPendingCount = _newbornPholdReplacementProbations.Count;
+    }
+
+    private void QueueProbationRollbackQuad(StableQuadKey ownerKey, StableQuadKey key, int a, int b, int c, int d, int winding)
+    {
+        for (int i = 0; i < _deferredArbitratedQuads.Count; i++)
+        {
+            DeferredArbitratedQuad existing = _deferredArbitratedQuads[i];
+            if (!existing.Key.Equals(key))
+                continue;
+            existing.Priority = StableArbitratedQuadPriority(key);
+            existing.Winding = winding;
+            existing.HeldProvisional = true;
+            existing.ProbationRollback = true;
+            existing.ProbationOwnerKey = ownerKey;
+            _deferredArbitratedQuads[i] = existing;
+            LastNewbornPholdProbationRollbackCandidateCount++;
+            RecordNewbornPholdProbationEvent(ownerKey, key, "rollback_queued");
+            return;
+        }
+
+        _deferredArbitratedQuads.Add(new DeferredArbitratedQuad
+        {
+            Key = key,
+            A = a,
+            B = b,
+            C = c,
+            D = d,
+            Priority = StableArbitratedQuadPriority(key),
+            Winding = winding,
+            Restored = false,
+            Newborn = false,
+            HeldProvisional = true,
+            ProbationRollback = true,
+            ProbationOwnerKey = ownerKey
+        });
+        _deferredArbitratedQuadKeys.Add(key);
+        LastNewbornPholdProbationRollbackCandidateCount++;
+        RecordNewbornPholdProbationEvent(ownerKey, key, "rollback_queued");
+    }
+
+    private void RecordNewbornPholdProbationEvent(StableQuadKey newbornKey, StableQuadKey pholdKey, string eventName)
+    {
+        _newbornPholdProbationEvents.Add(new NewbornPholdProbationEventRecord
+        {
+            NewbornKey = newbornKey,
+            PholdKey = pholdKey,
+            EventName = eventName
+        });
+    }
+
+    private void QueueMatureProvisionalHeldFaces(int cellX, int cellY, List<Vector3> vertices)
+    {
+        if (!retainMatureProvisionalHeldFaces || !enableStableIncrementalQuadShadow ||
+            _tsdf == null || _weights == null)
+            return;
+
+        int retainMissing = Mathf.Clamp(stableQuadShadowRetainMissingRebuilds, 1, 6);
+        int contradictionWeight = Mathf.Max(minSurfaceCornerWeight, minConflictVoxelWeight);
+        float contradictionAbs = Mathf.Clamp01(stableQuadHeldContradictionMinAbsTsdf);
+        foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _previousStableQuadAuditRecords)
+        {
+            StableQuadKey key = pair.Key;
+            if (_stableQuadAuditRecords.ContainsKey(key) || _deferredArbitratedQuadKeys.Contains(key))
+                continue;
+            if (!TryGetStableQuadEndpointIndices(key, out int indexA, out int indexB))
+                continue;
+            if (!HasProvisionalTsdfMarker(indexA) && !HasProvisionalTsdfMarker(indexB))
+                continue;
+
+            LastProvisionalHeldRetentionScannedCount++;
+            if (!_stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState state) ||
+                !state.Committed || state.TotalPresent < Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6))
+            {
+                LastProvisionalHeldRetentionBlockedMaturityCount++;
+                continue;
+            }
+            if (state.ConsecutiveMissing >= retainMissing)
+            {
+                LastProvisionalHeldRetentionBlockedExpiredCount++;
+                continue;
+            }
+            if (VoxelHasPendingTsdfCorrection(indexA) || VoxelHasPendingTsdfCorrection(indexB) ||
+                VoxelIsDirtyQuarantined(indexA) || VoxelIsDirtyQuarantined(indexB))
+            {
+                LastProvisionalHeldRetentionBlockedCorrectionCount++;
+                continue;
+            }
+
+            float tsdfA = _tsdf[indexA];
+            float tsdfB = _tsdf[indexB];
+            int currentWinding = StableQuadTsdfWinding(key);
+            int historicalWinding = pair.Value.Winding != 0 ? pair.Value.Winding : state.Winding;
+            if (currentWinding != 0 && historicalWinding != 0 && currentWinding != historicalWinding)
+            {
+                LastProvisionalHeldRetentionBlockedContradictionCount++;
+                continue;
+            }
+            bool sameSign = (tsdfA > 0f && tsdfB > 0f) || (tsdfA < 0f && tsdfB < 0f);
+            bool strongContradiction = sameSign &&
+                                       _weights[indexA] >= contradictionWeight && _weights[indexB] >= contradictionWeight &&
+                                       Mathf.Abs(tsdfA) >= contradictionAbs && Mathf.Abs(tsdfB) >= contradictionAbs;
+            if (strongContradiction)
+            {
+                LastProvisionalHeldRetentionBlockedContradictionCount++;
+                continue;
+            }
+            if (!TryGetStableQuadVertices(key, cellX, cellY, out int a, out int b, out int c, out int d))
+            {
+                LastProvisionalHeldRetentionBlockedGeometryCount++;
+                continue;
+            }
+            if (!UseLegacyMeshExtraction && rejectStretchedExtractedQuads &&
+                IsStretchedExtractedQuad(a, b, c, d, vertices))
+            {
+                LastProvisionalHeldRetentionBlockedGeometryCount++;
+                continue;
+            }
+
+            _deferredArbitratedQuads.Add(new DeferredArbitratedQuad
+            {
+                Key = key,
+                A = a,
+                B = b,
+                C = c,
+                D = d,
+                Priority = StableArbitratedQuadPriority(key),
+                Winding = historicalWinding,
+                Restored = false,
+                Newborn = false,
+                HeldProvisional = true,
+                ProbationRollback = false
+            });
+            _deferredArbitratedQuadKeys.Add(key);
+            LastProvisionalHeldRetentionCandidateCount++;
+        }
+    }
+
+    private bool TryGetStableQuadEndpointIndices(StableQuadKey key, out int indexA, out int indexB)
+    {
+        indexA = -1;
+        indexB = -1;
+        int bx = key.X + (key.Axis == 0 ? 1 : 0);
+        int by = key.Y + (key.Axis == 1 ? 1 : 0);
+        int bz = key.Z + (key.Axis == 2 ? 1 : 0);
+        if (key.X < 0 || key.Y < 0 || key.Z < 0 || bx < 0 || by < 0 || bz < 0 ||
+            key.X >= _dimX || key.Y >= _dimY || key.Z >= _dimZ ||
+            bx >= _dimX || by >= _dimY || bz >= _dimZ)
+            return false;
+        indexA = Index(key.X, key.Y, key.Z);
+        indexB = Index(bx, by, bz);
+        return true;
+    }
+
+    private bool TryGetStableQuadVertices(StableQuadKey key, int cellX, int cellY, out int a, out int b, out int c, out int d)
+    {
+        a = b = c = d = -1;
+        if (key.Axis == 0)
+        {
+            a = TryGetCellVertex(key.X, key.Y, key.Z, cellX, cellY);
+            b = TryGetCellVertex(key.X, key.Y - 1, key.Z, cellX, cellY);
+            c = TryGetCellVertex(key.X, key.Y - 1, key.Z - 1, cellX, cellY);
+            d = TryGetCellVertex(key.X, key.Y, key.Z - 1, cellX, cellY);
+        }
+        else if (key.Axis == 1)
+        {
+            a = TryGetCellVertex(key.X, key.Y, key.Z, cellX, cellY);
+            b = TryGetCellVertex(key.X, key.Y, key.Z - 1, cellX, cellY);
+            c = TryGetCellVertex(key.X - 1, key.Y, key.Z - 1, cellX, cellY);
+            d = TryGetCellVertex(key.X - 1, key.Y, key.Z, cellX, cellY);
+        }
+        else
+        {
+            a = TryGetCellVertex(key.X, key.Y, key.Z, cellX, cellY);
+            b = TryGetCellVertex(key.X - 1, key.Y, key.Z, cellX, cellY);
+            c = TryGetCellVertex(key.X - 1, key.Y - 1, key.Z, cellX, cellY);
+            d = TryGetCellVertex(key.X, key.Y - 1, key.Z, cellX, cellY);
+        }
+        return a >= 0 && b >= 0 && c >= 0 && d >= 0;
+    }
+
+    private void FlushDeferredArbitratedQuads(List<Vector3> vertices, List<int> triangles)
+    {
+        if (_deferredArbitratedQuads.Count <= 0)
+            return;
+
+        _deferredArbitratedQuads.Sort((left, right) =>
+        {
+            int compare = right.Priority.CompareTo(left.Priority);
+            if (compare != 0) return compare;
+            compare = left.Key.Axis.CompareTo(right.Key.Axis);
+            if (compare != 0) return compare;
+            compare = left.Key.X.CompareTo(right.Key.X);
+            if (compare != 0) return compare;
+            compare = left.Key.Y.CompareTo(right.Key.Y);
+            return compare != 0 ? compare : left.Key.Z.CompareTo(right.Key.Z);
+        });
+
+        for (int i = 0; i < _deferredArbitratedQuads.Count; i++)
+        {
+            DeferredArbitratedQuad quad = _deferredArbitratedQuads[i];
+            int winding = quad.Winding;
+            bool shadowWindingConflict = _stableQuadShadowStates.TryGetValue(quad.Key, out StableQuadShadowState state) &&
+                                         state.Committed && state.Winding != 0 && winding != 0 && state.Winding != winding;
+            bool previousWindingConflict = _previousStableQuadAuditRecords.TryGetValue(quad.Key, out StableQuadAuditRecord previous) &&
+                                           previous.Winding != 0 && winding != 0 && previous.Winding != winding;
+            if (shadowWindingConflict || previousWindingConflict)
+            {
+                CountArbitrationBlockedWinding(quad);
+                continue;
+            }
+
+            bool layerConflict = false;
+            bool topologyConflict = false;
+            EvaluateArbitratedQuadEdgeConflict(quad.A, quad.B, winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(quad.B, quad.C, winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(quad.C, quad.D, winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(quad.D, quad.A, winding, ref layerConflict, ref topologyConflict);
+            if (layerConflict)
+            {
+                CountArbitrationBlockedLayer(quad);
+                continue;
+            }
+            if (topologyConflict)
+            {
+                if (quad.Newborn)
+                {
+                    NewbornPholdCompetitionDecision decision = AuditNewbornPholdTopologyCompetition(quad);
+                    if (TryPromotePreferredNewbornOverPhold(quad, decision, vertices, triangles))
+                        continue;
+                }
+                CountArbitrationBlockedTopology(quad);
+                continue;
+            }
+
+            if (quad.HeldProvisional)
+            {
+                _heldProvisionalRetainedKeys.Add(quad.Key);
+                if (quad.Winding != 0)
+                    _forcedStableQuadAuditWindings[quad.Key] = quad.Winding;
+                if (quad.ProbationRollback)
+                {
+                    LastNewbornPholdProbationRollbackAcceptedCount++;
+                    RecordNewbornPholdProbationEvent(quad.ProbationOwnerKey, quad.Key, "rollback_accepted");
+                }
+                else
+                    LastProvisionalHeldRetentionAcceptedCount++;
+            }
+            CommitStableQuad(quad.Key, quad.A, quad.B, quad.C, quad.D, vertices, triangles);
+            if (quad.Restored)
+                LastAtomicRestoredArbitrationAcceptedCount++;
+            if (quad.Newborn)
+                LastNewbornArbitrationAcceptedCount++;
+        }
+        _deferredArbitratedQuads.Clear();
+        _deferredArbitratedQuadKeys.Clear();
+        RetireStaleNewbornPholdPreferredStates();
+        if (_stableQuadTrianglesNeedRebuild)
+            RebuildStableQuadTriangleBuffer(triangles);
+    }
+
+    private void CountArbitrationBlockedWinding(DeferredArbitratedQuad quad)
+    {
+        if (quad.Restored) LastAtomicRestoredArbitrationBlockedWindingCount++;
+        if (quad.Newborn) LastNewbornArbitrationBlockedWindingCount++;
+        if (quad.ProbationRollback)
+        {
+            LastNewbornPholdProbationRollbackWindingBlockedCount++;
+            RecordNewbornPholdProbationEvent(quad.ProbationOwnerKey, quad.Key, "rollback_blocked_winding");
+        }
+        else if (quad.HeldProvisional) LastProvisionalHeldRetentionBlockedWindingCount++;
+    }
+
+    private void CountArbitrationBlockedLayer(DeferredArbitratedQuad quad)
+    {
+        if (quad.Restored) LastAtomicRestoredArbitrationBlockedLayerCount++;
+        if (quad.Newborn) LastNewbornArbitrationBlockedLayerCount++;
+        if (quad.ProbationRollback)
+        {
+            LastNewbornPholdProbationRollbackLayerBlockedCount++;
+            RecordNewbornPholdProbationEvent(quad.ProbationOwnerKey, quad.Key, "rollback_blocked_layer");
+        }
+        else if (quad.HeldProvisional) LastProvisionalHeldRetentionBlockedLayerCount++;
+    }
+
+    private void CountArbitrationBlockedTopology(DeferredArbitratedQuad quad)
+    {
+        if (quad.Restored) LastAtomicRestoredArbitrationBlockedTopologyCount++;
+        if (quad.Newborn) LastNewbornArbitrationBlockedTopologyCount++;
+        if (quad.ProbationRollback)
+        {
+            LastNewbornPholdProbationRollbackTopologyBlockedCount++;
+            RecordNewbornPholdProbationEvent(quad.ProbationOwnerKey, quad.Key, "rollback_blocked_topology");
+        }
+        else if (quad.HeldProvisional) LastProvisionalHeldRetentionBlockedTopologyCount++;
+    }
+
+    private void EvaluateArbitratedQuadEdgeConflict(int a, int b, int candidateWinding, ref bool layerConflict, ref bool topologyConflict)
+    {
+        if (!_stableQuadAuditEdges.TryGetValue(EdgeKey(a, b), out List<StableQuadKey> linked) || linked == null || linked.Count < 2)
+            return;
+
+        bool positive = candidateWinding > 0;
+        bool negative = candidateWinding < 0;
+        for (int i = 0; i < linked.Count; i++)
+        {
+            if (!_stableQuadAuditRecords.TryGetValue(linked[i], out StableQuadAuditRecord record))
+                continue;
+            positive |= record.Winding > 0;
+            negative |= record.Winding < 0;
+        }
+        if (positive && negative)
+            layerConflict = true;
+        else
+            topologyConflict = true;
+    }
+
+    private NewbornPholdCompetitionDecision AuditNewbornPholdTopologyCompetition(DeferredArbitratedQuad newborn)
+    {
+        NewbornPholdCompetitionDecision decision = default;
+        ulong[] candidateEdges =
+        {
+            EdgeKey(newborn.A, newborn.B), EdgeKey(newborn.B, newborn.C),
+            EdgeKey(newborn.C, newborn.D), EdgeKey(newborn.D, newborn.A)
+        };
+        Dictionary<StableQuadKey, int> pholdSharedEdges = new Dictionary<StableQuadKey, int>();
+        int conflictEdges = 0;
+        int conflictEdgesWithPhold = 0;
+        for (int edgeIndex = 0; edgeIndex < candidateEdges.Length; edgeIndex++)
+        {
+            if (!_stableQuadAuditEdges.TryGetValue(candidateEdges[edgeIndex], out List<StableQuadKey> linked) ||
+                linked == null || linked.Count < 2)
+                continue;
+            conflictEdges++;
+            bool edgeHasPhold = false;
+            for (int i = 0; i < linked.Count; i++)
+            {
+                StableQuadKey linkedKey = linked[i];
+                if (!_heldProvisionalRetainedKeys.Contains(linkedKey))
+                    continue;
+                edgeHasPhold = true;
+                pholdSharedEdges.TryGetValue(linkedKey, out int shared);
+                pholdSharedEdges[linkedKey] = shared + 1;
+            }
+            if (edgeHasPhold)
+                conflictEdgesWithPhold++;
+        }
+        if (pholdSharedEdges.Count <= 0)
+            return decision;
+
+        bool fullyResolvable = conflictEdges > 0 && conflictEdgesWithPhold == conflictEdges;
+        GetQuadEndpointEvidence(newborn.Key, out int newbornMinWeight, out float newbornMinAbs,
+            out int newbornProvisional, out int newbornPending, out int newbornDirty);
+        _stableQuadShadowStates.TryGetValue(newborn.Key, out StableQuadShadowState newbornState);
+
+        List<NewbornPholdCompetitionRecord> pendingRecords = new List<NewbornPholdCompetitionRecord>(pholdSharedEdges.Count);
+        bool anyNonCrossingPhold = false;
+        bool anyBoundaryNonWorseSwap = false;
+        bool everySwapWorsensBoundary = true;
+        foreach (KeyValuePair<StableQuadKey, int> pair in pholdSharedEdges)
+        {
+            if (!_stableQuadAuditRecords.TryGetValue(pair.Key, out StableQuadAuditRecord pholdRecord))
+                continue;
+            GetQuadEndpointEvidence(pair.Key, out int pholdMinWeight, out float pholdMinAbs,
+                out int pholdProvisional, out int pholdPending, out int pholdDirty);
+            _stableQuadShadowStates.TryGetValue(pair.Key, out StableQuadShadowState pholdState);
+            int pholdCurrentWinding = StableQuadTsdfWinding(pair.Key);
+            int boundaryDelta = ComputeQuadSwapBoundaryDelta(newborn, pholdRecord);
+            anyNonCrossingPhold |= pholdCurrentWinding == 0;
+            anyBoundaryNonWorseSwap |= boundaryDelta <= 0;
+            everySwapWorsensBoundary &= boundaryDelta > 0;
+            pendingRecords.Add(new NewbornPholdCompetitionRecord
+            {
+                NewbornKey = newborn.Key,
+                PholdKey = pair.Key,
+                SharedConflictEdges = pair.Value,
+                CandidateConflictEdges = conflictEdges,
+                CandidateConflictEdgesWithPhold = conflictEdgesWithPhold,
+                DistinctPholdBlockers = pholdSharedEdges.Count,
+                FullyPholdResolvable = fullyResolvable,
+                SwapBoundaryDelta = boundaryDelta,
+                NewbornWinding = newborn.Winding,
+                NewbornMinWeight = newbornMinWeight,
+                NewbornMinAbsTsdf = newbornMinAbs,
+                NewbornProvisionalEndpoints = newbornProvisional,
+                NewbornPendingEndpoints = newbornPending,
+                NewbornDirtyEndpoints = newbornDirty,
+                NewbornRestored = newborn.Restored,
+                NewbornTotalPresent = newbornState.TotalPresent,
+                NewbornCommitted = newbornState.Committed,
+                PholdHistoricalWinding = pholdRecord.Winding,
+                PholdCurrentWinding = pholdCurrentWinding,
+                PholdMinWeight = pholdMinWeight,
+                PholdMinAbsTsdf = pholdMinAbs,
+                PholdProvisionalEndpoints = pholdProvisional,
+                PholdPendingEndpoints = pholdPending,
+                PholdDirtyEndpoints = pholdDirty,
+                PholdTotalPresent = pholdState.TotalPresent,
+                PholdMissingRebuilds = pholdState.ConsecutiveMissing
+            });
+        }
+        if (pendingRecords.Count <= 0)
+            return decision;
+
+        bool newbornCurrentStrong = newborn.Winding != 0 && newbornProvisional == 0 && newbornPending == 0 && newbornDirty == 0;
+        bool newbornCurrentRisky = newborn.Winding == 0 || newbornPending > 0 || newbornDirty > 0;
+        string recommendation;
+        if (fullyResolvable && newbornCurrentStrong && anyNonCrossingPhold && anyBoundaryNonWorseSwap)
+        {
+            recommendation = "newborn_preferred";
+            LastNewbornPholdCompetitionNewbornPreferredCount++;
+        }
+        else if (!fullyResolvable || newbornCurrentRisky || everySwapWorsensBoundary)
+        {
+            recommendation = "phold_preferred";
+            LastNewbornPholdCompetitionPholdPreferredCount++;
+        }
+        else
+        {
+            recommendation = "ambiguous";
+            LastNewbornPholdCompetitionAmbiguousCount++;
+        }
+        if (fullyResolvable)
+            LastNewbornPholdCompetitionFullyResolvableCount++;
+        LastNewbornPholdCompetitionBlockedNewbornCount++;
+        for (int i = 0; i < pendingRecords.Count; i++)
+        {
+            NewbornPholdCompetitionRecord record = pendingRecords[i];
+            record.Recommendation = recommendation;
+            _newbornPholdCompetitionRecords.Add(record);
+            LastNewbornPholdCompetitionPairCount++;
+        }
+        List<StableQuadKey> blockers = new List<StableQuadKey>(pholdSharedEdges.Keys);
+        blockers.Sort(CompareStableQuadKeys);
+        decision.HasPholdCompetition = true;
+        decision.NewbornPreferred = recommendation == "newborn_preferred";
+        decision.FullyPholdResolvable = fullyResolvable;
+        decision.BlockerSignature = StableQuadBlockerSignature(blockers);
+        decision.PholdBlockers = blockers;
+        return decision;
+    }
+
+    private bool TryPromotePreferredNewbornOverPhold(DeferredArbitratedQuad newborn,
+        NewbornPholdCompetitionDecision decision, List<Vector3> vertices, List<int> triangles)
+    {
+        if (!decision.HasPholdCompetition || !decision.NewbornPreferred || !decision.FullyPholdResolvable ||
+            decision.PholdBlockers == null || decision.PholdBlockers.Count <= 0)
+            return false;
+
+        _newbornPholdPreferredStates.TryGetValue(newborn.Key, out NewbornPholdPreferredState state);
+        bool consecutive = state.LastRebuildSequence == _newbornPholdCompetitionRebuildSequence - 1 &&
+                           state.BlockerSignature == decision.BlockerSignature;
+        state.ConsecutivePreferred = consecutive ? state.ConsecutivePreferred + 1 : 1;
+        state.LastRebuildSequence = _newbornPholdCompetitionRebuildSequence;
+        state.BlockerSignature = decision.BlockerSignature;
+        _newbornPholdPreferredStates[newborn.Key] = state;
+        _newbornPholdPreferredObserved.Add(newborn.Key);
+
+        int required = Mathf.Clamp(newbornPholdPreferredConfirmRebuilds, 2, 4);
+        if (state.ConsecutivePreferred < required)
+        {
+            LastNewbornPholdReplacementPendingCount++;
+            AnnotateNewbornPholdReplacement(newborn.Key, state.ConsecutivePreferred, "pending_confirmation");
+            return false;
+        }
+
+        List<StableQuadAuditRecord> removed = new List<StableQuadAuditRecord>(decision.PholdBlockers.Count);
+        for (int i = 0; i < decision.PholdBlockers.Count; i++)
+        {
+            StableQuadKey blocker = decision.PholdBlockers[i];
+            if (!_heldProvisionalRetainedKeys.Contains(blocker) ||
+                !_stableQuadAuditRecords.TryGetValue(blocker, out StableQuadAuditRecord record))
+            {
+                RestoreRemovedStableQuads(removed);
+                LastNewbornPholdReplacementRollbackCount++;
+                AnnotateNewbornPholdReplacement(newborn.Key, state.ConsecutivePreferred, "rollback_missing_blocker");
+                _newbornPholdPreferredStates.Remove(newborn.Key);
+                return false;
+            }
+            removed.Add(record);
+            RemoveStableQuadAuditRecord(record);
+        }
+
+        bool layerConflict = false;
+        bool topologyConflict = false;
+        EvaluateArbitratedQuadEdgeConflict(newborn.A, newborn.B, newborn.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(newborn.B, newborn.C, newborn.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(newborn.C, newborn.D, newborn.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(newborn.D, newborn.A, newborn.Winding, ref layerConflict, ref topologyConflict);
+        if (layerConflict || topologyConflict)
+        {
+            RestoreRemovedStableQuads(removed);
+            LastNewbornPholdReplacementRollbackCount++;
+            AnnotateNewbornPholdReplacement(newborn.Key, state.ConsecutivePreferred, "rollback_global_recheck");
+            _newbornPholdPreferredStates.Remove(newborn.Key);
+            return false;
+        }
+
+        if (enableNewbornPholdReplacementProbation)
+            StartNewbornPholdReplacementProbation(newborn, removed);
+        for (int i = 0; i < removed.Count; i++)
+        {
+            StableQuadAuditRecord record = removed[i];
+            _stableQuadShadowStates.Remove(record.Key);
+            _newbornPholdPreferredStates.Remove(record.Key);
+            if (record.RestoredByAtomicProvisionalBacking)
+                LastAtomicProvisionalBackingRestoredQuadCount = Mathf.Max(0, LastAtomicProvisionalBackingRestoredQuadCount - 1);
+        }
+        LastProvisionalHeldRetentionReplacedCount += removed.Count;
+        LastNewbornPholdReplacementRemovedPholdCount += removed.Count;
+        LastNewbornPholdReplacementAppliedCount++;
+        AnnotateNewbornPholdReplacement(newborn.Key, state.ConsecutivePreferred,
+            enableNewbornPholdReplacementProbation ? "applied_probation" : "applied");
+        CommitStableQuad(newborn.Key, newborn.A, newborn.B, newborn.C, newborn.D, vertices, triangles);
+        if (newborn.Restored)
+            LastAtomicRestoredArbitrationAcceptedCount++;
+        LastNewbornArbitrationAcceptedCount++;
+        _newbornPholdPreferredStates.Remove(newborn.Key);
+        _stableQuadTrianglesNeedRebuild = true;
+        return true;
+    }
+
+    private void StartNewbornPholdReplacementProbation(DeferredArbitratedQuad newborn,
+        List<StableQuadAuditRecord> removed)
+    {
+        List<NewbornPholdProbationBackup> backups = new List<NewbornPholdProbationBackup>(removed.Count);
+        for (int i = 0; i < removed.Count; i++)
+        {
+            StableQuadAuditRecord record = removed[i];
+            if (!_stableQuadShadowStates.TryGetValue(record.Key, out StableQuadShadowState shadowState))
+            {
+                shadowState.Committed = true;
+                shadowState.Winding = record.Winding;
+                shadowState.TotalPresent = Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6);
+            }
+            backups.Add(new NewbornPholdProbationBackup
+            {
+                Key = record.Key,
+                HistoricalWinding = record.Winding,
+                ShadowState = shadowState
+            });
+        }
+        _newbornPholdReplacementProbations[newborn.Key] = new NewbornPholdReplacementProbationState
+        {
+            NewbornKey = newborn.Key,
+            NewbornWinding = newborn.Winding,
+            StartedRebuildSequence = _newbornPholdCompetitionRebuildSequence,
+            PholdBackups = backups
+        };
+        LastNewbornPholdProbationPendingCount = _newbornPholdReplacementProbations.Count;
+    }
+
+    private void AnnotateNewbornPholdReplacement(StableQuadKey newbornKey, int consecutive, string status)
+    {
+        for (int i = _newbornPholdCompetitionRecords.Count - 1; i >= 0; i--)
+        {
+            NewbornPholdCompetitionRecord record = _newbornPholdCompetitionRecords[i];
+            if (!record.NewbornKey.Equals(newbornKey))
+                continue;
+            record.PreferredConsecutive = consecutive;
+            record.ReplacementStatus = status;
+            _newbornPholdCompetitionRecords[i] = record;
+        }
+    }
+
+    private void RemoveStableQuadAuditRecord(StableQuadAuditRecord record)
+    {
+        _stableQuadAuditRecords.Remove(record.Key);
+        RemoveStableQuadAuditEdge(record.A, record.B, record.Key);
+        RemoveStableQuadAuditEdge(record.B, record.C, record.Key);
+        RemoveStableQuadAuditEdge(record.C, record.D, record.Key);
+        RemoveStableQuadAuditEdge(record.D, record.A, record.Key);
+        _heldProvisionalRetainedKeys.Remove(record.Key);
+        LastStableQuadAuditUniqueCount = _stableQuadAuditRecords.Count;
+    }
+
+    private void RemoveStableQuadAuditEdge(int a, int b, StableQuadKey key)
+    {
+        ulong edge = EdgeKey(a, b);
+        if (!_stableQuadAuditEdges.TryGetValue(edge, out List<StableQuadKey> linked) || linked == null)
+            return;
+        linked.Remove(key);
+        if (linked.Count <= 0)
+            _stableQuadAuditEdges.Remove(edge);
+    }
+
+    private void RestoreRemovedStableQuads(List<StableQuadAuditRecord> removed)
+    {
+        if (removed == null)
+            return;
+        for (int i = 0; i < removed.Count; i++)
+        {
+            StableQuadAuditRecord record = removed[i];
+            if (_stableQuadAuditRecords.ContainsKey(record.Key))
+                continue;
+            _stableQuadAuditRecords.Add(record.Key, record);
+            AddStableQuadAuditEdge(record.A, record.B, record.Key);
+            AddStableQuadAuditEdge(record.B, record.C, record.Key);
+            AddStableQuadAuditEdge(record.C, record.D, record.Key);
+            AddStableQuadAuditEdge(record.D, record.A, record.Key);
+            _heldProvisionalRetainedKeys.Add(record.Key);
+        }
+        LastStableQuadAuditUniqueCount = _stableQuadAuditRecords.Count;
+    }
+
+    private void RebuildStableQuadTriangleBuffer(List<int> triangles)
+    {
+        if (triangles == null)
+            return;
+        triangles.Clear();
+        foreach (StableQuadAuditRecord record in _stableQuadAuditRecords.Values)
+        {
+            triangles.Add(record.A);
+            triangles.Add(record.B);
+            triangles.Add(record.C);
+            triangles.Add(record.A);
+            triangles.Add(record.C);
+            triangles.Add(record.D);
+            if (!doubleSidedTriangles)
+                continue;
+            triangles.Add(record.C);
+            triangles.Add(record.B);
+            triangles.Add(record.A);
+            triangles.Add(record.D);
+            triangles.Add(record.C);
+            triangles.Add(record.A);
+        }
+        LastAddedSurfaceQuadCount = _stableQuadAuditRecords.Count;
+        LastStableQuadAuditUniqueCount = _stableQuadAuditRecords.Count;
+        _stableQuadTrianglesNeedRebuild = false;
+    }
+
+    private void RetireStaleNewbornPholdPreferredStates()
+    {
+        if (_newbornPholdPreferredStates.Count <= 0)
+            return;
+        List<StableQuadKey> keys = new List<StableQuadKey>(_newbornPholdPreferredStates.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            if (_newbornPholdPreferredStates.TryGetValue(keys[i], out NewbornPholdPreferredState state) &&
+                state.LastRebuildSequence != _newbornPholdCompetitionRebuildSequence)
+            {
+                _newbornPholdPreferredStates.Remove(keys[i]);
+            }
+        }
+    }
+
+    private static int CompareStableQuadKeys(StableQuadKey left, StableQuadKey right)
+    {
+        int compare = left.Axis.CompareTo(right.Axis);
+        if (compare != 0) return compare;
+        compare = left.X.CompareTo(right.X);
+        if (compare != 0) return compare;
+        compare = left.Y.CompareTo(right.Y);
+        return compare != 0 ? compare : left.Z.CompareTo(right.Z);
+    }
+
+    private static int StableQuadBlockerSignature(List<StableQuadKey> blockers)
+    {
+        unchecked
+        {
+            int hash = 17;
+            for (int i = 0; i < blockers.Count; i++)
+                hash = hash * 31 + blockers[i].GetHashCode();
+            return hash;
+        }
+    }
+
+    private void GetQuadEndpointEvidence(StableQuadKey key, out int minWeight, out float minAbsTsdf,
+        out int provisional, out int pending, out int dirty)
+    {
+        minWeight = 0;
+        minAbsTsdf = 0f;
+        provisional = pending = dirty = 0;
+        if (!TryGetStableQuadEndpointIndices(key, out int indexA, out int indexB))
+            return;
+        minWeight = Mathf.Min(_weights[indexA], _weights[indexB]);
+        minAbsTsdf = Mathf.Min(Mathf.Abs(_tsdf[indexA]), Mathf.Abs(_tsdf[indexB]));
+        provisional = (HasProvisionalTsdfMarker(indexA) ? 1 : 0) + (HasProvisionalTsdfMarker(indexB) ? 1 : 0);
+        pending = (VoxelHasPendingTsdfCorrection(indexA) ? 1 : 0) + (VoxelHasPendingTsdfCorrection(indexB) ? 1 : 0);
+        dirty = (VoxelIsDirtyQuarantined(indexA) ? 1 : 0) + (VoxelIsDirtyQuarantined(indexB) ? 1 : 0);
+    }
+
+    private int ComputeQuadSwapBoundaryDelta(DeferredArbitratedQuad newborn, StableQuadAuditRecord phold)
+    {
+        HashSet<ulong> candidateEdges = new HashSet<ulong>
+        {
+            EdgeKey(newborn.A, newborn.B), EdgeKey(newborn.B, newborn.C),
+            EdgeKey(newborn.C, newborn.D), EdgeKey(newborn.D, newborn.A)
+        };
+        HashSet<ulong> pholdEdges = new HashSet<ulong>
+        {
+            EdgeKey(phold.A, phold.B), EdgeKey(phold.B, phold.C),
+            EdgeKey(phold.C, phold.D), EdgeKey(phold.D, phold.A)
+        };
+        HashSet<ulong> affected = new HashSet<ulong>(candidateEdges);
+        affected.UnionWith(pholdEdges);
+        int beforeBoundary = 0;
+        int afterBoundary = 0;
+        foreach (ulong edge in affected)
+        {
+            int before = _stableQuadAuditEdges.TryGetValue(edge, out List<StableQuadKey> linked) && linked != null
+                ? linked.Count : 0;
+            int after = before - (pholdEdges.Contains(edge) ? 1 : 0) + (candidateEdges.Contains(edge) ? 1 : 0);
+            if (before == 1) beforeBoundary++;
+            if (after == 1) afterBoundary++;
+        }
+        return afterBoundary - beforeBoundary;
+    }
+
+    private void ResetStableQuadTopologyAudit()
+    {
+        _newbornPholdCompetitionRebuildSequence++;
+        _newbornPholdPreferredObserved.Clear();
+        _naturallyObservedStableQuadKeys.Clear();
+        _stableQuadTrianglesNeedRebuild = false;
+        _stableQuadAuditRecords.Clear();
+        _stableQuadAuditEdges.Clear();
+        _lastStableQuadAdded.Clear();
+        _lastStableQuadRemoved.Clear();
+        _lastStableQuadWindingChanged.Clear();
+        LastStableQuadAuditUniqueCount = 0;
+        LastStableQuadAuditDuplicateKeyCount = 0;
+        LastStableQuadAuditReverseWindingDuplicateCount = 0;
+        LastStableQuadAuditLogicalEdgeCount = 0;
+        LastStableQuadAuditBoundaryEdgeCount = 0;
+        LastStableQuadAuditManifoldEdgeCount = 0;
+        LastStableQuadAuditConflictEdgeCount = 0;
+        LastStableQuadAuditCompetingLayerEdgeCount = 0;
+        LastStableQuadAuditMaxQuadsPerEdge = 0;
+        LastStableQuadAuditDoubleSidedFalsePositiveEdgeCount = 0;
+        LastStableQuadAuditPersistedCount = 0;
+        LastStableQuadAuditAddedCount = 0;
+        LastStableQuadAuditRemovedCount = 0;
+        LastStableQuadAuditWindingChangedCount = 0;
+        LastStableQuadShadowCandidateCount = 0;
+        LastStableQuadShadowCommittedCount = 0;
+        LastStableQuadShadowPromotedCount = 0;
+        LastStableQuadShadowHeldMissingCount = 0;
+        LastStableQuadShadowRetiredCount = 0;
+        LastStableQuadShadowWindingConflictCount = 0;
+        LastStableQuadShadowConflictResolvedEdgeCount = 0;
+        LastStableQuadShadowConflictBlockedQuadCount = 0;
+        LastStableQuadShadowOutputQuadCount = 0;
+        LastStableQuadHeldSafeCount = 0;
+        LastStableQuadHeldUncertainCount = 0;
+        LastStableQuadHeldContradictedCount = 0;
+        LastStableQuadHeldTypeProvisionalNotPromotedCount = 0;
+        LastStableQuadHeldTypeNearZeroJitterCount = 0;
+        LastStableQuadHeldTypeConfirmedContradictionCount = 0;
+        LastStableQuadHeldTypeCleanAssemblyLossCount = 0;
+        LastStableQuadHeldTypeOtherUnsettledCount = 0;
+        LastAtomicProvisionalMatureBackingPreservedCount = 0;
+        LastAtomicProvisionalMatureBackingWeakBlockedCount = 0;
+        LastAtomicProvisionalNonAtomicBlockedCount = 0;
+        LastAtomicProvisionalBackingProvenanceBlockedCount = 0;
+        LastAtomicProvisionalBackingRestoredCellCount = 0;
+        LastAtomicProvisionalBackingRestoredQuadCount = 0;
+        LastAtomicProvisionalBackingRestoredBoundaryEdgeCount = 0;
+        LastAtomicProvisionalBackingRestoredConflictEdgeCount = 0;
+        LastAtomicProvisionalBackingPlaneAnchorAllowedCount = 0;
+        LastAtomicRestoredArbitrationCandidateCount = 0;
+        LastAtomicRestoredArbitrationAcceptedCount = 0;
+        LastAtomicRestoredArbitrationBlockedLayerCount = 0;
+        LastAtomicRestoredArbitrationBlockedTopologyCount = 0;
+        LastAtomicRestoredArbitrationBlockedWindingCount = 0;
+        LastNewbornArbitrationPersistedFirstCount = 0;
+        LastNewbornArbitrationCandidateCount = 0;
+        LastNewbornArbitrationAcceptedCount = 0;
+        LastNewbornArbitrationBlockedLayerCount = 0;
+        LastNewbornArbitrationBlockedTopologyCount = 0;
+        LastNewbornArbitrationBlockedWindingCount = 0;
+        LastProvisionalHeldRetentionScannedCount = 0;
+        LastProvisionalHeldRetentionCandidateCount = 0;
+        LastProvisionalHeldRetentionAcceptedCount = 0;
+        LastProvisionalHeldRetentionBlockedMaturityCount = 0;
+        LastProvisionalHeldRetentionBlockedExpiredCount = 0;
+        LastProvisionalHeldRetentionBlockedCorrectionCount = 0;
+        LastProvisionalHeldRetentionBlockedContradictionCount = 0;
+        LastProvisionalHeldRetentionBlockedGeometryCount = 0;
+        LastProvisionalHeldRetentionBlockedLayerCount = 0;
+        LastProvisionalHeldRetentionBlockedTopologyCount = 0;
+        LastProvisionalHeldRetentionBlockedWindingCount = 0;
+        LastProvisionalHeldRetentionBoundaryEdgeCount = 0;
+        LastProvisionalHeldRetentionConflictEdgeCount = 0;
+        LastNewbornPholdCompetitionBlockedNewbornCount = 0;
+        LastNewbornPholdCompetitionPairCount = 0;
+        LastNewbornPholdCompetitionFullyResolvableCount = 0;
+        LastNewbornPholdCompetitionNewbornPreferredCount = 0;
+        LastNewbornPholdCompetitionPholdPreferredCount = 0;
+        LastNewbornPholdCompetitionAmbiguousCount = 0;
+        LastNewbornPholdReplacementPendingCount = 0;
+        LastNewbornPholdReplacementAppliedCount = 0;
+        LastNewbornPholdReplacementRemovedPholdCount = 0;
+        LastNewbornPholdReplacementRollbackCount = 0;
+        LastProvisionalHeldRetentionReplacedCount = 0;
+        LastNewbornPholdProbationPendingCount = 0;
+        LastNewbornPholdProbationConfirmedCount = 0;
+        LastNewbornPholdProbationRollbackTransactionCount = 0;
+        LastNewbornPholdProbationRollbackCandidateCount = 0;
+        LastNewbornPholdProbationRollbackAcceptedCount = 0;
+        LastNewbornPholdProbationRollbackContradictionBlockedCount = 0;
+        LastNewbornPholdProbationRollbackGeometryBlockedCount = 0;
+        LastNewbornPholdProbationRollbackLayerBlockedCount = 0;
+        LastNewbornPholdProbationRollbackTopologyBlockedCount = 0;
+        LastNewbornPholdProbationRollbackWindingBlockedCount = 0;
+        _atomicProvisionalMatureBackingPreserved.Clear();
+        _atomicProvisionalMatureBackingWeakBlocked.Clear();
+        _atomicProvisionalNonAtomicBlocked.Clear();
+        _atomicProvisionalBackingProvenanceBlocked.Clear();
+        _atomicProvisionalBackingRestoredVertexIndices.Clear();
+        _atomicProvisionalBackingPlaneAnchorAllowed.Clear();
+        _deferredArbitratedQuads.Clear();
+        _deferredArbitratedQuadKeys.Clear();
+        _heldProvisionalRetainedKeys.Clear();
+        _forcedStableQuadAuditWindings.Clear();
+        _newbornPholdCompetitionRecords.Clear();
+        _newbornPholdProbationEvents.Clear();
+        _lastBuiltCellRestoredByAtomicProvisionalBacking = false;
+        _stableQuadShadowObserved.Clear();
+        _stableQuadShadowConflictBlocked.Clear();
+        _stableQuadHeldEvidenceRecords.Clear();
+    }
+
+    private void RecordStableQuadTopologyAudit(StableQuadKey key, int a, int b, int c, int d, List<Vector3> vertices)
+    {
+        int winding = _forcedStableQuadAuditWindings.TryGetValue(key, out int forcedWinding)
+            ? forcedWinding
+            : StableQuadTsdfWinding(key);
+        if (_stableQuadAuditRecords.TryGetValue(key, out StableQuadAuditRecord existing))
+        {
+            LastStableQuadAuditDuplicateKeyCount++;
+            if (existing.Winding != 0 && winding != 0 && existing.Winding != winding)
+                LastStableQuadAuditReverseWindingDuplicateCount++;
+            return;
+        }
+
+        StableQuadAuditRecord record = new StableQuadAuditRecord
+        {
+            Key = key,
+            A = a,
+            B = b,
+            C = c,
+            D = d,
+            Winding = winding,
+            RestoredByAtomicProvisionalBacking =
+                _atomicProvisionalBackingRestoredVertexIndices.Contains(a) ||
+                _atomicProvisionalBackingRestoredVertexIndices.Contains(b) ||
+                _atomicProvisionalBackingRestoredVertexIndices.Contains(c) ||
+                _atomicProvisionalBackingRestoredVertexIndices.Contains(d)
+        };
+        if (record.RestoredByAtomicProvisionalBacking)
+            LastAtomicProvisionalBackingRestoredQuadCount++;
+        if (vertices != null && a < vertices.Count && b < vertices.Count && c < vertices.Count && d < vertices.Count)
+        {
+            Vector3 va = vertices[a];
+            Vector3 vb = vertices[b];
+            Vector3 vc = vertices[c];
+            Vector3 vd = vertices[d];
+            record.Center = (va + vb + vc + vd) * 0.25f;
+            Vector3 normal = Vector3.Cross(vb - va, vc - va) + Vector3.Cross(vc - va, vd - va);
+            record.Normal = normal.sqrMagnitude > 0.0000000001f ? normal.normalized : Vector3.zero;
+        }
+        CountStableQuadEndpointStates(key, ref record);
+        _stableQuadAuditRecords.Add(key, record);
+        AddStableQuadAuditEdge(a, b, key);
+        AddStableQuadAuditEdge(b, c, key);
+        AddStableQuadAuditEdge(c, d, key);
+        AddStableQuadAuditEdge(d, a, key);
+        LastStableQuadAuditUniqueCount = _stableQuadAuditRecords.Count;
+    }
+
+    private int StableQuadTsdfWinding(StableQuadKey key)
+    {
+        if (_tsdf == null || key.X < 0 || key.Y < 0 || key.Z < 0 ||
+            key.X >= _dimX || key.Y >= _dimY || key.Z >= _dimZ)
+            return 0;
+        int bx = key.X + (key.Axis == 0 ? 1 : 0);
+        int by = key.Y + (key.Axis == 1 ? 1 : 0);
+        int bz = key.Z + (key.Axis == 2 ? 1 : 0);
+        if (bx >= _dimX || by >= _dimY || bz >= _dimZ)
+            return 0;
+        float first = _tsdf[Index(key.X, key.Y, key.Z)];
+        float second = _tsdf[Index(bx, by, bz)];
+        if (first < 0f && second > 0f)
+            return 1;
+        if (first > 0f && second < 0f)
+            return -1;
+        return 0;
+    }
+
+    private void CountStableQuadEndpointStates(StableQuadKey key, ref StableQuadAuditRecord record)
+    {
+        for (int endpoint = 0; endpoint < 2; endpoint++)
+        {
+            int x = key.X + (endpoint == 1 && key.Axis == 0 ? 1 : 0);
+            int y = key.Y + (endpoint == 1 && key.Axis == 1 ? 1 : 0);
+            int z = key.Z + (endpoint == 1 && key.Axis == 2 ? 1 : 0);
+            if (x < 0 || y < 0 || z < 0 || x >= _dimX || y >= _dimY || z >= _dimZ)
+                continue;
+            int index = Index(x, y, z);
+            if (HasProvisionalTsdfMarker(index))
+                record.ProvisionalCorners++;
+            if (VoxelHasPendingTsdfCorrection(index))
+                record.PendingCorners++;
+            if (VoxelIsDirtyQuarantined(index))
+                record.DirtyCorners++;
+        }
+    }
+
+    private void AddStableQuadAuditEdge(int a, int b, StableQuadKey key)
+    {
+        ulong edge = EdgeKey(a, b);
+        if (!_stableQuadAuditEdges.TryGetValue(edge, out List<StableQuadKey> quads))
+        {
+            quads = new List<StableQuadKey>(2);
+            _stableQuadAuditEdges.Add(edge, quads);
+        }
+        quads.Add(key);
+    }
+
+    private void FinalizeStableQuadTopologyAudit(List<int> renderTriangles)
+    {
+        foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _stableQuadAuditRecords)
+        {
+            if (_previousStableQuadAuditRecords.TryGetValue(pair.Key, out StableQuadAuditRecord previous))
+            {
+                LastStableQuadAuditPersistedCount++;
+                if (previous.Winding != 0 && pair.Value.Winding != 0 && previous.Winding != pair.Value.Winding)
+                {
+                    LastStableQuadAuditWindingChangedCount++;
+                    _lastStableQuadWindingChanged.Add(pair.Key);
+                }
+            }
+            else
+            {
+                LastStableQuadAuditAddedCount++;
+                _lastStableQuadAdded.Add(pair.Key);
+            }
+        }
+        foreach (StableQuadKey key in _previousStableQuadAuditRecords.Keys)
+        {
+            if (_stableQuadAuditRecords.ContainsKey(key))
+                continue;
+            LastStableQuadAuditRemovedCount++;
+            _lastStableQuadRemoved.Add(key);
+        }
+
+        LastStableQuadAuditLogicalEdgeCount = _stableQuadAuditEdges.Count;
+        foreach (KeyValuePair<ulong, List<StableQuadKey>> pair in _stableQuadAuditEdges)
+        {
+            int count = pair.Value != null ? pair.Value.Count : 0;
+            LastStableQuadAuditMaxQuadsPerEdge = Mathf.Max(LastStableQuadAuditMaxQuadsPerEdge, count);
+            if (count == 1)
+            {
+                LastStableQuadAuditBoundaryEdgeCount++;
+                if (_heldProvisionalRetainedKeys.Contains(pair.Value[0]))
+                    LastProvisionalHeldRetentionBoundaryEdgeCount++;
+                if (_stableQuadAuditRecords.TryGetValue(pair.Value[0], out StableQuadAuditRecord boundaryQuad) &&
+                    boundaryQuad.RestoredByAtomicProvisionalBacking)
+                {
+                    LastAtomicProvisionalBackingRestoredBoundaryEdgeCount++;
+                }
+            }
+            else if (count == 2)
+                LastStableQuadAuditManifoldEdgeCount++;
+            else if (count > 2)
+            {
+                LastStableQuadAuditConflictEdgeCount++;
+                bool positive = false;
+                bool negative = false;
+                bool touchesRestoredQuad = false;
+                bool touchesHeldProvisional = false;
+                for (int i = 0; i < pair.Value.Count; i++)
+                {
+                    if (!_stableQuadAuditRecords.TryGetValue(pair.Value[i], out StableQuadAuditRecord record))
+                        continue;
+                    positive |= record.Winding > 0;
+                    negative |= record.Winding < 0;
+                    touchesRestoredQuad |= record.RestoredByAtomicProvisionalBacking;
+                    touchesHeldProvisional |= _heldProvisionalRetainedKeys.Contains(pair.Value[i]);
+                }
+                if (positive && negative)
+                    LastStableQuadAuditCompetingLayerEdgeCount++;
+                if (touchesRestoredQuad)
+                    LastAtomicProvisionalBackingRestoredConflictEdgeCount++;
+                if (touchesHeldProvisional)
+                    LastProvisionalHeldRetentionConflictEdgeCount++;
+            }
+        }
+
+        if (doubleSidedTriangles && renderTriangles != null)
+        {
+            Dictionary<ulong, int> renderEdgeUse = BuildMeshEdgeUseCounts(renderTriangles);
+            foreach (int count in renderEdgeUse.Values)
+            {
+                if (count > 2 && count <= 4)
+                    LastStableQuadAuditDoubleSidedFalsePositiveEdgeCount++;
+            }
+        }
+
+        EvaluateStableIncrementalQuadShadow();
+
+        _previousStableQuadAuditRecords.Clear();
+        foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _stableQuadAuditRecords)
+            _previousStableQuadAuditRecords.Add(pair.Key, pair.Value);
+    }
+
+    private void EvaluateStableIncrementalQuadShadow()
+    {
+        if (!enableStableIncrementalQuadShadow)
+            return;
+
+        ResolveStableQuadShadowConflicts();
+        int promoteThreshold = Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6);
+        int retainMissing = Mathf.Clamp(stableQuadShadowRetainMissingRebuilds, 1, 6);
+
+        foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _stableQuadAuditRecords)
+        {
+            StableQuadKey key = pair.Key;
+            if (_heldProvisionalRetainedKeys.Contains(key))
+                continue;
+            if (_stableQuadShadowConflictBlocked.Contains(key))
+                continue;
+
+            if (!_stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState state))
+            {
+                state.Winding = pair.Value.Winding;
+            }
+            else if (state.Winding != 0 && pair.Value.Winding != 0 && state.Winding != pair.Value.Winding)
+            {
+                LastStableQuadShadowWindingConflictCount++;
+                continue;
+            }
+
+            state.Winding = pair.Value.Winding != 0 ? pair.Value.Winding : state.Winding;
+            state.ConsecutivePresent++;
+            state.ConsecutiveMissing = 0;
+            state.TotalPresent++;
+            if (!state.Committed && state.ConsecutivePresent >= promoteThreshold)
+            {
+                state.Committed = true;
+                LastStableQuadShadowPromotedCount++;
+            }
+            _stableQuadShadowStates[key] = state;
+            _stableQuadShadowObserved.Add(key);
+        }
+
+        List<StableQuadKey> stateKeys = new List<StableQuadKey>(_stableQuadShadowStates.Keys);
+        for (int i = 0; i < stateKeys.Count; i++)
+        {
+            StableQuadKey key = stateKeys[i];
+            if (_stableQuadShadowObserved.Contains(key))
+                continue;
+            StableQuadShadowState state = _stableQuadShadowStates[key];
+            state.ConsecutivePresent = 0;
+            state.ConsecutiveMissing++;
+            if (!state.Committed)
+            {
+                _stableQuadShadowStates.Remove(key);
+                continue;
+            }
+            if (state.ConsecutiveMissing > retainMissing)
+            {
+                _stableQuadShadowStates.Remove(key);
+                LastStableQuadShadowRetiredCount++;
+                continue;
+            }
+            _stableQuadShadowStates[key] = state;
+            LastStableQuadShadowHeldMissingCount++;
+            ClassifyStableQuadHeldEvidence(key, state);
+        }
+
+        foreach (StableQuadShadowState state in _stableQuadShadowStates.Values)
+        {
+            if (state.Committed)
+                LastStableQuadShadowCommittedCount++;
+            else
+                LastStableQuadShadowCandidateCount++;
+        }
+        LastStableQuadShadowOutputQuadCount = LastStableQuadShadowCommittedCount;
+    }
+
+    private void ClassifyStableQuadHeldEvidence(StableQuadKey key, StableQuadShadowState state)
+    {
+        int bx = key.X + (key.Axis == 0 ? 1 : 0);
+        int by = key.Y + (key.Axis == 1 ? 1 : 0);
+        int bz = key.Z + (key.Axis == 2 ? 1 : 0);
+        if (_tsdf == null || _weights == null || key.X < 0 || key.Y < 0 || key.Z < 0 ||
+            bx < 0 || by < 0 || bz < 0 || key.X >= _dimX || key.Y >= _dimY || key.Z >= _dimZ ||
+            bx >= _dimX || by >= _dimY || bz >= _dimZ)
+        {
+            LastStableQuadHeldUncertainCount++;
+            LastStableQuadHeldTypeOtherUnsettledCount++;
+            _stableQuadHeldEvidenceRecords.Add(new StableQuadHeldEvidenceRecord
+            {
+                Key = key,
+                MissingRebuilds = state.ConsecutiveMissing,
+                TotalPresent = state.TotalPresent,
+                PreviousWinding = state.Winding,
+                Classification = "held_other_unsettled",
+                Reason = "endpoint_out_of_bounds"
+            });
+            return;
+        }
+
+        int indexA = Index(key.X, key.Y, key.Z);
+        int indexB = Index(bx, by, bz);
+        float tsdfA = _tsdf[indexA];
+        float tsdfB = _tsdf[indexB];
+        int weightA = _weights[indexA];
+        int weightB = _weights[indexB];
+        bool provisionalA = HasProvisionalTsdfMarker(indexA);
+        bool provisionalB = HasProvisionalTsdfMarker(indexB);
+        bool pendingA = VoxelHasPendingTsdfCorrection(indexA);
+        bool pendingB = VoxelHasPendingTsdfCorrection(indexB);
+        bool dirtyA = VoxelIsDirtyQuarantined(indexA);
+        bool dirtyB = VoxelIsDirtyQuarantined(indexB);
+        bool cleanA = IsCleanMeshTsdfVoxel(indexA);
+        bool cleanB = IsCleanMeshTsdfVoxel(indexB);
+        int currentWinding = StableQuadTsdfWinding(key);
+        GetStableProvisionalPromotionBlock(indexA, out string promotionBlockerA, out int promotionBlockerAgeA);
+        GetStableProvisionalPromotionBlock(indexB, out string promotionBlockerB, out int promotionBlockerAgeB);
+
+        string classification;
+        string reason;
+        if (cleanA && cleanB && currentWinding != 0)
+        {
+            classification = "held_clean_assembly_loss";
+            reason = provisionalA || provisionalB
+                ? "clean_zero_crossing_preserved_under_atomic_provisional_not_assembled"
+                : "clean_zero_crossing_not_assembled";
+            LastStableQuadHeldSafeCount++;
+            LastStableQuadHeldTypeCleanAssemblyLossCount++;
+        }
+        else if (provisionalA || provisionalB)
+        {
+            classification = "held_provisional_not_promoted";
+            reason = currentWinding != 0 ? "provisional_crossing" : "provisional_no_crossing";
+            LastStableQuadHeldUncertainCount++;
+            LastStableQuadHeldTypeProvisionalNotPromotedCount++;
+        }
+        else if (pendingA || pendingB || dirtyA || dirtyB)
+        {
+            classification = "held_other_unsettled";
+            reason = dirtyA || dirtyB ? "dirty_endpoint" : "pending_endpoint";
+            LastStableQuadHeldUncertainCount++;
+            LastStableQuadHeldTypeOtherUnsettledCount++;
+        }
+        else if (weightA < minSurfaceCornerWeight || weightB < minSurfaceCornerWeight)
+        {
+            classification = "held_other_unsettled";
+            reason = "under_observed_endpoint";
+            LastStableQuadHeldUncertainCount++;
+            LastStableQuadHeldTypeOtherUnsettledCount++;
+        }
+        else if (float.IsNaN(tsdfA) || float.IsNaN(tsdfB) || float.IsInfinity(tsdfA) || float.IsInfinity(tsdfB))
+        {
+            classification = "held_other_unsettled";
+            reason = "invalid_endpoint";
+            LastStableQuadHeldUncertainCount++;
+            LastStableQuadHeldTypeOtherUnsettledCount++;
+        }
+        else
+        {
+            int contradictionWeight = Mathf.Max(minSurfaceCornerWeight, minConflictVoxelWeight);
+            float contradictionAbs = Mathf.Clamp01(stableQuadHeldContradictionMinAbsTsdf);
+            bool sameSign = (tsdfA > 0f && tsdfB > 0f) || (tsdfA < 0f && tsdfB < 0f);
+            bool strongSameSign = cleanA && cleanB && sameSign &&
+                                  weightA >= contradictionWeight && weightB >= contradictionWeight &&
+                                  Mathf.Abs(tsdfA) >= contradictionAbs && Mathf.Abs(tsdfB) >= contradictionAbs;
+            if (strongSameSign)
+            {
+                classification = "held_confirmed_contradiction";
+                reason = "clean_strong_same_sign";
+                LastStableQuadHeldContradictedCount++;
+                LastStableQuadHeldTypeConfirmedContradictionCount++;
+            }
+            else if (sameSign || Mathf.Approximately(tsdfA, 0f) || Mathf.Approximately(tsdfB, 0f))
+            {
+                classification = "held_near_zero_jitter";
+                reason = "weak_or_near_surface_same_sign";
+                LastStableQuadHeldUncertainCount++;
+                LastStableQuadHeldTypeNearZeroJitterCount++;
+            }
+            else
+            {
+                classification = "held_other_unsettled";
+                reason = "non_clean_crossing";
+                LastStableQuadHeldUncertainCount++;
+                LastStableQuadHeldTypeOtherUnsettledCount++;
+            }
+        }
+
+        _stableQuadHeldEvidenceRecords.Add(new StableQuadHeldEvidenceRecord
+        {
+            Key = key,
+            MissingRebuilds = state.ConsecutiveMissing,
+            TotalPresent = state.TotalPresent,
+            PreviousWinding = state.Winding,
+            CurrentWinding = currentWinding,
+            TsdfA = tsdfA,
+            TsdfB = tsdfB,
+            WeightA = weightA,
+            WeightB = weightB,
+            CleanA = cleanA,
+            CleanB = cleanB,
+            ProvisionalA = provisionalA,
+            ProvisionalB = provisionalB,
+            PendingA = pendingA,
+            PendingB = pendingB,
+            DirtyA = dirtyA,
+            DirtyB = dirtyB,
+            Classification = classification,
+            Reason = reason,
+            PromotionBlockerA = promotionBlockerA,
+            PromotionBlockerB = promotionBlockerB,
+            PromotionBlockerAgeA = promotionBlockerAgeA,
+            PromotionBlockerAgeB = promotionBlockerAgeB
+        });
+    }
+
+    private void GetStableProvisionalPromotionBlock(int index, out string blocker, out int ageFrames)
+    {
+        if (_provisionalPromotionBlockStates.TryGetValue(index, out ProvisionalPromotionBlockState state))
+        {
+            blocker = StableProvisionalPromotionBlockReasonName(state.ReasonCode);
+            ageFrames = Mathf.Max(0, LastRawFrameIndex - state.Frame);
+            return;
+        }
+
+        blocker = "no_promotion_attempt_recorded";
+        ageFrames = -1;
+    }
+
+    private string GetStableQuadHeldDominantType()
+    {
+        string type = "none";
+        int count = 0;
+        if (LastStableQuadHeldTypeProvisionalNotPromotedCount > count)
+        {
+            type = "held_provisional_not_promoted";
+            count = LastStableQuadHeldTypeProvisionalNotPromotedCount;
+        }
+        if (LastStableQuadHeldTypeNearZeroJitterCount > count)
+        {
+            type = "held_near_zero_jitter";
+            count = LastStableQuadHeldTypeNearZeroJitterCount;
+        }
+        if (LastStableQuadHeldTypeConfirmedContradictionCount > count)
+        {
+            type = "held_confirmed_contradiction";
+            count = LastStableQuadHeldTypeConfirmedContradictionCount;
+        }
+        if (LastStableQuadHeldTypeCleanAssemblyLossCount > count)
+        {
+            type = "held_clean_assembly_loss";
+            count = LastStableQuadHeldTypeCleanAssemblyLossCount;
+        }
+        if (LastStableQuadHeldTypeOtherUnsettledCount > count)
+            type = "held_other_unsettled";
+        return type;
+    }
+
+    private void ResolveStableQuadShadowConflicts()
+    {
+        foreach (KeyValuePair<ulong, List<StableQuadKey>> pair in _stableQuadAuditEdges)
+        {
+            List<StableQuadKey> quads = pair.Value;
+            if (quads == null || quads.Count <= 2)
+                continue;
+
+            LastStableQuadShadowConflictResolvedEdgeCount++;
+            int bestA = -1;
+            int bestB = -1;
+            float bestScore = float.NegativeInfinity;
+            for (int i = 0; i < quads.Count; i++)
+            for (int j = i + 1; j < quads.Count; j++)
+            {
+                if (!_stableQuadAuditRecords.TryGetValue(quads[i], out StableQuadAuditRecord a) ||
+                    !_stableQuadAuditRecords.TryGetValue(quads[j], out StableQuadAuditRecord b))
+                    continue;
+                float normalScore = a.Normal.sqrMagnitude > 0f && b.Normal.sqrMagnitude > 0f
+                    ? Mathf.Abs(Vector3.Dot(a.Normal, b.Normal)) * 10f
+                    : 0f;
+                float committedScore = StableQuadShadowCommittedBonus(quads[i]) + StableQuadShadowCommittedBonus(quads[j]);
+                float persistedScore = (_previousStableQuadAuditRecords.ContainsKey(quads[i]) ? 1f : 0f) +
+                                       (_previousStableQuadAuditRecords.ContainsKey(quads[j]) ? 1f : 0f);
+                float score = normalScore + committedScore + persistedScore;
+                if (score <= bestScore)
+                    continue;
+                bestScore = score;
+                bestA = i;
+                bestB = j;
+            }
+
+            for (int i = 0; i < quads.Count; i++)
+            {
+                if (i == bestA || i == bestB)
+                    continue;
+                _stableQuadShadowConflictBlocked.Add(quads[i]);
+            }
+        }
+        LastStableQuadShadowConflictBlockedQuadCount = _stableQuadShadowConflictBlocked.Count;
+    }
+
+    private float StableQuadShadowCommittedBonus(StableQuadKey key)
+    {
+        return _stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState state) && state.Committed ? 4f : 0f;
+    }
+
+    private StringBuilder BuildStableQuadTopologyAuditCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(4096, _stableQuadAuditEdges.Count * 96));
+        csv.AppendLine("row_type,quad_x,quad_y,quad_z,axis,vertex_a,vertex_b,vertex_c,vertex_d,winding,provisional_endpoints,pending_endpoints,dirty_endpoints,edge_a,edge_b,edge_quad_count,classification,linked_quads,transition,restored_by_atomic_backing");
+        foreach (StableQuadAuditRecord record in _stableQuadAuditRecords.Values)
+        {
+            string transition = _lastStableQuadWindingChanged.Contains(record.Key)
+                ? "winding_changed"
+                : (_lastStableQuadAdded.Contains(record.Key) ? "added" : "persisted");
+            csv.Append("quad,").Append(record.Key.X).Append(',').Append(record.Key.Y).Append(',').Append(record.Key.Z).Append(',')
+                .Append(StableQuadAxisName(record.Key.Axis)).Append(',').Append(record.A).Append(',').Append(record.B).Append(',').Append(record.C).Append(',').Append(record.D).Append(',')
+                .Append(record.Winding).Append(',').Append(record.ProvisionalCorners).Append(',').Append(record.PendingCorners).Append(',').Append(record.DirtyCorners)
+                .Append(",,,,,,").Append(transition).Append(',').Append(record.RestoredByAtomicProvisionalBacking ? 1 : 0).AppendLine();
+        }
+        foreach (StableQuadKey key in _lastStableQuadRemoved)
+        {
+            csv.Append("quad,").Append(key.X).Append(',').Append(key.Y).Append(',').Append(key.Z).Append(',')
+                .Append(StableQuadAxisName(key.Axis)).Append(",,,,,,,,,,,,,,removed,0").AppendLine();
+        }
+        foreach (KeyValuePair<ulong, List<StableQuadKey>> pair in _stableQuadAuditEdges)
+        {
+            DecodeEdgeKey(pair.Key, out int a, out int b);
+            int count = pair.Value != null ? pair.Value.Count : 0;
+            string classification = count <= 1 ? "boundary" : (count == 2 ? "manifold" : "conflict_gt2");
+            StringBuilder linked = new StringBuilder(64);
+            if (pair.Value != null)
+            {
+                for (int i = 0; i < pair.Value.Count; i++)
+                {
+                    if (i > 0) linked.Append('|');
+                    StableQuadKey key = pair.Value[i];
+                    linked.Append(StableQuadAxisName(key.Axis)).Append(':').Append(key.X).Append(':').Append(key.Y).Append(':').Append(key.Z);
+                }
+            }
+            csv.Append("edge,,,,,,,,,,,,,").Append(a).Append(',').Append(b).Append(',').Append(count).Append(',').Append(classification).Append(',').Append(linked).Append(",,").AppendLine();
+        }
+        return csv;
+    }
+
+    private StringBuilder BuildStableQuadHeldEvidenceCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(1024, _stableQuadHeldEvidenceRecords.Count * 160));
+        csv.AppendLine("quad_x,quad_y,quad_z,axis,missing_rebuilds,total_present,previous_winding,current_winding,tsdf_a,weight_a,clean_a,provisional_a,pending_a,dirty_a,tsdf_b,weight_b,clean_b,provisional_b,pending_b,dirty_b,root_type,subtype,promotion_blocker_a,promotion_blocker_age_a,promotion_blocker_b,promotion_blocker_age_b");
+        for (int i = 0; i < _stableQuadHeldEvidenceRecords.Count; i++)
+        {
+            StableQuadHeldEvidenceRecord record = _stableQuadHeldEvidenceRecords[i];
+            csv.Append(record.Key.X).Append(',').Append(record.Key.Y).Append(',').Append(record.Key.Z).Append(',')
+                .Append(StableQuadAxisName(record.Key.Axis)).Append(',')
+                .Append(record.MissingRebuilds).Append(',').Append(record.TotalPresent).Append(',')
+                .Append(record.PreviousWinding).Append(',').Append(record.CurrentWinding).Append(',')
+                .Append(record.TsdfA.ToString("R", AuditCulture)).Append(',').Append(record.WeightA).Append(',')
+                .Append(record.CleanA ? 1 : 0).Append(',').Append(record.ProvisionalA ? 1 : 0).Append(',')
+                .Append(record.PendingA ? 1 : 0).Append(',').Append(record.DirtyA ? 1 : 0).Append(',')
+                .Append(record.TsdfB.ToString("R", AuditCulture)).Append(',').Append(record.WeightB).Append(',')
+                .Append(record.CleanB ? 1 : 0).Append(',').Append(record.ProvisionalB ? 1 : 0).Append(',')
+                .Append(record.PendingB ? 1 : 0).Append(',').Append(record.DirtyB ? 1 : 0).Append(',')
+                .Append(record.Classification).Append(',').Append(record.Reason).Append(',')
+                .Append(record.PromotionBlockerA).Append(',').Append(record.PromotionBlockerAgeA).Append(',')
+                .Append(record.PromotionBlockerB).Append(',').Append(record.PromotionBlockerAgeB).AppendLine();
+        }
+        return csv;
+    }
+
+    private StringBuilder BuildNewbornPholdCompetitionCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(2048, _newbornPholdCompetitionRecords.Count * 320));
+        csv.AppendLine("newborn_x,newborn_y,newborn_z,newborn_axis,phold_x,phold_y,phold_z,phold_axis,shared_conflict_edges,candidate_conflict_edges,candidate_conflict_edges_with_phold,distinct_phold_blockers,fully_phold_resolvable,swap_boundary_delta,newborn_winding,newborn_min_weight,newborn_min_abs_tsdf,newborn_provisional_endpoints,newborn_pending_endpoints,newborn_dirty_endpoints,newborn_restored,newborn_total_present,newborn_committed,phold_historical_winding,phold_current_winding,phold_min_weight,phold_min_abs_tsdf,phold_provisional_endpoints,phold_pending_endpoints,phold_dirty_endpoints,phold_total_present,phold_missing_rebuilds,recommendation,preferred_consecutive,replacement_status");
+        for (int i = 0; i < _newbornPholdCompetitionRecords.Count; i++)
+        {
+            NewbornPholdCompetitionRecord r = _newbornPholdCompetitionRecords[i];
+            csv.Append(r.NewbornKey.X).Append(',').Append(r.NewbornKey.Y).Append(',').Append(r.NewbornKey.Z).Append(',').Append(StableQuadAxisName(r.NewbornKey.Axis)).Append(',')
+                .Append(r.PholdKey.X).Append(',').Append(r.PholdKey.Y).Append(',').Append(r.PholdKey.Z).Append(',').Append(StableQuadAxisName(r.PholdKey.Axis)).Append(',')
+                .Append(r.SharedConflictEdges).Append(',').Append(r.CandidateConflictEdges).Append(',').Append(r.CandidateConflictEdgesWithPhold).Append(',').Append(r.DistinctPholdBlockers).Append(',')
+                .Append(r.FullyPholdResolvable ? 1 : 0).Append(',').Append(r.SwapBoundaryDelta).Append(',')
+                .Append(r.NewbornWinding).Append(',').Append(r.NewbornMinWeight).Append(',').Append(r.NewbornMinAbsTsdf.ToString(AuditCulture)).Append(',')
+                .Append(r.NewbornProvisionalEndpoints).Append(',').Append(r.NewbornPendingEndpoints).Append(',').Append(r.NewbornDirtyEndpoints).Append(',').Append(r.NewbornRestored ? 1 : 0).Append(',')
+                .Append(r.NewbornTotalPresent).Append(',').Append(r.NewbornCommitted ? 1 : 0).Append(',')
+                .Append(r.PholdHistoricalWinding).Append(',').Append(r.PholdCurrentWinding).Append(',').Append(r.PholdMinWeight).Append(',').Append(r.PholdMinAbsTsdf.ToString(AuditCulture)).Append(',')
+                .Append(r.PholdProvisionalEndpoints).Append(',').Append(r.PholdPendingEndpoints).Append(',').Append(r.PholdDirtyEndpoints).Append(',')
+                .Append(r.PholdTotalPresent).Append(',').Append(r.PholdMissingRebuilds).Append(',').Append(r.Recommendation).Append(',')
+                .Append(r.PreferredConsecutive).Append(',').Append(string.IsNullOrEmpty(r.ReplacementStatus) ? "not_preferred" : r.ReplacementStatus).AppendLine();
+        }
+        return csv;
+    }
+
+    private StringBuilder BuildNewbornPholdProbationCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(1024, _newbornPholdProbationEvents.Count * 96));
+        csv.AppendLine("newborn_x,newborn_y,newborn_z,newborn_axis,phold_x,phold_y,phold_z,phold_axis,event");
+        for (int i = 0; i < _newbornPholdProbationEvents.Count; i++)
+        {
+            NewbornPholdProbationEventRecord r = _newbornPholdProbationEvents[i];
+            csv.Append(r.NewbornKey.X).Append(',').Append(r.NewbornKey.Y).Append(',').Append(r.NewbornKey.Z).Append(',').Append(StableQuadAxisName(r.NewbornKey.Axis)).Append(',')
+                .Append(r.PholdKey.X).Append(',').Append(r.PholdKey.Y).Append(',').Append(r.PholdKey.Z).Append(',').Append(StableQuadAxisName(r.PholdKey.Axis)).Append(',')
+                .Append(r.EventName).AppendLine();
+        }
+        return csv;
+    }
+
+    private static string StableQuadAxisName(byte axis)
+    {
+        return axis == 0 ? "X" : (axis == 1 ? "Y" : "Z");
     }
 
     private bool IsStretchedExtractedQuad(int a, int b, int c, int d, List<Vector3> vertices)
@@ -13868,6 +20662,61 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRejectedNoEdgeCellCount = 0;
         LastRejectedEdgeCountCellCount = 0;
         LastSurfaceQuadCandidateCount = 0;
+        LastQuestRoomScanShadowCellScanCount = 0;
+        LastQuestRoomScanShadowActiveCellCount = 0;
+        LastQuestRoomScanShadowSharedFormalCellCount = 0;
+        LastQuestRoomScanShadowAddedCellCount = 0;
+        LastQuestRoomScanShadowFormalOnlyCellCount = 0;
+        LastQuestRoomScanShadowUnknownAssistedCellCount = 0;
+        LastQuestRoomScanShadowAllObservedCellCount = 0;
+        LastQuestRoomScanShadowSingleWeightCellCount = 0;
+        LastQuestRoomScanShadowPendingObservationCellCount = 0;
+        LastQuestRoomScanShadowRejectedObservationCellCount = 0;
+        LastQuestRoomScanShadowConflictHistoryCellCount = 0;
+        LastQuestRoomScanShadowDirtyPendingProvisionalCellCount = 0;
+        LastQuestRoomScanShadowDirtyQuarantinedCellCount = 0;
+        LastQuestRoomScanShadowPendingTsdfCorrectionCellCount = 0;
+        LastQuestRoomScanShadowProvisionalCellCount = 0;
+        LastQuestRoomScanShadowGoodCrossingCount = 0;
+        LastQuestRoomScanShadowBadCrossingCount = 0;
+        LastQuestRoomScanShadowQuadCount = 0;
+        LastQuestRoomScanShadowQuadAllFormalCellsCount = 0;
+        LastQuestRoomScanShadowQuadUsesAddedCellCount = 0;
+        LastQuestRoomScanShadowAddedUnknownAssistedCellCount = 0;
+        LastQuestRoomScanShadowAddedAllObservedCellCount = 0;
+        LastQuestRoomScanShadowAddedSingleWeightCellCount = 0;
+        LastQuestRoomScanShadowAddedPendingObservationCellCount = 0;
+        LastQuestRoomScanShadowAddedRejectedObservationCellCount = 0;
+        LastQuestRoomScanShadowAddedConflictHistoryCellCount = 0;
+        LastQuestRoomScanShadowAddedDirtyPendingProvisionalCellCount = 0;
+        LastQuestRoomScanShadowAddedDirtyQuarantinedCellCount = 0;
+        LastQuestRoomScanShadowAddedPendingTsdfCorrectionCellCount = 0;
+        LastQuestRoomScanShadowAddedProvisionalCellCount = 0;
+        LastQuestRoomScanShadowAddedPolicyRiskCellCount = 0;
+        LastQuestRoomScanShadowAddedEvidenceLimitedCellCount = 0;
+        LastQuestRoomScanShadowAddedStrongSafeCellCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalCellCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightCellCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightCellCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightCellCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightCellCount = 0;
+        LastQuestRoomScanShadowAddedQuadUnknownAssistedCount = 0;
+        LastQuestRoomScanShadowAddedQuadSingleWeightCount = 0;
+        LastQuestRoomScanShadowAddedQuadPendingObservationCount = 0;
+        LastQuestRoomScanShadowAddedQuadRejectedObservationCount = 0;
+        LastQuestRoomScanShadowAddedQuadConflictHistoryCount = 0;
+        LastQuestRoomScanShadowAddedQuadDirtyPendingProvisionalCount = 0;
+        LastQuestRoomScanShadowAddedQuadDirtyQuarantinedCount = 0;
+        LastQuestRoomScanShadowAddedQuadPendingTsdfCorrectionCount = 0;
+        LastQuestRoomScanShadowAddedQuadProvisionalCount = 0;
+        LastQuestRoomScanShadowAddedQuadPolicyRiskCount = 0;
+        LastQuestRoomScanShadowAddedQuadEvidenceLimitedCount = 0;
+        LastQuestRoomScanShadowAddedQuadStrongSafeCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalQuadCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedMultiWeightQuadCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalAllObservedSingleWeightQuadCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedMultiWeightQuadCount = 0;
+        LastQuestRoomScanShadowAddedCleanProvisionalUnknownAssistedSingleWeightQuadCount = 0;
         LastPrePruneMeshTriangleCount = 0;
         LastPostComponentMeshTriangleCount = 0;
         LastPostBridgeMeshTriangleCount = 0;
@@ -16144,6 +22993,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         string displayModeText = LastMeshUsedExtractedTsdf
             ? (useAtomicObservationTsdfBands ? "ATOMIC A/P/R VOXEL-PROJ" : (useStage03ACleanIsoSurface ? (useV08DirectBandWriteForDiagnosis ? "03A V0.8 WRITE / V0.9 MESH" : (UseLegacyMeshExtraction ? (useV09ExactCornerEligibilityForDiagnosis ? "03A V0.9 EXACT DIAG" : "03A CLEAN / V0.9 EXTRACT") : "STAGE 03A CLEAN TSDF")) : (UseLegacyMeshExtraction ? "TSDF EXTRACTION" : (strictMeshPreview ? "STRICT TSDF PREVIEW" : (guardedMeshPreview ? "GUARDED TSDF PREVIEW" : "TSDF EXTRACTION")))))
             : (renderStableCellsAsPlanarMeshCover ? "LIGHT TSDF COVER" : "FALLBACK RAW CELLS");
+        bool batchActive = _captureRoutine != null;
+        int hudBatchTarget = batchActive ? _activeCaptureBatchTargetFrames : LastCaptureBatchTargetFrames;
+        int hudBatchIntegrated = batchActive ? _activeCaptureBatchIntegratedFrames : LastCaptureBatchIntegratedFrames;
+        int hudBatchRaw = batchActive ? _activeCaptureBatchUniqueRawFrames : LastCaptureBatchUniqueRawFrames;
+        int hudBatchTimeouts = batchActive ? _activeCaptureBatchTimeouts : LastCaptureBatchTimeoutCount;
+        string hudBatchResult = batchActive ? "RUN" : (LastCaptureBatchComplete ? "OK" : "WAIT");
         if (useStage03ACleanIsoSurface)
         {
             bool meshVisible = _meshRenderer != null && _meshRenderer.enabled;
@@ -16153,17 +23008,35 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _hudText.text =
                 "ScanCover STAGE 03A\n" +
                 $"State : {(_captureRoutine != null ? "FUSING" : "READY")} / {(meshReady ? "MESH READY" : likelyCause)}  f={LastRawFrameIndex}/{IntegratedFrameCount}\n" +
+                $"Batch : {hudBatchResult} {hudBatchIntegrated}/{hudBatchTarget} raw={hudBatchRaw} timeout={hudBatchTimeouts} rebuild={LastCaptureBatchMeshRebuildCount}\n" +
                 $"Input : {LastIntegratedSampleCount}/{LastInputSampleCount} {acceptRatio:P0}  updated={LastUpdatedVoxelCount}\n" +
                 $"Bands : A/P={LastAtomicAcceptedBandVoxelWriteCount}/{LastAtomicProvisionalBandVoxelWriteCount}  up/down={LastAtomicPromotedProvisionalVoxelCount}/{LastAtomicRetiredProvisionalVoxelCount}\n" +
+                $"Backing: keep/weak/nonA/prov={LastAtomicProvisionalMatureBackingPreservedCount}/{LastAtomicProvisionalMatureBackingWeakBlockedCount}/{LastAtomicProvisionalNonAtomicBlockedCount}/{LastAtomicProvisionalBackingProvenanceBlockedCount}\n" +
+                $"BDelta : cell/quad/bound/conf/anchor={LastAtomicProvisionalBackingRestoredCellCount}/{LastAtomicProvisionalBackingRestoredQuadCount}/{LastAtomicProvisionalBackingRestoredBoundaryEdgeCount}/{LastAtomicProvisionalBackingRestoredConflictEdgeCount}/{LastAtomicProvisionalBackingPlaneAnchorAllowedCount}\n" +
+                $"BArb  : cand/ok/layer/topo/wind={LastAtomicRestoredArbitrationCandidateCount}/{LastAtomicRestoredArbitrationAcceptedCount}/{LastAtomicRestoredArbitrationBlockedLayerCount}/{LastAtomicRestoredArbitrationBlockedTopologyCount}/{LastAtomicRestoredArbitrationBlockedWindingCount}\n" +
+                $"NArb  : old/cand/ok/layer/topo/wind={LastNewbornArbitrationPersistedFirstCount}/{LastNewbornArbitrationCandidateCount}/{LastNewbornArbitrationAcceptedCount}/{LastNewbornArbitrationBlockedLayerCount}/{LastNewbornArbitrationBlockedTopologyCount}/{LastNewbornArbitrationBlockedWindingCount}\n" +
+                $"PHold : scan/cand/ok/contra/geom/arb={LastProvisionalHeldRetentionScannedCount}/{LastProvisionalHeldRetentionCandidateCount}/{LastProvisionalHeldRetentionAcceptedCount}/{LastProvisionalHeldRetentionBlockedContradictionCount}/{LastProvisionalHeldRetentionBlockedGeometryCount}/{LastProvisionalHeldRetentionBlockedLayerCount + LastProvisionalHeldRetentionBlockedTopologyCount + LastProvisionalHeldRetentionBlockedWindingCount}\n" +
+                $"NPx   : block/pair/free/new/old/amb={LastNewbornPholdCompetitionBlockedNewbornCount}/{LastNewbornPholdCompetitionPairCount}/{LastNewbornPholdCompetitionFullyResolvableCount}/{LastNewbornPholdCompetitionNewbornPreferredCount}/{LastNewbornPholdCompetitionPholdPreferredCount}/{LastNewbornPholdCompetitionAmbiguousCount}\n" +
+                $"NRep  : wait/apply/drop/rb={LastNewbornPholdReplacementPendingCount}/{LastNewbornPholdReplacementAppliedCount}/{LastNewbornPholdReplacementRemovedPholdCount}/{LastNewbornPholdReplacementRollbackCount}\n" +
+                $"NProb : live/ok/rb/cand/keep/contra/geom/arb={LastNewbornPholdProbationPendingCount}/{LastNewbornPholdProbationConfirmedCount}/{LastNewbornPholdProbationRollbackTransactionCount}/{LastNewbornPholdProbationRollbackCandidateCount}/{LastNewbornPholdProbationRollbackAcceptedCount}/{LastNewbornPholdProbationRollbackContradictionBlockedCount}/{LastNewbornPholdProbationRollbackGeometryBlockedCount}/{LastNewbornPholdProbationRollbackLayerBlockedCount + LastNewbornPholdProbationRollbackTopologyBlockedCount + LastNewbornPholdProbationRollbackWindingBlockedCount}\n" +
                 $"Holes : band/ok/drop={LastHoleSideRepairPlaneBandVoxelCount}/{LastHoleSideRepairPlaneConfirmedCount}/{LastHoleSideRepairPlaneRetiredCount}  N/S/P/T={LastHoleSideRepairRetiredNoNearAcceptCount}/{LastHoleSideRepairRetiredSignMismatchCount}/{LastHoleSideRepairRetiredPlaneMismatchCount}/{LastHoleSideRepairRetiredTsdfDeltaCount}\n" +
-                $"Pdist : .5/.75/1/1.5/2+={LastHoleSideRepairPlaneDistance0ToHalfCount}/{LastHoleSideRepairPlaneDistanceHalfTo075Count}/{LastHoleSideRepairPlaneDistance075To1Count}/{LastHoleSideRepairPlaneDistance1To15Count}/{LastHoleSideRepairPlaneDistance15To2Count + LastHoleSideRepairPlaneDistanceOver2Count}\n" +
+                $"Patch : ok/vox/net={LastPrecisionHolePatchAppliedCount}/{LastPrecisionHolePatchVoxelCount}/{LastPrecisionHolePatchBlockedNetTopologyCount}  NZC={LastNoZeroCrossRouteAppliedCount}/{LastNoZeroCrossRouteCandidateCount}\n" +
+                $"Pend  : c/a/e/t={LastPendingHoleRouteCandidateCount}/{LastPendingHoleRouteAppliedCount}/{LastPendingHoleRouteBlockedEvidenceCount}/{LastPendingHoleRouteBlockedTopologyCount} evA/C/N={LastPendingHoleRouteAcceptedEvidenceCount}/{LastPendingHoleRouteCellEvidenceCount}/{LastPendingHoleRouteNeighborEvidenceCount}\n" +
                 $"Commit: old/new/keep={LastCommittedMeshBlockCount}/{LastCandidateMeshBlockCount}/{LastRetainedCommittedMeshBlockCount} hold={LastHeldDisplayTriangleCount} grow={LastCommittedMeshGrowthTriangleCount}\n" +
+                $"Retain: cell/tri/dup/cap={LastRecoveredPendingRetentionCellCount}/{LastRecoveredPendingRetainedTriangleCount}/{LastRecoveredPendingDuplicateTriangleCount}/{LastRecoveredPendingRetentionBudgetCount}\n" +
+                $"RCover: 6/7/8={LastRecoveredPendingSixCornerCellCount}/{LastRecoveredPendingSevenCornerCellCount}/{LastRecoveredPendingEightCornerCellCount}\n" +
+                $"Weld  : reuse/add/deg/topo={LastRecoveredPendingWeldedVertexCount}/{LastRecoveredPendingAddedVertexCount}/{LastRecoveredPendingDegenerateTriangleCount}/{LastRecoveredPendingTopologyBlockedTriangleCount} edge={LastRecoveredPendingBoundaryEdgesBefore}>{LastRecoveredPendingBoundaryEdgesAfter} nonM={LastRecoveredPendingNonManifoldEdgesBefore}>{LastRecoveredPendingNonManifoldEdgesAfter}\n" +
+                $"TopoQ : q/dup/rev={LastStableQuadAuditUniqueCount}/{LastStableQuadAuditDuplicateKeyCount}/{LastStableQuadAuditReverseWindingDuplicateCount} edge b/m/x={LastStableQuadAuditBoundaryEdgeCount}/{LastStableQuadAuditManifoldEdgeCount}/{LastStableQuadAuditConflictEdgeCount} dsFP={LastStableQuadAuditDoubleSidedFalsePositiveEdgeCount}\n" +
+                $"QFlow : keep/add/del/flip={LastStableQuadAuditPersistedCount}/{LastStableQuadAuditAddedCount}/{LastStableQuadAuditRemovedCount}/{LastStableQuadAuditWindingChangedCount}\n" +
+                $"QInc  : cand/commit/up/hold/ret={LastStableQuadShadowCandidateCount}/{LastStableQuadShadowCommittedCount}/{LastStableQuadShadowPromotedCount}/{LastStableQuadShadowHeldMissingCount}/{LastStableQuadShadowRetiredCount} conflict={LastStableQuadShadowConflictResolvedEdgeCount}/{LastStableQuadShadowConflictBlockedQuadCount} flip={LastStableQuadShadowWindingConflictCount}\n" +
+                $"QType : P/J/X/A/O={LastStableQuadHeldTypeProvisionalNotPromotedCount}/{LastStableQuadHeldTypeNearZeroJitterCount}/{LastStableQuadHeldTypeConfirmedContradictionCount}/{LastStableQuadHeldTypeCleanAssemblyLossCount}/{LastStableQuadHeldTypeOtherUnsettledCount} dom={GetStableQuadHeldDominantType()}\n" +
                 $"Mesh  : tris={LastMeshTriangleCount} wire={LastWireSegmentCount} vis={(meshVisible ? 1 : 0)}/{(wireVisible ? 1 : 0)}  log={(string.IsNullOrEmpty(_lastHoleDiagnosticPath) ? "off" : Path.GetFileName(_lastHoleDiagnosticPath))}";
             return;
         }
         _hudText.text =
             "ScanCover SAFEHUD\n" +
             $"State : {(_captureRoutine != null ? "FUSING" : "READY")} / {likelyCause}\n" +
+            $"Batch : {hudBatchResult} {hudBatchIntegrated}/{hudBatchTarget} raw={hudBatchRaw} timeout={hudBatchTimeouts} rebuild={LastCaptureBatchMeshRebuildCount}\n" +
             $"Mode  : {displayModeText} f={LastRawFrameIndex} fused={IntegratedFrameCount} in={LastIntegratedSampleCount}/{LastInputSampleCount} {acceptRatio:P0}\n" +
             $"03A   : scan/cand/vert={LastSurfaceCellScanCount}/{LastStrictSurfaceCellCandidateCount}/{LastBuiltSurfaceCellVertexCount} quad/add={LastSurfaceQuadCandidateCount}/{LastAddedSurfaceQuadCount} tris={LastMeshTriangleCount} vis={(_meshRenderer != null && _meshRenderer.enabled ? 1 : 0)}/{(_wireObject != null && _wireObject.activeSelf ? 1 : 0)}\n" +
             $"Vote  : {observationVoteMode} A/P/R={_auditVoteAcceptCount}/{_auditVotePendingCount}/{_auditVoteRejectCount} blocked={_auditVoteEnforcedRejectCount}\n" +
