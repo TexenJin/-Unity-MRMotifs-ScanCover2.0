@@ -9074,8 +9074,8 @@ MonoBehaviour:
   fusionBurstDurationSeconds: 2
   maxFusionFramesPerTrigger: 24
   rebuildMeshAfterFusionBurstOnly: 1
-  voxelSizeMeters: 0.065
-  truncationMeters: 0.195
+  voxelSizeMeters: 0.1
+  truncationMeters: 0.3
   volumeSizeMeters: {x: 12, y: 4, z: 12}
   maxFusionWeight: 12
   minSurfaceCornerWeight: 1

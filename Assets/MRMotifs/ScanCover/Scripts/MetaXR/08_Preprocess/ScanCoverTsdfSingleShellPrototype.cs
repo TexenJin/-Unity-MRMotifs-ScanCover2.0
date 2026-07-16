@@ -35,8 +35,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool rebuildMeshAfterFusionBurstOnly = true;
 
     [Header("Distilled TSDF Shell Parameters")]
-    [SerializeField, Min(0.02f)] private float voxelSizeMeters = 0.065f;
-    [SerializeField, Min(0.02f)] private float truncationMeters = 0.195f;
+    [SerializeField, Min(0.02f)] private float voxelSizeMeters = 0.10f;
+    [SerializeField, Min(0.02f)] private float truncationMeters = 0.30f;
     [SerializeField] private Vector3 volumeSizeMeters = new Vector3(12f, 4f, 12f);
     [SerializeField, Range(1, 64)] private int maxFusionWeight = 12;
     [SerializeField, Range(1, 8)] private int minSurfaceCornerWeight = 2;
@@ -72,6 +72,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0f, 0.2f)] private float robustDepthEdgeDeltaRatio = 0.025f;
     [SerializeField, Range(0.05f, 1f)] private float depthEdgeWeightScale = 0.35f;
     [SerializeField] private bool rejectStrongDepthEdges = true;
+    [SerializeField] private bool enableGrazingPlaneAdaptiveDepthFilter = true;
+    [SerializeField, Range(0.1f, 0.7f)] private float grazingPlaneStartViewFacing = 0.5f;
+    [SerializeField, Range(0.05f, 0.5f)] private float minGrazingAdaptiveViewFacing = 0.15f;
+    [SerializeField, Range(0.5f, 1f)] private float minGrazingPlaneNeighborNormalDot = 0.85f;
+    [SerializeField, Range(0.005f, 0.12f)] private float maxGrazingPlaneResidualMeters = 0.035f;
+    [SerializeField, Range(2, 12)] private int minGrazingPlaneCompatibleNeighbors = 5;
     [SerializeField] private bool gateTsdfWritesByDepthSupport = true;
     [SerializeField, Range(1, 24)] private int minTsdfDepthCheckedNeighbors = 4;
     [SerializeField, Range(0f, 1f)] private float minTsdfDepthConsistencyRatio = 0.55f;
@@ -129,6 +135,36 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool enableQuestRoomScanSurfaceNetsShadow = true;
     [SerializeField, Range(1, 8)] private int questRoomScanShadowMinWeight = 1;
     [SerializeField] private bool questRoomScanShadowTreatSaturatedNegativeAsEmpty = true;
+    [Header("Reference Full-Volume Iso-Surface (Compare Only)")]
+    [SerializeField] private bool enableReferenceVolumetricShadow = true;
+    [SerializeField] private bool showReferenceVolumetricShadowMesh = false;
+    [SerializeField, Range(1, 8)] private int referenceVolumetricMinWeight = 1;
+    [SerializeField, Min(1000)] private int referenceVolumetricMaxTriangles = 250000;
+    [SerializeField] private Color referenceVolumetricColor = new Color(0.95f, 0.15f, 1f, 0.72f);
+    [Header("Reference Classic Weighted TSDF (Independent Compare Only)")]
+    [SerializeField] private bool enableReferenceClassicTsdf = true;
+    [SerializeField, Range(0.05f, 4f)] private float referenceClassicMesherMinWeight = 0.35f;
+    [SerializeField, Range(1f, 128f)] private float referenceClassicMaxVoxelWeight = 32f;
+    [SerializeField, Range(0.05f, 1f)] private float referenceClassicMinimumAngleWeight = 0.25f;
+    [SerializeField, Range(0.05f, 1f)] private float referenceClassicMinimumDistanceWeight = 0.35f;
+    [SerializeField] private bool showReferenceClassicBoundaryDiagnostics = true;
+    [SerializeField] private bool showAcceptedReferenceClassicCompletionMesh = true;
+    [Header("Reference Classic Plane-Fit Gap Completion (Shadow Only)")]
+    [SerializeField] private bool enableReferenceClassicGapCompletion = true;
+    [SerializeField, Range(1, 3)] private int referenceClassicCompletionRadiusVoxels = 2;
+    [SerializeField, Range(6, 32)] private int referenceClassicCompletionMinSamples = 8;
+    [SerializeField, Range(0.03f, 0.4f)] private float referenceClassicCompletionMaxResidual = 0.16f;
+    [SerializeField, Range(0.1f, 1f)] private float referenceClassicCompletionMaxPredictionMagnitude = 0.7f;
+    [SerializeField, Range(1, 8192)] private int referenceClassicCompletionMaxVoxels = 4096;
+    [SerializeField, Range(2, 64)] private int referenceClassicCompletionMinPatchVoxels = 3;
+    [SerializeField, Range(16, 1024)] private int referenceClassicCompletionMaxPatchVoxels = 256;
+    [SerializeField, Range(1, 32)] private int referenceClassicCompletionMaxPatchTrials = 12;
+    [SerializeField, Range(0.5f, 1f)] private float referenceClassicCompletionMinPatchNormalDot = 0.88f;
+    [SerializeField, Range(0.05f, 2f)] private float referenceClassicCompletionMaxPatchPlaneDistanceVoxelScale = 0.85f;
+    [SerializeField] private bool enableReferenceClassicCompletionGroupTrials = true;
+    [SerializeField, Range(1, 16)] private int referenceClassicCompletionMaxGroupTrials = 8;
+    [SerializeField, Range(2, 16)] private int referenceClassicCompletionMaxPatchesPerGroup = 8;
+    [SerializeField, Range(8, 2048)] private int referenceClassicCompletionMaxGroupVoxels = 512;
     [Header("Stage 03A Clean TSDF Iso-Surface")]
     [SerializeField] private bool useStage03ACleanIsoSurface = true;
     [SerializeField] private bool useV09LegacyExtractorForStage03A = true;
@@ -140,6 +176,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(1, 64)] private int minAtomicProvisionalMatureBackingWeight = 5;
     [SerializeField] private bool arbitrateRestoredAtomicBackingLayerConflicts = true;
     [SerializeField] private bool arbitrateAllNewbornLayerConflicts = true;
+    [SerializeField] private bool repairBoundaryWorseningNewbornLayerBlocks = true;
+    [SerializeField, Range(2, 4)] private int newbornLayerSwapConfirmRebuilds = 2;
+    [SerializeField] private bool useGrazingSamePlaneEvidenceForLayerArbitration = true;
+    [SerializeField, Range(0, 2)] private int grazingSamePlaneLayerEvidenceLookupRadiusCells = 1;
+    [SerializeField, Range(1, 32)] private int minGrazingSamePlaneLayerEvidenceSamples = 2;
+    [SerializeField, Range(0.5f, 1f)] private float minGrazingSamePlaneLayerEvidenceNormalDot = 0.85f;
+    [SerializeField, Min(0.01f)] private float maxGrazingSamePlaneLayerEvidenceResidualMeters = 0.06f;
+    [SerializeField, Range(2, 256)] private int maxGrazingSamePlaneAtomicPatchQuads = 128;
     [Header("Hard TSDF Write Audit")]
     [SerializeField] private bool enableHardTsdfWriteAudit = true;
     [SerializeField] private bool writeHardTsdfAuditOnCapture = true;
@@ -248,6 +292,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool showMeshAsWireOnlyBehindLayerDiagnostics = true;
     [SerializeField] private bool showGlobalPairedLayerDiagnostics = true;
     [SerializeField] private bool showAllLayerDiagnosticMarkers = true;
+    [SerializeField] private bool showLayerDiagnosticPointOverlay = false;
     [SerializeField, Range(12000, 100000)] private int maxFullLayerDiagnosticMarkers = 72000;
     [SerializeField, Range(0.02f, 0.5f)] private float layerDiagnosticMaxAbsTsdf = 0.22f;
     [SerializeField, Range(0.25f, 1f)] private float primaryLayerDiagnosticSizeScale = 0.6f;
@@ -350,6 +395,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.01f, 0.8f)] private float maxBoundaryBridgeAbsTsdf = 0.35f;
     [SerializeField, Range(0, 3)] private int boundaryBridgeCleanRadiusVoxels = 1;
     [SerializeField, Min(0)] private int maxBoundaryBridgesPerRebuild = 1200;
+    [SerializeField] private bool repairPersistentDoublePlaneCreases = false;
+    [SerializeField, Range(2f, 6f)] private float maxDoublePlaneCreaseGapVoxelScale = 4.5f;
+    [SerializeField, Range(0f, 0.8f)] private float maxDoublePlaneCreaseNormalDot = 0.70f;
+    [SerializeField, Range(0.5f, 1f)] private float minDoublePlaneCreaseDirectionDot = 0.78f;
+    [SerializeField, Range(0.5f, 1f)] private float minDoublePlaneCreaseVerticalDot = 0.70f;
+    [SerializeField, Range(2, 4)] private int doublePlaneCreaseConfirmRebuilds = 2;
+    [SerializeField, Range(1, 4)] private int doublePlaneCreaseRetainMissingRebuilds = 2;
+    [SerializeField, Range(1, 1024)] private int maxDoublePlaneCreaseRepairsPerRebuild = 256;
     [SerializeField] private bool doubleSidedTriangles = true;
     [SerializeField] private bool showFallbackSurfaceSamples = false;
     [SerializeField] private bool useFallbackMeshWhenTsdfExtractionEmpty = false;
@@ -397,6 +450,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     [Header("Diagnostic HUD")]
     [SerializeField] private bool showDiagnosticHud = true;
+    [SerializeField] private bool compactDiagnosticHud = true;
     [SerializeField] private Vector3 hudLocalPosition = new Vector3(0f, -0.18f, 0.78f);
     [SerializeField] private Vector3 hudLocalEuler = new Vector3(8f, 0f, 0f);
     [SerializeField] private Vector3 hudLocalScale = new Vector3(0.00075f, 0.00075f, 0.00075f);
@@ -483,6 +537,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Min(0.01f)] private float sameFrameConflictDepthMeters = 0.03f;
     [SerializeField, Min(0.03f)] private float sameFrameConflictSearchMeters = 0.18f;
     [SerializeField, Range(1f, 45f)] private float sameFrameConflictMaxNormalAngleDegrees = 20f;
+    [SerializeField] private bool enableGrazingSamePlaneFrameExemption = true;
+    [SerializeField, Min(0.01f)] private float maxGrazingSamePlaneFrameResidualMeters = 0.06f;
+    [SerializeField, Range(0.5f, 1f)] private float minGrazingSamePlaneFrameCandidateSupportRatio = 0.6f;
     [SerializeField] private bool enableSameFrameEntryGate = true;
     [SerializeField, Min(0.01f)] private float maxSameFrameEntryProvisionalDepthMeters = 0.06f;
     [SerializeField, Range(0.05f, 0.6f)] private float sameFrameEntryProvisionalWeightScale = 0.20f;
@@ -614,14 +671,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool hideMeshWhenRawCoverageGridOverlay = true;
     [SerializeField] private bool renderRawCoverageGridAsWorldCubes = false;
     [SerializeField, Min(0.03f)] private float rawCoverageGridCellSizeMeters = 0.10f;
-    [SerializeField, Min(256)] private int maxRawCoverageGridCells = 4096;
+    [SerializeField, Min(256)] private int maxRawCoverageGridCells = 16000;
     [SerializeField, Range(1, 64)] private int rawCoverageAcceptedDisplayStride = 5;
+    [SerializeField] private bool writeSpatialRuptureDiagnostics = true;
+    [SerializeField, Range(0, 3)] private int spatialRuptureLookupRadiusCells = 1;
 
     private GameObject _meshObject;
     private MeshFilter _meshFilter;
     private MeshRenderer _meshRenderer;
     private Mesh _mesh;
     private Material _runtimeMaterial;
+    private GameObject _referenceVolumetricObject;
+    private MeshFilter _referenceVolumetricMeshFilter;
+    private MeshRenderer _referenceVolumetricMeshRenderer;
+    private Mesh _referenceVolumetricMesh;
+    private Material _referenceVolumetricMaterial;
+    private readonly ScanCoverReferenceClassicTsdf _referenceClassicTsdf = new ScanCoverReferenceClassicTsdf();
+    private GameObject _referenceClassicBoundaryObject;
+    private MeshFilter _referenceClassicBoundaryMeshFilter;
+    private MeshRenderer _referenceClassicBoundaryRenderer;
+    private Mesh _referenceClassicBoundaryMesh;
+    private StringBuilder _referenceClassicBoundaryRows;
+    private StringBuilder _referenceClassicCompletionTrialRows;
+    private StringBuilder _referenceClassicCompletionGroupRows;
     private GameObject _wireObject;
     private MeshFilter _wireMeshFilter;
     private MeshRenderer _wireMeshRenderer;
@@ -660,6 +732,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private readonly List<Vector3> _rawDepthDebugPoints = new List<Vector3>(12000);
     private readonly List<RawDepthDebugKind> _rawDepthDebugKinds = new List<RawDepthDebugKind>(12000);
     private readonly Dictionary<Vector3Int, RawCoverageGridCell> _rawCoverageGridCells = new Dictionary<Vector3Int, RawCoverageGridCell>(4096);
+    private Vector3 _rawCoverageCaptureCameraPosition;
+    private bool _rawCoverageCaptureCameraValid;
     private int _rawDepthDebugReplaceCursor;
     private int _rawDepthDebugClassifierRevision = -1;
     private int _acceptedRawDepthDebugCounter;
@@ -953,6 +1027,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastCaptureBatchTimeoutCount { get; private set; }
     public int LastCaptureBatchMeshRebuildCount { get; private set; }
     public bool LastCaptureBatchComplete { get; private set; }
+    public int CompletedCaptureBatchCount { get; private set; }
     public int LastCaptureBatchAtomicProvisionalPromotionCount { get; private set; }
     public int LastCaptureBatchStrongProvisionalPromotionCount { get; private set; }
     public bool LastRebaselineValid { get; private set; }
@@ -967,6 +1042,89 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastUpdatedVoxelCount { get; private set; }
     public int LastMeshVertexCount { get; private set; }
     public int LastMeshTriangleCount { get; private set; }
+    public int LastReferenceVolumetricVertexCount { get; private set; }
+    public int LastReferenceVolumetricTriangleCount { get; private set; }
+    public int LastReferenceVolumetricBoundaryEdgeCount { get; private set; }
+    public int LastReferenceVolumetricNonManifoldEdgeCount { get; private set; }
+    public int LastReferenceVolumetricDuplicateTriangleCount { get; private set; }
+    public int LastReferenceVolumetricScannedCellCount { get; private set; }
+    public int LastReferenceVolumetricSupportedTetrahedronCount { get; private set; }
+    public int LastReferenceVolumetricMatchedLegacyVertexCount { get; private set; }
+    public int LastReferenceVolumetricUnmatchedLegacyVertexCount { get; private set; }
+    public float LastReferenceVolumetricMeanLegacyDistanceMeters { get; private set; }
+    public int LastReferenceVolumetricOverVoxelDistanceCount { get; private set; }
+    public float LastReferenceVolumetricBuildMilliseconds { get; private set; }
+    public bool LastReferenceVolumetricTruncated { get; private set; }
+    public int LastReferenceClassicVertexCount { get; private set; }
+    public int LastReferenceClassicTriangleCount { get; private set; }
+    public int LastReferenceClassicBoundaryEdgeCount { get; private set; }
+    public int LastReferenceClassicNonManifoldEdgeCount { get; private set; }
+    public int LastReferenceClassicDuplicateTriangleCount { get; private set; }
+    public int LastReferenceClassicWeightedVoxelCount { get; private set; }
+    public int LastReferenceClassicPositiveVoxelCount { get; private set; }
+    public int LastReferenceClassicNegativeVoxelCount { get; private set; }
+    public int LastReferenceClassicInputSampleCount { get; private set; }
+    public int LastReferenceClassicValidSampleCount { get; private set; }
+    public int LastReferenceClassicGrazingSampleCount { get; private set; }
+    public int LastReferenceClassicBandWriteCount { get; private set; }
+    public float LastReferenceClassicMeanObservationWeight { get; private set; }
+    public float LastReferenceClassicBuildMilliseconds { get; private set; }
+    public float LastReferenceClassicMeanLegacyDistanceMeters { get; private set; }
+    public int LastReferenceClassicUnmatchedLegacyVertexCount { get; private set; }
+    public bool LastReferenceClassicTruncated { get; private set; }
+    public int LastReferenceClassicWeldedVertexCount { get; private set; }
+    public int LastReferenceClassicWeldRemovedDegenerateTriangleCount { get; private set; }
+    public int LastReferenceClassicWeldRemovedDuplicateTriangleCount { get; private set; }
+    public int LastReferenceClassicBoundaryVolumeLimitCount { get; private set; }
+    public int LastReferenceClassicBoundaryEnvelopeCount { get; private set; }
+    public int LastReferenceClassicBoundaryInternalCount { get; private set; }
+    public int LastReferenceClassicBoundaryInternalUnobservedCount { get; private set; }
+    public int LastReferenceClassicBoundaryInternalLowWeightCount { get; private set; }
+    public int LastReferenceClassicBoundaryInternalSupportedCount { get; private set; }
+    public float LastReferenceClassicBoundaryTotalLengthMeters { get; private set; }
+    public float LastReferenceClassicBoundaryInternalLengthMeters { get; private set; }
+    public int LastReferenceClassicCompletionCandidateVoxelCount { get; private set; }
+    public int LastReferenceClassicCompletionFilledVoxelCount { get; private set; }
+    public int LastReferenceClassicCompletionBlockedSampleCount { get; private set; }
+    public int LastReferenceClassicCompletionBlockedSignCount { get; private set; }
+    public int LastReferenceClassicCompletionBlockedFitCount { get; private set; }
+    public int LastReferenceClassicCompletionBlockedResidualCount { get; private set; }
+    public int LastReferenceClassicCompletionBlockedPredictionCount { get; private set; }
+    public float LastReferenceClassicCompletionMeanResidual { get; private set; }
+    public int LastReferenceClassicCompletionTriangleCount { get; private set; }
+    public int LastReferenceClassicCompletionBoundaryEdgeCount { get; private set; }
+    public int LastReferenceClassicCompletionNonManifoldEdgeCount { get; private set; }
+    public bool LastReferenceClassicCompletionAccepted { get; private set; }
+    public int LastReferenceClassicCompletionPatchCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchTrialCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchAcceptedCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchRejectedCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchSkippedSizeCount { get; private set; }
+    public int LastReferenceClassicCompletionBoundaryEdgesRemoved { get; private set; }
+    public int LastReferenceClassicCompletionInvalidPlaneCandidateCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchAdjacencyCheckCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchNormalRejectedCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchDistanceRejectedCount { get; private set; }
+    public int LastReferenceClassicCompletionPatchJoinedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialBoundaryUnchangedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialBoundaryIncreasedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialNonManifoldIncreasedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialDuplicateIncreasedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialTriangleGrowthExceededCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialInvalidMeshCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialHitInternalUnobservedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialHitInternalSupportedCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialHitBothInternalTypesCount { get; private set; }
+    public int LastReferenceClassicCompletionTrialHitNeitherInternalTypeCount { get; private set; }
+    public int LastReferenceClassicCompletionDisplayTriangleCount { get; private set; }
+    public int LastReferenceClassicCompletionBoundaryComponentCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupCandidateCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupTrialCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupAcceptedCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupRejectedCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupSkippedSizeCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupBoundaryRemovedCount { get; private set; }
+    public int LastReferenceClassicCompletionGroupHitEdgeCount { get; private set; }
     public bool LastMeshUsedExtractedTsdf { get; private set; }
     public int LastRejectedInvalidPositionCount { get; private set; }
     public int LastRejectedDepthRangeCount { get; private set; }
@@ -981,6 +1139,50 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRobustDepthCorrectedCount { get; private set; }
     public int LastRejectedDepthEdgeErosionCount { get; private set; }
     public int LastDepthEdgeDownweightedCount { get; private set; }
+    public int LastGrazingPlaneCheckedSampleCount { get; private set; }
+    public int LastGrazingPlaneSupportedSampleCount { get; private set; }
+    public int LastGrazingPlaneDepthNeighborRescueCount { get; private set; }
+    public int LastGrazingPlaneEdgeExemptionCount { get; private set; }
+    public int LastGrazingPlaneMedianCorrectionSkippedCount { get; private set; }
+    public int LastRawCoverageBasicFilterCount { get; private set; }
+    public int LastRawCoverageDepthEdgeStageCount { get; private set; }
+    public int LastRawCoverageRobustStageCount { get; private set; }
+    public int LastRawCoverageSupportStageCount { get; private set; }
+    public int LastRawCoverageVoteRejectCount { get; private set; }
+    public int LastRawCoveragePendingHoldCount { get; private set; }
+    public int LastRawCoverageOutsideVolumeStageCount { get; private set; }
+    public int LastRawCoverageAuditOutcomeStageCount { get; private set; }
+    public int LastRawCoverageFallbackWeakStageCount { get; private set; }
+    public int LastRescuedGrazingFinalCount { get; private set; }
+    public int LastRescuedGrazingAcceptedCount { get; private set; }
+    public int LastRescuedGrazingPendingCount { get; private set; }
+    public int LastRescuedGrazingVoteRejectCount { get; private set; }
+    public int LastRescuedGrazingOtherCount { get; private set; }
+    public int LastRescuedGrazingDepthEdgeCount { get; private set; }
+    public int LastRescuedGrazingRobustCount { get; private set; }
+    public int LastRescuedGrazingSupportCount { get; private set; }
+    public int LastRescuedGrazingOutsideVolumeCount { get; private set; }
+    public int LastRescuedGrazingAuditOutcomeCount { get; private set; }
+    public int LastRescuedGrazingFallbackWeakCount { get; private set; }
+    public int LastRescuedVoteWeakSupportCount { get; private set; }
+    public int LastRescuedVoteDepthShiftCount { get; private set; }
+    public int LastRescuedVoteGrazingViewCount { get; private set; }
+    public int LastRescuedVoteLowWeightCount { get; private set; }
+    public int LastRescuedVoteTemporalJumpCount { get; private set; }
+    public int LastRescuedVoteOffHistoryCount { get; private set; }
+    public int LastRescuedVoteOldTsdfCount { get; private set; }
+    public int LastRescuedVoteWeakHistoryCount { get; private set; }
+    public int LastRescuedVoteBandConflictCount { get; private set; }
+    public int LastRescuedVoteBandResidualCount { get; private set; }
+    public int LastRescuedVoteSameFrameConflictCount { get; private set; }
+    public int LastRescuedVoteSameFrameSamePlaneGrazingCount { get; private set; }
+    public int LastRescuedVoteSameFrameCrossPlaneCount { get; private set; }
+    public int LastRescuedVoteSameFrameUnknownPlaneCount { get; private set; }
+    public int LastGrazingSamePlaneFrameCheckedCandidateCount { get; private set; }
+    public int LastGrazingSamePlaneFrameExemptedCandidateCount { get; private set; }
+    public int LastGrazingSamePlaneFrameExemptedSampleCount { get; private set; }
+    public int LastGrazingSamePlaneFrameConflictClearedSampleCount { get; private set; }
+    public int LastRescuedVoteCrossFrameConflictCount { get; private set; }
     public int LastRejectedTsdfConflictCount { get; private set; }
     public int LastPendingStableTsdfCount { get; private set; }
     public int LastProvisionalTsdfSupportWriteCount { get; private set; }
@@ -1273,6 +1475,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastBoundaryBridgeCandidateCount { get; private set; }
     public int LastAddedBoundaryBridgeCount { get; private set; }
     public int LastRejectedBoundaryBridgeCount { get; private set; }
+    public int LastDoublePlaneCreaseCandidateCount { get; private set; }
+    public int LastDoublePlaneCreasePendingCount { get; private set; }
+    public int LastDoublePlaneCreaseAppliedCount { get; private set; }
+    public int LastDoublePlaneCreaseReappliedCount { get; private set; }
+    public int LastDoublePlaneCreaseCommittedLiveCount { get; private set; }
+    public int LastDoublePlaneCreaseRetiredCount { get; private set; }
+    public int LastDoublePlaneCreaseRejectedGeometryCount { get; private set; }
+    public int LastDoublePlaneCreaseRejectedEvidenceCount { get; private set; }
+    public int LastDoublePlaneCreaseAddedTriangleCount { get; private set; }
+    public int LastDoublePlaneCreaseBoundaryEdgesBefore { get; private set; }
+    public int LastDoublePlaneCreaseBoundaryEdgesAfter { get; private set; }
+    public int LastPostRepairBoundaryEdgeCount { get; private set; }
+    public int LastPostRepairNonManifoldEdgeCount { get; private set; }
     public int LastRejectedBadMeshRebuildCount { get; private set; }
     public int LastHeldDisplayTriangleCount { get; private set; }
     public int LastCommittedMeshBlockCount { get; private set; }
@@ -1353,6 +1568,41 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastNewbornArbitrationBlockedLayerCount { get; private set; }
     public int LastNewbornArbitrationBlockedTopologyCount { get; private set; }
     public int LastNewbornArbitrationBlockedWindingCount { get; private set; }
+    public int LastNewbornLayerSwapCheckedCount { get; private set; }
+    public int LastNewbornLayerSwapEligibleCount { get; private set; }
+    public int LastNewbornLayerSwapPendingCount { get; private set; }
+    public int LastNewbornLayerSwapAppliedCount { get; private set; }
+    public int LastNewbornLayerSwapRemovedCount { get; private set; }
+    public int LastNewbornLayerSwapBlockedMatureCount { get; private set; }
+    public int LastNewbornLayerSwapBlockedEvidenceCount { get; private set; }
+    public int LastNewbornLayerSwapBlockedBoundaryCount { get; private set; }
+    public int LastNewbornLayerSwapBoundaryImprovingCount { get; private set; }
+    public int LastNewbornLayerSwapGroupEvidenceAcceptedCount { get; private set; }
+    public int LastNewbornLayerSwapRollbackCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceCheckedCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceMatchedCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceBlockedSupportCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceBlockedNormalCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceBlockedResidualCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceProvisionalAllowedCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceScoreOverrideCount { get; private set; }
+    public int LastSamePlaneLayerEvidencePendingCount { get; private set; }
+    public int LastSamePlaneLayerEvidenceAppliedCount { get; private set; }
+    public int LastSamePlaneAtomicPatchGroupCount { get; private set; }
+    public int LastSamePlaneAtomicPatchCandidateQuadCount { get; private set; }
+    public int LastSamePlaneAtomicPatchBoundaryImprovingCount { get; private set; }
+    public int LastSamePlaneAtomicPatchBlockedBoundaryCount { get; private set; }
+    public int LastSamePlaneAtomicPatchBlockedMatureCount { get; private set; }
+    public int LastSamePlaneAtomicPatchShadowMatureCount { get; private set; }
+    public int LastSamePlaneAtomicPatchShadowPendingCount { get; private set; }
+    public int LastSamePlaneAtomicPatchShadowConfirmedCount { get; private set; }
+    public int LastSamePlaneAtomicPatchBlockedEvidenceCount { get; private set; }
+    public int LastSamePlaneAtomicPatchBlockedTopologyCount { get; private set; }
+    public int LastSamePlaneAtomicPatchPendingCount { get; private set; }
+    public int LastSamePlaneAtomicPatchAppliedCount { get; private set; }
+    public int LastSamePlaneAtomicPatchAppliedQuadCount { get; private set; }
+    public int LastSamePlaneAtomicPatchRemovedBlockerCount { get; private set; }
+    public int LastSamePlaneAtomicPatchRollbackCount { get; private set; }
     public int LastProvisionalHeldRetentionScannedCount { get; private set; }
     public int LastProvisionalHeldRetentionCandidateCount { get; private set; }
     public int LastProvisionalHeldRetentionAcceptedCount { get; private set; }
@@ -1617,6 +1867,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRawCoverageGridSampleCount { get; private set; }
     public int LastRawCoverageGridDroppedSampleCount { get; private set; }
     public int LastRawCoverageGridCellCount { get; private set; }
+    public int LastRawCoverageAngleKnownSampleCount { get; private set; }
+    public int LastRawCoverageFrontSampleCount { get; private set; }
+    public int LastRawCoverageFrontAcceptedCount { get; private set; }
+    public int LastRawCoverageObliqueSampleCount { get; private set; }
+    public int LastRawCoverageObliqueAcceptedCount { get; private set; }
+    public int LastRawCoverageGrazingSampleCount { get; private set; }
+    public int LastRawCoverageGrazingAcceptedCount { get; private set; }
+    public int LastRawCoverageExtremeSampleCount { get; private set; }
+    public int LastRawCoverageExtremeAcceptedCount { get; private set; }
     public int LastRawCoverageAcceptedCellCount { get; private set; }
     public int LastRawCoverageProblemCellCount { get; private set; }
     public int LastRawCoverageMixedCellCount { get; private set; }
@@ -1625,6 +1884,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRawCoverageProblemComponentCount { get; private set; }
     public int LastRawCoverageLargestProblemComponentCells { get; private set; }
     public int LastRawCoverageRenderedCellCount { get; private set; }
+    public int LastSpatialRuptureBoundaryEdgeCount { get; private set; }
+    public int LastSpatialRuptureRawGapCount { get; private set; }
+    public int LastSpatialRuptureDepthEdgeCount { get; private set; }
+    public int LastSpatialRuptureRobustCount { get; private set; }
+    public int LastSpatialRuptureSupportCount { get; private set; }
+    public int LastSpatialRuptureViewConflictCount { get; private set; }
+    public int LastSpatialRuptureOtherRawCount { get; private set; }
+    public int LastSpatialRuptureTsdfStateCount { get; private set; }
+    public int LastSpatialRupturePlaneRejectCount { get; private set; }
+    public int LastSpatialRuptureArbitrationCount { get; private set; }
     public int LastMainShellPromotedCellCount { get; private set; }
     public int LastCandidateShellHeldCellCount { get; private set; }
     public int LastDetailCandidateHeldCellCount { get; private set; }
@@ -1752,6 +2021,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         Outside
     }
 
+    private enum RawCoverageDecisionStage
+    {
+        Other,
+        BasicFilter,
+        DepthNeighborhood,
+        RobustPrefilter,
+        TsdfSupport,
+        VoteReject,
+        PendingHold,
+        OutsideVolume,
+        AuditOutcome,
+        FallbackWeak,
+        Integrated
+    }
+
     private enum HoleBoundaryDiagnosticKind
     {
         WaitingPromotion,
@@ -1808,9 +2092,77 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private struct RawCoverageGridCell
     {
         public Vector3 PositionSum;
+        public float CameraDistanceSum;
+        public int CameraDistanceCount;
+        public float ViewFacingSum;
+        public int ViewFacingCount;
+        public int FrontCount;
+        public int FrontAcceptedCount;
+        public int ObliqueCount;
+        public int ObliqueAcceptedCount;
+        public int GrazingCount;
+        public int GrazingAcceptedCount;
+        public int ExtremeCount;
+        public int ExtremeAcceptedCount;
+        public int BasicFilterCount;
+        public int DepthNeighborhoodStageCount;
+        public int RobustPrefilterStageCount;
+        public int TsdfSupportStageCount;
+        public int VoteRejectCount;
+        public int PendingHoldCount;
+        public int OutsideVolumeStageCount;
+        public int AuditOutcomeStageCount;
+        public int FallbackWeakStageCount;
+        public int OtherRejectCount;
+        public int RescuedGrazingFinalCount;
+        public int RescuedGrazingAcceptedCount;
+        public int RescuedGrazingPendingCount;
+        public int RescuedGrazingVoteRejectCount;
+        public int RescuedGrazingOtherCount;
+        public int RescuedGrazingDepthEdgeCount;
+        public int RescuedGrazingRobustCount;
+        public int RescuedGrazingSupportCount;
+        public int RescuedGrazingOutsideVolumeCount;
+        public int RescuedGrazingAuditOutcomeCount;
+        public int RescuedGrazingFallbackWeakCount;
+        public int RescuedVoteWeakSupportCount;
+        public int RescuedVoteDepthShiftCount;
+        public int RescuedVoteGrazingViewCount;
+        public int RescuedVoteLowWeightCount;
+        public int RescuedVoteTemporalJumpCount;
+        public int RescuedVoteOffHistoryCount;
+        public int RescuedVoteOldTsdfCount;
+        public int RescuedVoteWeakHistoryCount;
+        public int RescuedVoteBandConflictCount;
+        public int RescuedVoteBandResidualCount;
+        public int RescuedVoteSameFrameConflictCount;
+        public int RescuedVoteSameFrameSamePlaneGrazingCount;
+        public int RescuedVoteSameFrameCrossPlaneCount;
+        public int RescuedVoteSameFrameUnknownPlaneCount;
+        public int GrazingSamePlaneFrameExemptedCount;
+        public int GrazingSamePlaneFrameConflictClearedCount;
+        public Vector3 GrazingSamePlaneClearedPositionSum;
+        public Vector3 GrazingSamePlaneClearedNormalSum;
+        public int RescuedVoteCrossFrameConflictCount;
         public int AcceptedCount;
         public int ProblemCount;
         public RawDepthDebugKind WorstKind;
+        public int BasicRejectCount;
+        public int DepthEdgeCount;
+        public int RobustCount;
+        public int SupportCount;
+        public int PendingCount;
+        public int ConflictEdgeCount;
+        public int ConflictViewCount;
+        public int ConflictLockedCount;
+        public int OutsideCount;
+    }
+
+    private struct SpatialArbitrationCell
+    {
+        public int LayerCount;
+        public int TopologyCount;
+        public int WindingCount;
     }
 
     private enum ObservationVoteMode
@@ -1869,11 +2221,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float _auditSampleRobustShiftMeters;
     private float _auditSampleViewFacing;
     private Vector3 _auditSampleNormal;
+    private bool _auditGrazingPlaneSupported;
+    private bool _auditGrazingPlaneActuallyRescued;
     private float _auditTemporalDepthDeltaMeters = -1f;
     private float _auditTemporalWorldDeltaMeters = -1f;
     private float _auditTemporalNormalDeltaDegrees = -1f;
     private float _auditSameFrameDepthDeltaMeters = -1f;
     private float _auditSameFrameNormalDeltaDegrees = -1f;
+    private bool _auditGrazingSamePlaneFrameExempted;
+    private bool _auditGrazingSamePlaneFrameConflictCleared;
     private float _auditCrossFrameCleanDepthDeltaMeters = -1f;
     private float _auditCrossFrameCleanLateralMeters = -1f;
     private float _auditCrossFrameCleanNormalDeltaDegrees = -1f;
@@ -1911,6 +2267,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         public Vector3 PositionSum;
         public Vector3 NormalSum;
+        public int GrazingPlaneSupportedCount;
         public int Count;
     }
     private float _auditMaxPosePositionDelta;
@@ -1965,6 +2322,83 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private bool _stableQuadTrianglesNeedRebuild;
     private bool _lastBuiltCellRestoredByAtomicProvisionalBacking;
     private readonly List<DeferredArbitratedQuad> _deferredArbitratedQuads = new List<DeferredArbitratedQuad>(4096);
+    private readonly List<DeferredArbitratedQuad> _samePlaneAtomicPatchCandidates = new List<DeferredArbitratedQuad>(512);
+    private readonly Dictionary<SamePlaneAtomicPatchKey, SamePlaneAtomicPatchState> _samePlaneAtomicPatchStates = new Dictionary<SamePlaneAtomicPatchKey, SamePlaneAtomicPatchState>(128);
+    private readonly HashSet<SamePlaneAtomicPatchKey> _samePlaneAtomicPatchObserved = new HashSet<SamePlaneAtomicPatchKey>();
+    private readonly Dictionary<int, PrimaryPlaneHoleRejectReason> _spatialPlaneRepairRejects = new Dictionary<int, PrimaryPlaneHoleRejectReason>(4096);
+    private readonly Dictionary<Vector3Int, SpatialArbitrationCell> _spatialArbitrationCells = new Dictionary<Vector3Int, SpatialArbitrationCell>(2048);
+    private readonly List<SpatialRuptureRecord> _spatialRuptureRecords = new List<SpatialRuptureRecord>(4096);
+    private readonly List<CreaseRepairAuditRecord> _creaseRepairAuditRecords = new List<CreaseRepairAuditRecord>(1024);
+    private readonly Dictionary<CreaseCandidateKey, CreaseCandidateState> _doublePlaneCreaseStates = new Dictionary<CreaseCandidateKey, CreaseCandidateState>(1024);
+    private readonly HashSet<CreaseCandidateKey> _doublePlaneCreaseObserved = new HashSet<CreaseCandidateKey>();
+    private readonly Dictionary<StableQuadKey, NewbornLayerSwapState> _newbornLayerSwapStates = new Dictionary<StableQuadKey, NewbornLayerSwapState>(512);
+    private readonly HashSet<StableQuadKey> _newbornLayerSwapObserved = new HashSet<StableQuadKey>();
+
+    private struct SpatialRuptureRecord
+    {
+        public int VertexA;
+        public int VertexB;
+        public Vector3 PointA;
+        public Vector3 PointB;
+        public Vector3 Midpoint;
+        public float Length;
+        public StableQuadKey QuadKey;
+        public Vector3 QuadNormal;
+        public Vector3Int CoverageKey;
+        public int CoverageLookupRadius;
+        public RawCoverageGridCell Coverage;
+        public bool HasCoverage;
+        public int VoxelX;
+        public int VoxelY;
+        public int VoxelZ;
+        public float Tsdf;
+        public int Weight;
+        public bool Provisional;
+        public bool Pending;
+        public bool Dirty;
+        public PrimaryPlaneHoleRejectReason PlaneReject;
+        public SpatialArbitrationCell Arbitration;
+        public string RootType;
+        public string Subtype;
+    }
+
+    private struct CreaseCandidateKey : System.IEquatable<CreaseCandidateKey>
+    {
+        public int X;
+        public int Y;
+        public int Z;
+        public bool Equals(CreaseCandidateKey other) { return X == other.X && Y == other.Y && Z == other.Z; }
+        public override bool Equals(object obj) { return obj is CreaseCandidateKey other && Equals(other); }
+        public override int GetHashCode() { unchecked { return (X * 397 ^ Y) * 397 ^ Z; } }
+    }
+
+    private struct CreaseCandidateState
+    {
+        public int Consecutive;
+        public int LastRebuildSequence;
+        public int ConsecutiveMissing;
+        public bool Committed;
+        public int TotalApplied;
+    }
+
+    private struct CreaseRepairAuditRecord
+    {
+        public CreaseCandidateKey Key;
+        public Vector3 Crease0;
+        public Vector3 Crease1;
+        public Vector3 EvidencePoint;
+        public string Status;
+        public int Consecutive;
+        public int Missing;
+        public int TotalApplied;
+    }
+
+    private struct NewbornLayerSwapState
+    {
+        public int Consecutive;
+        public int LastRebuildSequence;
+        public int BlockerSignature;
+    }
 
     private struct StableQuadKey : System.IEquatable<StableQuadKey>
     {
@@ -2068,6 +2502,46 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public bool HeldProvisional;
         public bool ProbationRollback;
         public StableQuadKey ProbationOwnerKey;
+    }
+
+    private struct SamePlaneAtomicPatchKey
+    {
+        public int X;
+        public int Y;
+        public int Z;
+        public byte NormalAxis;
+
+        public bool Equals(SamePlaneAtomicPatchKey other)
+        {
+            return X == other.X && Y == other.Y && Z == other.Z && NormalAxis == other.NormalAxis;
+        }
+
+        public override bool Equals(object obj)
+        {
+            return obj is SamePlaneAtomicPatchKey other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = X;
+                hash = hash * 397 ^ Y;
+                hash = hash * 397 ^ Z;
+                return hash * 397 ^ NormalAxis;
+            }
+        }
+    }
+
+    private struct SamePlaneAtomicPatchState
+    {
+        public int LastRebuildSequence;
+        public int Consecutive;
+        public int CandidateCount;
+        public int BlockerCount;
+        public int MatureBlockerCount;
+        public Vector3 Center;
+        public Vector3 Normal;
     }
 
     private struct NewbornPholdCompetitionRecord
@@ -2456,6 +2930,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         showExtractedSurfaceMesh = true;
         showPlanarCoverSurfaceFill = true;
         showMeshEdgeWireOverlay = true;
+        showFallbackSurfaceSamples = false;
+        showLayerDiagnosticPointOverlay = false;
+        repairPersistentDoublePlaneCreases = false;
         if (useStage03ACleanIsoSurface)
         {
             DisableDiagnosticDiskWrites();
@@ -2540,6 +3017,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Destroy(_runtimeMaterial);
         if (_meshObject != null)
             Destroy(_meshObject);
+        if (_referenceVolumetricMesh != null)
+            Destroy(_referenceVolumetricMesh);
+        if (_referenceVolumetricMaterial != null)
+            Destroy(_referenceVolumetricMaterial);
+        if (_referenceVolumetricObject != null)
+            Destroy(_referenceVolumetricObject);
+        if (_referenceClassicBoundaryMesh != null)
+            Destroy(_referenceClassicBoundaryMesh);
+        if (_referenceClassicBoundaryObject != null)
+            Destroy(_referenceClassicBoundaryObject);
         if (_wireMesh != null)
             Destroy(_wireMesh);
         if (_wireRuntimeMaterial != null)
@@ -2630,6 +3117,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _volumeInitialized = false;
         _tsdf = null;
         _weights = null;
+        _referenceClassicTsdf.Clear();
         _atomicProvisionalBandTsdf = null;
         _atomicProvisionalBandWeight = null;
         _atomicProvisionalBandRetiredLastFrame = null;
@@ -2683,6 +3171,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _newbornPholdPreferredStates.Clear();
         _newbornPholdPreferredObserved.Clear();
         _newbornPholdReplacementProbations.Clear();
+        _doublePlaneCreaseStates.Clear();
+        _newbornLayerSwapStates.Clear();
+        _samePlaneAtomicPatchCandidates.Clear();
+        _samePlaneAtomicPatchStates.Clear();
+        _samePlaneAtomicPatchObserved.Clear();
         _naturallyObservedStableQuadKeys.Clear();
         _newbornPholdCompetitionRebuildSequence = 0;
         _holeLifecycleRebuildSequence = 0;
@@ -2797,6 +3290,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRobustDepthCorrectedCount = 0;
         LastRejectedDepthEdgeErosionCount = 0;
         LastDepthEdgeDownweightedCount = 0;
+        LastGrazingPlaneCheckedSampleCount = 0;
+        LastGrazingPlaneSupportedSampleCount = 0;
+        LastGrazingPlaneDepthNeighborRescueCount = 0;
+        LastGrazingPlaneEdgeExemptionCount = 0;
+        LastGrazingPlaneMedianCorrectionSkippedCount = 0;
         LastRejectedFallbackWeakCount = 0;
         LastCarvedFreeSpaceVoxelCount = 0;
         ResetFreeSpaceEvidenceDiagnostics();
@@ -2834,6 +3332,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastCaptureBatchTimeoutCount = 0;
         LastCaptureBatchMeshRebuildCount = 0;
         LastCaptureBatchComplete = false;
+        CompletedCaptureBatchCount = 0;
         LastCaptureBatchAtomicProvisionalPromotionCount = 0;
         LastCaptureBatchStrongProvisionalPromotionCount = 0;
         LastRebaselineValid = false;
@@ -2875,6 +3374,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         if (_mesh != null)
             _mesh.Clear();
+        if (_referenceVolumetricMesh != null)
+            _referenceVolumetricMesh.Clear();
+        if (_referenceClassicBoundaryMesh != null)
+            _referenceClassicBoundaryMesh.Clear();
+        if (_referenceClassicBoundaryObject != null)
+            _referenceClassicBoundaryObject.SetActive(false);
+        ResetReferenceVolumetricDiagnostics();
         if (_wireMesh != null)
             _wireMesh.Clear();
     }
@@ -3129,7 +3635,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ResolveNewbornPholdReplacementProbations(cellX, cellY, vertices);
             QueueMatureProvisionalHeldFaces(cellX, cellY, vertices);
             FlushDeferredArbitratedQuads(vertices, triangles);
-            FinalizeStableQuadTopologyAudit(triangles);
+            FinalizeStableQuadTopologyAudit(triangles, vertices);
             RebuildHoleBoundaryDiagnostic(cellX, cellY, cellZ, vertices.Count, triangles);
         }
 
@@ -3150,6 +3656,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (UseLegacyMeshExtraction)
             {
                 LastPostComponentMeshTriangleCount = triangles.Count / 3;
+                RepairPersistentDoublePlaneCreases(vertices, triangles, colors);
                 LastPostBridgeMeshTriangleCount = triangles.Count / 3;
             }
             else
@@ -3157,6 +3664,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 PruneSmallExtractedMeshComponents(vertices, triangles, colors);
                 LastPostComponentMeshTriangleCount = triangles.Count / 3;
                 BridgeCleanCoplanarBoundaryEdges(vertices, triangles, colors);
+                RepairPersistentDoublePlaneCreases(vertices, triangles, colors);
                 LastPostBridgeMeshTriangleCount = triangles.Count / 3;
                 PruneDanglingExtractedMeshTriangles(vertices, triangles);
                 PruneSpikePatchTriangles(vertices, triangles);
@@ -3164,9 +3672,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         RetainRecoveredPendingFaces(vertices, triangles, colors);
+        CountMeshEdgeTopology(triangles, out int postRepairBoundary, out int postRepairNonManifold);
+        LastPostRepairBoundaryEdgeCount = postRepairBoundary;
+        LastPostRepairNonManifoldEdgeCount = postRepairNonManifold;
         AnalyzeMeshDiagnostics(vertices, triangles);
         ApplyMeshTumorSuspectOverlay(vertices, triangles, colors);
         AuditUntrackedTsdfWrites("extraction");
+        RebuildReferenceVolumetricShadow(vertices);
 
         if (ShouldKeepDisplayedMesh(previousTriangleCount, vertices, triangles.Count / 3))
         {
@@ -3211,6 +3723,859 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         return vertices.Count > 0;
+    }
+
+    private void RebuildReferenceVolumetricShadow(List<Vector3> legacyVertices)
+    {
+        ResetReferenceVolumetricDiagnostics();
+        EnsureReferenceVolumetricObjects();
+        if (!enableReferenceVolumetricShadow || _referenceVolumetricMesh == null)
+        {
+            if (_referenceVolumetricMesh != null)
+                _referenceVolumetricMesh.Clear();
+            if (_referenceVolumetricObject != null)
+                _referenceVolumetricObject.SetActive(false);
+            if (_referenceClassicBoundaryObject != null)
+                _referenceClassicBoundaryObject.SetActive(false);
+            return;
+        }
+
+        System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        ScanCoverReferenceVolumetricMesher.Result reference =
+            ScanCoverReferenceVolumetricMesher.Build(
+                _tsdf, _weights, _dimX, _dimY, _dimZ,
+                _volumeOriginWorld, voxelSizeMeters,
+                Mathf.Max(1, referenceVolumetricMinWeight),
+                Mathf.Max(1000, referenceVolumetricMaxTriangles));
+        stopwatch.Stop();
+
+        LastReferenceVolumetricVertexCount = reference.Vertices.Count;
+        LastReferenceVolumetricTriangleCount = reference.Triangles.Count / 3;
+        LastReferenceVolumetricBoundaryEdgeCount = reference.BoundaryEdges;
+        LastReferenceVolumetricNonManifoldEdgeCount = reference.NonManifoldEdges;
+        LastReferenceVolumetricDuplicateTriangleCount = reference.DuplicateTriangles;
+        LastReferenceVolumetricScannedCellCount = reference.ScannedCells;
+        LastReferenceVolumetricSupportedTetrahedronCount = reference.SupportedTetrahedra;
+        LastReferenceVolumetricTruncated = reference.Truncated;
+        LastReferenceVolumetricBuildMilliseconds = (float)stopwatch.Elapsed.TotalMilliseconds;
+        CompareReferenceVolumetricToLegacy(reference.Vertices, legacyVertices);
+
+        ScanCoverReferenceVolumetricMesher.Result displayReference = reference;
+        ScanCoverReferenceVolumetricMesher.Result acceptedCompletionDisplay = null;
+        if (enableReferenceClassicTsdf &&
+            _referenceClassicTsdf.IsCompatible(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters))
+        {
+            _referenceClassicTsdf.AuditVolume();
+            stopwatch.Restart();
+            ScanCoverReferenceVolumetricMesher.Result classic =
+                ScanCoverReferenceVolumetricMesher.Build(
+                    _referenceClassicTsdf.Tsdf, _referenceClassicTsdf.Weights,
+                    _dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters,
+                    Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                    Mathf.Max(1000, referenceVolumetricMaxTriangles));
+            stopwatch.Stop();
+            LastReferenceClassicVertexCount = classic.Vertices.Count;
+            LastReferenceClassicTriangleCount = classic.Triangles.Count / 3;
+            LastReferenceClassicBoundaryEdgeCount = classic.BoundaryEdges;
+            LastReferenceClassicNonManifoldEdgeCount = classic.NonManifoldEdges;
+            LastReferenceClassicDuplicateTriangleCount = classic.DuplicateTriangles;
+            LastReferenceClassicWeightedVoxelCount = _referenceClassicTsdf.WeightedVoxelCount;
+            LastReferenceClassicPositiveVoxelCount = _referenceClassicTsdf.PositiveVoxelCount;
+            LastReferenceClassicNegativeVoxelCount = _referenceClassicTsdf.NegativeVoxelCount;
+            LastReferenceClassicBuildMilliseconds = (float)stopwatch.Elapsed.TotalMilliseconds;
+            LastReferenceClassicTruncated = classic.Truncated;
+            LastReferenceClassicWeldedVertexCount = classic.WeldedVertices;
+            LastReferenceClassicWeldRemovedDegenerateTriangleCount = classic.WeldRemovedDegenerateTriangles;
+            LastReferenceClassicWeldRemovedDuplicateTriangleCount = classic.WeldRemovedDuplicateTriangles;
+            ScanCoverReferenceVolumetricMesher.Result classicDisplay = classic;
+            float[] classicDisplayWeights = _referenceClassicTsdf.Weights;
+            if (enableReferenceClassicGapCompletion)
+            {
+                ScanCoverReferenceBoundaryDiagnostics.Result measuredBoundary =
+                    ScanCoverReferenceBoundaryDiagnostics.Build(
+                        classic, _referenceClassicTsdf.Weights,
+                        _dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters,
+                        Mathf.Max(0.0001f, referenceClassicMesherMinWeight));
+                LastReferenceClassicCompletionBoundaryComponentCount = measuredBoundary.InternalComponentCount;
+                ScanCoverReferenceTsdfGapCompleter.Result completion =
+                    ScanCoverReferenceTsdfGapCompleter.Build(
+                        _referenceClassicTsdf.Tsdf, _referenceClassicTsdf.Weights,
+                        _dimX, _dimY, _dimZ,
+                        Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                        Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                        referenceClassicCompletionRadiusVoxels,
+                        referenceClassicCompletionMinSamples,
+                        referenceClassicCompletionMaxResidual,
+                        referenceClassicCompletionMaxPredictionMagnitude,
+                        referenceClassicCompletionMaxVoxels,
+                        referenceClassicCompletionMinPatchNormalDot,
+                        referenceClassicCompletionMaxPatchPlaneDistanceVoxelScale);
+                LastReferenceClassicCompletionCandidateVoxelCount = completion.CandidateVoxels;
+                LastReferenceClassicCompletionBlockedSampleCount = completion.BlockedSampleCount;
+                LastReferenceClassicCompletionBlockedSignCount = completion.BlockedSignSupport;
+                LastReferenceClassicCompletionBlockedFitCount = completion.BlockedFit;
+                LastReferenceClassicCompletionBlockedResidualCount = completion.BlockedResidual;
+                LastReferenceClassicCompletionBlockedPredictionCount = completion.BlockedPrediction;
+                LastReferenceClassicCompletionInvalidPlaneCandidateCount = completion.InvalidPlaneCandidates;
+                LastReferenceClassicCompletionPatchAdjacencyCheckCount = completion.PatchAdjacencyChecks;
+                LastReferenceClassicCompletionPatchNormalRejectedCount = completion.PatchNormalRejected;
+                LastReferenceClassicCompletionPatchDistanceRejectedCount = completion.PatchDistanceRejected;
+                LastReferenceClassicCompletionPatchJoinedCount = completion.PatchJoined;
+                LastReferenceClassicCompletionMeanResidual = completion.MeanResidual;
+                LastReferenceClassicCompletionPatchCount = completion.Patches.Count;
+                ScanCoverReferenceVolumetricMesher.Result completed = classic;
+                if (completion.PredictedVoxels > 0 && completion.Tsdf != null && completion.Weights != null)
+                {
+                    int maxTrials = Mathf.Max(1, referenceClassicCompletionMaxPatchTrials);
+                    for (int patchIndex = 0; patchIndex < completion.Patches.Count; patchIndex++)
+                    {
+                        ScanCoverReferenceTsdfGapCompleter.Result.Patch patch = completion.Patches[patchIndex];
+                        if (patch.Voxels.Count < referenceClassicCompletionMinPatchVoxels ||
+                            patch.Voxels.Count > referenceClassicCompletionMaxPatchVoxels)
+                        {
+                            LastReferenceClassicCompletionPatchSkippedSizeCount++;
+                            continue;
+                        }
+                        if (LastReferenceClassicCompletionPatchTrialCount >= maxTrials)
+                            break;
+                        LastReferenceClassicCompletionPatchTrialCount++;
+                        ScanCoverReferenceTsdfGapCompleter.ApplyPatch(
+                            completion, patch,
+                            Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                            Mathf.Max(0.0001f, referenceClassicMesherMinWeight));
+                        ScanCoverReferenceVolumetricMesher.Result trial =
+                            ScanCoverReferenceVolumetricMesher.Build(
+                                completion.Tsdf, completion.Weights,
+                                _dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters,
+                                Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                                Mathf.Max(1000, referenceVolumetricMaxTriangles));
+                        int beforeTriangles = completed.Triangles.Count / 3;
+                        int afterTriangles = trial.Triangles.Count / 3;
+                        bool invalidMesh = trial.Truncated || trial.Triangles.Count <= 0;
+                        bool boundaryUnchanged = trial.BoundaryEdges == completed.BoundaryEdges;
+                        bool boundaryIncreased = trial.BoundaryEdges > completed.BoundaryEdges;
+                        bool nonManifoldIncreased = trial.NonManifoldEdges > completed.NonManifoldEdges;
+                        bool duplicateIncreased = trial.DuplicateTriangles > completed.DuplicateTriangles;
+                        bool triangleGrowthExceeded = afterTriangles > beforeTriangles + patch.Voxels.Count * 24;
+                        CountReferenceClassicPatchBoundaryHits(
+                            patch, measuredBoundary,
+                            out int internalUnobservedHits,
+                            out int internalSupportedHits);
+                        bool hitInternalUnobserved = internalUnobservedHits > 0;
+                        bool hitInternalSupported = internalSupportedHits > 0;
+                        if (invalidMesh) LastReferenceClassicCompletionTrialInvalidMeshCount++;
+                        if (boundaryUnchanged) LastReferenceClassicCompletionTrialBoundaryUnchangedCount++;
+                        if (boundaryIncreased) LastReferenceClassicCompletionTrialBoundaryIncreasedCount++;
+                        if (nonManifoldIncreased) LastReferenceClassicCompletionTrialNonManifoldIncreasedCount++;
+                        if (duplicateIncreased) LastReferenceClassicCompletionTrialDuplicateIncreasedCount++;
+                        if (triangleGrowthExceeded) LastReferenceClassicCompletionTrialTriangleGrowthExceededCount++;
+                        if (hitInternalUnobserved) LastReferenceClassicCompletionTrialHitInternalUnobservedCount++;
+                        if (hitInternalSupported) LastReferenceClassicCompletionTrialHitInternalSupportedCount++;
+                        if (hitInternalUnobserved && hitInternalSupported)
+                            LastReferenceClassicCompletionTrialHitBothInternalTypesCount++;
+                        if (!hitInternalUnobserved && !hitInternalSupported)
+                            LastReferenceClassicCompletionTrialHitNeitherInternalTypeCount++;
+                        bool acceptPatch =
+                            !invalidMesh && !nonManifoldIncreased && !duplicateIncreased &&
+                            !triangleGrowthExceeded &&
+                            trial.BoundaryEdges < completed.BoundaryEdges;
+                        AppendReferenceClassicCompletionTrialRow(
+                            patchIndex, patch, completed, trial,
+                            internalUnobservedHits, internalSupportedHits,
+                            invalidMesh, boundaryUnchanged, boundaryIncreased,
+                            nonManifoldIncreased, duplicateIncreased, triangleGrowthExceeded,
+                            acceptPatch);
+                        if (acceptPatch)
+                        {
+                            LastReferenceClassicCompletionPatchAcceptedCount++;
+                            LastReferenceClassicCompletionFilledVoxelCount += patch.Voxels.Count;
+                            LastReferenceClassicCompletionBoundaryEdgesRemoved += completed.BoundaryEdges - trial.BoundaryEdges;
+                            completed = trial;
+                        }
+                        else
+                        {
+                            LastReferenceClassicCompletionPatchRejectedCount++;
+                            ScanCoverReferenceTsdfGapCompleter.RevertPatch(
+                                completion, patch,
+                                _referenceClassicTsdf.Tsdf, _referenceClassicTsdf.Weights);
+                        }
+                    }
+                }
+                if (enableReferenceClassicCompletionGroupTrials)
+                    EvaluateReferenceClassicCompletionGroups(completion, classic, measuredBoundary);
+                LastReferenceClassicCompletionTriangleCount = completed.Triangles.Count / 3;
+                LastReferenceClassicCompletionBoundaryEdgeCount = completed.BoundaryEdges;
+                LastReferenceClassicCompletionNonManifoldEdgeCount = completed.NonManifoldEdges;
+                LastReferenceClassicCompletionAccepted = LastReferenceClassicCompletionPatchAcceptedCount > 0;
+                if (LastReferenceClassicCompletionAccepted)
+                {
+                    classicDisplay = completed;
+                    classicDisplayWeights = completion.Weights;
+                    acceptedCompletionDisplay = BuildReferenceClassicCompletionDisplayDelta(classic, completed);
+                    LastReferenceClassicCompletionDisplayTriangleCount =
+                        acceptedCompletionDisplay != null ? acceptedCompletionDisplay.Triangles.Count / 3 : 0;
+                }
+            }
+            RebuildReferenceClassicBoundaryDiagnostics(classicDisplay, classicDisplayWeights);
+
+            int savedMatched = LastReferenceVolumetricMatchedLegacyVertexCount;
+            int savedUnmatched = LastReferenceVolumetricUnmatchedLegacyVertexCount;
+            int savedOverVoxel = LastReferenceVolumetricOverVoxelDistanceCount;
+            float savedMean = LastReferenceVolumetricMeanLegacyDistanceMeters;
+            LastReferenceVolumetricMatchedLegacyVertexCount = 0;
+            LastReferenceVolumetricUnmatchedLegacyVertexCount = 0;
+            LastReferenceVolumetricOverVoxelDistanceCount = 0;
+            LastReferenceVolumetricMeanLegacyDistanceMeters = 0f;
+            CompareReferenceVolumetricToLegacy(classic.Vertices, legacyVertices);
+            LastReferenceClassicUnmatchedLegacyVertexCount = LastReferenceVolumetricUnmatchedLegacyVertexCount;
+            LastReferenceClassicMeanLegacyDistanceMeters = LastReferenceVolumetricMeanLegacyDistanceMeters;
+            LastReferenceVolumetricMatchedLegacyVertexCount = savedMatched;
+            LastReferenceVolumetricUnmatchedLegacyVertexCount = savedUnmatched;
+            LastReferenceVolumetricOverVoxelDistanceCount = savedOverVoxel;
+            LastReferenceVolumetricMeanLegacyDistanceMeters = savedMean;
+            displayReference = classicDisplay;
+        }
+
+        bool displayFullReference = showReferenceVolumetricShadowMesh;
+        bool displayAcceptedCompletionOnly =
+            !displayFullReference &&
+            showAcceptedReferenceClassicCompletionMesh &&
+            LastReferenceClassicCompletionAccepted &&
+            acceptedCompletionDisplay != null &&
+            acceptedCompletionDisplay.Triangles.Count > 0;
+        ScanCoverReferenceVolumetricMesher.Result renderedReference =
+            displayFullReference ? displayReference : acceptedCompletionDisplay;
+
+        _referenceVolumetricMesh.Clear();
+        if (renderedReference != null)
+        {
+            _referenceVolumetricMesh.indexFormat = renderedReference.Vertices.Count > 65535
+            ? IndexFormat.UInt32
+            : IndexFormat.UInt16;
+            _referenceVolumetricMesh.SetVertices(renderedReference.Vertices);
+            _referenceVolumetricMesh.SetTriangles(renderedReference.Triangles, 0, true);
+            _referenceVolumetricMesh.RecalculateNormals();
+            _referenceVolumetricMesh.RecalculateBounds();
+        }
+        _referenceVolumetricObject.SetActive(displayFullReference || displayAcceptedCompletionOnly);
+    }
+
+    private ScanCoverReferenceVolumetricMesher.Result BuildReferenceClassicCompletionDisplayDelta(
+        ScanCoverReferenceVolumetricMesher.Result measured,
+        ScanCoverReferenceVolumetricMesher.Result completed)
+    {
+        ScanCoverReferenceVolumetricMesher.Result delta = new ScanCoverReferenceVolumetricMesher.Result();
+        if (measured == null || completed == null || measured.Triangles == null || completed.Triangles == null)
+            return delta;
+
+        float quantization = Mathf.Max(0.000001f, voxelSizeMeters * 0.001f);
+        HashSet<string> measuredTriangles = new HashSet<string>();
+        for (int triangle = 0; triangle + 2 < measured.Triangles.Count; triangle += 3)
+        {
+            int a = measured.Triangles[triangle];
+            int b = measured.Triangles[triangle + 1];
+            int c = measured.Triangles[triangle + 2];
+            if (!ReferenceTriangleIndicesValid(measured, a, b, c))
+                continue;
+            measuredTriangles.Add(ReferenceTriangleGeometryKey(
+                measured.Vertices[a], measured.Vertices[b], measured.Vertices[c], quantization));
+        }
+
+        Dictionary<int, int> remappedVertices = new Dictionary<int, int>();
+        for (int triangle = 0; triangle + 2 < completed.Triangles.Count; triangle += 3)
+        {
+            int a = completed.Triangles[triangle];
+            int b = completed.Triangles[triangle + 1];
+            int c = completed.Triangles[triangle + 2];
+            if (!ReferenceTriangleIndicesValid(completed, a, b, c))
+                continue;
+            string key = ReferenceTriangleGeometryKey(
+                completed.Vertices[a], completed.Vertices[b], completed.Vertices[c], quantization);
+            if (measuredTriangles.Contains(key))
+                continue;
+            delta.Triangles.Add(RemapReferenceCompletionVertex(a, completed, delta, remappedVertices));
+            delta.Triangles.Add(RemapReferenceCompletionVertex(b, completed, delta, remappedVertices));
+            delta.Triangles.Add(RemapReferenceCompletionVertex(c, completed, delta, remappedVertices));
+        }
+        return delta;
+    }
+
+    private static bool ReferenceTriangleIndicesValid(
+        ScanCoverReferenceVolumetricMesher.Result mesh,
+        int a,
+        int b,
+        int c)
+    {
+        return mesh != null && a >= 0 && b >= 0 && c >= 0 &&
+               a < mesh.Vertices.Count && b < mesh.Vertices.Count && c < mesh.Vertices.Count;
+    }
+
+    private static int RemapReferenceCompletionVertex(
+        int sourceIndex,
+        ScanCoverReferenceVolumetricMesher.Result source,
+        ScanCoverReferenceVolumetricMesher.Result destination,
+        Dictionary<int, int> remappedVertices)
+    {
+        if (remappedVertices.TryGetValue(sourceIndex, out int destinationIndex))
+            return destinationIndex;
+        destinationIndex = destination.Vertices.Count;
+        remappedVertices[sourceIndex] = destinationIndex;
+        destination.Vertices.Add(source.Vertices[sourceIndex]);
+        return destinationIndex;
+    }
+
+    private static string ReferenceTriangleGeometryKey(Vector3 a, Vector3 b, Vector3 c, float quantization)
+    {
+        string[] points =
+        {
+            ReferencePointGeometryKey(a, quantization),
+            ReferencePointGeometryKey(b, quantization),
+            ReferencePointGeometryKey(c, quantization)
+        };
+        System.Array.Sort(points, System.StringComparer.Ordinal);
+        return points[0] + ";" + points[1] + ";" + points[2];
+    }
+
+    private static string ReferencePointGeometryKey(Vector3 point, float quantization)
+    {
+        float inverse = 1f / Mathf.Max(0.000001f, quantization);
+        return Mathf.RoundToInt(point.x * inverse) + ":" +
+               Mathf.RoundToInt(point.y * inverse) + ":" +
+               Mathf.RoundToInt(point.z * inverse);
+    }
+
+    private sealed class ReferenceClassicCompletionGroup
+    {
+        public int Component;
+        public int HitEdges;
+        public readonly List<ScanCoverReferenceTsdfGapCompleter.Result.Patch> Patches =
+            new List<ScanCoverReferenceTsdfGapCompleter.Result.Patch>(8);
+    }
+
+    private void EvaluateReferenceClassicCompletionGroups(
+        ScanCoverReferenceTsdfGapCompleter.Result completion,
+        ScanCoverReferenceVolumetricMesher.Result measuredMesh,
+        ScanCoverReferenceBoundaryDiagnostics.Result measuredBoundary)
+    {
+        if (completion == null || measuredMesh == null || measuredBoundary == null ||
+            completion.Patches == null || completion.Patches.Count < 2)
+            return;
+
+        List<ReferenceClassicCompletionGroup> groups = new List<ReferenceClassicCompletionGroup>(16);
+        for (int patchIndex = 0; patchIndex < completion.Patches.Count; patchIndex++)
+        {
+            ScanCoverReferenceTsdfGapCompleter.Result.Patch patch = completion.Patches[patchIndex];
+            if (patch == null || patch.Voxels.Count < referenceClassicCompletionMinPatchVoxels ||
+                patch.Voxels.Count > referenceClassicCompletionMaxPatchVoxels)
+                continue;
+            int component = FindDominantReferenceClassicBoundaryComponent(patch, measuredBoundary, out int hitEdges);
+            if (component < 0 || hitEdges <= 0)
+                continue;
+
+            ReferenceClassicCompletionGroup selected = null;
+            for (int groupIndex = 0; groupIndex < groups.Count; groupIndex++)
+            {
+                ReferenceClassicCompletionGroup candidate = groups[groupIndex];
+                if (candidate.Component != component || candidate.Patches.Count <= 0)
+                    continue;
+                if (!ReferenceClassicPatchPlanesCompatible(candidate.Patches[0], patch))
+                    continue;
+                selected = candidate;
+                break;
+            }
+            if (selected == null)
+            {
+                selected = new ReferenceClassicCompletionGroup { Component = component };
+                groups.Add(selected);
+            }
+            selected.Patches.Add(patch);
+            selected.HitEdges += hitEdges;
+        }
+
+        for (int groupIndex = 0; groupIndex < groups.Count; groupIndex++)
+        {
+            ReferenceClassicCompletionGroup group = groups[groupIndex];
+            if (group.Patches.Count < 2)
+                continue;
+            LastReferenceClassicCompletionGroupCandidateCount++;
+            int voxelCount = 0;
+            for (int patchIndex = 0; patchIndex < group.Patches.Count; patchIndex++)
+                voxelCount += group.Patches[patchIndex].Voxels.Count;
+            if (group.Patches.Count > Mathf.Max(2, referenceClassicCompletionMaxPatchesPerGroup) ||
+                voxelCount > Mathf.Max(8, referenceClassicCompletionMaxGroupVoxels))
+            {
+                LastReferenceClassicCompletionGroupSkippedSizeCount++;
+                AppendReferenceClassicCompletionGroupRow(
+                    groupIndex, group, voxelCount, measuredMesh, null,
+                    true, false, "group_size_limit");
+                continue;
+            }
+            if (LastReferenceClassicCompletionGroupTrialCount >= Mathf.Max(1, referenceClassicCompletionMaxGroupTrials))
+                break;
+
+            LastReferenceClassicCompletionGroupTrialCount++;
+            ScanCoverReferenceTsdfGapCompleter.Result groupVolume = new ScanCoverReferenceTsdfGapCompleter.Result
+            {
+                Tsdf = (float[])_referenceClassicTsdf.Tsdf.Clone(),
+                Weights = (float[])_referenceClassicTsdf.Weights.Clone()
+            };
+            for (int patchIndex = 0; patchIndex < group.Patches.Count; patchIndex++)
+            {
+                ScanCoverReferenceTsdfGapCompleter.ApplyPatch(
+                    groupVolume, group.Patches[patchIndex],
+                    Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                    Mathf.Max(0.0001f, referenceClassicMesherMinWeight));
+            }
+            ScanCoverReferenceVolumetricMesher.Result trial =
+                ScanCoverReferenceVolumetricMesher.Build(
+                    groupVolume.Tsdf, groupVolume.Weights,
+                    _dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters,
+                    Mathf.Max(0.0001f, referenceClassicMesherMinWeight),
+                    Mathf.Max(1000, referenceVolumetricMaxTriangles));
+            bool invalid = trial.Truncated || trial.Triangles.Count <= 0;
+            bool nonManifold = trial.NonManifoldEdges > measuredMesh.NonManifoldEdges;
+            bool duplicate = trial.DuplicateTriangles > measuredMesh.DuplicateTriangles;
+            bool growth = trial.Triangles.Count / 3 > measuredMesh.Triangles.Count / 3 + voxelCount * 24;
+            bool accepted = !invalid && !nonManifold && !duplicate && !growth &&
+                            trial.BoundaryEdges < measuredMesh.BoundaryEdges;
+            string reason = accepted ? "none" :
+                BuildReferenceClassicGroupRejectReason(
+                    invalid,
+                    trial.BoundaryEdges == measuredMesh.BoundaryEdges,
+                    trial.BoundaryEdges > measuredMesh.BoundaryEdges,
+                    nonManifold,
+                    duplicate,
+                    growth);
+            if (accepted)
+            {
+                LastReferenceClassicCompletionGroupAcceptedCount++;
+                LastReferenceClassicCompletionGroupBoundaryRemovedCount +=
+                    measuredMesh.BoundaryEdges - trial.BoundaryEdges;
+            }
+            else
+            {
+                LastReferenceClassicCompletionGroupRejectedCount++;
+            }
+            LastReferenceClassicCompletionGroupHitEdgeCount += group.HitEdges;
+            AppendReferenceClassicCompletionGroupRow(
+                groupIndex, group, voxelCount, measuredMesh, trial,
+                false, accepted, reason);
+        }
+    }
+
+    private int FindDominantReferenceClassicBoundaryComponent(
+        ScanCoverReferenceTsdfGapCompleter.Result.Patch patch,
+        ScanCoverReferenceBoundaryDiagnostics.Result boundary,
+        out int hitEdges)
+    {
+        hitEdges = 0;
+        if (patch == null || boundary == null || boundary.Records == null)
+            return -1;
+        Dictionary<int, int> hitsByComponent = new Dictionary<int, int>();
+        float maximumDistanceSquared = Mathf.Pow(Mathf.Max(0.001f, voxelSizeMeters * 1.75f), 2f);
+        for (int edgeIndex = 0; edgeIndex < boundary.Records.Count; edgeIndex++)
+        {
+            ScanCoverReferenceBoundaryDiagnostics.Result.BoundaryRecord edge = boundary.Records[edgeIndex];
+            if (edge.InternalComponent < 0)
+                continue;
+            bool hit = false;
+            for (int voxelIndex = 0; voxelIndex < patch.Voxels.Count; voxelIndex++)
+            {
+                ScanCoverReferenceTsdfGapCompleter.Result.Candidate voxel = patch.Voxels[voxelIndex];
+                Vector3 world = _volumeOriginWorld +
+                                new Vector3(voxel.X * voxelSizeMeters, voxel.Y * voxelSizeMeters, voxel.Z * voxelSizeMeters);
+                if ((world - edge.Midpoint).sqrMagnitude <= maximumDistanceSquared)
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit)
+                continue;
+            hitsByComponent.TryGetValue(edge.InternalComponent, out int count);
+            hitsByComponent[edge.InternalComponent] = count + 1;
+        }
+
+        int dominant = -1;
+        foreach (KeyValuePair<int, int> pair in hitsByComponent)
+        {
+            if (pair.Value <= hitEdges)
+                continue;
+            dominant = pair.Key;
+            hitEdges = pair.Value;
+        }
+        return dominant;
+    }
+
+    private bool ReferenceClassicPatchPlanesCompatible(
+        ScanCoverReferenceTsdfGapCompleter.Result.Patch a,
+        ScanCoverReferenceTsdfGapCompleter.Result.Patch b)
+    {
+        if (a == null || b == null || !a.PlaneValid || !b.PlaneValid)
+            return false;
+        float signedDot = Vector3.Dot(a.PlaneNormal, b.PlaneNormal);
+        if (Mathf.Abs(signedDot) < Mathf.Clamp(referenceClassicCompletionMinPatchNormalDot, 0.5f, 1f))
+            return false;
+        Vector3 bNormal = signedDot < 0f ? -b.PlaneNormal : b.PlaneNormal;
+        float bOffset = signedDot < 0f ? -b.PlaneOffset : b.PlaneOffset;
+        float maximumDistance = Mathf.Max(0.01f, referenceClassicCompletionMaxPatchPlaneDistanceVoxelScale);
+        float aToB = Mathf.Abs(Vector3.Dot(a.PlaneNormal, b.PlanePoint) + a.PlaneOffset);
+        float bToA = Mathf.Abs(Vector3.Dot(bNormal, a.PlanePoint) + bOffset);
+        return aToB <= maximumDistance && bToA <= maximumDistance;
+    }
+
+    private static string BuildReferenceClassicGroupRejectReason(
+        bool invalid,
+        bool boundaryUnchanged,
+        bool boundaryIncreased,
+        bool nonManifold,
+        bool duplicate,
+        bool growth)
+    {
+        StringBuilder reasons = new StringBuilder(96);
+        AppendReferenceClassicTrialReason(reasons, invalid, "invalid_mesh");
+        AppendReferenceClassicTrialReason(reasons, boundaryUnchanged, "boundary_unchanged");
+        AppendReferenceClassicTrialReason(reasons, boundaryIncreased, "boundary_increased");
+        AppendReferenceClassicTrialReason(reasons, nonManifold, "nonmanifold_increased");
+        AppendReferenceClassicTrialReason(reasons, duplicate, "duplicates_increased");
+        AppendReferenceClassicTrialReason(reasons, growth, "triangle_growth_exceeded");
+        return reasons.Length > 0 ? reasons.ToString() : "other_safety_gate";
+    }
+
+    private void AppendReferenceClassicCompletionGroupRow(
+        int groupIndex,
+        ReferenceClassicCompletionGroup group,
+        int voxelCount,
+        ScanCoverReferenceVolumetricMesher.Result before,
+        ScanCoverReferenceVolumetricMesher.Result after,
+        bool skipped,
+        bool accepted,
+        string reason)
+    {
+        if (_referenceClassicCompletionGroupRows == null)
+            ResetReferenceClassicCompletionGroupRows();
+        int afterTriangles = after != null ? after.Triangles.Count / 3 : -1;
+        int afterBoundary = after != null ? after.BoundaryEdges : -1;
+        int afterNonManifold = after != null ? after.NonManifoldEdges : -1;
+        int afterDuplicates = after != null ? after.DuplicateTriangles : -1;
+        _referenceClassicCompletionGroupRows
+            .Append(groupIndex).Append(',').Append(group.Component).Append(',')
+            .Append(group.Patches.Count).Append(',').Append(voxelCount).Append(',').Append(group.HitEdges).Append(',')
+            .Append(before.Triangles.Count / 3).Append(',').Append(afterTriangles).Append(',')
+            .Append(before.BoundaryEdges).Append(',').Append(afterBoundary).Append(',')
+            .Append(after != null ? afterBoundary - before.BoundaryEdges : 0).Append(',')
+            .Append(before.NonManifoldEdges).Append(',').Append(afterNonManifold).Append(',')
+            .Append(before.DuplicateTriangles).Append(',').Append(afterDuplicates).Append(',')
+            .Append(skipped ? 1 : 0).Append(',').Append(accepted ? 1 : 0).Append(',')
+            .Append(reason).AppendLine();
+    }
+
+    private void ResetReferenceClassicCompletionGroupRows()
+    {
+        _referenceClassicCompletionGroupRows = new StringBuilder(4096);
+        _referenceClassicCompletionGroupRows.AppendLine(
+            "group_index,boundary_component,patches,voxels,hit_internal_edges,before_triangles,after_triangles,before_boundary,after_boundary,boundary_delta,before_nonmanifold,after_nonmanifold,before_duplicates,after_duplicates,skipped,accepted,reject_reasons");
+    }
+
+    private void CountReferenceClassicPatchBoundaryHits(
+        ScanCoverReferenceTsdfGapCompleter.Result.Patch patch,
+        ScanCoverReferenceBoundaryDiagnostics.Result boundary,
+        out int internalUnobservedHits,
+        out int internalSupportedHits)
+    {
+        internalUnobservedHits = 0;
+        internalSupportedHits = 0;
+        if (patch == null || boundary == null || boundary.Records == null || patch.Voxels.Count <= 0)
+            return;
+
+        float maximumDistance = Mathf.Max(0.001f, voxelSizeMeters * 1.75f);
+        float maximumDistanceSquared = maximumDistance * maximumDistance;
+        for (int edgeIndex = 0; edgeIndex < boundary.Records.Count; edgeIndex++)
+        {
+            ScanCoverReferenceBoundaryDiagnostics.Result.BoundaryRecord edge = boundary.Records[edgeIndex];
+            bool unobserved = edge.Classification == "internal_unobserved_gap";
+            bool supported = edge.Classification == "internal_supported_open_edge";
+            if (!unobserved && !supported)
+                continue;
+
+            bool hit = false;
+            for (int voxelIndex = 0; voxelIndex < patch.Voxels.Count; voxelIndex++)
+            {
+                ScanCoverReferenceTsdfGapCompleter.Result.Candidate voxel = patch.Voxels[voxelIndex];
+                Vector3 world = _volumeOriginWorld +
+                                new Vector3(voxel.X * voxelSizeMeters, voxel.Y * voxelSizeMeters, voxel.Z * voxelSizeMeters);
+                if ((world - edge.Midpoint).sqrMagnitude <= maximumDistanceSquared)
+                {
+                    hit = true;
+                    break;
+                }
+            }
+
+            if (!hit)
+                continue;
+            if (unobserved) internalUnobservedHits++;
+            else internalSupportedHits++;
+        }
+    }
+
+    private void AppendReferenceClassicCompletionTrialRow(
+        int patchIndex,
+        ScanCoverReferenceTsdfGapCompleter.Result.Patch patch,
+        ScanCoverReferenceVolumetricMesher.Result before,
+        ScanCoverReferenceVolumetricMesher.Result after,
+        int internalUnobservedHits,
+        int internalSupportedHits,
+        bool invalidMesh,
+        bool boundaryUnchanged,
+        bool boundaryIncreased,
+        bool nonManifoldIncreased,
+        bool duplicateIncreased,
+        bool triangleGrowthExceeded,
+        bool accepted)
+    {
+        if (_referenceClassicCompletionTrialRows == null)
+        {
+            _referenceClassicCompletionTrialRows = new StringBuilder(4096);
+            _referenceClassicCompletionTrialRows.AppendLine(
+                "patch_index,voxels,mean_residual,before_triangles,after_triangles,triangle_delta,before_boundary,after_boundary,boundary_delta,before_nonmanifold,after_nonmanifold,before_duplicates,after_duplicates,hit_internal_unobserved_edges,hit_internal_supported_edges,invalid_mesh,boundary_unchanged,boundary_increased,nonmanifold_increased,duplicates_increased,triangle_growth_exceeded,accepted,reject_reasons");
+        }
+
+        StringBuilder reasons = new StringBuilder(96);
+        AppendReferenceClassicTrialReason(reasons, invalidMesh, "invalid_mesh");
+        AppendReferenceClassicTrialReason(reasons, boundaryUnchanged, "boundary_unchanged");
+        AppendReferenceClassicTrialReason(reasons, boundaryIncreased, "boundary_increased");
+        AppendReferenceClassicTrialReason(reasons, nonManifoldIncreased, "nonmanifold_increased");
+        AppendReferenceClassicTrialReason(reasons, duplicateIncreased, "duplicates_increased");
+        AppendReferenceClassicTrialReason(reasons, triangleGrowthExceeded, "triangle_growth_exceeded");
+        if (!accepted && after.BoundaryEdges < before.BoundaryEdges && reasons.Length <= 0)
+            reasons.Append("other_safety_gate");
+        if (accepted)
+            reasons.Append("none");
+
+        int beforeTriangles = before.Triangles.Count / 3;
+        int afterTriangles = after.Triangles.Count / 3;
+        CultureInfo c = CultureInfo.InvariantCulture;
+        _referenceClassicCompletionTrialRows
+            .Append(patchIndex).Append(',')
+            .Append(patch.Voxels.Count).Append(',')
+            .Append(patch.MeanResidual.ToString("R", c)).Append(',')
+            .Append(beforeTriangles).Append(',').Append(afterTriangles).Append(',').Append(afterTriangles - beforeTriangles).Append(',')
+            .Append(before.BoundaryEdges).Append(',').Append(after.BoundaryEdges).Append(',').Append(after.BoundaryEdges - before.BoundaryEdges).Append(',')
+            .Append(before.NonManifoldEdges).Append(',').Append(after.NonManifoldEdges).Append(',')
+            .Append(before.DuplicateTriangles).Append(',').Append(after.DuplicateTriangles).Append(',')
+            .Append(internalUnobservedHits).Append(',').Append(internalSupportedHits).Append(',')
+            .Append(invalidMesh ? 1 : 0).Append(',')
+            .Append(boundaryUnchanged ? 1 : 0).Append(',')
+            .Append(boundaryIncreased ? 1 : 0).Append(',')
+            .Append(nonManifoldIncreased ? 1 : 0).Append(',')
+            .Append(duplicateIncreased ? 1 : 0).Append(',')
+            .Append(triangleGrowthExceeded ? 1 : 0).Append(',')
+            .Append(accepted ? 1 : 0).Append(',')
+            .Append(reasons).AppendLine();
+    }
+
+    private static void AppendReferenceClassicTrialReason(StringBuilder reasons, bool include, string reason)
+    {
+        if (!include)
+            return;
+        if (reasons.Length > 0)
+            reasons.Append('|');
+        reasons.Append(reason);
+    }
+
+    private void RebuildReferenceClassicBoundaryDiagnostics(
+        ScanCoverReferenceVolumetricMesher.Result classic,
+        float[] diagnosticWeights)
+    {
+        ScanCoverReferenceBoundaryDiagnostics.Result diagnostic =
+            ScanCoverReferenceBoundaryDiagnostics.Build(
+                classic, diagnosticWeights,
+                _dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters,
+                Mathf.Max(0.0001f, referenceClassicMesherMinWeight));
+        _referenceClassicBoundaryRows = diagnostic.Csv;
+        LastReferenceClassicBoundaryVolumeLimitCount = diagnostic.VolumeLimitEdges;
+        LastReferenceClassicBoundaryEnvelopeCount = diagnostic.EnvelopeEdges;
+        LastReferenceClassicBoundaryInternalCount = diagnostic.InternalEdges;
+        LastReferenceClassicBoundaryInternalUnobservedCount = diagnostic.InternalUnobservedEdges;
+        LastReferenceClassicBoundaryInternalLowWeightCount = diagnostic.InternalLowWeightEdges;
+        LastReferenceClassicBoundaryInternalSupportedCount = diagnostic.InternalSupportedEdges;
+        LastReferenceClassicBoundaryTotalLengthMeters = diagnostic.TotalLength;
+        LastReferenceClassicBoundaryInternalLengthMeters = diagnostic.InternalLength;
+
+        EnsureReferenceClassicBoundaryObjects();
+        if (_referenceClassicBoundaryMesh == null)
+            return;
+        _referenceClassicBoundaryMesh.Clear();
+        _referenceClassicBoundaryMesh.indexFormat = diagnostic.LineVertices.Count > 65535
+            ? IndexFormat.UInt32
+            : IndexFormat.UInt16;
+        _referenceClassicBoundaryMesh.SetVertices(diagnostic.LineVertices);
+        if (diagnostic.LineColors.Count == diagnostic.LineVertices.Count)
+            _referenceClassicBoundaryMesh.SetColors(diagnostic.LineColors);
+        _referenceClassicBoundaryMesh.SetIndices(diagnostic.LineIndices, MeshTopology.Lines, 0, true);
+        _referenceClassicBoundaryObject.SetActive(
+            showReferenceClassicBoundaryDiagnostics && diagnostic.LineVertices.Count > 0);
+    }
+
+    private void CompareReferenceVolumetricToLegacy(List<Vector3> referenceVertices, List<Vector3> legacyVertices)
+    {
+        if (referenceVertices == null || legacyVertices == null ||
+            referenceVertices.Count <= 0 || legacyVertices.Count <= 0)
+        {
+            LastReferenceVolumetricUnmatchedLegacyVertexCount = referenceVertices != null
+                ? referenceVertices.Count
+                : 0;
+            return;
+        }
+
+        float cellSize = Mathf.Max(0.01f, voxelSizeMeters);
+        float inverseCell = 1f / cellSize;
+        float maximumDistanceSq = cellSize * cellSize * 4f;
+        Dictionary<Vector3Int, List<Vector3>> legacyBuckets =
+            new Dictionary<Vector3Int, List<Vector3>>(legacyVertices.Count);
+        for (int i = 0; i < legacyVertices.Count; i++)
+        {
+            Vector3 point = legacyVertices[i];
+            Vector3Int key = new Vector3Int(
+                Mathf.FloorToInt(point.x * inverseCell),
+                Mathf.FloorToInt(point.y * inverseCell),
+                Mathf.FloorToInt(point.z * inverseCell));
+            if (!legacyBuckets.TryGetValue(key, out List<Vector3> bucket))
+            {
+                bucket = new List<Vector3>(8);
+                legacyBuckets[key] = bucket;
+            }
+            bucket.Add(point);
+        }
+
+        double distanceSum = 0.0;
+        for (int i = 0; i < referenceVertices.Count; i++)
+        {
+            Vector3 point = referenceVertices[i];
+            Vector3Int center = new Vector3Int(
+                Mathf.FloorToInt(point.x * inverseCell),
+                Mathf.FloorToInt(point.y * inverseCell),
+                Mathf.FloorToInt(point.z * inverseCell));
+            float bestSq = maximumDistanceSq;
+            bool matched = false;
+            for (int z = -2; z <= 2; z++)
+            for (int y = -2; y <= 2; y++)
+            for (int x = -2; x <= 2; x++)
+            {
+                if (!legacyBuckets.TryGetValue(center + new Vector3Int(x, y, z), out List<Vector3> bucket))
+                    continue;
+                for (int j = 0; j < bucket.Count; j++)
+                {
+                    float distanceSq = (bucket[j] - point).sqrMagnitude;
+                    if (distanceSq > bestSq)
+                        continue;
+                    bestSq = distanceSq;
+                    matched = true;
+                }
+            }
+            if (!matched)
+            {
+                LastReferenceVolumetricUnmatchedLegacyVertexCount++;
+                continue;
+            }
+            float distance = Mathf.Sqrt(bestSq);
+            LastReferenceVolumetricMatchedLegacyVertexCount++;
+            distanceSum += distance;
+            if (distance > cellSize)
+                LastReferenceVolumetricOverVoxelDistanceCount++;
+        }
+
+        LastReferenceVolumetricMeanLegacyDistanceMeters =
+            LastReferenceVolumetricMatchedLegacyVertexCount > 0
+                ? (float)(distanceSum / LastReferenceVolumetricMatchedLegacyVertexCount)
+                : 0f;
+    }
+
+    private void ResetReferenceVolumetricDiagnostics()
+    {
+        LastReferenceVolumetricVertexCount = 0;
+        LastReferenceVolumetricTriangleCount = 0;
+        LastReferenceVolumetricBoundaryEdgeCount = 0;
+        LastReferenceVolumetricNonManifoldEdgeCount = 0;
+        LastReferenceVolumetricDuplicateTriangleCount = 0;
+        LastReferenceVolumetricScannedCellCount = 0;
+        LastReferenceVolumetricSupportedTetrahedronCount = 0;
+        LastReferenceVolumetricMatchedLegacyVertexCount = 0;
+        LastReferenceVolumetricUnmatchedLegacyVertexCount = 0;
+        LastReferenceVolumetricMeanLegacyDistanceMeters = 0f;
+        LastReferenceVolumetricOverVoxelDistanceCount = 0;
+        LastReferenceVolumetricBuildMilliseconds = 0f;
+        LastReferenceVolumetricTruncated = false;
+        LastReferenceClassicVertexCount = 0;
+        LastReferenceClassicTriangleCount = 0;
+        LastReferenceClassicBoundaryEdgeCount = 0;
+        LastReferenceClassicNonManifoldEdgeCount = 0;
+        LastReferenceClassicDuplicateTriangleCount = 0;
+        LastReferenceClassicWeightedVoxelCount = 0;
+        LastReferenceClassicPositiveVoxelCount = 0;
+        LastReferenceClassicNegativeVoxelCount = 0;
+        LastReferenceClassicBuildMilliseconds = 0f;
+        LastReferenceClassicMeanLegacyDistanceMeters = 0f;
+        LastReferenceClassicUnmatchedLegacyVertexCount = 0;
+        LastReferenceClassicTruncated = false;
+        LastReferenceClassicWeldedVertexCount = 0;
+        LastReferenceClassicWeldRemovedDegenerateTriangleCount = 0;
+        LastReferenceClassicWeldRemovedDuplicateTriangleCount = 0;
+        LastReferenceClassicBoundaryVolumeLimitCount = 0;
+        LastReferenceClassicBoundaryEnvelopeCount = 0;
+        LastReferenceClassicBoundaryInternalCount = 0;
+        LastReferenceClassicBoundaryInternalUnobservedCount = 0;
+        LastReferenceClassicBoundaryInternalLowWeightCount = 0;
+        LastReferenceClassicBoundaryInternalSupportedCount = 0;
+        LastReferenceClassicBoundaryTotalLengthMeters = 0f;
+        LastReferenceClassicBoundaryInternalLengthMeters = 0f;
+        LastReferenceClassicCompletionCandidateVoxelCount = 0;
+        LastReferenceClassicCompletionFilledVoxelCount = 0;
+        LastReferenceClassicCompletionBlockedSampleCount = 0;
+        LastReferenceClassicCompletionBlockedSignCount = 0;
+        LastReferenceClassicCompletionBlockedFitCount = 0;
+        LastReferenceClassicCompletionBlockedResidualCount = 0;
+        LastReferenceClassicCompletionBlockedPredictionCount = 0;
+        LastReferenceClassicCompletionMeanResidual = 0f;
+        LastReferenceClassicCompletionTriangleCount = 0;
+        LastReferenceClassicCompletionBoundaryEdgeCount = 0;
+        LastReferenceClassicCompletionNonManifoldEdgeCount = 0;
+        LastReferenceClassicCompletionAccepted = false;
+        LastReferenceClassicCompletionPatchCount = 0;
+        LastReferenceClassicCompletionPatchTrialCount = 0;
+        LastReferenceClassicCompletionPatchAcceptedCount = 0;
+        LastReferenceClassicCompletionPatchRejectedCount = 0;
+        LastReferenceClassicCompletionPatchSkippedSizeCount = 0;
+        LastReferenceClassicCompletionBoundaryEdgesRemoved = 0;
+        LastReferenceClassicCompletionInvalidPlaneCandidateCount = 0;
+        LastReferenceClassicCompletionPatchAdjacencyCheckCount = 0;
+        LastReferenceClassicCompletionPatchNormalRejectedCount = 0;
+        LastReferenceClassicCompletionPatchDistanceRejectedCount = 0;
+        LastReferenceClassicCompletionPatchJoinedCount = 0;
+        LastReferenceClassicCompletionTrialBoundaryUnchangedCount = 0;
+        LastReferenceClassicCompletionTrialBoundaryIncreasedCount = 0;
+        LastReferenceClassicCompletionTrialNonManifoldIncreasedCount = 0;
+        LastReferenceClassicCompletionTrialDuplicateIncreasedCount = 0;
+        LastReferenceClassicCompletionTrialTriangleGrowthExceededCount = 0;
+        LastReferenceClassicCompletionTrialInvalidMeshCount = 0;
+        LastReferenceClassicCompletionTrialHitInternalUnobservedCount = 0;
+        LastReferenceClassicCompletionTrialHitInternalSupportedCount = 0;
+        LastReferenceClassicCompletionTrialHitBothInternalTypesCount = 0;
+        LastReferenceClassicCompletionTrialHitNeitherInternalTypeCount = 0;
+        LastReferenceClassicCompletionDisplayTriangleCount = 0;
+        LastReferenceClassicCompletionBoundaryComponentCount = 0;
+        LastReferenceClassicCompletionGroupCandidateCount = 0;
+        LastReferenceClassicCompletionGroupTrialCount = 0;
+        LastReferenceClassicCompletionGroupAcceptedCount = 0;
+        LastReferenceClassicCompletionGroupRejectedCount = 0;
+        LastReferenceClassicCompletionGroupSkippedSizeCount = 0;
+        LastReferenceClassicCompletionGroupBoundaryRemovedCount = 0;
+        LastReferenceClassicCompletionGroupHitEdgeCount = 0;
+        _referenceClassicBoundaryRows = null;
+        _referenceClassicCompletionTrialRows = new StringBuilder(4096);
+        _referenceClassicCompletionTrialRows.AppendLine(
+            "patch_index,voxels,mean_residual,before_triangles,after_triangles,triangle_delta,before_boundary,after_boundary,boundary_delta,before_nonmanifold,after_nonmanifold,before_duplicates,after_duplicates,hit_internal_unobserved_edges,hit_internal_supported_edges,invalid_mesh,boundary_unchanged,boundary_increased,nonmanifold_increased,duplicates_increased,triangle_growth_exceeded,accepted,reject_reasons");
+        ResetReferenceClassicCompletionGroupRows();
     }
 
     private bool ShouldKeepDisplayedMesh(int previousTriangleCount, List<Vector3> candidateVertices, int newTriangleCount)
@@ -3888,6 +5253,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             LastCaptureBatchMeshRebuildCount = 1;
         }
         UpdateRebaselineDiagnostics();
+        if (LastCaptureBatchComplete)
+            CompletedCaptureBatchCount++;
 
         if (debugLog)
         {
@@ -3909,6 +5276,36 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _activeCaptureBatchTimeouts = 0;
     }
 
+    private void IntegrateReferenceClassicSnapshot(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot,
+        Vector3[] positions,
+        Vector3[] normals,
+        Color[] meta,
+        int width,
+        int height)
+    {
+        if (!enableReferenceClassicTsdf)
+            return;
+
+        if (!_referenceClassicTsdf.IsCompatible(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters))
+            _referenceClassicTsdf.Reset(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters);
+
+        Vector3 captureCamera = snapshot.hasSnapshotCameraPose
+            ? snapshot.snapshotCameraPosition
+            : GetCameraPosition();
+        _referenceClassicTsdf.IntegrateFrame(
+            positions, normals, meta, width, height, Mathf.Max(1, sampleStridePixels), captureCamera,
+            minDepthMeters, maxDepthMeters, truncationMeters,
+            referenceClassicMaxVoxelWeight,
+            referenceClassicMinimumAngleWeight,
+            referenceClassicMinimumDistanceWeight);
+        LastReferenceClassicInputSampleCount = _referenceClassicTsdf.LastInputSamples;
+        LastReferenceClassicValidSampleCount = _referenceClassicTsdf.LastValidSamples;
+        LastReferenceClassicGrazingSampleCount = _referenceClassicTsdf.LastGrazingSamples;
+        LastReferenceClassicBandWriteCount = _referenceClassicTsdf.LastBandVoxelWrites;
+        LastReferenceClassicMeanObservationWeight = _referenceClassicTsdf.LastMeanObservationWeight;
+    }
+
     private bool IntegrateSnapshot(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
     {
         if (snapshot == null ||
@@ -3921,6 +5318,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         EnsureVolumeInitialized();
 
         Vector3 cameraPosition = GetCameraPosition();
+        _rawCoverageCaptureCameraPosition = snapshot.hasSnapshotCameraPose
+            ? snapshot.snapshotCameraPosition
+            : cameraPosition;
+        _rawCoverageCaptureCameraValid = true;
         double integrationRealtime = Time.realtimeSinceStartupAsDouble;
         float posePositionDelta = snapshot.hasSnapshotCameraPose
             ? Vector3.Distance(snapshot.snapshotCameraPosition, cameraPosition)
@@ -3939,6 +5340,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int width = snapshot.resolutionWidth;
         int height = snapshot.resolutionHeight;
         int expected = Mathf.Min(width * height, positions.Length);
+        IntegrateReferenceClassicSnapshot(snapshot, positions, normals, meta, width, height);
         BeginVoteHistoryFrame();
         int stride = Mathf.Max(1, sampleStridePixels);
         int halfBandSteps = Mathf.Max(1, Mathf.CeilToInt(truncationMeters / voxelSizeMeters));
@@ -3969,28 +5371,34 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (!TryGetUsableSampleOrNeighbor(x, y, width, height, positions, normals, meta, cameraPosition, out Vector3 point, out Vector3 normal, out float sampleWeight))
                 {
                     SetObservationVote(ObservationVoteState.Reject, 0f, "invalid_or_basic_filter");
-                    RecordRawCoverageGridSample(positions[index], RawDepthDebugKind.Rejected, false);
+                    RecordRawCoverageGridSample(positions[index], RawDepthDebugKind.Rejected, false, RawCoverageDecisionStage.BasicFilter);
                     CacheRawDepthDebugSample(positions[index], RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, rawPoint, 0f, 0, 0, 0f, 0f, 0, 0, "discard", "invalid_or_basic_filter", auditThisSample);
                     continue;
                 }
 
-                if (!PassDepthNeighborhoodConsistency(x, y, width, height, positions, cameraPosition, point, out int checkedDepthNeighbors, out int consistentDepthNeighbors))
+                _auditSampleNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+                Vector3 initialAuditViewDirection = (cameraPosition - point).normalized;
+                _auditSampleViewFacing = _auditSampleNormal.sqrMagnitude > 0.0001f
+                    ? Mathf.Abs(Vector3.Dot(_auditSampleNormal, initialAuditViewDirection))
+                    : -1f;
+
+                if (!PassDepthNeighborhoodConsistency(x, y, width, height, positions, normals, cameraPosition, point, normal, out int checkedDepthNeighbors, out int consistentDepthNeighbors))
                 {
                     SetObservationVote(ObservationVoteState.Reject, 0.05f, "depth_discontinuity");
                     LastRejectedDepthDiscontinuityCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.DepthEdge, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.DepthEdge, false, RawCoverageDecisionStage.DepthNeighborhood);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.DepthEdge);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, 0f, 0f, 0, 0, "discard", "depth_discontinuity", auditThisSample);
                     continue;
                 }
 
                 Vector3 pointBeforeRobust = point;
-                if (!ApplyRobustDepthPrefilter(x, y, width, height, positions, cameraPosition, ref point, ref sampleWeight))
+                if (!ApplyRobustDepthPrefilter(x, y, width, height, positions, normals, cameraPosition, normal, ref point, ref sampleWeight))
                 {
                     SetObservationVote(ObservationVoteState.Reject, 0.10f, "robust_depth_outlier");
                     LastRejectedRobustDepthCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Robust, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Robust, false, RawCoverageDecisionStage.RobustPrefilter);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Robust);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "robust_depth_outlier", auditThisSample);
                     continue;
@@ -4013,7 +5421,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 {
                     SetObservationVote(ObservationVoteState.Reject, 0.15f, "insufficient_depth_support");
                     LastRejectedTsdfDepthSupportCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Support, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Support, false, RawCoverageDecisionStage.TsdfSupport);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Support);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "insufficient_depth_support", auditThisSample);
                     continue;
@@ -4084,7 +5492,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     RecordShadowBlockObservation(cameraPosition, point, normal, sampleWeight, halfBandSteps, observationVote, false);
                     MarkRejectedObservationBand(cameraPosition, point, normal, halfBandSteps);
                     TryMetabolizeOldCleanTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps);
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false, RawCoverageDecisionStage.VoteReject);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "vote_reject", auditThisSample);
                     continue;
@@ -4099,7 +5507,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         LastVotePendingHoldCount++;
                         if (HasSameFrameEntryConflict())
                             LastSameFrameEntryHeldCount++;
-                        RecordRawCoverageGridSample(point, RawDepthDebugKind.Pending, false);
+                        RecordRawCoverageGridSample(point, RawDepthDebugKind.Pending, false, RawCoverageDecisionStage.PendingHold);
                         CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                         AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "hold", "vote_pending_hold", auditThisSample);
                         continue;
@@ -4171,7 +5579,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (!touchedDenseTsdf)
                 {
                     LastRejectedOutsideVolumeCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Outside, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Outside, false, RawCoverageDecisionStage.OutsideVolume);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Outside);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "discard", "outside_tsdf_volume", auditThisSample);
                     continue;
@@ -4186,7 +5594,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 {
                     LastBlockedDirtyLightCoverSampleCount++;
                     TotalBlockedDirtyLightCoverSampleCount++;
-                    RecordRawCoverageGridSample(point, RawDepthKindFromAuditOutcome(), false);
+                    RecordRawCoverageGridSample(point, RawDepthKindFromAuditOutcome(), false, RawCoverageDecisionStage.AuditOutcome);
                     CacheRawDepthDebugSample(point, RawDepthKindFromAuditOutcome());
                     string repairReason = LastReplacedDirtyTsdfCount > dirtyReplaceBeforeSample ? "dirty_replaced" :
                         (LastDirtyTsdfQuarantineCount > dirtyQuarantineBeforeSample ? "dirty_quarantined" : "dirty_neighbor_cleaned");
@@ -4199,7 +5607,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     string decision = _auditCenterOutcome == "pending_correction" || _auditCenterOutcome == "pending_stability"
                         ? "pending"
                         : (_auditCenterOutcome == "rejected_conflict" ? "discard" : "accept");
-                    RecordRawCoverageGridSample(point, outcomeKind, observationVote == ObservationVoteState.Accept);
+                    RecordRawCoverageGridSample(point, outcomeKind, observationVote == ObservationVoteState.Accept, RawCoverageDecisionStage.Integrated);
                     CacheRawDepthDebugSample(point, outcomeKind);
                     string reason = _auditCenterOutcome;
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, decision, reason, auditThisSample);
@@ -4207,7 +5615,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 else
                 {
                     LastRejectedFallbackWeakCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false);
+                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false, RawCoverageDecisionStage.FallbackWeak);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "discard", "fallback_weight_weak", auditThisSample);
                 }
@@ -4334,6 +5742,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             string quadHeldEvidencePath = Path.Combine(directory, stem + "_quad_shadow_held_evidence.csv");
             string newbornPholdCompetitionPath = Path.Combine(directory, stem + "_newborn_phold_competition.csv");
             string newbornPholdProbationPath = Path.Combine(directory, stem + "_newborn_phold_probation.csv");
+            string spatialRupturePath = Path.Combine(directory, stem + "_spatial_ruptures.csv");
+            string referenceClassicBoundaryPath = Path.Combine(directory, stem + "_reference_classic_boundaries.csv");
+            string referenceClassicCompletionTrialPath = Path.Combine(directory, stem + "_reference_classic_completion_trials.csv");
+            string referenceClassicCompletionGroupPath = Path.Combine(directory, stem + "_reference_classic_completion_groups.csv");
+            string creaseRepairPath = Path.Combine(directory, stem + "_crease_repairs.csv");
             string summaryPath = Path.Combine(directory, stem + "_summary.txt");
 
             StringBuilder holes = BuildHoleProfileCsv();
@@ -4349,6 +5762,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             File.WriteAllText(quadHeldEvidencePath, BuildStableQuadHeldEvidenceCsv().ToString(), new UTF8Encoding(false));
             File.WriteAllText(newbornPholdCompetitionPath, BuildNewbornPholdCompetitionCsv().ToString(), new UTF8Encoding(false));
             File.WriteAllText(newbornPholdProbationPath, BuildNewbornPholdProbationCsv().ToString(), new UTF8Encoding(false));
+            if (writeSpatialRuptureDiagnostics)
+                File.WriteAllText(spatialRupturePath, BuildSpatialRuptureCsv().ToString(), new UTF8Encoding(false));
+            if (enableReferenceClassicTsdf)
+            {
+                File.WriteAllText(referenceClassicBoundaryPath,
+                    _referenceClassicBoundaryRows != null ? _referenceClassicBoundaryRows.ToString() : string.Empty,
+                    new UTF8Encoding(false));
+                File.WriteAllText(referenceClassicCompletionTrialPath,
+                    _referenceClassicCompletionTrialRows != null ? _referenceClassicCompletionTrialRows.ToString() : string.Empty,
+                    new UTF8Encoding(false));
+                File.WriteAllText(referenceClassicCompletionGroupPath,
+                    _referenceClassicCompletionGroupRows != null ? _referenceClassicCompletionGroupRows.ToString() : string.Empty,
+                    new UTF8Encoding(false));
+            }
+            File.WriteAllText(creaseRepairPath, BuildCreaseRepairCsv().ToString(), new UTF8Encoding(false));
 
             StringBuilder summary = new StringBuilder(512);
             summary.AppendLine("ScanCover TSDF surface profile");
@@ -4376,6 +5804,225 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("stable_quad_audit_added=" + LastStableQuadAuditAddedCount);
             summary.AppendLine("stable_quad_audit_removed=" + LastStableQuadAuditRemovedCount);
             summary.AppendLine("stable_quad_audit_winding_changed=" + LastStableQuadAuditWindingChangedCount);
+            summary.AppendLine("spatial_rupture_enabled=" + (writeSpatialRuptureDiagnostics ? 1 : 0));
+            summary.AppendLine("spatial_rupture_boundary_edges=" + LastSpatialRuptureBoundaryEdgeCount);
+            summary.AppendLine("spatial_rupture_raw_gap=" + LastSpatialRuptureRawGapCount);
+            summary.AppendLine("spatial_rupture_depth_edge=" + LastSpatialRuptureDepthEdgeCount);
+            summary.AppendLine("spatial_rupture_robust=" + LastSpatialRuptureRobustCount);
+            summary.AppendLine("spatial_rupture_support=" + LastSpatialRuptureSupportCount);
+            summary.AppendLine("spatial_rupture_view_conflict=" + LastSpatialRuptureViewConflictCount);
+            summary.AppendLine("spatial_rupture_other_raw=" + LastSpatialRuptureOtherRawCount);
+            summary.AppendLine("spatial_rupture_tsdf_state=" + LastSpatialRuptureTsdfStateCount);
+            summary.AppendLine("spatial_rupture_plane_reject=" + LastSpatialRupturePlaneRejectCount);
+            summary.AppendLine("spatial_rupture_arbitration=" + LastSpatialRuptureArbitrationCount);
+            summary.AppendLine("spatial_rupture_reconcile_delta=" +
+                (LastSpatialRuptureBoundaryEdgeCount - LastSpatialRuptureRawGapCount -
+                 LastSpatialRuptureDepthEdgeCount - LastSpatialRuptureRobustCount -
+                 LastSpatialRuptureSupportCount - LastSpatialRuptureViewConflictCount -
+                 LastSpatialRuptureOtherRawCount - LastSpatialRuptureTsdfStateCount -
+                 LastSpatialRupturePlaneRejectCount - LastSpatialRuptureArbitrationCount));
+            summary.AppendLine("spatial_rupture_coverage_cells=" + LastRawCoverageGridCellCount);
+            summary.AppendLine("spatial_rupture_coverage_dropped_samples=" + LastRawCoverageGridDroppedSampleCount);
+            summary.AppendLine("spatial_angle_known_samples=" + LastRawCoverageAngleKnownSampleCount);
+            summary.AppendLine("spatial_angle_front_samples=" + LastRawCoverageFrontSampleCount);
+            summary.AppendLine("spatial_angle_front_accepted=" + LastRawCoverageFrontAcceptedCount);
+            summary.AppendLine("spatial_angle_oblique_samples=" + LastRawCoverageObliqueSampleCount);
+            summary.AppendLine("spatial_angle_oblique_accepted=" + LastRawCoverageObliqueAcceptedCount);
+            summary.AppendLine("spatial_angle_grazing_samples=" + LastRawCoverageGrazingSampleCount);
+            summary.AppendLine("spatial_angle_grazing_accepted=" + LastRawCoverageGrazingAcceptedCount);
+            summary.AppendLine("spatial_angle_extreme_samples=" + LastRawCoverageExtremeSampleCount);
+            summary.AppendLine("spatial_angle_extreme_accepted=" + LastRawCoverageExtremeAcceptedCount);
+            summary.AppendLine("grazing_plane_adaptive_enabled=" + (enableGrazingPlaneAdaptiveDepthFilter ? 1 : 0));
+            summary.AppendLine("grazing_plane_checked=" + LastGrazingPlaneCheckedSampleCount);
+            summary.AppendLine("grazing_plane_supported=" + LastGrazingPlaneSupportedSampleCount);
+            summary.AppendLine("grazing_plane_depth_neighbors_rescued=" + LastGrazingPlaneDepthNeighborRescueCount);
+            summary.AppendLine("grazing_plane_edge_exemptions=" + LastGrazingPlaneEdgeExemptionCount);
+            summary.AppendLine("grazing_plane_median_corrections_skipped=" + LastGrazingPlaneMedianCorrectionSkippedCount);
+            summary.AppendLine("raw_reject_basic_filter=" + LastRawCoverageBasicFilterCount);
+            summary.AppendLine("raw_reject_depth_neighborhood=" + LastRawCoverageDepthEdgeStageCount);
+            summary.AppendLine("raw_reject_robust_prefilter=" + LastRawCoverageRobustStageCount);
+            summary.AppendLine("raw_reject_tsdf_support=" + LastRawCoverageSupportStageCount);
+            summary.AppendLine("raw_reject_vote_reject=" + LastRawCoverageVoteRejectCount);
+            summary.AppendLine("raw_reject_pending_hold=" + LastRawCoveragePendingHoldCount);
+            summary.AppendLine("raw_reject_outside_volume=" + LastRawCoverageOutsideVolumeStageCount);
+            summary.AppendLine("raw_reject_audit_outcome=" + LastRawCoverageAuditOutcomeStageCount);
+            summary.AppendLine("raw_reject_fallback_weak=" + LastRawCoverageFallbackWeakStageCount);
+            summary.AppendLine("rescued_grazing_final=" + LastRescuedGrazingFinalCount);
+            summary.AppendLine("rescued_grazing_accepted=" + LastRescuedGrazingAcceptedCount);
+            summary.AppendLine("rescued_grazing_pending=" + LastRescuedGrazingPendingCount);
+            summary.AppendLine("rescued_grazing_vote_reject=" + LastRescuedGrazingVoteRejectCount);
+            summary.AppendLine("rescued_grazing_other=" + LastRescuedGrazingOtherCount);
+            summary.AppendLine("rescued_grazing_depth_neighborhood=" + LastRescuedGrazingDepthEdgeCount);
+            summary.AppendLine("rescued_grazing_robust_prefilter=" + LastRescuedGrazingRobustCount);
+            summary.AppendLine("rescued_grazing_tsdf_support=" + LastRescuedGrazingSupportCount);
+            summary.AppendLine("rescued_grazing_outside_volume=" + LastRescuedGrazingOutsideVolumeCount);
+            summary.AppendLine("rescued_grazing_audit_outcome=" + LastRescuedGrazingAuditOutcomeCount);
+            summary.AppendLine("rescued_grazing_fallback_weak=" + LastRescuedGrazingFallbackWeakCount);
+            summary.AppendLine("rescued_grazing_reconcile_delta=" +
+                (LastRescuedGrazingFinalCount - LastRescuedGrazingAcceptedCount -
+                 LastRescuedGrazingPendingCount - LastRescuedGrazingVoteRejectCount -
+                 LastRescuedGrazingDepthEdgeCount - LastRescuedGrazingRobustCount -
+                 LastRescuedGrazingSupportCount - LastRescuedGrazingOutsideVolumeCount -
+                 LastRescuedGrazingAuditOutcomeCount - LastRescuedGrazingFallbackWeakCount -
+                 LastRescuedGrazingOtherCount));
+            summary.AppendLine("rescued_vote_reason_multilabel=1");
+            summary.AppendLine("rescued_vote_weak_support=" + LastRescuedVoteWeakSupportCount);
+            summary.AppendLine("rescued_vote_depth_shift=" + LastRescuedVoteDepthShiftCount);
+            summary.AppendLine("rescued_vote_grazing_view=" + LastRescuedVoteGrazingViewCount);
+            summary.AppendLine("rescued_vote_low_weight=" + LastRescuedVoteLowWeightCount);
+            summary.AppendLine("rescued_vote_temporal_jump=" + LastRescuedVoteTemporalJumpCount);
+            summary.AppendLine("rescued_vote_off_history=" + LastRescuedVoteOffHistoryCount);
+            summary.AppendLine("rescued_vote_old_tsdf=" + LastRescuedVoteOldTsdfCount);
+            summary.AppendLine("rescued_vote_weak_history=" + LastRescuedVoteWeakHistoryCount);
+            summary.AppendLine("rescued_vote_band_conflict=" + LastRescuedVoteBandConflictCount);
+            summary.AppendLine("rescued_vote_band_residual=" + LastRescuedVoteBandResidualCount);
+            summary.AppendLine("rescued_vote_same_frame_conflict=" + LastRescuedVoteSameFrameConflictCount);
+            summary.AppendLine("rescued_vote_same_frame_same_plane_grazing=" + LastRescuedVoteSameFrameSamePlaneGrazingCount);
+            summary.AppendLine("rescued_vote_same_frame_cross_plane=" + LastRescuedVoteSameFrameCrossPlaneCount);
+            summary.AppendLine("rescued_vote_same_frame_unknown_plane=" + LastRescuedVoteSameFrameUnknownPlaneCount);
+            summary.AppendLine("rescued_vote_same_frame_reconcile_delta=" +
+                (LastRescuedVoteSameFrameConflictCount - LastRescuedVoteSameFrameSamePlaneGrazingCount -
+                 LastRescuedVoteSameFrameCrossPlaneCount - LastRescuedVoteSameFrameUnknownPlaneCount));
+            summary.AppendLine("grazing_same_plane_frame_exemption_enabled=" + (enableGrazingSamePlaneFrameExemption ? 1 : 0));
+            summary.AppendLine("grazing_same_plane_frame_checked_candidates=" + LastGrazingSamePlaneFrameCheckedCandidateCount);
+            summary.AppendLine("grazing_same_plane_frame_exempted_candidates=" + LastGrazingSamePlaneFrameExemptedCandidateCount);
+            summary.AppendLine("grazing_same_plane_frame_exempted_samples=" + LastGrazingSamePlaneFrameExemptedSampleCount);
+            summary.AppendLine("grazing_same_plane_frame_conflict_cleared_samples=" + LastGrazingSamePlaneFrameConflictClearedSampleCount);
+            summary.AppendLine("grazing_same_plane_frame_max_residual_m=" + AuditFloat(maxGrazingSamePlaneFrameResidualMeters));
+            summary.AppendLine("grazing_same_plane_frame_min_candidate_support_ratio=" + AuditFloat(minGrazingSamePlaneFrameCandidateSupportRatio));
+            summary.AppendLine("rescued_vote_cross_frame_conflict=" + LastRescuedVoteCrossFrameConflictCount);
+            summary.AppendLine("spatial_rupture_csv=" + (writeSpatialRuptureDiagnostics ? spatialRupturePath : "off"));
+            summary.AppendLine("double_plane_crease_enabled=" + (repairPersistentDoublePlaneCreases ? 1 : 0));
+            summary.AppendLine("double_plane_crease_confirm_rebuilds=" + Mathf.Clamp(doublePlaneCreaseConfirmRebuilds, 2, 4));
+            summary.AppendLine("double_plane_crease_retain_missing_rebuilds=" + Mathf.Clamp(doublePlaneCreaseRetainMissingRebuilds, 1, 4));
+            summary.AppendLine("double_plane_crease_candidates=" + LastDoublePlaneCreaseCandidateCount);
+            summary.AppendLine("double_plane_crease_pending=" + LastDoublePlaneCreasePendingCount);
+            summary.AppendLine("double_plane_crease_applied=" + LastDoublePlaneCreaseAppliedCount);
+            summary.AppendLine("double_plane_crease_reapplied=" + LastDoublePlaneCreaseReappliedCount);
+            summary.AppendLine("double_plane_crease_committed_live=" + LastDoublePlaneCreaseCommittedLiveCount);
+            summary.AppendLine("double_plane_crease_retired=" + LastDoublePlaneCreaseRetiredCount);
+            summary.AppendLine("double_plane_crease_rejected_geometry=" + LastDoublePlaneCreaseRejectedGeometryCount);
+            summary.AppendLine("double_plane_crease_rejected_evidence=" + LastDoublePlaneCreaseRejectedEvidenceCount);
+            summary.AppendLine("double_plane_crease_added_triangles=" + LastDoublePlaneCreaseAddedTriangleCount);
+            summary.AppendLine("double_plane_crease_boundary_before=" + LastDoublePlaneCreaseBoundaryEdgesBefore);
+            summary.AppendLine("double_plane_crease_boundary_after=" + LastDoublePlaneCreaseBoundaryEdgesAfter);
+            summary.AppendLine("post_repair_boundary_edges=" + LastPostRepairBoundaryEdgeCount);
+            summary.AppendLine("post_repair_nonmanifold_edges=" + LastPostRepairNonManifoldEdgeCount);
+            summary.AppendLine("reference_volumetric_enabled=" + (enableReferenceVolumetricShadow ? 1 : 0));
+            summary.AppendLine("reference_volumetric_algorithm=fixed_six_tetra_full_volume_tsdf_iso_surface");
+            summary.AppendLine("reference_volumetric_read_only=1");
+            summary.AppendLine("reference_volumetric_min_weight=" + Mathf.Max(1, referenceVolumetricMinWeight));
+            summary.AppendLine("reference_volumetric_vertices=" + LastReferenceVolumetricVertexCount);
+            summary.AppendLine("reference_volumetric_triangles=" + LastReferenceVolumetricTriangleCount);
+            summary.AppendLine("reference_volumetric_boundary_edges=" + LastReferenceVolumetricBoundaryEdgeCount);
+            summary.AppendLine("reference_volumetric_nonmanifold_edges=" + LastReferenceVolumetricNonManifoldEdgeCount);
+            summary.AppendLine("reference_volumetric_duplicate_triangles=" + LastReferenceVolumetricDuplicateTriangleCount);
+            summary.AppendLine("reference_volumetric_scanned_cells=" + LastReferenceVolumetricScannedCellCount);
+            summary.AppendLine("reference_volumetric_supported_tetrahedra=" + LastReferenceVolumetricSupportedTetrahedronCount);
+            summary.AppendLine("reference_volumetric_matched_legacy_vertices=" + LastReferenceVolumetricMatchedLegacyVertexCount);
+            summary.AppendLine("reference_volumetric_unmatched_legacy_vertices=" + LastReferenceVolumetricUnmatchedLegacyVertexCount);
+            summary.AppendLine("reference_volumetric_mean_legacy_distance_m=" + AuditFloat(LastReferenceVolumetricMeanLegacyDistanceMeters));
+            summary.AppendLine("reference_volumetric_over_voxel_distance=" + LastReferenceVolumetricOverVoxelDistanceCount);
+            summary.AppendLine("reference_volumetric_build_ms=" + AuditFloat(LastReferenceVolumetricBuildMilliseconds));
+            summary.AppendLine("reference_volumetric_truncated=" + (LastReferenceVolumetricTruncated ? 1 : 0));
+            summary.AppendLine("reference_volumetric_boundary_delta_vs_legacy=" +
+                               (LastReferenceVolumetricBoundaryEdgeCount - LastPostRepairBoundaryEdgeCount));
+            summary.AppendLine("reference_classic_enabled=" + (enableReferenceClassicTsdf ? 1 : 0));
+            summary.AppendLine("reference_classic_algorithm=independent_raw_depth_weighted_tsdf_fixed_six_tetra_iso_surface");
+            summary.AppendLine("reference_classic_meta_depth_source=1");
+            summary.AppendLine("reference_classic_production_tsdf_read_write=0");
+            summary.AppendLine("reference_classic_mesher_min_weight=" + AuditFloat(referenceClassicMesherMinWeight));
+            summary.AppendLine("reference_classic_input_samples_last_frame=" + LastReferenceClassicInputSampleCount);
+            summary.AppendLine("reference_classic_valid_samples_last_frame=" + LastReferenceClassicValidSampleCount);
+            summary.AppendLine("reference_classic_grazing_samples_last_frame=" + LastReferenceClassicGrazingSampleCount);
+            summary.AppendLine("reference_classic_band_writes_last_frame=" + LastReferenceClassicBandWriteCount);
+            summary.AppendLine("reference_classic_mean_observation_weight_last_frame=" + AuditFloat(LastReferenceClassicMeanObservationWeight));
+            summary.AppendLine("reference_classic_weighted_voxels=" + LastReferenceClassicWeightedVoxelCount);
+            summary.AppendLine("reference_classic_positive_voxels=" + LastReferenceClassicPositiveVoxelCount);
+            summary.AppendLine("reference_classic_negative_voxels=" + LastReferenceClassicNegativeVoxelCount);
+            summary.AppendLine("reference_classic_vertices=" + LastReferenceClassicVertexCount);
+            summary.AppendLine("reference_classic_triangles=" + LastReferenceClassicTriangleCount);
+            summary.AppendLine("reference_classic_boundary_edges=" + LastReferenceClassicBoundaryEdgeCount);
+            summary.AppendLine("reference_classic_nonmanifold_edges=" + LastReferenceClassicNonManifoldEdgeCount);
+            summary.AppendLine("reference_classic_duplicate_triangles=" + LastReferenceClassicDuplicateTriangleCount);
+            summary.AppendLine("reference_classic_unmatched_legacy_vertices=" + LastReferenceClassicUnmatchedLegacyVertexCount);
+            summary.AppendLine("reference_classic_mean_legacy_distance_m=" + AuditFloat(LastReferenceClassicMeanLegacyDistanceMeters));
+            summary.AppendLine("reference_classic_build_ms=" + AuditFloat(LastReferenceClassicBuildMilliseconds));
+            summary.AppendLine("reference_classic_truncated=" + (LastReferenceClassicTruncated ? 1 : 0));
+            summary.AppendLine("reference_classic_weld_tolerance_voxel_ratio=0.0025");
+            summary.AppendLine("reference_classic_welded_vertices=" + LastReferenceClassicWeldedVertexCount);
+            summary.AppendLine("reference_classic_weld_removed_degenerate_triangles=" + LastReferenceClassicWeldRemovedDegenerateTriangleCount);
+            summary.AppendLine("reference_classic_weld_removed_duplicate_triangles=" + LastReferenceClassicWeldRemovedDuplicateTriangleCount);
+            summary.AppendLine("reference_classic_completion_enabled=" + (enableReferenceClassicGapCompletion ? 1 : 0));
+            summary.AppendLine("reference_classic_completion_read_only_shadow=1");
+            summary.AppendLine("reference_classic_completion_mode=six_connected_plane_homogeneous_atomic_patch_full_mesh_trial");
+            summary.AppendLine("reference_classic_completion_radius_voxels=" + referenceClassicCompletionRadiusVoxels);
+            summary.AppendLine("reference_classic_completion_min_samples=" + referenceClassicCompletionMinSamples);
+            summary.AppendLine("reference_classic_completion_max_residual=" + AuditFloat(referenceClassicCompletionMaxResidual));
+            summary.AppendLine("reference_classic_completion_patch_min_normal_dot=" + AuditFloat(referenceClassicCompletionMinPatchNormalDot));
+            summary.AppendLine("reference_classic_completion_patch_max_plane_distance_voxels=" + AuditFloat(referenceClassicCompletionMaxPatchPlaneDistanceVoxelScale));
+            summary.AppendLine("reference_classic_completion_candidates=" + LastReferenceClassicCompletionCandidateVoxelCount);
+            summary.AppendLine("reference_classic_completion_filled=" + LastReferenceClassicCompletionFilledVoxelCount);
+            summary.AppendLine("reference_classic_completion_block_samples=" + LastReferenceClassicCompletionBlockedSampleCount);
+            summary.AppendLine("reference_classic_completion_block_sign=" + LastReferenceClassicCompletionBlockedSignCount);
+            summary.AppendLine("reference_classic_completion_block_fit=" + LastReferenceClassicCompletionBlockedFitCount);
+            summary.AppendLine("reference_classic_completion_block_residual=" + LastReferenceClassicCompletionBlockedResidualCount);
+            summary.AppendLine("reference_classic_completion_block_prediction=" + LastReferenceClassicCompletionBlockedPredictionCount);
+            summary.AppendLine("reference_classic_completion_mean_residual=" + AuditFloat(LastReferenceClassicCompletionMeanResidual));
+            summary.AppendLine("reference_classic_completion_triangles=" + LastReferenceClassicCompletionTriangleCount);
+            summary.AppendLine("reference_classic_completion_boundary_edges=" + LastReferenceClassicCompletionBoundaryEdgeCount);
+            summary.AppendLine("reference_classic_completion_nonmanifold_edges=" + LastReferenceClassicCompletionNonManifoldEdgeCount);
+            summary.AppendLine("reference_classic_completion_accepted=" + (LastReferenceClassicCompletionAccepted ? 1 : 0));
+            summary.AppendLine("reference_classic_completion_patches=" + LastReferenceClassicCompletionPatchCount);
+            summary.AppendLine("reference_classic_completion_patch_trials=" + LastReferenceClassicCompletionPatchTrialCount);
+            summary.AppendLine("reference_classic_completion_patch_accepted=" + LastReferenceClassicCompletionPatchAcceptedCount);
+            summary.AppendLine("reference_classic_completion_patch_rejected=" + LastReferenceClassicCompletionPatchRejectedCount);
+            summary.AppendLine("reference_classic_completion_patch_skipped_size=" + LastReferenceClassicCompletionPatchSkippedSizeCount);
+            summary.AppendLine("reference_classic_completion_patch_invalid_plane_candidates=" + LastReferenceClassicCompletionInvalidPlaneCandidateCount);
+            summary.AppendLine("reference_classic_completion_patch_adjacency_checks=" + LastReferenceClassicCompletionPatchAdjacencyCheckCount);
+            summary.AppendLine("reference_classic_completion_patch_normal_rejected=" + LastReferenceClassicCompletionPatchNormalRejectedCount);
+            summary.AppendLine("reference_classic_completion_patch_distance_rejected=" + LastReferenceClassicCompletionPatchDistanceRejectedCount);
+            summary.AppendLine("reference_classic_completion_patch_joined=" + LastReferenceClassicCompletionPatchJoinedCount);
+            summary.AppendLine("reference_classic_completion_trial_boundary_unchanged=" + LastReferenceClassicCompletionTrialBoundaryUnchangedCount);
+            summary.AppendLine("reference_classic_completion_trial_boundary_increased=" + LastReferenceClassicCompletionTrialBoundaryIncreasedCount);
+            summary.AppendLine("reference_classic_completion_trial_nonmanifold_increased=" + LastReferenceClassicCompletionTrialNonManifoldIncreasedCount);
+            summary.AppendLine("reference_classic_completion_trial_duplicates_increased=" + LastReferenceClassicCompletionTrialDuplicateIncreasedCount);
+            summary.AppendLine("reference_classic_completion_trial_triangle_growth_exceeded=" + LastReferenceClassicCompletionTrialTriangleGrowthExceededCount);
+            summary.AppendLine("reference_classic_completion_trial_invalid_mesh=" + LastReferenceClassicCompletionTrialInvalidMeshCount);
+            summary.AppendLine("reference_classic_completion_trial_hit_internal_unobserved=" + LastReferenceClassicCompletionTrialHitInternalUnobservedCount);
+            summary.AppendLine("reference_classic_completion_trial_hit_internal_supported=" + LastReferenceClassicCompletionTrialHitInternalSupportedCount);
+            summary.AppendLine("reference_classic_completion_trial_hit_both_internal_types=" + LastReferenceClassicCompletionTrialHitBothInternalTypesCount);
+            summary.AppendLine("reference_classic_completion_trial_hit_neither_internal_type=" + LastReferenceClassicCompletionTrialHitNeitherInternalTypeCount);
+            summary.AppendLine("reference_classic_completion_trial_hit_distance_voxels=1.75");
+            summary.AppendLine("reference_classic_completion_trial_csv=" + referenceClassicCompletionTrialPath);
+            summary.AppendLine("reference_classic_completion_display_mode=accepted_triangle_delta_only");
+            summary.AppendLine("reference_classic_completion_display_triangles=" + LastReferenceClassicCompletionDisplayTriangleCount);
+            summary.AppendLine("reference_classic_completion_internal_boundary_components=" + LastReferenceClassicCompletionBoundaryComponentCount);
+            summary.AppendLine("reference_classic_completion_group_trials_enabled=" + (enableReferenceClassicCompletionGroupTrials ? 1 : 0));
+            summary.AppendLine("reference_classic_completion_group_mode=same_internal_boundary_component_plus_plane_compatible_atomic_shadow");
+            summary.AppendLine("reference_classic_completion_group_candidates=" + LastReferenceClassicCompletionGroupCandidateCount);
+            summary.AppendLine("reference_classic_completion_group_trials=" + LastReferenceClassicCompletionGroupTrialCount);
+            summary.AppendLine("reference_classic_completion_group_accepted=" + LastReferenceClassicCompletionGroupAcceptedCount);
+            summary.AppendLine("reference_classic_completion_group_rejected=" + LastReferenceClassicCompletionGroupRejectedCount);
+            summary.AppendLine("reference_classic_completion_group_skipped_size=" + LastReferenceClassicCompletionGroupSkippedSizeCount);
+            summary.AppendLine("reference_classic_completion_group_boundary_removed=" + LastReferenceClassicCompletionGroupBoundaryRemovedCount);
+            summary.AppendLine("reference_classic_completion_group_hit_internal_edges=" + LastReferenceClassicCompletionGroupHitEdgeCount);
+            summary.AppendLine("reference_classic_completion_group_csv=" + referenceClassicCompletionGroupPath);
+            summary.AppendLine("reference_classic_completion_boundary_edges_removed=" + LastReferenceClassicCompletionBoundaryEdgesRemoved);
+            summary.AppendLine("reference_classic_boundary_delta_vs_legacy=" +
+                               (LastReferenceClassicBoundaryEdgeCount - LastPostRepairBoundaryEdgeCount));
+            summary.AppendLine("reference_classic_boundary_volume_limit=" + LastReferenceClassicBoundaryVolumeLimitCount);
+            summary.AppendLine("reference_classic_boundary_diagnostic_source=" +
+                               (LastReferenceClassicCompletionAccepted ? "accepted_completion_shadow" : "measured_classic"));
+            summary.AppendLine("reference_classic_boundary_observed_envelope=" + LastReferenceClassicBoundaryEnvelopeCount);
+            summary.AppendLine("reference_classic_boundary_internal=" + LastReferenceClassicBoundaryInternalCount);
+            summary.AppendLine("reference_classic_boundary_internal_unobserved=" + LastReferenceClassicBoundaryInternalUnobservedCount);
+            summary.AppendLine("reference_classic_boundary_internal_low_weight=" + LastReferenceClassicBoundaryInternalLowWeightCount);
+            summary.AppendLine("reference_classic_boundary_internal_supported_open=" + LastReferenceClassicBoundaryInternalSupportedCount);
+            summary.AppendLine("reference_classic_boundary_total_length_m=" + AuditFloat(LastReferenceClassicBoundaryTotalLengthMeters));
+            summary.AppendLine("reference_classic_boundary_internal_length_m=" + AuditFloat(LastReferenceClassicBoundaryInternalLengthMeters));
+            summary.AppendLine("reference_classic_boundary_csv=" + referenceClassicBoundaryPath);
+            summary.AppendLine("double_plane_crease_csv=" + creaseRepairPath);
             summary.AppendLine("stable_quad_shadow_compare_only=1");
             summary.AppendLine("stable_quad_shadow_promote_rebuilds=" + Mathf.Clamp(stableQuadShadowPromoteRebuilds, 2, 6));
             summary.AppendLine("stable_quad_shadow_retain_missing_rebuilds=" + Mathf.Clamp(stableQuadShadowRetainMissingRebuilds, 1, 6));
@@ -4435,6 +6082,54 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                  LastNewbornArbitrationBlockedLayerCount -
                  LastNewbornArbitrationBlockedTopologyCount -
                  LastNewbornArbitrationBlockedWindingCount));
+            summary.AppendLine("newborn_layer_swap_enabled=" + (repairBoundaryWorseningNewbornLayerBlocks ? 1 : 0));
+            summary.AppendLine("newborn_layer_swap_confirm_rebuilds=" + Mathf.Clamp(newbornLayerSwapConfirmRebuilds, 2, 4));
+            summary.AppendLine("newborn_layer_swap_checked=" + LastNewbornLayerSwapCheckedCount);
+            summary.AppendLine("newborn_layer_swap_eligible=" + LastNewbornLayerSwapEligibleCount);
+            summary.AppendLine("newborn_layer_swap_pending=" + LastNewbornLayerSwapPendingCount);
+            summary.AppendLine("newborn_layer_swap_applied=" + LastNewbornLayerSwapAppliedCount);
+            summary.AppendLine("newborn_layer_swap_removed=" + LastNewbornLayerSwapRemovedCount);
+            summary.AppendLine("newborn_layer_swap_blocked_mature=" + LastNewbornLayerSwapBlockedMatureCount);
+            summary.AppendLine("newborn_layer_swap_blocked_evidence=" + LastNewbornLayerSwapBlockedEvidenceCount);
+            summary.AppendLine("newborn_layer_swap_blocked_boundary=" + LastNewbornLayerSwapBlockedBoundaryCount);
+            summary.AppendLine("newborn_layer_swap_boundary_improving=" + LastNewbornLayerSwapBoundaryImprovingCount);
+            summary.AppendLine("newborn_layer_swap_group_evidence_accepted=" + LastNewbornLayerSwapGroupEvidenceAcceptedCount);
+            summary.AppendLine("newborn_layer_swap_rollback=" + LastNewbornLayerSwapRollbackCount);
+            summary.AppendLine("same_plane_layer_evidence_enabled=" + (useGrazingSamePlaneEvidenceForLayerArbitration ? 1 : 0));
+            summary.AppendLine("same_plane_layer_evidence_checked=" + LastSamePlaneLayerEvidenceCheckedCount);
+            summary.AppendLine("same_plane_layer_evidence_matched=" + LastSamePlaneLayerEvidenceMatchedCount);
+            summary.AppendLine("same_plane_layer_evidence_blocked_support=" + LastSamePlaneLayerEvidenceBlockedSupportCount);
+            summary.AppendLine("same_plane_layer_evidence_blocked_normal=" + LastSamePlaneLayerEvidenceBlockedNormalCount);
+            summary.AppendLine("same_plane_layer_evidence_blocked_residual=" + LastSamePlaneLayerEvidenceBlockedResidualCount);
+            summary.AppendLine("same_plane_layer_evidence_provisional_allowed=" + LastSamePlaneLayerEvidenceProvisionalAllowedCount);
+            summary.AppendLine("same_plane_layer_evidence_score_override=" + LastSamePlaneLayerEvidenceScoreOverrideCount);
+            summary.AppendLine("same_plane_layer_evidence_pending=" + LastSamePlaneLayerEvidencePendingCount);
+            summary.AppendLine("same_plane_layer_evidence_applied=" + LastSamePlaneLayerEvidenceAppliedCount);
+            summary.AppendLine("same_plane_layer_evidence_lookup_radius_cells=" + Mathf.Clamp(grazingSamePlaneLayerEvidenceLookupRadiusCells, 0, 2));
+            summary.AppendLine("same_plane_layer_evidence_min_samples=" + Mathf.Clamp(minGrazingSamePlaneLayerEvidenceSamples, 1, 32));
+            summary.AppendLine("same_plane_layer_evidence_min_normal_dot=" + AuditFloat(minGrazingSamePlaneLayerEvidenceNormalDot));
+            summary.AppendLine("same_plane_layer_evidence_max_residual_m=" + AuditFloat(maxGrazingSamePlaneLayerEvidenceResidualMeters));
+            summary.AppendLine("same_plane_atomic_patch_groups=" + LastSamePlaneAtomicPatchGroupCount);
+            summary.AppendLine("same_plane_atomic_patch_candidate_quads=" + LastSamePlaneAtomicPatchCandidateQuadCount);
+            summary.AppendLine("same_plane_atomic_patch_boundary_improving=" + LastSamePlaneAtomicPatchBoundaryImprovingCount);
+            summary.AppendLine("same_plane_atomic_patch_blocked_boundary=" + LastSamePlaneAtomicPatchBlockedBoundaryCount);
+            summary.AppendLine("same_plane_atomic_patch_blocked_mature=" + LastSamePlaneAtomicPatchBlockedMatureCount);
+            summary.AppendLine("same_plane_atomic_patch_shadow_mature_blockers=" + LastSamePlaneAtomicPatchShadowMatureCount);
+            summary.AppendLine("same_plane_atomic_patch_shadow_pending=" + LastSamePlaneAtomicPatchShadowPendingCount);
+            summary.AppendLine("same_plane_atomic_patch_shadow_confirmed=" + LastSamePlaneAtomicPatchShadowConfirmedCount);
+            summary.AppendLine("same_plane_atomic_patch_blocked_evidence=" + LastSamePlaneAtomicPatchBlockedEvidenceCount);
+            summary.AppendLine("same_plane_atomic_patch_blocked_topology=" + LastSamePlaneAtomicPatchBlockedTopologyCount);
+            summary.AppendLine("same_plane_atomic_patch_pending=" + LastSamePlaneAtomicPatchPendingCount);
+            summary.AppendLine("same_plane_atomic_patch_applied=" + LastSamePlaneAtomicPatchAppliedCount);
+            summary.AppendLine("same_plane_atomic_patch_applied_quads=" + LastSamePlaneAtomicPatchAppliedQuadCount);
+            summary.AppendLine("same_plane_atomic_patch_removed_blockers=" + LastSamePlaneAtomicPatchRemovedBlockerCount);
+            summary.AppendLine("same_plane_atomic_patch_rollback=" + LastSamePlaneAtomicPatchRollbackCount);
+            summary.AppendLine("same_plane_atomic_patch_reconcile_delta=" +
+                (LastSamePlaneAtomicPatchGroupCount - LastSamePlaneAtomicPatchBlockedBoundaryCount -
+                 LastSamePlaneAtomicPatchBlockedMatureCount - LastSamePlaneAtomicPatchBlockedEvidenceCount -
+                 LastSamePlaneAtomicPatchBlockedTopologyCount - LastSamePlaneAtomicPatchPendingCount -
+                 LastSamePlaneAtomicPatchAppliedCount - LastSamePlaneAtomicPatchRollbackCount));
+            summary.AppendLine("same_plane_atomic_patch_max_quads=" + Mathf.Clamp(maxGrazingSamePlaneAtomicPatchQuads, 2, 256));
             summary.AppendLine("provisional_held_retention_enabled=" + (retainMatureProvisionalHeldFaces ? 1 : 0));
             summary.AppendLine("provisional_held_retention_scanned=" + LastProvisionalHeldRetentionScannedCount);
             summary.AppendLine("provisional_held_retention_candidates=" + LastProvisionalHeldRetentionCandidateCount);
@@ -5208,6 +6903,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("capture_batch_timeout_count=" + LastCaptureBatchTimeoutCount);
         summary.AppendLine("capture_batch_mesh_rebuilds=" + LastCaptureBatchMeshRebuildCount);
         summary.AppendLine("capture_batch_complete=" + (LastCaptureBatchComplete ? 1 : 0));
+        summary.AppendLine("capture_completed_batch_count=" + CompletedCaptureBatchCount);
         summary.AppendLine("capture_batch_reconcile_delta=" + (LastCaptureBatchIntegratedFrames - LastCaptureBatchTargetFrames));
         int integratedFrames = Mathf.Max(1, LastCaptureBatchIntegratedFrames);
         int pendingPromotionEvents = LastCaptureBatchAtomicProvisionalPromotionCount +
@@ -5846,11 +7542,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _auditSampleRobustShiftMeters = 0f;
         _auditSampleViewFacing = 0f;
         _auditSampleNormal = Vector3.zero;
+        _auditGrazingPlaneSupported = false;
+        _auditGrazingPlaneActuallyRescued = false;
         _auditTemporalDepthDeltaMeters = -1f;
         _auditTemporalWorldDeltaMeters = -1f;
         _auditTemporalNormalDeltaDegrees = -1f;
         _auditSameFrameDepthDeltaMeters = -1f;
         _auditSameFrameNormalDeltaDegrees = -1f;
+        _auditGrazingSamePlaneFrameExempted = false;
+        _auditGrazingSamePlaneFrameConflictCleared = false;
         _auditCrossFrameCleanDepthDeltaMeters = -1f;
         _auditCrossFrameCleanLateralMeters = -1f;
         _auditCrossFrameCleanNormalDeltaDegrees = -1f;
@@ -5981,6 +7681,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         float sameFrameSearch = Mathf.Max(0.03f, sameFrameConflictSearchMeters);
         float sameFrameNormalLimit = Mathf.Clamp(sameFrameConflictMaxNormalAngleDegrees, 1f, 45f);
+        bool exemptedGrazingSamePlaneCandidate = false;
         for (int dz = -2; dz <= 2; dz++)
         for (int dy = -2; dy <= 2; dy++)
         for (int dx = -2; dx <= 2; dx++)
@@ -6001,10 +7702,46 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 ? candidateNormal
                 : (normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.up);
             float depthDelta = Mathf.Abs(Vector3.Dot(point - candidate, planeNormal));
+            bool grazingSamePlaneCheck =
+                enableGrazingSamePlaneFrameExemption &&
+                _auditGrazingPlaneSupported &&
+                _auditSampleViewFacing >= 0f &&
+                _auditSampleViewFacing < Mathf.Clamp01(grazingPlaneStartViewFacing) &&
+                normal.sqrMagnitude > 0.0001f &&
+                candidateNormal.sqrMagnitude > 0.0001f &&
+                cell.GrazingPlaneSupportedCount >= Mathf.CeilToInt(
+                    cell.Count * Mathf.Clamp01(minGrazingSamePlaneFrameCandidateSupportRatio)) &&
+                Vector3.Dot(normal.normalized, candidateNormal) >=
+                    Mathf.Clamp01(minGrazingPlaneNeighborNormalDot);
+            if (grazingSamePlaneCheck)
+            {
+                LastGrazingSamePlaneFrameCheckedCandidateCount++;
+                if (depthDelta >= Mathf.Max(0.01f, sameFrameConflictDepthMeters) &&
+                    depthDelta <= Mathf.Max(
+                        sameFrameConflictDepthMeters,
+                        maxGrazingSamePlaneFrameResidualMeters))
+                {
+                    LastGrazingSamePlaneFrameExemptedCandidateCount++;
+                    exemptedGrazingSamePlaneCandidate = true;
+                    continue;
+                }
+            }
             if (depthDelta <= _auditSameFrameDepthDeltaMeters)
                 continue;
             _auditSameFrameDepthDeltaMeters = depthDelta;
             _auditSameFrameNormalDeltaDegrees = normalAngle;
+        }
+        if (exemptedGrazingSamePlaneCandidate)
+        {
+            LastGrazingSamePlaneFrameExemptedSampleCount++;
+            _auditGrazingSamePlaneFrameExempted = true;
+            bool conflictCleared = _auditSameFrameDepthDeltaMeters < Mathf.Max(0.01f, sameFrameConflictDepthMeters) ||
+                _auditSameFrameNormalDeltaDegrees > sameFrameNormalLimit;
+            if (conflictCleared)
+            {
+                LastGrazingSamePlaneFrameConflictClearedSampleCount++;
+                _auditGrazingSamePlaneFrameConflictCleared = true;
+            }
         }
     }
 
@@ -6014,6 +7751,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _voteCurrentFrameHistory.TryGetValue(key, out VoteHistoryCell current);
         current.PositionSum += point;
         current.NormalSum += normal;
+        if (_auditGrazingPlaneSupported)
+            current.GrazingPlaneSupportedCount++;
         current.Count++;
         _voteCurrentFrameHistory[key] = current;
     }
@@ -6024,6 +7763,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _voteCurrentFrameRawHistory.TryGetValue(key, out VoteHistoryCell current);
         current.PositionSum += point;
         current.NormalSum += normal;
+        if (_auditGrazingPlaneSupported)
+            current.GrazingPlaneSupportedCount++;
         current.Count++;
         _voteCurrentFrameRawHistory[key] = current;
     }
@@ -6244,6 +7985,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return higherIsBetter ? score : 1f - score;
     }
 
+    private bool CurrentViewFacingHasWriteSupport()
+    {
+        return _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) ||
+               (_auditGrazingPlaneSupported &&
+                _auditSampleViewFacing >= Mathf.Clamp01(minGrazingAdaptiveViewFacing));
+    }
+
     private ObservationVoteState EvaluateObservationVote(float sampleWeight)
     {
         float supportScore = Mathf.InverseLerp(
@@ -6312,7 +8060,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             reasons.Append("weak_support|");
         if (robustScore < 0.5f)
             reasons.Append("depth_shift|");
-        if (viewScore < 0.5f)
+        if (viewScore < 0.5f && !CurrentViewFacingHasWriteSupport())
             reasons.Append("grazing_view|");
         if (weightScore < 0.5f)
             reasons.Append("low_weight|");
@@ -6340,7 +8088,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         bool strongCurrentEvidence =
             _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
             _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters) &&
-            _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+            CurrentViewFacingHasWriteSupport() &&
             sampleWeight >= Mathf.Clamp01(voteGoodSampleWeight);
         bool strongCurrentAccept =
             strongCurrentEvidence &&
@@ -6402,7 +8150,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return bandSafe &&
                _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
                _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters * 2f) &&
-               _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+               CurrentViewFacingHasWriteSupport() &&
                sampleWeight >= Mathf.Clamp01(voteBadSampleWeight);
     }
 
@@ -6432,7 +8180,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         bool strongLocalObservation =
             _auditSampleSupportRatio >= Mathf.Clamp01(voteGoodSupportRatio) &&
             _auditSampleRobustShiftMeters <= Mathf.Max(0.001f, voteGoodRobustShiftMeters) &&
-            _auditSampleViewFacing >= Mathf.Clamp01(voteGoodViewFacing) &&
+            CurrentViewFacingHasWriteSupport() &&
             sampleWeight >= Mathf.Clamp01(voteGoodSampleWeight);
         bool oldTsdfSafe =
             _auditOldTsdfWeight <= 0 ||
@@ -6780,6 +8528,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("strong_sample_seed_max_old_tsdf_residual=" + AuditFloat(maxStrongSampleSeedOldTsdfResidual));
             summary.AppendLine("vote_strong_current_accept=" + LastVoteStrongCurrentAcceptCount);
             summary.AppendLine("vote_same_frame_conflict_depth_m=" + AuditFloat(sameFrameConflictDepthMeters));
+            summary.AppendLine("vote_grazing_same_plane_frame_exemption=" + (enableGrazingSamePlaneFrameExemption ? 1 : 0));
+            summary.AppendLine("vote_grazing_same_plane_frame_max_residual_m=" + AuditFloat(maxGrazingSamePlaneFrameResidualMeters));
             summary.AppendLine("vote_cross_frame_clean_conflict_depth_m=" + AuditFloat(crossFrameCleanConflictDepthMeters));
             summary.AppendLine("vote_cross_frame_clean_conflict_search_m=" + AuditFloat(crossFrameCleanConflictSearchMeters));
             summary.AppendLine("vote_pending_weight_scale=" + AuditFloat(confirmedPendingWriteWeightScale));
@@ -7369,6 +9119,54 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRawCoverageGridSampleCount = 0;
         LastRawCoverageGridDroppedSampleCount = 0;
         LastRawCoverageGridCellCount = 0;
+        LastRawCoverageAngleKnownSampleCount = 0;
+        LastRawCoverageFrontSampleCount = 0;
+        LastRawCoverageFrontAcceptedCount = 0;
+        LastRawCoverageObliqueSampleCount = 0;
+        LastRawCoverageObliqueAcceptedCount = 0;
+        LastRawCoverageGrazingSampleCount = 0;
+        LastRawCoverageGrazingAcceptedCount = 0;
+        LastRawCoverageExtremeSampleCount = 0;
+        LastRawCoverageExtremeAcceptedCount = 0;
+        LastRawCoverageBasicFilterCount = 0;
+        LastRawCoverageDepthEdgeStageCount = 0;
+        LastRawCoverageRobustStageCount = 0;
+        LastRawCoverageSupportStageCount = 0;
+        LastRawCoverageVoteRejectCount = 0;
+        LastRawCoveragePendingHoldCount = 0;
+        LastRawCoverageOutsideVolumeStageCount = 0;
+        LastRawCoverageAuditOutcomeStageCount = 0;
+        LastRawCoverageFallbackWeakStageCount = 0;
+        LastRescuedGrazingFinalCount = 0;
+        LastRescuedGrazingAcceptedCount = 0;
+        LastRescuedGrazingPendingCount = 0;
+        LastRescuedGrazingVoteRejectCount = 0;
+        LastRescuedGrazingOtherCount = 0;
+        LastRescuedGrazingDepthEdgeCount = 0;
+        LastRescuedGrazingRobustCount = 0;
+        LastRescuedGrazingSupportCount = 0;
+        LastRescuedGrazingOutsideVolumeCount = 0;
+        LastRescuedGrazingAuditOutcomeCount = 0;
+        LastRescuedGrazingFallbackWeakCount = 0;
+        LastRescuedVoteWeakSupportCount = 0;
+        LastRescuedVoteDepthShiftCount = 0;
+        LastRescuedVoteGrazingViewCount = 0;
+        LastRescuedVoteLowWeightCount = 0;
+        LastRescuedVoteTemporalJumpCount = 0;
+        LastRescuedVoteOffHistoryCount = 0;
+        LastRescuedVoteOldTsdfCount = 0;
+        LastRescuedVoteWeakHistoryCount = 0;
+        LastRescuedVoteBandConflictCount = 0;
+        LastRescuedVoteBandResidualCount = 0;
+        LastRescuedVoteSameFrameConflictCount = 0;
+        LastRescuedVoteSameFrameSamePlaneGrazingCount = 0;
+        LastRescuedVoteSameFrameCrossPlaneCount = 0;
+        LastRescuedVoteSameFrameUnknownPlaneCount = 0;
+        LastGrazingSamePlaneFrameCheckedCandidateCount = 0;
+        LastGrazingSamePlaneFrameExemptedCandidateCount = 0;
+        LastGrazingSamePlaneFrameExemptedSampleCount = 0;
+        LastGrazingSamePlaneFrameConflictClearedSampleCount = 0;
+        LastRescuedVoteCrossFrameConflictCount = 0;
         LastRawCoverageAcceptedCellCount = 0;
         LastRawCoverageProblemCellCount = 0;
         LastRawCoverageMixedCellCount = 0;
@@ -7379,7 +9177,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRawCoverageRenderedCellCount = 0;
     }
 
-    private void RecordRawCoverageGridSample(Vector3 point, RawDepthDebugKind kind, bool accepted)
+    private void RecordRawCoverageGridSample(Vector3 point, RawDepthDebugKind kind, bool accepted,
+        RawCoverageDecisionStage decisionStage = RawCoverageDecisionStage.Other)
     {
         if (!enableRawCoverageGridDiagnostics || !Finite(point))
             return;
@@ -7404,10 +9203,179 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         cell.PositionSum += point;
+        if (_rawCoverageCaptureCameraValid)
+        {
+            cell.CameraDistanceSum += Vector3.Distance(_rawCoverageCaptureCameraPosition, point);
+            cell.CameraDistanceCount++;
+        }
+        float captureViewFacing = -1f;
+        if (_rawCoverageCaptureCameraValid && _auditSampleNormal.sqrMagnitude > 0.0001f)
+        {
+            Vector3 toCamera = _rawCoverageCaptureCameraPosition - point;
+            if (toCamera.sqrMagnitude > 0.000001f)
+                captureViewFacing = Mathf.Abs(Vector3.Dot(_auditSampleNormal.normalized, toCamera.normalized));
+        }
+        if (captureViewFacing >= 0f)
+        {
+            captureViewFacing = Mathf.Clamp01(captureViewFacing);
+            cell.ViewFacingSum += captureViewFacing;
+            cell.ViewFacingCount++;
+            LastRawCoverageAngleKnownSampleCount++;
+            if (captureViewFacing >= 0.7071068f)
+            {
+                cell.FrontCount++;
+                LastRawCoverageFrontSampleCount++;
+                if (accepted) { cell.FrontAcceptedCount++; LastRawCoverageFrontAcceptedCount++; }
+            }
+            else if (captureViewFacing >= 0.5f)
+            {
+                cell.ObliqueCount++;
+                LastRawCoverageObliqueSampleCount++;
+                if (accepted) { cell.ObliqueAcceptedCount++; LastRawCoverageObliqueAcceptedCount++; }
+            }
+            else if (captureViewFacing >= 0.2f)
+            {
+                cell.GrazingCount++;
+                LastRawCoverageGrazingSampleCount++;
+                if (accepted) { cell.GrazingAcceptedCount++; LastRawCoverageGrazingAcceptedCount++; }
+            }
+            else
+            {
+                cell.ExtremeCount++;
+                LastRawCoverageExtremeSampleCount++;
+                if (accepted) { cell.ExtremeAcceptedCount++; LastRawCoverageExtremeAcceptedCount++; }
+            }
+        }
         if (accepted)
             cell.AcceptedCount++;
         else
+        {
             cell.ProblemCount++;
+            switch (kind)
+            {
+                case RawDepthDebugKind.DepthEdge: cell.DepthEdgeCount++; break;
+                case RawDepthDebugKind.Robust: cell.RobustCount++; break;
+                case RawDepthDebugKind.Support: cell.SupportCount++; break;
+                case RawDepthDebugKind.Pending:
+                case RawDepthDebugKind.StableBand: cell.PendingCount++; break;
+                case RawDepthDebugKind.ConflictEdge: cell.ConflictEdgeCount++; break;
+                case RawDepthDebugKind.ConflictView: cell.ConflictViewCount++; break;
+                case RawDepthDebugKind.ConflictLocked: cell.ConflictLockedCount++; break;
+                case RawDepthDebugKind.Outside: cell.OutsideCount++; break;
+                default: cell.BasicRejectCount++; break;
+            }
+        }
+        if (_auditGrazingSamePlaneFrameExempted)
+            cell.GrazingSamePlaneFrameExemptedCount++;
+        if (_auditGrazingSamePlaneFrameConflictCleared)
+        {
+            cell.GrazingSamePlaneFrameConflictClearedCount++;
+            cell.GrazingSamePlaneClearedPositionSum += point;
+            if (_auditSampleNormal.sqrMagnitude > 0.0001f)
+                cell.GrazingSamePlaneClearedNormalSum += _auditSampleNormal.normalized;
+        }
+
+        switch (decisionStage)
+        {
+            case RawCoverageDecisionStage.BasicFilter:
+                cell.BasicFilterCount++;
+                LastRawCoverageBasicFilterCount++;
+                break;
+            case RawCoverageDecisionStage.DepthNeighborhood:
+                cell.DepthNeighborhoodStageCount++;
+                LastRawCoverageDepthEdgeStageCount++;
+                break;
+            case RawCoverageDecisionStage.RobustPrefilter:
+                cell.RobustPrefilterStageCount++;
+                LastRawCoverageRobustStageCount++;
+                break;
+            case RawCoverageDecisionStage.TsdfSupport:
+                cell.TsdfSupportStageCount++;
+                LastRawCoverageSupportStageCount++;
+                break;
+            case RawCoverageDecisionStage.VoteReject:
+                cell.VoteRejectCount++;
+                LastRawCoverageVoteRejectCount++;
+                break;
+            case RawCoverageDecisionStage.PendingHold:
+                cell.PendingHoldCount++;
+                LastRawCoveragePendingHoldCount++;
+                break;
+            case RawCoverageDecisionStage.OutsideVolume:
+                cell.OutsideVolumeStageCount++;
+                LastRawCoverageOutsideVolumeStageCount++;
+                break;
+            case RawCoverageDecisionStage.AuditOutcome:
+                cell.AuditOutcomeStageCount++;
+                LastRawCoverageAuditOutcomeStageCount++;
+                break;
+            case RawCoverageDecisionStage.FallbackWeak:
+                cell.FallbackWeakStageCount++;
+                LastRawCoverageFallbackWeakStageCount++;
+                break;
+            case RawCoverageDecisionStage.Other:
+                if (!accepted) cell.OtherRejectCount++;
+                break;
+        }
+
+        if (_auditGrazingPlaneActuallyRescued &&
+            decisionStage != RawCoverageDecisionStage.BasicFilter)
+        {
+            cell.RescuedGrazingFinalCount++;
+            LastRescuedGrazingFinalCount++;
+            if (decisionStage == RawCoverageDecisionStage.VoteReject)
+            {
+                cell.RescuedGrazingVoteRejectCount++;
+                LastRescuedGrazingVoteRejectCount++;
+                CountRescuedGrazingVoteRejectReasons(ref cell);
+            }
+            else if (decisionStage == RawCoverageDecisionStage.Integrated && accepted)
+            {
+                cell.RescuedGrazingAcceptedCount++;
+                LastRescuedGrazingAcceptedCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.PendingHold ||
+                     decisionStage == RawCoverageDecisionStage.Integrated)
+            {
+                cell.RescuedGrazingPendingCount++;
+                LastRescuedGrazingPendingCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.DepthNeighborhood)
+            {
+                cell.RescuedGrazingDepthEdgeCount++;
+                LastRescuedGrazingDepthEdgeCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.RobustPrefilter)
+            {
+                cell.RescuedGrazingRobustCount++;
+                LastRescuedGrazingRobustCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.TsdfSupport)
+            {
+                cell.RescuedGrazingSupportCount++;
+                LastRescuedGrazingSupportCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.OutsideVolume)
+            {
+                cell.RescuedGrazingOutsideVolumeCount++;
+                LastRescuedGrazingOutsideVolumeCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.AuditOutcome)
+            {
+                cell.RescuedGrazingAuditOutcomeCount++;
+                LastRescuedGrazingAuditOutcomeCount++;
+            }
+            else if (decisionStage == RawCoverageDecisionStage.FallbackWeak)
+            {
+                cell.RescuedGrazingFallbackWeakCount++;
+                LastRescuedGrazingFallbackWeakCount++;
+            }
+            else
+            {
+                cell.RescuedGrazingOtherCount++;
+                LastRescuedGrazingOtherCount++;
+            }
+        }
 
         if (RawDepthDebugPriority(kind) > RawDepthDebugPriority(cell.WorstKind))
             cell.WorstKind = kind;
@@ -7415,6 +9383,48 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _rawCoverageGridCells[key] = cell;
         _rawCoverageGridVersion++;
         _rawCoverageOverlayBuildVersion = -1;
+    }
+
+    private void CountRescuedGrazingVoteRejectReasons(ref RawCoverageGridCell cell)
+    {
+        string reasons = _auditVoteReasons ?? string.Empty;
+        if (reasons.Contains("weak_support")) { cell.RescuedVoteWeakSupportCount++; LastRescuedVoteWeakSupportCount++; }
+        if (reasons.Contains("depth_shift")) { cell.RescuedVoteDepthShiftCount++; LastRescuedVoteDepthShiftCount++; }
+        if (reasons.Contains("grazing_view")) { cell.RescuedVoteGrazingViewCount++; LastRescuedVoteGrazingViewCount++; }
+        if (reasons.Contains("low_weight")) { cell.RescuedVoteLowWeightCount++; LastRescuedVoteLowWeightCount++; }
+        if (reasons.Contains("temporal_depth_jump")) { cell.RescuedVoteTemporalJumpCount++; LastRescuedVoteTemporalJumpCount++; }
+        if (reasons.Contains("off_history_surface")) { cell.RescuedVoteOffHistoryCount++; LastRescuedVoteOffHistoryCount++; }
+        if (reasons.Contains("old_tsdf_residual")) { cell.RescuedVoteOldTsdfCount++; LastRescuedVoteOldTsdfCount++; }
+        if (reasons.Contains("weak_history")) { cell.RescuedVoteWeakHistoryCount++; LastRescuedVoteWeakHistoryCount++; }
+        if (reasons.Contains("band_conflict")) { cell.RescuedVoteBandConflictCount++; LastRescuedVoteBandConflictCount++; }
+        if (reasons.Contains("band_residual")) { cell.RescuedVoteBandResidualCount++; LastRescuedVoteBandResidualCount++; }
+        if (reasons.Contains("same_frame"))
+        {
+            cell.RescuedVoteSameFrameConflictCount++;
+            LastRescuedVoteSameFrameConflictCount++;
+            if (_auditSameFrameNormalDeltaDegrees < 0f)
+            {
+                cell.RescuedVoteSameFrameUnknownPlaneCount++;
+                LastRescuedVoteSameFrameUnknownPlaneCount++;
+            }
+            else
+            {
+                float normalDot = Mathf.Cos(_auditSameFrameNormalDeltaDegrees * Mathf.Deg2Rad);
+                bool samePlaneGrazing = _auditGrazingPlaneSupported &&
+                    normalDot >= Mathf.Clamp01(minGrazingPlaneNeighborNormalDot);
+                if (samePlaneGrazing)
+                {
+                    cell.RescuedVoteSameFrameSamePlaneGrazingCount++;
+                    LastRescuedVoteSameFrameSamePlaneGrazingCount++;
+                }
+                else
+                {
+                    cell.RescuedVoteSameFrameCrossPlaneCount++;
+                    LastRescuedVoteSameFrameCrossPlaneCount++;
+                }
+            }
+        }
+        if (reasons.Contains("cross_frame_clean_conflict")) { cell.RescuedVoteCrossFrameConflictCount++; LastRescuedVoteCrossFrameConflictCount++; }
     }
 
     private Vector3Int RawCoverageGridKey(Vector3 point)
@@ -8213,14 +10223,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     // Prefer nearby markers in the current view. Markers behind the user
                     // remain eligible, but naturally leave the bounded render budget.
                     float viewPenalty = Mathf.Max(0f, 1f - forwardDot) * (distanceSq + 1f) * 4f;
-                    markerCandidates.Add(new HoleBoundaryMarkerCandidate
+                    if (showLayerDiagnosticPointOverlay)
                     {
-                        Center = center,
-                        Color = color,
-                        ViewScore = distanceSq + viewPenalty,
-                        Priority = 0,
-                        SizeScale = primaryLayerDiagnosticSizeScale
-                    });
+                        markerCandidates.Add(new HoleBoundaryMarkerCandidate
+                        {
+                            Center = center,
+                            Color = color,
+                            ViewScore = distanceSq + viewPenalty,
+                            Priority = 0,
+                            SizeScale = primaryLayerDiagnosticSizeScale
+                        });
+                    }
                 }
             }
         }
@@ -8238,6 +10251,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             AppendGlobalPairedLayerDiagnosticCandidates(markerCandidates, cameraPosition, cameraForward);
         }
         UpdateLayerHoleTrend();
+
+        if (!showLayerDiagnosticPointOverlay)
+        {
+            _holeBoundaryDiagnosticObject.SetActive(false);
+            return;
+        }
 
         markerCandidates.Sort((a, b) =>
         {
@@ -8396,16 +10415,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 ? Vector3.Dot(cameraForward, toMarker / Mathf.Sqrt(distanceSq))
                 : 1f;
             float viewPenalty = Mathf.Max(0f, 1f - forwardDot) * (distanceSq + 1f) * 4f;
-            markerCandidates.Add(new HoleBoundaryMarkerCandidate
+            if (showLayerDiagnosticPointOverlay)
             {
-                Center = center,
-                Color = layerRole == DiagnosticLayerRole.Secondary
-                    ? secondaryLayerDiagnosticColor
-                    : primaryLayerDiagnosticColor,
-                ViewScore = distanceSq + viewPenalty,
-                Priority = 0,
-                SizeScale = primaryLayerDiagnosticSizeScale
-            });
+                markerCandidates.Add(new HoleBoundaryMarkerCandidate
+                {
+                    Center = center,
+                    Color = layerRole == DiagnosticLayerRole.Secondary
+                        ? secondaryLayerDiagnosticColor
+                        : primaryLayerDiagnosticColor,
+                    ViewScore = distanceSq + viewPenalty,
+                    Priority = 0,
+                    SizeScale = primaryLayerDiagnosticSizeScale
+                });
+            }
         }
     }
 
@@ -9273,14 +11295,41 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return ok;
     }
 
+    private bool IsGrazingPlaneCompatible(Vector3 centerPoint, Vector3 centerNormal,
+        Vector3 neighborPoint, Vector3 neighborNormal)
+    {
+        if (!enableGrazingPlaneAdaptiveDepthFilter || !Finite(centerNormal) || !Finite(neighborNormal) ||
+            centerNormal.sqrMagnitude < 0.0001f || neighborNormal.sqrMagnitude < 0.0001f)
+            return false;
+        float normalDot = Mathf.Abs(Vector3.Dot(centerNormal.normalized, neighborNormal.normalized));
+        if (normalDot < Mathf.Clamp01(minGrazingPlaneNeighborNormalDot))
+            return false;
+        float residual = Mathf.Abs(Vector3.Dot(neighborPoint - centerPoint, centerNormal.normalized));
+        return residual <= Mathf.Max(0.005f, maxGrazingPlaneResidualMeters);
+    }
+
+    private bool IsGrazingView(Vector3 point, Vector3 normal, Vector3 cameraPosition)
+    {
+        if (!enableGrazingPlaneAdaptiveDepthFilter || normal.sqrMagnitude < 0.0001f)
+            return false;
+        Vector3 toCamera = cameraPosition - point;
+        if (toCamera.sqrMagnitude < 0.000001f)
+            return false;
+        float facing = Mathf.Abs(Vector3.Dot(normal.normalized, toCamera.normalized));
+        return facing < Mathf.Clamp01(grazingPlaneStartViewFacing) &&
+               facing >= Mathf.Clamp01(minGrazingAdaptiveViewFacing);
+    }
+
     private bool PassDepthNeighborhoodConsistency(
         int x,
         int y,
         int width,
         int height,
         Vector3[] positions,
+        Vector3[] normals,
         Vector3 cameraPosition,
         Vector3 point,
+        Vector3 normal,
         out int checkedNeighbors,
         out int consistentNeighbors)
     {
@@ -9296,6 +11345,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         int radius = Mathf.Clamp(depthDiscontinuityNeighborRadiusPixels, 1, 3);
         float maxDelta = Mathf.Max(maxDepthDiscontinuityMeters, depth * maxDepthDiscontinuityRatio);
+        bool grazingView = IsGrazingView(point, normal, cameraPosition);
+        int planeCompatibleNeighbors = 0;
+        if (grazingView)
+            LastGrazingPlaneCheckedSampleCount++;
 
         for (int dy = -radius; dy <= radius; dy++)
         {
@@ -9322,9 +11375,31 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     continue;
 
                 checkedNeighbors++;
-                if (Mathf.Abs(neighborDepth - depth) <= maxDelta)
+                float depthDelta = Mathf.Abs(neighborDepth - depth);
+                Vector3 neighborNormal = normals != null && neighborIndex < normals.Length ? normals[neighborIndex] : Vector3.zero;
+                bool planeCompatible = grazingView && IsGrazingPlaneCompatible(point, normal, neighbor, neighborNormal);
+                if (planeCompatible)
+                    planeCompatibleNeighbors++;
+                if (depthDelta <= maxDelta || planeCompatible)
+                {
                     consistentNeighbors++;
+                    if (depthDelta > maxDelta && planeCompatible)
+                    {
+                        _auditGrazingPlaneActuallyRescued = true;
+                        LastGrazingPlaneDepthNeighborRescueCount++;
+                    }
+                }
             }
+        }
+
+        if (grazingView && planeCompatibleNeighbors >= Mathf.Max(2, minGrazingPlaneCompatibleNeighbors))
+        {
+            _auditGrazingPlaneSupported = true;
+            LastGrazingPlaneSupportedSampleCount++;
+            // Once a coherent plane is established, perpendicular corner neighbors are
+            // not negative evidence for this surface's own support ratio.
+            checkedNeighbors = planeCompatibleNeighbors;
+            consistentNeighbors = planeCompatibleNeighbors;
         }
 
         int minNeighbors = Mathf.Max(1, minDepthConsistentNeighbors);
@@ -9350,7 +11425,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int width,
         int height,
         Vector3[] positions,
+        Vector3[] normals,
         Vector3 cameraPosition,
+        Vector3 normal,
         ref Vector3 point,
         ref float sampleWeight)
     {
@@ -9372,6 +11449,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int edgeNeighbors = 0;
         int edgeRadius = Mathf.Clamp(depthEdgeErosionRadiusPixels, 1, radius);
         float edgeDelta = Mathf.Max(robustDepthEdgeDeltaMeters, depth * robustDepthEdgeDeltaRatio);
+        bool grazingView = IsGrazingView(point, normal, cameraPosition);
+        int planeCompatibleNeighbors = 0;
 
         for (int dy = -radius; dy <= radius; dy++)
         {
@@ -9394,23 +11473,53 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (neighborDepth < minDepthMeters || neighborDepth > maxDepthMeters)
                     continue;
 
-                if (sampleCount < _robustDepthSamples.Length)
-                    _robustDepthSamples[sampleCount++] = neighborDepth;
                 if (dx == 0 && dy == 0)
+                {
+                    if (sampleCount < _robustDepthSamples.Length)
+                        _robustDepthSamples[sampleCount++] = neighborDepth;
                     continue;
+                }
 
                 checkedNeighbors++;
                 float depthDelta = Mathf.Abs(neighborDepth - depth);
-                if (depthDelta <= maxDelta)
+                Vector3 neighborNormal = normals != null && neighborIndex < normals.Length ? normals[neighborIndex] : Vector3.zero;
+                bool planeCompatible = grazingView && IsGrazingPlaneCompatible(point, normal, neighbor, neighborNormal);
+                if (planeCompatible)
+                    planeCompatibleNeighbors++;
+                if (depthDelta <= maxDelta || planeCompatible)
                     consistentNeighbors++;
+                if (sampleCount < _robustDepthSamples.Length &&
+                    (!grazingView || depthDelta <= maxDelta || planeCompatible))
+                    _robustDepthSamples[sampleCount++] = neighborDepth;
 
                 if (erodeDepthEdgesBeforeTsdf && Mathf.Abs(dx) <= edgeRadius && Mathf.Abs(dy) <= edgeRadius)
                 {
                     edgeCheckedNeighbors++;
                     if (depthDelta > edgeDelta)
-                        edgeNeighbors++;
+                    {
+                        if (planeCompatible)
+                        {
+                            _auditGrazingPlaneActuallyRescued = true;
+                            LastGrazingPlaneEdgeExemptionCount++;
+                        }
+                        else
+                            edgeNeighbors++;
+                    }
                 }
             }
+        }
+
+        bool grazingPlaneSupported = grazingView &&
+            planeCompatibleNeighbors >= Mathf.Max(2, minGrazingPlaneCompatibleNeighbors);
+        if (grazingPlaneSupported && !_auditGrazingPlaneSupported)
+        {
+            _auditGrazingPlaneSupported = true;
+            LastGrazingPlaneSupportedSampleCount++;
+        }
+        if (grazingPlaneSupported)
+        {
+            checkedNeighbors = planeCompatibleNeighbors;
+            consistentNeighbors = planeCompatibleNeighbors;
         }
 
         if (erodeDepthEdgesBeforeTsdf && edgeCheckedNeighbors > 0 && edgeNeighbors > maxRobustDepthEdgeNeighbors)
@@ -9441,7 +11550,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             sampleWeight *= weightScale;
         }
 
-        if (sampleCount >= 3)
+        if (sampleCount >= 3 && !grazingPlaneSupported)
         {
             float medianDepth = MedianInPlace(_robustDepthSamples, sampleCount);
             float medianDelta = Mathf.Abs(depth - medianDepth);
@@ -9455,6 +11564,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 sampleWeight *= Mathf.Lerp(minRobustDepthWeightScale, 0.75f, correctionScale);
                 LastRobustDepthCorrectedCount++;
             }
+        }
+        else if (sampleCount >= 3 && grazingPlaneSupported)
+        {
+            // A radial-depth median is biased on a valid oblique plane. Preserve the
+            // measured point once the local plane has supplied the missing support.
+            LastGrazingPlaneMedianCorrectionSkippedCount++;
+            _auditGrazingPlaneActuallyRescued = true;
         }
 
         return sampleWeight >= minRobustTsdfSampleWeight;
@@ -12896,6 +15012,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRobustDepthCorrectedCount = 0;
         LastRejectedDepthEdgeErosionCount = 0;
         LastDepthEdgeDownweightedCount = 0;
+        LastGrazingPlaneCheckedSampleCount = 0;
+        LastGrazingPlaneSupportedSampleCount = 0;
+        LastGrazingPlaneDepthNeighborRescueCount = 0;
+        LastGrazingPlaneEdgeExemptionCount = 0;
+        LastGrazingPlaneMedianCorrectionSkippedCount = 0;
         LastRejectedTsdfConflictCount = 0;
         LastPendingStableTsdfCount = 0;
         LastProvisionalTsdfSupportWriteCount = 0;
@@ -13796,6 +15917,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _newbornPholdPreferredStates.Clear();
         _newbornPholdPreferredObserved.Clear();
         _newbornPholdReplacementProbations.Clear();
+        _doublePlaneCreaseStates.Clear();
+        _newbornLayerSwapStates.Clear();
+        _samePlaneAtomicPatchCandidates.Clear();
+        _samePlaneAtomicPatchStates.Clear();
+        _samePlaneAtomicPatchObserved.Clear();
         _naturallyObservedStableQuadKeys.Clear();
         _newbornPholdCompetitionRebuildSequence = 0;
         _holeLifecycleRebuildSequence = 0;
@@ -13859,6 +15985,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _hardAuditExpectedTsdf = (float[])_tsdf.Clone();
         _hardAuditExpectedWeights = (byte[])_weights.Clone();
         ResetHardTsdfWriteAuditCounters();
+
+        _referenceClassicTsdf.Reset(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters);
 
         _volumeInitialized = true;
     }
@@ -16418,6 +18546,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (usePrimaryPlaneHoleRepair && !primaryPlaneValid)
                 {
                     LastHoleSideRepairBlockedPlaneCount++;
+                    _spatialPlaneRepairRejects[index] = planeRejectReason;
                     switch (planeRejectReason)
                     {
                         case PrimaryPlaneHoleRejectReason.AnchorCount:
@@ -18779,7 +20908,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private void FlushDeferredArbitratedQuads(List<Vector3> vertices, List<int> triangles)
     {
         if (_deferredArbitratedQuads.Count <= 0)
+        {
+            RetireStaleSamePlaneAtomicPatchStates();
             return;
+        }
 
         _deferredArbitratedQuads.Sort((left, right) =>
         {
@@ -18803,6 +20935,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                                            previous.Winding != 0 && winding != 0 && previous.Winding != winding;
             if (shadowWindingConflict || previousWindingConflict)
             {
+                RecordSpatialArbitrationBlock(quad, "winding", vertices);
                 CountArbitrationBlockedWinding(quad);
                 continue;
             }
@@ -18815,6 +20948,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             EvaluateArbitratedQuadEdgeConflict(quad.D, quad.A, winding, ref layerConflict, ref topologyConflict);
             if (layerConflict)
             {
+                if (quad.Newborn && TryQueueGrazingSamePlaneAtomicPatchCandidate(quad, vertices))
+                    continue;
+                if (quad.Newborn && TryRepairBoundaryWorseningLayerBlock(quad, vertices, triangles))
+                    continue;
+                RecordSpatialArbitrationBlock(quad, "layer", vertices);
                 CountArbitrationBlockedLayer(quad);
                 continue;
             }
@@ -18826,6 +20964,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     if (TryPromotePreferredNewbornOverPhold(quad, decision, vertices, triangles))
                         continue;
                 }
+                RecordSpatialArbitrationBlock(quad, "topology", vertices);
                 CountArbitrationBlockedTopology(quad);
                 continue;
             }
@@ -18849,9 +20988,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (quad.Newborn)
                 LastNewbornArbitrationAcceptedCount++;
         }
+        ProcessGrazingSamePlaneAtomicPatches(vertices, triangles);
         _deferredArbitratedQuads.Clear();
         _deferredArbitratedQuadKeys.Clear();
         RetireStaleNewbornPholdPreferredStates();
+        RetireStaleNewbornLayerSwapStates();
+        RetireStaleSamePlaneAtomicPatchStates();
         if (_stableQuadTrianglesNeedRebuild)
             RebuildStableQuadTriangleBuffer(triangles);
     }
@@ -18890,6 +21032,697 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             RecordNewbornPholdProbationEvent(quad.ProbationOwnerKey, quad.Key, "rollback_blocked_topology");
         }
         else if (quad.HeldProvisional) LastProvisionalHeldRetentionBlockedTopologyCount++;
+    }
+
+    private void RecordSpatialArbitrationBlock(DeferredArbitratedQuad quad, string reason, List<Vector3> vertices)
+    {
+        if (!writeSpatialRuptureDiagnostics || vertices == null ||
+            quad.A < 0 || quad.B < 0 || quad.C < 0 || quad.D < 0 ||
+            quad.A >= vertices.Count || quad.B >= vertices.Count || quad.C >= vertices.Count || quad.D >= vertices.Count)
+            return;
+
+        Vector3 center = (vertices[quad.A] + vertices[quad.B] + vertices[quad.C] + vertices[quad.D]) * 0.25f;
+        Vector3Int key = RawCoverageGridKey(center);
+        _spatialArbitrationCells.TryGetValue(key, out SpatialArbitrationCell cell);
+        if (reason == "layer") cell.LayerCount++;
+        else if (reason == "topology") cell.TopologyCount++;
+        else if (reason == "winding") cell.WindingCount++;
+        _spatialArbitrationCells[key] = cell;
+    }
+
+    private bool TryGetGrazingSamePlaneLayerEvidence(
+        DeferredArbitratedQuad candidate,
+        List<Vector3> vertices,
+        out int samples,
+        out float normalDot,
+        out float planeResidual,
+        out string blockedReason)
+    {
+        samples = 0;
+        normalDot = -1f;
+        planeResidual = -1f;
+        blockedReason = "support";
+        if (!useGrazingSamePlaneEvidenceForLayerArbitration || vertices == null ||
+            candidate.A < 0 || candidate.B < 0 || candidate.C < 0 || candidate.D < 0 ||
+            candidate.A >= vertices.Count || candidate.B >= vertices.Count ||
+            candidate.C >= vertices.Count || candidate.D >= vertices.Count)
+        {
+            return false;
+        }
+
+        Vector3 va = vertices[candidate.A];
+        Vector3 vb = vertices[candidate.B];
+        Vector3 vc = vertices[candidate.C];
+        Vector3 vd = vertices[candidate.D];
+        Vector3 center = (va + vb + vc + vd) * 0.25f;
+        Vector3 candidateNormal = Vector3.Cross(vb - va, vc - va) + Vector3.Cross(vc - va, vd - va);
+        if (candidateNormal.sqrMagnitude <= 0.0000000001f)
+        {
+            blockedReason = "normal";
+            return false;
+        }
+        candidateNormal.Normalize();
+
+        Vector3 positionSum = Vector3.zero;
+        Vector3 normalSum = Vector3.zero;
+        Vector3Int centerKey = RawCoverageGridKey(center);
+        int radius = Mathf.Clamp(grazingSamePlaneLayerEvidenceLookupRadiusCells, 0, 2);
+        for (int z = -radius; z <= radius; z++)
+        for (int y = -radius; y <= radius; y++)
+        for (int x = -radius; x <= radius; x++)
+        {
+            if (!_rawCoverageGridCells.TryGetValue(centerKey + new Vector3Int(x, y, z), out RawCoverageGridCell cell) ||
+                cell.GrazingSamePlaneFrameConflictClearedCount <= 0)
+            {
+                continue;
+            }
+            samples += cell.GrazingSamePlaneFrameConflictClearedCount;
+            positionSum += cell.GrazingSamePlaneClearedPositionSum;
+            normalSum += cell.GrazingSamePlaneClearedNormalSum;
+        }
+
+        if (samples < Mathf.Clamp(minGrazingSamePlaneLayerEvidenceSamples, 1, 32))
+            return false;
+        if (normalSum.sqrMagnitude <= 0.0001f)
+        {
+            blockedReason = "normal";
+            return false;
+        }
+        Vector3 evidenceNormal = normalSum.normalized;
+        normalDot = Mathf.Abs(Vector3.Dot(candidateNormal, evidenceNormal));
+        if (normalDot < Mathf.Clamp01(minGrazingSamePlaneLayerEvidenceNormalDot))
+        {
+            blockedReason = "normal";
+            return false;
+        }
+        Vector3 evidencePoint = positionSum / Mathf.Max(1, samples);
+        planeResidual = Mathf.Abs(Vector3.Dot(center - evidencePoint, evidenceNormal));
+        if (planeResidual > Mathf.Max(0.01f, maxGrazingSamePlaneLayerEvidenceResidualMeters))
+        {
+            blockedReason = "residual";
+            return false;
+        }
+        blockedReason = "none";
+        return true;
+    }
+
+    private bool TryQueueGrazingSamePlaneAtomicPatchCandidate(
+        DeferredArbitratedQuad candidate, List<Vector3> vertices)
+    {
+        LastSamePlaneLayerEvidenceCheckedCount++;
+        bool matched = TryGetGrazingSamePlaneLayerEvidence(
+            candidate, vertices, out int samples, out float normalDot,
+            out float residual, out string blockedReason);
+        if (!matched)
+        {
+            if (blockedReason == "normal") LastSamePlaneLayerEvidenceBlockedNormalCount++;
+            else if (blockedReason == "residual") LastSamePlaneLayerEvidenceBlockedResidualCount++;
+            else LastSamePlaneLayerEvidenceBlockedSupportCount++;
+            return false;
+        }
+
+        LastSamePlaneLayerEvidenceMatchedCount++;
+        _samePlaneAtomicPatchCandidates.Add(candidate);
+        LastSamePlaneAtomicPatchCandidateQuadCount++;
+        return true;
+    }
+
+    private bool TryGetDeferredQuadGeometry(DeferredArbitratedQuad quad, List<Vector3> vertices,
+        out Vector3 center, out Vector3 normal)
+    {
+        center = Vector3.zero;
+        normal = Vector3.zero;
+        if (vertices == null || quad.A < 0 || quad.B < 0 || quad.C < 0 || quad.D < 0 ||
+            quad.A >= vertices.Count || quad.B >= vertices.Count || quad.C >= vertices.Count || quad.D >= vertices.Count)
+            return false;
+        Vector3 va = vertices[quad.A];
+        Vector3 vb = vertices[quad.B];
+        Vector3 vc = vertices[quad.C];
+        Vector3 vd = vertices[quad.D];
+        center = (va + vb + vc + vd) * 0.25f;
+        Vector3 raw = Vector3.Cross(vb - va, vc - va) + Vector3.Cross(vc - va, vd - va);
+        if (raw.sqrMagnitude <= 0.0000000001f)
+            return false;
+        normal = raw.normalized;
+        return true;
+    }
+
+    private bool SamePlanePatchCandidatesConnected(DeferredArbitratedQuad a, DeferredArbitratedQuad b,
+        List<Vector3> vertices)
+    {
+        if (a.Winding == 0 || b.Winding == 0 || a.Winding != b.Winding)
+            return false;
+        bool sharesVertex = a.A == b.A || a.A == b.B || a.A == b.C || a.A == b.D ||
+                            a.B == b.A || a.B == b.B || a.B == b.C || a.B == b.D ||
+                            a.C == b.A || a.C == b.B || a.C == b.C || a.C == b.D ||
+                            a.D == b.A || a.D == b.B || a.D == b.C || a.D == b.D;
+        if (!sharesVertex || !TryGetDeferredQuadGeometry(a, vertices, out Vector3 centerA, out Vector3 normalA) ||
+            !TryGetDeferredQuadGeometry(b, vertices, out Vector3 centerB, out Vector3 normalB))
+            return false;
+        if (Mathf.Abs(Vector3.Dot(normalA, normalB)) < Mathf.Clamp01(minGrazingSamePlaneLayerEvidenceNormalDot))
+            return false;
+        return Mathf.Abs(Vector3.Dot(centerB - centerA, normalA)) <=
+               Mathf.Max(0.01f, maxGrazingSamePlaneLayerEvidenceResidualMeters);
+    }
+
+    private void ProcessGrazingSamePlaneAtomicPatches(List<Vector3> vertices, List<int> triangles)
+    {
+        if (_samePlaneAtomicPatchCandidates.Count <= 0)
+            return;
+        int count = _samePlaneAtomicPatchCandidates.Count;
+        int maxPatch = Mathf.Clamp(maxGrazingSamePlaneAtomicPatchQuads, 2, 256);
+        bool[] visited = new bool[count];
+        Queue<int> queue = new Queue<int>();
+        List<DeferredArbitratedQuad> patch = new List<DeferredArbitratedQuad>(maxPatch);
+        for (int seed = 0; seed < count; seed++)
+        {
+            if (visited[seed])
+                continue;
+            visited[seed] = true;
+            queue.Enqueue(seed);
+            patch.Clear();
+            while (queue.Count > 0 && patch.Count < maxPatch)
+            {
+                int current = queue.Dequeue();
+                DeferredArbitratedQuad currentQuad = _samePlaneAtomicPatchCandidates[current];
+                patch.Add(currentQuad);
+                for (int next = 0; next < count; next++)
+                {
+                    if (visited[next] || !SamePlanePatchCandidatesConnected(
+                            currentQuad, _samePlaneAtomicPatchCandidates[next], vertices))
+                        continue;
+                    visited[next] = true;
+                    queue.Enqueue(next);
+                }
+            }
+            // A capped component continues as another atomic patch instead of being partly committed.
+            while (queue.Count > 0)
+                visited[queue.Dequeue()] = false;
+            LastSamePlaneAtomicPatchGroupCount++;
+            if (!TryApplyGrazingSamePlaneAtomicPatch(patch, vertices, triangles))
+            {
+                for (int i = 0; i < patch.Count; i++)
+                {
+                    RecordSpatialArbitrationBlock(patch[i], "layer", vertices);
+                    CountArbitrationBlockedLayer(patch[i]);
+                }
+            }
+        }
+        _samePlaneAtomicPatchCandidates.Clear();
+    }
+
+    private bool TryApplyGrazingSamePlaneAtomicPatch(List<DeferredArbitratedQuad> patch,
+        List<Vector3> vertices, List<int> triangles)
+    {
+        if (patch == null || patch.Count <= 0)
+            return false;
+        GetSamePlaneAtomicPatchGeometry(patch, vertices, out Vector3 patchCenter, out Vector3 patchNormal);
+        SamePlaneAtomicPatchKey patchKey = SamePlaneAtomicPatchSpatialKey(patchCenter, patchNormal);
+        bool priorContinuation = TryFindPriorSamePlaneAtomicPatchState(
+            patchKey, patchCenter, patchNormal, out SamePlaneAtomicPatchKey matchedPatchKey,
+            out SamePlaneAtomicPatchState state);
+        if (priorContinuation)
+            patchKey = matchedPatchKey;
+        HashSet<StableQuadKey> blockerKeys = new HashSet<StableQuadKey>();
+        for (int q = 0; q < patch.Count; q++)
+        {
+            DeferredArbitratedQuad candidate = patch[q];
+            ulong[] edges = { EdgeKey(candidate.A, candidate.B), EdgeKey(candidate.B, candidate.C),
+                              EdgeKey(candidate.C, candidate.D), EdgeKey(candidate.D, candidate.A) };
+            for (int e = 0; e < edges.Length; e++)
+            {
+                if (!_stableQuadAuditEdges.TryGetValue(edges[e], out List<StableQuadKey> linked) || linked == null)
+                    continue;
+                for (int i = 0; i < linked.Count; i++)
+                {
+                    if (_stableQuadAuditRecords.TryGetValue(linked[i], out StableQuadAuditRecord record) &&
+                        record.Winding != 0 && record.Winding != candidate.Winding)
+                        blockerKeys.Add(linked[i]);
+                }
+            }
+        }
+        if (blockerKeys.Count <= 0)
+        {
+            LastSamePlaneAtomicPatchBlockedTopologyCount++;
+            return false;
+        }
+        List<StableQuadAuditRecord> blockers = new List<StableQuadAuditRecord>(blockerKeys.Count);
+        int matureBlockerCount = 0;
+        foreach (StableQuadKey key in blockerKeys)
+        {
+            if (!_stableQuadAuditRecords.TryGetValue(key, out StableQuadAuditRecord blocker))
+            {
+                LastSamePlaneAtomicPatchBlockedTopologyCount++;
+                return false;
+            }
+            bool mature = blocker.RestoredByAtomicProvisionalBacking ||
+                          _previousStableQuadAuditRecords.ContainsKey(key) ||
+                          _heldProvisionalRetainedKeys.Contains(key) ||
+                          (_stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState shadow) && shadow.Committed);
+            if (mature)
+                matureBlockerCount++;
+            blockers.Add(blocker);
+        }
+        // Mature committed geometry remains visible throughout probation.  It is evidence
+        // about the current layer, not a reason to prevent the competing patch from being
+        // observed across rebuilds.  Removal is deferred until the shadow patch confirms.
+        LastSamePlaneAtomicPatchShadowMatureCount += matureBlockerCount;
+
+        for (int i = 0; i < patch.Count; i++)
+        {
+            GetQuadEndpointEvidence(patch[i].Key, out int weight, out float absTsdf,
+                out int provisional, out int pending, out int dirty);
+            if (pending > 0 || dirty > 0 || weight < minSurfaceCornerWeight)
+            {
+                LastSamePlaneAtomicPatchBlockedEvidenceCount++;
+                return false;
+            }
+            if (provisional > 0)
+                LastSamePlaneLayerEvidenceProvisionalAllowedCount++;
+        }
+
+        int boundaryDelta = ComputeSamePlaneAtomicPatchBoundaryDelta(patch, blockers, out bool topologySafe);
+        if (!topologySafe)
+        {
+            LastSamePlaneAtomicPatchBlockedTopologyCount++;
+            return false;
+        }
+        if (boundaryDelta >= 0)
+        {
+            LastSamePlaneAtomicPatchBlockedBoundaryCount++;
+            return false;
+        }
+        LastSamePlaneAtomicPatchBoundaryImprovingCount++;
+
+        bool consecutive = state.LastRebuildSequence == _newbornPholdCompetitionRebuildSequence - 1 &&
+                           Mathf.Abs(state.CandidateCount - patch.Count) <= Mathf.Max(1, patch.Count / 2) &&
+                           Mathf.Abs(state.BlockerCount - blockers.Count) <= Mathf.Max(1, blockers.Count / 2) &&
+                           Mathf.Abs(state.MatureBlockerCount - matureBlockerCount) <= Mathf.Max(1, matureBlockerCount / 2) &&
+                           Vector3.Distance(state.Center, patchCenter) <= 0.25f &&
+                           (state.Normal.sqrMagnitude <= 0.0001f || patchNormal.sqrMagnitude <= 0.0001f ||
+                            Mathf.Abs(Vector3.Dot(state.Normal.normalized, patchNormal.normalized)) >=
+                            Mathf.Clamp01(minGrazingSamePlaneLayerEvidenceNormalDot));
+        state.Consecutive = consecutive ? state.Consecutive + 1 : 1;
+        state.LastRebuildSequence = _newbornPholdCompetitionRebuildSequence;
+        state.CandidateCount = patch.Count;
+        state.BlockerCount = blockers.Count;
+        state.MatureBlockerCount = matureBlockerCount;
+        state.Center = patchCenter;
+        state.Normal = patchNormal;
+        _samePlaneAtomicPatchStates[patchKey] = state;
+        _samePlaneAtomicPatchObserved.Add(patchKey);
+        if (state.Consecutive < Mathf.Clamp(newbornLayerSwapConfirmRebuilds, 2, 4))
+        {
+            LastSamePlaneAtomicPatchPendingCount++;
+            if (matureBlockerCount > 0)
+                LastSamePlaneAtomicPatchShadowPendingCount++;
+            LastSamePlaneLayerEvidencePendingCount += patch.Count;
+            return false;
+        }
+
+        if (matureBlockerCount > 0)
+            LastSamePlaneAtomicPatchShadowConfirmedCount++;
+
+        for (int i = 0; i < blockers.Count; i++)
+            RemoveStableQuadAuditRecord(blockers[i]);
+        List<StableQuadKey> committed = new List<StableQuadKey>(patch.Count);
+        for (int i = 0; i < patch.Count; i++)
+        {
+            bool layerConflict = false;
+            bool topologyConflict = false;
+            DeferredArbitratedQuad candidate = patch[i];
+            EvaluateArbitratedQuadEdgeConflict(candidate.A, candidate.B, candidate.Winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(candidate.B, candidate.C, candidate.Winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(candidate.C, candidate.D, candidate.Winding, ref layerConflict, ref topologyConflict);
+            EvaluateArbitratedQuadEdgeConflict(candidate.D, candidate.A, candidate.Winding, ref layerConflict, ref topologyConflict);
+            if (layerConflict || topologyConflict)
+            {
+                for (int c = 0; c < committed.Count; c++)
+                {
+                    if (_stableQuadAuditRecords.TryGetValue(committed[c], out StableQuadAuditRecord record))
+                    {
+                        RemoveStableQuadAuditRecord(record);
+                        LastAddedSurfaceQuadCount = Mathf.Max(0, LastAddedSurfaceQuadCount - 1);
+                        if (record.RestoredByAtomicProvisionalBacking)
+                            LastAtomicProvisionalBackingRestoredQuadCount = Mathf.Max(0, LastAtomicProvisionalBackingRestoredQuadCount - 1);
+                    }
+                }
+                RestoreRemovedStableQuads(blockers);
+                LastSamePlaneAtomicPatchRollbackCount++;
+                _samePlaneAtomicPatchStates.Remove(patchKey);
+                _stableQuadTrianglesNeedRebuild = true;
+                return false;
+            }
+            CommitStableQuad(candidate.Key, candidate.A, candidate.B, candidate.C, candidate.D, vertices, triangles);
+            committed.Add(candidate.Key);
+        }
+
+        for (int i = 0; i < blockers.Count; i++)
+        {
+            _stableQuadShadowStates.Remove(blockers[i].Key);
+            _newbornLayerSwapStates.Remove(blockers[i].Key);
+            if (_previousStableQuadAuditRecords.ContainsKey(blockers[i].Key))
+                LastNewbornArbitrationPersistedFirstCount = Mathf.Max(0, LastNewbornArbitrationPersistedFirstCount - 1);
+            else
+                LastNewbornArbitrationAcceptedCount = Mathf.Max(0, LastNewbornArbitrationAcceptedCount - 1);
+            if (blockers[i].RestoredByAtomicProvisionalBacking)
+            {
+                LastAtomicProvisionalBackingRestoredQuadCount = Mathf.Max(0, LastAtomicProvisionalBackingRestoredQuadCount - 1);
+                LastAtomicRestoredArbitrationAcceptedCount = Mathf.Max(0, LastAtomicRestoredArbitrationAcceptedCount - 1);
+            }
+        }
+        for (int i = 0; i < patch.Count; i++)
+        {
+            if (patch[i].Restored) LastAtomicRestoredArbitrationAcceptedCount++;
+            LastNewbornArbitrationAcceptedCount++;
+        }
+        LastSamePlaneAtomicPatchAppliedCount++;
+        LastSamePlaneAtomicPatchAppliedQuadCount += patch.Count;
+        LastSamePlaneAtomicPatchRemovedBlockerCount += blockers.Count;
+        LastSamePlaneLayerEvidenceAppliedCount += patch.Count;
+        _samePlaneAtomicPatchStates.Remove(patchKey);
+        _stableQuadTrianglesNeedRebuild = true;
+        return true;
+    }
+
+    private int ComputeSamePlaneAtomicPatchBoundaryDelta(List<DeferredArbitratedQuad> patch,
+        List<StableQuadAuditRecord> blockers, out bool topologySafe)
+    {
+        Dictionary<ulong, int> additions = new Dictionary<ulong, int>();
+        Dictionary<ulong, int> removals = new Dictionary<ulong, int>();
+        HashSet<ulong> affected = new HashSet<ulong>();
+        for (int i = 0; i < patch.Count; i++)
+        {
+            ulong[] edges = { EdgeKey(patch[i].A, patch[i].B), EdgeKey(patch[i].B, patch[i].C),
+                              EdgeKey(patch[i].C, patch[i].D), EdgeKey(patch[i].D, patch[i].A) };
+            for (int e = 0; e < edges.Length; e++)
+            {
+                affected.Add(edges[e]);
+                additions.TryGetValue(edges[e], out int value);
+                additions[edges[e]] = value + 1;
+            }
+        }
+        for (int i = 0; i < blockers.Count; i++)
+        {
+            ulong[] edges = { EdgeKey(blockers[i].A, blockers[i].B), EdgeKey(blockers[i].B, blockers[i].C),
+                              EdgeKey(blockers[i].C, blockers[i].D), EdgeKey(blockers[i].D, blockers[i].A) };
+            for (int e = 0; e < edges.Length; e++)
+            {
+                affected.Add(edges[e]);
+                removals.TryGetValue(edges[e], out int value);
+                removals[edges[e]] = value + 1;
+            }
+        }
+        int beforeBoundary = 0;
+        int afterBoundary = 0;
+        topologySafe = true;
+        foreach (ulong edge in affected)
+        {
+            int before = _stableQuadAuditEdges.TryGetValue(edge, out List<StableQuadKey> linked) && linked != null ? linked.Count : 0;
+            additions.TryGetValue(edge, out int add);
+            removals.TryGetValue(edge, out int remove);
+            int after = before - remove + add;
+            if (after < 0 || after > 2)
+                topologySafe = false;
+            if (before == 1) beforeBoundary++;
+            if (after == 1) afterBoundary++;
+        }
+        return afterBoundary - beforeBoundary;
+    }
+
+    private void GetSamePlaneAtomicPatchGeometry(List<DeferredArbitratedQuad> patch, List<Vector3> vertices,
+        out Vector3 center, out Vector3 normal)
+    {
+        center = Vector3.zero;
+        normal = Vector3.zero;
+        int count = 0;
+        for (int i = 0; i < patch.Count; i++)
+        {
+            if (!TryGetDeferredQuadGeometry(patch[i], vertices, out Vector3 c, out Vector3 n))
+                continue;
+            center += c;
+            if (normal.sqrMagnitude > 0.0001f && Vector3.Dot(normal, n) < 0f)
+                n = -n;
+            normal += n;
+            count++;
+        }
+        if (count > 0) center /= count;
+        if (normal.sqrMagnitude > 0.0001f) normal.Normalize();
+    }
+
+    private SamePlaneAtomicPatchKey SamePlaneAtomicPatchSpatialKey(Vector3 center, Vector3 normal)
+    {
+        const float cell = 0.25f;
+        Vector3 abs = new Vector3(Mathf.Abs(normal.x), Mathf.Abs(normal.y), Mathf.Abs(normal.z));
+        byte axis = abs.x >= abs.y && abs.x >= abs.z ? (byte)0 : (abs.y >= abs.z ? (byte)1 : (byte)2);
+        return new SamePlaneAtomicPatchKey
+        {
+            X = Mathf.FloorToInt(center.x / cell),
+            Y = Mathf.FloorToInt(center.y / cell),
+            Z = Mathf.FloorToInt(center.z / cell),
+            NormalAxis = axis
+        };
+    }
+
+    private bool TryFindPriorSamePlaneAtomicPatchState(
+        SamePlaneAtomicPatchKey searchKey, Vector3 center, Vector3 normal,
+        out SamePlaneAtomicPatchKey matchedKey, out SamePlaneAtomicPatchState matchedState)
+    {
+        matchedKey = searchKey;
+        matchedState = default;
+        float bestDistance = 0.30f;
+        bool found = false;
+        for (int z = -1; z <= 1; z++)
+        for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++)
+        {
+            SamePlaneAtomicPatchKey key = new SamePlaneAtomicPatchKey
+            {
+                X = searchKey.X + x,
+                Y = searchKey.Y + y,
+                Z = searchKey.Z + z,
+                NormalAxis = searchKey.NormalAxis
+            };
+            if (!_samePlaneAtomicPatchStates.TryGetValue(key, out SamePlaneAtomicPatchState state) ||
+                state.LastRebuildSequence != _newbornPholdCompetitionRebuildSequence - 1)
+                continue;
+            if (state.Normal.sqrMagnitude > 0.0001f && normal.sqrMagnitude > 0.0001f &&
+                Mathf.Abs(Vector3.Dot(state.Normal.normalized, normal.normalized)) <
+                Mathf.Clamp01(minGrazingSamePlaneLayerEvidenceNormalDot))
+                continue;
+            float distance = Vector3.Distance(state.Center, center);
+            if (distance > bestDistance)
+                continue;
+            bestDistance = distance;
+            matchedKey = key;
+            matchedState = state;
+            found = true;
+        }
+        return found;
+    }
+
+    private void RetireStaleSamePlaneAtomicPatchStates()
+    {
+        if (_samePlaneAtomicPatchStates.Count <= 0)
+            return;
+        List<SamePlaneAtomicPatchKey> keys = new List<SamePlaneAtomicPatchKey>(_samePlaneAtomicPatchStates.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            if (!_samePlaneAtomicPatchObserved.Contains(keys[i]))
+                _samePlaneAtomicPatchStates.Remove(keys[i]);
+        }
+        _samePlaneAtomicPatchObserved.Clear();
+    }
+
+    private bool TryRepairBoundaryWorseningLayerBlock(DeferredArbitratedQuad candidate,
+        List<Vector3> vertices, List<int> triangles)
+    {
+        if (!repairBoundaryWorseningNewbornLayerBlocks || candidate.Winding == 0)
+            return false;
+        LastNewbornLayerSwapCheckedCount++;
+        HashSet<StableQuadKey> blockerKeys = new HashSet<StableQuadKey>();
+        ulong[] candidateEdges =
+        {
+            EdgeKey(candidate.A, candidate.B), EdgeKey(candidate.B, candidate.C),
+            EdgeKey(candidate.C, candidate.D), EdgeKey(candidate.D, candidate.A)
+        };
+        for (int edgeIndex = 0; edgeIndex < candidateEdges.Length; edgeIndex++)
+        {
+            if (!_stableQuadAuditEdges.TryGetValue(candidateEdges[edgeIndex], out List<StableQuadKey> linked) || linked == null)
+                continue;
+            for (int i = 0; i < linked.Count; i++)
+            {
+                if (_stableQuadAuditRecords.TryGetValue(linked[i], out StableQuadAuditRecord record) &&
+                    record.Winding != 0 && record.Winding != candidate.Winding)
+                    blockerKeys.Add(linked[i]);
+            }
+        }
+        if (blockerKeys.Count <= 0)
+            return false;
+
+        List<StableQuadAuditRecord> blockers = new List<StableQuadAuditRecord>(blockerKeys.Count);
+        foreach (StableQuadKey key in blockerKeys)
+        {
+            if (!_stableQuadAuditRecords.TryGetValue(key, out StableQuadAuditRecord blocker))
+                return false;
+            blockers.Add(blocker);
+        }
+
+        // First establish that the whole atomic exchange really shortens the open boundary.
+        // Evidence is compared only for swaps with a positive topological value.
+        int boundaryDelta = ComputeMultiQuadSwapBoundaryDelta(candidate, blockers, out bool topologySafe);
+        if (!topologySafe || boundaryDelta >= 0)
+        {
+            LastNewbornLayerSwapBlockedBoundaryCount++;
+            return false;
+        }
+        LastNewbornLayerSwapBoundaryImprovingCount++;
+
+        GetQuadEndpointEvidence(candidate.Key, out int candidateWeight, out float candidateAbs,
+            out int candidateProvisional, out int candidatePending, out int candidateDirty);
+        if (candidateProvisional > 0 || candidatePending > 0 || candidateDirty > 0 || candidateWeight < minSurfaceCornerWeight)
+        {
+            LastNewbornLayerSwapBlockedEvidenceCount++;
+            return false;
+        }
+
+        bool priorContinuation = _newbornLayerSwapStates.TryGetValue(candidate.Key, out NewbornLayerSwapState priorState) &&
+                                 priorState.LastRebuildSequence == _newbornPholdCompetitionRebuildSequence - 1;
+        float blockerScoreSum = 0f;
+        for (int blockerIndex = 0; blockerIndex < blockers.Count; blockerIndex++)
+        {
+            StableQuadAuditRecord blocker = blockers[blockerIndex];
+            StableQuadKey key = blocker.Key;
+            bool mature = blocker.RestoredByAtomicProvisionalBacking ||
+                          (_previousStableQuadAuditRecords.ContainsKey(key) && !priorContinuation) ||
+                          _heldProvisionalRetainedKeys.Contains(key) ||
+                          (_stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState shadow) && shadow.Committed);
+            if (mature)
+            {
+                LastNewbornLayerSwapBlockedMatureCount++;
+                return false;
+            }
+            GetQuadEndpointEvidence(key, out int blockerWeight, out float blockerAbs,
+                out int blockerProvisional, out int blockerPending, out int blockerDirty);
+            float riskPenalty = blockerProvisional * 1.0f + blockerPending * 1.5f + blockerDirty * 2.0f;
+            blockerScoreSum += blockerWeight + blockerAbs * 2f - riskPenalty;
+        }
+        float candidateScore = candidateWeight + candidateAbs * 2f;
+        float blockerAverageScore = blockerScoreSum / Mathf.Max(1, blockers.Count);
+        if (candidateScore + 0.5f < blockerAverageScore)
+        {
+            LastNewbornLayerSwapBlockedEvidenceCount++;
+            return false;
+        }
+        LastNewbornLayerSwapGroupEvidenceAcceptedCount++;
+        LastNewbornLayerSwapEligibleCount++;
+        List<StableQuadKey> sortedKeys = new List<StableQuadKey>(blockerKeys);
+        sortedKeys.Sort(CompareStableQuadKeys);
+        int signature = StableQuadBlockerSignature(sortedKeys);
+        _newbornLayerSwapStates.TryGetValue(candidate.Key, out NewbornLayerSwapState state);
+        bool consecutive = state.LastRebuildSequence == _newbornPholdCompetitionRebuildSequence - 1 &&
+                           state.BlockerSignature == signature;
+        state.Consecutive = consecutive ? state.Consecutive + 1 : 1;
+        state.LastRebuildSequence = _newbornPholdCompetitionRebuildSequence;
+        state.BlockerSignature = signature;
+        _newbornLayerSwapStates[candidate.Key] = state;
+        _newbornLayerSwapObserved.Add(candidate.Key);
+        if (state.Consecutive < Mathf.Clamp(newbornLayerSwapConfirmRebuilds, 2, 4))
+        {
+            LastNewbornLayerSwapPendingCount++;
+            return false;
+        }
+
+        for (int i = 0; i < blockers.Count; i++)
+            RemoveStableQuadAuditRecord(blockers[i]);
+        bool layerConflict = false;
+        bool topologyConflict = false;
+        EvaluateArbitratedQuadEdgeConflict(candidate.A, candidate.B, candidate.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(candidate.B, candidate.C, candidate.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(candidate.C, candidate.D, candidate.Winding, ref layerConflict, ref topologyConflict);
+        EvaluateArbitratedQuadEdgeConflict(candidate.D, candidate.A, candidate.Winding, ref layerConflict, ref topologyConflict);
+        if (layerConflict || topologyConflict)
+        {
+            RestoreRemovedStableQuads(blockers);
+            for (int i = 0; i < blockers.Count; i++)
+                _heldProvisionalRetainedKeys.Remove(blockers[i].Key);
+            LastNewbornLayerSwapRollbackCount++;
+            _newbornLayerSwapStates.Remove(candidate.Key);
+            return false;
+        }
+
+        for (int i = 0; i < blockers.Count; i++)
+        {
+            _stableQuadShadowStates.Remove(blockers[i].Key);
+            _newbornLayerSwapStates.Remove(blockers[i].Key);
+            if (_previousStableQuadAuditRecords.ContainsKey(blockers[i].Key))
+                LastNewbornArbitrationPersistedFirstCount = Mathf.Max(0, LastNewbornArbitrationPersistedFirstCount - 1);
+            else
+                LastNewbornArbitrationAcceptedCount = Mathf.Max(0, LastNewbornArbitrationAcceptedCount - 1);
+            if (blockers[i].RestoredByAtomicProvisionalBacking)
+            {
+                LastAtomicProvisionalBackingRestoredQuadCount = Mathf.Max(0, LastAtomicProvisionalBackingRestoredQuadCount - 1);
+                LastAtomicRestoredArbitrationAcceptedCount = Mathf.Max(0, LastAtomicRestoredArbitrationAcceptedCount - 1);
+            }
+        }
+        CommitStableQuad(candidate.Key, candidate.A, candidate.B, candidate.C, candidate.D, vertices, triangles);
+        if (candidate.Restored) LastAtomicRestoredArbitrationAcceptedCount++;
+        LastNewbornArbitrationAcceptedCount++;
+        LastNewbornLayerSwapAppliedCount++;
+        LastNewbornLayerSwapRemovedCount += blockers.Count;
+        _newbornLayerSwapStates.Remove(candidate.Key);
+        _stableQuadTrianglesNeedRebuild = true;
+        return true;
+    }
+
+    private int ComputeMultiQuadSwapBoundaryDelta(DeferredArbitratedQuad candidate,
+        List<StableQuadAuditRecord> blockers, out bool topologySafe)
+    {
+        HashSet<ulong> candidateEdges = new HashSet<ulong>
+        {
+            EdgeKey(candidate.A, candidate.B), EdgeKey(candidate.B, candidate.C),
+            EdgeKey(candidate.C, candidate.D), EdgeKey(candidate.D, candidate.A)
+        };
+        Dictionary<ulong, int> removals = new Dictionary<ulong, int>();
+        HashSet<ulong> affected = new HashSet<ulong>(candidateEdges);
+        for (int i = 0; i < blockers.Count; i++)
+        {
+            StableQuadAuditRecord b = blockers[i];
+            ulong[] edges = { EdgeKey(b.A, b.B), EdgeKey(b.B, b.C), EdgeKey(b.C, b.D), EdgeKey(b.D, b.A) };
+            for (int e = 0; e < edges.Length; e++)
+            {
+                affected.Add(edges[e]);
+                removals.TryGetValue(edges[e], out int count);
+                removals[edges[e]] = count + 1;
+            }
+        }
+        int beforeBoundary = 0;
+        int afterBoundary = 0;
+        topologySafe = true;
+        foreach (ulong edge in affected)
+        {
+            int before = _stableQuadAuditEdges.TryGetValue(edge, out List<StableQuadKey> linked) && linked != null ? linked.Count : 0;
+            removals.TryGetValue(edge, out int remove);
+            int after = before - remove + (candidateEdges.Contains(edge) ? 1 : 0);
+            if (before == 1) beforeBoundary++;
+            if (after == 1) afterBoundary++;
+            if (after < 0 || after > 2)
+                topologySafe = false;
+        }
+        return afterBoundary - beforeBoundary;
+    }
+
+    private void RetireStaleNewbornLayerSwapStates()
+    {
+        if (_newbornLayerSwapStates.Count <= 0)
+            return;
+        List<StableQuadKey> keys = new List<StableQuadKey>(_newbornLayerSwapStates.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            if (!_newbornLayerSwapObserved.Contains(keys[i]))
+                _newbornLayerSwapStates.Remove(keys[i]);
+        }
+        _newbornLayerSwapObserved.Clear();
     }
 
     private void EvaluateArbitratedQuadEdgeConflict(int a, int b, int candidateWinding, ref bool layerConflict, ref bool topologyConflict)
@@ -19308,6 +22141,24 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private void ResetStableQuadTopologyAudit()
     {
         _newbornPholdCompetitionRebuildSequence++;
+        _spatialPlaneRepairRejects.Clear();
+        _spatialArbitrationCells.Clear();
+        _spatialRuptureRecords.Clear();
+        _creaseRepairAuditRecords.Clear();
+        _doublePlaneCreaseObserved.Clear();
+        _newbornLayerSwapObserved.Clear();
+        _samePlaneAtomicPatchCandidates.Clear();
+        _samePlaneAtomicPatchObserved.Clear();
+        LastSpatialRuptureBoundaryEdgeCount = 0;
+        LastSpatialRuptureRawGapCount = 0;
+        LastSpatialRuptureDepthEdgeCount = 0;
+        LastSpatialRuptureRobustCount = 0;
+        LastSpatialRuptureSupportCount = 0;
+        LastSpatialRuptureViewConflictCount = 0;
+        LastSpatialRuptureOtherRawCount = 0;
+        LastSpatialRuptureTsdfStateCount = 0;
+        LastSpatialRupturePlaneRejectCount = 0;
+        LastSpatialRuptureArbitrationCount = 0;
         _newbornPholdPreferredObserved.Clear();
         _naturallyObservedStableQuadKeys.Clear();
         _stableQuadTrianglesNeedRebuild = false;
@@ -19367,6 +22218,41 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastNewbornArbitrationBlockedLayerCount = 0;
         LastNewbornArbitrationBlockedTopologyCount = 0;
         LastNewbornArbitrationBlockedWindingCount = 0;
+        LastNewbornLayerSwapCheckedCount = 0;
+        LastNewbornLayerSwapEligibleCount = 0;
+        LastNewbornLayerSwapPendingCount = 0;
+        LastNewbornLayerSwapAppliedCount = 0;
+        LastNewbornLayerSwapRemovedCount = 0;
+        LastNewbornLayerSwapBlockedMatureCount = 0;
+        LastNewbornLayerSwapBlockedEvidenceCount = 0;
+        LastNewbornLayerSwapBlockedBoundaryCount = 0;
+        LastNewbornLayerSwapBoundaryImprovingCount = 0;
+        LastNewbornLayerSwapGroupEvidenceAcceptedCount = 0;
+        LastNewbornLayerSwapRollbackCount = 0;
+        LastSamePlaneLayerEvidenceCheckedCount = 0;
+        LastSamePlaneLayerEvidenceMatchedCount = 0;
+        LastSamePlaneLayerEvidenceBlockedSupportCount = 0;
+        LastSamePlaneLayerEvidenceBlockedNormalCount = 0;
+        LastSamePlaneLayerEvidenceBlockedResidualCount = 0;
+        LastSamePlaneLayerEvidenceProvisionalAllowedCount = 0;
+        LastSamePlaneLayerEvidenceScoreOverrideCount = 0;
+        LastSamePlaneLayerEvidencePendingCount = 0;
+        LastSamePlaneLayerEvidenceAppliedCount = 0;
+        LastSamePlaneAtomicPatchGroupCount = 0;
+        LastSamePlaneAtomicPatchCandidateQuadCount = 0;
+        LastSamePlaneAtomicPatchBoundaryImprovingCount = 0;
+        LastSamePlaneAtomicPatchBlockedBoundaryCount = 0;
+        LastSamePlaneAtomicPatchBlockedMatureCount = 0;
+        LastSamePlaneAtomicPatchShadowMatureCount = 0;
+        LastSamePlaneAtomicPatchShadowPendingCount = 0;
+        LastSamePlaneAtomicPatchShadowConfirmedCount = 0;
+        LastSamePlaneAtomicPatchBlockedEvidenceCount = 0;
+        LastSamePlaneAtomicPatchBlockedTopologyCount = 0;
+        LastSamePlaneAtomicPatchPendingCount = 0;
+        LastSamePlaneAtomicPatchAppliedCount = 0;
+        LastSamePlaneAtomicPatchAppliedQuadCount = 0;
+        LastSamePlaneAtomicPatchRemovedBlockerCount = 0;
+        LastSamePlaneAtomicPatchRollbackCount = 0;
         LastProvisionalHeldRetentionScannedCount = 0;
         LastProvisionalHeldRetentionCandidateCount = 0;
         LastProvisionalHeldRetentionAcceptedCount = 0;
@@ -19516,7 +22402,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         quads.Add(key);
     }
 
-    private void FinalizeStableQuadTopologyAudit(List<int> renderTriangles)
+    private void FinalizeStableQuadTopologyAudit(List<int> renderTriangles, List<Vector3> vertices)
     {
         foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _stableQuadAuditRecords)
         {
@@ -19551,6 +22437,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (count == 1)
             {
                 LastStableQuadAuditBoundaryEdgeCount++;
+                RecordSpatialRuptureBoundaryEdge(pair.Key, pair.Value[0], vertices);
                 if (_heldProvisionalRetainedKeys.Contains(pair.Value[0]))
                     LastProvisionalHeldRetentionBoundaryEdgeCount++;
                 if (_stableQuadAuditRecords.TryGetValue(pair.Value[0], out StableQuadAuditRecord boundaryQuad) &&
@@ -19601,6 +22488,262 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _previousStableQuadAuditRecords.Clear();
         foreach (KeyValuePair<StableQuadKey, StableQuadAuditRecord> pair in _stableQuadAuditRecords)
             _previousStableQuadAuditRecords.Add(pair.Key, pair.Value);
+    }
+
+    private void RecordSpatialRuptureBoundaryEdge(ulong edgeKey, StableQuadKey quadKey, List<Vector3> vertices)
+    {
+        if (!writeSpatialRuptureDiagnostics || vertices == null)
+            return;
+        DecodeEdgeKey(edgeKey, out int a, out int b);
+        if (a < 0 || b < 0 || a >= vertices.Count || b >= vertices.Count)
+            return;
+
+        Vector3 pointA = vertices[a];
+        Vector3 pointB = vertices[b];
+        Vector3 midpoint = (pointA + pointB) * 0.5f;
+        SpatialRuptureRecord record = new SpatialRuptureRecord
+        {
+            VertexA = a,
+            VertexB = b,
+            PointA = pointA,
+            PointB = pointB,
+            Midpoint = midpoint,
+            Length = Vector3.Distance(pointA, pointB),
+            QuadKey = quadKey
+        };
+        if (_stableQuadAuditRecords.TryGetValue(quadKey, out StableQuadAuditRecord quad))
+            record.QuadNormal = quad.Normal;
+
+        record.HasCoverage = TryFindNearestRawCoverageCell(midpoint, out record.CoverageKey,
+            out record.CoverageLookupRadius, out record.Coverage);
+        FindSpatialArbitration(midpoint, out record.Arbitration);
+        if (TryWorldToVoxel(midpoint, out int vx, out int vy, out int vz))
+        {
+            record.VoxelX = vx;
+            record.VoxelY = vy;
+            record.VoxelZ = vz;
+            int index = Index(vx, vy, vz);
+            record.Tsdf = _tsdf[index];
+            record.Weight = _weights[index];
+            record.Provisional = HasProvisionalTsdfMarker(index);
+            record.Pending = VoxelHasPendingTsdfCorrection(index);
+            record.Dirty = VoxelIsDirtyQuarantined(index);
+            record.PlaneReject = FindNearestPlaneRepairReject(vx, vy, vz);
+        }
+        else
+        {
+            record.VoxelX = record.VoxelY = record.VoxelZ = -1;
+        }
+
+        ClassifySpatialRupture(ref record);
+        _spatialRuptureRecords.Add(record);
+        LastSpatialRuptureBoundaryEdgeCount++;
+    }
+
+    private bool TryFindNearestRawCoverageCell(Vector3 world, out Vector3Int bestKey, out int bestRadius,
+        out RawCoverageGridCell bestCell)
+    {
+        Vector3Int center = RawCoverageGridKey(world);
+        bestKey = center;
+        bestRadius = -1;
+        bestCell = default;
+        float bestDistance = float.PositiveInfinity;
+        int maxRadius = Mathf.Clamp(spatialRuptureLookupRadiusCells, 0, 3);
+        for (int radius = 0; radius <= maxRadius; radius++)
+        {
+            bool foundAtRadius = false;
+            for (int z = -radius; z <= radius; z++)
+            for (int y = -radius; y <= radius; y++)
+            for (int x = -radius; x <= radius; x++)
+            {
+                if (radius > 0 && Mathf.Max(Mathf.Abs(x), Mathf.Abs(y), Mathf.Abs(z)) != radius)
+                    continue;
+                Vector3Int key = center + new Vector3Int(x, y, z);
+                if (!_rawCoverageGridCells.TryGetValue(key, out RawCoverageGridCell cell))
+                    continue;
+                int total = cell.AcceptedCount + cell.ProblemCount;
+                if (total <= 0)
+                    continue;
+                float distance = Vector3.SqrMagnitude(cell.PositionSum / total - world);
+                if (distance >= bestDistance)
+                    continue;
+                bestDistance = distance;
+                bestKey = key;
+                bestCell = cell;
+                bestRadius = radius;
+                foundAtRadius = true;
+            }
+            if (foundAtRadius)
+                return true;
+        }
+        return false;
+    }
+
+    private void FindSpatialArbitration(Vector3 world, out SpatialArbitrationCell result)
+    {
+        result = default;
+        Vector3Int center = RawCoverageGridKey(world);
+        int maxRadius = Mathf.Clamp(spatialRuptureLookupRadiusCells, 0, 3);
+        for (int z = -maxRadius; z <= maxRadius; z++)
+        for (int y = -maxRadius; y <= maxRadius; y++)
+        for (int x = -maxRadius; x <= maxRadius; x++)
+        {
+            if (!_spatialArbitrationCells.TryGetValue(center + new Vector3Int(x, y, z), out SpatialArbitrationCell cell))
+                continue;
+            result.LayerCount += cell.LayerCount;
+            result.TopologyCount += cell.TopologyCount;
+            result.WindingCount += cell.WindingCount;
+        }
+    }
+
+    private PrimaryPlaneHoleRejectReason FindNearestPlaneRepairReject(int cx, int cy, int cz)
+    {
+        for (int radius = 0; radius <= 1; radius++)
+        for (int z = -radius; z <= radius; z++)
+        for (int y = -radius; y <= radius; y++)
+        for (int x = -radius; x <= radius; x++)
+        {
+            int vx = cx + x;
+            int vy = cy + y;
+            int vz = cz + z;
+            if (vx < 0 || vy < 0 || vz < 0 || vx >= _dimX || vy >= _dimY || vz >= _dimZ)
+                continue;
+            if (_spatialPlaneRepairRejects.TryGetValue(Index(vx, vy, vz), out PrimaryPlaneHoleRejectReason reason))
+                return reason;
+        }
+        return PrimaryPlaneHoleRejectReason.None;
+    }
+
+    private void ClassifySpatialRupture(ref SpatialRuptureRecord record)
+    {
+        int arbitration = record.Arbitration.LayerCount + record.Arbitration.TopologyCount + record.Arbitration.WindingCount;
+        string rawCause = record.HasCoverage ? DominantRawCoverageCause(record.Coverage) : "none";
+        if (arbitration > 0)
+        {
+            record.RootType = "mesh_arbitration";
+            record.Subtype = record.Arbitration.LayerCount >= record.Arbitration.TopologyCount && record.Arbitration.LayerCount >= record.Arbitration.WindingCount
+                ? "layer_block" : (record.Arbitration.TopologyCount >= record.Arbitration.WindingCount ? "topology_block" : "winding_block");
+            LastSpatialRuptureArbitrationCount++;
+        }
+        else if (!record.HasCoverage)
+        {
+            record.RootType = "raw_spatial_gap";
+            record.Subtype = "no_world_sample_near_boundary";
+            LastSpatialRuptureRawGapCount++;
+        }
+        else if (rawCause != "none")
+        {
+            record.RootType = "raw_filter";
+            record.Subtype = rawCause;
+            if (rawCause == "depth_discontinuity") LastSpatialRuptureDepthEdgeCount++;
+            else if (rawCause == "robust_depth_outlier") LastSpatialRuptureRobustCount++;
+            else if (rawCause == "insufficient_depth_support") LastSpatialRuptureSupportCount++;
+            else if (rawCause == "view_angle_conflict") LastSpatialRuptureViewConflictCount++;
+            else LastSpatialRuptureOtherRawCount++;
+        }
+        else if (record.Weight <= 0 || record.Pending || record.Dirty || record.Provisional)
+        {
+            record.RootType = "tsdf_state";
+            record.Subtype = record.Weight <= 0 ? "unobserved_voxel" :
+                (record.Dirty ? "dirty_quarantine" : (record.Pending ? "pending_correction" : "provisional_not_promoted"));
+            LastSpatialRuptureTsdfStateCount++;
+        }
+        else if (record.PlaneReject != PrimaryPlaneHoleRejectReason.None)
+        {
+            record.RootType = "plane_repair_reject";
+            record.Subtype = record.PlaneReject.ToString();
+            LastSpatialRupturePlaneRejectCount++;
+        }
+        else
+        {
+            record.RootType = "clean_boundary";
+            record.Subtype = "zero_crossing_or_assembly_gap";
+            LastSpatialRuptureTsdfStateCount++;
+        }
+    }
+
+    private static string DominantRawCoverageCause(RawCoverageGridCell cell)
+    {
+        int best = 0;
+        string cause = "none";
+        if (cell.DepthEdgeCount > best) { best = cell.DepthEdgeCount; cause = "depth_discontinuity"; }
+        if (cell.RobustCount > best) { best = cell.RobustCount; cause = "robust_depth_outlier"; }
+        if (cell.SupportCount > best) { best = cell.SupportCount; cause = "insufficient_depth_support"; }
+        if (cell.ConflictViewCount > best) { best = cell.ConflictViewCount; cause = "view_angle_conflict"; }
+        if (cell.ConflictEdgeCount > best) { best = cell.ConflictEdgeCount; cause = "tsdf_depth_edge_conflict"; }
+        if (cell.ConflictLockedCount > best) { best = cell.ConflictLockedCount; cause = "old_weight_locked"; }
+        if (cell.PendingCount > best) { best = cell.PendingCount; cause = "pending_or_stability"; }
+        if (cell.OutsideCount > best) { best = cell.OutsideCount; cause = "outside_volume"; }
+        if (cell.BasicFilterCount > best) { best = cell.BasicFilterCount; cause = "basic_filter"; }
+        if (cell.DepthNeighborhoodStageCount > best) { best = cell.DepthNeighborhoodStageCount; cause = "depth_neighborhood"; }
+        if (cell.RobustPrefilterStageCount > best) { best = cell.RobustPrefilterStageCount; cause = "robust_prefilter"; }
+        if (cell.TsdfSupportStageCount > best) { best = cell.TsdfSupportStageCount; cause = "tsdf_support"; }
+        if (cell.VoteRejectCount > best) { best = cell.VoteRejectCount; cause = "vote_reject"; }
+        if (cell.PendingHoldCount > best) { best = cell.PendingHoldCount; cause = "vote_pending_hold"; }
+        if (cell.OutsideVolumeStageCount > best) { best = cell.OutsideVolumeStageCount; cause = "outside_volume"; }
+        if (cell.AuditOutcomeStageCount > best) { best = cell.AuditOutcomeStageCount; cause = "audit_outcome"; }
+        if (cell.FallbackWeakStageCount > best) { best = cell.FallbackWeakStageCount; cause = "fallback_weak"; }
+        int otherBasic = Mathf.Max(0, cell.BasicRejectCount - cell.BasicFilterCount - cell.VoteRejectCount -
+            cell.FallbackWeakStageCount - cell.AuditOutcomeStageCount);
+        if (otherBasic > best || cell.OtherRejectCount > best) { cause = "other_reject"; }
+        return cause;
+    }
+
+    private static float RawCoverageMeanDistance(RawCoverageGridCell cell)
+    {
+        return cell.CameraDistanceCount > 0 ? cell.CameraDistanceSum / cell.CameraDistanceCount : -1f;
+    }
+
+    private static float RawCoverageMeanViewFacing(RawCoverageGridCell cell)
+    {
+        return cell.ViewFacingCount > 0 ? Mathf.Clamp01(cell.ViewFacingSum / cell.ViewFacingCount) : -1f;
+    }
+
+    private static float RawCoverageMeanIncidenceDegrees(RawCoverageGridCell cell)
+    {
+        float facing = RawCoverageMeanViewFacing(cell);
+        return facing >= 0f ? Mathf.Acos(Mathf.Clamp01(facing)) * Mathf.Rad2Deg : -1f;
+    }
+
+    private static string DominantRawCoverageAngleBand(RawCoverageGridCell cell)
+    {
+        int best = cell.FrontCount;
+        string band = best > 0 ? "front_0_45" : "unknown";
+        if (cell.ObliqueCount > best) { best = cell.ObliqueCount; band = "oblique_45_60"; }
+        if (cell.GrazingCount > best) { best = cell.GrazingCount; band = "grazing_60_78"; }
+        if (cell.ExtremeCount > best) { band = "extreme_78_90"; }
+        return band;
+    }
+
+    private static string DominantRescuedGrazingVoteRejectReason(RawCoverageGridCell cell)
+    {
+        int best = 0;
+        string reason = "none";
+        if (cell.RescuedVoteWeakSupportCount > best) { best = cell.RescuedVoteWeakSupportCount; reason = "weak_support"; }
+        if (cell.RescuedVoteDepthShiftCount > best) { best = cell.RescuedVoteDepthShiftCount; reason = "depth_shift"; }
+        if (cell.RescuedVoteGrazingViewCount > best) { best = cell.RescuedVoteGrazingViewCount; reason = "grazing_view"; }
+        if (cell.RescuedVoteLowWeightCount > best) { best = cell.RescuedVoteLowWeightCount; reason = "low_weight"; }
+        if (cell.RescuedVoteTemporalJumpCount > best) { best = cell.RescuedVoteTemporalJumpCount; reason = "temporal_depth_jump"; }
+        if (cell.RescuedVoteOffHistoryCount > best) { best = cell.RescuedVoteOffHistoryCount; reason = "off_history_surface"; }
+        if (cell.RescuedVoteOldTsdfCount > best) { best = cell.RescuedVoteOldTsdfCount; reason = "old_tsdf_residual"; }
+        if (cell.RescuedVoteWeakHistoryCount > best) { best = cell.RescuedVoteWeakHistoryCount; reason = "weak_history"; }
+        if (cell.RescuedVoteBandConflictCount > best) { best = cell.RescuedVoteBandConflictCount; reason = "band_conflict"; }
+        if (cell.RescuedVoteBandResidualCount > best) { best = cell.RescuedVoteBandResidualCount; reason = "band_residual"; }
+        if (cell.RescuedVoteSameFrameConflictCount > best)
+        {
+            best = cell.RescuedVoteSameFrameConflictCount;
+            reason = "same_frame_unknown_plane";
+            int sameFrameBest = cell.RescuedVoteSameFrameUnknownPlaneCount;
+            if (cell.RescuedVoteSameFrameSamePlaneGrazingCount > sameFrameBest)
+            {
+                sameFrameBest = cell.RescuedVoteSameFrameSamePlaneGrazingCount;
+                reason = "same_frame_same_plane_grazing";
+            }
+            if (cell.RescuedVoteSameFrameCrossPlaneCount > sameFrameBest)
+                reason = "same_frame_cross_plane";
+        }
+        if (cell.RescuedVoteCrossFrameConflictCount > best) { reason = "cross_frame_clean_conflict"; }
+        return reason;
     }
 
     private void EvaluateStableIncrementalQuadShadow()
@@ -19904,6 +23047,118 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float StableQuadShadowCommittedBonus(StableQuadKey key)
     {
         return _stableQuadShadowStates.TryGetValue(key, out StableQuadShadowState state) && state.Committed ? 4f : 0f;
+    }
+
+    private StringBuilder BuildSpatialRuptureCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(4096,
+            _spatialRuptureRecords.Count * 320 + _rawCoverageGridCells.Count * 160));
+        csv.AppendLine("row_type,root_type,subtype,world_x,world_y,world_z,edge_ax,edge_ay,edge_az,edge_bx,edge_by,edge_bz,edge_length_m,quad_x,quad_y,quad_z,quad_axis,quad_nx,quad_ny,quad_nz,coverage_x,coverage_y,coverage_z,coverage_lookup_radius,accepted_samples,problem_samples,basic_reject,depth_edge,robust,support,pending,conflict_edge,conflict_view,conflict_locked,outside,mean_capture_distance_m,mean_capture_view_facing,mean_incidence_degrees,dominant_angle_band,angle_known_samples,front_samples,front_accepted,oblique_samples,oblique_accepted,grazing_samples,grazing_accepted,extreme_samples,extreme_accepted,voxel_x,voxel_y,voxel_z,tsdf,weight,provisional,correction_pending,dirty,plane_reject,arbitration_layer,arbitration_topology,arbitration_winding,basic_filter_stage,vote_reject_stage,pending_hold_stage,other_reject_stage,rescued_grazing_final,rescued_grazing_accepted,rescued_grazing_pending,rescued_grazing_vote_reject,rescued_grazing_other,dominant_rescued_vote_reason,rescued_weak_support,rescued_depth_shift,rescued_grazing_view,rescued_low_weight,rescued_temporal_jump,rescued_off_history,rescued_old_tsdf,rescued_weak_history,rescued_band_conflict,rescued_band_residual,rescued_same_frame_conflict,rescued_cross_frame_conflict,depth_neighborhood_stage,robust_prefilter_stage,tsdf_support_stage,outside_volume_stage,audit_outcome_stage,fallback_weak_stage,rescued_grazing_depth_neighborhood,rescued_grazing_robust_prefilter,rescued_grazing_tsdf_support,rescued_grazing_outside_volume,rescued_grazing_audit_outcome,rescued_grazing_fallback_weak,rescued_same_frame_same_plane_grazing,rescued_same_frame_cross_plane,rescued_same_frame_unknown_plane,grazing_same_plane_frame_exempted,grazing_same_plane_frame_conflict_cleared");
+        for (int i = 0; i < _spatialRuptureRecords.Count; i++)
+        {
+            SpatialRuptureRecord r = _spatialRuptureRecords[i];
+            csv.Append("boundary_edge,").Append(r.RootType).Append(',').Append(r.Subtype).Append(',')
+                .Append(AuditFloat(r.Midpoint.x)).Append(',').Append(AuditFloat(r.Midpoint.y)).Append(',').Append(AuditFloat(r.Midpoint.z)).Append(',')
+                .Append(AuditFloat(r.PointA.x)).Append(',').Append(AuditFloat(r.PointA.y)).Append(',').Append(AuditFloat(r.PointA.z)).Append(',')
+                .Append(AuditFloat(r.PointB.x)).Append(',').Append(AuditFloat(r.PointB.y)).Append(',').Append(AuditFloat(r.PointB.z)).Append(',')
+                .Append(AuditFloat(r.Length)).Append(',')
+                .Append(r.QuadKey.X).Append(',').Append(r.QuadKey.Y).Append(',').Append(r.QuadKey.Z).Append(',').Append(StableQuadAxisName(r.QuadKey.Axis)).Append(',')
+                .Append(AuditFloat(r.QuadNormal.x)).Append(',').Append(AuditFloat(r.QuadNormal.y)).Append(',').Append(AuditFloat(r.QuadNormal.z)).Append(',')
+                .Append(r.HasCoverage ? r.CoverageKey.x.ToString(AuditCulture) : string.Empty).Append(',')
+                .Append(r.HasCoverage ? r.CoverageKey.y.ToString(AuditCulture) : string.Empty).Append(',')
+                .Append(r.HasCoverage ? r.CoverageKey.z.ToString(AuditCulture) : string.Empty).Append(',')
+                .Append(r.CoverageLookupRadius).Append(',')
+                .Append(r.Coverage.AcceptedCount).Append(',').Append(r.Coverage.ProblemCount).Append(',')
+                .Append(r.Coverage.BasicRejectCount).Append(',').Append(r.Coverage.DepthEdgeCount).Append(',')
+                .Append(r.Coverage.RobustCount).Append(',').Append(r.Coverage.SupportCount).Append(',').Append(r.Coverage.PendingCount).Append(',')
+                .Append(r.Coverage.ConflictEdgeCount).Append(',').Append(r.Coverage.ConflictViewCount).Append(',').Append(r.Coverage.ConflictLockedCount).Append(',').Append(r.Coverage.OutsideCount).Append(',')
+                .Append(r.HasCoverage ? AuditFloat(RawCoverageMeanDistance(r.Coverage)) : string.Empty).Append(',')
+                .Append(r.HasCoverage ? AuditFloat(RawCoverageMeanViewFacing(r.Coverage)) : string.Empty).Append(',')
+                .Append(r.HasCoverage ? AuditFloat(RawCoverageMeanIncidenceDegrees(r.Coverage)) : string.Empty).Append(',')
+                .Append(r.HasCoverage ? DominantRawCoverageAngleBand(r.Coverage) : "unknown").Append(',')
+                .Append(r.Coverage.ViewFacingCount).Append(',')
+                .Append(r.Coverage.FrontCount).Append(',').Append(r.Coverage.FrontAcceptedCount).Append(',')
+                .Append(r.Coverage.ObliqueCount).Append(',').Append(r.Coverage.ObliqueAcceptedCount).Append(',')
+                .Append(r.Coverage.GrazingCount).Append(',').Append(r.Coverage.GrazingAcceptedCount).Append(',')
+                .Append(r.Coverage.ExtremeCount).Append(',').Append(r.Coverage.ExtremeAcceptedCount).Append(',')
+                .Append(r.VoxelX).Append(',').Append(r.VoxelY).Append(',').Append(r.VoxelZ).Append(',').Append(AuditFloat(r.Tsdf)).Append(',').Append(r.Weight).Append(',')
+                .Append(r.Provisional ? 1 : 0).Append(',').Append(r.Pending ? 1 : 0).Append(',').Append(r.Dirty ? 1 : 0).Append(',')
+                .Append(r.PlaneReject == PrimaryPlaneHoleRejectReason.None ? string.Empty : r.PlaneReject.ToString()).Append(',')
+                .Append(r.Arbitration.LayerCount).Append(',').Append(r.Arbitration.TopologyCount).Append(',').Append(r.Arbitration.WindingCount);
+            AppendRawCoverageDecisionDiagnostics(csv, r.Coverage);
+            csv.AppendLine();
+        }
+
+        foreach (KeyValuePair<Vector3Int, RawCoverageGridCell> pair in _rawCoverageGridCells)
+        {
+            RawCoverageGridCell cell = pair.Value;
+            if (cell.ProblemCount <= 0)
+                continue;
+            int total = Mathf.Max(1, cell.AcceptedCount + cell.ProblemCount);
+            Vector3 world = cell.PositionSum / total;
+            string subtype = DominantRawCoverageCause(cell);
+            csv.Append("coverage_cell,raw_filter,").Append(subtype).Append(',')
+                .Append(AuditFloat(world.x)).Append(',').Append(AuditFloat(world.y)).Append(',').Append(AuditFloat(world.z))
+                .Append(",,,,,,,,,,,,,,")
+                .Append(pair.Key.x).Append(',').Append(pair.Key.y).Append(',').Append(pair.Key.z).Append(",0,")
+                .Append(cell.AcceptedCount).Append(',').Append(cell.ProblemCount).Append(',')
+                .Append(cell.BasicRejectCount).Append(',').Append(cell.DepthEdgeCount).Append(',').Append(cell.RobustCount).Append(',').Append(cell.SupportCount).Append(',').Append(cell.PendingCount).Append(',')
+                .Append(cell.ConflictEdgeCount).Append(',').Append(cell.ConflictViewCount).Append(',').Append(cell.ConflictLockedCount).Append(',').Append(cell.OutsideCount)
+                .Append(',').Append(AuditFloat(RawCoverageMeanDistance(cell)))
+                .Append(',').Append(AuditFloat(RawCoverageMeanViewFacing(cell)))
+                .Append(',').Append(AuditFloat(RawCoverageMeanIncidenceDegrees(cell)))
+                .Append(',').Append(DominantRawCoverageAngleBand(cell)).Append(',').Append(cell.ViewFacingCount)
+                .Append(',').Append(cell.FrontCount).Append(',').Append(cell.FrontAcceptedCount)
+                .Append(',').Append(cell.ObliqueCount).Append(',').Append(cell.ObliqueAcceptedCount)
+                .Append(',').Append(cell.GrazingCount).Append(',').Append(cell.GrazingAcceptedCount)
+                .Append(',').Append(cell.ExtremeCount).Append(',').Append(cell.ExtremeAcceptedCount)
+                .Append(",,,,,,,,,,,,,");
+            AppendRawCoverageDecisionDiagnostics(csv, cell);
+            csv.AppendLine();
+        }
+        return csv;
+    }
+
+    private static void AppendRawCoverageDecisionDiagnostics(StringBuilder csv, RawCoverageGridCell cell)
+    {
+        csv.Append(',').Append(cell.BasicFilterCount).Append(',').Append(cell.VoteRejectCount).Append(',')
+            .Append(cell.PendingHoldCount).Append(',').Append(cell.OtherRejectCount).Append(',')
+            .Append(cell.RescuedGrazingFinalCount).Append(',').Append(cell.RescuedGrazingAcceptedCount).Append(',')
+            .Append(cell.RescuedGrazingPendingCount).Append(',').Append(cell.RescuedGrazingVoteRejectCount).Append(',')
+            .Append(cell.RescuedGrazingOtherCount).Append(',').Append(DominantRescuedGrazingVoteRejectReason(cell)).Append(',')
+            .Append(cell.RescuedVoteWeakSupportCount).Append(',').Append(cell.RescuedVoteDepthShiftCount).Append(',')
+            .Append(cell.RescuedVoteGrazingViewCount).Append(',').Append(cell.RescuedVoteLowWeightCount).Append(',')
+            .Append(cell.RescuedVoteTemporalJumpCount).Append(',').Append(cell.RescuedVoteOffHistoryCount).Append(',')
+            .Append(cell.RescuedVoteOldTsdfCount).Append(',').Append(cell.RescuedVoteWeakHistoryCount).Append(',')
+            .Append(cell.RescuedVoteBandConflictCount).Append(',').Append(cell.RescuedVoteBandResidualCount).Append(',')
+            .Append(cell.RescuedVoteSameFrameConflictCount).Append(',').Append(cell.RescuedVoteCrossFrameConflictCount).Append(',')
+            .Append(cell.DepthNeighborhoodStageCount).Append(',').Append(cell.RobustPrefilterStageCount).Append(',')
+            .Append(cell.TsdfSupportStageCount).Append(',').Append(cell.OutsideVolumeStageCount).Append(',')
+            .Append(cell.AuditOutcomeStageCount).Append(',').Append(cell.FallbackWeakStageCount).Append(',')
+            .Append(cell.RescuedGrazingDepthEdgeCount).Append(',').Append(cell.RescuedGrazingRobustCount).Append(',')
+            .Append(cell.RescuedGrazingSupportCount).Append(',').Append(cell.RescuedGrazingOutsideVolumeCount).Append(',')
+            .Append(cell.RescuedGrazingAuditOutcomeCount).Append(',').Append(cell.RescuedGrazingFallbackWeakCount).Append(',')
+            .Append(cell.RescuedVoteSameFrameSamePlaneGrazingCount).Append(',')
+            .Append(cell.RescuedVoteSameFrameCrossPlaneCount).Append(',')
+            .Append(cell.RescuedVoteSameFrameUnknownPlaneCount).Append(',')
+            .Append(cell.GrazingSamePlaneFrameExemptedCount).Append(',')
+            .Append(cell.GrazingSamePlaneFrameConflictClearedCount);
+    }
+
+    private StringBuilder BuildCreaseRepairCsv()
+    {
+        StringBuilder csv = new StringBuilder(Mathf.Max(1024, _creaseRepairAuditRecords.Count * 180));
+        csv.AppendLine("key_x,key_y,key_z,status,consecutive,missing,total_applied,crease0_x,crease0_y,crease0_z,crease1_x,crease1_y,crease1_z,evidence_x,evidence_y,evidence_z");
+        for (int i = 0; i < _creaseRepairAuditRecords.Count; i++)
+        {
+            CreaseRepairAuditRecord r = _creaseRepairAuditRecords[i];
+            csv.Append(r.Key.X).Append(',').Append(r.Key.Y).Append(',').Append(r.Key.Z).Append(',')
+                .Append(r.Status).Append(',').Append(r.Consecutive).Append(',').Append(r.Missing).Append(',').Append(r.TotalApplied).Append(',')
+                .Append(AuditFloat(r.Crease0.x)).Append(',').Append(AuditFloat(r.Crease0.y)).Append(',').Append(AuditFloat(r.Crease0.z)).Append(',')
+                .Append(AuditFloat(r.Crease1.x)).Append(',').Append(AuditFloat(r.Crease1.y)).Append(',').Append(AuditFloat(r.Crease1.z)).Append(',')
+                .Append(AuditFloat(r.EvidencePoint.x)).Append(',').Append(AuditFloat(r.EvidencePoint.y)).Append(',').Append(AuditFloat(r.EvidencePoint.z)).AppendLine();
+        }
+        return csv;
     }
 
     private StringBuilder BuildStableQuadTopologyAuditCsv()
@@ -20364,6 +23619,299 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return result;
     }
 
+    private List<BoundaryEdgeInfo> CollectLogicalBoundaryEdges(List<Vector3> vertices, List<int> triangles)
+    {
+        int triangleCount = triangles.Count / 3;
+        Dictionary<ulong, List<int>> edgeToTriangles = new Dictionary<ulong, List<int>>(triangleCount * 3);
+        Vector3[] triangleNormals = new Vector3[triangleCount];
+        for (int tri = 0; tri < triangleCount; tri++)
+        {
+            triangleNormals[tri] = ComputeTriangleNormal(vertices, triangles, tri);
+            AddEdgeTriangle(edgeToTriangles, triangles[tri * 3], triangles[tri * 3 + 1], tri);
+            AddEdgeTriangle(edgeToTriangles, triangles[tri * 3 + 1], triangles[tri * 3 + 2], tri);
+            AddEdgeTriangle(edgeToTriangles, triangles[tri * 3 + 2], triangles[tri * 3], tri);
+        }
+
+        int boundaryUse = doubleSidedTriangles ? 2 : 1;
+        List<BoundaryEdgeInfo> result = new List<BoundaryEdgeInfo>();
+        foreach (KeyValuePair<ulong, List<int>> pair in edgeToTriangles)
+        {
+            if (pair.Value == null || pair.Value.Count != boundaryUse)
+                continue;
+            DecodeEdgeKey(pair.Key, out int a, out int b);
+            if (a < 0 || b < 0 || a >= vertices.Count || b >= vertices.Count)
+                continue;
+            Vector3 delta = vertices[b] - vertices[a];
+            float length = delta.magnitude;
+            if (length < voxelSizeMeters * 0.25f || length > voxelSizeMeters * 2.5f)
+                continue;
+            Vector3 normal = Vector3.zero;
+            for (int i = 0; i < pair.Value.Count; i++)
+            {
+                Vector3 candidate = triangleNormals[pair.Value[i]];
+                if (Finite(candidate) && candidate.sqrMagnitude > 0.0001f)
+                {
+                    normal = candidate.normalized;
+                    break;
+                }
+            }
+            if (normal.sqrMagnitude < 0.0001f)
+                continue;
+            result.Add(new BoundaryEdgeInfo
+            {
+                A = a,
+                B = b,
+                Center = (vertices[a] + vertices[b]) * 0.5f,
+                Direction = delta / length,
+                Normal = normal,
+                Length = length
+            });
+        }
+        return result;
+    }
+
+    private void RepairPersistentDoublePlaneCreases(List<Vector3> vertices, List<int> triangles, List<Color> colors)
+    {
+        if (!repairPersistentDoublePlaneCreases || vertices == null || triangles == null || triangles.Count < 3)
+            return;
+        CountMeshEdgeTopology(triangles, out int boundaryBefore, out int ignoredNonManifoldBefore);
+        LastDoublePlaneCreaseBoundaryEdgesBefore = boundaryBefore;
+        List<BoundaryEdgeInfo> edges = CollectLogicalBoundaryEdges(vertices, triangles);
+        float maxGap = Mathf.Max(voxelSizeMeters * 2f, voxelSizeMeters * maxDoublePlaneCreaseGapVoxelScale);
+        Dictionary<Vector3Int, List<int>> buckets = new Dictionary<Vector3Int, List<int>>();
+        for (int i = 0; i < edges.Count; i++)
+        {
+            Vector3Int bucket = BoundaryBridgeBucket(edges[i].Center, maxGap);
+            if (!buckets.TryGetValue(bucket, out List<int> list))
+            {
+                list = new List<int>(8);
+                buckets.Add(bucket, list);
+            }
+            list.Add(i);
+        }
+
+        HashSet<int> usedEdges = new HashSet<int>();
+        HashSet<CreaseCandidateKey> handledKeys = new HashSet<CreaseCandidateKey>();
+        _doublePlaneCreaseObserved.Clear();
+        int limit = Mathf.Max(1, maxDoublePlaneCreaseRepairsPerRebuild);
+        int patchesThisRebuild = 0;
+        for (int i = 0; i < edges.Count && patchesThisRebuild < limit; i++)
+        {
+            BoundaryEdgeInfo a = edges[i];
+            Vector3Int bucket = BoundaryBridgeBucket(a.Center, maxGap);
+            for (int bz = -1; bz <= 1 && patchesThisRebuild < limit; bz++)
+            for (int by = -1; by <= 1 && patchesThisRebuild < limit; by++)
+            for (int bx = -1; bx <= 1 && patchesThisRebuild < limit; bx++)
+            {
+                if (!buckets.TryGetValue(bucket + new Vector3Int(bx, by, bz), out List<int> candidates))
+                    continue;
+                for (int c = 0; c < candidates.Count && patchesThisRebuild < limit; c++)
+                {
+                    int j = candidates[c];
+                    if (j <= i || usedEdges.Contains(i) || usedEdges.Contains(j))
+                        continue;
+                    LastDoublePlaneCreaseCandidateCount++;
+                    if (!TryBuildDoublePlaneCrease(a, edges[j], vertices, maxGap,
+                        out int b0, out int b1, out Vector3 crease0, out Vector3 crease1))
+                    {
+                        LastDoublePlaneCreaseRejectedGeometryCount++;
+                        continue;
+                    }
+                    Vector3 evidencePoint = (a.Center + edges[j].Center) * 0.5f;
+                    if (!DoublePlaneCreaseEvidenceIsSafe(evidencePoint, crease0, crease1))
+                    {
+                        LastDoublePlaneCreaseRejectedEvidenceCount++;
+                        continue;
+                    }
+
+                    CreaseCandidateKey key = DoublePlaneCreaseKey((crease0 + crease1) * 0.5f);
+                    if (!handledKeys.Add(key))
+                        continue;
+                    _doublePlaneCreaseStates.TryGetValue(key, out CreaseCandidateState state);
+                    if (state.LastRebuildSequence != _newbornPholdCompetitionRebuildSequence)
+                    {
+                        state.Consecutive = state.LastRebuildSequence == _newbornPholdCompetitionRebuildSequence - 1 ||
+                                            (state.Committed && state.ConsecutiveMissing <= Mathf.Clamp(doublePlaneCreaseRetainMissingRebuilds, 1, 4))
+                            ? state.Consecutive + 1 : 1;
+                        state.LastRebuildSequence = _newbornPholdCompetitionRebuildSequence;
+                        state.ConsecutiveMissing = 0;
+                    }
+                    _doublePlaneCreaseObserved.Add(key);
+                    bool wasCommitted = state.Committed;
+                    if (!state.Committed && state.Consecutive >= Mathf.Clamp(doublePlaneCreaseConfirmRebuilds, 2, 4))
+                        state.Committed = true;
+                    if (!state.Committed)
+                    {
+                        _doublePlaneCreaseStates[key] = state;
+                        LastDoublePlaneCreasePendingCount++;
+                        _creaseRepairAuditRecords.Add(new CreaseRepairAuditRecord
+                        {
+                            Key = key, Crease0 = crease0, Crease1 = crease1, EvidencePoint = evidencePoint,
+                            Status = "pending", Consecutive = state.Consecutive, Missing = 0, TotalApplied = state.TotalApplied
+                        });
+                        continue;
+                    }
+
+                    if (!AddDoublePlaneCreasePatch(a.A, a.B, b0, b1, crease0, crease1, vertices, triangles, colors))
+                    {
+                        LastDoublePlaneCreaseRejectedGeometryCount++;
+                        continue;
+                    }
+                    usedEdges.Add(i);
+                    usedEdges.Add(j);
+                    patchesThisRebuild++;
+                    state.TotalApplied++;
+                    _doublePlaneCreaseStates[key] = state;
+                    LastDoublePlaneCreaseAppliedCount++;
+                    if (wasCommitted)
+                        LastDoublePlaneCreaseReappliedCount++;
+                    _creaseRepairAuditRecords.Add(new CreaseRepairAuditRecord
+                    {
+                        Key = key, Crease0 = crease0, Crease1 = crease1, EvidencePoint = evidencePoint,
+                        Status = wasCommitted ? "reapplied" : "committed", Consecutive = state.Consecutive,
+                        Missing = 0, TotalApplied = state.TotalApplied
+                    });
+                }
+            }
+        }
+
+        List<CreaseCandidateKey> keys = new List<CreaseCandidateKey>(_doublePlaneCreaseStates.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            CreaseCandidateKey key = keys[i];
+            if (_doublePlaneCreaseObserved.Contains(key))
+                continue;
+            CreaseCandidateState state = _doublePlaneCreaseStates[key];
+            state.Consecutive = 0;
+            state.ConsecutiveMissing++;
+            if (state.ConsecutiveMissing > Mathf.Clamp(doublePlaneCreaseRetainMissingRebuilds, 1, 4))
+            {
+                _doublePlaneCreaseStates.Remove(key);
+                LastDoublePlaneCreaseRetiredCount++;
+            }
+            else
+            {
+                _doublePlaneCreaseStates[key] = state;
+            }
+        }
+        foreach (CreaseCandidateState state in _doublePlaneCreaseStates.Values)
+            if (state.Committed)
+                LastDoublePlaneCreaseCommittedLiveCount++;
+        CountMeshEdgeTopology(triangles, out int boundaryAfter, out int ignoredNonManifoldAfter);
+        LastDoublePlaneCreaseBoundaryEdgesAfter = boundaryAfter;
+    }
+
+    private bool TryBuildDoublePlaneCrease(BoundaryEdgeInfo a, BoundaryEdgeInfo b, List<Vector3> vertices,
+        float maxGap, out int b0, out int b1, out Vector3 crease0, out Vector3 crease1)
+    {
+        b0 = b.A;
+        b1 = b.B;
+        crease0 = crease1 = Vector3.zero;
+        if (SharesEndpoint(a.A, a.B, b.A, b.B))
+            return false;
+        float normalDot = Mathf.Abs(Vector3.Dot(a.Normal, b.Normal));
+        if (normalDot > Mathf.Clamp(maxDoublePlaneCreaseNormalDot, 0f, 0.8f))
+            return false;
+        Vector3 cross = Vector3.Cross(a.Normal, b.Normal);
+        float denominator = cross.sqrMagnitude;
+        if (denominator < 0.08f)
+            return false;
+        Vector3 direction = cross / Mathf.Sqrt(denominator);
+        if (Mathf.Abs(Vector3.Dot(direction, Vector3.up)) < Mathf.Clamp01(minDoublePlaneCreaseVerticalDot) ||
+            Mathf.Abs(Vector3.Dot(a.Direction, direction)) < Mathf.Clamp01(minDoublePlaneCreaseDirectionDot) ||
+            Mathf.Abs(Vector3.Dot(b.Direction, direction)) < Mathf.Clamp01(minDoublePlaneCreaseDirectionDot))
+            return false;
+
+        float same = Vector3.Distance(vertices[a.A], vertices[b.A]) + Vector3.Distance(vertices[a.B], vertices[b.B]);
+        float crossed = Vector3.Distance(vertices[a.A], vertices[b.B]) + Vector3.Distance(vertices[a.B], vertices[b.A]);
+        if (crossed < same)
+        {
+            b0 = b.B;
+            b1 = b.A;
+        }
+        if (Vector3.Distance(vertices[a.A], vertices[b0]) > maxGap ||
+            Vector3.Distance(vertices[a.B], vertices[b1]) > maxGap)
+            return false;
+
+        float d1 = Vector3.Dot(a.Normal, a.Center);
+        float d2 = Vector3.Dot(b.Normal, b.Center);
+        Vector3 linePoint = (d1 * Vector3.Cross(b.Normal, cross) + d2 * Vector3.Cross(cross, a.Normal)) / denominator;
+        if (!Finite(linePoint))
+            return false;
+        float t0 = (Vector3.Dot(vertices[a.A] - linePoint, direction) + Vector3.Dot(vertices[b0] - linePoint, direction)) * 0.5f;
+        float t1 = (Vector3.Dot(vertices[a.B] - linePoint, direction) + Vector3.Dot(vertices[b1] - linePoint, direction)) * 0.5f;
+        crease0 = linePoint + direction * t0;
+        crease1 = linePoint + direction * t1;
+        float creaseLength = Vector3.Distance(crease0, crease1);
+        if (!Finite(crease0) || !Finite(crease1) || creaseLength < voxelSizeMeters * 0.2f || creaseLength > voxelSizeMeters * 3f)
+            return false;
+        float maxProjection = maxGap * 1.25f;
+        return Vector3.Distance(vertices[a.A], crease0) <= maxProjection &&
+               Vector3.Distance(vertices[a.B], crease1) <= maxProjection &&
+               Vector3.Distance(vertices[b0], crease0) <= maxProjection &&
+               Vector3.Distance(vertices[b1], crease1) <= maxProjection;
+    }
+
+    private bool DoublePlaneCreaseEvidenceIsSafe(Vector3 gapCenter, Vector3 crease0, Vector3 crease1)
+    {
+        if (!TryFindNearestRawCoverageCell(gapCenter, out _, out _, out RawCoverageGridCell coverage) || coverage.ProblemCount <= 0)
+            return false;
+        string cause = DominantRawCoverageCause(coverage);
+        if (cause != "robust_depth_outlier" && cause != "depth_discontinuity" && cause != "basic_filter_or_vote_reject")
+            return false;
+        Vector3[] samples = { gapCenter, crease0, crease1, (crease0 + crease1) * 0.5f };
+        for (int i = 0; i < samples.Length; i++)
+        {
+            if (!TryWorldToVoxel(samples[i], out int x, out int y, out int z))
+                return false;
+            int index = Index(x, y, z);
+            if (VoxelHasPendingTsdfCorrection(index) || VoxelIsDirtyQuarantined(index))
+                return false;
+        }
+        return true;
+    }
+
+    private CreaseCandidateKey DoublePlaneCreaseKey(Vector3 world)
+    {
+        float scale = Mathf.Max(0.01f, voxelSizeMeters * 1.5f);
+        return new CreaseCandidateKey
+        {
+            X = Mathf.RoundToInt(world.x / scale),
+            Y = Mathf.RoundToInt(world.y / scale),
+            Z = Mathf.RoundToInt(world.z / scale)
+        };
+    }
+
+    private bool AddDoublePlaneCreasePatch(int a0, int a1, int b0, int b1, Vector3 crease0, Vector3 crease1,
+        List<Vector3> vertices, List<int> triangles, List<Color> colors)
+    {
+        int c0 = vertices.Count;
+        int c1 = c0 + 1;
+        vertices.Add(crease0);
+        vertices.Add(crease1);
+        if (colors != null)
+        {
+            while (colors.Count < c0) colors.Add(cleanCoverCellColor);
+            colors.Add(cleanCoverCellColor);
+            colors.Add(cleanCoverCellColor);
+        }
+        AddCreaseTriangle(a0, a1, c1, triangles);
+        AddCreaseTriangle(a0, c1, c0, triangles);
+        AddCreaseTriangle(b0, c0, c1, triangles);
+        AddCreaseTriangle(b0, c1, b1, triangles);
+        LastDoublePlaneCreaseAddedTriangleCount += doubleSidedTriangles ? 8 : 4;
+        return true;
+    }
+
+    private void AddCreaseTriangle(int a, int b, int c, List<int> triangles)
+    {
+        triangles.Add(a); triangles.Add(b); triangles.Add(c);
+        if (doubleSidedTriangles)
+        {
+            triangles.Add(c); triangles.Add(b); triangles.Add(a);
+        }
+    }
+
     private bool PassBoundaryBridgeGeometry(
         BoundaryEdgeInfo a,
         BoundaryEdgeInfo b,
@@ -20729,6 +24277,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastBoundaryBridgeCandidateCount = 0;
         LastAddedBoundaryBridgeCount = 0;
         LastRejectedBoundaryBridgeCount = 0;
+        LastDoublePlaneCreaseCandidateCount = 0;
+        LastDoublePlaneCreasePendingCount = 0;
+        LastDoublePlaneCreaseAppliedCount = 0;
+        LastDoublePlaneCreaseReappliedCount = 0;
+        LastDoublePlaneCreaseCommittedLiveCount = 0;
+        LastDoublePlaneCreaseRetiredCount = 0;
+        LastDoublePlaneCreaseRejectedGeometryCount = 0;
+        LastDoublePlaneCreaseRejectedEvidenceCount = 0;
+        LastDoublePlaneCreaseAddedTriangleCount = 0;
+        LastDoublePlaneCreaseBoundaryEdgesBefore = 0;
+        LastDoublePlaneCreaseBoundaryEdgesAfter = 0;
+        LastPostRepairBoundaryEdgeCount = 0;
+        LastPostRepairNonManifoldEdgeCount = 0;
         LastHeldDisplayTriangleCount = 0;
         LastCommittedMeshHoldSpatialCount = 0;
         LastCommittedMeshHoldTriangleCount = 0;
@@ -22660,6 +26221,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _meshFilter.sharedMesh = _mesh;
         _meshRenderer.sharedMaterial = ResolveMaterial();
         _meshRenderer.enabled = showPlanarCoverSurfaceFill || !renderStableCellsAsPlanarMeshCover || !showPlanarCoverWireOverlay;
+        EnsureReferenceVolumetricObjects();
 
         if (_wireMeshFilter == null)
             _wireMeshFilter = _wireObject.GetComponent<MeshFilter>();
@@ -22687,6 +26249,90 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         EnsureDiagnosticHud();
     }
 
+    private void EnsureReferenceVolumetricObjects()
+    {
+        if (_referenceVolumetricObject == null)
+            _referenceVolumetricObject = new GameObject("[ScanCover] Reference Volumetric Shadow");
+
+        if (forceWorldSpaceDisplay)
+        {
+            _referenceVolumetricObject.transform.SetParent(null, true);
+            _referenceVolumetricObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _referenceVolumetricObject.transform.localScale = Vector3.one;
+        }
+        else if (_referenceVolumetricObject.transform.parent != displayRoot)
+        {
+            _referenceVolumetricObject.transform.SetParent(displayRoot, false);
+        }
+
+        if (_referenceVolumetricMeshFilter == null)
+            _referenceVolumetricMeshFilter = _referenceVolumetricObject.GetComponent<MeshFilter>();
+        if (_referenceVolumetricMeshFilter == null)
+            _referenceVolumetricMeshFilter = _referenceVolumetricObject.AddComponent<MeshFilter>();
+        if (_referenceVolumetricMeshRenderer == null)
+            _referenceVolumetricMeshRenderer = _referenceVolumetricObject.GetComponent<MeshRenderer>();
+        if (_referenceVolumetricMeshRenderer == null)
+            _referenceVolumetricMeshRenderer = _referenceVolumetricObject.AddComponent<MeshRenderer>();
+        if (_referenceVolumetricMesh == null)
+        {
+            _referenceVolumetricMesh = new Mesh { name = "ScanCover_Reference_Volumetric_Shadow" };
+            _referenceVolumetricMesh.indexFormat = IndexFormat.UInt32;
+        }
+        if (_referenceVolumetricMaterial == null)
+        {
+            Material source = ResolveMaterial();
+            if (source != null)
+            {
+                _referenceVolumetricMaterial = new Material(source)
+                {
+                    name = "ScanCover_Reference_Volumetric_Shadow_Material"
+                };
+                if (_referenceVolumetricMaterial.HasProperty("_BaseColor"))
+                    _referenceVolumetricMaterial.SetColor("_BaseColor", referenceVolumetricColor);
+                if (_referenceVolumetricMaterial.HasProperty("_Color"))
+                    _referenceVolumetricMaterial.SetColor("_Color", referenceVolumetricColor);
+                if (_referenceVolumetricMaterial.HasProperty("_Cull"))
+                    _referenceVolumetricMaterial.SetFloat("_Cull", 0f);
+            }
+        }
+        _referenceVolumetricMeshFilter.sharedMesh = _referenceVolumetricMesh;
+        _referenceVolumetricMeshRenderer.sharedMaterial = _referenceVolumetricMaterial != null
+            ? _referenceVolumetricMaterial
+            : ResolveMaterial();
+        _referenceVolumetricObject.SetActive(enableReferenceVolumetricShadow && showReferenceVolumetricShadowMesh);
+    }
+
+    private void EnsureReferenceClassicBoundaryObjects()
+    {
+        if (_referenceClassicBoundaryObject == null)
+            _referenceClassicBoundaryObject = new GameObject("[ScanCover] Reference Classic Boundaries");
+        if (forceWorldSpaceDisplay)
+        {
+            _referenceClassicBoundaryObject.transform.SetParent(null, true);
+            _referenceClassicBoundaryObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _referenceClassicBoundaryObject.transform.localScale = Vector3.one;
+        }
+        else if (_referenceClassicBoundaryObject.transform.parent != displayRoot)
+        {
+            _referenceClassicBoundaryObject.transform.SetParent(displayRoot, false);
+        }
+        if (_referenceClassicBoundaryMeshFilter == null)
+            _referenceClassicBoundaryMeshFilter = _referenceClassicBoundaryObject.GetComponent<MeshFilter>();
+        if (_referenceClassicBoundaryMeshFilter == null)
+            _referenceClassicBoundaryMeshFilter = _referenceClassicBoundaryObject.AddComponent<MeshFilter>();
+        if (_referenceClassicBoundaryRenderer == null)
+            _referenceClassicBoundaryRenderer = _referenceClassicBoundaryObject.GetComponent<MeshRenderer>();
+        if (_referenceClassicBoundaryRenderer == null)
+            _referenceClassicBoundaryRenderer = _referenceClassicBoundaryObject.AddComponent<MeshRenderer>();
+        if (_referenceClassicBoundaryMesh == null)
+        {
+            _referenceClassicBoundaryMesh = new Mesh { name = "ScanCover_ReferenceClassic_Boundaries" };
+            _referenceClassicBoundaryMesh.indexFormat = IndexFormat.UInt32;
+        }
+        _referenceClassicBoundaryMeshFilter.sharedMesh = _referenceClassicBoundaryMesh;
+        _referenceClassicBoundaryRenderer.sharedMaterial = ResolveRawDepthDebugMaterial();
+    }
+
     private void ApplyRawDepthDebugDisplayMode()
     {
         bool coverageOverlay = enableRawCoverageGridDiagnostics && showRawCoverageGridOverlay;
@@ -22697,6 +26343,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _meshRenderer.enabled = !showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis && !layerWireOnly && (showPlanarCoverSurfaceFill || !renderStableCellsAsPlanarMeshCover || !showPlanarCoverWireOverlay);
         if (_wireObject != null)
             _wireObject.SetActive(!showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis && (layerWireOnly || showMeshEdgeWireOverlay || showPlanarCoverWireOverlay));
+        if (_referenceVolumetricObject != null)
+            _referenceVolumetricObject.SetActive(
+                enableReferenceVolumetricShadow &&
+                (showReferenceVolumetricShadowMesh ||
+                 (showAcceptedReferenceClassicCompletionMesh && LastReferenceClassicCompletionAccepted)) &&
+                !showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis);
+        if (_referenceClassicBoundaryObject != null)
+            _referenceClassicBoundaryObject.SetActive(
+                enableReferenceClassicTsdf && showReferenceClassicBoundaryDiagnostics &&
+                _referenceClassicBoundaryMesh != null && _referenceClassicBoundaryMesh.vertexCount > 0 &&
+                !showRawDepthDebugView && !hideMeshForCoverage && !hideMeshForHoleDiagnosis);
         if (_rawDepthDebugObject != null)
             _rawDepthDebugObject.SetActive((showRawDepthDebugView || coverageOverlay) && LastRawDepthDebugRenderedCount > 0);
     }
@@ -22999,6 +26656,31 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int hudBatchRaw = batchActive ? _activeCaptureBatchUniqueRawFrames : LastCaptureBatchUniqueRawFrames;
         int hudBatchTimeouts = batchActive ? _activeCaptureBatchTimeouts : LastCaptureBatchTimeoutCount;
         string hudBatchResult = batchActive ? "RUN" : (LastCaptureBatchComplete ? "OK" : "WAIT");
+        if (compactDiagnosticHud)
+        {
+            bool meshVisible = _meshRenderer != null && _meshRenderer.enabled;
+            bool wireVisible = _wireObject != null && _wireObject.activeSelf;
+            bool meshReady = LastMeshTriangleCount > 0 && (meshVisible || wireVisible);
+            bool topologySafe = LastPostRepairNonManifoldEdgeCount <= 0 &&
+                                LastStableQuadAuditConflictEdgeCount <= 0 &&
+                                LastStableQuadAuditCompetingLayerEdgeCount <= 0;
+            string logStatus = _contributionLedgerWriteFailures > 0
+                ? "FAIL"
+                : (string.IsNullOrEmpty(_lastHoleDiagnosticPath) ? "OFF" : "OK");
+            _hudText.color = meshReady && topologySafe && logStatus != "FAIL" ? hudHealthyColor : hudWarningColor;
+            _hudText.text =
+                "ScanCover 03A\n" +
+                $"State  {(_captureRoutine != null ? "FUSING" : "READY")}  Batch {hudBatchResult} {hudBatchIntegrated}/{hudBatchTarget} raw={hudBatchRaw} timeout={hudBatchTimeouts}\n" +
+                $"Mesh   tri={LastMeshTriangleCount} quad={LastStableQuadAuditUniqueCount} edge={LastStableQuadAuditBoundaryEdgeCount} nonM={LastPostRepairNonManifoldEdgeCount}\n" +
+                $"Ref L  tri={LastReferenceVolumetricTriangleCount} edge={LastReferenceVolumetricBoundaryEdgeCount} nonM={LastReferenceVolumetricNonManifoldEdgeCount} d={LastReferenceVolumetricMeanLegacyDistanceMeters:0.000}m\n" +
+                $"Ref C  edge={LastReferenceClassicBoundaryEdgeCount}->{LastReferenceClassicCompletionBoundaryEdgeCount} patch={LastReferenceClassicCompletionPatchAcceptedCount}/{LastReferenceClassicCompletionPatchTrialCount} dtri={LastReferenceClassicCompletionDisplayTriangleCount} group={LastReferenceClassicCompletionGroupAcceptedCount}/{LastReferenceClassicCompletionGroupTrialCount}(-{LastReferenceClassicCompletionGroupBoundaryRemovedCount}) grp={LastReferenceClassicCompletionPatchCount} n/d={LastReferenceClassicCompletionPatchNormalRejectedCount}/{LastReferenceClassicCompletionPatchDistanceRejectedCount}\n" +
+                $"Angle  plane={LastGrazingPlaneSupportedSampleCount} clear={LastGrazingSamePlaneFrameConflictClearedSampleCount} voteR={LastRescuedGrazingVoteRejectCount}\n" +
+                $"Patch  group/q={LastSamePlaneAtomicPatchGroupCount}/{LastSamePlaneAtomicPatchCandidateQuadCount} wait={LastSamePlaneAtomicPatchPendingCount} appQ={LastSamePlaneAtomicPatchAppliedQuadCount} drop={LastSamePlaneAtomicPatchRemovedBlockerCount} rb={LastSamePlaneAtomicPatchRollbackCount}\n" +
+                $"Block  layer/topo/wind={LastNewbornArbitrationBlockedLayerCount}/{LastNewbornArbitrationBlockedTopologyCount}/{LastNewbornArbitrationBlockedWindingCount} gap={LastSpatialRuptureRawGapCount}\n" +
+                $"Safe   dup/rev/conflict={LastStableQuadAuditDuplicateKeyCount}/{LastStableQuadAuditReverseWindingDuplicateCount}/{LastStableQuadAuditConflictEdgeCount} compete={LastStableQuadAuditCompetingLayerEdgeCount}\n" +
+                $"Log    {logStatus}  rounds={CompletedCaptureBatchCount}";
+            return;
+        }
         if (useStage03ACleanIsoSurface)
         {
             bool meshVisible = _meshRenderer != null && _meshRenderer.enabled;
@@ -23015,10 +26697,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 $"BDelta : cell/quad/bound/conf/anchor={LastAtomicProvisionalBackingRestoredCellCount}/{LastAtomicProvisionalBackingRestoredQuadCount}/{LastAtomicProvisionalBackingRestoredBoundaryEdgeCount}/{LastAtomicProvisionalBackingRestoredConflictEdgeCount}/{LastAtomicProvisionalBackingPlaneAnchorAllowedCount}\n" +
                 $"BArb  : cand/ok/layer/topo/wind={LastAtomicRestoredArbitrationCandidateCount}/{LastAtomicRestoredArbitrationAcceptedCount}/{LastAtomicRestoredArbitrationBlockedLayerCount}/{LastAtomicRestoredArbitrationBlockedTopologyCount}/{LastAtomicRestoredArbitrationBlockedWindingCount}\n" +
                 $"NArb  : old/cand/ok/layer/topo/wind={LastNewbornArbitrationPersistedFirstCount}/{LastNewbornArbitrationCandidateCount}/{LastNewbornArbitrationAcceptedCount}/{LastNewbornArbitrationBlockedLayerCount}/{LastNewbornArbitrationBlockedTopologyCount}/{LastNewbornArbitrationBlockedWindingCount}\n" +
+                $"LSwap : chk/better/evOK/elig/wait/app/drop/mat/ev/bnd/rb={LastNewbornLayerSwapCheckedCount}/{LastNewbornLayerSwapBoundaryImprovingCount}/{LastNewbornLayerSwapGroupEvidenceAcceptedCount}/{LastNewbornLayerSwapEligibleCount}/{LastNewbornLayerSwapPendingCount}/{LastNewbornLayerSwapAppliedCount}/{LastNewbornLayerSwapRemovedCount}/{LastNewbornLayerSwapBlockedMatureCount}/{LastNewbornLayerSwapBlockedEvidenceCount}/{LastNewbornLayerSwapBlockedBoundaryCount}/{LastNewbornLayerSwapRollbackCount}\n" +
+                $"SPlane: chk/match/sup/norm/res/prov/score/wait/app={LastSamePlaneLayerEvidenceCheckedCount}/{LastSamePlaneLayerEvidenceMatchedCount}/{LastSamePlaneLayerEvidenceBlockedSupportCount}/{LastSamePlaneLayerEvidenceBlockedNormalCount}/{LastSamePlaneLayerEvidenceBlockedResidualCount}/{LastSamePlaneLayerEvidenceProvisionalAllowedCount}/{LastSamePlaneLayerEvidenceScoreOverrideCount}/{LastSamePlaneLayerEvidencePendingCount}/{LastSamePlaneLayerEvidenceAppliedCount}\n" +
+                $"SPatch: grp/q/better/bnd/mat/ev/topo/wait/appQ/drop/rb={LastSamePlaneAtomicPatchGroupCount}/{LastSamePlaneAtomicPatchCandidateQuadCount}/{LastSamePlaneAtomicPatchBoundaryImprovingCount}/{LastSamePlaneAtomicPatchBlockedBoundaryCount}/{LastSamePlaneAtomicPatchBlockedMatureCount}/{LastSamePlaneAtomicPatchBlockedEvidenceCount}/{LastSamePlaneAtomicPatchBlockedTopologyCount}/{LastSamePlaneAtomicPatchPendingCount}/{LastSamePlaneAtomicPatchAppliedQuadCount}/{LastSamePlaneAtomicPatchRemovedBlockerCount}/{LastSamePlaneAtomicPatchRollbackCount}\n" +
                 $"PHold : scan/cand/ok/contra/geom/arb={LastProvisionalHeldRetentionScannedCount}/{LastProvisionalHeldRetentionCandidateCount}/{LastProvisionalHeldRetentionAcceptedCount}/{LastProvisionalHeldRetentionBlockedContradictionCount}/{LastProvisionalHeldRetentionBlockedGeometryCount}/{LastProvisionalHeldRetentionBlockedLayerCount + LastProvisionalHeldRetentionBlockedTopologyCount + LastProvisionalHeldRetentionBlockedWindingCount}\n" +
                 $"NPx   : block/pair/free/new/old/amb={LastNewbornPholdCompetitionBlockedNewbornCount}/{LastNewbornPholdCompetitionPairCount}/{LastNewbornPholdCompetitionFullyResolvableCount}/{LastNewbornPholdCompetitionNewbornPreferredCount}/{LastNewbornPholdCompetitionPholdPreferredCount}/{LastNewbornPholdCompetitionAmbiguousCount}\n" +
                 $"NRep  : wait/apply/drop/rb={LastNewbornPholdReplacementPendingCount}/{LastNewbornPholdReplacementAppliedCount}/{LastNewbornPholdReplacementRemovedPholdCount}/{LastNewbornPholdReplacementRollbackCount}\n" +
                 $"NProb : live/ok/rb/cand/keep/contra/geom/arb={LastNewbornPholdProbationPendingCount}/{LastNewbornPholdProbationConfirmedCount}/{LastNewbornPholdProbationRollbackTransactionCount}/{LastNewbornPholdProbationRollbackCandidateCount}/{LastNewbornPholdProbationRollbackAcceptedCount}/{LastNewbornPholdProbationRollbackContradictionBlockedCount}/{LastNewbornPholdProbationRollbackGeometryBlockedCount}/{LastNewbornPholdProbationRollbackLayerBlockedCount + LastNewbornPholdProbationRollbackTopologyBlockedCount + LastNewbornPholdProbationRollbackWindingBlockedCount}\n" +
+                $"Rupt  : edge/gap/depth/rob/sup/view/raw/tsdf/plane/arb={LastSpatialRuptureBoundaryEdgeCount}/{LastSpatialRuptureRawGapCount}/{LastSpatialRuptureDepthEdgeCount}/{LastSpatialRuptureRobustCount}/{LastSpatialRuptureSupportCount}/{LastSpatialRuptureViewConflictCount}/{LastSpatialRuptureOtherRawCount}/{LastSpatialRuptureTsdfStateCount}/{LastSpatialRupturePlaneRejectCount}/{LastSpatialRuptureArbitrationCount}\n" +
+                $"Angle : front/obliq/graze/ext A:T={LastRawCoverageFrontAcceptedCount}:{LastRawCoverageFrontSampleCount}/{LastRawCoverageObliqueAcceptedCount}:{LastRawCoverageObliqueSampleCount}/{LastRawCoverageGrazingAcceptedCount}:{LastRawCoverageGrazingSampleCount}/{LastRawCoverageExtremeAcceptedCount}:{LastRawCoverageExtremeSampleCount}\n" +
+                $"GPlane: chk/sup/depth/edge/median={LastGrazingPlaneCheckedSampleCount}/{LastGrazingPlaneSupportedSampleCount}/{LastGrazingPlaneDepthNeighborRescueCount}/{LastGrazingPlaneEdgeExemptionCount}/{LastGrazingPlaneMedianCorrectionSkippedCount}\n" +
+                $"GFinal: all/A/P/V/O={LastRescuedGrazingFinalCount}/{LastRescuedGrazingAcceptedCount}/{LastRescuedGrazingPendingCount}/{LastRescuedGrazingVoteRejectCount}/{LastRescuedGrazingOtherCount} raw B/V/H={LastRawCoverageBasicFilterCount}/{LastRawCoverageVoteRejectCount}/{LastRawCoveragePendingHoldCount}\n" +
+                $"GExit : depth/rob/sup/out/audit/fb={LastRescuedGrazingDepthEdgeCount}/{LastRescuedGrazingRobustCount}/{LastRescuedGrazingSupportCount}/{LastRescuedGrazingOutsideVolumeCount}/{LastRescuedGrazingAuditOutcomeCount}/{LastRescuedGrazingFallbackWeakCount}\n" +
+                $"GVote : sup/shift/view/wt/temp/hist/off/old/band/res/same/cross={LastRescuedVoteWeakSupportCount}/{LastRescuedVoteDepthShiftCount}/{LastRescuedVoteGrazingViewCount}/{LastRescuedVoteLowWeightCount}/{LastRescuedVoteTemporalJumpCount}/{LastRescuedVoteWeakHistoryCount}/{LastRescuedVoteOffHistoryCount}/{LastRescuedVoteOldTsdfCount}/{LastRescuedVoteBandConflictCount}/{LastRescuedVoteBandResidualCount}/{LastRescuedVoteSameFrameConflictCount}/{LastRescuedVoteCrossFrameConflictCount}\n" +
+                $"GSame : plane/cross/unknown={LastRescuedVoteSameFrameSamePlaneGrazingCount}/{LastRescuedVoteSameFrameCrossPlaneCount}/{LastRescuedVoteSameFrameUnknownPlaneCount}\n" +
+                $"GSEmpt: chk/free/sample/clear={LastGrazingSamePlaneFrameCheckedCandidateCount}/{LastGrazingSamePlaneFrameExemptedCandidateCount}/{LastGrazingSamePlaneFrameExemptedSampleCount}/{LastGrazingSamePlaneFrameConflictClearedSampleCount}\n" +
+                $"Crease: cand/wait/new/re/live/ret/tri={LastDoublePlaneCreaseCandidateCount}/{LastDoublePlaneCreasePendingCount}/{LastDoublePlaneCreaseAppliedCount - LastDoublePlaneCreaseReappliedCount}/{LastDoublePlaneCreaseReappliedCount}/{LastDoublePlaneCreaseCommittedLiveCount}/{LastDoublePlaneCreaseRetiredCount}/{LastDoublePlaneCreaseAddedTriangleCount} edge={LastDoublePlaneCreaseBoundaryEdgesBefore}>{LastDoublePlaneCreaseBoundaryEdgesAfter} final={LastPostRepairBoundaryEdgeCount}/{LastPostRepairNonManifoldEdgeCount}\n" +
                 $"Holes : band/ok/drop={LastHoleSideRepairPlaneBandVoxelCount}/{LastHoleSideRepairPlaneConfirmedCount}/{LastHoleSideRepairPlaneRetiredCount}  N/S/P/T={LastHoleSideRepairRetiredNoNearAcceptCount}/{LastHoleSideRepairRetiredSignMismatchCount}/{LastHoleSideRepairRetiredPlaneMismatchCount}/{LastHoleSideRepairRetiredTsdfDeltaCount}\n" +
                 $"Patch : ok/vox/net={LastPrecisionHolePatchAppliedCount}/{LastPrecisionHolePatchVoxelCount}/{LastPrecisionHolePatchBlockedNetTopologyCount}  NZC={LastNoZeroCrossRouteAppliedCount}/{LastNoZeroCrossRouteCandidateCount}\n" +
                 $"Pend  : c/a/e/t={LastPendingHoleRouteCandidateCount}/{LastPendingHoleRouteAppliedCount}/{LastPendingHoleRouteBlockedEvidenceCount}/{LastPendingHoleRouteBlockedTopologyCount} evA/C/N={LastPendingHoleRouteAcceptedEvidenceCount}/{LastPendingHoleRouteCellEvidenceCount}/{LastPendingHoleRouteNeighborEvidenceCount}\n" +
@@ -23030,7 +26724,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 $"QFlow : keep/add/del/flip={LastStableQuadAuditPersistedCount}/{LastStableQuadAuditAddedCount}/{LastStableQuadAuditRemovedCount}/{LastStableQuadAuditWindingChangedCount}\n" +
                 $"QInc  : cand/commit/up/hold/ret={LastStableQuadShadowCandidateCount}/{LastStableQuadShadowCommittedCount}/{LastStableQuadShadowPromotedCount}/{LastStableQuadShadowHeldMissingCount}/{LastStableQuadShadowRetiredCount} conflict={LastStableQuadShadowConflictResolvedEdgeCount}/{LastStableQuadShadowConflictBlockedQuadCount} flip={LastStableQuadShadowWindingConflictCount}\n" +
                 $"QType : P/J/X/A/O={LastStableQuadHeldTypeProvisionalNotPromotedCount}/{LastStableQuadHeldTypeNearZeroJitterCount}/{LastStableQuadHeldTypeConfirmedContradictionCount}/{LastStableQuadHeldTypeCleanAssemblyLossCount}/{LastStableQuadHeldTypeOtherUnsettledCount} dom={GetStableQuadHeldDominantType()}\n" +
-                $"Mesh  : tris={LastMeshTriangleCount} wire={LastWireSegmentCount} vis={(meshVisible ? 1 : 0)}/{(wireVisible ? 1 : 0)}  log={(string.IsNullOrEmpty(_lastHoleDiagnosticPath) ? "off" : Path.GetFileName(_lastHoleDiagnosticPath))}";
+                $"Mesh  : tris={LastMeshTriangleCount} wire={LastWireSegmentCount} vis={(meshVisible ? 1 : 0)}/{(wireVisible ? 1 : 0)}  rounds={CompletedCaptureBatchCount} log={(string.IsNullOrEmpty(_lastHoleDiagnosticPath) ? "off" : Path.GetFileName(_lastHoleDiagnosticPath))}";
             return;
         }
         _hudText.text =

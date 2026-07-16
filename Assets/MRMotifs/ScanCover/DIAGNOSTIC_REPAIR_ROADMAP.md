@@ -43,6 +43,8 @@ compensate for mesh defects by weakening the completed TSDF safety gates.
 
 ### Stage 03A - Clean TSDF Iso-Surface
 
+Status: IN PROGRESS
+
 - Extract the mesh from valid weighted TSDF zero crossings.
 - Exclude pending, dirty, quarantined and unverified provisional voxels.
 - Preserve real corners and depth boundaries.
