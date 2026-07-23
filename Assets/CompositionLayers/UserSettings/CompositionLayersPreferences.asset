@@ -11,7 +11,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: c66150246d824833a8257ecb5aaa1d11, type: 3}
   m_Name: CompositionLayersPreferences
-  m_EditorClassIdentifier: 
+  m_EditorClassIdentifier: Unity.XR.CompositionLayers.Editor::Unity.XR.CompositionLayers.CompositionLayersPreferences
   m_DisplayAnglesAs: 0
   m_EmulationInScene: 1
   m_EmulationInPlayMode: 1

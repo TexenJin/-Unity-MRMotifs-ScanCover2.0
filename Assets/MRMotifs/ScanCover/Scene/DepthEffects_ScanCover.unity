@@ -9202,6 +9202,27 @@ MonoBehaviour:
   boundaryBridgeCleanRadiusVoxels: 1
   maxBoundaryBridgesPerRebuild: 1200
   doubleSidedTriangles: 1
+  enableFeaturePreservingMeshOptimization: 1
+  meshOptimizationIterations: 1
+  meshOptimizationMinPlanarNormalDot: 0.93
+  meshOptimizationFeatureAngleDegrees: 32
+  meshOptimizationTangentialRelaxation: 0.22
+  meshOptimizationPlaneProjectionStrength: 0.65
+  meshOptimizationMaxMoveVoxelScale: 0.12
+  meshOptimizationMinTriangleAreaRatio: 0.45
+  meshOptimizationMinTriangleNormalDot: 0.75
+  meshOptimizationMaxMeanQualityLoss: 0.005
+  enableQuestStyleDisplayRemesh: 1
+  questRemeshTargetEdgeVoxelScale: 1.35
+  questRemeshCollapseBelowTargetScale: 0.82
+  questRemeshMaxCollapseFraction: 0.16
+  questRemeshMaxEdgeCollapses: 1800
+  questRemeshMaxEdgeFlips: 1400
+  questRemeshMinFlipQualityGain: 0.025
+  questRemeshMaxFlipEdgeTargetScale: 1.55
+  questRemeshMaxProjectionVoxelScale: 0.08
+  questRemeshMinTriangleAreaVoxelSquared: 0.01
+  questRemeshMaxMeanQualityLoss: 0.01
   showFallbackSurfaceSamples: 0
   useFallbackMeshWhenTsdfExtractionEmpty: 0
   addFallbackOnlyAfterTsdfSupport: 1
