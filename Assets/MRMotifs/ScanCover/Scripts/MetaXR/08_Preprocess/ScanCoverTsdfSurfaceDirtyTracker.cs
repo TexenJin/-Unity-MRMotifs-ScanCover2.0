@@ -24,6 +24,8 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         public float StableNormalDot;
         public int MinCrossingsForNormal;
         public int RetireMissingRebuilds;
+        public int BoundaryMaskConfirmRebuilds;
+        public bool StabilizeBoundaryMaskChanges;
     }
 
     public struct Result
@@ -37,6 +39,8 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         public int ChangedBlocks;
         public int MissingBlocks;
         public int RetiredBlocks;
+        public int BoundaryMaskPendingBlocks;
+        public int BoundaryMaskConfirmedBlocks;
     }
 
     private sealed class Signature
@@ -64,6 +68,9 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
     {
         public Signature Last;
         public int MissingRebuilds;
+        public int StableBoundaryMask;
+        public int PendingBoundaryMask;
+        public int PendingBoundaryMaskRebuilds;
     }
 
     private readonly Dictionary<Vector3Int, Track> _tracks = new Dictionary<Vector3Int, Track>(256);
@@ -75,6 +82,8 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         new Dictionary<Vector3Int, ScanCoverIncrementalPatchShadow.PatchDirtyReason>(128);
     private readonly Dictionary<Vector3Int, int> _dependencyBoundaryMasks =
         new Dictionary<Vector3Int, int>(128);
+    private readonly Dictionary<Vector3Int, int> _currentBoundaryMasks =
+        new Dictionary<Vector3Int, int>(256);
     private int _rebuildSequence;
 
     public Result Update(
@@ -93,6 +102,7 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         _current.Clear();
         _dirty.Clear();
         _dependencyBoundaryMasks.Clear();
+        _currentBoundaryMasks.Clear();
         Result result = new Result { RebuildSequence = _rebuildSequence };
         if (tsdf == null || weights == null || dimX < 2 || dimY < 2 || dimZ < 2)
             return result;
@@ -133,6 +143,7 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
                 BoundaryMask = a.BoundaryMask
             };
             _current[pair.Key] = signature;
+            _currentBoundaryMasks[pair.Key] = signature.BoundaryMask;
             result.CurrentCrossings += a.Count;
         }
         result.CurrentBlocks = _current.Count;
@@ -141,7 +152,12 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         {
             if (!_tracks.TryGetValue(pair.Key, out Track track))
             {
-                _tracks[pair.Key] = new Track { Last = Clone(pair.Value) };
+                _tracks[pair.Key] = new Track
+                {
+                    Last = Clone(pair.Value),
+                    StableBoundaryMask = pair.Value.BoundaryMask,
+                    PendingBoundaryMask = pair.Value.BoundaryMask
+                };
                 _dirty[pair.Key] = ScanCoverIncrementalPatchShadow.PatchDirtyReason.New;
                 _dependencyBoundaryMasks[pair.Key] = pair.Value.BoundaryMask;
                 result.NewBlocks++;
@@ -149,7 +165,29 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
                 continue;
             }
             track.MissingRebuilds = 0;
-            if (Compatible(track.Last, pair.Value, settings))
+            bool boundaryMaskDiffers =
+                track.Last.BoundaryMask != pair.Value.BoundaryMask;
+            bool boundaryConfirmed;
+            if (settings.StabilizeBoundaryMaskChanges)
+            {
+                boundaryConfirmed = AdvanceBoundaryMaskState(
+                    track, pair.Value.BoundaryMask, settings.BoundaryMaskConfirmRebuilds);
+            }
+            else
+            {
+                // v1.4 production invariant: a boundary footprint change is an
+                // immediate topology change. Do not defer a new seam for a second
+                // rebuild merely to suppress mask noise.
+                boundaryConfirmed = boundaryMaskDiffers;
+                track.StableBoundaryMask = pair.Value.BoundaryMask;
+                track.PendingBoundaryMask = pair.Value.BoundaryMask;
+                track.PendingBoundaryMaskRebuilds = 0;
+            }
+            if (boundaryConfirmed)
+                result.BoundaryMaskConfirmedBlocks++;
+            else if (boundaryMaskDiffers)
+                result.BoundaryMaskPendingBlocks++;
+            if (Compatible(track.Last, pair.Value, settings) && !boundaryConfirmed)
                 result.CleanBlocks++;
             else
             {
@@ -192,6 +230,8 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
     public IReadOnlyDictionary<Vector3Int, ScanCoverIncrementalPatchShadow.PatchDirtyReason> DirtyReasons => _dirty;
     public IReadOnlyDictionary<Vector3Int, int> DependencyBoundaryMasks =>
         _dependencyBoundaryMasks;
+    public IReadOnlyDictionary<Vector3Int, int> CurrentBoundaryMasks =>
+        _currentBoundaryMasks;
 
     public void Clear()
     {
@@ -200,6 +240,7 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         _current.Clear();
         _dirty.Clear();
         _dependencyBoundaryMasks.Clear();
+        _currentBoundaryMasks.Clear();
         _rebuildSequence = 0;
     }
 
@@ -290,8 +331,6 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
     {
         if (a == null || b == null || a.CrossingCount <= 0 || b.CrossingCount <= 0)
             return false;
-        if (a.BoundaryMask != b.BoundaryMask)
-            return false;
         float ratio = b.CrossingCount / (float)a.CrossingCount;
         if (ratio < settings.StableCrossingRatio || ratio > 1f / settings.StableCrossingRatio)
             return false;
@@ -304,6 +343,33 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
             a.AverageNormal.sqrMagnitude > 0.000001f && b.AverageNormal.sqrMagnitude > 0.000001f &&
             Mathf.Abs(Vector3.Dot(a.AverageNormal, b.AverageNormal)) < settings.StableNormalDot)
             return false;
+        return true;
+    }
+
+    private static bool AdvanceBoundaryMaskState(
+        Track track,
+        int currentMask,
+        int requiredRebuilds)
+    {
+        if (track.StableBoundaryMask == currentMask)
+        {
+            track.PendingBoundaryMask = currentMask;
+            track.PendingBoundaryMaskRebuilds = 0;
+            return false;
+        }
+        if (track.PendingBoundaryMask == currentMask)
+        {
+            track.PendingBoundaryMaskRebuilds++;
+        }
+        else
+        {
+            track.PendingBoundaryMask = currentMask;
+            track.PendingBoundaryMaskRebuilds = 1;
+        }
+        if (track.PendingBoundaryMaskRebuilds < Mathf.Clamp(requiredRebuilds, 2, 8))
+            return false;
+        track.StableBoundaryMask = currentMask;
+        track.PendingBoundaryMaskRebuilds = 0;
         return true;
     }
 
@@ -346,5 +412,7 @@ public sealed class ScanCoverTsdfSurfaceDirtyTracker
         settings.StableNormalDot = Mathf.Clamp(settings.StableNormalDot, 0.5f, 1f);
         settings.MinCrossingsForNormal = Mathf.Clamp(settings.MinCrossingsForNormal, 2, 64);
         settings.RetireMissingRebuilds = Mathf.Clamp(settings.RetireMissingRebuilds, 2, 16);
+        settings.BoundaryMaskConfirmRebuilds = Mathf.Clamp(
+            settings.BoundaryMaskConfirmRebuilds, 2, 8);
     }
 }

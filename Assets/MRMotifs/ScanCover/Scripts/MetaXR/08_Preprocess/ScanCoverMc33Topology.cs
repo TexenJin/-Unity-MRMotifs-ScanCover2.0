@@ -21,6 +21,16 @@ internal static class ScanCoverMc33Topology
 
     // Current ScanCover cube edge -> MC33 v5.3 edge.
     private static readonly int[] CurrentToMcEdge = { 8, 4, 9, 0, 11, 6, 10, 2, 3, 7, 5, 1 };
+    // MC33 v5.3 edge -> current ScanCover cube edge.  Entry 12 is the
+    // optional MC33 interior/centre vertex and is preserved as 12.
+    private static readonly int[] McToCurrentEdge =
+        { 3, 11, 7, 8, 1, 10, 5, 9, 0, 2, 6, 4, 12 };
+    private static readonly int[,] CurrentEdges =
+    {
+        { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 },
+        { 4, 5 }, { 5, 6 }, { 6, 7 }, { 7, 4 },
+        { 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }
+    };
 
     // Generated verbatim from the MIT-licensed mc33cpp.h initializer.  The first
     // 256 entries classify sign masks; the remainder store selected triangle patterns.
@@ -301,6 +311,88 @@ internal static class ScanCoverMc33Topology
         }
         result.ComponentCount = components.Count;
         return result.ComponentCount > 0;
+    }
+
+    /// <summary>
+    /// Returns the ambiguity-resolved MC33 triangle pattern in ScanCover's
+    /// edge numbering.  Values 0..11 address cube edges and 12 addresses the
+    /// optional MC33 interior vertex.  The caller owns geometry placement.
+    /// </summary>
+    internal static bool TryBuildTriangles(
+        float[] currentValues,
+        List<int> currentTriangleVertices,
+        out Result result)
+    {
+        result = default(Result);
+        if (currentValues == null || currentValues.Length < 8 ||
+            currentTriangleVertices == null)
+            return false;
+
+        currentTriangleVertices.Clear();
+        float[] v =
+        {
+            -currentValues[0], -currentValues[3], -currentValues[7], -currentValues[4],
+            -currentValues[1], -currentValues[2], -currentValues[6], -currentValues[5]
+        };
+        int signMask = 0;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            if (v[corner] < 0f)
+                signMask |= 1 << (7 - corner);
+        }
+        if (signMask == 0 || signMask == 0xFF)
+            return false;
+
+        result.AmbiguousFaces = CountAmbiguousFaces(signMask);
+        int patternOffset = SelectPattern(v, signMask, ref result.InteriorTests);
+        result.PatternOffset = patternOffset;
+        if (patternOffset < 0 || patternOffset + 1 >= Table.Length)
+            return false;
+
+        int cursor = patternOffset;
+        int guard = 0;
+        while (++cursor < Table.Length && guard++ < 32)
+        {
+            int triangle = Table[cursor];
+            int a = triangle & 0xF;
+            int b = (triangle >> 4) & 0xF;
+            int c = (triangle >> 8) & 0xF;
+            if (a > 12 || b > 12 || c > 12)
+            {
+                currentTriangleVertices.Clear();
+                return false;
+            }
+            currentTriangleVertices.Add(McToCurrentEdge[a]);
+            currentTriangleVertices.Add(McToCurrentEdge[b]);
+            currentTriangleVertices.Add(McToCurrentEdge[c]);
+            if ((triangle & 0xF000) == 0)
+                break;
+        }
+        if (guard <= 0 || guard >= 32 ||
+            currentTriangleVertices.Count == 0 ||
+            currentTriangleVertices.Count % 3 != 0)
+        {
+            currentTriangleVertices.Clear();
+            return false;
+        }
+
+        bool[] active = new bool[12];
+        int[] components = new int[12];
+        for (int edge = 0; edge < 12; edge++)
+        {
+            int a = CurrentEdgeCorner(edge, 0);
+            int b = CurrentEdgeCorner(edge, 1);
+            active[edge] = (currentValues[a] < 0f) != (currentValues[b] < 0f);
+        }
+        if (TryBuildComponents(currentValues, active, components, out Result componentResult))
+            result.ComponentCount = componentResult.ComponentCount;
+        return true;
+    }
+
+    private static int CurrentEdgeCorner(int edge, int endpoint)
+    {
+        // Must remain identical to ScanCoverDirectionalTsdfShadow.CubeEdges.
+        return CurrentEdges[edge, endpoint];
     }
 
     private static int SelectPattern(float[] v, int i, ref int interiorTests)

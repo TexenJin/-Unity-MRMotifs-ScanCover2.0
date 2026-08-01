@@ -1,0 +1,318 @@
+// ScanCover QuestRoom candidate: GPU Surface Nets with persistent temporal state.
+// Adapted from QuestRoomScan SurfaceNetsExtract.compute
+// (https://github.com/arghyasur1991/QuestRoomScan, MIT License).
+#pragma kernel ClearCountersAndMap
+#pragma kernel ClassifyAndEmit
+#pragma kernel BuildDispatchArgs
+#pragma kernel InitSmooth
+#pragma kernel SmoothVertices
+#pragma kernel ApplySmooth
+#pragma kernel TemporalBlend
+#pragma kernel GenerateLineIndices
+#pragma kernel BuildDrawArgs
+#pragma kernel InitTemporal
+
+Texture3D<float2> _TsdfVolume;
+RWStructuredBuffer<int> _CoordVertexMap;
+
+struct SurfaceVertex
+{
+    float3 position;
+    float3 normal;
+    uint voxelIndex;
+    uint padding;
+};
+
+RWStructuredBuffer<SurfaceVertex> _Vertices;
+RWStructuredBuffer<uint> _LineIndices;
+RWStructuredBuffer<uint> _Counters;       // vertex, index, dropped
+RWStructuredBuffer<uint> _DispatchArgs;
+RWStructuredBuffer<uint> _DrawArgs;
+RWStructuredBuffer<float3> _SmoothPositionA;
+RWStructuredBuffer<float3> _SmoothPositionB;
+RWTexture3D<float4> _TemporalState;
+
+int3 _VoxelCount;
+int _TotalVoxelCount;
+int _MaximumVertices;
+int _MaximumLineIndices;
+float _VoxelSize;
+float _MinimumWeight;
+float _SmoothLambda;
+float _SmoothBeta;
+float _TemporalAlphaMaximum;
+float _TemporalAlphaMinimum;
+float _TemporalDecayRate;
+float _ConvergenceThreshold;
+float _TemporalDeadzone;
+
+static const int3 CornerOffset[8] =
+{
+    int3(0,0,0), int3(1,0,0), int3(1,0,1), int3(0,0,1),
+    int3(0,1,0), int3(1,1,0), int3(1,1,1), int3(0,1,1)
+};
+static const uint EdgeA[12] = { 0,1,2,3, 4,5,6,7, 0,1,2,3 };
+static const uint EdgeB[12] = { 1,2,3,0, 5,6,7,4, 4,5,6,7 };
+
+int Flatten(int3 c)
+{
+    return c.x + c.y * _VoxelCount.x + c.z * _VoxelCount.x * _VoxelCount.y;
+}
+
+int3 Unflatten(int index)
+{
+    int slice = _VoxelCount.x * _VoxelCount.y;
+    int z = index / slice;
+    int rem = index - z * slice;
+    int y = rem / _VoxelCount.x;
+    return int3(rem - y * _VoxelCount.x, y, z);
+}
+
+float3 VoxelToLocal(float3 c)
+{
+    return (c + 0.5 - (float3)_VoxelCount * 0.5) * _VoxelSize;
+}
+
+float SampleSdf(int3 c)
+{
+    float2 value = _TsdfVolume[c];
+    return value.y >= _MinimumWeight ? value.x : 0.0;
+}
+
+[numthreads(64, 1, 1)]
+void ClearCountersAndMap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0)
+    {
+        _Counters[0] = 0;
+        _Counters[1] = 0;
+        _Counters[2] = 0;
+    }
+    if (id.x < (uint)_TotalVoxelCount)
+        _CoordVertexMap[id.x] = -1;
+}
+
+[numthreads(4, 4, 4)]
+void InitTemporal(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+    _TemporalState[id] = float4(0.0, 0.0, 0.0, -1.0);
+}
+
+[numthreads(4, 4, 4)]
+void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)(_VoxelCount.x - 1) ||
+        id.y >= (uint)(_VoxelCount.y - 1) ||
+        id.z >= (uint)(_VoxelCount.z - 1)) return;
+
+    float3 crossingPosition = 0.0;
+    float3 gradient = 0.0;
+    uint crossingCount = 0;
+    uint observedCrossingCount = 0;
+
+    [unroll]
+    for (uint edge = 0; edge < 12; edge++)
+    {
+        int3 aCoord = (int3)id + CornerOffset[EdgeA[edge]];
+        int3 bCoord = (int3)id + CornerOffset[EdgeB[edge]];
+        float2 a = _TsdfVolume[aCoord];
+        float2 b = _TsdfVolume[bCoord];
+        bool aObserved = a.y >= _MinimumWeight;
+        bool bObserved = b.y >= _MinimumWeight;
+        float aValue = aObserved ? a.x : 0.0;
+        float bValue = bObserved ? b.x : 0.0;
+        float change = aValue - bValue;
+        gradient += (float3)(aCoord - bCoord) * change;
+        if ((aValue < 0.0) == (bValue < 0.0)) continue;
+        float t = abs(change) > 1e-6 ? saturate(aValue / change) : 0.5;
+        crossingPosition += (float3)aCoord + t * (float3)(bCoord - aCoord);
+        crossingCount++;
+        if (aObserved && bObserved) observedCrossingCount++;
+    }
+
+    if (crossingCount < 3 || observedCrossingCount == 0) return;
+    uint vertexIndex;
+    InterlockedAdd(_Counters[0], 1, vertexIndex);
+    if (vertexIndex >= (uint)_MaximumVertices)
+    {
+        InterlockedAdd(_Counters[2], 1);
+        return;
+    }
+
+    SurfaceVertex vertex;
+    vertex.position = VoxelToLocal(crossingPosition / crossingCount);
+    float gradientLengthSq = dot(gradient, gradient);
+    vertex.normal = gradientLengthSq > 1e-8 ? normalize(gradient) : float3(0, 1, 0);
+    vertex.voxelIndex = (uint)Flatten((int3)id);
+    vertex.padding = 0;
+    _Vertices[vertexIndex] = vertex;
+    _CoordVertexMap[vertex.voxelIndex] = (int)vertexIndex;
+}
+
+[numthreads(1, 1, 1)]
+void BuildDispatchArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    _DispatchArgs[0] = (count + 63) / 64;
+    _DispatchArgs[1] = 1;
+    _DispatchArgs[2] = 1;
+}
+
+[numthreads(64, 1, 1)]
+void InitSmooth(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    if (id.x >= count) return;
+    _SmoothPositionA[id.x] = _Vertices[id.x].position;
+}
+
+[numthreads(64, 1, 1)]
+void SmoothVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    if (id.x >= count) return;
+
+    SurfaceVertex vertex = _Vertices[id.x];
+    float3 position = _SmoothPositionA[id.x];
+    int3 coord = Unflatten((int)vertex.voxelIndex);
+    float3 neighbourMean = 0.0;
+    float totalWeight = 0.0;
+
+    [unroll]
+    for (int axis = 0; axis < 3; axis++)
+    {
+        [unroll]
+        for (int direction = -1; direction <= 1; direction += 2)
+        {
+            int3 neighbourCoord = coord;
+            neighbourCoord[axis] += direction;
+            if (neighbourCoord[axis] < 0 ||
+                neighbourCoord[axis] >= _VoxelCount[axis]) continue;
+
+            int neighbourIndex = _CoordVertexMap[Flatten(neighbourCoord)];
+            if (neighbourIndex < 0 || (uint)neighbourIndex >= count) continue;
+            float normalWeight = max(0.0, dot(vertex.normal, _Vertices[neighbourIndex].normal));
+            neighbourMean += _SmoothPositionA[neighbourIndex] * normalWeight;
+            totalWeight += normalWeight;
+        }
+    }
+
+    if (totalWeight < 0.001)
+    {
+        _SmoothPositionB[id.x] = position;
+        return;
+    }
+
+    neighbourMean /= totalWeight;
+    float3 laplacianPosition = lerp(position, neighbourMean, _SmoothLambda);
+    _SmoothPositionB[id.x] = laplacianPosition -
+        _SmoothBeta * (laplacianPosition - vertex.position);
+}
+
+[numthreads(64, 1, 1)]
+void ApplySmooth(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    if (id.x >= count) return;
+    SurfaceVertex vertex = _Vertices[id.x];
+    vertex.position = _SmoothPositionA[id.x];
+    _Vertices[id.x] = vertex;
+}
+
+[numthreads(64, 1, 1)]
+void TemporalBlend(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    if (id.x >= count) return;
+    SurfaceVertex vertex = _Vertices[id.x];
+    int3 coord = Unflatten((int)vertex.voxelIndex);
+    float4 previous = _TemporalState[coord];
+    if (previous.w < 0.0)
+    {
+        _TemporalState[coord] = float4(vertex.position, 0.0);
+        return;
+    }
+
+    float delta = distance(vertex.position, previous.xyz);
+    if (delta < _TemporalDeadzone)
+    {
+        vertex.position = previous.xyz;
+        _Vertices[id.x] = vertex;
+        _TemporalState[coord] = float4(previous.xyz, previous.w + 1.0);
+        return;
+    }
+
+    float age = delta > _ConvergenceThreshold ? 0.0 : previous.w + 1.0;
+    float alpha = _TemporalAlphaMinimum +
+        (_TemporalAlphaMaximum - _TemporalAlphaMinimum) * exp(-age * _TemporalDecayRate);
+    vertex.position = lerp(previous.xyz, vertex.position, alpha);
+    _Vertices[id.x] = vertex;
+    _TemporalState[coord] = float4(vertex.position, age);
+}
+
+void EmitTriangleWire(uint a, uint b, uint c)
+{
+    uint baseIndex;
+    InterlockedAdd(_Counters[1], 6, baseIndex);
+    if (baseIndex + 5 >= (uint)_MaximumLineIndices)
+    {
+        InterlockedAdd(_Counters[2], 1);
+        return;
+    }
+    _LineIndices[baseIndex + 0] = a;
+    _LineIndices[baseIndex + 1] = b;
+    _LineIndices[baseIndex + 2] = b;
+    _LineIndices[baseIndex + 3] = c;
+    _LineIndices[baseIndex + 4] = c;
+    _LineIndices[baseIndex + 5] = a;
+}
+
+void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
+{
+    if (any(coord - d1 < 0) || any(coord - d2 < 0)) return;
+    int3 edgeEnd = coord + axis;
+    if (edgeEnd.x >= _VoxelCount.x ||
+        edgeEnd.y >= _VoxelCount.y ||
+        edgeEnd.z >= _VoxelCount.z) return;
+    float aValue = SampleSdf(coord);
+    float bValue = SampleSdf(coord + axis);
+    if ((aValue < 0.0) == (bValue < 0.0)) return;
+
+    int a = _CoordVertexMap[Flatten(coord)];
+    int b = _CoordVertexMap[Flatten(coord - d1)];
+    int c = _CoordVertexMap[Flatten(coord - d1 - d2)];
+    int d = _CoordVertexMap[Flatten(coord - d2)];
+    if (a < 0 || b < 0 || c < 0 || d < 0) return;
+    if (aValue < 0.0)
+    {
+        EmitTriangleWire(c, b, a);
+        EmitTriangleWire(d, c, a);
+    }
+    else
+    {
+        EmitTriangleWire(a, c, d);
+        EmitTriangleWire(a, b, c);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void GenerateLineIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    if (id.x >= count) return;
+    int3 coord = Unflatten((int)_Vertices[id.x].voxelIndex);
+    TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0));
+    TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1));
+    TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0));
+}
+
+[numthreads(1, 1, 1)]
+void BuildDrawArgs(uint3 id : SV_DispatchThreadID)
+{
+    _DrawArgs[0] = min(_Counters[1], (uint)_MaximumLineIndices);
+    _DrawArgs[1] = 1;
+    _DrawArgs[2] = 0;
+    _DrawArgs[3] = 0;
+    _DrawArgs[4] = 0;
+}

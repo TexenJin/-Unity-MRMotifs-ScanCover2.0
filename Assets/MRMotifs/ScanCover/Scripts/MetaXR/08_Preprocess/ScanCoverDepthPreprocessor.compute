@@ -1,8 +1,11 @@
 #pragma kernel CSMain
+#pragma kernel CSNeighbourNormals
 
 Texture2DArray<float> _SourceDepthTexture;
+RWTexture2D<float4> _WorldPositionRawTexture;
 RWTexture2D<float4> _WorldPositionTexture;
 RWTexture2D<float4> _WorldNormalTexture;
+RWTexture2D<float4> _WorldNormalNeighbourTexture;
 RWTexture2D<float4> _ObservationMetaTexture;
 
 float4x4 _InverseReprojectionMatrices[2];
@@ -112,11 +115,18 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     if (!centerValid)
     {
+        _WorldPositionRawTexture[pixel] = 0.0.xxxx;
         _WorldPositionTexture[pixel] = 0.0.xxxx;
         _WorldNormalTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        _WorldNormalNeighbourTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
         _ObservationMetaTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
         return;
     }
+
+    // Keep the unfiltered projective sample beside the legacy smoothed point.
+    // Production continues to consume _WorldPositionTexture; the frozen paper
+    // DMC shadow consumes this raw point instead.
+    _WorldPositionRawTexture[pixel] = float4(centerWorld, 1.0);
 
     float3 leftWorld;
     float3 rightWorld;
@@ -195,4 +205,44 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     _WorldPositionTexture[pixel] = float4(filteredWorld, 1.0);
     _WorldNormalTexture[pixel] = float4(worldNormal, normalValid);
     _ObservationMetaTexture[pixel] = float4(1.0, confidence, centerLinearDepthMeters, normalValid);
+}
+
+float3 SafeNeighbourNormal(float3 horizontal, float3 vertical)
+{
+    float3 candidate = cross(vertical, horizontal);
+    float lengthSq = dot(candidate, candidate);
+    return lengthSq > 1e-10 ? candidate * rsqrt(lengthSq) : 0.0.xxx;
+}
+
+[numthreads(8, 8, 1)]
+void CSNeighbourNormals(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_OutputSize.x || id.y >= (uint)_OutputSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float4 centreRaw = _WorldPositionRawTexture[pixel];
+    if (centreRaw.w <= 0.0)
+    {
+        _WorldNormalNeighbourTexture[pixel] = 0.0.xxxx;
+        return;
+    }
+
+    int width = max(1, (int)_OutputSize.x);
+    int height = max(1, (int)_OutputSize.y);
+    int2 leftPixel = int2(max(pixel.x - 1, 0), pixel.y);
+    int2 rightPixel = int2(min(pixel.x + 1, width - 1), pixel.y);
+    int2 downPixel = int2(pixel.x, max(pixel.y - 1, 0));
+    int2 upPixel = int2(pixel.x, min(pixel.y + 1, height - 1));
+
+    float4 left = _WorldPositionTexture[leftPixel];
+    float4 right = _WorldPositionTexture[rightPixel];
+    float4 down = _WorldPositionTexture[downPixel];
+    float4 up = _WorldPositionTexture[upPixel];
+    bool supported = left.w > 0.0 && right.w > 0.0 && down.w > 0.0 && up.w > 0.0;
+    float3 normal = supported
+        ? SafeNeighbourNormal(right.xyz - left.xyz, up.xyz - down.xyz)
+        : 0.0.xxx;
+    float valid = dot(normal, normal) > 0.5 ? 1.0 : 0.0;
+    _WorldNormalNeighbourTexture[pixel] = float4(normal, valid);
 }

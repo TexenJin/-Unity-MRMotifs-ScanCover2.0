@@ -60,6 +60,21 @@ RISK_COLOR = np.asarray((1.0, 0.12, 0.08), dtype=np.float64)
 STABLE_COLOR = np.asarray((0.0, 0.85, 1.0), dtype=np.float64)
 FAR_COLOR = np.asarray((1.0, 0.8, 0.05), dtype=np.float64)
 
+STRUCTURE_SMOOTH = 0
+STRUCTURE_BOUNDARY_NEAR = 1
+STRUCTURE_BOUNDARY_FAR = 2
+STRUCTURE_CONVEX = 3
+STRUCTURE_CONCAVE = 4
+STRUCTURE_CREASE = 5
+STRUCTURE_LABELS = {
+    STRUCTURE_SMOOTH: "smooth",
+    STRUCTURE_BOUNDARY_NEAR: "occlusion_near",
+    STRUCTURE_BOUNDARY_FAR: "occlusion_far",
+    STRUCTURE_CONVEX: "convex_crease",
+    STRUCTURE_CONCAVE: "concave_crease",
+    STRUCTURE_CREASE: "crease_ambiguous",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -99,12 +114,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-distance", type=float, default=5.0)
     parser.add_argument("--min-distance", type=float, default=0.3)
     parser.add_argument("--noise-std", type=float, default=0.008)
+    parser.add_argument(
+        "--structured-edge-degradation",
+        action="store_true",
+        help=(
+            "Inject foreground/background mixing around depth discontinuities and signed creases. "
+            "This is the structure-specific Quest degradation path; Gaussian noise/dropout remain enabled."
+        ),
+    )
+    parser.add_argument("--structure-depth-jump", type=float, default=0.06)
+    parser.add_argument("--structure-crease-degrees", type=float, default=32.0)
+    parser.add_argument("--structure-band-meters", type=float, default=0.08)
+    parser.add_argument(
+        "--ideal-observer",
+        action="store_true",
+        help="Disable noise and dropout while keeping the same poses and working range for a path-only control.",
+    )
     parser.add_argument("--seed", type=int, default=15319)
     parser.add_argument(
         "--learning-profile",
         type=Path,
         default=None,
         help="Quest3 observation learning profile. If present, it replaces hard-coded risk/dropout priors.",
+    )
+    parser.add_argument(
+        "--degradation-model",
+        type=Path,
+        default=None,
+        help="ScanCoverQuestDepthDegradationModel/v1 generated from dense SCQ3BIN2 captures.",
     )
     parser.add_argument(
         "--pose-source",
@@ -196,6 +233,12 @@ def parse_args() -> argparse.Namespace:
         default=0.02,
         help="World-space cell size for exported virtual Quest3 observation features.",
     )
+    parser.add_argument(
+        "--surface-coverage-samples",
+        type=int,
+        default=50000,
+        help="Uniform truth-mesh samples used for geometry coverage metrics.",
+    )
     return parser.parse_args()
 
 
@@ -283,6 +326,174 @@ def profile_bin(value: float, rows: list[dict[str, Any]]) -> dict[str, Any] | No
             if float(lo_s) <= value < float(hi_s):
                 return row
     return None
+
+
+def numeric_profile_bin(
+    value: float,
+    rows: list[dict[str, Any]],
+    minimum_key: str,
+    maximum_key: str,
+) -> dict[str, Any] | None:
+    for row in rows:
+        if float(row.get(minimum_key, float("inf"))) <= value < float(row.get(maximum_key, float("-inf"))):
+            return row
+    return None
+
+
+def degradation_parameters(
+    distance: float,
+    angle_deg: float,
+    model: dict[str, Any] | None,
+    fallback_sigma: float,
+) -> tuple[float, float]:
+    if model is None:
+        return fallback_sigma * (1.0 + 0.25 * distance), -1.0
+
+    joint = None
+    for row in model.get("distanceAngleProfile", []):
+        if (
+            float(row.get("minDepthMeters", float("inf"))) <= distance < float(row.get("maxDepthMeters", float("-inf")))
+            and float(row.get("minAngleDegrees", float("inf"))) <= angle_deg < float(row.get("maxAngleDegrees", float("-inf")))
+        ):
+            joint = row
+            break
+    distance_row = numeric_profile_bin(distance, model.get("distanceProfile", []), "minDepthMeters", "maxDepthMeters")
+    angle_row = numeric_profile_bin(angle_deg, model.get("angleProfile", []), "minAngleDegrees", "maxAngleDegrees")
+    sigma_candidates = [
+        float(row.get("recommendedGaussianNoiseSigmaMeters", 0.0))
+        for row in (joint, distance_row, angle_row)
+        if row is not None and int(row.get("points", 0)) > 0
+    ]
+    sigma = max(sigma_candidates, default=fallback_sigma * (1.0 + 0.25 * distance))
+    dropout = float(
+        distance_row.get(
+            "recommendedDropoutProbability",
+            model.get("globalValidity", {}).get("sensorDropoutRatio", 0.0),
+        )
+    ) if distance_row is not None else float(model.get("globalValidity", {}).get("sensorDropoutRatio", 0.0))
+    return max(0.0001, sigma), min(0.7, max(0.0, dropout))
+
+
+def sample_depth_noise(ray_direction: np.ndarray, sigma: float) -> np.ndarray:
+    direction = normalize(np.asarray(ray_direction, dtype=np.float64))
+    axial = direction * np.random.normal(0.0, sigma)
+    lateral = np.random.normal(0.0, sigma * 0.20, 3)
+    lateral -= direction * float(np.dot(lateral, direction))
+    return axial + lateral
+
+
+def classify_structural_pixels(
+    t_hit: np.ndarray,
+    primitive_normals: np.ndarray,
+    rays: np.ndarray,
+    width: int,
+    height: int,
+    valid_mask: np.ndarray,
+    depth_jump_meters: float = 0.06,
+    crease_degrees: float = 32.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classify image-space surface transitions without using a room-specific model.
+
+    Normals are oriented toward the camera before the local plane-side test.  Two
+    positive plane-side tests indicate an inside/concave corner; two negative
+    tests indicate an outside/convex corner.  A large range jump takes priority
+    and records the competing near/far layer depth for structured mixing.
+    """
+    count = width * height
+    labels = np.full(count, STRUCTURE_SMOOTH, dtype=np.uint8)
+    partner_depths = np.full(count, np.nan, dtype=np.float64)
+    points = rays[:, :3].astype(np.float64) + rays[:, 3:].astype(np.float64) * np.where(
+        valid_mask, t_hit, 0.0
+    )[:, None]
+    normals = np.asarray(primitive_normals, dtype=np.float64).copy()
+    directions = rays[:, 3:].astype(np.float64)
+    for index in np.where(valid_mask)[0]:
+        if float(np.dot(normals[index], -directions[index])) < 0.0:
+            normals[index] *= -1.0
+
+    jump_threshold = max(0.015, float(depth_jump_meters))
+    crease_cos = math.cos(math.radians(max(5.0, min(89.0, float(crease_degrees)))))
+    for y in range(height):
+        for x in range(width):
+            index = y * width + x
+            if not valid_mask[index]:
+                continue
+            depth_candidates: list[tuple[float, int]] = []
+            crease_candidates: list[tuple[float, int]] = []
+            n0 = normalize(normals[index])
+            for dy, dx in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                nx, ny = x + dx, y + dy
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    continue
+                neighbor = ny * width + nx
+                if not valid_mask[neighbor]:
+                    continue
+                depth_delta = abs(float(t_hit[neighbor]) - float(t_hit[index]))
+                if depth_delta >= jump_threshold:
+                    depth_candidates.append((depth_delta, neighbor))
+                    continue
+                n1 = normalize(normals[neighbor])
+                normal_dot = max(-1.0, min(1.0, float(np.dot(n0, n1))))
+                if normal_dot <= crease_cos:
+                    crease_candidates.append((1.0 - normal_dot, neighbor))
+
+            if depth_candidates:
+                _, neighbor = max(depth_candidates, key=lambda item: item[0])
+                partner_depths[index] = float(t_hit[neighbor])
+                labels[index] = (
+                    STRUCTURE_BOUNDARY_NEAR
+                    if float(t_hit[index]) < float(t_hit[neighbor])
+                    else STRUCTURE_BOUNDARY_FAR
+                )
+                continue
+            if not crease_candidates:
+                continue
+            _, neighbor = max(crease_candidates, key=lambda item: item[0])
+            partner_depths[index] = float(t_hit[neighbor])
+            n1 = normalize(normals[neighbor])
+            center_to_neighbor = points[neighbor] - points[index]
+            side0 = float(np.dot(n0, center_to_neighbor))
+            side1 = float(np.dot(n1, -center_to_neighbor))
+            side_epsilon = 0.002
+            if side0 > side_epsilon and side1 > side_epsilon:
+                labels[index] = STRUCTURE_CONCAVE
+            elif side0 < -side_epsilon and side1 < -side_epsilon:
+                labels[index] = STRUCTURE_CONVEX
+            else:
+                labels[index] = STRUCTURE_CREASE
+    return labels, partner_depths
+
+
+def structured_edge_observation_range(
+    distance: float,
+    partner_depth: float,
+    structure_label: int,
+    angle_degrees: float,
+    model: dict[str, Any] | None,
+) -> tuple[float, bool, float]:
+    """Return a Quest-like mixed range and whether ownership should be considered ambiguous."""
+    if structure_label == STRUCTURE_SMOOTH or not math.isfinite(partner_depth):
+        return distance, False, 0.0
+    defaults = {
+        STRUCTURE_BOUNDARY_NEAR: 0.34,
+        STRUCTURE_BOUNDARY_FAR: 0.42,
+        STRUCTURE_CONVEX: 0.28,
+        STRUCTURE_CONCAVE: 0.16,
+        STRUCTURE_CREASE: 0.22,
+    }
+    config = model.get("structuredEdgeModel", {}) if model is not None else {}
+    label_name = STRUCTURE_LABELS.get(structure_label, "crease_ambiguous")
+    probability = float(config.get("mixProbability", {}).get(label_name, defaults.get(structure_label, 0.20)))
+    probability += 0.14 * min(1.0, max(0.0, angle_degrees) / 90.0)
+    probability = min(0.80, max(0.0, probability))
+    depth_gap = abs(partner_depth - distance)
+    ambiguous = depth_gap >= float(config.get("ownershipAmbiguousDepthGapMeters", 0.045))
+    if random.random() >= probability:
+        return distance, ambiguous, 0.0
+    alpha_min = float(config.get("mixAlphaMin", 0.18))
+    alpha_max = float(config.get("mixAlphaMax", 0.58))
+    alpha = random.uniform(min(alpha_min, alpha_max), max(alpha_min, alpha_max))
+    return distance + (partner_depth - distance) * alpha, True, alpha
 
 
 def risk_probability(
@@ -841,6 +1052,152 @@ def write_cloud(path: Path, points: np.ndarray, colors: np.ndarray, normals: np.
     o3d.io.write_point_cloud(str(path), cloud, write_ascii=False, compressed=False)
 
 
+def percentile(values: np.ndarray, q: float) -> float:
+    return float(np.percentile(values, q)) if len(values) else 0.0
+
+
+def build_mesh_structure_reference(
+    mesh: o3d.geometry.TriangleMesh,
+    crease_degrees: float = 32.0,
+) -> dict[str, np.ndarray]:
+    """Build room-independent truth references for boundary and signed crease bands."""
+    work = o3d.geometry.TriangleMesh(mesh)
+    if not work.has_triangle_normals():
+        work.compute_triangle_normals()
+    vertices = np.asarray(work.vertices, dtype=np.float64)
+    triangles = np.asarray(work.triangles, dtype=np.int64)
+    normals = np.asarray(work.triangle_normals, dtype=np.float64)
+    centers = np.mean(vertices[triangles], axis=1) if len(triangles) else np.empty((0, 3), dtype=np.float64)
+    edge_to_triangles: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for triangle_index, triangle in enumerate(triangles):
+        for a, b in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
+            edge_to_triangles[(min(int(a), int(b)), max(int(a), int(b)))].append(triangle_index)
+
+    references: dict[str, list[np.ndarray]] = {
+        "mesh_boundary": [],
+        "convex_crease": [],
+        "concave_crease": [],
+        "crease_ambiguous": [],
+    }
+    crease_cos = math.cos(math.radians(max(5.0, min(89.0, float(crease_degrees)))))
+    for (a, b), adjacent in edge_to_triangles.items():
+        midpoint = (vertices[a] + vertices[b]) * 0.5
+        if len(adjacent) == 1:
+            references["mesh_boundary"].append(midpoint)
+            continue
+        if len(adjacent) != 2:
+            references["crease_ambiguous"].append(midpoint)
+            continue
+        first, second = adjacent
+        n0 = normalize(normals[first])
+        n1 = normalize(normals[second])
+        normal_dot = max(-1.0, min(1.0, float(np.dot(n0, n1))))
+        if abs(normal_dot) > crease_cos:
+            continue
+        delta = centers[second] - centers[first]
+        side0 = float(np.dot(n0, delta))
+        side1 = float(np.dot(n1, -delta))
+        if side0 > 0.002 and side1 > 0.002:
+            label = "concave_crease"
+        elif side0 < -0.002 and side1 < -0.002:
+            label = "convex_crease"
+        else:
+            label = "crease_ambiguous"
+        references[label].append(midpoint)
+    return {
+        label: np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        for label, points in references.items()
+    }
+
+
+def distance_to_reference(points: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    if len(points) == 0 or len(reference) == 0:
+        return np.full(len(points), math.inf, dtype=np.float64)
+    source = o3d.geometry.PointCloud()
+    source.points = o3d.utility.Vector3dVector(points)
+    target = o3d.geometry.PointCloud()
+    target.points = o3d.utility.Vector3dVector(reference)
+    return np.asarray(source.compute_point_cloud_distance(target), dtype=np.float64)
+
+
+def compute_surface_coverage_metrics(
+    mesh: o3d.geometry.TriangleMesh,
+    observed_points: np.ndarray,
+    sample_count: int,
+    vertical_axis_name: str,
+    structure_reference: dict[str, np.ndarray] | None = None,
+    structure_band_meters: float = 0.08,
+) -> dict[str, Any]:
+    """Measure how much Replica truth surface is reached by accepted observations.
+
+    This deliberately evaluates the raw virtual observations, not a reconstructed
+    mesh. It therefore isolates scan-path/degradation coverage from later TSDF and
+    topology decisions.
+    """
+    if sample_count <= 0 or len(observed_points) == 0:
+        return {
+            "truthSampleCount": 0,
+            "observedPointCount": int(len(observed_points)),
+            "coverageAtMeters": {},
+        }
+
+    truth = mesh.sample_points_uniformly(number_of_points=sample_count, use_triangle_normal=True)
+    observed = o3d.geometry.PointCloud()
+    observed.points = o3d.utility.Vector3dVector(observed_points)
+    observed = observed.voxel_down_sample(voxel_size=0.015)
+    distances = np.asarray(truth.compute_point_cloud_distance(observed), dtype=np.float64)
+    positions = np.asarray(truth.points, dtype=np.float64)
+    normals = np.asarray(truth.normals, dtype=np.float64)
+
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(vertical_axis_name, 2)
+    coordinate = positions[:, axis_index]
+    axis_min = float(np.min(coordinate))
+    axis_max = float(np.max(coordinate))
+    vertical_component = np.abs(normals[:, axis_index]) if len(normals) else np.zeros(len(positions))
+
+    thresholds = (0.03, 0.05, 0.10, 0.20)
+    coverage = {f"{threshold:.2f}": float(np.mean(distances <= threshold)) for threshold in thresholds}
+
+    def band(mask: np.ndarray, threshold: float = 0.05) -> dict[str, Any]:
+        count = int(np.sum(mask))
+        return {
+            "truthSamples": count,
+            "coverageAt0.05m": float(np.mean(distances[mask] <= threshold)) if count else 0.0,
+            "distanceP90m": percentile(distances[mask], 90.0) if count else 0.0,
+        }
+
+    structure_bands: dict[str, Any] = {}
+    if structure_reference:
+        for label, reference_points in structure_reference.items():
+            reference_distance = distance_to_reference(positions, reference_points)
+            structure_bands[label] = band(reference_distance <= max(0.01, structure_band_meters))
+
+    return {
+        "truthSampleCount": int(len(distances)),
+        "observedPointCount": int(len(observed_points)),
+        "observedDownsampledPointCount": int(len(observed.points)),
+        "coverageAtMeters": coverage,
+        "truthToObservationDistanceMeters": {
+            "p50": percentile(distances, 50.0),
+            "p90": percentile(distances, 90.0),
+            "p95": percentile(distances, 95.0),
+            "max": float(np.max(distances)) if len(distances) else 0.0,
+        },
+        "surfaceBands": {
+            "lower0.30m": band(coordinate <= axis_min + 0.30),
+            "upper0.30m": band(coordinate >= axis_max - 0.30),
+            "vertical": band(vertical_component < 0.50),
+            "horizontal": band(vertical_component >= math.cos(math.radians(30.0))),
+            "oblique": band(
+                (vertical_component >= 0.50)
+                & (vertical_component < math.cos(math.radians(30.0)))
+            ),
+        },
+        "structureBands": structure_bands,
+        "structureBandMeters": structure_band_meters,
+    }
+
+
 def ratio_table(counts: dict[str, int], risk_counts: dict[str, int], order: list[tuple[str, float, float]]) -> list[dict[str, Any]]:
     rows = []
     total = max(1, sum(counts.values()))
@@ -1109,10 +1466,11 @@ def main() -> int:
 
     random.seed(args.seed)
     np.random.seed(args.seed)
+    o3d.utility.random.seed(args.seed)
 
     if not args.truth_mesh.exists():
         raise FileNotFoundError(args.truth_mesh)
-    if not args.pose_session.exists():
+    if args.pose_source == "real" and not args.pose_session.exists():
         raise FileNotFoundError(args.pose_session)
     if not args.real_summary.exists():
         raise FileNotFoundError(args.real_summary)
@@ -1126,6 +1484,16 @@ def main() -> int:
         learning_profile = json.loads(args.learning_profile.read_text(encoding="utf-8-sig"))
         profile_range = learning_profile.get("workingRangeMeters", {})
         args.max_distance = min(args.max_distance, float(profile_range.get("max", args.max_distance)))
+    degradation_model = None
+    if args.degradation_model is not None:
+        if not args.degradation_model.exists():
+            raise FileNotFoundError(args.degradation_model)
+        degradation_model = json.loads(args.degradation_model.read_text(encoding="utf-8-sig"))
+        if degradation_model.get("schema") != "ScanCoverQuestDepthDegradationModel/v1":
+            raise ValueError(f"Unsupported degradation model: {degradation_model.get('schema')}")
+        model_range = degradation_model.get("workingRangeMeters", {})
+        args.min_distance = max(args.min_distance, float(model_range.get("min", args.min_distance)))
+        args.max_distance = min(args.max_distance, float(model_range.get("max", args.max_distance)))
     scan_feedback = None
     if args.scan_feedback and args.scan_feedback.exists():
         scan_feedback = json.loads(args.scan_feedback.read_text(encoding="utf-8-sig"))
@@ -1133,7 +1501,7 @@ def main() -> int:
 
     mesh = load_legacy_mesh(args.truth_mesh)
     scene = build_scene(mesh)
-    manifest_rows = pick_evenly(read_manifest(args.pose_session), args.max_frames)
+    manifest_rows = pick_evenly(read_manifest(args.pose_session), args.max_frames) if args.pose_session.exists() else []
     first_real_camera = load_camera(Path(manifest_rows[0]["cameraJson"])) if manifest_rows else {}
     default_fov = float(first_real_camera.get("camera", {}).get("fieldOfView", 100.2439))
     default_aspect = float(first_real_camera.get("camera", {}).get("aspect", args.width / max(1, args.height)))
@@ -1193,6 +1561,12 @@ def main() -> int:
     hit = 0
     accepted = 0
     risk_total = 0
+    observation_errors: list[float] = []
+    structure_counts = {label: 0 for label in STRUCTURE_LABELS.values()}
+    structure_accepted = {label: 0 for label in STRUCTURE_LABELS.values()}
+    structure_mixed = {label: 0 for label in STRUCTURE_LABELS.values()}
+    structure_ambiguous = {label: 0 for label in STRUCTURE_LABELS.values()}
+    structured_shift_meters: list[float] = []
     feature_cells: dict[tuple[int, int, int], dict[str, Any]] = defaultdict(make_feature_cell)
 
     for frame_index, camera_data in enumerate(camera_frames):
@@ -1211,22 +1585,61 @@ def main() -> int:
         directions = rays[:, 3:].astype(np.float64)
         points = origins + directions * t_hit[:, None]
         edge_like = estimate_edge_like(points - origins, args.width, args.height, finite)
+        structure_labels, structure_partner_depths = classify_structural_pixels(
+            t_hit,
+            primitive_normals,
+            rays,
+            args.width,
+            args.height,
+            finite,
+            args.structure_depth_jump,
+            args.structure_crease_degrees,
+        )
 
         for i in np.where(finite)[0]:
             distance = float(t_hit[i])
             if distance < args.min_distance or distance > args.max_distance:
                 continue
 
+            structure_label = int(structure_labels[i])
+            structure_name = STRUCTURE_LABELS.get(structure_label, "smooth")
+            structure_counts[structure_name] += 1
+
             normal = normalize(np.asarray(primitive_normals[i], dtype=np.float64))
             view_dir = normalize(-directions[i])
             angle = math.degrees(math.acos(max(-1.0, min(1.0, abs(float(np.dot(normal, view_dir)))))))
             risk_p = risk_probability(distance, angle, bool(edge_like[i]), learning_profile)
-            risk = random.random() < risk_p
-            if random.random() < dropout_probability(distance, angle, risk, learning_profile):
+            risk = False if args.ideal_observer else random.random() < risk_p
+            noise_sigma, measured_dropout = degradation_parameters(distance, angle, degradation_model, args.noise_std)
+            dropout_p = dropout_probability(distance, angle, risk, learning_profile)
+            if measured_dropout >= 0.0:
+                dropout_p = min(0.7, measured_dropout + (0.02 if risk else 0.0) + (0.02 if angle >= 75.0 else 0.0))
+            if args.ideal_observer:
+                noise_sigma = 0.0
+                dropout_p = 0.0
+            if random.random() < dropout_p:
                 continue
 
-            noise = np.random.normal(0.0, args.noise_std * (1.0 + 0.25 * distance), 3)
-            observed_point = points[i] + noise
+            observed_range = distance
+            ownership_ambiguous = False
+            structured_alpha = 0.0
+            if args.structured_edge_degradation and not args.ideal_observer:
+                observed_range, ownership_ambiguous, structured_alpha = structured_edge_observation_range(
+                    distance,
+                    float(structure_partner_depths[i]),
+                    structure_label,
+                    angle,
+                    degradation_model,
+                )
+            structured_shift = abs(observed_range - distance)
+            if structured_alpha > 0.0:
+                structure_mixed[structure_name] += 1
+                structured_shift_meters.append(structured_shift)
+            if ownership_ambiguous:
+                structure_ambiguous[structure_name] += 1
+            noise = sample_depth_noise(directions[i], noise_sigma)
+            observed_point = origins[i] + directions[i] * observed_range + noise
+            observation_errors.append(float(np.linalg.norm(observed_point - points[i])))
             view_depth = float(np.dot(observed_point - origins[i], directions[i]))
             add_feature_observation(
                 feature_cells,
@@ -1243,6 +1656,7 @@ def main() -> int:
             all_points.append(observed_point)
             all_normals.append(normal)
             all_colors.append(color_for_point(distance, risk))
+            structure_accepted[structure_name] += 1
 
             d_label = bin_label(distance, DISTANCE_BINS)
             a_label = bin_label(angle, ANGLE_BINS)
@@ -1262,6 +1676,22 @@ def main() -> int:
     if len(points_array):
         write_cloud(cloud_path, points_array, colors_array, normals_array)
     feature_csv = write_observation_feature_csv(out_dir, feature_cells, args.feature_voxel)
+    vertical_axis_name = str(scan_metadata.get("verticalAxis", "z"))
+    structure_reference = build_mesh_structure_reference(mesh, args.structure_crease_degrees)
+    surface_coverage = compute_surface_coverage_metrics(
+        mesh,
+        points_array,
+        args.surface_coverage_samples,
+        vertical_axis_name,
+        structure_reference,
+        args.structure_band_meters,
+    )
+    observation_error_array = np.asarray(observation_errors, dtype=np.float64)
+    structured_shift_array = np.asarray(structured_shift_meters, dtype=np.float64)
+    feature_count = len(feature_cells)
+    repeat2_count = sum(1 for cell in feature_cells.values() if len(cell["frames"]) >= 2)
+    mature3_count = sum(1 for cell in feature_cells.values() if len(cell["frames"]) >= 3)
+    mature5_count = sum(1 for cell in feature_cells.values() if len(cell["frames"]) >= 5)
 
     distance_rows = ratio_table(distance_counts, distance_risks, DISTANCE_BINS)
     angle_rows = ratio_table(angle_counts, angle_risks, ANGLE_BINS)
@@ -1282,7 +1712,11 @@ def main() -> int:
         "scanMetadata": scan_metadata,
         "realSummary": str(args.real_summary),
         "learningProfile": str(args.learning_profile) if learning_profile is not None else None,
+        "degradationModel": str(args.degradation_model) if degradation_model is not None else None,
+        "idealObserver": bool(args.ideal_observer),
+        "structuredEdgeDegradation": bool(args.structured_edge_degradation),
         "scanFeedback": str(args.scan_feedback) if scan_feedback is not None else None,
+        "effectiveWorkingMinDistance": args.min_distance,
         "effectiveWorkingMaxDistance": args.max_distance,
         "framesReplayed": len(camera_frames),
         "rayGrid": {"width": args.width, "height": args.height},
@@ -1292,8 +1726,42 @@ def main() -> int:
         "hitRatio": hit / attempted if attempted else 0.0,
         "acceptedRatio": accepted / attempted if attempted else 0.0,
         "riskRatio": risk_total / accepted if accepted else 0.0,
+        "observationErrorMeters": {
+            "p50": percentile(observation_error_array, 50.0),
+            "p90": percentile(observation_error_array, 90.0),
+            "p95": percentile(observation_error_array, 95.0),
+            "p99": percentile(observation_error_array, 99.0),
+        },
+        "structureObservations": {
+            "depthJumpMeters": args.structure_depth_jump,
+            "creaseDegrees": args.structure_crease_degrees,
+            "bandMeters": args.structure_band_meters,
+            "truthReferencePoints": {
+                label: int(len(points)) for label, points in structure_reference.items()
+            },
+            "candidates": structure_counts,
+            "accepted": structure_accepted,
+            "mixed": structure_mixed,
+            "ownershipAmbiguous": structure_ambiguous,
+            "structuredShiftMeters": {
+                "count": int(len(structured_shift_array)),
+                "p50": percentile(structured_shift_array, 50.0),
+                "p90": percentile(structured_shift_array, 90.0),
+                "p95": percentile(structured_shift_array, 95.0),
+            },
+        },
+        "surfaceCoverage": surface_coverage,
         "observationFeatureCsv": str(feature_csv),
         "observationFeatureVoxels": len(feature_cells),
+        "multiViewMaturity": {
+            "featureVoxels": feature_count,
+            "observedInAtLeast2Frames": repeat2_count,
+            "observedInAtLeast3Frames": mature3_count,
+            "observedInAtLeast5Frames": mature5_count,
+            "ratioAtLeast2Frames": repeat2_count / feature_count if feature_count else 0.0,
+            "ratioAtLeast3Frames": mature3_count / feature_count if feature_count else 0.0,
+            "ratioAtLeast5Frames": mature5_count / feature_count if feature_count else 0.0,
+        },
         "distanceBins": distance_rows,
         "angleBins": angle_rows,
         "similarity": {

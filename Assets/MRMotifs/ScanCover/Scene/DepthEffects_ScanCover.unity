@@ -9064,6 +9064,76 @@ MonoBehaviour:
   volumeAnchor: {fileID: 0}
   displayRoot: {fileID: 0}
   forceWorldSpaceDisplay: 1
+  enablePersistentResultChunkPublishing: 1
+  enablePersistentResultDeltaPublishing: 1
+  persistentResultDeltaHaloBlocks: 1
+  persistentResultEdgeOwnerHaloBlocks: 1
+  enableIncrementalSemanticFinalizationScope: 1
+  persistentSemanticFinalizationHaloBlocks: 1
+  dependencySemanticReusePositionToleranceVoxels: 0.05
+  enableDependencyBoundaryZeroCrossSignHysteresisShadow: 0
+  dependencyBoundarySignHysteresisNearZeroTsdf: 0.05
+  dependencyBoundarySignHysteresisFarTsdfLimit: 0.25
+  dependencyBoundarySignHysteresisGraceRebuilds: 1
+  enableDependencyBoundaryTemporalFreeSpaceShadow: 1
+  dependencyBoundaryTemporalObservationRebuilds: 3
+  enableUnifiedObservationSemanticsShadow: 1
+  writeCompactBatchContextCsv: 1
+  batchContextDepthSampleStridePixels: 4
+  observationFovBorderFraction: 0.08
+  ownershipShadowMinimumCloserNeighbors: 2
+  ownershipShadowStrongDepthJumpScale: 2
+  persistentResultRetireConfirmRebuilds: 3
+  enablePersistentResultChunkDoubleBuffering: 1
+  persistentResultEntriesPerBudgetCheck: 32
+  requireReciprocalAuthoritativeBoundaryDependency: 0
+  requireReciprocalDiagonalAuthoritativeDependency: 1
+  authoritativeDependencyFaceNeighborsOnly: 0
+  localizeLegacyRelaxedCandidateIntake: 1
+  compactFusionRepresentativeIteration: 1
+  useFusionDenseStampProduction: 1
+  enableFusionDenseStampShadow: 0
+  enableMatureSmoothFastPath: 1
+  geometryCertificateMinimumWeight: 7
+  geometryCertificateStableObservations: 4
+  geometryCertificateDistinctViews: 2
+  geometryCertificateViewSeparationDegrees: 8
+  geometryCertificateMinimumNormalDot: 0.94
+  geometryCertificateMaximumPlaneResidualMeters: 0.025
+  matureSmoothMaximumChangeMeters: 0.04
+  geometryCertificateConflictCooldownFrames: 4
+  geometryCertificateMaximumRecentFrameGap: 6
+  enableNewPlaneLocalReanchoring: 1
+  localReanchorMinimumSupport: 5
+  localReanchorMinimumNormalDot: 0.94
+  localReanchorMaximumResidualMeters: 0.025
+  localReanchorMaximumShiftMeters: 0.06
+  localReanchorMinimumStableObservations: 2
+  localReanchorMinimumDistinctViews: 2
+  enableHorizontalPlaneProposalShadow: 1
+  horizontalPlaneShadowMinimumUpDot: 0.82
+  horizontalPlaneShadowMaxSamples: 1024
+  horizontalPlaneShadowMinInliers: 48
+  enablePersistentResultLocalityShadow: 0
+  localityShadowPositionQuantumMeters: 0.00025
+  enableMatureHorizontalPlaneProduction: 1
+  matureHorizontalProductionMinimumUpDot: 0.9
+  matureHorizontalProductionMinimumRadiusMeters: 0.75
+  matureHorizontalProductionMinimumInliers: 160
+  matureHorizontalProductionMissingGraceRounds: 2
+  enableObservedFloorSupportCompletion: 0
+  observedFloorSupportMinConsecutiveBatches: 2
+  observedFloorSupportRetainMissingBatches: 1
+  observedFloorSupportMaxCells: 384
+  skipAuthoritativeAggregateMeshInCurrentComposite: 1
+  stablePlaneInvalidationDistanceMeters: 0.004
+  stablePlaneInvalidationNormalDot: 0.9998
+  stablePlaneInvalidationRadiusMeters: 0.04
+  deferStablePlaneInvalidationUntilBlockDirty: 0
+  invalidateNewlyMaturePlaneFootprintOnce: 0
+  complexLeaseEntriesPerBudgetCheck: 4
+  incrementalTsdfBoundaryMaskConfirmRebuilds: 2
+  stabilizeIncrementalTsdfBoundaryMaskChanges: 0
   hideSourcePreview: 1
   forceRawRefreshOnSnapshot: 1
   waitForRawFrameTimeoutSeconds: 0.85
@@ -9267,12 +9337,13 @@ MonoBehaviour:
   shellMaterialOverride: {fileID: 0}
   debugLog: 1
   showDiagnosticHud: 1
-  hudLocalPosition: {x: 0, y: -0.18, z: 0.78}
-  hudLocalEuler: {x: 8, y: 0, z: 0}
-  hudLocalScale: {x: 0.00075, y: 0.00075, z: 0.00075}
+  compactDiagnosticHud: 1
+  hudLocalPosition: {x: 0, y: -0.27, z: 0.55}
+  hudLocalEuler: {x: 10, y: 0, z: 0}
+  hudLocalScale: {x: 0.0009, y: 0.0009, z: 0.0009}
   hudRefreshIntervalSeconds: 0.12
-  hudHealthyColor: {r: 0.7, g: 1, b: 0.92, a: 1}
-  hudWarningColor: {r: 1, g: 0.72, b: 0.25, a: 1}
+  hudHealthyColor: {r: 0.42, g: 0.78, b: 1, a: 1}
+  hudWarningColor: {r: 1, g: 0.24, b: 0.34, a: 1}
   runMeshDiagnosticsOnRebuild: 0
   showMeshDiagnosticHotspots: 0
   maxDiagnosticHotspots: 6
@@ -10181,6 +10252,19 @@ MonoBehaviour:
   refreshWaitTimeoutSeconds: 0.35
   enableEditorLocalSessionExport: 1
   editorLocalSessionExportRoot: E:\PCAII\NEW-SCANCOVER\ScanCoverExports
+  questCloneContinuousCaptureMode: 0
+  questCloneCaptureStaticFrames: 1
+  questCloneUseCompactBinary: 1
+  questCloneMaxPendingWrites: 2
+  questCloneProgressSampleStride: 8
+  questCloneMaxTrackedVoxels: 60000
+  questCloneTargetLabel: free_scan
+  questCloneActionLabel: move_smoothly
+  questCloneHudColor: {r: 0.2, g: 0.92, b: 1, a: 1}
+  questCloneProgressPendingColor: {r: 0.34, g: 0.34, b: 0.38, a: 0.85}
+  questCloneProgressSupportedColor: {r: 0.65, g: 0.32, b: 1, a: 0.92}
+  questCloneProgressStableColor: {r: 0.12, g: 0.9, b: 1, a: 0.95}
+  questCloneProgressRiskColor: {r: 0.95, g: 0.2, b: 0.78, a: 0.95}
   exportGridStateCsv: 1
   exportRawDepthProbe: 0
   exportObservationStats: 1
@@ -10399,7 +10483,7 @@ MonoBehaviour:
   hudLocalEuler: {x: 0, y: 0, z: 0}
   hudLocalScale: {x: 0.00135, y: 0.00135, z: 0.00135}
   hudPanelWidth: 820
-  hudPanelHeight: 420
+  hudPanelHeight: 300
   hudRefreshIntervalSeconds: 0.15
   hudIdleColor: {r: 0.78, g: 0.9, b: 1, a: 1}
   hudRecordingColor: {r: 0.45, g: 1, b: 0.62, a: 1}
@@ -88421,6 +88505,162 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
+--- !u!1 &910000000000100001
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 910000000000100002}
+  - component: {fileID: 910000000000100003}
+  - component: {fileID: 910000000000100004}
+  - component: {fileID: 910000000000100005}
+  - component: {fileID: 910000000000100006}
+  m_Layer: 0
+  m_Name: '[ScanCover] 不可见系统房间网格导出'
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &910000000000100002
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 910000000000100001}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &910000000000100003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 910000000000100001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: de27d7f2f20024e18898941292d6c164, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  <SceneLoadedEvent>k__BackingField:
+    m_PersistentCalls:
+      m_Calls: []
+  <RoomCreatedEvent>k__BackingField:
+    m_PersistentCalls:
+      m_Calls: []
+  <RoomUpdatedEvent>k__BackingField:
+    m_PersistentCalls:
+      m_Calls: []
+  <RoomRemovedEvent>k__BackingField:
+    m_PersistentCalls:
+      m_Calls: []
+  EnableWorldLock: 1
+  TrackingSpaceOffset:
+    e00: 1
+    e01: 0
+    e02: 0
+    e03: 0
+    e10: 0
+    e11: 1
+    e12: 0
+    e13: 0
+    e20: 0
+    e21: 0
+    e22: 1
+    e23: 0
+    e30: 0
+    e31: 0
+    e32: 0
+    e33: 1
+  SceneSettings:
+    DataSource: 0
+    RoomIndex: -1
+    RoomPrefabs: []
+    SceneJsons: []
+    LoadSceneOnStartup: 1
+    SeatWidth: 0.6
+    EnableHighFidelityScene: 0
+    SceneJson: 
+    <TrackerConfiguration>k__BackingField:
+      <KeyboardTrackingEnabled>k__BackingField: 0
+      <QRCodeTrackingEnabled>k__BackingField: 0
+    <TrackableAdded>k__BackingField:
+      m_PersistentCalls:
+        m_Calls: []
+    <TrackableRemoved>k__BackingField:
+      m_PersistentCalls:
+        m_Calls: []
+  _immersiveSceneDebuggerPrefab: {fileID: 0}
+--- !u!114 &910000000000100004
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 910000000000100001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3da7e2c8b4f64de48a8c7f3d2e9ab521, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sceneMeshRoot: {fileID: 0}
+  searchWholeSceneWhenRootMissing: 0
+  includeInactiveChildren: 1
+  requireRenderer: 0
+  requireRendererEnabled: 0
+  exportDirectoryOverride: 
+  sessionPrefix: ScanCover_SystemRoomMesh
+  exportLocalRawObjects: 0
+  exportWorldAlignedObjects: 0
+  exportCombinedWorldObj: 1
+  exportComponentInventory: 1
+  debugLog: 1
+--- !u!114 &910000000000100005
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 910000000000100001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a8f1e2d3201f4b8a962fbc534e0700d1, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  mruk: {fileID: 910000000000100003}
+  includeAllLoadedRooms: 1
+  disableSourceRenderers: 1
+  exporter: {fileID: 910000000000100004}
+  outputFolderName: system_room_mesh
+  writeChecksums: 1
+--- !u!114 &910000000000100006
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 910000000000100001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f452ec0ad8aa4b98ac0b133be36e6f92, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRightControllerExportInput: 1
+  exportButton: 2
+  inputDebounceSeconds: 0.75
+  roomMeshCapture: {fileID: 910000000000100005}
+  diagnosticsFolderName: ScanCoverDiagnostics
+  exportSessionPrefix: SystemRoomMesh
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -88430,3 +88670,4 @@ SceneRoots:
   - {fileID: 1915124019}
   - {fileID: 1177598824}
   - {fileID: 3458649013154915047}
+  - {fileID: 910000000000100002}

@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.Rendering;
@@ -43,6 +44,26 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     [SerializeField] private string editorLocalSessionExportRoot = "ScanCoverExports";
 
     [Header("Quest3 Clone Data")]
+    [SerializeField] private bool questCloneContinuousCaptureMode = false;
+    [SerializeField] private bool questCloneCaptureStaticFrames = true;
+    [SerializeField] private bool questCloneUseCompactBinary = true;
+    [SerializeField, Range(1, 4)] private int questCloneMaxPendingWrites = 2;
+    [SerializeField, Range(1, 32)] private int questCloneProgressSampleStride = 8;
+    [SerializeField, Min(1000)] private int questCloneMaxTrackedVoxels = 60000;
+    [SerializeField] private string questCloneTargetLabel = "free_scan";
+    [SerializeField] private string questCloneActionLabel = "move_smoothly";
+    [SerializeField] private Color questCloneHudColor = new Color(0.2f, 0.92f, 1f, 1f);
+    [SerializeField] private Color questCloneProgressPendingColor = new Color(0.34f, 0.34f, 0.38f, 0.85f);
+    [SerializeField] private Color questCloneProgressSupportedColor = new Color(0.65f, 0.32f, 1f, 0.92f);
+    [SerializeField] private Color questCloneProgressStableColor = new Color(0.12f, 0.9f, 1f, 0.95f);
+    [SerializeField] private Color questCloneProgressRiskColor = new Color(0.95f, 0.2f, 0.78f, 0.95f);
+    [SerializeField, Range(0f, 0.08f)] private float questCloneProgressSurfaceOffsetMeters = 0.025f;
+    [SerializeField, Range(0f, 1f)] private float questCloneProgressLowConfidenceThreshold = 0.12f;
+    [SerializeField, Range(0.01f, 1f)] private float questCloneProgressRiskEmaAlpha = 0.12f;
+    [SerializeField, Min(0.001f)] private float questCloneProgressStablePositionStdMeters = 0.04f;
+    [SerializeField, Min(0.001f)] private float questCloneProgressHardPositionStdMeters = 0.07f;
+    [SerializeField, Range(0f, 1f)] private float questCloneProgressWarnRecentRiskRatio = 0.35f;
+    [SerializeField, Range(0f, 1f)] private float questCloneProgressBadRecentRiskRatio = 0.75f;
     [SerializeField] private bool exportGridStateCsv = true;
         [SerializeField] private bool exportRawDepthProbe = false;
         [SerializeField] private bool exportObservationStats = true;
@@ -550,6 +571,18 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private Mesh _roomRawDepthCompletionMesh;
     private Material _roomRawDepthCompletionMaterial;
     private readonly Material[] _roomRawDepthCompletionInstancedMaterials = new Material[5];
+    private MeshFilter _roomRawDepthCompletionCombinedMeshFilter;
+    private MeshRenderer _roomRawDepthCompletionCombinedMeshRenderer;
+    private Mesh _roomRawDepthCompletionCombinedMesh;
+    private readonly List<Vector3> _roomRawDepthCompletionCombinedVertices = new List<Vector3>(9600);
+    private readonly List<int>[] _roomRawDepthCompletionCombinedIndices =
+    {
+        new List<int>(2048),
+        new List<int>(2048),
+        new List<int>(2048),
+        new List<int>(2048),
+        new List<int>(2048)
+    };
     private Material _roomRawDepthSnapshotMaterial;
     private GameObject _roomRawDepthSnapshotMeshRoot;
     private MeshFilter _roomRawDepthSnapshotMeshFilter;
@@ -571,6 +604,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private readonly List<Color> _roomRawDepthSnapshotColors = new List<Color>(51200 * 4);
     private readonly List<int> _roomRawDepthSnapshotIndices = new List<int>(51200 * 6);
     private readonly Dictionary<Vector3Int, RoomRawDepthCompletionVoxel> _roomRawDepthCompletionVoxels = new Dictionary<Vector3Int, RoomRawDepthCompletionVoxel>(32768);
+    // Surface cells discovered by the production grid are the capture target map.
+    // Keeping this separate from capture evidence lets the overlay represent cells
+    // that are known to exist but have not yet received enough raw-depth support.
+    private readonly Dictionary<Vector3Int, Vector3> _questCloneGuideVoxels = new Dictionary<Vector3Int, Vector3>(32768);
+    private readonly List<Vector3> _questCloneGuideScratchPositions = new List<Vector3>(4096);
     private float _nextRoomRawDepthCompletionRefreshTime;
     private int _roomRawDepthCompletionGrayCount;
     private int _roomRawDepthCompletionBlueCount;
@@ -591,6 +629,13 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private int _roomRawDepthSnapshotLastValidPixels;
     private string _roomRawDepthSnapshotLastFrame = "none";
     private string _lastExportedFrameName = "";
+    private string _questCloneBinaryDirectory;
+    private string _questCloneBinaryManifestPath;
+    private int _questCloneWritesInFlight;
+    private int _questCloneDroppedWrites;
+    private double _questCloneLastInterEyeDeltaMs;
+    private string _questCloneLastWriteError = string.Empty;
+    private readonly object _questCloneWriteLock = new object();
     private string _lastGateStatus = "none";
     private ComputeBuffer _rawDepthProbeBuffer;
     private readonly Dictionary<Vector3Int, StabilityVoxel> _stabilityVoxels = new Dictionary<Vector3Int, StabilityVoxel>(32768);
@@ -684,11 +729,14 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         public float sumDepth;
         public float sumDepthSq;
         public Vector3 positionSum;
+        public float positionMagnitudeSqSum;
+        private float recentRiskRatio;
+        private bool hasRecentRisk;
         private bool hasFirstView;
         private Vector3 firstViewDirection;
         private float minViewDot = 1f;
 
-        public void Add(Vector3 point, Vector3 cameraPosition, float depth, bool risk)
+        public void Add(Vector3 point, Vector3 cameraPosition, float depth, bool risk, float riskEmaAlpha)
         {
             hits++;
             if (risk)
@@ -697,6 +745,17 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             sumDepth += depth;
             sumDepthSq += depth * depth;
             positionSum += point;
+            positionMagnitudeSqSum += point.sqrMagnitude;
+            float riskValue = risk ? 1f : 0f;
+            if (!hasRecentRisk)
+            {
+                recentRiskRatio = riskValue;
+                hasRecentRisk = true;
+            }
+            else
+            {
+                recentRiskRatio = Mathf.Lerp(recentRiskRatio, riskValue, Mathf.Clamp01(riskEmaAlpha));
+            }
 
             Vector3 viewDirection = point - cameraPosition;
             if (!IsFinite(viewDirection) || viewDirection.sqrMagnitude <= 1e-8f)
@@ -731,6 +790,20 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         }
 
         public float RiskRatio => hits > 0 ? riskHits / (float)hits : 0f;
+        public float RecentRiskRatio => hasRecentRisk ? recentRiskRatio : 0f;
+
+        public float PositionStd
+        {
+            get
+            {
+                if (hits <= 1)
+                    return 0f;
+
+                Vector3 mean = positionSum / hits;
+                float variance = Mathf.Max(0f, positionMagnitudeSqSum / hits - mean.sqrMagnitude);
+                return Mathf.Sqrt(variance);
+            }
+        }
 
         public float AngleSpanDegrees
         {
@@ -812,6 +885,18 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         public RawObservationOrderResult rawObservationOrder;
         public ObservationOrderScore observationOrderScore;
         public string status;
+    }
+
+    private sealed class QuestCloneWriteJob
+    {
+        public string rightPath;
+        public string leftPath;
+        public string metadataPath;
+        public string manifestPath;
+        public string metadataJson;
+        public string manifestRow;
+        public ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right;
+        public ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left;
     }
 
     private struct RoomRawCoverageViewMeter
@@ -1035,14 +1120,42 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void Awake()
     {
+        ApplyQuestCloneRuntimeSafetyDefaults();
         ResolveRefs();
     }
 
     private void OnEnable()
     {
+        ApplyQuestCloneRuntimeSafetyDefaults();
         ResolveRefs();
+        if (questCloneContinuousCaptureMode)
+            Debug.Log($"[ScanCoverQuestCapture] ready hud={showHud} productionGridVisible=true target={questCloneTargetLabel} action={questCloneActionLabel}", this);
         if (startSessionOnEnable)
             StartSession();
+    }
+
+    private void ApplyQuestCloneRuntimeSafetyDefaults()
+    {
+        if (!questCloneContinuousCaptureMode)
+            return;
+
+        // The collection chain is an overlay/recorder, not a replacement for the
+        // production mesh. Keep a visible boot state even if an older serialized
+        // scene still contains the previous capture-HUD defaults.
+        showHud = true;
+        enableOvrInput = true;
+        enableOvrStartStopInput = true;
+        captureWhileSessionActive = true;
+        startSessionOnEnable = true;
+        useBinocularRoomRawDepthSnapshots = true;
+        hideDepthGridPreviewWhileRecording = false;
+        roomRawDepthCompletionUseGpuInstancing = true;
+        roomRawDepthCompletionUseVoxelCenterPresentation = true;
+        roomRawDepthCompletionPointSize = Mathf.Max(0.055f, roomRawDepthCompletionPointSize);
+        questCloneProgressStablePositionStdMeters = Mathf.Max(0.04f, questCloneProgressStablePositionStdMeters);
+        questCloneProgressHardPositionStdMeters = Mathf.Max(0.07f, questCloneProgressHardPositionStdMeters);
+        roomRawDepthCompletionMaxVisualPoints = Mathf.Clamp(roomRawDepthCompletionMaxVisualPoints, 64, 2400);
+        roomRawDepthCompletionRefreshSeconds = Mathf.Max(0.35f, roomRawDepthCompletionRefreshSeconds);
     }
 
     private void Update()
@@ -1138,6 +1251,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             _roomRawDepthDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_frames");
             _roomRawDepthSnapshotDirectory = Path.Combine(_sessionDirectory, "room_raw_depth_snapshots");
             _virtualCloneInputDirectory = Path.Combine(_sessionDirectory, SafeDirectoryName(virtualCloneInputDirectoryName, "virtual_clone_input"));
+            _questCloneBinaryDirectory = Path.Combine(_sessionDirectory, "quest_clone_capture");
             Directory.CreateDirectory(_framesDirectory);
             Directory.CreateDirectory(_observationDirectory);
             if (exportQuest3ObservationBadnessStats)
@@ -1152,6 +1266,8 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 Directory.CreateDirectory(_roomRawDepthSnapshotDirectory);
             if (ShouldExportVirtualCloneInputMetadata())
                 Directory.CreateDirectory(_virtualCloneInputDirectory);
+            if (questCloneContinuousCaptureMode && questCloneUseCompactBinary)
+                Directory.CreateDirectory(_questCloneBinaryDirectory);
             _manifestPath = Path.Combine(_sessionDirectory, "session_manifest.csv");
             _frameObservationStatsPath = Path.Combine(_observationDirectory, "frame_observation_stats.csv");
             _distanceBinsPath = Path.Combine(_observationDirectory, "distance_bins.csv");
@@ -1167,6 +1283,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             _roomRawDepthSummaryPath = Path.Combine(_roomRawDepthDirectory, "room_raw_depth_summary.json");
             _roomRawDepthSnapshotManifestPath = Path.Combine(_roomRawDepthSnapshotDirectory, "room_raw_depth_snapshot_manifest.csv");
             _virtualCloneInputManifestPath = Path.Combine(_virtualCloneInputDirectory, "virtual_clone_input_manifest.csv");
+            _questCloneBinaryManifestPath = Path.Combine(_questCloneBinaryDirectory, "quest_clone_capture_manifest.csv");
             _rawDepthBadnessFramesPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_frames.csv");
             _rawDepthHoleComponentsPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_hole_components.csv");
             _rawDepthBadnessSummaryPath = Path.Combine(_quest3BadnessDirectory, "raw_depth_badness_summary.json");
@@ -1178,6 +1295,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             WriteRoomRawDepthHeaders();
             WriteRoomRawDepthSnapshotHeaders();
             WriteVirtualCloneInputHeaders();
+            WriteQuestCloneBinaryHeader();
             WriteSessionInfo(timestamp);
         }
         else
@@ -1192,6 +1310,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _roomRawDepthSnapshotExportedFrames = 0;
         _roomRawDepthSnapshotTotalPixels = 0;
         _roomRawDepthSnapshotValidPixels = 0;
+        Interlocked.Exchange(ref _questCloneDroppedWrites, 0);
+        _questCloneLastWriteError = string.Empty;
+        _questCloneLastInterEyeDeltaMs = 0d;
         ResetRoomRawDepthCompletionOverlay();
         ClearRoomRawDepthSnapshotOverlay();
         PrepareSnapshotGridCaptureMaskForSession(!_snapshotGridMaskActive);
@@ -1543,6 +1664,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (Time.unscaledTime - _lastCaptureTime < minCaptureIntervalSeconds)
             return false;
 
+        // Degradation-model collection needs stationary samples as well as motion.
+        // Target/action labels are guidance only; they must never reject raw data.
+        if (questCloneContinuousCaptureMode && questCloneCaptureStaticFrames)
+            return true;
+
         if (ShouldUseRoomRawCoverageHudOnlyCapture() && lockRoomRawCoverageToStartView)
         {
             if (!_roomRawCoverageWindowActive || !_roomRawCoverageViewFrameLocked)
@@ -1637,6 +1763,20 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         Transform pose = ResolvePoseTransform();
         if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.Ready)
         {
+            if (questCloneContinuousCaptureMode && questCloneUseCompactBinary)
+            {
+                ExportQuestCloneCapture(frameName, pose);
+                _lastExportedFrameName = frameName;
+                _capturedFrameCount++;
+                MarkCaptureAttemptPose(pose);
+                _pendingCapture = false;
+                _pendingRefreshRequested = false;
+                ResetBinocularRoomRawDepthSnapshotCapture(restoreOriginalEye: true);
+                if (_capturedFrameCount >= maxFramesPerSession)
+                    StopSession();
+                return;
+            }
+
             if (_binocularRoomRawDepthFusedSnapshot != null)
                 MaybeExportRoomRawDepthSnapshot(frameName, _binocularRoomRawDepthFusedSnapshot, pose);
 
@@ -2536,6 +2676,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     {
         if (depthGridPointCloud == null)
             return;
+
+        if (recording && questCloneContinuousCaptureMode)
+        {
+            if (!_hasDepthGridPreviewDisplayRestoreState)
+            {
+                _restoreDepthGridPreviewDisplay = depthGridPointCloud.PreviewDisplayVisible;
+                _hasDepthGridPreviewDisplayRestoreState = true;
+            }
+
+            depthGridPointCloud.SetPreviewDisplayVisible(true);
+            depthGridPointCloud.SetCaptureOnlySnapshotMode(false);
+            return;
+        }
 
         if (recording && (ShouldUseRoomRawCoverageHudOnlyCapture() || ShouldUseLegacyFullViewRoomRawCoverage()))
         {
@@ -3692,6 +3845,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (_hudText == null)
             return;
 
+        if (questCloneContinuousCaptureMode)
+        {
+            RefreshQuestCloneCaptureHudText();
+            return;
+        }
+
         string state = _isRecording ? "RECORDING" : "IDLE";
         if (_pendingCapture)
             state = "SAMPLING";
@@ -3791,6 +3950,130 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.Append("Dir: ").Append(directory);
 
         _hudText.text = builder.ToString();
+    }
+
+    private void RefreshQuestCloneCaptureHudText()
+    {
+        string state = _isRecording ? (_pendingCapture ? "SAMPLING" : "RECORDING") : "READY";
+        _hudText.color = questCloneHudColor;
+        if (_hudPanelImage != null)
+            _hudPanelImage.color = hudPanelColor;
+
+        int risk = _roomRawDepthCompletionYellowCount + _roomRawDepthCompletionRedCount;
+        BuildQuestCloneViewGuidance(out int viewTotal, out int viewStable, out string viewHint);
+        int viewPercent = Mathf.RoundToInt(viewStable * 100f / Mathf.Max(1, viewTotal));
+        StringBuilder builder = new StringBuilder(320);
+        builder.Append("QUEST CLONE CAPTURE  ").Append(state).AppendLine();
+        builder.Append("VIEW: ").Append(viewHint)
+            .Append("  COMPLETE ").Append(viewPercent).Append('%')
+            .Append(" (").Append(viewStable).Append('/').Append(viewTotal).AppendLine(")");
+        builder.Append("FRAMES: ").Append(_capturedFrameCount).Append('/').Append(maxFramesPerSession)
+            .Append("  EYE DELTA: ").Append(_questCloneLastInterEyeDeltaMs.ToString("0.0", CultureInfo.InvariantCulture)).AppendLine("ms");
+        builder.AppendLine("MAP: GRAY TODO | PURPLE ANGLE | CYAN DONE | MAGENTA BAD");
+        builder.Append("CELLS D/A/B/T: ")
+            .Append(_roomRawDepthCompletionGreenCount).Append('/')
+            .Append(_roomRawDepthCompletionBlueCount).Append('/')
+            .Append(risk).Append('/')
+            .Append(_roomRawDepthCompletionGrayCount).AppendLine();
+        builder.Append("WRITER active/drop: ")
+            .Append(Volatile.Read(ref _questCloneWritesInFlight)).Append('/')
+            .Append(Volatile.Read(ref _questCloneDroppedWrites));
+        if (!string.IsNullOrEmpty(_questCloneLastWriteError))
+            builder.Append("  ERR: ").Append(_questCloneLastWriteError);
+        _hudText.text = builder.ToString();
+    }
+
+    private void BuildQuestCloneViewGuidance(out int viewTotal, out int viewStable, out string hint)
+    {
+        viewTotal = 0;
+        viewStable = 0;
+        int viewPending = 0;
+        int viewSupported = 0;
+        int viewRisk = 0;
+        Transform pose = ResolvePoseTransform();
+        if (pose == null || _questCloneGuideVoxels.Count <= 0)
+        {
+            hint = "LOOK AROUND TO DISCOVER SURFACES";
+            return;
+        }
+
+        int stride = Mathf.Max(1, Mathf.CeilToInt(_questCloneGuideVoxels.Count / 10000f));
+        int index = 0;
+        bool hasOutsideTarget = false;
+        Vector3 bestOutsideTarget = Vector3.zero;
+        float bestOutsideScore = float.PositiveInfinity;
+        foreach (KeyValuePair<Vector3Int, Vector3> guide in _questCloneGuideVoxels)
+        {
+            if ((index++ % stride) != 0)
+                continue;
+
+            _roomRawDepthCompletionVoxels.TryGetValue(guide.Key, out RoomRawDepthCompletionVoxel voxel);
+            RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(guide.Key, voxel);
+            Vector3 position = voxel != null
+                ? GetRoomRawDepthCompletionDisplayPosition(guide.Key, voxel)
+                : GetQuestCloneGuideDisplayPosition(guide.Key);
+            bool inView = IsPointInsideRoomRawCoverageViewMeter(position, pose, out _);
+            if (inView)
+            {
+                viewTotal++;
+                switch (state)
+                {
+                    case RoomRawDepthCompletionState.Stable:
+                        viewStable++;
+                        break;
+                    case RoomRawDepthCompletionState.Supported:
+                        viewSupported++;
+                        break;
+                    case RoomRawDepthCompletionState.Risk:
+                    case RoomRawDepthCompletionState.Conflict:
+                        viewRisk++;
+                        break;
+                    default:
+                        viewPending++;
+                        break;
+                }
+            }
+            else if (state != RoomRawDepthCompletionState.Stable)
+            {
+                Vector3 toTarget = position - pose.position;
+                if (toTarget.sqrMagnitude <= 1e-6f)
+                    continue;
+                float angle = Vector3.Angle(pose.forward, toTarget);
+                float score = angle + Mathf.Sqrt(toTarget.sqrMagnitude) * 2f;
+                if (score < bestOutsideScore)
+                {
+                    bestOutsideScore = score;
+                    bestOutsideTarget = position;
+                    hasOutsideTarget = true;
+                }
+            }
+        }
+
+        if (viewTotal <= 0)
+        {
+            hint = hasOutsideTarget ? GetQuestCloneTurnHint(pose, bestOutsideTarget) : "LOOK AROUND TO DISCOVER SURFACES";
+            return;
+        }
+        if (viewPending > 0)
+            hint = "HOLD ON GRAY CELLS";
+        else if (viewRisk > Mathf.Max(2, viewTotal / 5))
+            hint = "STEP SIDEWAYS FROM MAGENTA";
+        else if (viewSupported > 0)
+            hint = "CHANGE ANGLE ON PURPLE";
+        else if (viewStable * 100 < viewTotal * 80)
+            hint = "SWEEP THIS VIEW SLOWLY";
+        else
+            hint = hasOutsideTarget ? GetQuestCloneTurnHint(pose, bestOutsideTarget) : "VIEW COMPLETE - DISCOVER MORE";
+    }
+
+    private static string GetQuestCloneTurnHint(Transform pose, Vector3 target)
+    {
+        Vector3 local = pose.InverseTransformPoint(target);
+        if (local.z < 0f && Mathf.Abs(local.z) > Mathf.Abs(local.x))
+            return "TURN AROUND TO PENDING AREA";
+        if (Mathf.Abs(local.x) > Mathf.Abs(local.y) * 0.8f)
+            return local.x >= 0f ? "TURN RIGHT TO PENDING AREA" : "TURN LEFT TO PENDING AREA";
+        return local.y >= 0f ? "LOOK UP TO PENDING AREA" : "LOOK DOWN TO PENDING AREA";
     }
 
 
@@ -3993,6 +4276,20 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _roomRawDepthSnapshotManifestPath = string.Empty;
         _virtualCloneInputDirectory = string.Empty;
         _virtualCloneInputManifestPath = string.Empty;
+        _questCloneBinaryDirectory = string.Empty;
+        _questCloneBinaryManifestPath = string.Empty;
+    }
+
+    private void WriteQuestCloneBinaryHeader()
+    {
+        if (!_sessionFileExportEnabled || !questCloneContinuousCaptureMode || !questCloneUseCompactBinary ||
+            string.IsNullOrEmpty(_questCloneBinaryManifestPath))
+            return;
+
+        File.WriteAllText(_questCloneBinaryManifestPath,
+            "# ScanCover Quest3 degradation-model capture. Target/action labels guide collection and never gate frames.\n" +
+            "frame,rightFrame,leftFrame,rightDispatchSeconds,leftDispatchSeconds,interEyeDeltaMs,target,action,rightBinary,leftBinary,metadataJson,status\n",
+            Encoding.UTF8);
     }
 
     private void WriteManifestHeader()
@@ -4129,7 +4426,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         File.WriteAllText(_virtualCloneInputManifestPath,
             "# ScanCover binocular virtual-clone input. This is metadata for offline Replica/shell raycast; Raw Depth CSV remains unchanged.\n" +
-            "frame,rawDepthFrame,width,height,rightStart,rightCount,leftStart,leftCount,eyeBaselineMeters,fieldOfViewDegrees,aspect,rawSnapshotCsv,metadataJson,status\n",
+            "frame,rawDepthFrame,width,height,rightStart,rightCount,leftStart,leftCount,eyeBaselineMeters,fieldOfViewDegrees,aspect,rightDispatchSeconds,leftDispatchSeconds,interEyeDeltaMs,target,action,rawSnapshotCsv,metadataJson,status\n",
             Encoding.UTF8);
     }
 
@@ -4169,6 +4466,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         StringBuilder builder = new StringBuilder(1024);
         builder.AppendLine("{");
         builder.Append("  \"timestamp\": \"").Append(timestamp).AppendLine("\",");
+        builder.Append("  \"questCloneContinuousCaptureMode\": ").Append(questCloneContinuousCaptureMode ? "true" : "false").AppendLine(",");
+        builder.Append("  \"questCloneTarget\": \"").Append(EscapeJson(questCloneTargetLabel)).AppendLine("\",");
+        builder.Append("  \"questCloneAction\": \"").Append(EscapeJson(questCloneActionLabel)).AppendLine("\",");
+        builder.Append("  \"questCloneCaptureStaticFrames\": ").Append(questCloneCaptureStaticFrames ? "true" : "false").AppendLine(",");
         builder.Append("  \"depthGrid\": \"").Append(EscapeJson(depthGridPointCloud != null ? depthGridPointCloud.name : "")).AppendLine("\",");
         builder.Append("  \"camera\": \"").Append(EscapeJson(captureCamera != null ? captureCamera.name : "")).AppendLine("\",");
         builder.Append("  \"poseSource\": \"").Append(EscapeJson(pose != null ? pose.name : "")).AppendLine("\",");
@@ -6811,6 +7112,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private void ResetRoomRawDepthCompletionOverlay()
     {
         _roomRawDepthCompletionVoxels.Clear();
+        _questCloneGuideVoxels.Clear();
         _roomRawDepthCompletionGrayCount = 0;
         _roomRawDepthCompletionBlueCount = 0;
         _roomRawDepthCompletionGreenCount = 0;
@@ -6828,17 +7130,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AddRoomRawDepthCompletionSample(Vector3 point, Vector3 cameraPosition, float depth, bool risk)
     {
-        if (!showRoomRawDepthCompletionOverlay || !IsFinite(point) || float.IsNaN(depth) || float.IsInfinity(depth))
+        if (!ShouldTrackRoomRawDepthCompletion() || !IsFinite(point) || float.IsNaN(depth) || float.IsInfinity(depth))
             return;
 
         Vector3Int key = GetRoomRawDepthCompletionKey(point);
         if (!_roomRawDepthCompletionVoxels.TryGetValue(key, out RoomRawDepthCompletionVoxel voxel))
         {
+            if (questCloneContinuousCaptureMode && _roomRawDepthCompletionVoxels.Count >= Mathf.Max(1000, questCloneMaxTrackedVoxels))
+                return;
             voxel = new RoomRawDepthCompletionVoxel();
             _roomRawDepthCompletionVoxels.Add(key, voxel);
         }
 
-        voxel.Add(point, cameraPosition, depth, risk);
+        voxel.Add(point, cameraPosition, depth, risk, questCloneContinuousCaptureMode ? questCloneProgressRiskEmaAlpha : 1f);
     }
 
     private Vector3Int GetRoomRawDepthCompletionKey(Vector3 point)
@@ -6862,15 +7166,48 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             (key.z + 0.5f) * size);
     }
 
+    private Vector3 GetQuestCloneGuideDisplayPosition(Vector3Int key)
+    {
+        if (!roomRawDepthCompletionUseVoxelCenterPresentation && _questCloneGuideVoxels.TryGetValue(key, out Vector3 position))
+            return position;
+
+        float size = Mathf.Max(0.001f, roomRawDepthCompletionVoxelSizeMeters);
+        return new Vector3(
+            (key.x + 0.5f) * size,
+            (key.y + 0.5f) * size,
+            (key.z + 0.5f) * size);
+    }
+
+    private void SeedQuestCloneGuideFromProductionGrid()
+    {
+        if (!questCloneContinuousCaptureMode || depthGridPointCloud == null)
+            return;
+        if (depthGridPointCloud.CopyCurrentValidGridPositions(_questCloneGuideScratchPositions) <= 0)
+            return;
+
+        int maxTracked = Mathf.Max(1000, questCloneMaxTrackedVoxels);
+        for (int i = 0; i < _questCloneGuideScratchPositions.Count && _questCloneGuideVoxels.Count < maxTracked; i++)
+        {
+            Vector3 position = _questCloneGuideScratchPositions[i];
+            Vector3Int key = GetRoomRawDepthCompletionKey(position);
+            if (!_questCloneGuideVoxels.ContainsKey(key))
+                _questCloneGuideVoxels.Add(key, position);
+        }
+    }
+
     private void UpdateRoomRawDepthCompletionOverlay()
     {
-        if (!showRoomRawDepthCompletionOverlay)
+        if (!ShouldTrackRoomRawDepthCompletion())
         {
             SetRoomRawDepthCompletionOverlayVisible(false);
             return;
         }
 
-        bool shouldShow = _roomRawDepthCompletionVoxels.Count > 0 && (!roomRawDepthCompletionOnlyWhileRecording || _isRecording);
+        if (questCloneContinuousCaptureMode && _isRecording)
+            SeedQuestCloneGuideFromProductionGrid();
+
+        bool shouldShow = (_roomRawDepthCompletionVoxels.Count > 0 || _questCloneGuideVoxels.Count > 0) &&
+            (questCloneContinuousCaptureMode ? _isRecording : (!roomRawDepthCompletionOnlyWhileRecording || _isRecording));
         if (!shouldShow)
         {
             SetRoomRawDepthCompletionOverlayVisible(false);
@@ -6891,15 +7228,46 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _roomRawDepthCompletionYellowCount = 0;
         _roomRawDepthCompletionRedCount = 0;
 
-        int total = _roomRawDepthCompletionVoxels.Count;
+        int total = _questCloneGuideVoxels.Count;
+        foreach (KeyValuePair<Vector3Int, RoomRawDepthCompletionVoxel> pair in _roomRawDepthCompletionVoxels)
+        {
+            if (!_questCloneGuideVoxels.ContainsKey(pair.Key))
+                total++;
+        }
         int maxVisual = Mathf.Max(1, roomRawDepthCompletionMaxVisualPoints);
         int stride = Mathf.Max(1, Mathf.CeilToInt(total / (float)maxVisual));
         int sourceIndex = 0;
         int visualIndex = 0;
         ClearRoomRawDepthCompletionMatrices();
 
+        foreach (KeyValuePair<Vector3Int, Vector3> guide in _questCloneGuideVoxels)
+        {
+            _roomRawDepthCompletionVoxels.TryGetValue(guide.Key, out RoomRawDepthCompletionVoxel voxel);
+            RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(guide.Key, voxel);
+            CountRoomRawDepthCompletionState(state);
+
+            if (sourceIndex % stride == 0)
+            {
+                Vector3 position = voxel != null
+                    ? GetRoomRawDepthCompletionDisplayPosition(guide.Key, voxel)
+                    : GetQuestCloneGuideDisplayPosition(guide.Key);
+                if (roomRawDepthCompletionUseGpuInstancing)
+                    AddRoomRawDepthCompletionMatrix(state, position);
+                else
+                {
+                    GameObject pointObject = GetOrCreateRoomRawDepthCompletionPoint(visualIndex);
+                    ApplyRoomRawDepthCompletionPoint(pointObject, position, GetRoomRawDepthCompletionColor(state));
+                    visualIndex++;
+                }
+            }
+
+            sourceIndex++;
+        }
+
         foreach (KeyValuePair<Vector3Int, RoomRawDepthCompletionVoxel> pair in _roomRawDepthCompletionVoxels)
         {
+            if (_questCloneGuideVoxels.ContainsKey(pair.Key))
+                continue;
             RoomRawDepthCompletionState state = ClassifyRoomRawDepthCompletionVoxel(pair.Key, pair.Value);
             CountRoomRawDepthCompletionState(state);
 
@@ -6919,6 +7287,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             sourceIndex++;
         }
 
+        if (questCloneContinuousCaptureMode)
+            RebuildRoomRawDepthCompletionCombinedMesh();
+
         int firstHiddenIndex = roomRawDepthCompletionUseGpuInstancing ? 0 : visualIndex;
         for (int i = firstHiddenIndex; i < _roomRawDepthCompletionPointObjects.Count; i++)
         {
@@ -6935,19 +7306,90 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             _roomRawDepthCompletionMatrices[i].Clear();
     }
 
+    private void RebuildRoomRawDepthCompletionCombinedMesh()
+    {
+        EnsureRoomRawDepthCompletionOverlay();
+        EnsureRoomRawDepthCompletionCombinedRenderer();
+        if (_roomRawDepthCompletionCombinedMesh == null || _roomRawDepthCompletionCombinedMeshRenderer == null)
+            return;
+
+        _roomRawDepthCompletionCombinedVertices.Clear();
+        for (int i = 0; i < _roomRawDepthCompletionCombinedIndices.Length; i++)
+            _roomRawDepthCompletionCombinedIndices[i].Clear();
+
+        Transform pose = ResolvePoseTransform();
+        if (pose == null)
+        {
+            _roomRawDepthCompletionCombinedMeshRenderer.enabled = false;
+            return;
+        }
+
+        Vector3 right = pose.right * (Mathf.Max(0.002f, roomRawDepthCompletionPointSize) * 0.5f);
+        Vector3 up = pose.up * (Mathf.Max(0.002f, roomRawDepthCompletionPointSize) * 0.5f);
+        for (int stateIndex = 0; stateIndex < _roomRawDepthCompletionMatrices.Length; stateIndex++)
+        {
+            List<Matrix4x4> matrices = _roomRawDepthCompletionMatrices[stateIndex];
+            List<int> indices = _roomRawDepthCompletionCombinedIndices[stateIndex];
+            for (int i = 0; i < matrices.Count; i++)
+            {
+                Vector4 column = matrices[i].GetColumn(3);
+                Vector3 center = new Vector3(column.x, column.y, column.z);
+                int first = _roomRawDepthCompletionCombinedVertices.Count;
+                _roomRawDepthCompletionCombinedVertices.Add(center - right - up);
+                _roomRawDepthCompletionCombinedVertices.Add(center + right - up);
+                _roomRawDepthCompletionCombinedVertices.Add(center + right + up);
+                _roomRawDepthCompletionCombinedVertices.Add(center - right + up);
+                indices.Add(first);
+                indices.Add(first + 2);
+                indices.Add(first + 1);
+                indices.Add(first);
+                indices.Add(first + 3);
+                indices.Add(first + 2);
+            }
+        }
+
+        _roomRawDepthCompletionCombinedMesh.Clear(false);
+        _roomRawDepthCompletionCombinedMesh.SetVertices(_roomRawDepthCompletionCombinedVertices);
+        _roomRawDepthCompletionCombinedMesh.subMeshCount = _roomRawDepthCompletionCombinedIndices.Length;
+        for (int i = 0; i < _roomRawDepthCompletionCombinedIndices.Length; i++)
+            _roomRawDepthCompletionCombinedMesh.SetTriangles(_roomRawDepthCompletionCombinedIndices[i], i, false);
+        _roomRawDepthCompletionCombinedMesh.RecalculateBounds();
+        _roomRawDepthCompletionCombinedMeshRenderer.enabled = _roomRawDepthCompletionCombinedVertices.Count > 0;
+    }
+
     private void AddRoomRawDepthCompletionMatrix(RoomRawDepthCompletionState state, Vector3 position)
     {
         int index = Mathf.Clamp((int)state, 0, _roomRawDepthCompletionMatrices.Length - 1);
         float size = Mathf.Max(0.002f, roomRawDepthCompletionPointSize);
+        position = OffsetQuestCloneProgressPointTowardViewer(position);
         _roomRawDepthCompletionMatrices[index].Add(Matrix4x4.TRS(position, Quaternion.identity, Vector3.one * size));
+    }
+
+    private Vector3 OffsetQuestCloneProgressPointTowardViewer(Vector3 position)
+    {
+        if (!questCloneContinuousCaptureMode)
+            return position;
+
+        float offset = Mathf.Max(0f, questCloneProgressSurfaceOffsetMeters);
+        Transform pose = ResolvePoseTransform();
+        if (offset <= 0f || pose == null)
+            return position;
+
+        Vector3 towardViewer = pose.position - position;
+        if (!IsFinite(towardViewer) || towardViewer.sqrMagnitude <= 1e-8f)
+            return position;
+        return position + towardViewer.normalized * offset;
     }
 
     private void DrawRoomRawDepthCompletionOverlay()
     {
+        if (questCloneContinuousCaptureMode)
+            return;
+
         if (!roomRawDepthCompletionUseGpuInstancing ||
-            !showRoomRawDepthCompletionOverlay ||
-            _roomRawDepthCompletionVoxels.Count <= 0 ||
-            (roomRawDepthCompletionOnlyWhileRecording && !_isRecording))
+            !ShouldTrackRoomRawDepthCompletion() ||
+            (_roomRawDepthCompletionVoxels.Count <= 0 && _questCloneGuideVoxels.Count <= 0) ||
+            ((questCloneContinuousCaptureMode || roomRawDepthCompletionOnlyWhileRecording) && !_isRecording))
             return;
 
         EnsureRoomRawDepthCompletionOverlay();
@@ -7208,6 +7650,38 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _roomRawDepthCompletionPropertyBlock = new MaterialPropertyBlock();
         EnsureRoomRawDepthCompletionMesh();
         EnsureRoomRawDepthCompletionInstancedMaterials();
+        EnsureRoomRawDepthCompletionCombinedRenderer();
+    }
+
+    private void EnsureRoomRawDepthCompletionCombinedRenderer()
+    {
+        if (!questCloneContinuousCaptureMode || _roomRawDepthCompletionRoot == null)
+            return;
+
+        if (_roomRawDepthCompletionCombinedMesh == null)
+        {
+            _roomRawDepthCompletionCombinedMesh = new Mesh
+            {
+                name = "ScanCover Quest Capture Progress Quads",
+                hideFlags = HideFlags.DontSave,
+                indexFormat = IndexFormat.UInt32
+            };
+            _roomRawDepthCompletionCombinedMesh.MarkDynamic();
+        }
+
+        if (_roomRawDepthCompletionCombinedMeshFilter == null)
+            _roomRawDepthCompletionCombinedMeshFilter = _roomRawDepthCompletionRoot.AddComponent<MeshFilter>();
+        _roomRawDepthCompletionCombinedMeshFilter.sharedMesh = _roomRawDepthCompletionCombinedMesh;
+
+        if (_roomRawDepthCompletionCombinedMeshRenderer == null)
+        {
+            _roomRawDepthCompletionCombinedMeshRenderer = _roomRawDepthCompletionRoot.AddComponent<MeshRenderer>();
+            _roomRawDepthCompletionCombinedMeshRenderer.shadowCastingMode = ShadowCastingMode.Off;
+            _roomRawDepthCompletionCombinedMeshRenderer.receiveShadows = false;
+            _roomRawDepthCompletionCombinedMeshRenderer.lightProbeUsage = LightProbeUsage.Off;
+            _roomRawDepthCompletionCombinedMeshRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
+        }
+        _roomRawDepthCompletionCombinedMeshRenderer.sharedMaterials = _roomRawDepthCompletionInstancedMaterials;
     }
 
     private void EnsureRoomRawDepthCompletionMesh()
@@ -7253,6 +7727,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             Color color = GetRoomRawDepthCompletionColor((RoomRawDepthCompletionState)i);
             material.SetColor("_BaseColor", color);
             material.SetColor("_Color", color);
+            if (material.HasProperty("_Cull"))
+                material.SetFloat("_Cull", (float)CullMode.Off);
+            material.renderQueue = 3000;
             _roomRawDepthCompletionInstancedMaterials[i] = material;
         }
     }
@@ -7291,7 +7768,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             return;
 
         pointObject.SetActive(true);
-        pointObject.transform.position = position;
+        pointObject.transform.position = OffsetQuestCloneProgressPointTowardViewer(position);
         pointObject.transform.localScale = Vector3.one * Mathf.Max(0.002f, roomRawDepthCompletionPointSize);
 
         Renderer renderer = pointObject.GetComponent<Renderer>();
@@ -7323,6 +7800,20 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 DestroyImmediate(_roomRawDepthCompletionRoot);
             _roomRawDepthCompletionRoot = null;
         }
+        _roomRawDepthCompletionCombinedMeshFilter = null;
+        _roomRawDepthCompletionCombinedMeshRenderer = null;
+
+        if (_roomRawDepthCompletionCombinedMesh != null)
+        {
+            if (Application.isPlaying)
+                Destroy(_roomRawDepthCompletionCombinedMesh);
+            else
+                DestroyImmediate(_roomRawDepthCompletionCombinedMesh);
+            _roomRawDepthCompletionCombinedMesh = null;
+        }
+        _roomRawDepthCompletionCombinedVertices.Clear();
+        for (int i = 0; i < _roomRawDepthCompletionCombinedIndices.Length; i++)
+            _roomRawDepthCompletionCombinedIndices[i].Clear();
 
         if (_roomRawDepthCompletionMaterial != null)
         {
@@ -7365,21 +7856,57 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (voxel.hits < roomRawDepthCompletionMinHits)
             return RoomRawDepthCompletionState.Scanning;
 
-        float depthStd = voxel.DepthStd;
-        float riskRatio = voxel.RiskRatio;
-        if (depthStd >= roomRawDepthCompletionHardDepthStdMeters || riskRatio >= roomRawDepthCompletionBadRiskRatio)
+        float consistencyStd = questCloneContinuousCaptureMode ? voxel.PositionStd : voxel.DepthStd;
+        float riskRatio = questCloneContinuousCaptureMode ? voxel.RecentRiskRatio : voxel.RiskRatio;
+        float hardStd = questCloneContinuousCaptureMode
+            ? GetQuestCloneHardPositionStdMeters(voxel.MeanDepth)
+            : roomRawDepthCompletionHardDepthStdMeters;
+        float badRisk = questCloneContinuousCaptureMode
+            ? questCloneProgressBadRecentRiskRatio
+            : roomRawDepthCompletionBadRiskRatio;
+        float warnRisk = questCloneContinuousCaptureMode
+            ? questCloneProgressWarnRecentRiskRatio
+            : roomRawDepthCompletionWarnRiskRatio;
+        if (consistencyStd >= hardStd || riskRatio >= badRisk)
             return RoomRawDepthCompletionState.Conflict;
 
-        if (IsRoomRawDepthCompletionStableCandidate(key, voxel, depthStd, riskRatio))
+        if (IsRoomRawDepthCompletionStableCandidate(key, voxel, consistencyStd, riskRatio))
             return RoomRawDepthCompletionState.Stable;
 
-        if (depthStd >= roomRawDepthCompletionStableDepthStdMeters || riskRatio >= roomRawDepthCompletionWarnRiskRatio)
+        float stableStd = questCloneContinuousCaptureMode
+            ? GetQuestCloneStablePositionStdMeters(voxel.MeanDepth)
+            : roomRawDepthCompletionStableDepthStdMeters;
+        if (consistencyStd >= stableStd || riskRatio >= warnRisk)
             return RoomRawDepthCompletionState.Risk;
 
         return RoomRawDepthCompletionState.Supported;
     }
 
-    private bool IsRoomRawDepthCompletionStableCandidate(Vector3Int key, RoomRawDepthCompletionVoxel voxel, float depthStd, float riskRatio)
+    private float GetQuestClonePositionToleranceScale(float depthMeters)
+    {
+        if (!float.IsFinite(depthMeters) || depthMeters <= 0f)
+            return 1f;
+
+        if (depthMeters < 0.75f)
+        {
+            float nearT = Mathf.InverseLerp(0.35f, 0.75f, depthMeters);
+            return Mathf.Lerp(1.20f, 1f, nearT);
+        }
+        if (depthMeters > 3f)
+        {
+            float farT = Mathf.InverseLerp(3f, 5f, depthMeters);
+            return Mathf.Lerp(1f, 1.25f, farT);
+        }
+        return 1f;
+    }
+
+    private float GetQuestCloneStablePositionStdMeters(float depthMeters)
+        => Mathf.Max(0.001f, questCloneProgressStablePositionStdMeters) * GetQuestClonePositionToleranceScale(depthMeters);
+
+    private float GetQuestCloneHardPositionStdMeters(float depthMeters)
+        => Mathf.Max(0.001f, questCloneProgressHardPositionStdMeters) * GetQuestClonePositionToleranceScale(depthMeters);
+
+    private bool IsRoomRawDepthCompletionStableCandidate(Vector3Int key, RoomRawDepthCompletionVoxel voxel, float consistencyStd, float riskRatio)
     {
         int stableHits = Mathf.Max(1, roomRawDepthCompletionStableHits);
         int candidateHits = Mathf.Max(stableHits, roomRawDepthCompletionCandidateStableHits);
@@ -7391,13 +7918,20 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (!hasEnoughHits)
             return false;
 
-        float stableDepthStd = Mathf.Max(0.001f, roomRawDepthCompletionStableDepthStdMeters);
-        bool cleanStable = depthStd <= stableDepthStd && riskRatio <= roomRawDepthCompletionWarnRiskRatio;
+        float stableDepthStd = Mathf.Max(0.001f, questCloneContinuousCaptureMode
+            ? GetQuestCloneStablePositionStdMeters(voxel.MeanDepth)
+            : roomRawDepthCompletionStableDepthStdMeters);
+        float warnRisk = questCloneContinuousCaptureMode
+            ? questCloneProgressWarnRecentRiskRatio
+            : roomRawDepthCompletionWarnRiskRatio;
+        bool cleanStable = consistencyStd <= stableDepthStd && riskRatio <= warnRisk;
         if (cleanStable)
             return true;
 
         bool recoverableRisk = voxel.hits >= candidateHits &&
-            depthStd <= Mathf.Max(stableDepthStd, roomRawDepthCompletionNeighborStableDepthStdMeters) &&
+            consistencyStd <= Mathf.Max(stableDepthStd, questCloneContinuousCaptureMode
+                ? GetQuestCloneHardPositionStdMeters(voxel.MeanDepth)
+                : roomRawDepthCompletionNeighborStableDepthStdMeters) &&
             riskRatio <= Mathf.Max(roomRawDepthCompletionWarnRiskRatio, roomRawDepthCompletionRecoverableRiskRatio) &&
             CountRoomRawDepthCompletionNeighborSupport(key, voxel) >= Mathf.Max(0, roomRawDepthCompletionNeighborStableSupport);
         return recoverableRisk;
@@ -7411,8 +7945,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         int support = 0;
         float maxDepthDelta = Mathf.Max(0.001f, roomRawDepthCompletionNeighborDepthDeltaMeters);
-        float maxDepthStd = Mathf.Max(0.001f, roomRawDepthCompletionNeighborStableDepthStdMeters);
-        float maxRisk = Mathf.Clamp01(roomRawDepthCompletionNeighborRiskRatio);
+        float maxDepthStd = Mathf.Max(0.001f, questCloneContinuousCaptureMode
+            ? GetQuestCloneHardPositionStdMeters(center.MeanDepth)
+            : roomRawDepthCompletionNeighborStableDepthStdMeters);
+        float maxRisk = Mathf.Clamp01(questCloneContinuousCaptureMode
+            ? questCloneProgressBadRecentRiskRatio
+            : roomRawDepthCompletionNeighborRiskRatio);
         for (int dz = -1; dz <= 1; dz++)
         for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++)
@@ -7425,9 +7963,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
                 continue;
             if (neighbor.hits < roomRawDepthCompletionMinHits)
                 continue;
-            if (Mathf.Abs(neighbor.MeanDepth - center.MeanDepth) > maxDepthDelta)
+            if (!questCloneContinuousCaptureMode && Mathf.Abs(neighbor.MeanDepth - center.MeanDepth) > maxDepthDelta)
                 continue;
-            if (neighbor.DepthStd > maxDepthStd || neighbor.RiskRatio > maxRisk)
+            float neighborStd = questCloneContinuousCaptureMode ? neighbor.PositionStd : neighbor.DepthStd;
+            float neighborRisk = questCloneContinuousCaptureMode ? neighbor.RecentRiskRatio : neighbor.RiskRatio;
+            if (neighborStd > maxDepthStd || neighborRisk > maxRisk)
                 continue;
 
             support++;
@@ -7440,6 +7980,22 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private Color GetRoomRawDepthCompletionColor(RoomRawDepthCompletionState state)
     {
+        if (questCloneContinuousCaptureMode)
+        {
+            switch (state)
+            {
+                case RoomRawDepthCompletionState.Stable:
+                    return questCloneProgressStableColor;
+                case RoomRawDepthCompletionState.Supported:
+                    return questCloneProgressSupportedColor;
+                case RoomRawDepthCompletionState.Risk:
+                case RoomRawDepthCompletionState.Conflict:
+                    return questCloneProgressRiskColor;
+                default:
+                    return questCloneProgressPendingColor;
+            }
+        }
+
         switch (state)
         {
             case RoomRawDepthCompletionState.Stable:
@@ -7478,7 +8034,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private void AppendRoomRawDepthCompletionHudLine(StringBuilder builder)
     {
-        if (!showRoomRawDepthCompletionOverlay)
+        if (!ShouldTrackRoomRawDepthCompletion())
             return;
 
         int total = _roomRawDepthCompletionVoxels.Count;
@@ -7489,6 +8045,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         }
 
         float stableRatio = _roomRawDepthCompletionGreenCount / (float)Mathf.Max(1, total);
+        if (questCloneContinuousCaptureMode)
+        {
+            builder.Append("Capture grid cyan/purple/risk/pending: ")
+                .Append(_roomRawDepthCompletionGreenCount.ToString(CultureInfo.InvariantCulture)).Append('/')
+                .Append(_roomRawDepthCompletionBlueCount.ToString(CultureInfo.InvariantCulture)).Append('/')
+                .Append((_roomRawDepthCompletionYellowCount + _roomRawDepthCompletionRedCount).ToString(CultureInfo.InvariantCulture)).Append('/')
+                .Append(_roomRawDepthCompletionGrayCount.ToString(CultureInfo.InvariantCulture))
+                .Append(" complete ")
+                .Append((stableRatio * 100f).ToString("0", CultureInfo.InvariantCulture))
+                .AppendLine("%");
+            return;
+        }
+
         builder.Append("Raw completion G/B/Y/R: ")
             .Append(_roomRawDepthCompletionGreenCount.ToString(CultureInfo.InvariantCulture)).Append('/')
             .Append(_roomRawDepthCompletionBlueCount.ToString(CultureInfo.InvariantCulture)).Append('/')
@@ -7499,6 +8068,9 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .AppendLine("%");
         builder.Append("Scan hint: ").AppendLine(_roomRawDepthCompletionHint);
     }
+
+    private bool ShouldTrackRoomRawDepthCompletion()
+        => showRoomRawDepthCompletionOverlay || questCloneContinuousCaptureMode;
 
     private void AppendRoomRawDepthSnapshotHudLine(StringBuilder builder)
     {
@@ -7525,10 +8097,12 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
     private bool ShouldUseBinocularRoomRawDepthSnapshotCapture()
     {
-        if (!useBinocularRoomRawDepthSnapshots || !ShouldExportRoomRawDepthSnapshots() || depthGridPointCloud == null)
+        if (!useBinocularRoomRawDepthSnapshots || depthGridPointCloud == null)
+            return false;
+        if (!(questCloneContinuousCaptureMode && questCloneUseCompactBinary) && !ShouldExportRoomRawDepthSnapshots())
             return false;
 
-        if (binocularRoomRawDepthSnapshotsManualOnly &&
+        if (!questCloneContinuousCaptureMode && binocularRoomRawDepthSnapshotsManualOnly &&
             !string.Equals(_pendingReason, "manual", StringComparison.OrdinalIgnoreCase))
             return false;
 
@@ -7561,6 +8135,15 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         _binocularRoomRawDepthSnapshotStage = stage;
         preprocessor.SetSourceEye(eye);
 
+        if (depthGridPointCloud.HasPendingReadback)
+        {
+            _binocularRoomRawDepthStatus = eye == ScanCoverDepthPreprocessor.SourceEye.Right
+                ? "waiting for right-eye source"
+                : "waiting for left-eye source";
+            _pendingRefreshRequested = false;
+            return true;
+        }
+
         if (!depthGridPointCloud.RefreshNow(forcePreprocessorRefresh: true))
             return FailBinocularRoomRawDepthSnapshotCapture(depthGridPointCloud.LastIssue ?? "depth refresh failed");
 
@@ -7580,6 +8163,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         if (!hasFreshSnapshot)
         {
+            if (!depthGridPointCloud.HasPendingReadback)
+            {
+                if (depthGridPointCloud.RefreshNow(forcePreprocessorRefresh: true))
+                    _pendingRefreshRequested = true;
+            }
             if (timedOut)
                 FailBinocularRoomRawDepthSnapshotCapture("timeout");
             return;
@@ -7589,6 +8177,19 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         {
             if (timedOut)
                 FailBinocularRoomRawDepthSnapshotCapture("snapshot unavailable");
+            return;
+        }
+
+        int expectedEye = _binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.RightRequested
+            ? (int)ScanCoverDepthPreprocessor.SourceEye.Right
+            : (int)ScanCoverDepthPreprocessor.SourceEye.Left;
+        if (snapshot.sourceEyeIndex != expectedEye)
+        {
+            _binocularRoomRawDepthStartSnapshotIndex = snapshot.frameIndex;
+            if (!depthGridPointCloud.HasPendingReadback && depthGridPointCloud.RefreshNow(forcePreprocessorRefresh: true))
+                _pendingRefreshRequested = true;
+            if (timedOut)
+                FailBinocularRoomRawDepthSnapshotCapture("eye provenance timeout");
             return;
         }
 
@@ -7603,9 +8204,13 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         if (_binocularRoomRawDepthSnapshotStage == BinocularRoomRawDepthSnapshotStage.LeftRequested)
         {
             _binocularRoomRawDepthLeftSnapshot = snapshot;
-            _binocularRoomRawDepthFusedSnapshot = BuildBinocularRoomRawDepthSnapshot(
-                _binocularRoomRawDepthRightSnapshot,
-                _binocularRoomRawDepthLeftSnapshot);
+            // Compact collection writes the two eye buffers independently. Avoid
+            // allocating and copying a third, fused 2-eye buffer on the main thread.
+            _binocularRoomRawDepthFusedSnapshot = questCloneContinuousCaptureMode && questCloneUseCompactBinary
+                ? _binocularRoomRawDepthLeftSnapshot
+                : BuildBinocularRoomRawDepthSnapshot(
+                    _binocularRoomRawDepthRightSnapshot,
+                    _binocularRoomRawDepthLeftSnapshot);
 
             if (_binocularRoomRawDepthFusedSnapshot == null)
             {
@@ -7658,10 +8263,224 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             frameIndex = Mathf.Max(right.frameIndex, left.frameIndex),
             resolutionWidth = width,
             resolutionHeight = height,
+            sourceEyeIndex = -1,
+            dispatchRealtimeSeconds = Math.Min(right.dispatchRealtimeSeconds, left.dispatchRealtimeSeconds),
+            completionRealtimeSeconds = Math.Max(right.completionRealtimeSeconds, left.completionRealtimeSeconds),
+            snapshotRealtimeSeconds = Math.Max(right.snapshotRealtimeSeconds, left.snapshotRealtimeSeconds),
+            hasSnapshotCameraPose = left.hasSnapshotCameraPose || right.hasSnapshotCameraPose,
+            snapshotCameraPosition = left.hasSnapshotCameraPose ? left.snapshotCameraPosition : right.snapshotCameraPosition,
+            snapshotCameraRotation = left.hasSnapshotCameraPose ? left.snapshotCameraRotation : right.snapshotCameraRotation,
             worldPositions = positions,
             worldNormals = normals,
             observationMeta = meta
         };
+    }
+
+    private void ExportQuestCloneCapture(string frameName, Transform pose)
+    {
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right = _binocularRoomRawDepthRightSnapshot;
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left = _binocularRoomRawDepthLeftSnapshot;
+        if (!_sessionFileExportEnabled || right == null || left == null || string.IsNullOrEmpty(_questCloneBinaryDirectory))
+            return;
+
+        UpdateQuestCloneProgress(right);
+        UpdateQuestCloneProgress(left);
+
+        double rightTime = right.dispatchRealtimeSeconds > 0d ? right.dispatchRealtimeSeconds : right.snapshotRealtimeSeconds;
+        double leftTime = left.dispatchRealtimeSeconds > 0d ? left.dispatchRealtimeSeconds : left.snapshotRealtimeSeconds;
+        _questCloneLastInterEyeDeltaMs = Math.Abs(leftTime - rightTime) * 1000d;
+
+        int maxPending = Mathf.Max(1, questCloneMaxPendingWrites);
+        if (Volatile.Read(ref _questCloneWritesInFlight) >= maxPending)
+        {
+            Interlocked.Increment(ref _questCloneDroppedWrites);
+            AppendQuestCloneDroppedRow(frameName, right, left, "dropped-writer-backpressure");
+            return;
+        }
+
+        Directory.CreateDirectory(_questCloneBinaryDirectory);
+        string safeFrame = SafeDirectoryName(frameName, $"frame_{_capturedFrameCount:D4}");
+        string rightPath = Path.Combine(_questCloneBinaryDirectory, safeFrame + "_right.scq3bin");
+        string leftPath = Path.Combine(_questCloneBinaryDirectory, safeFrame + "_left.scq3bin");
+        string metadataPath = Path.Combine(_questCloneBinaryDirectory, safeFrame + "_capture.json");
+        string metadataJson = BuildQuestCloneCaptureMetadata(frameName, right, left, pose, rightPath, leftPath);
+        string row = BuildQuestCloneManifestRow(frameName, right, left, rightPath, leftPath, metadataPath, "exported");
+        QuestCloneWriteJob job = new QuestCloneWriteJob
+        {
+            rightPath = rightPath,
+            leftPath = leftPath,
+            metadataPath = metadataPath,
+            manifestPath = _questCloneBinaryManifestPath,
+            metadataJson = metadataJson,
+            manifestRow = row,
+            right = right,
+            left = left
+        };
+
+        Interlocked.Increment(ref _questCloneWritesInFlight);
+        ThreadPool.QueueUserWorkItem(_ => WriteQuestCloneJob(job));
+    }
+
+    private void UpdateQuestCloneProgress(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        if (snapshot == null || snapshot.worldPositions == null || snapshot.observationMeta == null)
+            return;
+
+        int count = Mathf.Min(snapshot.worldPositions.Length, snapshot.observationMeta.Length);
+        int stride = Mathf.Max(1, questCloneProgressSampleStride);
+        Vector3 cameraPosition = snapshot.hasDispatchCameraPose
+            ? snapshot.dispatchCameraPosition
+            : snapshot.hasSnapshotCameraPose ? snapshot.snapshotCameraPosition : Vector3.zero;
+        for (int i = 0; i < count; i += stride)
+        {
+            if (!IsRawDepthSnapshotPixelValid(snapshot, i))
+                continue;
+
+            Color meta = snapshot.observationMeta[i];
+            bool risk = meta.g < Mathf.Clamp01(questCloneProgressLowConfidenceThreshold);
+            AddRoomRawDepthCompletionSample(snapshot.worldPositions[i], cameraPosition, meta.b, risk);
+        }
+    }
+
+    private void WriteQuestCloneJob(QuestCloneWriteJob job)
+    {
+        try
+        {
+            WriteQuestCloneSnapshotBinary(job.rightPath, job.right);
+            WriteQuestCloneSnapshotBinary(job.leftPath, job.left);
+            File.WriteAllText(job.metadataPath, job.metadataJson, Encoding.UTF8);
+            lock (_questCloneWriteLock)
+                File.AppendAllText(job.manifestPath, job.manifestRow, Encoding.UTF8);
+            _questCloneLastWriteError = string.Empty;
+        }
+        catch (Exception ex)
+        {
+            _questCloneLastWriteError = ex.GetType().Name + ": " + ex.Message;
+            Interlocked.Increment(ref _questCloneDroppedWrites);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _questCloneWritesInFlight);
+        }
+    }
+
+    private static void WriteQuestCloneSnapshotBinary(string path, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        int count = snapshot != null && snapshot.worldPositions != null && snapshot.observationMeta != null
+            ? Math.Min(snapshot.worldPositions.Length, snapshot.observationMeta.Length)
+            : 0;
+        using (FileStream stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan))
+        using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8))
+        {
+            writer.Write(Encoding.ASCII.GetBytes("SCQ3BIN2"));
+            writer.Write(2);
+            writer.Write(snapshot != null ? snapshot.sourceEyeIndex : -1);
+            writer.Write(snapshot != null ? snapshot.frameIndex : -1);
+            writer.Write(snapshot != null ? snapshot.resolutionWidth : 0);
+            writer.Write(snapshot != null ? snapshot.resolutionHeight : 0);
+            writer.Write(count);
+            writer.Write(snapshot != null ? snapshot.dispatchRealtimeSeconds : 0d);
+            writer.Write(snapshot != null ? snapshot.completionRealtimeSeconds : 0d);
+            WriteQuestClonePose(writer, snapshot != null && snapshot.hasDispatchCameraPose,
+                snapshot != null ? snapshot.dispatchCameraPosition : Vector3.zero,
+                snapshot != null ? snapshot.dispatchCameraRotation : Quaternion.identity);
+            WriteQuestCloneMatrix(writer, snapshot != null && snapshot.hasProjectionMatrix, snapshot != null ? snapshot.projectionMatrix : Matrix4x4.identity);
+            WriteQuestCloneMatrix(writer, snapshot != null && snapshot.hasWorldToCameraMatrix, snapshot != null ? snapshot.worldToCameraMatrix : Matrix4x4.identity);
+            WriteQuestCloneMatrix(writer, snapshot != null && snapshot.hasDepthReprojectionMatrix, snapshot != null ? snapshot.depthReprojectionMatrix : Matrix4x4.identity);
+
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 point = snapshot.worldPositions[i];
+                Color meta = snapshot.observationMeta[i];
+                bool valid = meta.r >= 0.5f && meta.b > 0f &&
+                    float.IsFinite(point.x) && float.IsFinite(point.y) && float.IsFinite(point.z);
+                writer.Write((byte)(valid ? 1 : 0));
+                writer.Write(point.x); writer.Write(point.y); writer.Write(point.z);
+                writer.Write(meta.r); writer.Write(meta.g); writer.Write(meta.b); writer.Write(meta.a);
+            }
+        }
+    }
+
+    private static void WriteQuestClonePose(BinaryWriter writer, bool valid, Vector3 position, Quaternion rotation)
+    {
+        writer.Write((byte)(valid ? 1 : 0));
+        writer.Write(position.x); writer.Write(position.y); writer.Write(position.z);
+        writer.Write(rotation.x); writer.Write(rotation.y); writer.Write(rotation.z); writer.Write(rotation.w);
+    }
+
+    private static void WriteQuestCloneMatrix(BinaryWriter writer, bool valid, Matrix4x4 matrix)
+    {
+        writer.Write((byte)(valid ? 1 : 0));
+        for (int row = 0; row < 4; row++)
+            for (int column = 0; column < 4; column++)
+                writer.Write(matrix[row, column]);
+    }
+
+    private string BuildQuestCloneCaptureMetadata(
+        string frameName,
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right,
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left,
+        Transform pose,
+        string rightPath,
+        string leftPath)
+    {
+        StringBuilder json = new StringBuilder(4096);
+        json.AppendLine("{");
+        AppendJsonString(json, "schema", "ScanCoverQuestCloneCapture/v2", 1, true);
+        AppendJsonString(json, "frame", frameName ?? "", 1, true);
+        AppendJsonString(json, "target", questCloneTargetLabel ?? "", 1, true);
+        AppendJsonString(json, "action", questCloneActionLabel ?? "", 1, true);
+        AppendJsonNumber(json, "interEyeDeltaMs", _questCloneLastInterEyeDeltaMs, 1, true);
+        AppendJsonString(json, "rightBinary", rightPath ?? "", 1, true);
+        AppendJsonString(json, "leftBinary", leftPath ?? "", 1, true);
+        AppendIndent(json, 1); json.AppendLine("\"headPoseAtExport\": {");
+        AppendJsonVector(json, "position", pose != null ? pose.position : Vector3.zero, 2, true);
+        AppendJsonQuaternion(json, "rotation", pose != null ? pose.rotation : Quaternion.identity, 2, false);
+        AppendIndent(json, 1); json.AppendLine("},");
+        AppendIndent(json, 1); json.AppendLine("\"eyes\": [");
+        AppendQuestCloneEyeMetadata(json, "Right", right, 2, true);
+        AppendQuestCloneEyeMetadata(json, "Left", left, 2, false);
+        AppendIndent(json, 1); json.AppendLine("]");
+        json.AppendLine("}");
+        return json.ToString();
+    }
+
+    private static void AppendQuestCloneEyeMetadata(StringBuilder json, string name, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot, int indent, bool trailingComma)
+    {
+        AppendIndent(json, indent); json.AppendLine("{");
+        AppendJsonString(json, "name", name, indent + 1, true);
+        AppendJsonNumber(json, "sourceEyeIndex", snapshot != null ? snapshot.sourceEyeIndex : -1, indent + 1, true);
+        AppendJsonNumber(json, "frame", snapshot != null ? snapshot.frameIndex : -1, indent + 1, true);
+        AppendJsonNumber(json, "dispatchRealtimeSeconds", snapshot != null ? snapshot.dispatchRealtimeSeconds : 0d, indent + 1, true);
+        AppendJsonNumber(json, "completionRealtimeSeconds", snapshot != null ? snapshot.completionRealtimeSeconds : 0d, indent + 1, true);
+        AppendJsonBool(json, "hasDispatchPose", snapshot != null && snapshot.hasDispatchCameraPose, indent + 1, true);
+        AppendJsonBool(json, "hasProjectionMatrix", snapshot != null && snapshot.hasProjectionMatrix, indent + 1, true);
+        AppendJsonBool(json, "hasWorldToCameraMatrix", snapshot != null && snapshot.hasWorldToCameraMatrix, indent + 1, true);
+        AppendJsonBool(json, "hasDepthReprojectionMatrix", snapshot != null && snapshot.hasDepthReprojectionMatrix, indent + 1, true);
+        AppendJsonVector(json, "dispatchPosition", snapshot != null ? snapshot.dispatchCameraPosition : Vector3.zero, indent + 1, true);
+        AppendJsonQuaternion(json, "dispatchRotation", snapshot != null ? snapshot.dispatchCameraRotation : Quaternion.identity, indent + 1, true);
+        AppendJsonMatrix(json, "projectionMatrix", snapshot != null ? snapshot.projectionMatrix : Matrix4x4.identity, indent + 1, true);
+        AppendJsonMatrix(json, "worldToCameraMatrix", snapshot != null ? snapshot.worldToCameraMatrix : Matrix4x4.identity, indent + 1, true);
+        AppendJsonMatrix(json, "depthReprojectionMatrix", snapshot != null ? snapshot.depthReprojectionMatrix : Matrix4x4.identity, indent + 1, false);
+        AppendIndent(json, indent); json.Append('}');
+        if (trailingComma) json.Append(',');
+        json.AppendLine();
+    }
+
+    private string BuildQuestCloneManifestRow(string frameName, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left, string rightPath, string leftPath, string metadataPath, string status)
+    {
+        return EscapeCsv(frameName) + "," + right.frameIndex.ToString(CultureInfo.InvariantCulture) + "," + left.frameIndex.ToString(CultureInfo.InvariantCulture) + "," +
+            right.dispatchRealtimeSeconds.ToString("R", CultureInfo.InvariantCulture) + "," + left.dispatchRealtimeSeconds.ToString("R", CultureInfo.InvariantCulture) + "," +
+            _questCloneLastInterEyeDeltaMs.ToString("0.###", CultureInfo.InvariantCulture) + "," + EscapeCsv(questCloneTargetLabel) + "," + EscapeCsv(questCloneActionLabel) + "," +
+            EscapeCsv(rightPath) + "," + EscapeCsv(leftPath) + "," + EscapeCsv(metadataPath) + "," + EscapeCsv(status) + Environment.NewLine;
+    }
+
+    private void AppendQuestCloneDroppedRow(string frameName, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot right, ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot left, string status)
+    {
+        if (string.IsNullOrEmpty(_questCloneBinaryManifestPath))
+            return;
+        string row = BuildQuestCloneManifestRow(frameName, right, left, "", "", "", status);
+        File.AppendAllText(_questCloneBinaryManifestPath, row, Encoding.UTF8);
     }
 
     private int GetLatestRawDepthSnapshotFrameIndex()
@@ -7792,8 +8611,17 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
 
         StringBuilder json = new StringBuilder(2048);
         json.AppendLine("{");
-        AppendJsonString(json, "schema", "ScanCoverVirtualCloneInput/v1", 1, true);
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot rightSnapshot = _binocularRoomRawDepthRightSnapshot;
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot leftSnapshot = _binocularRoomRawDepthLeftSnapshot;
+        double rightDispatch = rightSnapshot != null ? rightSnapshot.dispatchRealtimeSeconds : 0d;
+        double leftDispatch = leftSnapshot != null ? leftSnapshot.dispatchRealtimeSeconds : 0d;
+        double interEyeDeltaMs = Math.Abs(leftDispatch - rightDispatch) * 1000d;
+
+        AppendJsonString(json, "schema", "ScanCoverVirtualCloneInput/v2", 1, true);
         AppendJsonString(json, "frame", frameName ?? "", 1, true);
+        AppendJsonString(json, "target", questCloneTargetLabel ?? "", 1, true);
+        AppendJsonString(json, "action", questCloneActionLabel ?? "", 1, true);
+        AppendJsonNumber(json, "interEyeDeltaMs", interEyeDeltaMs, 1, true);
         AppendJsonNumber(json, "rawDepthFrame", snapshot.frameIndex, 1, true);
         AppendJsonString(json, "rawSnapshotCsv", rawSnapshotCsvPath ?? "", 1, true);
         AppendJsonNumber(json, "totalPixels", totalPixels, 1, true);
@@ -7810,6 +8638,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         AppendJsonVector(json, "right", right, 2, true);
         AppendJsonVector(json, "up", up, 2, false);
         AppendIndent(json, 1); json.AppendLine("},");
+        AppendIndent(json, 1); json.AppendLine("\"captureEyes\": [");
+        AppendQuestCloneEyeMetadata(json, "Right", rightSnapshot, 2, true);
+        AppendQuestCloneEyeMetadata(json, "Left", leftSnapshot, 2, false);
+        AppendIndent(json, 1); json.AppendLine("],");
         AppendIndent(json, 1); json.AppendLine("\"eyes\": [");
         AppendEyeSegmentJson(json, "Right", 0, rightCount, snapshot.resolutionWidth, 2, true);
         AppendEyeSegmentJson(json, "Left", rightCount, leftCount, snapshot.resolutionWidth, 2, false);
@@ -7829,6 +8661,11 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .Append(FormatFloat(virtualCloneEyeBaselineMeters)).Append(',')
             .Append(FormatFloat(fov)).Append(',')
             .Append(FormatFloat(aspect)).Append(',')
+            .Append(rightDispatch.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+            .Append(leftDispatch.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+            .Append(interEyeDeltaMs.ToString("0.###", CultureInfo.InvariantCulture)).Append(',')
+            .Append(EscapeCsv(questCloneTargetLabel)).Append(',')
+            .Append(EscapeCsv(questCloneActionLabel)).Append(',')
             .Append(EscapeCsv(rawSnapshotCsvPath)).Append(',')
             .Append(EscapeCsv(metadataPath)).Append(',')
             .Append("exported").AppendLine();
@@ -8494,6 +9331,15 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.AppendLine();
     }
 
+    private static void AppendJsonNumber(StringBuilder builder, string key, double value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": ").Append(value.ToString("R", CultureInfo.InvariantCulture));
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
     private static void AppendJsonVector(StringBuilder builder, string key, Vector3 value, int indent, bool trailingComma)
     {
         AppendIndent(builder, indent);
@@ -8501,6 +9347,38 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
             .Append(FormatFloat(value.x)).Append(", ")
             .Append(FormatFloat(value.y)).Append(", ")
             .Append(FormatFloat(value.z)).Append(']');
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
+    private static void AppendJsonQuaternion(StringBuilder builder, string key, Quaternion value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": [")
+            .Append(FormatFloat(value.x)).Append(", ")
+            .Append(FormatFloat(value.y)).Append(", ")
+            .Append(FormatFloat(value.z)).Append(", ")
+            .Append(FormatFloat(value.w)).Append(']');
+        if (trailingComma)
+            builder.Append(',');
+        builder.AppendLine();
+    }
+
+    private static void AppendJsonMatrix(StringBuilder builder, string key, Matrix4x4 value, int indent, bool trailingComma)
+    {
+        AppendIndent(builder, indent);
+        builder.Append('"').Append(EscapeJson(key)).Append("\": [");
+        for (int row = 0; row < 4; row++)
+        {
+            for (int column = 0; column < 4; column++)
+            {
+                if (row != 0 || column != 0)
+                    builder.Append(", ");
+                builder.Append(FormatFloat(value[row, column]));
+            }
+        }
+        builder.Append(']');
         if (trailingComma)
             builder.Append(',');
         builder.AppendLine();

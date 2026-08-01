@@ -5,6 +5,9 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
+  - enabled: 0
+    path: Assets/MRMotifs/ScanCover/EvidenceCapture/Scene/QuestDepthEvidenceCapture.unity
+    guid: 62a209d18d8f67d469f6126c6e89e4ca
   - enabled: 1
     path: Assets/MRMotifs/ScanCover/Scene/DepthEffects_ScanCover.unity
     guid: d5e1205134804ce46ad6f879bf7b649b

@@ -35,13 +35,22 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     [SerializeField] private bool debugLog;
 
     public SourceEye CurrentSourceEye => sourceEye;
+    public RenderTexture WorldPositionRawTexture => _worldPositionRawTexture;
     public RenderTexture WorldPositionTexture => _worldPositionTexture;
     public RenderTexture WorldNormalTexture => _worldNormalTexture;
+    public RenderTexture WorldNormalNeighbourTexture => _worldNormalNeighbourTexture;
     public RenderTexture ObservationMetaTexture => _observationMetaTexture;
     public Vector2Int OutputResolution => _outputResolution;
     public bool IsReady => _isReady;
     public bool RefreshEveryFrame => refreshEveryFrame;
     public string LastIssue { get; private set; }
+    public bool HasLastDispatchEyePosition { get; private set; }
+    public Vector3 LastDispatchEyePosition { get; private set; }
+    public bool HasLastDispatchDepthReprojectionMatrix { get; private set; }
+    public Matrix4x4 LastDispatchDepthReprojectionMatrix { get; private set; }
+    public int LastSuccessfulRefreshFrame { get; private set; } = -1;
+    public double LastSuccessfulRefreshRealtimeSeconds { get; private set; } = -1d;
+    public int SuccessfulRefreshCount { get; private set; }
 
     private static readonly int EnvironmentDepthTextureId = Shader.PropertyToID("_EnvironmentDepthTexture");
     private static readonly int ReprojectionMatricesId = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
@@ -59,19 +68,24 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     private static readonly int MaxLinearDepthMetersId = Shader.PropertyToID("_MaxLinearDepthMeters");
     private static readonly int SmoothingDepthDeltaMetersId = Shader.PropertyToID("_SmoothingDepthDeltaMeters");
     private static readonly int CameraWorldPositionId = Shader.PropertyToID("_CameraWorldPosition");
+    private static readonly int WorldPositionRawTextureId = Shader.PropertyToID("_WorldPositionRawTexture");
     private static readonly int WorldPositionTextureId = Shader.PropertyToID("_WorldPositionTexture");
     private static readonly int WorldNormalTextureId = Shader.PropertyToID("_WorldNormalTexture");
+    private static readonly int WorldNormalNeighbourTextureId = Shader.PropertyToID("_WorldNormalNeighbourTexture");
     private static readonly int ObservationMetaTextureId = Shader.PropertyToID("_ObservationMetaTexture");
     private static readonly int GlobalWorldPositionTextureId = Shader.PropertyToID("_ScanCoverDepthWorldPositionTexture");
     private static readonly int GlobalWorldNormalTextureId = Shader.PropertyToID("_ScanCoverDepthWorldNormalTexture");
     private static readonly int GlobalObservationMetaTextureId = Shader.PropertyToID("_ScanCoverDepthObservationMetaTexture");
 
     private readonly Matrix4x4[] _inverseReprojectionMatrices = new Matrix4x4[2];
+    private RenderTexture _worldPositionRawTexture;
     private RenderTexture _worldPositionTexture;
     private RenderTexture _worldNormalTexture;
+    private RenderTexture _worldNormalNeighbourTexture;
     private RenderTexture _observationMetaTexture;
     private Vector2Int _outputResolution;
     private int _kernelIndex = -1;
+    private int _neighbourNormalKernelIndex = -1;
     private bool _isReady;
 
     private void Awake()
@@ -117,7 +131,7 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
             return SetIssue("EnvironmentDepthManager is present but disabled.");
         }
 
-        if (computeShader == null || _kernelIndex < 0)
+        if (computeShader == null || _kernelIndex < 0 || _neighbourNormalKernelIndex < 0)
         {
             return SetIssue("ComputeShader or kernel is missing.");
         }
@@ -146,6 +160,9 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
 
         _inverseReprojectionMatrices[0] = reprojectionMatrices[0].inverse;
         _inverseReprojectionMatrices[1] = reprojectionMatrices[1].inverse;
+        int selectedEye = Mathf.Clamp((int)sourceEye, 0, 1);
+        HasLastDispatchDepthReprojectionMatrix = true;
+        LastDispatchDepthReprojectionMatrix = reprojectionMatrices[selectedEye];
 
         computeShader.SetTexture(_kernelIndex, SourceDepthTextureId, sourceDepth);
         computeShader.SetMatrixArray(InverseReprojectionMatricesId, _inverseReprojectionMatrices);
@@ -159,14 +176,18 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         computeShader.SetFloat(MaxLinearDepthMetersId, maxLinearDepthMeters);
         computeShader.SetFloat(SmoothingDepthDeltaMetersId, smoothingDepthDeltaMeters);
         Camera sourceCamera = Camera.main;
-        Vector3 cameraWorldPosition = sourceCamera ? sourceCamera.transform.position : Vector3.zero;
+        Vector3 cameraWorldPosition = ResolveSelectedEyeWorldPosition(sourceCamera, out bool hasEyePosition);
+        HasLastDispatchEyePosition = hasEyePosition;
+        LastDispatchEyePosition = cameraWorldPosition;
         computeShader.SetVector(CameraWorldPositionId, new Vector4(
             cameraWorldPosition.x,
             cameraWorldPosition.y,
             cameraWorldPosition.z,
             1f));
+        computeShader.SetTexture(_kernelIndex, WorldPositionRawTextureId, _worldPositionRawTexture);
         computeShader.SetTexture(_kernelIndex, WorldPositionTextureId, _worldPositionTexture);
         computeShader.SetTexture(_kernelIndex, WorldNormalTextureId, _worldNormalTexture);
+        computeShader.SetTexture(_kernelIndex, WorldNormalNeighbourTextureId, _worldNormalNeighbourTexture);
         computeShader.SetTexture(_kernelIndex, ObservationMetaTextureId, _observationMetaTexture);
 
         uint threadX;
@@ -177,12 +198,24 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         int dispatchY = Mathf.CeilToInt(_outputResolution.y / (float)threadY);
         computeShader.Dispatch(_kernelIndex, dispatchX, dispatchY, 1);
 
+        computeShader.SetVector(OutputSizeId, new Vector4(_outputResolution.x, _outputResolution.y, 0f, 0f));
+        computeShader.SetTexture(_neighbourNormalKernelIndex, WorldPositionRawTextureId, _worldPositionRawTexture);
+        computeShader.SetTexture(_neighbourNormalKernelIndex, WorldPositionTextureId, _worldPositionTexture);
+        computeShader.SetTexture(_neighbourNormalKernelIndex, WorldNormalNeighbourTextureId, _worldNormalNeighbourTexture);
+        computeShader.GetKernelThreadGroupSizes(_neighbourNormalKernelIndex, out threadX, out threadY, out threadZ);
+        dispatchX = Mathf.CeilToInt(_outputResolution.x / (float)threadX);
+        dispatchY = Mathf.CeilToInt(_outputResolution.y / (float)threadY);
+        computeShader.Dispatch(_neighbourNormalKernelIndex, dispatchX, dispatchY, 1);
+
         Shader.SetGlobalTexture(GlobalWorldPositionTextureId, _worldPositionTexture);
         Shader.SetGlobalTexture(GlobalWorldNormalTextureId, _worldNormalTexture);
         Shader.SetGlobalTexture(GlobalObservationMetaTextureId, _observationMetaTexture);
 
         _isReady = true;
         LastIssue = null;
+        LastSuccessfulRefreshFrame = Time.frameCount;
+        LastSuccessfulRefreshRealtimeSeconds = Time.realtimeSinceStartupAsDouble;
+        SuccessfulRefreshCount++;
 
         if (debugLog)
         {
@@ -192,6 +225,36 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Creates a deterministic stereo companion from the exact preprocessor used
+    /// by the production raw-depth source.  This avoids scene-wide runtime searches
+    /// while keeping both eyes on identical depth, filtering and confidence rules.
+    /// </summary>
+    public bool ConfigureAsStereoCompanion(
+        ScanCoverDepthPreprocessor productionTemplate,
+        SourceEye eye)
+    {
+        if (productionTemplate == null)
+            return SetIssue("Production depth preprocessor template is missing.");
+
+        environmentDepthManager = productionTemplate.environmentDepthManager;
+        computeShader = productionTemplate.computeShader;
+        sourceEye = eye;
+        downsample = productionTemplate.downsample;
+        refreshEveryFrame = false;
+        minDepth01 = productionTemplate.minDepth01;
+        depthEdgeThreshold01 = productionTemplate.depthEdgeThreshold01;
+        depthEdgeSoftness01 = productionTemplate.depthEdgeSoftness01;
+        minLinearDepthMeters = productionTemplate.minLinearDepthMeters;
+        maxLinearDepthMeters = productionTemplate.maxLinearDepthMeters;
+        smoothingDepthDeltaMeters = productionTemplate.smoothingDepthDeltaMeters;
+        debugLog = false;
+        ResolveRefs();
+        ResolveKernel();
+        LastIssue = null;
+        return computeShader != null && _kernelIndex >= 0 && _neighbourNormalKernelIndex >= 0;
     }
 
     public void SetSourceEye(SourceEye eye)
@@ -204,7 +267,7 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         refreshEveryFrame = enabled;
     }
 
-        public bool TryGetOutputs(
+    public bool TryGetOutputs(
             out RenderTexture worldPositionTexture,
         out RenderTexture worldNormalTexture,
         out RenderTexture observationMetaTexture)
@@ -218,13 +281,26 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
             observationMetaTexture != null;
         }
 
+    public bool TryGetPaperShadowOutputs(
+        out RenderTexture worldPositionRawTexture,
+        out RenderTexture worldNormalNeighbourTexture)
+    {
+        worldPositionRawTexture = _worldPositionRawTexture;
+        worldNormalNeighbourTexture = _worldNormalNeighbourTexture;
+        return _isReady &&
+            worldPositionRawTexture != null &&
+            worldNormalNeighbourTexture != null;
+    }
+
         public void ReleaseOutputs()
         {
         Shader.SetGlobalTexture(GlobalWorldPositionTextureId, null);
         Shader.SetGlobalTexture(GlobalWorldNormalTextureId, null);
         Shader.SetGlobalTexture(GlobalObservationMetaTextureId, null);
+        ReleaseTexture(ref _worldPositionRawTexture);
         ReleaseTexture(ref _worldPositionTexture);
         ReleaseTexture(ref _worldNormalTexture);
+        ReleaseTexture(ref _worldNormalNeighbourTexture);
         ReleaseTexture(ref _observationMetaTexture);
         _outputResolution = Vector2Int.zero;
     }
@@ -242,6 +318,8 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
 
         if (_kernelIndex < 0)
             _kernelIndex = computeShader.FindKernel("CSMain");
+        if (_neighbourNormalKernelIndex < 0)
+            _neighbourNormalKernelIndex = computeShader.FindKernel("CSNeighbourNormals");
     }
 
     private bool EnsureOutputs(int sourceWidth, int sourceHeight)
@@ -252,8 +330,10 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
             Mathf.Max(1, sourceHeight / safeDownsample));
 
         if (_outputResolution == wantedResolution &&
+            _worldPositionRawTexture != null &&
             _worldPositionTexture != null &&
             _worldNormalTexture != null &&
+            _worldNormalNeighbourTexture != null &&
             _observationMetaTexture != null)
         {
             return true;
@@ -261,6 +341,10 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
 
         ReleaseOutputs();
 
+        _worldPositionRawTexture = CreateOutputTexture(
+            "ScanCover_DepthWorldPositionRaw",
+            wantedResolution,
+            GraphicsFormat.R32G32B32A32_SFloat);
         _worldPositionTexture = CreateOutputTexture(
             "ScanCover_DepthWorldPosition",
             wantedResolution,
@@ -269,15 +353,49 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
             "ScanCover_DepthWorldNormal",
             wantedResolution,
             GraphicsFormat.R32G32B32A32_SFloat);
+        _worldNormalNeighbourTexture = CreateOutputTexture(
+            "ScanCover_DepthWorldNormalNeighbour",
+            wantedResolution,
+            GraphicsFormat.R32G32B32A32_SFloat);
         _observationMetaTexture = CreateOutputTexture(
             "ScanCover_DepthObservationMeta",
             wantedResolution,
             GraphicsFormat.R32G32B32A32_SFloat);
 
         _outputResolution = wantedResolution;
-        return _worldPositionTexture != null &&
+        return _worldPositionRawTexture != null &&
+            _worldPositionTexture != null &&
             _worldNormalTexture != null &&
+            _worldNormalNeighbourTexture != null &&
             _observationMetaTexture != null;
+    }
+
+    private Vector3 ResolveSelectedEyeWorldPosition(Camera sourceCamera, out bool valid)
+    {
+        valid = false;
+        if (sourceCamera == null)
+            return Vector3.zero;
+
+        try
+        {
+            Camera.StereoscopicEye eye = sourceEye == SourceEye.Left
+                ? Camera.StereoscopicEye.Left
+                : Camera.StereoscopicEye.Right;
+            Matrix4x4 eyeToWorld = sourceCamera.GetStereoViewMatrix(eye).inverse;
+            Vector4 column = eyeToWorld.GetColumn(3);
+            Vector3 position = new Vector3(column.x, column.y, column.z);
+            if (float.IsFinite(position.x) && float.IsFinite(position.y) && float.IsFinite(position.z))
+            {
+                valid = true;
+                return position;
+            }
+        }
+        catch
+        {
+            // Non-stereo editor cameras fall back to the camera transform.
+        }
+
+        return sourceCamera.transform.position;
     }
 
     private static RenderTexture CreateOutputTexture(string textureName, Vector2Int size, GraphicsFormat format)

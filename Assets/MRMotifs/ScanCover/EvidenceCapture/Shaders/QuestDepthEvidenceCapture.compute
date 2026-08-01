@@ -1,0 +1,288 @@
+#pragma kernel FreezeDepth
+#pragma kernel CaptureGeometry
+#pragma kernel CaptureNormals
+#pragma kernel CopyR32ArrayToBuffer
+#pragma kernel CopyRGBA32ArrayToBuffer
+
+Texture2DArray<float> _EnvironmentDepthTexture;
+RWTexture2DArray<float> _FrozenDepthWritable;
+Texture2DArray<float> _FrozenDepthTexture;
+RWTexture2DArray<float4> _DepthMetricsTexture;
+RWTexture2DArray<float4> _WorldPositionRawTexture;
+RWTexture2DArray<float4> _WorldPositionFilteredTexture;
+RWTexture2DArray<float4> _WorldNormalRawTexture;
+RWTexture2DArray<float4> _WorldNormalFilteredTexture;
+RWTexture2DArray<float4> _DiagnosticsTexture;
+Texture2DArray<float> _ReadbackR32Texture;
+Texture2DArray<float4> _ReadbackRGBA32Texture;
+RWStructuredBuffer<float> _ReadbackR32Buffer;
+RWStructuredBuffer<float4> _ReadbackRGBA32Buffer;
+
+float4x4 _InverseReprojectionMatrices[2];
+float4x4 _WorldToEyeMatrices[2];
+// Keep the two positions as separate uniforms. On Quest/Vulkan the previous
+// dynamically indexed float4 array produced corrupt per-thread radial values.
+float4 _LeftEyeWorldPosition;
+float4 _RightEyeWorldPosition;
+float4 _EnvironmentDepthZBufferParams;
+int _CaptureWidth;
+int _CaptureHeight;
+float _NeighbourDepthToleranceMetres;
+
+[numthreads(8, 8, 1)]
+void FreezeDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight || id.z >= 2)
+    {
+        return;
+    }
+
+    _FrozenDepthWritable[id] = _EnvironmentDepthTexture.Load(int4(id.xyz, 0));
+}
+
+bool PixelInside(int2 pixel)
+{
+    return pixel.x >= 0 && pixel.y >= 0 && pixel.x < _CaptureWidth && pixel.y < _CaptureHeight;
+}
+
+float ReadDepth01(int2 pixel, uint eye)
+{
+    if (!PixelInside(pixel))
+    {
+        return 0.0;
+    }
+
+    return _FrozenDepthTexture.Load(int4(pixel.x, pixel.y, eye, 0));
+}
+
+bool IsValidDepth(float depth01)
+{
+    // Raw values are always preserved. Derived validity only rejects zero/NaN/Inf;
+    // it deliberately does not impose a near/far quality gate.
+    return isfinite(depth01) && depth01 > 0.0;
+}
+
+bool TryLinearizeDepth(float depth01, out float linearDepth)
+{
+    const float ndcDepth = depth01 * 2.0 - 1.0;
+    const float denominator = ndcDepth + _EnvironmentDepthZBufferParams.y;
+    if (!isfinite(denominator) || abs(denominator) < 1e-7)
+    {
+        linearDepth = 0.0;
+        return false;
+    }
+
+    linearDepth = _EnvironmentDepthZBufferParams.x / denominator;
+    // Preserve finite positive measurements even when they are implausibly far.
+    // Distance quality is an offline classification, not a capture-time erase gate.
+    return isfinite(linearDepth) && linearDepth > 0.0;
+}
+
+float3 EyeWorldPosition(uint eye)
+{
+    return eye == 0 ? _LeftEyeWorldPosition.xyz : _RightEyeWorldPosition.xyz;
+}
+
+bool TryReconstructWorld(int2 pixel, uint eye, float depth01, out float3 world)
+{
+    float2 uv = (float2(pixel) + 0.5) / float2(_CaptureWidth, _CaptureHeight);
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 clip = float4(ndc, depth01 * 2.0 - 1.0, 1.0);
+    float4 homogeneousWorld = mul(_InverseReprojectionMatrices[eye], clip);
+    if (!all(isfinite(homogeneousWorld)) || abs(homogeneousWorld.w) < 1e-7)
+    {
+        world = 0.0;
+        return false;
+    }
+
+    world = homogeneousWorld.xyz / homogeneousWorld.w;
+    return all(isfinite(world));
+}
+
+bool ReadWorld(int2 pixel, uint eye, out float3 world, out float depth01, out float radial)
+{
+    depth01 = ReadDepth01(pixel, eye);
+    if (!IsValidDepth(depth01))
+    {
+        world = 0.0;
+        radial = 0.0;
+        return false;
+    }
+
+    if (!TryReconstructWorld(pixel, eye, depth01, world))
+    {
+        radial = 0.0;
+        return false;
+    }
+
+    radial = distance(world, EyeWorldPosition(eye));
+    // No arbitrary far-distance ceiling here: a finite reconstructed sample is
+    // evidence and must be written. Downstream diagnostics may flag it as an outlier.
+    return isfinite(radial) && radial >= 0.0;
+}
+
+float3 SafeNormal(float3 dx, float3 dy)
+{
+    float3 n = cross(dx, dy);
+    float lengthSquared = dot(n, n);
+    if (!isfinite(lengthSquared) || lengthSquared < 1e-12)
+    {
+        return 0.0;
+    }
+
+    return n * rsqrt(lengthSquared);
+}
+
+[numthreads(8, 8, 1)]
+void CaptureGeometry(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight || id.z >= 2)
+    {
+        return;
+    }
+
+    int2 pixel = int2(id.xy);
+    uint eye = id.z;
+    float3 centreWorld;
+    float centreDepth01;
+    float centreRadial;
+    bool centreValid = ReadWorld(pixel, eye, centreWorld, centreDepth01, centreRadial);
+    float centreLinearDepth;
+    centreValid = centreValid && TryLinearizeDepth(centreDepth01, centreLinearDepth);
+
+    if (!centreValid)
+    {
+        _DepthMetricsTexture[id] = 0.0;
+        _WorldPositionRawTexture[id] = 0.0;
+        _WorldPositionFilteredTexture[id] = 0.0;
+        return;
+    }
+
+    _DepthMetricsTexture[id] = float4(centreDepth01, centreLinearDepth, centreRadial, 1.0);
+    _WorldPositionRawTexture[id] = float4(centreWorld, 1.0);
+
+    const int2 offsets[4] =
+    {
+        int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
+    };
+
+    float3 sum = centreWorld;
+    float support = 1.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        float3 neighbourWorld;
+        float neighbourDepth01;
+        float neighbourRadial;
+        if (ReadWorld(pixel + offsets[i], eye, neighbourWorld, neighbourDepth01, neighbourRadial) &&
+            abs(neighbourRadial - centreRadial) <= _NeighbourDepthToleranceMetres)
+        {
+            sum += neighbourWorld;
+            support += 1.0;
+        }
+    }
+
+    _WorldPositionFilteredTexture[id] = float4(sum / support, support / 5.0);
+}
+
+[numthreads(8, 8, 1)]
+void CaptureNormals(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight || id.z >= 2)
+    {
+        return;
+    }
+
+    int2 pixel = int2(id.xy);
+    uint eye = id.z;
+    float4 centre = _WorldPositionRawTexture[id];
+    if (centre.w <= 0.0)
+    {
+        _WorldNormalRawTexture[id] = 0.0;
+        _WorldNormalFilteredTexture[id] = 0.0;
+        _DiagnosticsTexture[id] = 0.0;
+        return;
+    }
+
+    int2 leftPixel = int2(max(pixel.x - 1, 0), pixel.y);
+    int2 rightPixel = int2(min(pixel.x + 1, _CaptureWidth - 1), pixel.y);
+    int2 downPixel = int2(pixel.x, max(pixel.y - 1, 0));
+    int2 upPixel = int2(pixel.x, min(pixel.y + 1, _CaptureHeight - 1));
+
+    float4 rawLeft = _WorldPositionRawTexture[uint3(leftPixel, eye)];
+    float4 rawRight = _WorldPositionRawTexture[uint3(rightPixel, eye)];
+    float4 rawDown = _WorldPositionRawTexture[uint3(downPixel, eye)];
+    float4 rawUp = _WorldPositionRawTexture[uint3(upPixel, eye)];
+    bool rawSupport = rawLeft.w > 0.0 && rawRight.w > 0.0 && rawDown.w > 0.0 && rawUp.w > 0.0;
+    float3 rawNormal = rawSupport ? SafeNormal(rawRight.xyz - rawLeft.xyz, rawUp.xyz - rawDown.xyz) : 0.0;
+    float rawNormalValid = dot(rawNormal, rawNormal) > 0.5 ? 1.0 : 0.0;
+    _WorldNormalRawTexture[id] = float4(rawNormal, rawNormalValid);
+
+    float4 filteredLeft = _WorldPositionFilteredTexture[uint3(leftPixel, eye)];
+    float4 filteredRight = _WorldPositionFilteredTexture[uint3(rightPixel, eye)];
+    float4 filteredDown = _WorldPositionFilteredTexture[uint3(downPixel, eye)];
+    float4 filteredUp = _WorldPositionFilteredTexture[uint3(upPixel, eye)];
+    bool filteredSupport = filteredLeft.w > 0.0 && filteredRight.w > 0.0 && filteredDown.w > 0.0 && filteredUp.w > 0.0;
+    float3 filteredNormal = filteredSupport
+        ? SafeNormal(filteredRight.xyz - filteredLeft.xyz, filteredUp.xyz - filteredDown.xyz)
+        : 0.0;
+    float filteredNormalValid = dot(filteredNormal, filteredNormal) > 0.5 ? 1.0 : 0.0;
+    _WorldNormalFilteredTexture[id] = float4(filteredNormal, filteredNormalValid);
+
+    float centreRadial = _DepthMetricsTexture[id].z;
+    float centreDepth01 = _DepthMetricsTexture[id].x;
+    const int2 offsets[4] =
+    {
+        int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
+    };
+    float maxRadialJump = 0.0;
+    float maxDepth01Jump = 0.0;
+    float validNeighbours = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        int2 neighbourPixel = pixel + offsets[i];
+        if (!PixelInside(neighbourPixel))
+        {
+            continue;
+        }
+
+        float4 neighbourMetrics = _DepthMetricsTexture[uint3(neighbourPixel, eye)];
+        if (neighbourMetrics.w > 0.0)
+        {
+            validNeighbours += 1.0;
+            maxRadialJump = max(maxRadialJump, abs(neighbourMetrics.z - centreRadial));
+            maxDepth01Jump = max(maxDepth01Jump, abs(neighbourMetrics.x - centreDepth01));
+        }
+    }
+
+    float edgeRisk = maxRadialJump > _NeighbourDepthToleranceMetres ? 1.0 : 0.0;
+    _DiagnosticsTexture[id] = float4(maxRadialJump, maxDepth01Jump, validNeighbours / 4.0, edgeRisk);
+}
+
+uint ReadbackIndex(uint3 id)
+{
+    return id.x + id.y * (uint)_CaptureWidth + id.z * (uint)(_CaptureWidth * _CaptureHeight);
+}
+
+[numthreads(8, 8, 1)]
+void CopyR32ArrayToBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight || id.z >= 2)
+    {
+        return;
+    }
+
+    _ReadbackR32Buffer[ReadbackIndex(id)] = _ReadbackR32Texture.Load(int4(id.xyz, 0));
+}
+
+[numthreads(8, 8, 1)]
+void CopyRGBA32ArrayToBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight || id.z >= 2)
+    {
+        return;
+    }
+
+    _ReadbackRGBA32Buffer[ReadbackIndex(id)] = _ReadbackRGBA32Texture.Load(int4(id.xyz, 0));
+}

@@ -1,0 +1,93 @@
+// ScanCover QuestRoom candidate: projective TSDF integration.
+// Architecture and convergence policy adapted from QuestRoomScan
+// (https://github.com/arghyasur1991/QuestRoomScan, MIT License).
+#pragma kernel Clear
+#pragma kernel Integrate
+
+RWTexture3D<float2> _Volume;
+Texture2D<float4> _WorldPosition;
+Texture2D<float4> _WorldNormal;
+Texture2D<float4> _ObservationMeta;
+
+int3 _VoxelCount;
+float _VoxelSize;
+float _TruncationDistance;
+float _MinimumDepth;
+float _MaximumDepth;
+float _MinimumConfidence;
+float _MinimumNormalDot;
+float _BlendRate;
+float _Stability;
+float _WeightGrowth;
+float _MaximumWeight;
+float4 _SourceSize;
+float4 _EyeWorldPosition;
+float4x4 _WorldToClip;
+float4x4 _VolumeLocalToWorld;
+
+float3 VoxelToLocal(uint3 id)
+{
+    return ((float3)id + 0.5 - (float3)_VoxelCount * 0.5) * _VoxelSize;
+}
+
+[numthreads(4, 4, 4)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+    _Volume[id] = float2(1.0, 0.0);
+}
+
+[numthreads(4, 4, 4)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+
+    float3 voxelWorld = mul(_VolumeLocalToWorld, float4(VoxelToLocal(id), 1.0)).xyz;
+    float4 clip = mul(_WorldToClip, float4(voxelWorld, 1.0));
+    if (abs(clip.w) < 1e-6) return;
+
+    float3 ndc = clip.xyz / clip.w;
+    if (any(ndc.xy < -0.985) || any(ndc.xy > 0.985)) return;
+
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    int2 pixel = int2(saturate(uv) * max(_SourceSize.xy - 1.0, 0.0));
+    float4 meta = _ObservationMeta.Load(int3(pixel, 0));
+    if (meta.x < 0.5 || meta.w < 0.5 || meta.y < _MinimumConfidence) return;
+    if (meta.z < _MinimumDepth || meta.z > _MaximumDepth) return;
+
+    float3 surfaceWorld = _WorldPosition.Load(int3(pixel, 0)).xyz;
+    float3 surfaceNormal = _WorldNormal.Load(int3(pixel, 0)).xyz;
+    float normalLengthSq = dot(surfaceNormal, surfaceNormal);
+    if (normalLengthSq < 1e-5) return;
+    surfaceNormal *= rsqrt(normalLengthSq);
+
+    float3 eyeToSurface = surfaceWorld - _EyeWorldPosition.xyz;
+    float surfaceDistance = length(eyeToSurface);
+    if (surfaceDistance < 1e-4) return;
+    float3 rayDirection = eyeToSurface / surfaceDistance;
+    float facing = saturate(-dot(rayDirection, surfaceNormal));
+    if (facing < _MinimumNormalDot) return;
+
+    float voxelDistance = distance(voxelWorld, _EyeWorldPosition.xyz);
+    float signedDistance = (surfaceDistance - voxelDistance) * facing;
+    if (signedDistance < -_TruncationDistance) return;
+    float normalizedDistance = min(signedDistance / _TruncationDistance, 1.0);
+
+    float rangeQuality = saturate(1.0 - surfaceDistance / _MaximumDepth);
+    float quality = max(0.05, rangeQuality * facing * saturate(meta.y));
+    float q2 = quality * quality;
+    float2 oldValue = _Volume[id];
+    float oldWeight = max(0.0, oldValue.y);
+
+    if (oldWeight < 0.001)
+    {
+        if (quality >= 0.20)
+            _Volume[id] = float2(normalizedDistance, 0.10);
+        return;
+    }
+
+    float blend = clamp(q2 * _BlendRate / (1.0 + oldWeight * _Stability), 0.005, 0.70);
+    float updatedTsdf = lerp(oldValue.x, normalizedDistance, blend);
+    float updatedWeight = min(oldWeight + q2 * _WeightGrowth, _MaximumWeight);
+    _Volume[id] = float2(updatedTsdf, updatedWeight);
+}

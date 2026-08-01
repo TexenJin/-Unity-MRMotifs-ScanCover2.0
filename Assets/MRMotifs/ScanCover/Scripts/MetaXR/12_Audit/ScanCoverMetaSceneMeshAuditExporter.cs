@@ -50,6 +50,11 @@ public sealed class ScanCoverMetaSceneMeshAuditExporter : MonoBehaviour
 
     public bool ExportAuditPackage()
     {
+        return ExportAuditPackageToDirectory(CreateSessionDirectory());
+    }
+
+    public bool ExportAuditPackageToDirectory(string sessionDir)
+    {
         LastIssue = null;
         LastExportDirectory = "";
         LastExportedMeshCount = 0;
@@ -65,7 +70,15 @@ public sealed class ScanCoverMetaSceneMeshAuditExporter : MonoBehaviour
             return false;
         }
 
-        string sessionDir = CreateSessionDirectory();
+        if (string.IsNullOrWhiteSpace(sessionDir))
+        {
+            LastIssue = "The requested Meta Scene Mesh export directory is empty.";
+            if (debugLog)
+                Debug.LogWarning($"[ScanCoverMetaSceneMeshAuditExporter] {LastIssue}", this);
+            return false;
+        }
+
+        sessionDir = Path.GetFullPath(sessionDir);
         Directory.CreateDirectory(sessionDir);
 
         string localDir = Path.Combine(sessionDir, "raw_local_meshes");

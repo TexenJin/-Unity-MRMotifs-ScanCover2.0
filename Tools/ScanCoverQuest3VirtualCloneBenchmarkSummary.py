@@ -37,6 +37,15 @@ def status(distance_delta: float, angle_delta: float) -> str:
     return "needs-path-calibration"
 
 
+def nested_float(data: dict[str, Any], path: list[str], default: float = 0.0) -> float:
+    value: Any = data
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return default
+        value = value[key]
+    return float(value)
+
+
 def read_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -64,6 +73,13 @@ def main() -> int:
                 "hitRatio": report["hitRatio"],
                 "acceptedRatio": report["acceptedRatio"],
                 "riskRatio": report["riskRatio"],
+                "coverageAt0.05m": nested_float(report, ["surfaceCoverage", "coverageAtMeters", "0.05"]),
+                "coverageAt0.10m": nested_float(report, ["surfaceCoverage", "coverageAtMeters", "0.10"]),
+                "lowerCoverageAt0.05m": nested_float(report, ["surfaceCoverage", "surfaceBands", "lower0.30m", "coverageAt0.05m"]),
+                "upperCoverageAt0.05m": nested_float(report, ["surfaceCoverage", "surfaceBands", "upper0.30m", "coverageAt0.05m"]),
+                "verticalCoverageAt0.05m": nested_float(report, ["surfaceCoverage", "surfaceBands", "vertical", "coverageAt0.05m"]),
+                "observationErrorP95m": nested_float(report, ["observationErrorMeters", "p95"]),
+                "mature3FrameRatio": nested_float(report, ["multiViewMaturity", "ratioAtLeast3Frames"]),
                 "distanceMeanAbsShareDelta": distance_delta,
                 "angleMeanAbsShareDelta": angle_delta,
                 "status": status(distance_delta, angle_delta),
@@ -88,6 +104,15 @@ def main() -> int:
         "passCount": pass_count,
         "usableWithCalibrationCount": usable_count,
         "rows": rows,
+        "aggregates": {
+            "meanCoverageAt0.05m": sum(row["coverageAt0.05m"] for row in rows) / len(rows),
+            "minCoverageAt0.05m": min(row["coverageAt0.05m"] for row in rows),
+            "meanCoverageAt0.10m": sum(row["coverageAt0.10m"] for row in rows) / len(rows),
+            "minLowerCoverageAt0.05m": min(row["lowerCoverageAt0.05m"] for row in rows),
+            "minVerticalCoverageAt0.05m": min(row["verticalCoverageAt0.05m"] for row in rows),
+            "meanMature3FrameRatio": sum(row["mature3FrameRatio"] for row in rows) / len(rows),
+            "maxObservationErrorP95m": max(row["observationErrorP95m"] for row in rows),
+        },
         "verdict": {
             "pipelineReusable": usable_count == len(rows),
             "fullyCalibrated": pass_count == len(rows),
@@ -109,13 +134,15 @@ def main() -> int:
         f"- Fully calibrated: {summary['verdict']['fullyCalibrated']}",
         f"- Note: {summary['verdict']['note']}",
         "",
-        "| Experiment | Hit | Accepted | Risk | Distance delta | Angle delta | Status |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Experiment | Cov 5cm | Cov 10cm | Lower 5cm | Vertical 5cm | Mature 3+ | Error p95 | Distance delta | Angle delta | Status |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
         lines.append(
-            f"| {row['experiment']} | {row['hitRatio']:.4f} | {row['acceptedRatio']:.4f} | "
-            f"{row['riskRatio']:.4f} | {row['distanceMeanAbsShareDelta']:.4f} | "
+            f"| {row['experiment']} | {row['coverageAt0.05m']:.4f} | {row['coverageAt0.10m']:.4f} | "
+            f"{row['lowerCoverageAt0.05m']:.4f} | {row['verticalCoverageAt0.05m']:.4f} | "
+            f"{row['mature3FrameRatio']:.4f} | {row['observationErrorP95m']:.4f} | "
+            f"{row['distanceMeanAbsShareDelta']:.4f} | "
             f"{row['angleMeanAbsShareDelta']:.4f} | {row['status']} |"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

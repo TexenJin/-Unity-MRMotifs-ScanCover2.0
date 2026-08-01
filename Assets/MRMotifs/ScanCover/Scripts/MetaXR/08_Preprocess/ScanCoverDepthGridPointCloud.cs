@@ -48,8 +48,34 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         public bool hasSnapshotCameraPose;
         public Vector3 snapshotCameraPosition;
         public Quaternion snapshotCameraRotation;
+        // Capture provenance. The legacy snapshot fields above intentionally keep
+        // their completion-time meaning; these fields identify the pose/matrices
+        // that actually produced the GPU sample.
+        public int sourceEyeIndex;
+        public double dispatchRealtimeSeconds;
+        public double completionRealtimeSeconds;
+        public bool hasDispatchCameraPose;
+        public Vector3 dispatchCameraPosition;
+        public Quaternion dispatchCameraRotation;
+        public bool hasCompletionCameraPose;
+        public Vector3 completionCameraPosition;
+        public Quaternion completionCameraRotation;
+        public bool hasProjectionMatrix;
+        public Matrix4x4 projectionMatrix;
+        public bool hasWorldToCameraMatrix;
+        public Matrix4x4 worldToCameraMatrix;
+        public bool hasDepthReprojectionMatrix;
+        public Matrix4x4 depthReprojectionMatrix;
+        public bool hasDispatchEyePosition;
+        public Vector3 dispatchEyePosition;
+        // Legacy production fields remain the filtered point and raw finite-
+        // difference normal. The paper DMC shadow uses the two explicit fields
+        // below and never substitutes the production values.
+        public Vector3[] worldPositionsRaw;
         public Vector3[] worldPositions;
         public Vector3[] worldNormals;
+        public Vector3[] worldNormalsNeighbour;
+        public bool[] worldNormalsNeighbourValid;
         public Color[] observationMeta;
     }
 
@@ -117,7 +143,21 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private Vector3[] _rawSurfaceExportVertices = Array.Empty<Vector3>();
     private Vector3[] _rawSurfaceExportNormals = Array.Empty<Vector3>();
     private int[] _rawSurfaceExportTriangles = Array.Empty<int>();
-    private AsyncGPUReadbackRequest _worldPositionRequest, _worldNormalRequest, _observationMetaRequest; private bool _hasPendingReadback; private Vector2Int _pendingResolution; private int _visibleCount; private int _frameIndex; private bool _hasDumpedRoster;
+    private AsyncGPUReadbackRequest _worldPositionRawRequest, _worldPositionRequest, _worldNormalRequest, _worldNormalNeighbourRequest, _observationMetaRequest; private bool _hasPendingReadback; private Vector2Int _pendingResolution; private int _visibleCount; private int _frameIndex; private bool _hasDumpedRoster;
+    private int _pendingSourceEyeIndex = -1;
+    private double _pendingDispatchRealtimeSeconds;
+    private bool _pendingHasCameraPose;
+    private Vector3 _pendingCameraPosition;
+    private Quaternion _pendingCameraRotation = Quaternion.identity;
+    private bool _pendingHasProjectionMatrix;
+    private Matrix4x4 _pendingProjectionMatrix = Matrix4x4.identity;
+    private bool _pendingHasWorldToCameraMatrix;
+    private Matrix4x4 _pendingWorldToCameraMatrix = Matrix4x4.identity;
+    private bool _pendingHasDepthReprojectionMatrix;
+    private Matrix4x4 _pendingDepthReprojectionMatrix = Matrix4x4.identity;
+    private bool _pendingHasEyePosition;
+    private Vector3 _pendingEyePosition;
+    private static readonly int EnvironmentDepthReprojectionMatricesId = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
     private RawDepthFrameSnapshot _latestRawDepthFrameSnapshot;
     private int _rawDepthSnapshotFrameIndex;
     private bool[] _currentValid = Array.Empty<bool>(); private bool[] _currentLineValid = Array.Empty<bool>(); private Vector3[] _currentPositions = Array.Empty<Vector3>(); private Vector3[] _currentNormals = Array.Empty<Vector3>(); private float[] _currentConfidences = Array.Empty<float>(); private Vector2Int _currentResolution;
@@ -158,7 +198,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         ResolveRefs(); EnsurePropertyBlock();
         if (preprocessor == null) return SetIssue("ScanCoverDepthPreprocessor is missing.");
         if (_hasPendingReadback) return false;
-        if (!TryPrepareOutputs(preprocessor, forcePreprocessorRefresh, out RenderTexture worldPosTex, out RenderTexture worldNormalTex, out RenderTexture metaTex, out Vector2Int primaryResolution))
+        if (!TryPrepareOutputs(preprocessor, forcePreprocessorRefresh, out RenderTexture worldPosRawTex, out RenderTexture worldPosTex, out RenderTexture worldNormalTex, out RenderTexture worldNormalNeighbourTex, out RenderTexture metaTex, out Vector2Int primaryResolution))
             return false;
         BuildCells(primaryResolution);
         UpdateDisplayRootsTransform(force: true);
@@ -166,8 +206,11 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         if (ShouldShowGridLines()) EnsureGridLineObjects(); else SetGridLinesVisible(false);
         if (ShouldMaintainSurfaceMesh()) EnsureSurfaceObjects(); else SetSurfaceVisible(false);
         _pendingResolution = primaryResolution;
+        CapturePendingReadbackProvenance();
+        _worldPositionRawRequest = AsyncGPUReadback.Request(worldPosRawTex);
         _worldPositionRequest = AsyncGPUReadback.Request(worldPosTex);
         _worldNormalRequest = AsyncGPUReadback.Request(worldNormalTex);
+        _worldNormalNeighbourRequest = AsyncGPUReadback.Request(worldNormalNeighbourTex);
         _observationMetaRequest = AsyncGPUReadback.Request(metaTex);
         _hasPendingReadback = true; LastIssue = null; return true;
     }
@@ -396,6 +439,7 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     {
         _hasPendingReadback = false;
         _pendingResolution = Vector2Int.zero;
+        ResetPendingReadbackProvenance();
         _visibleCount = 0;
         _currentResolution = Vector2Int.zero;
         _currentValid = Array.Empty<bool>();
@@ -445,42 +489,50 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
 
     private void UpdatePendingReadback()
     {
-        if (!_worldPositionRequest.done || !_worldNormalRequest.done || !_observationMetaRequest.done) return;
+        if (!_worldPositionRawRequest.done || !_worldPositionRequest.done || !_worldNormalRequest.done || !_worldNormalNeighbourRequest.done || !_observationMetaRequest.done) return;
         _hasPendingReadback = false;
         if (_snapshotGridExternalControlActive)
             return;
-        if (_worldPositionRequest.hasError || _worldNormalRequest.hasError || _observationMetaRequest.hasError) { SetIssue("AsyncGPUReadback failed for depth grid point cloud."); return; }
+        if (_worldPositionRawRequest.hasError || _worldPositionRequest.hasError || _worldNormalRequest.hasError || _worldNormalNeighbourRequest.hasError || _observationMetaRequest.hasError) { SetIssue("AsyncGPUReadback failed for depth grid point cloud."); return; }
+        NativeArray<Color> worldPositionsRaw = _worldPositionRawRequest.GetData<Color>();
         NativeArray<Color> worldPositions = _worldPositionRequest.GetData<Color>();
         NativeArray<Color> worldNormals = _worldNormalRequest.GetData<Color>();
+        NativeArray<Color> worldNormalsNeighbour = _worldNormalNeighbourRequest.GetData<Color>();
         NativeArray<Color> observationMeta = _observationMetaRequest.GetData<Color>();
 
         if (ShouldRectifyRegularGridBuffers())
         {
+            NativeArray<Color> rectifiedWorldPositionsRaw = default;
             NativeArray<Color> rectifiedWorldPositions = default;
             NativeArray<Color> rectifiedWorldNormals = default;
+            NativeArray<Color> rectifiedWorldNormalsNeighbour = default;
             NativeArray<Color> rectifiedObservationMeta = default;
             try
             {
                 int pixelCount = worldPositions.Length;
+                rectifiedWorldPositionsRaw = new NativeArray<Color>(pixelCount, Allocator.Temp);
                 rectifiedWorldPositions = new NativeArray<Color>(pixelCount, Allocator.Temp);
                 rectifiedWorldNormals = new NativeArray<Color>(pixelCount, Allocator.Temp);
+                rectifiedWorldNormalsNeighbour = new NativeArray<Color>(pixelCount, Allocator.Temp);
                 rectifiedObservationMeta = new NativeArray<Color>(pixelCount, Allocator.Temp);
-                RectifyRegularGridBuffers(worldPositions, worldNormals, observationMeta, _pendingResolution, rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta);
-                StoreLatestRawDepthFrameSnapshot(rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta, _pendingResolution);
+                RectifyRegularGridBuffers(worldPositionsRaw, worldPositions, worldNormals, worldNormalsNeighbour, observationMeta, _pendingResolution, rectifiedWorldPositionsRaw, rectifiedWorldPositions, rectifiedWorldNormals, rectifiedWorldNormalsNeighbour, rectifiedObservationMeta);
+                StoreLatestRawDepthFrameSnapshot(rectifiedWorldPositionsRaw, rectifiedWorldPositions, rectifiedWorldNormals, rectifiedWorldNormalsNeighbour, rectifiedObservationMeta, _pendingResolution);
                 if (!_captureOnlySnapshotMode)
                     BuildVisualization(rectifiedWorldPositions, rectifiedWorldNormals, rectifiedObservationMeta, _pendingResolution);
             }
             finally
             {
+                if (rectifiedWorldPositionsRaw.IsCreated) rectifiedWorldPositionsRaw.Dispose();
                 if (rectifiedWorldPositions.IsCreated) rectifiedWorldPositions.Dispose();
                 if (rectifiedWorldNormals.IsCreated) rectifiedWorldNormals.Dispose();
+                if (rectifiedWorldNormalsNeighbour.IsCreated) rectifiedWorldNormalsNeighbour.Dispose();
                 if (rectifiedObservationMeta.IsCreated) rectifiedObservationMeta.Dispose();
             }
 
             return;
         }
 
-        StoreLatestRawDepthFrameSnapshot(worldPositions, worldNormals, observationMeta, _pendingResolution);
+        StoreLatestRawDepthFrameSnapshot(worldPositionsRaw, worldPositions, worldNormals, worldNormalsNeighbour, observationMeta, _pendingResolution);
         if (!_captureOnlySnapshotMode)
             BuildVisualization(worldPositions, worldNormals, observationMeta, _pendingResolution);
     }
@@ -9240,8 +9292,34 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             hasSnapshotCameraPose = _latestRawDepthFrameSnapshot.hasSnapshotCameraPose,
             snapshotCameraPosition = _latestRawDepthFrameSnapshot.snapshotCameraPosition,
             snapshotCameraRotation = _latestRawDepthFrameSnapshot.snapshotCameraRotation,
+            sourceEyeIndex = _latestRawDepthFrameSnapshot.sourceEyeIndex,
+            dispatchRealtimeSeconds = _latestRawDepthFrameSnapshot.dispatchRealtimeSeconds,
+            completionRealtimeSeconds = _latestRawDepthFrameSnapshot.completionRealtimeSeconds,
+            hasDispatchCameraPose = _latestRawDepthFrameSnapshot.hasDispatchCameraPose,
+            dispatchCameraPosition = _latestRawDepthFrameSnapshot.dispatchCameraPosition,
+            dispatchCameraRotation = _latestRawDepthFrameSnapshot.dispatchCameraRotation,
+            hasCompletionCameraPose = _latestRawDepthFrameSnapshot.hasCompletionCameraPose,
+            completionCameraPosition = _latestRawDepthFrameSnapshot.completionCameraPosition,
+            completionCameraRotation = _latestRawDepthFrameSnapshot.completionCameraRotation,
+            hasProjectionMatrix = _latestRawDepthFrameSnapshot.hasProjectionMatrix,
+            projectionMatrix = _latestRawDepthFrameSnapshot.projectionMatrix,
+            hasWorldToCameraMatrix = _latestRawDepthFrameSnapshot.hasWorldToCameraMatrix,
+            worldToCameraMatrix = _latestRawDepthFrameSnapshot.worldToCameraMatrix,
+            hasDepthReprojectionMatrix = _latestRawDepthFrameSnapshot.hasDepthReprojectionMatrix,
+            depthReprojectionMatrix = _latestRawDepthFrameSnapshot.depthReprojectionMatrix,
+            hasDispatchEyePosition = _latestRawDepthFrameSnapshot.hasDispatchEyePosition,
+            dispatchEyePosition = _latestRawDepthFrameSnapshot.dispatchEyePosition,
+            worldPositionsRaw = _latestRawDepthFrameSnapshot.worldPositionsRaw != null
+                ? (Vector3[])_latestRawDepthFrameSnapshot.worldPositionsRaw.Clone()
+                : null,
             worldPositions = (Vector3[])_latestRawDepthFrameSnapshot.worldPositions.Clone(),
             worldNormals = (Vector3[])_latestRawDepthFrameSnapshot.worldNormals.Clone(),
+            worldNormalsNeighbour = _latestRawDepthFrameSnapshot.worldNormalsNeighbour != null
+                ? (Vector3[])_latestRawDepthFrameSnapshot.worldNormalsNeighbour.Clone()
+                : null,
+            worldNormalsNeighbourValid = _latestRawDepthFrameSnapshot.worldNormalsNeighbourValid != null
+                ? (bool[])_latestRawDepthFrameSnapshot.worldNormalsNeighbourValid.Clone()
+                : null,
             observationMeta = (Color[])_latestRawDepthFrameSnapshot.observationMeta.Clone()
         };
         return true;
@@ -9544,6 +9622,29 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         return true;
     }
 
+    public int CopyCurrentValidGridPositions(List<Vector3> target)
+    {
+        if (target == null)
+            return 0;
+
+        target.Clear();
+        if (_cells.Count <= 0 || _currentValid == null || _currentPositions == null)
+            return 0;
+
+        if (target.Capacity < _visibleCount)
+            target.Capacity = _visibleCount;
+        int count = Mathf.Min(_cells.Count, Mathf.Min(_currentValid.Length, _currentPositions.Length));
+        for (int i = 0; i < count; i++)
+        {
+            Vector3 position = _currentPositions[i];
+            if (_currentValid[i] &&
+                float.IsFinite(position.x) && float.IsFinite(position.y) && float.IsFinite(position.z))
+                target.Add(position);
+        }
+
+        return target.Count;
+    }
+
     public bool UsesPreprocessor(ScanCoverDepthPreprocessor targetPreprocessor)
     {
         return targetPreprocessor != null && preprocessor == targetPreprocessor;
@@ -9578,10 +9679,22 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
         return _surfaceRenderer != null ? _surfaceRenderer.sharedMaterial : null;
     }
 
-    private bool TryPrepareOutputs(ScanCoverDepthPreprocessor targetPreprocessor, bool forcePreprocessorRefresh, out RenderTexture worldPosTex, out RenderTexture worldNormalTex, out RenderTexture metaTex, out Vector2Int outputResolution)
+    private bool TryPrepareOutputs(
+        ScanCoverDepthPreprocessor targetPreprocessor,
+        bool forcePreprocessorRefresh,
+        out RenderTexture worldPosRawTex,
+        out RenderTexture worldPosTex,
+        out RenderTexture worldNormalTex,
+        out RenderTexture worldNormalNeighbourTex,
+        out RenderTexture metaTex,
+        out Vector2Int outputResolution)
     {
         outputResolution = Vector2Int.zero;
-        worldPosTex = null; worldNormalTex = null; metaTex = null;
+        worldPosRawTex = null;
+        worldPosTex = null;
+        worldNormalTex = null;
+        worldNormalNeighbourTex = null;
+        metaTex = null;
         if (targetPreprocessor == null)
             return false;
 
@@ -9598,6 +9711,9 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             if (!targetPreprocessor.TryGetOutputs(out worldPosTex, out worldNormalTex, out metaTex))
                 return SetIssue(targetPreprocessor.LastIssue ?? "Depth preprocessor outputs are unavailable.");
         }
+        if (!targetPreprocessor.TryGetPaperShadowOutputs(
+                out worldPosRawTex, out worldNormalNeighbourTex))
+            return SetIssue(targetPreprocessor.LastIssue ?? "Paper DMC shadow inputs are unavailable.");
 
         outputResolution = targetPreprocessor.OutputResolution;
         return true;
@@ -9628,29 +9744,42 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     }
 
     private void StoreLatestRawDepthFrameSnapshot(
+        NativeArray<Color> worldPositionsRaw,
         NativeArray<Color> worldPositions,
         NativeArray<Color> worldNormals,
+        NativeArray<Color> worldNormalsNeighbour,
         NativeArray<Color> observationMeta,
         Vector2Int resolution)
     {
-        int count = Mathf.Min(worldPositions.Length, Mathf.Min(worldNormals.Length, observationMeta.Length));
+        int count = Mathf.Min(
+            Mathf.Min(worldPositionsRaw.Length, worldPositions.Length),
+            Mathf.Min(worldNormals.Length, Mathf.Min(worldNormalsNeighbour.Length, observationMeta.Length)));
         if (count <= 0)
         {
             _latestRawDepthFrameSnapshot = null;
             return;
         }
 
+        Vector3[] rawPositions = new Vector3[count];
         Vector3[] positions = new Vector3[count];
         Vector3[] normals = new Vector3[count];
+        Vector3[] neighbourNormals = new Vector3[count];
+        bool[] neighbourNormalValid = new bool[count];
         Color[] meta = new Color[count];
         for (int i = 0; i < count; i++)
         {
+            rawPositions[i] = WorldPos(worldPositionsRaw[i]);
             positions[i] = WorldPos(worldPositions[i]);
             normals[i] = WorldNormal(worldNormals[i], observationMeta[i].a >= 0.5f);
+            neighbourNormalValid[i] = worldNormalsNeighbour[i].a >= 0.5f;
+            neighbourNormals[i] = neighbourNormalValid[i]
+                ? WorldNormal(worldNormalsNeighbour[i], true)
+                : Vector3.zero;
             meta[i] = observationMeta[i];
         }
         _rawDepthSnapshotFrameIndex++;
         Camera snapshotCamera = Camera.main;
+        double completionRealtimeSeconds = Time.realtimeSinceStartupAsDouble;
 
         _latestRawDepthFrameSnapshot = new RawDepthFrameSnapshot
         {
@@ -9662,10 +9791,97 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             hasSnapshotCameraPose = snapshotCamera != null,
             snapshotCameraPosition = snapshotCamera != null ? snapshotCamera.transform.position : Vector3.zero,
             snapshotCameraRotation = snapshotCamera != null ? snapshotCamera.transform.rotation : Quaternion.identity,
+            sourceEyeIndex = _pendingSourceEyeIndex,
+            dispatchRealtimeSeconds = _pendingDispatchRealtimeSeconds,
+            completionRealtimeSeconds = completionRealtimeSeconds,
+            hasDispatchCameraPose = _pendingHasCameraPose,
+            dispatchCameraPosition = _pendingCameraPosition,
+            dispatchCameraRotation = _pendingCameraRotation,
+            hasCompletionCameraPose = snapshotCamera != null,
+            completionCameraPosition = snapshotCamera != null ? snapshotCamera.transform.position : Vector3.zero,
+            completionCameraRotation = snapshotCamera != null ? snapshotCamera.transform.rotation : Quaternion.identity,
+            hasProjectionMatrix = _pendingHasProjectionMatrix,
+            projectionMatrix = _pendingProjectionMatrix,
+            hasWorldToCameraMatrix = _pendingHasWorldToCameraMatrix,
+            worldToCameraMatrix = _pendingWorldToCameraMatrix,
+            hasDepthReprojectionMatrix = _pendingHasDepthReprojectionMatrix,
+            depthReprojectionMatrix = _pendingDepthReprojectionMatrix,
+            hasDispatchEyePosition = _pendingHasEyePosition,
+            dispatchEyePosition = _pendingEyePosition,
+            worldPositionsRaw = rawPositions,
             worldPositions = positions,
             worldNormals = normals,
+            worldNormalsNeighbour = neighbourNormals,
+            worldNormalsNeighbourValid = neighbourNormalValid,
             observationMeta = meta
         };
+    }
+
+    private void CapturePendingReadbackProvenance()
+    {
+        ResetPendingReadbackProvenance();
+        _pendingDispatchRealtimeSeconds = Time.realtimeSinceStartupAsDouble;
+        _pendingSourceEyeIndex = preprocessor != null ? (int)preprocessor.CurrentSourceEye : -1;
+        _pendingHasEyePosition = preprocessor != null && preprocessor.HasLastDispatchEyePosition;
+        _pendingEyePosition = _pendingHasEyePosition
+            ? preprocessor.LastDispatchEyePosition
+            : Vector3.zero;
+
+        Camera camera = Camera.main;
+        if (camera != null)
+        {
+            _pendingHasCameraPose = true;
+            _pendingCameraPosition = camera.transform.position;
+            _pendingCameraRotation = camera.transform.rotation;
+            _pendingHasProjectionMatrix = true;
+            _pendingHasWorldToCameraMatrix = true;
+            if (camera.stereoEnabled && _pendingSourceEyeIndex >= 0)
+            {
+                Camera.StereoscopicEye stereoEye = _pendingSourceEyeIndex == (int)ScanCoverDepthPreprocessor.SourceEye.Left
+                    ? Camera.StereoscopicEye.Left
+                    : Camera.StereoscopicEye.Right;
+                _pendingProjectionMatrix = camera.GetStereoProjectionMatrix(stereoEye);
+                _pendingWorldToCameraMatrix = camera.GetStereoViewMatrix(stereoEye);
+                Matrix4x4 eyeToWorld = _pendingWorldToCameraMatrix.inverse;
+                Vector4 eyePosition = eyeToWorld.GetColumn(3);
+                Vector4 eyeForward = eyeToWorld.GetColumn(2);
+                Vector4 eyeUp = eyeToWorld.GetColumn(1);
+                _pendingCameraPosition = new Vector3(eyePosition.x, eyePosition.y, eyePosition.z);
+                Vector3 forward = new Vector3(eyeForward.x, eyeForward.y, eyeForward.z);
+                Vector3 up = new Vector3(eyeUp.x, eyeUp.y, eyeUp.z);
+                if (forward.sqrMagnitude > 1e-8f && up.sqrMagnitude > 1e-8f)
+                    _pendingCameraRotation = Quaternion.LookRotation(forward, up);
+            }
+            else
+            {
+                _pendingProjectionMatrix = camera.projectionMatrix;
+                _pendingWorldToCameraMatrix = camera.worldToCameraMatrix;
+            }
+        }
+
+        Matrix4x4[] matrices = Shader.GetGlobalMatrixArray(EnvironmentDepthReprojectionMatricesId);
+        if (matrices != null && _pendingSourceEyeIndex >= 0 && _pendingSourceEyeIndex < matrices.Length)
+        {
+            _pendingHasDepthReprojectionMatrix = true;
+            _pendingDepthReprojectionMatrix = matrices[_pendingSourceEyeIndex];
+        }
+    }
+
+    private void ResetPendingReadbackProvenance()
+    {
+        _pendingSourceEyeIndex = -1;
+        _pendingDispatchRealtimeSeconds = 0d;
+        _pendingHasCameraPose = false;
+        _pendingCameraPosition = Vector3.zero;
+        _pendingCameraRotation = Quaternion.identity;
+        _pendingHasProjectionMatrix = false;
+        _pendingProjectionMatrix = Matrix4x4.identity;
+        _pendingHasWorldToCameraMatrix = false;
+        _pendingWorldToCameraMatrix = Matrix4x4.identity;
+        _pendingHasDepthReprojectionMatrix = false;
+        _pendingDepthReprojectionMatrix = Matrix4x4.identity;
+        _pendingHasEyePosition = false;
+        _pendingEyePosition = Vector3.zero;
     }
 
     private bool TryGetNeighborMetrics(int index, int rowDelta, int colDelta, out float distance, out float normalDelta, out float verticalDelta)
@@ -12144,28 +12360,38 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     }
 
     private void RectifyRegularGridBuffers(
+        NativeArray<Color> sourceWorldPositionsRaw,
         NativeArray<Color> sourceWorldPositions,
         NativeArray<Color> sourceWorldNormals,
+        NativeArray<Color> sourceWorldNormalsNeighbour,
         NativeArray<Color> sourceObservationMeta,
         Vector2Int resolution,
+        NativeArray<Color> rectifiedWorldPositionsRaw,
         NativeArray<Color> rectifiedWorldPositions,
         NativeArray<Color> rectifiedWorldNormals,
+        NativeArray<Color> rectifiedWorldNormalsNeighbour,
         NativeArray<Color> rectifiedObservationMeta)
     {
         int width = Mathf.Max(1, resolution.x);
         int height = Mathf.Max(1, resolution.y);
         int pixelCount = width * height;
-        if (sourceWorldPositions.Length != pixelCount ||
+        if (sourceWorldPositionsRaw.Length != pixelCount ||
+            sourceWorldPositions.Length != pixelCount ||
             sourceWorldNormals.Length != pixelCount ||
+            sourceWorldNormalsNeighbour.Length != pixelCount ||
             sourceObservationMeta.Length != pixelCount ||
+            rectifiedWorldPositionsRaw.Length != pixelCount ||
             rectifiedWorldPositions.Length != pixelCount ||
             rectifiedWorldNormals.Length != pixelCount ||
+            rectifiedWorldNormalsNeighbour.Length != pixelCount ||
             rectifiedObservationMeta.Length != pixelCount)
         {
             for (int i = 0; i < Mathf.Min(pixelCount, rectifiedWorldPositions.Length); i++)
             {
+                rectifiedWorldPositionsRaw[i] = i < sourceWorldPositionsRaw.Length ? sourceWorldPositionsRaw[i] : default;
                 rectifiedWorldPositions[i] = i < sourceWorldPositions.Length ? sourceWorldPositions[i] : default;
                 rectifiedWorldNormals[i] = i < sourceWorldNormals.Length ? sourceWorldNormals[i] : default;
+                rectifiedWorldNormalsNeighbour[i] = i < sourceWorldNormalsNeighbour.Length ? sourceWorldNormalsNeighbour[i] : default;
                 rectifiedObservationMeta[i] = i < sourceObservationMeta.Length ? sourceObservationMeta[i] : default;
             }
             return;
@@ -12182,8 +12408,10 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
                 ResolveRegularGridSampleCoord(x, y, width, height, rollCompensationDegrees, out int sampleX, out int sampleY);
                 int dstIndex = x + y * width;
                 int srcIndex = sampleX + sampleY * width;
+                rectifiedWorldPositionsRaw[dstIndex] = sourceWorldPositionsRaw[srcIndex];
                 rectifiedWorldPositions[dstIndex] = sourceWorldPositions[srcIndex];
                 rectifiedWorldNormals[dstIndex] = sourceWorldNormals[srcIndex];
+                rectifiedWorldNormalsNeighbour[dstIndex] = sourceWorldNormalsNeighbour[srcIndex];
                 rectifiedObservationMeta[dstIndex] = sourceObservationMeta[srcIndex];
             }
         }

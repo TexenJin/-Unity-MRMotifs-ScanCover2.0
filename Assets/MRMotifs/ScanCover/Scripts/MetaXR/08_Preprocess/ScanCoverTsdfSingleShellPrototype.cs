@@ -24,6 +24,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         Reference = 2
     }
 
+    private enum DirectionalTsdfShadowDisplayMode
+    {
+        ProductionOnly = 0,
+        Compare = 1,
+        DirectionalShadowOnly = 2
+    }
+
     private const int OutputDisplayLayerViewCount = 3;
 
     private static readonly Vector3Int[] FaceDirections =
@@ -52,9 +59,50 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool stageMeshRebuildAfterFusionBatch = true;
     [SerializeField, Range(0, 3)] private int meshRebuildSettleFrames = 1;
 
+    [Header("QuestRoom GPU Streaming Production")]
+    [Tooltip("Feed every newly accepted stereo frame directly into the persistent GPU TSDF. This path has no fixed 12-frame boundary and never invokes the legacy CPU fusion or final rebuild.")]
+    [SerializeField] private bool useQuestRoomGpuStreamingProduction = true;
+    [Tooltip("Diagnostic rollback only. When enabled, the trigger runs the original bounded CPU fusion batch instead of the streaming production path.")]
+    [SerializeField] private bool useLegacyCpuFusionDiagnosticBatch = false;
+    [Tooltip("A second capture trigger requests a clean streaming stop and writes the lightweight session summary.")]
+    [SerializeField] private bool stopQuestRoomGpuStreamingOnRepeatedTrigger = true;
+    [SerializeField] private bool writeQuestRoomGpuStreamingSummaryOnStop = true;
+
     [Header("Per-Frame Convergence / Pressure Shadow")]
     [SerializeField] private bool enableLowOverheadPerformanceMeasurement = true;
     [SerializeField] private bool enablePersistentResultChunkPublishing = true;
+    [SerializeField] private bool enablePersistentResultDeltaPublishing = true;
+    [SerializeField, Range(0, 2)] private int persistentResultDeltaHaloBlocks = 1;
+    [Tooltip("Extra read-only block halo used only to resolve shared edge ownership around a dirty result delta. This keeps incremental publishing local without changing which chunks are rebuilt.")]
+    [SerializeField, Range(0, 2)] private int persistentResultEdgeOwnerHaloBlocks = 1;
+    [SerializeField] private bool enableIncrementalSemanticFinalizationScope = true;
+    [SerializeField, Range(0, 2)] private int persistentSemanticFinalizationHaloBlocks = 1;
+    [SerializeField, Range(0.01f, 0.20f)]
+    private float dependencySemanticReusePositionToleranceVoxels = 0.05f;
+    [SerializeField] private bool enableDependencyBoundaryZeroCrossSignHysteresisShadow = true;
+    [SerializeField, Range(0.005f, 0.20f)]
+    private float dependencyBoundarySignHysteresisNearZeroTsdf = 0.05f;
+    [SerializeField, Range(0.05f, 0.50f)]
+    private float dependencyBoundarySignHysteresisFarTsdfLimit = 0.25f;
+    [SerializeField, Range(1, 3)]
+    private int dependencyBoundarySignHysteresisGraceRebuilds = 1;
+    [SerializeField] private bool enableDependencyBoundaryTemporalFreeSpaceShadow = true;
+    [SerializeField, Range(2, 5)]
+    private int dependencyBoundaryTemporalObservationRebuilds = 3;
+    [Header("Unified Observation Semantics Shadow")]
+    [SerializeField] private bool enableUnifiedObservationSemanticsShadow = true;
+    [SerializeField] private bool enableStrongMixedOwnershipProductionHold = false;
+    [SerializeField] private bool allowOwnershipProductionHoldAtFovBorder = false;
+    [SerializeField] private bool writeCompactBatchContextCsv = true;
+    [SerializeField, Range(2, 16)] private int batchContextDepthSampleStridePixels = 4;
+    [SerializeField, Range(0.02f, 0.20f)] private float observationFovBorderFraction = 0.08f;
+    [SerializeField, Range(1, 8)] private int ownershipShadowMinimumCloserNeighbors = 2;
+    [SerializeField, Range(1f, 4f)] private float ownershipShadowStrongDepthJumpScale = 2f;
+    [SerializeField, Range(0.005f, 0.08f)] private float ownershipProductionMinimumEndpointResidualMeters = 0.03f;
+    [SerializeField, Range(0.05f, 0.49f)] private float ownershipProductionMinimumInteriorFraction = 0.30f;
+    [SerializeField, Range(2, 8)] private int persistentResultRetireConfirmRebuilds = 3;
+    [SerializeField] private bool enablePersistentResultChunkDoubleBuffering = true;
+    [SerializeField, Range(16, 512)] private int persistentResultEntriesPerBudgetCheck = 32;
     [SerializeField] private bool enablePerFrameConvergenceDiagnostics = true;
     [SerializeField] private bool enablePressureShadowMatrix = true;
     [SerializeField, Range(0.90f, 1f)] private float pressureShadowWeightedCoverageThreshold = 0.995f;
@@ -67,8 +115,118 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(1f, 12f)] private float fusionWorkBudgetMillisecondsPerRenderFrame = 4f;
     [SerializeField] private bool mergeSameFrameSurfaceVoxelWrites = true;
     [SerializeField] private bool selectSurfaceVoxelRepresentativeBeforeHeavyFusion = true;
+    [Tooltip("After the representative prepass, run the expensive fusion path only for one representative per surface voxel plus samples that still require neighbour recovery. Non-representative samples already have no production write effect.")]
+    [SerializeField] private bool compactFusionRepresentativeIteration = true;
+    [Tooltip("Use generation-stamped arrays indexed by TSDF voxel as the production representative and same-frame write table. This replaces per-sample Dictionary/HashSet traffic without changing representative selection.")]
+    [SerializeField] private bool useFusionDenseStampProduction = true;
+    [SerializeField] private bool enableFusionDenseStampShadow = false;
     [SerializeField, Range(1f, 6f)] private float maximumMergedSurfaceVoxelWeightScale = 4f;
     [SerializeField, Range(1, 8)] private int maximumMergedVoteEvidencePerVoxel = 4;
+    [Header("Geometry Maturity Certificate / Stable Smooth Fast Path")]
+    [SerializeField] private bool enableMatureSmoothFastPath = true;
+    [SerializeField, Range(3, 12)] private int geometryCertificateMinimumWeight = 7;
+    [SerializeField, Range(3, 12)] private int geometryCertificateStableObservations = 4;
+    [SerializeField, Range(2, 4)] private int geometryCertificateDistinctViews = 2;
+    [SerializeField, Range(4f, 20f)] private float geometryCertificateViewSeparationDegrees = 8f;
+    [Tooltip("Accept real lateral camera parallax as a distinct view even when the fixed angular threshold is not reached. Pure head rotation does not contribute.")]
+    [SerializeField] private bool enableAdaptiveGeometryCertificateViewBaseline = true;
+    [SerializeField, Range(0.25f, 1.5f)] private float geometryCertificateMinimumLateralBaselineVoxels = 0.5f;
+    [SerializeField, Range(0.5f, 6f)] private float geometryCertificateMinimumAdaptiveParallaxDegrees = 2f;
+    [Tooltip("Allow metric RGB-D observations to mature without camera translation when the same surface slot remains geometrically consistent across independent frames.")]
+    [SerializeField] private bool enableTemporalGeometryCertificateMaturity = true;
+    [SerializeField, Range(4, 12)] private int geometryCertificateTemporalStableFrames = 6;
+    [SerializeField, Range(6, 16)] private int geometryCertificateContestedTemporalStableFrames = 8;
+    [SerializeField, Range(0.5f, 1f)] private float geometryCertificateTemporalResidualScale = 0.75f;
+    [SerializeField, Range(0.90f, 1f)] private float geometryCertificateMinimumNormalDot = 0.94f;
+    [SerializeField, Range(0.005f, 0.08f)] private float geometryCertificateMaximumPlaneResidualMeters = 0.025f;
+    [SerializeField, Range(0.01f, 0.12f)] private float matureSmoothMaximumChangeMeters = 0.04f;
+    [SerializeField, Range(1, 12)] private int geometryCertificateConflictCooldownFrames = 4;
+    [SerializeField, Range(2, 12)] private int geometryCertificateMaximumRecentFrameGap = 6;
+    [Header("Bounded Multi-Surface Geometry Certificates")]
+    [Tooltip("Keep a second local plane hypothesis only in voxels where two coherent surfaces compete. The normal single-surface path remains unchanged elsewhere.")]
+    [SerializeField] private bool enableBoundedMultiSurfaceCertificates = true;
+    [SerializeField, Range(8f, 60f)] private float multiSurfaceMinimumNormalSeparationDegrees = 18f;
+    [SerializeField, Range(0.015f, 0.12f)] private float multiSurfaceMinimumParallelPlaneSeparationMeters = 0.04f;
+    [Header("Multi-Surface Certificate Production Fusion")]
+    [Tooltip("Carry contested primary/secondary geometry certificate ownership through representative compaction, same-frame write suppression, and authoritative TSDF fusion.")]
+    [SerializeField] private bool enableMultiSurfaceCertificateProductionFusion = true;
+    [Tooltip("Select one representative for each resolved primary/secondary direction in contested voxels instead of collapsing both directions or sending every raw pixel through the heavy path.")]
+    [SerializeField] private bool preserveContestedSurfaceCandidatesBeforeHeavyFusion = true;
+    [Tooltip("Do not publish an unresolved third surface into a voxel that already owns two bounded certificate slots.")]
+    [SerializeField] private bool holdUnresolvedContestedProductionWrites = true;
+    [SerializeField, Range(1, 8)] private int multiSurfaceProductionBootstrapOldWeightCap = 3;
+    [SerializeField, Range(0f, 0.15f)] private float multiSurfaceProductionOwnerSwitchMarginTsdf = 0.02f;
+    [Header("Sparse Six-Direction TSDF Shadow")]
+    [Tooltip("Integrate accepted samples into isolated X+/X-/Y+/Y-/Z+/Z- TSDF layers. This never writes the authoritative production TSDF.")]
+    [SerializeField] private bool enableDirectionalTsdfShadow = true;
+    [Tooltip("Use canonical six-channel Directional TSDF semantics: each sample writes every compatible direction (up to three), without primary/secondary direction ownership or wide lateral splatting.")]
+    [SerializeField] private bool enableCanonicalSixDirectionTsdfFusion = true;
+    [Tooltip("Collect read-only per-block same-direction depth-spread evidence and predict whether half-size voxels would separate it. This never changes production geometry.")]
+    [SerializeField] private bool enableDirectionalTsdfRefinementProbe = true;
+    [Tooltip("Build a real read-only 2x Directional TSDF only inside persistent, half-voxel-resolvable blocks. Includes a one-coarse-voxel halo and never publishes production geometry.")]
+    [SerializeField] private bool enableDirectionalTsdfHalfVoxelShadow = true;
+    [Tooltip("Use the six-direction result as the only foreground geometry while the legacy scalar TSDF remains a hidden rollback and evidence chain.")]
+    [SerializeField] private bool promoteDirectionalTsdfShadowFrontend = true;
+    [SerializeField] private DirectionalTsdfShadowDisplayMode directionalTsdfShadowDisplayMode =
+        DirectionalTsdfShadowDisplayMode.DirectionalShadowOnly;
+    [SerializeField, Range(4, 16)] private int directionalTsdfShadowBlockVoxels = 8;
+    [SerializeField, Range(1, 4)] private int directionalTsdfShadowSampleStride = 1;
+    [SerializeField, Range(0.1f, 8f)] private float directionalTsdfShadowMinimumExtractionWeight = 3f;
+    [Header("Frozen Paper Quest Input Contract Shadow")]
+    [Tooltip("Feed the paper DMC shadow directly from raw projective points plus neighbour-filtered normals before any legacy production vote, representative merge or geometry certificate. Production TSDF remains unchanged.")]
+    [SerializeField] private bool enablePaperQuestInputContractShadow = true;
+    [SerializeField, Min(0.01f)] private float paperQuestInputMinimumDepthMeters = 0.35f;
+    [SerializeField, Min(0.02f)] private float paperQuestInputMaximumDepthMeters = 5.0f;
+    [SerializeField, Range(1f, 64f)] private float paperQuestInputMaximumWeight = 32f;
+    [SerializeField, Min(0.000001f)] private float paperQuestInputMinimumExtractionWeight = 0.000001f;
+    [Tooltip("Read-only sampling stride for comparing raw projective depth points with the already fused Paper TSDF zero surface. This never writes TSDF or topology.")]
+    [SerializeField, Range(1, 32)] private int paperSurfaceAlignmentAuditPixelStride = 8;
+    [Tooltip("Compose compatible directional hypotheses before publishing triangles. Prefer a narrow missing boundary over overlapping or interpenetrating sheets.")]
+    [SerializeField] private bool enableDirectionalTsdfComposedExtraction = true;
+    [SerializeField, Range(-0.25f, 0.75f)] private float directionalTsdfCompositionMinimumGradientDot = 0.15f;
+    [SerializeField, Range(0.5f, 0.99f)] private float directionalTsdfCompositionParallelNormalDot = 0.82f;
+    [SerializeField, Range(0.05f, 0.49f)] private float directionalTsdfCompositionEdgeMergeVoxelRatio = 0.35f;
+    [Tooltip("Connect compatible candidates in adjacent cells into one physical surface before polygonization. Direction layers remain evidence channels, not visible topology partitions.")]
+    [SerializeField] private bool enableDirectionalTsdfSurfaceContinuity = true;
+    [Tooltip("Experimental one-cell surface extrapolation. Kept off until internal-seam metrics prove that it closes holes without growing valid boundaries.")]
+    [SerializeField] private bool enableDirectionalTsdfSurfaceGapBridging = false;
+    [SerializeField, Range(0.82f, 0.995f)] private float directionalTsdfSurfaceLinkNormalDot = 0.94f;
+    [SerializeField, Range(0.1f, 0.75f)] private float directionalTsdfSurfaceLinkPlaneOffsetVoxelRatio = 0.40f;
+    [SerializeField, Range(0f, 0.5f)] private float directionalTsdfShadowOwnerSwitchMargin = 0.12f;
+    [SerializeField, Range(2, 8)] private int directionalTsdfShadowOwnerSwitchConfirmations = 3;
+    [SerializeField, Range(1000, 200000)] private int directionalTsdfShadowMaximumTriangles = 80000;
+    [SerializeField, Range(10000, 500000)] private int directionalTsdfShadowMaximumScannedCells = 250000;
+    [Tooltip("Display the independent MC33-resolved Directional Marching Cubes wire. It is read-only and never replaces production geometry.")]
+    [SerializeField] private bool showDirectionalDmcShadowWire = true;
+    [Tooltip("Show the independently audited TSDF-Hermite QEF feature-placement shadow when it is available. Paper DMC topology remains authoritative and the base DMC wire is retained as automatic rollback.")]
+    [SerializeField] private bool showHermiteQefFeatureShadowWire = true;
+    [Tooltip("Legacy display toggle. Kept disabled because the right-controller B button is reserved for exporting the invisible Quest system room mesh in the production scene.")]
+    [SerializeField] private bool enableHermiteQefFeatureShadowToggleInput = false;
+    [SerializeField] private OVRInput.RawButton hermiteQefFeatureShadowToggleButton =
+        OVRInput.RawButton.B;
+    [Tooltip("When the DMC wire is available, hide the older composed directional wire so the two extractors cannot visually overlap.")]
+    [SerializeField] private bool isolateDirectionalDmcShadowWire = true;
+    [SerializeField] private Color directionalDmcShadowColor =
+        new Color(1.00f, 0.72f, 0.10f, 0.98f);
+    [SerializeField] private bool enableDirectionalTsdfShadowDisplayCycleInput = true;
+    [SerializeField] private OVRInput.RawButton directionalTsdfShadowDisplayCycleButton = OVRInput.RawButton.X;
+    [SerializeField] private Color[] directionalTsdfShadowDirectionColors =
+    {
+        new Color(0.10f, 0.65f, 1.00f, 0.95f),
+        new Color(0.05f, 0.95f, 1.00f, 0.95f),
+        new Color(0.80f, 0.25f, 1.00f, 0.95f),
+        new Color(1.00f, 0.15f, 0.65f, 0.95f),
+        new Color(0.95f, 0.95f, 1.00f, 0.95f),
+        new Color(0.30f, 0.35f, 1.00f, 0.95f)
+    };
+    [Header("New Plane Local Re-anchoring")]
+    [SerializeField] private bool enableNewPlaneLocalReanchoring = true;
+    [SerializeField, Range(4, 12)] private int localReanchorMinimumSupport = 5;
+    [SerializeField, Range(0.90f, 1f)] private float localReanchorMinimumNormalDot = 0.94f;
+    [SerializeField, Range(0.005f, 0.08f)] private float localReanchorMaximumResidualMeters = 0.025f;
+    [SerializeField, Range(0.01f, 0.15f)] private float localReanchorMaximumShiftMeters = 0.06f;
+    [SerializeField, Range(2, 5)] private int localReanchorMinimumStableObservations = 2;
+    [SerializeField, Range(1, 3)] private int localReanchorMinimumDistinctViews = 2;
     [SerializeField] private bool pauseReferenceClassicDuringLowOverheadMeasurement = true;
     [SerializeField] private bool enableBudgetedIncrementalRebuildQueue = true;
     [SerializeField, Range(1f, 12f)] private float incrementalRebuildBudgetMillisecondsPerRenderFrame = 4f;
@@ -76,6 +234,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool enableIncrementalStablePlaneBootstrap = true;
     [SerializeField, Range(512, 6000)] private int incrementalStablePlaneBootstrapMaxSamples = 2048;
     [SerializeField, Range(16, 128)] private int incrementalStablePlaneBootstrapRansacIterations = 48;
+
+    [Header("Three-Line Read-Only Validation")]
+    [SerializeField] private bool enableHorizontalPlaneProposalShadow = true;
+    [SerializeField, Range(0.5f, 1f)] private float horizontalPlaneShadowMinimumUpDot = 0.82f;
+    [SerializeField, Range(256, 4096)] private int horizontalPlaneShadowMaxSamples = 1024;
+    [SerializeField, Range(16, 256)] private int horizontalPlaneShadowMinInliers = 48;
+    [SerializeField] private bool enablePersistentResultLocalityShadow = false;
+    [SerializeField, Range(0.0001f, 0.002f)] private float localityShadowPositionQuantumMeters = 0.00025f;
+    [SerializeField] private bool enableMatureHorizontalPlaneProduction = true;
+    [SerializeField, Range(0.75f, 1f)] private float matureHorizontalProductionMinimumUpDot = 0.90f;
+    [SerializeField, Range(0.40f, 2f)] private float matureHorizontalProductionMinimumRadiusMeters = 0.75f;
+    [SerializeField, Range(64, 2048)] private int matureHorizontalProductionMinimumInliers = 160;
+    [SerializeField, Range(0, 3)] private int matureHorizontalProductionMissingGraceRounds = 2;
 
     [Header("Fast Fusion Shadow (Isolated Performance Validation)")]
     [SerializeField] private bool enableFastFusionShadow = true;
@@ -141,12 +312,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0f, 0.2f)] private float maxDepthDiscontinuityRatio = 0.03f;
     [SerializeField, Range(1, 8)] private int minDepthConsistentNeighbors = 5;
     [SerializeField] private bool allowSparseDepthNeighborhood = false;
+    [SerializeField] private bool enableSeparatedDepthLayerSupport = true;
+    [SerializeField, Range(2, 6)] private int minSeparatedDepthLayerNeighbors = 3;
     [SerializeField] private bool useRobustDepthPrefilter = true;
     [SerializeField, Range(1, 3)] private int robustDepthFilterRadiusPixels = 1;
     [SerializeField, Range(2, 8)] private int minRobustDepthNeighbors = 6;
     [SerializeField, Range(0f, 1f)] private float minRobustDepthConsistencyRatio = 0.62f;
     [SerializeField, Min(0.01f)] private float maxRobustMedianDepthDeviationMeters = 0.055f;
     [SerializeField] private bool correctDepthToNeighborhoodMedian = true;
+    [SerializeField] private bool keepRobustMedianWithinObservedLayer = true;
     [SerializeField, Range(0.05f, 1f)] private float minRobustDepthWeightScale = 0.28f;
     [SerializeField, Range(0.01f, 1f)] private float minRobustTsdfSampleWeight = 0.28f;
     [SerializeField] private bool erodeDepthEdgesBeforeTsdf = true;
@@ -219,6 +393,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool enableQuestRoomScanSurfaceNetsShadow = true;
     [SerializeField, Range(1, 8)] private int questRoomScanShadowMinWeight = 1;
     [SerializeField] private bool questRoomScanShadowTreatSaturatedNegativeAsEmpty = true;
+    [Header("QuestRoomScan GPU Production Candidate")]
+    [Tooltip("Independent projective TSDF + GPU Surface Nets. The old DMC stays resident as rollback, but is hidden after this chain produces geometry.")]
+    [SerializeField] private bool enableQuestRoomScanGpuProductionCandidate = true;
+    [Tooltip("Deterministic accepted-frame left-eye source. Created as a companion of the production source when absent.")]
+    [SerializeField] private ScanCoverDepthPreprocessor questRoomAcceptedLeftDepthSource;
+    [Tooltip("Deterministic accepted-frame right-eye source. Bound directly from rawDepthSource.Preprocessor.")]
+    [SerializeField] private ScanCoverDepthPreprocessor questRoomAcceptedRightDepthSource;
+    [SerializeField] private bool createQuestRoomAcceptedLeftCompanion = true;
     [Header("Reference Full-Volume Iso-Surface (Compare Only)")]
     [SerializeField] private bool enableReferenceVolumetricShadow = true;
     [SerializeField] private bool showReferenceVolumetricShadowMesh = false;
@@ -581,8 +763,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool authoritativeIncrementalFallbackToFullRebuild = true;
     [SerializeField] private bool runContinuityAuditDuringIncrementalProduction = false;
     [SerializeField] private bool localizeAuthoritativeHaloDependencies = true;
+    [SerializeField] private bool requireReciprocalAuthoritativeBoundaryDependency = false;
+    [SerializeField] private bool requireReciprocalDiagonalAuthoritativeDependency = true;
+    [SerializeField] private bool authoritativeDependencyFaceNeighborsOnly = false;
+    [SerializeField] private bool localizeLegacyRelaxedCandidateIntake = true;
+    [SerializeField] private bool skipAuthoritativeAggregateMeshInCurrentComposite = true;
     [SerializeField, Range(1, 8)] private int authoritativeTsdfBlockMinWeight = 2;
     [SerializeField] private bool localizeStablePlaneInvalidation = true;
+    [SerializeField] private bool deferStablePlaneInvalidationUntilBlockDirty = false;
+    [SerializeField] private bool invalidateNewlyMaturePlaneFootprintOnce = false;
     [SerializeField, Range(0.0005f, 0.02f)] private float stablePlaneInvalidationDistanceMeters = 0.004f;
     [SerializeField, Range(0.95f, 1f)] private float stablePlaneInvalidationNormalDot = 0.9998f;
     [SerializeField, Range(0.005f, 0.25f)] private float stablePlaneInvalidationRadiusMeters = 0.04f;
@@ -594,6 +783,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.5f, 1f)] private float incrementalTsdfDirtyNormalDot = 0.90f;
     [SerializeField, Range(2, 64)] private int incrementalTsdfDirtyMinCrossingsForNormal = 4;
     [SerializeField, Range(2, 16)] private int incrementalTsdfDirtyRetireMissingRebuilds = 4;
+    [SerializeField, Range(2, 8)] private int incrementalTsdfBoundaryMaskConfirmRebuilds = 2;
+    [SerializeField] private bool stabilizeIncrementalTsdfBoundaryMaskChanges = false;
     [SerializeField, Range(2, 8)] private int incrementalPatchConfirmRebuilds = 2;
     [SerializeField, Range(2, 8)] private int incrementalPatchReplacementConfirmRebuilds = 2;
     [SerializeField, Range(2, 8)] private int incrementalPatchCorrectionConfirmRebuilds = 2;
@@ -674,6 +865,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField] private bool authoritativeCyanLocalSupportRequireDirectCellEvidence = true;
     [SerializeField, Range(1, 16)] private int authoritativeCyanDirectCellMinSamplesPerBatch = 2;
     [SerializeField, Range(0, 6)] private int authoritativeCyanDirectCellRetainMissingBatches = 2;
+    [Header("Observed Floor Support Completion")]
+    [SerializeField] private bool enableObservedFloorSupportCompletion = false;
+    [SerializeField, Range(2, 4)] private int observedFloorSupportMinConsecutiveBatches = 2;
+    [SerializeField, Range(0, 2)] private int observedFloorSupportRetainMissingBatches = 1;
+    [SerializeField, Range(32, 1024)] private int observedFloorSupportMaxCells = 384;
     [Header("Authoritative Cyan Plane Uncertainty Band")]
     [SerializeField] private bool enableAuthoritativeCyanAdaptivePlaneDistance = true;
     [SerializeField, Range(0f, 4f)] private float authoritativeCyanAdaptivePlaneRmsScale = 2f;
@@ -721,6 +917,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [SerializeField, Range(0.5f, 1f)] private float confirmedComplexRenewalNormalDot = 0.82f;
     [SerializeField, Range(0.05f, 1f)] private float confirmedComplexRenewalMinimumAreaRatio = 0.25f;
     [SerializeField, Range(0, 3)] private int confirmedComplexLeaseMissingGraceRounds = 2;
+    [SerializeField, Range(1, 32)] private int complexLeaseEntriesPerBudgetCheck = 4;
     [SerializeField] private bool showLegacyRelaxedProvisionalWire = true;
     [SerializeField] private bool showLegacyRelaxedUnclassifiedWire = true;
     [SerializeField] private Color legacyRelaxedProvisionalColor = new Color(1f, 0.42f, 0.02f, 0.98f);
@@ -798,12 +995,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     [Header("Diagnostic HUD")]
     [SerializeField] private bool showDiagnosticHud = true;
     [SerializeField] private bool compactDiagnosticHud = true;
-    [SerializeField] private Vector3 hudLocalPosition = new Vector3(0f, -0.18f, 0.78f);
-    [SerializeField] private Vector3 hudLocalEuler = new Vector3(8f, 0f, 0f);
-    [SerializeField] private Vector3 hudLocalScale = new Vector3(0.00075f, 0.00075f, 0.00075f);
+    [SerializeField] private Vector3 hudLocalPosition = new Vector3(0f, -0.27f, 0.55f);
+    [SerializeField] private Vector3 hudLocalEuler = new Vector3(10f, 0f, 0f);
+    [SerializeField] private Vector3 hudLocalScale = new Vector3(0.0009f, 0.0009f, 0.0009f);
     [SerializeField, Min(0.05f)] private float hudRefreshIntervalSeconds = 0.12f;
-    [SerializeField] private Color hudHealthyColor = new Color(0.7f, 1f, 0.92f, 1f);
-    [SerializeField] private Color hudWarningColor = new Color(1f, 0.72f, 0.25f, 1f);
+    [SerializeField] private Color hudHealthyColor = new Color(0.42f, 0.78f, 1f, 1f);
+    [SerializeField] private Color hudWarningColor = new Color(1f, 0.24f, 0.34f, 1f);
 
     [Header("Confidence Audit")]
     [SerializeField] private bool writeConfidenceAuditOnCapture = true;
@@ -1082,6 +1279,303 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         new ScanCoverTsdfSurfaceDirtyTracker();
     private readonly Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> _authoritativeTsdfBlocks =
         new Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh>(256);
+    // Unlike the extraction cache above, this baseline advances only when a block
+    // actually enters semantic finalization.  Comparing dependency-only updates to
+    // this fixed baseline prevents sub-threshold drift from hiding indefinitely.
+    private readonly Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh>
+        _authoritativeSemanticReuseBaselineByBlock =
+            new Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh>(256);
+    private readonly HashSet<AuthoritativeCellComponentKey>
+        _dependencySemanticReuseAcceptedKeyScratch =
+            new HashSet<AuthoritativeCellComponentKey>();
+    private readonly HashSet<AuthoritativeCellComponentKey>
+        _dependencySemanticReuseCandidateKeyScratch =
+            new HashSet<AuthoritativeCellComponentKey>();
+    private readonly HashSet<AuthoritativeCellComponentKey>
+        _dependencySemanticReuseBoundaryAddedKeys =
+            new HashSet<AuthoritativeCellComponentKey>();
+    private readonly HashSet<AuthoritativeCellComponentKey>
+        _dependencySemanticReuseBoundaryRemovedKeys =
+            new HashSet<AuthoritativeCellComponentKey>();
+    private readonly Dictionary<AuthoritativeCellComponentKey, Vector3Int>
+        _dependencySemanticReuseBoundaryAddedOwnerByKey =
+            new Dictionary<AuthoritativeCellComponentKey, Vector3Int>();
+    private readonly Dictionary<AuthoritativeCellComponentKey, Vector3Int>
+        _dependencySemanticReuseBoundaryRemovedOwnerByKey =
+            new Dictionary<AuthoritativeCellComponentKey, Vector3Int>();
+    private readonly HashSet<StableQuadKey>
+        _dependencySemanticReuseAcceptedSourceScratch = new HashSet<StableQuadKey>();
+    private readonly HashSet<StableQuadKey>
+        _dependencySemanticReuseCandidateSourceScratch = new HashSet<StableQuadKey>();
+    private readonly List<Vector3> _dependencySemanticReuseQuadVertexScratch =
+        new List<Vector3>(4);
+    private sealed class DependencyBoundarySignHysteresisShadowState
+    {
+        public int MissingRebuilds;
+        public bool RetainedLastRebuild;
+    }
+    private sealed class DependencyBoundarySignHysteresisObservation
+    {
+        public float MinimumAbs;
+        public float MaximumAbs;
+        public bool Positive;
+    }
+    private readonly Dictionary<Vector3Int,
+        Dictionary<StableQuadKey, DependencyBoundarySignHysteresisShadowState>>
+        _dependencyBoundarySignHysteresisShadowByBlock =
+            new Dictionary<Vector3Int,
+                Dictionary<StableQuadKey, DependencyBoundarySignHysteresisShadowState>>();
+    private readonly List<StableQuadKey> _dependencyBoundarySignHysteresisRemoveScratch =
+        new List<StableQuadKey>(256);
+    private readonly Dictionary<Vector3Int,
+        Dictionary<StableQuadKey, DependencyBoundarySignHysteresisObservation>>
+        _dependencyBoundarySignHysteresisObservationsByBlock =
+            new Dictionary<Vector3Int,
+                Dictionary<StableQuadKey, DependencyBoundarySignHysteresisObservation>>();
+    private const int DependencyBoundarySignHistogramAxisBuckets = 6;
+    private const int DependencyBoundarySignHistogramCellCount =
+        DependencyBoundarySignHistogramAxisBuckets *
+        DependencyBoundarySignHistogramAxisBuckets;
+    private readonly int[] _dependencyBoundarySignHistogramPositiveCandidates =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramNegativeCandidates =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramPositiveRecovered =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramNegativeRecovered =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramPositiveExpired =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramNegativeExpired =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramPositiveHardDropped =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private readonly int[] _dependencyBoundarySignHistogramNegativeHardDropped =
+        new int[DependencyBoundarySignHistogramCellCount];
+    private sealed class DependencyBoundaryTemporalFreeSpaceObservation
+    {
+        public int MissingRebuilds;
+        public int SupportBucket;
+        public int EntryFreeSpaceClass;
+        public int MaximumFreeSpaceClass;
+        public bool MultiView;
+    }
+    private sealed class DependencyBoundaryTemporalFreeSpaceSourceState
+    {
+        public int ConsecutivePresentRebuilds;
+        public int DistinctSupportViews;
+        public int LastSupportFrame = int.MinValue;
+        public bool HasSupportView;
+        public Vector3 LastSupportViewDirection;
+        public DependencyBoundaryTemporalFreeSpaceObservation Observation;
+    }
+    private struct DepthOwnershipShadowEvidence
+    {
+        public int ValidNeighbors;
+        public int InvalidNeighbors;
+        public int CloserLayerNeighbors;
+        public int FartherLayerNeighbors;
+        public int NormalDiscontinuityNeighbors;
+        public float MaximumNormalDisagreement;
+        public float SampleDepthMeters;
+        public float MaximumDepthDeltaMeters;
+        public float DepthSpanMeters;
+        public float DiscontinuityThresholdMeters;
+        public float MinimumObservedDepthMeters;
+        public float MaximumObservedDepthMeters;
+        public bool GrazingPlaneSupported;
+    }
+    private struct GeometryMaturityState
+    {
+        public int FirstFrame;
+        public int LastFrame;
+        public int LastConflictFrame;
+        public int StableObservations;
+        public int ConsecutiveStableFrames;
+        public int DistinctViews;
+        public int PlaneSupport;
+        public Vector3 PlanePoint;
+        public Vector3 PlaneNormal;
+        public Vector3 LastDiverseViewDirection;
+        public Vector3 LastDiverseCameraPosition;
+        public float PlaneResidualMeters;
+        public bool LayerCompetitionObserved;
+        public bool Mature;
+    }
+    private struct GeometryProductionContext
+    {
+        public bool Valid;
+        public bool Contested;
+        public bool Mature;
+        public bool SecondarySlot;
+        public int CertificateVoxelIndex;
+        public int OwnerKey;
+        public Vector3 PlanePoint;
+        public Vector3 PlaneNormal;
+    }
+    private const int FusionDistanceBinCount = 5;
+    private const int FusionAngleBinCount = 3;
+    private const int FusionStructureBinCount = 4;
+    private const int FusionStratumCount =
+        FusionDistanceBinCount * FusionAngleBinCount * FusionStructureBinCount;
+    private static readonly string[] FusionDistanceBinLabels =
+        { "lt1m", "1to2m", "2to3m", "3to5m", "5mplus" };
+    private static readonly string[] FusionAngleBinLabels =
+        { "front", "oblique", "grazing" };
+    private static readonly string[] FusionStructureBinLabels =
+        { "smooth", "depth_boundary", "crease", "mixed_junction" };
+    private readonly long[] _fusionStratumHeavySamples = new long[FusionStratumCount];
+    private readonly double[] _fusionStratumHeavyTotalMilliseconds = new double[FusionStratumCount];
+    private readonly long[] _fusionStratumBandCalls = new long[FusionStratumCount];
+    private readonly long[] _fusionStratumDiagnosticBandCalls = new long[FusionStratumCount];
+    private readonly long[] _fusionStratumBandCandidateVoxels = new long[FusionStratumCount];
+    private readonly long[] _fusionStratumBandAcceptedVoxels = new long[FusionStratumCount];
+    private readonly double[] _fusionStratumBandMilliseconds = new double[FusionStratumCount];
+    private readonly long[] _fusionStratumCarvingCalls = new long[FusionStratumCount];
+    private readonly long[] _fusionStratumCarvingTraversedVoxels = new long[FusionStratumCount];
+    private readonly double[] _fusionStratumCarvingMilliseconds = new double[FusionStratumCount];
+    private int _activeFusionDiagnosticStratum = -1;
+    private sealed class CompactBatchContext
+    {
+        public const int DepthHistogramBins = 32;
+        public readonly int[] DepthHistogram = new int[DepthHistogramBins];
+        public bool Active;
+        public double StartRealtimeSeconds;
+        public double PreviousBatchIntervalSeconds = -1d;
+        public int SnapshotCount;
+        public int SampledPixelCount;
+        public int ValidDepthCount;
+        public int InvalidDepthCount;
+        public int FovBorderValidCount;
+        public float ConfidenceSum;
+        public int ConfidenceCount;
+        public bool HasExtent;
+        public Vector3 ExtentMin;
+        public Vector3 ExtentMax;
+        public bool HasPose;
+        public Vector3 FirstPosePosition;
+        public Quaternion FirstPoseRotation;
+        public Vector3 LastPosePosition;
+        public Quaternion LastPoseRotation;
+        public float PoseTravelMeters;
+        public float PoseRotationDegrees;
+        public float MaximumTranslationFromStartMeters;
+        public float MaximumRotationFromStartDegrees;
+        public int InputSamples;
+        public int IntegratedSamples;
+        public int RejectedInvalid;
+        public int RejectedDepthRange;
+        public int RejectedDepthDiscontinuity;
+        public int RejectedRobust;
+        public int RejectedSupport;
+        public int RejectedConfidence;
+        public int RejectedOutside;
+        public int OwnershipCandidates;
+        public int OwnershipProductionDepthRejected;
+        public int OwnershipPassedDepthGate;
+        public int OwnershipNearSideCandidates;
+        public int OwnershipFarSideCandidates;
+        public int OwnershipMixedCandidates;
+        public int OwnershipWouldHoldWrites;
+        public int OwnershipStrongRiskWrites;
+        public int OwnershipAmbiguousWrites;
+        public int OwnershipFovBorderWrites;
+        public int OwnershipLowConfidenceWrites;
+        public int OwnershipTemporalStableWrites;
+        public int OwnershipTemporalUnstableWrites;
+        public float TemporalDepthDeltaSum;
+        public int TemporalDepthDeltaCount;
+        public float ViewFacingSum;
+        public int ViewFacingCount;
+
+        public void Reset(double startRealtimeSeconds, double previousBatchEndRealtimeSeconds)
+        {
+            Active = true;
+            StartRealtimeSeconds = startRealtimeSeconds;
+            PreviousBatchIntervalSeconds = previousBatchEndRealtimeSeconds > 0d
+                ? System.Math.Max(0d, startRealtimeSeconds - previousBatchEndRealtimeSeconds)
+                : -1d;
+            SnapshotCount = 0;
+            SampledPixelCount = 0;
+            ValidDepthCount = 0;
+            InvalidDepthCount = 0;
+            FovBorderValidCount = 0;
+            ConfidenceSum = 0f;
+            ConfidenceCount = 0;
+            HasExtent = false;
+            ExtentMin = Vector3.zero;
+            ExtentMax = Vector3.zero;
+            HasPose = false;
+            FirstPosePosition = Vector3.zero;
+            FirstPoseRotation = Quaternion.identity;
+            LastPosePosition = Vector3.zero;
+            LastPoseRotation = Quaternion.identity;
+            PoseTravelMeters = 0f;
+            PoseRotationDegrees = 0f;
+            MaximumTranslationFromStartMeters = 0f;
+            MaximumRotationFromStartDegrees = 0f;
+            InputSamples = 0;
+            IntegratedSamples = 0;
+            RejectedInvalid = 0;
+            RejectedDepthRange = 0;
+            RejectedDepthDiscontinuity = 0;
+            RejectedRobust = 0;
+            RejectedSupport = 0;
+            RejectedConfidence = 0;
+            RejectedOutside = 0;
+            OwnershipCandidates = 0;
+            OwnershipProductionDepthRejected = 0;
+            OwnershipPassedDepthGate = 0;
+            OwnershipNearSideCandidates = 0;
+            OwnershipFarSideCandidates = 0;
+            OwnershipMixedCandidates = 0;
+            OwnershipWouldHoldWrites = 0;
+            OwnershipStrongRiskWrites = 0;
+            OwnershipAmbiguousWrites = 0;
+            OwnershipFovBorderWrites = 0;
+            OwnershipLowConfidenceWrites = 0;
+            OwnershipTemporalStableWrites = 0;
+            OwnershipTemporalUnstableWrites = 0;
+            TemporalDepthDeltaSum = 0f;
+            TemporalDepthDeltaCount = 0;
+            ViewFacingSum = 0f;
+            ViewFacingCount = 0;
+            System.Array.Clear(DepthHistogram, 0, DepthHistogram.Length);
+        }
+    }
+    private const int DependencyBoundaryTemporalSupportBuckets = 4;
+    private const int DependencyBoundaryTemporalFreeSpaceBuckets = 3;
+    private const int DependencyBoundaryTemporalHistogramCellCount =
+        DependencyBoundaryTemporalSupportBuckets *
+        DependencyBoundaryTemporalFreeSpaceBuckets;
+    private const float DependencyBoundaryTemporalViewSeparationDegrees = 8f;
+    private readonly Dictionary<Vector3Int,
+        Dictionary<StableQuadKey, DependencyBoundaryTemporalFreeSpaceSourceState>>
+        _dependencyBoundaryTemporalFreeSpaceByBlock =
+            new Dictionary<Vector3Int,
+                Dictionary<StableQuadKey, DependencyBoundaryTemporalFreeSpaceSourceState>>();
+    private readonly List<StableQuadKey> _dependencyBoundaryTemporalFreeSpaceRemoveScratch =
+        new List<StableQuadKey>(256);
+    private readonly int[] _dependencyBoundaryTemporalSingleViewCandidates =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalSingleViewRecoveredH1 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalSingleViewRecoveredH2 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalSingleViewRecoveredH3 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalSingleViewPersistent =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalMultiViewCandidates =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalMultiViewRecoveredH1 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalMultiViewRecoveredH2 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalMultiViewRecoveredH3 =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
+    private readonly int[] _dependencyBoundaryTemporalMultiViewPersistent =
+        new int[DependencyBoundaryTemporalHistogramCellCount];
     private readonly List<ScanCoverStablePlaneRegistry.PlaneConstraint> _lastAuthoritativePlaneConstraints =
         new List<ScanCoverStablePlaneRegistry.PlaneConstraint>(12);
     private readonly Dictionary<AuthoritativeCellComponentKey, AuthoritativeCyanNearPlaneProbation>
@@ -1181,6 +1675,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private readonly Dictionary<int, AuthoritativeCyanPlaneSupportFrame>
         _authoritativeCyanPlaneSupportFrames =
             new Dictionary<int, AuthoritativeCyanPlaneSupportFrame>();
+    private readonly Dictionary<Vector3Int, ulong> _observedFloorFillSignaturesByBlock =
+        new Dictionary<Vector3Int, ulong>();
     // Frozen immediately after integration and before any legacy repair pass.  The
     // authoritative cyan route only reads these arrays, so extraction cannot observe
     // TSDF mutations performed by the legacy green publication pipeline.
@@ -1193,12 +1689,74 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private MeshRenderer _incrementalPatchShadowRenderer;
     private Mesh _incrementalPatchShadowMesh;
     private Material _incrementalPatchShadowMaterial;
+    private readonly ScanCoverDirectionalTsdfShadow _directionalTsdfShadow =
+        new ScanCoverDirectionalTsdfShadow();
+    private int _paperSurfaceAlignmentSupportedSamples;
+    private int _paperSurfaceAlignmentMissingSamples;
+    private double _paperSurfaceAlignmentSignedSum;
+    private double _paperSurfaceAlignmentAbsoluteSum;
+    private double _paperSurfaceAlignmentSquaredSum;
+    private float _paperSurfaceAlignmentMaximumAbsolute;
+    private long _paperSurfaceAlignmentSupportVoxels;
+    private long _paperSurfaceAlignmentSaturatedVoxels;
+    private readonly List<float> _paperSurfaceAlignmentAbsoluteResiduals =
+        new List<float>(32768);
+    private readonly int[] _paperSurfaceAlignmentDepthCounts = new int[4];
+    private readonly double[] _paperSurfaceAlignmentDepthAbsoluteSums = new double[4];
+    private readonly int[] _paperSurfaceAlignmentFacingCounts = new int[3];
+    private readonly double[] _paperSurfaceAlignmentFacingAbsoluteSums = new double[3];
+    private readonly int[] _paperSurfaceAlignmentDirectionCounts =
+        new int[ScanCoverDirectionalTsdfShadow.DirectionCount];
+    private readonly double[] _paperSurfaceAlignmentDirectionAbsoluteSums =
+        new double[ScanCoverDirectionalTsdfShadow.DirectionCount];
+    private readonly int[] _paperSurfaceAlignmentReadbackAgeCounts = new int[4];
+    private readonly double[] _paperSurfaceAlignmentReadbackAgeAbsoluteSums = new double[4];
+    private int _paperProvenanceReadbackAgeSamples;
+    private double _paperProvenanceReadbackAgeMillisecondsSum;
+    private double _paperProvenanceReadbackAgeMillisecondsMaximum;
+    private int _paperProvenanceCompletionPoseSamples;
+    private double _paperProvenanceCompletionTranslationMetersSum;
+    private double _paperProvenanceCompletionTranslationMetersMaximum;
+    private double _paperProvenanceCompletionRotationDegreesSum;
+    private double _paperProvenanceCompletionRotationDegreesMaximum;
+    private int _paperProvenanceDepthMatrixEyeSamples;
+    private int _paperProvenanceDepthMatrixEyeMissing;
+    private double _paperProvenanceDepthMatrixEyeDeltaMetersSum;
+    private double _paperProvenanceDepthMatrixEyeDeltaMetersMaximum;
+    private GameObject _directionalTsdfShadowObject;
+    private MeshFilter _directionalTsdfShadowMeshFilter;
+    private MeshRenderer _directionalTsdfShadowRenderer;
+    private Mesh _directionalTsdfShadowMesh;
+    private Mesh _directionalTsdfShadowStagingMesh;
+    private readonly Material[] _directionalTsdfShadowMaterials =
+        new Material[ScanCoverDirectionalTsdfShadow.DirectionCount];
+    private GameObject _directionalDmcShadowObject;
+    private MeshFilter _directionalDmcShadowMeshFilter;
+    private MeshRenderer _directionalDmcShadowRenderer;
+    private Mesh _directionalDmcShadowMesh;
+    private Mesh _directionalDmcShadowStagingMesh;
+    private Material _directionalDmcShadowMaterial;
+    private ScanCoverQuestRoomSurfaceNetsPipeline _questRoomSurfaceNetsPipeline;
+    private ScanCoverDirectionalTsdfShadow.MeshResult _lastDirectionalTsdfShadowMeshResult;
+    private bool _directionalTsdfProductionVisibilityCaptured;
+    private bool _directionalTsdfSavedMeshObjectActive;
+    private bool _directionalTsdfSavedWireObjectActive;
+    private bool _directionalTsdfSavedResultObjectActive;
+    private bool _directionalTsdfSavedIssueObjectActive;
+    private bool _directionalTsdfSavedPersistentRootActive;
     private GameObject _authoritativeCyanCrackObject;
     private MeshFilter _authoritativeCyanCrackMeshFilter;
     private MeshRenderer _authoritativeCyanCrackRenderer;
     private Mesh _authoritativeCyanCrackMesh;
     private readonly Material[] _authoritativeCyanCrackMaterials = new Material[4];
     private readonly ScanCoverStablePlaneRegistry _stablePlaneRegistry = new ScanCoverStablePlaneRegistry();
+    private readonly ScanCoverStablePlaneRegistry _horizontalPlaneShadowRegistry =
+        new ScanCoverStablePlaneRegistry();
+    private bool _hasRetainedMatureHorizontalProductionPlane;
+    private ScanCoverStablePlaneRegistry.PlaneConstraint
+        _retainedMatureHorizontalProductionPlane;
+    private int _retainedMatureHorizontalProductionMissingRounds;
+    private int _retainedMatureHorizontalProductionLastSnapshot = -1;
     private GameObject _stablePlaneShadowObject;
     private MeshFilter _stablePlaneShadowMeshFilter;
     private MeshRenderer _stablePlaneShadowRenderer;
@@ -1237,9 +1795,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public MeshFilter Filter;
         public MeshRenderer Renderer;
         public Mesh Mesh;
+        public Mesh StagingMesh;
+        public readonly List<Vector3> Vertices = new List<Vector3>();
         public readonly List<int> StructuralLines = new List<int>();
         public readonly List<int> ComplexLines = new List<int>();
         public readonly List<int> UnclassifiedLines = new List<int>();
+        public readonly HashSet<AuthoritativeCanonicalEdgeKey> StructuralEdges =
+            new HashSet<AuthoritativeCanonicalEdgeKey>();
+        public readonly HashSet<AuthoritativeCanonicalEdgeKey> ComplexEdges =
+            new HashSet<AuthoritativeCanonicalEdgeKey>();
+        public readonly HashSet<AuthoritativeCanonicalEdgeKey> UnclassifiedEdges =
+            new HashSet<AuthoritativeCanonicalEdgeKey>();
         public ulong Signature;
         public int AppliedView = -1;
         public int FormalTriangles;
@@ -1321,6 +1887,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             new Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int>();
         public readonly Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int> Unclassified =
             new Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int>();
+        public readonly Dictionary<AuthoritativeCanonicalEdgeKey, int> GlobalCategory =
+            new Dictionary<AuthoritativeCanonicalEdgeKey, int>();
+        public readonly Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int> GlobalOwner =
+            new Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int>();
+    }
+    private sealed class PersistentResultChunkSignatureState
+    {
+        public ulong Signature;
     }
     private GameObject _persistentResultChunkRoot;
     private readonly Dictionary<Vector3Int, PersistentResultChunk> _persistentResultChunks =
@@ -1330,22 +1904,151 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastPersistentResultChunkRemovedCount { get; private set; }
     public int LastPersistentResultChunkActiveCount { get; private set; }
     public float LastPersistentResultChunkPublishMilliseconds { get; private set; }
+    public int LastPersistentResultDeltaChangedCount { get; private set; }
+    public int LastPersistentResultDeltaHaloCount { get; private set; }
+    public int LastPersistentResultDeltaTouchedCount { get; private set; }
+    public int LastPersistentResultRetireCandidateCount { get; private set; }
+    public int LastPersistentResultRetireDeferredCount { get; private set; }
+    public int LastPersistentResultDoubleBufferedSwapCount { get; private set; }
+    public float LastPersistentResultChunkUploadMaxMilliseconds { get; private set; }
+    public int LastPersistentResultCrossCategoryEdgeSuppressedCount { get; private set; }
+    public int LastPersistentResultEdgeOwnerScopeBlockCount { get; private set; }
+    public int LastPersistentResultEdgeOwnerScopeEntryCount { get; private set; }
+    public int LastPersistentSemanticFinalizationScopeBlockCount { get; private set; }
+    public int LastPersistentSemanticFinalizationReusedBlockCount { get; private set; }
+    public int LastDependencySemanticReuseCheckCount { get; private set; }
+    public int LastDependencySemanticReuseAcceptedCount { get; private set; }
+    public int LastDependencySemanticReuseRejectedNullCount { get; private set; }
+    public int LastDependencySemanticReuseRejectedShapeCount { get; private set; }
+    public int LastDependencySemanticReuseShapeVertexCountMismatchBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeTriangleCountMismatchBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeSourceCountMismatchBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeMalformedVertexKeyBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeMultiComponentMismatchBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeSplitVertexMismatchBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeBoundaryOnlyBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeInteriorBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeConnectivityOnlyBlockCount { get; private set; }
+    public int LastDependencySemanticReuseShapeAddedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseShapeRemovedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseShapeBoundaryAddedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseShapeBoundaryRemovedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseShapeInteriorAddedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseShapeInteriorRemovedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryUniqueAddedKeyCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryMigratedKeyCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryFaceNeighbourMigrationCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryDiagonalNeighbourMigrationCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryNonNeighbourMigrationCount { get; private set; }
+    public int LastDependencySemanticReuseBoundarySameOwnerMigrationCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryUnmatchedAddedKeyCount { get; private set; }
+    public int LastDependencySemanticReuseBoundaryUnmatchedRemovedKeyCount { get; private set; }
+    public float LastDependencySemanticReuseBoundaryMigrationRatio { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceBoundaryCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceInteriorCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceOutsideExtractionRangeCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceWeightCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceEligibilityCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceNonFiniteTsdfCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceExactZeroCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceSameSignCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceDegenerateDeltaCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceNonFiniteCrossingCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceOwnerChangedCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceCellVertexMissingCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryInvalidCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryEdgeCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryDiagonalCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryAreaCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryTwistCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceGeometryPlaneCount { get; private set; }
+    public int LastDependencySemanticReuseRemovedSourceStillValidMissingCount { get; private set; }
+    public float LastDependencySemanticReuseRemovedSourceDiagnosticMilliseconds { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowTrackedSourceCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowSameSignMissingCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowEligibleCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowRetainedCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowActiveRetainedCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowRecoveredCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowExpiredCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowHardDroppedCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowPositiveCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowNegativeCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowNearRejectedCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowFarRejectedCount { get; private set; }
+    public int LastDependencyBoundarySignHysteresisShadowDirectResetCount { get; private set; }
+    public float LastDependencyBoundarySignHysteresisShadowPotentialMissingReductionRatio { get; private set; }
+    public float LastDependencyBoundarySignHysteresisShadowDiagnosticMilliseconds { get; private set; }
+    public int LastDependencyBoundarySignObservationCreatedCount { get; private set; }
+    public int LastDependencyBoundarySignObservationRecoveredCount { get; private set; }
+    public int LastDependencyBoundarySignObservationExpiredCount { get; private set; }
+    public int LastDependencyBoundarySignObservationHardDroppedCount { get; private set; }
+    public int LastDependencyBoundarySignObservationDirectResetCount { get; private set; }
+    public int LastDependencyBoundarySignObservationPendingCount { get; private set; }
+    public int LastDependencyBoundaryTemporalObservationCreatedCount { get; private set; }
+    public int LastDependencyBoundaryTemporalRecoveredH1Count { get; private set; }
+    public int LastDependencyBoundaryTemporalRecoveredH2Count { get; private set; }
+    public int LastDependencyBoundaryTemporalRecoveredH3Count { get; private set; }
+    public int LastDependencyBoundaryTemporalPersistentCount { get; private set; }
+    public int LastDependencyBoundaryTemporalDirectResetCount { get; private set; }
+    public int LastDependencyBoundaryTemporalPendingCount { get; private set; }
+    public int LastDependencyBoundaryTemporalFreeSpaceConfirmedRecoveredCount { get; private set; }
+    public int LastDependencyBoundaryTemporalFreeSpaceConfirmedPersistentCount { get; private set; }
+    public int LastDependencyBoundaryTemporalNeverConfirmedRecoveredCount { get; private set; }
+    public int LastDependencyBoundaryTemporalNeverConfirmedPersistentCount { get; private set; }
+    public float LastDependencyBoundaryTemporalDiagnosticMilliseconds { get; private set; }
+    public int LastDependencySemanticReuseShapeVertexDeltaSum { get; private set; }
+    public int LastDependencySemanticReuseShapeTriangleDeltaSum { get; private set; }
+    public int LastDependencySemanticReuseShapeSourceDeltaSum { get; private set; }
+    public int LastDependencySemanticReuseShapeVertexDeltaMaxAbs { get; private set; }
+    public int LastDependencySemanticReuseShapeTriangleDeltaMaxAbs { get; private set; }
+    public int LastDependencySemanticReuseRejectedVertexKeyCount { get; private set; }
+    public int LastDependencySemanticReuseRejectedTriangleCount { get; private set; }
+    public int LastDependencySemanticReuseRejectedTriangleSourceCount { get; private set; }
+    public int LastDependencySemanticReuseRejectedPositionCount { get; private set; }
+    public int LastDependencySemanticReusePositionComparedVertexCount { get; private set; }
+    public float LastDependencySemanticReusePositionMaxDriftMeters { get; private set; }
+    public float LastDependencySemanticReusePositionRmsDriftMeters { get; private set; }
+    public float LastDependencySemanticReuseComparisonMilliseconds { get; private set; }
+    private double _lastDependencySemanticReusePositionSquaredDriftSum;
+    public int LastLocalityShadowBlocksTotal { get; private set; }
+    public int LastLocalityShadowBlocksNew { get; private set; }
+    public int LastLocalityShadowBlocksRemoved { get; private set; }
+    public int LastLocalityShadowSemanticSame { get; private set; }
+    public int LastLocalityShadowSemanticDelta { get; private set; }
+    public int LastLocalityShadowRenderSame { get; private set; }
+    public int LastLocalityShadowRenderDelta { get; private set; }
+    public int LastLocalityShadowMutatedButRenderSame { get; private set; }
+    public int LastLocalityShadowTheoreticalUploadSkip { get; private set; }
+    public float LastLocalityShadowChangedToRenderDeltaRatio { get; private set; }
     private List<PlaneSupportCellLedgerEntry> _lastOutputDisplaySupportCellLedger =
         new List<PlaneSupportCellLedgerEntry>();
-    // RESULT is scene state, not a per-batch delta.  Keep pristine candidate entries
-    // per authoritative TSDF block and clone/finalize the complete ledger each batch.
-    // Dirty blocks atomically replace only their own entry list; untouched blocks stay.
+    // RESULT is scene state, not a per-batch delta. Keep pristine candidate entries
+    // per authoritative TSDF block. Only changed blocks plus their semantic halo are
+    // cloned/finalized; untouched finalized blocks retain their accepted state.
     private readonly Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
         _persistentResultLedgerByBlock =
             new Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>();
+    // Presentation state is deliberately separate from the mutable reconstruction
+    // ledger. Only changed blocks and their edge-sharing halo replace entries here;
+    // untouched chunks keep the exact finalized geometry they already display.
+    private readonly Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+        _persistentFinalizedResultLedgerByBlock =
+            new Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>();
+    private HashSet<Vector3Int> _activeSemanticFinalizeScopeKeys;
+    private readonly Dictionary<Vector3Int, int> _persistentResultMissingStreakByBlock =
+        new Dictionary<Vector3Int, int>();
     // Complex faces have a stricter first admission than structural faces.  Once a
     // face passed that gate, keep a separate geometric lease so a dependency-only
     // block rebuild can renew the same green surface without treating it as a new face.
     private readonly Dictionary<Vector3Int, List<ConfirmedComplexLeaseEntry>>
         _confirmedComplexLeasesByBlock =
             new Dictionary<Vector3Int, List<ConfirmedComplexLeaseEntry>>();
-    private readonly HashSet<string> _claimedConfirmedComplexLeaseKeys =
-        new HashSet<string>();
+    private readonly HashSet<ConfirmedComplexLeaseClaimKey> _claimedConfirmedComplexLeaseKeys =
+        new HashSet<ConfirmedComplexLeaseClaimKey>();
     private readonly Dictionary<Vector3Int, List<ComplexCandidateProbationEntry>>
         _complexCandidateProbationByBlock =
             new Dictionary<Vector3Int, List<ComplexCandidateProbationEntry>>();
@@ -1358,20 +2061,51 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private readonly Dictionary<string, int> _heldToProvisionalBreakdownCounts =
         new Dictionary<string, int>();
     private readonly HashSet<int> _budgetedFusionSurfaceVoxelWrites = new HashSet<int>();
+    private readonly HashSet<int> _budgetedFusionSecondarySurfaceVoxelWrites = new HashSet<int>();
     private readonly Dictionary<int, int> _budgetedFusionRepresentativeBySurfaceVoxel =
         new Dictionary<int, int>();
     private readonly Dictionary<int, int> _budgetedFusionRawHitsBySurfaceVoxel =
         new Dictionary<int, int>();
     private readonly Dictionary<int, float> _budgetedFusionRepresentativeScoreBySurfaceVoxel =
         new Dictionary<int, float>();
+    private readonly List<int> _budgetedFusionMainSampleIndices = new List<int>(4096);
+    private int[] _fusionDenseStampGeneration;
+    private int[] _fusionDenseStampRepresentativeIndex;
+    private int[] _fusionDenseStampRawHits;
+    private float[] _fusionDenseStampRepresentativeScore;
+    private int[] _fusionDenseStampSecondaryRepresentativeGeneration;
+    private int[] _fusionDenseStampSecondaryRepresentativeIndex;
+    private int[] _fusionDenseStampSecondaryRawHits;
+    private float[] _fusionDenseStampSecondaryRepresentativeScore;
+    private int[] _fusionDenseStampWriteGeneration;
+    private int[] _fusionDenseStampSecondaryWriteGeneration;
+    private int _fusionDenseStampCurrentGeneration;
+    private readonly List<int> _fusionDenseStampTouchedVoxels = new List<int>(4096);
+    private readonly Dictionary<Vector3Int, ulong> _localityShadowSemanticSignatures =
+        new Dictionary<Vector3Int, ulong>();
+    private readonly Dictionary<Vector3Int, ulong> _localityShadowRenderSignatures =
+        new Dictionary<Vector3Int, ulong>();
     private bool _budgetedSnapshotIntegratedResult;
+    private bool _collectBudgetedFusionPhaseDiagnostics;
     private bool _budgetedIncrementalProductionResult;
     private CooperativeRebuildBudget _activeIncrementalRebuildBudget;
     private Coroutine _captureRoutine;
+    private bool _questRoomGpuStreamingStopRequested;
+    private bool _questRoomGpuStreamingCaptureOpen;
+    private bool _questRoomGpuStreamingSessionFinalized;
+    private int _questRoomGpuStreamingSessionRawFrames;
+    private int _questRoomGpuStreamingSessionStereoPairs;
+    private int _questRoomGpuStreamingSessionRejectedFrames;
+    private int _questRoomGpuStreamingSessionTimeouts;
+    private int _questRoomGpuStreamingSubmissionOrdinal;
+    private float _questRoomGpuStreamingSessionDispatchMilliseconds;
+    private float _questRoomGpuStreamingSessionMaxDispatchMilliseconds;
     private int _activeCaptureBatchTargetFrames;
     private int _activeCaptureBatchIntegratedFrames;
     private int _activeCaptureBatchUniqueRawFrames;
     private int _activeCaptureBatchTimeouts;
+    private readonly CompactBatchContext _compactBatchContext = new CompactBatchContext();
+    private double _lastCompactBatchEndRealtimeSeconds = -1d;
     private GameObject _hudRoot;
     private Canvas _hudCanvas;
     private Text _hudText;
@@ -1590,9 +2324,42 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastDuplicateLayerCleanupClearedCount { get; private set; }
     public int LastDuplicateLayerCleanupBoostedCount { get; private set; }
     public int LastDuplicateLayerCleanupMaxEvidence { get; private set; }
+    public int LastGeometryCertificateCandidateCount { get; private set; }
+    public int LastGeometryCertificateCreatedCount { get; private set; }
+    public int LastGeometryCertificateMatureCount { get; private set; }
+    public int LastGeometryCertificateConflictResetCount { get; private set; }
+    public int LastGeometrySecondarySlotCreatedCount { get; private set; }
+    public int LastGeometrySecondarySlotMatchedCount { get; private set; }
+    public int LastGeometryDistinctSurfacePreservedCount { get; private set; }
+    public int LastGeometryMultiJunctionDeferredCount { get; private set; }
+    public int LastGeometryFixedAngleDistinctViewCount { get; private set; }
+    public int LastGeometryAdaptiveBaselineDistinctViewCount { get; private set; }
+    public int LastGeometryInsufficientBaselineViewCount { get; private set; }
+    public int LastGeometryTemporalMaturityAcceptedCount { get; private set; }
+    public int LastGeometryTemporalReanchorAcceptedCount { get; private set; }
+    public int LastGeometryTemporalStreakResetCount { get; private set; }
+    public int LastGeometryProductionPrepassPreservedCount { get; private set; }
+    public int LastGeometryProductionSecondarySurfaceWriteCount { get; private set; }
+    public int LastGeometryProductionUnresolvedHeldCount { get; private set; }
+    public int LastGeometryProductionCanonicalDirectionalRoutedCount { get; private set; }
+    public int LastGeometryProductionOwnerBootstrapCount { get; private set; }
+    public int LastGeometryProductionOwnerMatchedCount { get; private set; }
+    public int LastGeometryProductionOwnerPreservedCount { get; private set; }
+    public int LastGeometryProductionOwnerSwitchedCount { get; private set; }
+    public int LastMatureSmoothFastPathCandidateCount { get; private set; }
+    public int LastMatureSmoothFastPathAcceptedCount { get; private set; }
+    public int LastMatureSmoothFastPathChangedCount { get; private set; }
+    public int LastMatureSmoothFastPathUnsafeStateCount { get; private set; }
+    public int LastLocalReanchorFitCandidateCount { get; private set; }
+    public int LastLocalReanchorFitAcceptedCount { get; private set; }
+    public int LastLocalReanchorAppliedCount { get; private set; }
+    public float LastLocalReanchorShiftMeters { get; private set; }
+    public int LastLocalReanchorCrossLayerExcludedCount { get; private set; }
 
     private float[] _tsdf;
     private byte[] _weights;
+    private int[] _geometryProductionOwnerKeys;
+    private GeometryProductionContext _activeGeometryProductionContext;
     private readonly ScanCoverFastFusionShadow _fastFusionShadow = new ScanCoverFastFusionShadow();
     private readonly ScanCoverFastFusionShadow _fastFusionIndependentShadow =
         new ScanCoverFastFusionShadow();
@@ -1732,6 +2499,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int IntegratedFrameCount { get; private set; }
     public int LastRawFrameIndex { get; private set; } = -1;
     public bool IsCaptureBatchActive => _captureRoutine != null;
+    public bool IsQuestRoomGpuStreamingActive =>
+        _captureRoutine != null && LastCaptureBatchUsedQuestRoomGpuStreaming;
+    public bool LastCaptureBatchUsedQuestRoomGpuStreaming { get; private set; }
+    public int LastQuestRoomGpuStreamingRawFrameCount { get; private set; }
+    public int LastQuestRoomGpuStreamingStereoPairCount { get; private set; }
+    public int LastQuestRoomGpuStreamingRejectedFrameCount { get; private set; }
+    public float LastQuestRoomGpuStreamingDispatchMilliseconds { get; private set; }
+    public float LastQuestRoomGpuStreamingMaxDispatchMilliseconds { get; private set; }
     public int LastCaptureBatchTargetFrames { get; private set; }
     public int LastCaptureBatchIntegratedFrames { get; private set; }
     public int LastCaptureBatchUniqueRawFrames { get; private set; }
@@ -1752,6 +2527,58 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public float LastCaptureBatchBudgetedFusionMaxSliceMilliseconds { get; private set; }
     public int LastCaptureBatchUniqueSurfaceVoxelWriteCount { get; private set; }
     public int LastCaptureBatchMergedSurfaceVoxelWriteCount { get; private set; }
+    public int LastCaptureBatchCompactedFusionSampleCount { get; private set; }
+    public int LastCaptureBatchHeavyFusionSampleCount { get; private set; }
+    public float LastCaptureBatchFusionPrepassMilliseconds { get; private set; }
+    public float LastCaptureBatchFusionRepresentativeBuildMilliseconds { get; private set; }
+    public float LastCaptureBatchFusionHeavyMilliseconds { get; private set; }
+    public float LastCaptureBatchFusionHeavyDecisionMilliseconds { get; private set; }
+    public int LastCaptureBatchGeometryCertificateCandidateCount { get; private set; }
+    public int LastCaptureBatchGeometryCertificateCreatedCount { get; private set; }
+    public int LastCaptureBatchGeometryCertificateMatureCount { get; private set; }
+    public int LastCaptureBatchGeometryCertificateConflictResetCount { get; private set; }
+    public int LastCaptureBatchGeometrySecondarySlotCreatedCount { get; private set; }
+    public int LastCaptureBatchGeometrySecondarySlotMatchedCount { get; private set; }
+    public int LastCaptureBatchGeometryDistinctSurfacePreservedCount { get; private set; }
+    public int LastCaptureBatchGeometryMultiJunctionDeferredCount { get; private set; }
+    public int LastCaptureBatchGeometryFixedAngleDistinctViewCount { get; private set; }
+    public int LastCaptureBatchGeometryAdaptiveBaselineDistinctViewCount { get; private set; }
+    public int LastCaptureBatchGeometryInsufficientBaselineViewCount { get; private set; }
+    public int LastCaptureBatchGeometryTemporalMaturityAcceptedCount { get; private set; }
+    public int LastCaptureBatchGeometryTemporalReanchorAcceptedCount { get; private set; }
+    public int LastCaptureBatchGeometryTemporalStreakResetCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionPrepassPreservedCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionSecondarySurfaceWriteCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionUnresolvedHeldCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionCanonicalDirectionalRoutedCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionOwnerBootstrapCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionOwnerMatchedCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionOwnerPreservedCount { get; private set; }
+    public int LastCaptureBatchGeometryProductionOwnerSwitchedCount { get; private set; }
+    public int LastCaptureBatchMatureSmoothFastPathCandidateCount { get; private set; }
+    public int LastCaptureBatchMatureSmoothFastPathAcceptedCount { get; private set; }
+    public int LastCaptureBatchMatureSmoothFastPathChangedCount { get; private set; }
+    public int LastCaptureBatchMatureSmoothFastPathUnsafeStateCount { get; private set; }
+    public int LastCaptureBatchLocalReanchorFitCandidateCount { get; private set; }
+    public int LastCaptureBatchLocalReanchorFitAcceptedCount { get; private set; }
+    public int LastCaptureBatchLocalReanchorAppliedCount { get; private set; }
+    public float LastCaptureBatchLocalReanchorShiftMeters { get; private set; }
+    public int LastCaptureBatchLocalReanchorCrossLayerExcludedCount { get; private set; }
+    public int LastCaptureBatchRobustDepthCrossLayerExcludedCount { get; private set; }
+    public int LastCaptureBatchSeparatedDepthLayerRescuedCount { get; private set; }
+    public int LastCaptureBatchStrongMixedOwnershipProductionHeldCount { get; private set; }
+    public float LastCaptureBatchFusionProjectiveBandMilliseconds { get; private set; }
+    public float LastCaptureBatchFusionFreeSpaceCarvingMilliseconds { get; private set; }
+    public int LastCaptureBatchFusionPrepassSampleCount { get; private set; }
+    public int LastCaptureBatchFusionPrepassValidSampleCount { get; private set; }
+    public int LastCaptureBatchFusionProjectiveBandCallCount { get; private set; }
+    public int LastCaptureBatchFusionProjectiveDiagnosticBandCallCount { get; private set; }
+    public long LastCaptureBatchFusionProjectiveBandCandidateVoxelCount { get; private set; }
+    public long LastCaptureBatchFusionProjectiveBandAcceptedVoxelCount { get; private set; }
+    public int LastCaptureBatchFusionFreeSpaceCarvingCallCount { get; private set; }
+    public long LastCaptureBatchFusionFreeSpaceTraversedVoxelCount { get; private set; }
+    public int LastCaptureBatchFusionDenseStampLookupCount { get; private set; }
+    public int LastCaptureBatchFusionDenseStampMismatchCount { get; private set; }
     public bool LastCaptureBatchComplete { get; private set; }
     public int CompletedCaptureBatchCount { get; private set; }
     public int LastCaptureBatchTsdfGenerationStart { get; private set; }
@@ -1769,6 +2596,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRebaselineNewHoleCellCount { get; private set; }
     public int LastRebaselineRecoveredHoleCellCount { get; private set; }
     public int LastInputSampleCount { get; private set; }
+    public int LastPaperQuestInputPixelCount { get; private set; }
+    public int LastPaperQuestAcceptedRayCount { get; private set; }
+    public int LastPaperQuestRangeRejectCount { get; private set; }
+    public int LastPaperQuestGeometryRejectCount { get; private set; }
+    public int LastPaperQuestMissingEyePoseCount { get; private set; }
+    public int LastPaperQuestIntegratedVoxelCount { get; private set; }
+    public int LastCaptureBatchPaperQuestInputPixelCount { get; private set; }
+    public int LastCaptureBatchPaperQuestAcceptedRayCount { get; private set; }
+    public int LastCaptureBatchPaperQuestRangeRejectCount { get; private set; }
+    public int LastCaptureBatchPaperQuestGeometryRejectCount { get; private set; }
+    public int LastCaptureBatchPaperQuestMissingEyePoseCount { get; private set; }
+    public int LastCaptureBatchPaperQuestIntegratedVoxelCount { get; private set; }
+    public int LastCaptureBatchPaperSurfaceAlignmentSupportedSamples =>
+        _paperSurfaceAlignmentSupportedSamples;
+    public int LastCaptureBatchPaperSurfaceAlignmentMissingSamples =>
+        _paperSurfaceAlignmentMissingSamples;
     public int LastIntegratedSampleCount { get; private set; }
     public int LastUpdatedVoxelCount { get; private set; }
     public int LastMeshVertexCount { get; private set; }
@@ -1808,6 +2651,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public float LastBudgetedFusionMaxSliceMilliseconds { get; private set; }
     public int LastBudgetedFusionUniqueSurfaceVoxelWriteCount { get; private set; }
     public int LastBudgetedFusionMergedSurfaceVoxelWriteCount { get; private set; }
+    public int LastBudgetedFusionCompactedSampleCount { get; private set; }
+    public int LastBudgetedFusionHeavySampleCount { get; private set; }
+    public float LastBudgetedFusionPrepassMilliseconds { get; private set; }
+    public float LastBudgetedFusionRepresentativeBuildMilliseconds { get; private set; }
+    public float LastBudgetedFusionHeavyMilliseconds { get; private set; }
+    public float LastBudgetedFusionHeavyDecisionMilliseconds { get; private set; }
+    public float LastBudgetedFusionProjectiveBandMilliseconds { get; private set; }
+    public float LastBudgetedFusionFreeSpaceCarvingMilliseconds { get; private set; }
+    public int LastBudgetedFusionPrepassSampleCount { get; private set; }
+    public int LastBudgetedFusionPrepassValidSampleCount { get; private set; }
+    public int LastBudgetedFusionProjectiveBandCallCount { get; private set; }
+    public int LastBudgetedFusionProjectiveDiagnosticBandCallCount { get; private set; }
+    public long LastBudgetedFusionProjectiveBandCandidateVoxelCount { get; private set; }
+    public long LastBudgetedFusionProjectiveBandAcceptedVoxelCount { get; private set; }
+    public int LastBudgetedFusionFreeSpaceCarvingCallCount { get; private set; }
+    public long LastBudgetedFusionFreeSpaceTraversedVoxelCount { get; private set; }
+    public int LastBudgetedFusionDenseStampLookupCount { get; private set; }
+    public int LastBudgetedFusionDenseStampRepresentativeVoxelCount { get; private set; }
+    public int LastBudgetedFusionDenseStampRepresentativeMismatchCount { get; private set; }
+    public int LastBudgetedFusionDenseStampRawHitMismatchCount { get; private set; }
+    public int LastBudgetedFusionDenseStampScoreMismatchCount { get; private set; }
+    public int LastBudgetedFusionDenseStampWriteMembershipMismatchCount { get; private set; }
+    public bool LastBudgetedFusionDenseStampEquivalent { get; private set; }
     public float LastReferenceClassicMeanLegacyDistanceMeters { get; private set; }
     public int LastReferenceClassicUnmatchedLegacyVertexCount { get; private set; }
     public bool LastReferenceClassicTruncated { get; private set; }
@@ -1876,6 +2742,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastRejectedRobustDepthCount { get; private set; }
     public int LastRobustDepthDownweightedCount { get; private set; }
     public int LastRobustDepthCorrectedCount { get; private set; }
+    public int LastRobustDepthCrossLayerExcludedCount { get; private set; }
+    public int LastSeparatedDepthLayerRescuedCount { get; private set; }
+    public int LastStrongMixedOwnershipProductionHeldCount { get; private set; }
     public int LastRejectedDepthEdgeErosionCount { get; private set; }
     public int LastDepthEdgeDownweightedCount { get; private set; }
     public int LastGrazingPlaneCheckedSampleCount { get; private set; }
@@ -2339,15 +3208,20 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public Vector3Int LastIncrementalPatchDirtyBoundsMin { get; private set; }
     public Vector3Int LastIncrementalPatchDirtyBoundsMax { get; private set; }
     public int LastIncrementalTsdfDirtyBlockCount { get; private set; }
+    public int LastIncrementalTsdfBoundaryMaskPendingCount { get; private set; }
+    public int LastIncrementalTsdfBoundaryMaskConfirmedCount { get; private set; }
     public int LastAuthoritativeBlockCachedCount { get; private set; }
     public int LastAuthoritativeBlockDirtyAttemptCount { get; private set; }
     public int LastAuthoritativeBlockDependencyAttemptCount { get; private set; }
     public int LastAuthoritativeBlockDependencyCandidateCount { get; private set; }
     public int LastAuthoritativeBlockDependencyPrunedCount { get; private set; }
+    public int LastAuthoritativeBlockDependencyReciprocalPrunedCount { get; private set; }
+    public int LastAuthoritativeBlockDependencyDiagonalPrunedCount { get; private set; }
     public float LastIncrementalProductionDirtyTrackingMilliseconds { get; private set; }
     public float LastAuthoritativeBlockDependencyScheduleMilliseconds { get; private set; }
     public float LastAuthoritativeBlockExtractionMilliseconds { get; private set; }
     public float LastAuthoritativeBlockSemanticFinalizeMilliseconds { get; private set; }
+    public float LastAuthoritativePlaneConstraintApplyMilliseconds { get; private set; }
     public float LastAuthoritativeBlockCacheMergeMilliseconds { get; private set; }
     public float LastPlaneLedgerTopologyMilliseconds { get; private set; }
     public float LastPlaneLedgerIndependentAuditMilliseconds { get; private set; }
@@ -2357,6 +3231,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public float LastPlaneLedgerPresentationMilliseconds { get; private set; }
     public int LastAuthoritativePlaneChangedCount { get; private set; }
     public int LastAuthoritativePlaneInvalidatedBlockCount { get; private set; }
+    public int LastAuthoritativeNewPlaneCount { get; private set; }
+    public int LastAuthoritativeNewPlaneInvalidatedBlockCount { get; private set; }
     public int LastAuthoritativeBlockRebuiltCount { get; private set; }
     public int LastAuthoritativeBlockRollbackCount { get; private set; }
     public int LastAuthoritativeBlockDirectEmptyCount { get; private set; }
@@ -2380,6 +3256,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastAuthoritativeBlockTriangleCount { get; private set; }
     public int LastAuthoritativeBlockBoundaryEdgeCount { get; private set; }
     public int LastAuthoritativeBlockNonManifoldEdgeCount { get; private set; }
+    public int LastAuthoritativeTopologyCachedBlockCount { get; private set; }
+    public bool LastAuthoritativeAggregateMeshSkipped { get; private set; }
     public int LastAuthoritativeCyanPlaneMatureCount { get; private set; }
     public int LastAuthoritativeCyanPlaneCandidateBlockCount { get; private set; }
     public int LastAuthoritativeCyanPlaneAppliedBlockCount { get; private set; }
@@ -2464,6 +3342,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastPlaneConstrainedZeroCrossShadowFullyOwnedTriangleCount { get; private set; }
     public int LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount { get; private set; }
     public int LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount { get; private set; }
+    public bool LastPlaneConstrainedZeroCrossAggregateTopologySkipped { get; private set; }
+    public float LastPlaneConstrainedZeroCrossReextractMilliseconds { get; private set; }
+    public float LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds { get; private set; }
+    public float LastPlaneConstrainedZeroCrossAggregateTopologyMilliseconds { get; private set; }
+    public float LastPlaneConstrainedZeroCrossCommitMilliseconds { get; private set; }
     public int LastPlaneConstrainedZeroCrossLedgerTriangleCount { get; private set; }
     public int LastPlaneConstrainedZeroCrossLedgerProblemTriangleCount { get; private set; }
     public int LastPlaneConstrainedZeroCrossLedgerMeshComponentCount { get; private set; }
@@ -2490,6 +3373,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastConfirmedComplexLeaseExpiredCount { get; private set; }
     public int LastConfirmedComplexLeaseGraceRetainedCount { get; private set; }
     public int LastConfirmedComplexLeaseGraceReacquiredCount { get; private set; }
+    public int LastConfirmedComplexLeaseRebuildYieldCount { get; private set; }
+    public float LastConfirmedComplexLeaseRebuildMilliseconds { get; private set; }
     public int LastConfirmedComplexRenewedDespiteCandidateCount { get; private set; }
     public int LastComplexCandidateProbationBeforeCount { get; private set; }
     public int LastComplexCandidateProbationObservedCount { get; private set; }
@@ -2529,6 +3414,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastIndependentStructuralIdentityConflictTriangleCount { get; private set; }
     public int LastIndependentStructuralQualificationFailureTriangleCount { get; private set; }
     public int LastPlaneSupportCellCount { get; private set; }
+    public int LastObservedFloorSupportPlaneCount { get; private set; }
+    public int LastObservedFloorSupportCandidateCellCount { get; private set; }
+    public int LastObservedFloorSupportCoveredCellCount { get; private set; }
+    public int LastObservedFloorSupportFilledCellCount { get; private set; }
+    public int LastObservedFloorSupportTriangleCount { get; private set; }
+    public int LastObservedFloorSupportBlockCount { get; private set; }
     public int LastPlaneSupportQualifiedCellCount { get; private set; }
     public int LastPlaneSupportCoveredCellCount { get; private set; }
     public int LastPlaneSupportGapCellCount { get; private set; }
@@ -2612,6 +3503,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     public int LastIncrementalStablePlaneBootstrapAttempted { get; private set; }
     public int LastIncrementalStablePlaneBootstrapUpdated { get; private set; }
     public float LastIncrementalStablePlaneBootstrapMilliseconds { get; private set; }
+    public int LastHorizontalPlaneShadowInputSampleCount { get; private set; }
+    public int LastHorizontalPlaneShadowEligibleSampleCount { get; private set; }
+    public int LastHorizontalPlaneShadowProposalCount { get; private set; }
+    public int LastHorizontalPlaneShadowCandidateCount { get; private set; }
+    public int LastHorizontalPlaneShadowMatureCount { get; private set; }
+    public int LastHorizontalPlaneShadowFloorLikelyCount { get; private set; }
+    public int LastHorizontalPlaneShadowObjectLikelyCount { get; private set; }
+    public int LastHorizontalPlaneShadowAmbiguousCount { get; private set; }
+    public float LastHorizontalPlaneShadowLowestY { get; private set; }
+    public float LastHorizontalPlaneShadowBestRadius { get; private set; }
+    public int LastHorizontalPlaneShadowBestInliers { get; private set; }
+    public float LastHorizontalPlaneShadowMilliseconds { get; private set; }
+    public int LastMatureHorizontalProductionPlaneCount { get; private set; }
     public int LastStablePlaneShadowAssignedVertexCount { get; private set; }
     public int LastStablePlaneShadowMovedVertexCount { get; private set; }
     public int LastStablePlaneShadowRevertedVertexCount { get; private set; }
@@ -3141,6 +4045,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public int MultiComponentCells;
         public int SplitVertices;
         public int MissingRebuilds;
+        public bool HasCachedTopology;
+        public int CachedBoundaryEdges;
+        public int CachedNonManifoldEdges;
+        public int CachedMaxEdgeIncidence;
+    }
+
+    private sealed class AuthoritativeTsdfBlockMeshCloneState
+    {
+        public Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> Result;
     }
 
     private static Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> CloneAuthoritativeTsdfBlockMeshes(
@@ -3159,7 +4072,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             {
                 MultiComponentCells = input.MultiComponentCells,
                 SplitVertices = input.SplitVertices,
-                MissingRebuilds = input.MissingRebuilds
+                MissingRebuilds = input.MissingRebuilds,
+                HasCachedTopology = input.HasCachedTopology,
+                CachedBoundaryEdges = input.CachedBoundaryEdges,
+                CachedNonManifoldEdges = input.CachedNonManifoldEdges,
+                CachedMaxEdgeIncidence = input.CachedMaxEdgeIncidence
             };
             copy.Vertices.AddRange(input.Vertices);
             copy.VertexKeys.AddRange(input.VertexKeys);
@@ -3168,6 +4085,1182 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             clone[pair.Key] = copy;
         }
         return clone;
+    }
+
+    private IEnumerator CloneAuthoritativeTsdfBlockMeshesBudgetedRoutine(
+        IReadOnlyDictionary<Vector3Int, AuthoritativeTsdfBlockMesh> source,
+        AuthoritativeTsdfBlockMeshCloneState state,
+        CooperativeRebuildBudget budget)
+    {
+        Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> clone =
+            new Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh>(
+                source != null ? source.Count : 0);
+        state.Result = clone;
+        if (source == null)
+            yield break;
+        foreach (KeyValuePair<Vector3Int, AuthoritativeTsdfBlockMesh> pair in source)
+        {
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+            AuthoritativeTsdfBlockMesh input = pair.Value;
+            if (input == null)
+                continue;
+            AuthoritativeTsdfBlockMesh copy = new AuthoritativeTsdfBlockMesh
+            {
+                MultiComponentCells = input.MultiComponentCells,
+                SplitVertices = input.SplitVertices,
+                MissingRebuilds = input.MissingRebuilds,
+                HasCachedTopology = input.HasCachedTopology,
+                CachedBoundaryEdges = input.CachedBoundaryEdges,
+                CachedNonManifoldEdges = input.CachedNonManifoldEdges,
+                CachedMaxEdgeIncidence = input.CachedMaxEdgeIncidence
+            };
+            copy.Vertices.AddRange(input.Vertices);
+            copy.VertexKeys.AddRange(input.VertexKeys);
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+            copy.Triangles.AddRange(input.Triangles);
+            copy.TriangleSources.AddRange(input.TriangleSources);
+            clone[pair.Key] = copy;
+        }
+    }
+
+    private static bool IsAuthoritativeSemanticReuseBoundaryBand(
+        AuthoritativeCellComponentKey key,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        int size = Mathf.Max(2, blockVoxels);
+        Vector3Int minimum = blockKey * size;
+        Vector3Int maximum = minimum + new Vector3Int(size - 1, size - 1, size - 1);
+        Vector3Int cell = key.Cell;
+        // The extractor reads a one-cell halo.  Cells on or beyond the nominal
+        // block faces are therefore the seam band; only cells strictly inside all
+        // six faces count as an interior topology change.
+        return cell.x <= minimum.x || cell.x >= maximum.x ||
+               cell.y <= minimum.y || cell.y >= maximum.y ||
+               cell.z <= minimum.z || cell.z >= maximum.z;
+    }
+
+    private static StableQuadKey MakeDependencySemanticReuseSourceKey(
+        AuthoritativeTriangleSource source)
+    {
+        return new StableQuadKey
+        {
+            X = source.EdgeStart.x,
+            Y = source.EdgeStart.y,
+            Z = source.EdgeStart.z,
+            Axis = unchecked((byte)source.Axis)
+        };
+    }
+
+    private void RecordDependencySemanticReuseRemovedSourceFailures(
+        AuthoritativeTsdfBlockMesh candidate,
+        AuthoritativeTsdfBlockMesh accepted,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        double diagnosticStart = Time.realtimeSinceStartupAsDouble;
+        _dependencySemanticReuseAcceptedSourceScratch.Clear();
+        _dependencySemanticReuseCandidateSourceScratch.Clear();
+        for (int i = 0; i < accepted.TriangleSources.Count; i++)
+            _dependencySemanticReuseAcceptedSourceScratch.Add(
+                MakeDependencySemanticReuseSourceKey(accepted.TriangleSources[i]));
+        for (int i = 0; i < candidate.TriangleSources.Count; i++)
+            _dependencySemanticReuseCandidateSourceScratch.Add(
+                MakeDependencySemanticReuseSourceKey(candidate.TriangleSources[i]));
+        foreach (StableQuadKey source in _dependencySemanticReuseAcceptedSourceScratch)
+        {
+            if (_dependencySemanticReuseCandidateSourceScratch.Contains(source))
+                continue;
+            LastDependencySemanticReuseRemovedSourceCount++;
+            AuthoritativeCellComponentKey boundaryProbe =
+                new AuthoritativeCellComponentKey
+                {
+                    Cell = new Vector3Int(source.X, source.Y, source.Z),
+                    Component = 0
+                };
+            if (IsAuthoritativeSemanticReuseBoundaryBand(
+                    boundaryProbe, blockKey, blockVoxels))
+                LastDependencySemanticReuseRemovedSourceBoundaryCount++;
+            else
+                LastDependencySemanticReuseRemovedSourceInteriorCount++;
+            DiagnoseDependencySemanticReuseRemovedSource(
+                source, blockKey, blockVoxels);
+        }
+        LastDependencySemanticReuseRemovedSourceDiagnosticMilliseconds +=
+            (float)((Time.realtimeSinceStartupAsDouble - diagnosticStart) * 1000.0);
+    }
+
+    private void DiagnoseDependencySemanticReuseRemovedSource(
+        StableQuadKey source,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        int axis = source.Axis;
+        if (axis < 0 || axis > 2 ||
+            _authoritativeReadTsdf == null ||
+            _authoritativeReadWeights == null ||
+            _authoritativeReadEligibility == null)
+        {
+            LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount++;
+            return;
+        }
+        Vector3Int aCoord = new Vector3Int(source.X, source.Y, source.Z);
+        Vector3Int bCoord = aCoord +
+            (axis == 0 ? Vector3Int.right :
+             axis == 1 ? Vector3Int.up : new Vector3Int(0, 0, 1));
+        int minX = Mathf.Max(0, blockKey.x * blockVoxels - 1);
+        int minY = Mathf.Max(0, blockKey.y * blockVoxels - 1);
+        int minZ = Mathf.Max(0, blockKey.z * blockVoxels - 1);
+        int maxX = Mathf.Min(_dimX - 1, (blockKey.x + 1) * blockVoxels + 1);
+        int maxY = Mathf.Min(_dimY - 1, (blockKey.y + 1) * blockVoxels + 1);
+        int maxZ = Mathf.Min(_dimZ - 1, (blockKey.z + 1) * blockVoxels + 1);
+        if (aCoord.x < minX || aCoord.x > maxX ||
+            aCoord.y < minY || aCoord.y > maxY ||
+            aCoord.z < minZ || aCoord.z > maxZ)
+        {
+            LastDependencySemanticReuseRemovedSourceOutsideExtractionRangeCount++;
+            return;
+        }
+        if (aCoord.x < 0 || aCoord.y < 0 || aCoord.z < 0 ||
+            bCoord.x < 0 || bCoord.y < 0 || bCoord.z < 0 ||
+            aCoord.x >= _dimX || aCoord.y >= _dimY || aCoord.z >= _dimZ ||
+            bCoord.x >= _dimX || bCoord.y >= _dimY || bCoord.z >= _dimZ)
+        {
+            LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount++;
+            return;
+        }
+        int aIndex = Index(aCoord.x, aCoord.y, aCoord.z);
+        int bIndex = Index(bCoord.x, bCoord.y, bCoord.z);
+        if (aIndex < 0 || bIndex < 0 ||
+            aIndex >= _authoritativeReadTsdf.Length ||
+            bIndex >= _authoritativeReadTsdf.Length ||
+            aIndex >= _authoritativeReadWeights.Length ||
+            bIndex >= _authoritativeReadWeights.Length ||
+            aIndex >= _authoritativeReadEligibility.Length ||
+            bIndex >= _authoritativeReadEligibility.Length)
+        {
+            LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount++;
+            return;
+        }
+        int minWeight = Mathf.Max(1, authoritativeTsdfBlockMinWeight);
+        if (_authoritativeReadWeights[aIndex] < minWeight ||
+            _authoritativeReadWeights[bIndex] < minWeight)
+        {
+            LastDependencySemanticReuseRemovedSourceWeightCount++;
+            return;
+        }
+        if (_authoritativeReadEligibility[aIndex] == 0 ||
+            _authoritativeReadEligibility[bIndex] == 0)
+        {
+            LastDependencySemanticReuseRemovedSourceEligibilityCount++;
+            return;
+        }
+        float a = _authoritativeReadTsdf[aIndex];
+        float b = _authoritativeReadTsdf[bIndex];
+        if (float.IsNaN(a) || float.IsInfinity(a) ||
+            float.IsNaN(b) || float.IsInfinity(b))
+        {
+            LastDependencySemanticReuseRemovedSourceNonFiniteTsdfCount++;
+            return;
+        }
+        if (a == 0f || b == 0f)
+        {
+            LastDependencySemanticReuseRemovedSourceExactZeroCount++;
+            return;
+        }
+        if (!((a < 0f && b > 0f) || (a > 0f && b < 0f)))
+        {
+            LastDependencySemanticReuseRemovedSourceSameSignCount++;
+            return;
+        }
+        if (Mathf.Abs(a - b) < 0.000001f)
+        {
+            LastDependencySemanticReuseRemovedSourceDegenerateDeltaCount++;
+            return;
+        }
+        float t = Mathf.Clamp01(a / (a - b));
+        Vector3 crossing = Vector3.Lerp(
+            VoxelCenter(aCoord.x, aCoord.y, aCoord.z),
+            VoxelCenter(bCoord.x, bCoord.y, bCoord.z), t);
+        if (!Finite(crossing))
+        {
+            LastDependencySemanticReuseRemovedSourceNonFiniteCrossingCount++;
+            return;
+        }
+        float patchSize = Mathf.Max(0.001f, blockVoxels * voxelSizeMeters);
+        if (AuthoritativeBlockKey(crossing, patchSize) != blockKey)
+        {
+            LastDependencySemanticReuseRemovedSourceOwnerChangedCount++;
+            return;
+        }
+
+        Vector3Int cellA = aCoord;
+        Vector3Int cellB;
+        Vector3Int cellC;
+        Vector3Int cellD;
+        if (axis == 0)
+        {
+            cellB = aCoord + new Vector3Int(0, -1, 0);
+            cellC = aCoord + new Vector3Int(0, -1, -1);
+            cellD = aCoord + new Vector3Int(0, 0, -1);
+        }
+        else if (axis == 1)
+        {
+            cellB = aCoord + new Vector3Int(0, 0, -1);
+            cellC = aCoord + new Vector3Int(-1, 0, -1);
+            cellD = aCoord + new Vector3Int(-1, 0, 0);
+        }
+        else
+        {
+            cellB = aCoord + new Vector3Int(-1, 0, 0);
+            cellC = aCoord + new Vector3Int(-1, -1, 0);
+            cellD = aCoord + new Vector3Int(0, -1, 0);
+        }
+        _dependencySemanticReuseQuadVertexScratch.Clear();
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3Int cell = i == 0 ? cellA : i == 1 ? cellB : i == 2 ? cellC : cellD;
+            if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                cell.x >= _dimX - 1 || cell.y >= _dimY - 1 ||
+                cell.z >= _dimZ - 1)
+            {
+                LastDependencySemanticReuseRemovedSourceCellVertexMissingCount++;
+                return;
+            }
+            AuthoritativeCellTopology topology =
+                BuildAuthoritativeCellTopology(cell, false);
+            int localEdge = FindAuthoritativeLocalCubeEdge(cell, aCoord, axis);
+            if (localEdge < 0 || topology.EdgeComponents[localEdge] < 0 ||
+                !TryBuildAuthoritativeBlockCellVertex(
+                    cell, topology.EdgeComponents[localEdge], topology,
+                    out Vector3 vertex))
+            {
+                LastDependencySemanticReuseRemovedSourceCellVertexMissingCount++;
+                return;
+            }
+            _dependencySemanticReuseQuadVertexScratch.Add(vertex);
+        }
+        ExtractedQuadGeometryRejectReason geometryReason =
+            !enableLegacyTentPrevention && !rejectStretchedExtractedQuads
+                ? ExtractedQuadGeometryRejectReason.None
+                : EvaluateExtractedQuadGeometry(
+                    0, 1, 2, 3, _dependencySemanticReuseQuadVertexScratch);
+        switch (geometryReason)
+        {
+            case ExtractedQuadGeometryRejectReason.Invalid:
+                LastDependencySemanticReuseRemovedSourceGeometryInvalidCount++;
+                break;
+            case ExtractedQuadGeometryRejectReason.Edge:
+                LastDependencySemanticReuseRemovedSourceGeometryEdgeCount++;
+                break;
+            case ExtractedQuadGeometryRejectReason.Diagonal:
+                LastDependencySemanticReuseRemovedSourceGeometryDiagonalCount++;
+                break;
+            case ExtractedQuadGeometryRejectReason.Area:
+                LastDependencySemanticReuseRemovedSourceGeometryAreaCount++;
+                break;
+            case ExtractedQuadGeometryRejectReason.Twist:
+                LastDependencySemanticReuseRemovedSourceGeometryTwistCount++;
+                break;
+            case ExtractedQuadGeometryRejectReason.Plane:
+                LastDependencySemanticReuseRemovedSourceGeometryPlaneCount++;
+                break;
+            default:
+                LastDependencySemanticReuseRemovedSourceStillValidMissingCount++;
+                break;
+        }
+    }
+
+    private bool TryGetDependencyBoundarySameSignTsdf(
+        StableQuadKey source,
+        out bool positive,
+        out float minimumAbs,
+        out float maximumAbs)
+    {
+        positive = false;
+        minimumAbs = 0f;
+        maximumAbs = 0f;
+        int axis = source.Axis;
+        if (axis < 0 || axis > 2 ||
+            _authoritativeReadTsdf == null ||
+            _authoritativeReadWeights == null ||
+            _authoritativeReadEligibility == null)
+            return false;
+        Vector3Int aCoord = new Vector3Int(source.X, source.Y, source.Z);
+        Vector3Int bCoord = aCoord +
+            (axis == 0 ? Vector3Int.right :
+             axis == 1 ? Vector3Int.up : new Vector3Int(0, 0, 1));
+        if (aCoord.x < 0 || aCoord.y < 0 || aCoord.z < 0 ||
+            bCoord.x < 0 || bCoord.y < 0 || bCoord.z < 0 ||
+            aCoord.x >= _dimX || aCoord.y >= _dimY || aCoord.z >= _dimZ ||
+            bCoord.x >= _dimX || bCoord.y >= _dimY || bCoord.z >= _dimZ)
+            return false;
+        int aIndex = Index(aCoord.x, aCoord.y, aCoord.z);
+        int bIndex = Index(bCoord.x, bCoord.y, bCoord.z);
+        if (aIndex < 0 || bIndex < 0 ||
+            aIndex >= _authoritativeReadTsdf.Length ||
+            bIndex >= _authoritativeReadTsdf.Length ||
+            aIndex >= _authoritativeReadWeights.Length ||
+            bIndex >= _authoritativeReadWeights.Length ||
+            aIndex >= _authoritativeReadEligibility.Length ||
+            bIndex >= _authoritativeReadEligibility.Length)
+            return false;
+        int minWeight = Mathf.Max(1, authoritativeTsdfBlockMinWeight);
+        if (_authoritativeReadWeights[aIndex] < minWeight ||
+            _authoritativeReadWeights[bIndex] < minWeight ||
+            _authoritativeReadEligibility[aIndex] == 0 ||
+            _authoritativeReadEligibility[bIndex] == 0)
+            return false;
+        float a = _authoritativeReadTsdf[aIndex];
+        float b = _authoritativeReadTsdf[bIndex];
+        if (float.IsNaN(a) || float.IsInfinity(a) ||
+            float.IsNaN(b) || float.IsInfinity(b) ||
+            a == 0f || b == 0f || (a > 0f) != (b > 0f))
+            return false;
+        positive = a > 0f;
+        minimumAbs = Mathf.Min(Mathf.Abs(a), Mathf.Abs(b));
+        maximumAbs = Mathf.Max(Mathf.Abs(a), Mathf.Abs(b));
+        return true;
+    }
+
+    private bool IsDependencyBoundarySource(
+        StableQuadKey source,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        return IsAuthoritativeSemanticReuseBoundaryBand(
+            new AuthoritativeCellComponentKey
+            {
+                Cell = new Vector3Int(source.X, source.Y, source.Z),
+                Component = 0
+            },
+            blockKey,
+            blockVoxels);
+    }
+
+    private static int DependencyBoundarySignMinimumAbsBucket(float value)
+    {
+        if (value <= 0.005f) return 0;
+        if (value <= 0.010f) return 1;
+        if (value <= 0.020f) return 2;
+        if (value <= 0.050f) return 3;
+        if (value <= 0.100f) return 4;
+        return 5;
+    }
+
+    private static int DependencyBoundarySignMaximumAbsBucket(float value)
+    {
+        if (value <= 0.050f) return 0;
+        if (value <= 0.100f) return 1;
+        if (value <= 0.150f) return 2;
+        if (value <= 0.250f) return 3;
+        if (value <= 0.500f) return 4;
+        return 5;
+    }
+
+    private static int DependencyBoundarySignHistogramIndex(
+        float minimumAbs,
+        float maximumAbs)
+    {
+        return DependencyBoundarySignMinimumAbsBucket(minimumAbs) *
+               DependencyBoundarySignHistogramAxisBuckets +
+               DependencyBoundarySignMaximumAbsBucket(maximumAbs);
+    }
+
+    private static void IncrementDependencyBoundarySignHistogram(
+        int[] histogram,
+        float minimumAbs,
+        float maximumAbs)
+    {
+        int index = DependencyBoundarySignHistogramIndex(minimumAbs, maximumAbs);
+        if (histogram != null && index >= 0 && index < histogram.Length)
+            histogram[index]++;
+    }
+
+    private void CreateDependencyBoundarySignObservation(
+        Vector3Int blockKey,
+        StableQuadKey source,
+        bool positive,
+        float minimumAbs,
+        float maximumAbs)
+    {
+        if (!_dependencyBoundarySignHysteresisObservationsByBlock.TryGetValue(
+                blockKey,
+                out Dictionary<StableQuadKey,
+                    DependencyBoundarySignHysteresisObservation> observations))
+        {
+            observations = new Dictionary<StableQuadKey,
+                DependencyBoundarySignHysteresisObservation>();
+            _dependencyBoundarySignHysteresisObservationsByBlock[blockKey] = observations;
+        }
+        if (observations.ContainsKey(source))
+            return;
+        observations[source] = new DependencyBoundarySignHysteresisObservation
+        {
+            MinimumAbs = minimumAbs,
+            MaximumAbs = maximumAbs,
+            Positive = positive
+        };
+        IncrementDependencyBoundarySignHistogram(
+            positive
+                ? _dependencyBoundarySignHistogramPositiveCandidates
+                : _dependencyBoundarySignHistogramNegativeCandidates,
+            minimumAbs,
+            maximumAbs);
+        LastDependencyBoundarySignObservationCreatedCount++;
+    }
+
+    private void ResolveDependencyBoundarySignObservations(
+        Vector3Int blockKey,
+        HashSet<StableQuadKey> currentSources,
+        bool direct)
+    {
+        if (!_dependencyBoundarySignHysteresisObservationsByBlock.TryGetValue(
+                blockKey,
+                out Dictionary<StableQuadKey,
+                    DependencyBoundarySignHysteresisObservation> observations) ||
+            observations.Count == 0)
+            return;
+        if (direct)
+        {
+            LastDependencyBoundarySignObservationDirectResetCount += observations.Count;
+            observations.Clear();
+            _dependencyBoundarySignHysteresisObservationsByBlock.Remove(blockKey);
+            return;
+        }
+        foreach (KeyValuePair<StableQuadKey,
+                 DependencyBoundarySignHysteresisObservation> pair in observations)
+        {
+            DependencyBoundarySignHysteresisObservation observation = pair.Value;
+            int[] histogram;
+            if (currentSources != null && currentSources.Contains(pair.Key))
+            {
+                histogram = observation.Positive
+                    ? _dependencyBoundarySignHistogramPositiveRecovered
+                    : _dependencyBoundarySignHistogramNegativeRecovered;
+                LastDependencyBoundarySignObservationRecoveredCount++;
+            }
+            else if (TryGetDependencyBoundarySameSignTsdf(
+                         pair.Key, out _, out _, out _))
+            {
+                histogram = observation.Positive
+                    ? _dependencyBoundarySignHistogramPositiveExpired
+                    : _dependencyBoundarySignHistogramNegativeExpired;
+                LastDependencyBoundarySignObservationExpiredCount++;
+            }
+            else
+            {
+                histogram = observation.Positive
+                    ? _dependencyBoundarySignHistogramPositiveHardDropped
+                    : _dependencyBoundarySignHistogramNegativeHardDropped;
+                LastDependencyBoundarySignObservationHardDroppedCount++;
+            }
+            IncrementDependencyBoundarySignHistogram(
+                histogram, observation.MinimumAbs, observation.MaximumAbs);
+        }
+        observations.Clear();
+        _dependencyBoundarySignHysteresisObservationsByBlock.Remove(blockKey);
+    }
+
+    private static void AppendDependencyBoundarySignHistogram(
+        StringBuilder summary,
+        string key,
+        int[] histogram)
+    {
+        summary.Append(key).Append('=');
+        if (histogram != null)
+        {
+            for (int i = 0; i < histogram.Length; i++)
+            {
+                if (i > 0)
+                    summary.Append(',');
+                summary.Append(histogram[i]);
+            }
+        }
+        summary.AppendLine();
+    }
+
+    private bool TryGetDependencyBoundaryEndpointIndices(
+        StableQuadKey source,
+        out int aIndex,
+        out int bIndex)
+    {
+        aIndex = -1;
+        bIndex = -1;
+        int axis = source.Axis;
+        if (axis < 0 || axis > 2 || _dimX <= 0 || _dimY <= 0 || _dimZ <= 0)
+            return false;
+        Vector3Int a = new Vector3Int(source.X, source.Y, source.Z);
+        Vector3Int b = a +
+            (axis == 0 ? Vector3Int.right :
+             axis == 1 ? Vector3Int.up : new Vector3Int(0, 0, 1));
+        if (a.x < 0 || a.y < 0 || a.z < 0 ||
+            b.x < 0 || b.y < 0 || b.z < 0 ||
+            a.x >= _dimX || a.y >= _dimY || a.z >= _dimZ ||
+            b.x >= _dimX || b.y >= _dimY || b.z >= _dimZ)
+            return false;
+        aIndex = Index(a.x, a.y, a.z);
+        bIndex = Index(b.x, b.y, b.z);
+        return aIndex >= 0 && bIndex >= 0;
+    }
+
+    private int ClassifyDependencyBoundaryFreeSpaceEvidence(StableQuadKey source)
+    {
+        if (!TryGetDependencyBoundaryEndpointIndices(source, out int aIndex, out int bIndex))
+            return 0;
+        int confirmedHits = Mathf.Clamp(minFreeSpaceEvidenceFrames, 2, 8);
+        int recentFrameFloor = LastRawFrameIndex - Mathf.Max(2, maxFreeSpaceEvidenceFrameGap);
+        bool pending = false;
+        int[] endpoints = { aIndex, bIndex };
+        for (int i = 0; i < endpoints.Length; i++)
+        {
+            int index = endpoints[i];
+            if (_freeSpaceEvidenceHits != null &&
+                index < _freeSpaceEvidenceHits.Length)
+            {
+                int hits = _freeSpaceEvidenceHits[index];
+                if (hits >= confirmedHits)
+                    return 2;
+                pending |= hits > 0;
+            }
+            if (_clearedVoxelLastFrame != null &&
+                index < _clearedVoxelLastFrame.Length &&
+                _clearedVoxelLastFrame[index] >= recentFrameFloor)
+                return 2;
+            if (_voxelWriteProvenance.TryGetValue(
+                    index, out VoxelWriteProvenance provenance) &&
+                provenance.LastOperation == "free_space_carve" &&
+                provenance.Frame >= recentFrameFloor)
+                return 2;
+        }
+        return pending ? 1 : 0;
+    }
+
+    private static int DependencyBoundaryTemporalSupportBucket(int rebuilds)
+    {
+        if (rebuilds <= 1) return 0;
+        if (rebuilds <= 3) return 1;
+        if (rebuilds <= 7) return 2;
+        return 3;
+    }
+
+    private static int DependencyBoundaryTemporalHistogramIndex(
+        int supportBucket,
+        int freeSpaceClass)
+    {
+        return Mathf.Clamp(supportBucket, 0, DependencyBoundaryTemporalSupportBuckets - 1) *
+               DependencyBoundaryTemporalFreeSpaceBuckets +
+               Mathf.Clamp(freeSpaceClass, 0, DependencyBoundaryTemporalFreeSpaceBuckets - 1);
+    }
+
+    private void UpdateDependencyBoundarySupportView(
+        StableQuadKey source,
+        DependencyBoundaryTemporalFreeSpaceSourceState state)
+    {
+        if (state == null || state.LastSupportFrame == LastRawFrameIndex ||
+            !TryGetDependencyBoundaryEndpointIndices(source, out int aIndex, out int bIndex))
+            return;
+        Vector3 midpoint = (VoxelCenterFromIndex(aIndex) + VoxelCenterFromIndex(bIndex)) * 0.5f;
+        Vector3 direction = midpoint - GetCameraPosition();
+        if (direction.sqrMagnitude <= 0.000001f)
+            return;
+        direction.Normalize();
+        if (!state.HasSupportView)
+        {
+            state.HasSupportView = true;
+            state.DistinctSupportViews = 1;
+            state.LastSupportViewDirection = direction;
+        }
+        else if (Vector3.Angle(state.LastSupportViewDirection, direction) >=
+                 DependencyBoundaryTemporalViewSeparationDegrees)
+        {
+            state.DistinctSupportViews++;
+            state.LastSupportViewDirection = direction;
+        }
+        state.LastSupportFrame = LastRawFrameIndex;
+    }
+
+    private void IncrementDependencyBoundaryTemporalHistogram(
+        int[] histogram,
+        DependencyBoundaryTemporalFreeSpaceObservation observation)
+    {
+        if (histogram == null || observation == null)
+            return;
+        int index = DependencyBoundaryTemporalHistogramIndex(
+            observation.SupportBucket, observation.EntryFreeSpaceClass);
+        histogram[index]++;
+    }
+
+    private void RecordDependencyBoundaryTemporalOutcome(
+        DependencyBoundaryTemporalFreeSpaceObservation observation,
+        bool recovered)
+    {
+        int[] histogram;
+        if (recovered)
+        {
+            if (observation.MissingRebuilds <= 1)
+            {
+                histogram = observation.MultiView
+                    ? _dependencyBoundaryTemporalMultiViewRecoveredH1
+                    : _dependencyBoundaryTemporalSingleViewRecoveredH1;
+                LastDependencyBoundaryTemporalRecoveredH1Count++;
+            }
+            else if (observation.MissingRebuilds == 2)
+            {
+                histogram = observation.MultiView
+                    ? _dependencyBoundaryTemporalMultiViewRecoveredH2
+                    : _dependencyBoundaryTemporalSingleViewRecoveredH2;
+                LastDependencyBoundaryTemporalRecoveredH2Count++;
+            }
+            else
+            {
+                histogram = observation.MultiView
+                    ? _dependencyBoundaryTemporalMultiViewRecoveredH3
+                    : _dependencyBoundaryTemporalSingleViewRecoveredH3;
+                LastDependencyBoundaryTemporalRecoveredH3Count++;
+            }
+            if (observation.MaximumFreeSpaceClass >= 2)
+                LastDependencyBoundaryTemporalFreeSpaceConfirmedRecoveredCount++;
+            else
+                LastDependencyBoundaryTemporalNeverConfirmedRecoveredCount++;
+        }
+        else
+        {
+            histogram = observation.MultiView
+                ? _dependencyBoundaryTemporalMultiViewPersistent
+                : _dependencyBoundaryTemporalSingleViewPersistent;
+            LastDependencyBoundaryTemporalPersistentCount++;
+            if (observation.MaximumFreeSpaceClass >= 2)
+                LastDependencyBoundaryTemporalFreeSpaceConfirmedPersistentCount++;
+            else
+                LastDependencyBoundaryTemporalNeverConfirmedPersistentCount++;
+        }
+        IncrementDependencyBoundaryTemporalHistogram(histogram, observation);
+    }
+
+    private void UpdateDependencyBoundaryTemporalFreeSpaceShadow(
+        Vector3Int blockKey,
+        AuthoritativeTsdfBlockMesh candidate,
+        bool direct,
+        int blockVoxels)
+    {
+        if (!enableDependencyBoundaryTemporalFreeSpaceShadow || candidate == null)
+            return;
+        double diagnosticStart = Time.realtimeSinceStartupAsDouble;
+        _dependencySemanticReuseCandidateSourceScratch.Clear();
+        for (int i = 0; i < candidate.TriangleSources.Count; i++)
+        {
+            StableQuadKey source =
+                MakeDependencySemanticReuseSourceKey(candidate.TriangleSources[i]);
+            if (IsDependencyBoundarySource(source, blockKey, blockVoxels))
+                _dependencySemanticReuseCandidateSourceScratch.Add(source);
+        }
+        if (!_dependencyBoundaryTemporalFreeSpaceByBlock.TryGetValue(
+                blockKey,
+                out Dictionary<StableQuadKey,
+                    DependencyBoundaryTemporalFreeSpaceSourceState> states))
+        {
+            states = new Dictionary<StableQuadKey,
+                DependencyBoundaryTemporalFreeSpaceSourceState>(
+                    _dependencySemanticReuseCandidateSourceScratch.Count);
+            _dependencyBoundaryTemporalFreeSpaceByBlock[blockKey] = states;
+        }
+        if (direct)
+        {
+            foreach (DependencyBoundaryTemporalFreeSpaceSourceState state in states.Values)
+            {
+                if (state.Observation != null)
+                    LastDependencyBoundaryTemporalDirectResetCount++;
+            }
+            states.Clear();
+        }
+
+        _dependencyBoundaryTemporalFreeSpaceRemoveScratch.Clear();
+        int horizon = Mathf.Clamp(dependencyBoundaryTemporalObservationRebuilds, 2, 5);
+        if (!direct)
+        {
+            foreach (KeyValuePair<StableQuadKey,
+                     DependencyBoundaryTemporalFreeSpaceSourceState> pair in states)
+            {
+                StableQuadKey source = pair.Key;
+                DependencyBoundaryTemporalFreeSpaceSourceState state = pair.Value;
+                if (_dependencySemanticReuseCandidateSourceScratch.Contains(source))
+                {
+                    if (state.Observation != null)
+                    {
+                        RecordDependencyBoundaryTemporalOutcome(state.Observation, true);
+                        state.Observation = null;
+                        state.ConsecutivePresentRebuilds = 1;
+                        state.DistinctSupportViews = 0;
+                        state.HasSupportView = false;
+                        state.LastSupportFrame = int.MinValue;
+                    }
+                    else
+                    {
+                        state.ConsecutivePresentRebuilds++;
+                    }
+                    UpdateDependencyBoundarySupportView(source, state);
+                    continue;
+                }
+
+                int freeSpaceClass = ClassifyDependencyBoundaryFreeSpaceEvidence(source);
+                if (state.Observation == null)
+                {
+                    state.Observation = new DependencyBoundaryTemporalFreeSpaceObservation
+                    {
+                        MissingRebuilds = 1,
+                        SupportBucket = DependencyBoundaryTemporalSupportBucket(
+                            state.ConsecutivePresentRebuilds),
+                        EntryFreeSpaceClass = freeSpaceClass,
+                        MaximumFreeSpaceClass = freeSpaceClass,
+                        MultiView = state.DistinctSupportViews >= 2
+                    };
+                    IncrementDependencyBoundaryTemporalHistogram(
+                        state.Observation.MultiView
+                            ? _dependencyBoundaryTemporalMultiViewCandidates
+                            : _dependencyBoundaryTemporalSingleViewCandidates,
+                        state.Observation);
+                    LastDependencyBoundaryTemporalObservationCreatedCount++;
+                }
+                else
+                {
+                    state.Observation.MissingRebuilds++;
+                    state.Observation.MaximumFreeSpaceClass = Mathf.Max(
+                        state.Observation.MaximumFreeSpaceClass, freeSpaceClass);
+                    if (state.Observation.MissingRebuilds > horizon)
+                    {
+                        RecordDependencyBoundaryTemporalOutcome(state.Observation, false);
+                        _dependencyBoundaryTemporalFreeSpaceRemoveScratch.Add(source);
+                    }
+                }
+            }
+            for (int i = 0; i < _dependencyBoundaryTemporalFreeSpaceRemoveScratch.Count; i++)
+                states.Remove(_dependencyBoundaryTemporalFreeSpaceRemoveScratch[i]);
+        }
+
+        foreach (StableQuadKey source in _dependencySemanticReuseCandidateSourceScratch)
+        {
+            if (states.ContainsKey(source))
+                continue;
+            DependencyBoundaryTemporalFreeSpaceSourceState state =
+                new DependencyBoundaryTemporalFreeSpaceSourceState
+                {
+                    ConsecutivePresentRebuilds = 1
+                };
+            UpdateDependencyBoundarySupportView(source, state);
+            states[source] = state;
+        }
+        LastDependencyBoundaryTemporalDiagnosticMilliseconds +=
+            (float)((Time.realtimeSinceStartupAsDouble - diagnosticStart) * 1000.0);
+    }
+
+    private void FinalizeDependencyBoundaryTemporalFreeSpaceDiagnostics()
+    {
+        foreach (Dictionary<StableQuadKey,
+                 DependencyBoundaryTemporalFreeSpaceSourceState> states in
+                 _dependencyBoundaryTemporalFreeSpaceByBlock.Values)
+        {
+            foreach (DependencyBoundaryTemporalFreeSpaceSourceState state in states.Values)
+            {
+                if (state.Observation != null)
+                    LastDependencyBoundaryTemporalPendingCount++;
+            }
+        }
+    }
+
+    private void UpdateDependencyBoundaryZeroCrossSignHysteresisShadow(
+        Vector3Int blockKey,
+        AuthoritativeTsdfBlockMesh candidate,
+        bool direct,
+        int blockVoxels)
+    {
+        if (!enableDependencyBoundaryZeroCrossSignHysteresisShadow || candidate == null)
+            return;
+        double diagnosticStart = Time.realtimeSinceStartupAsDouble;
+        _dependencySemanticReuseCandidateSourceScratch.Clear();
+        for (int i = 0; i < candidate.TriangleSources.Count; i++)
+        {
+            StableQuadKey source =
+                MakeDependencySemanticReuseSourceKey(candidate.TriangleSources[i]);
+            if (IsDependencyBoundarySource(source, blockKey, blockVoxels))
+                _dependencySemanticReuseCandidateSourceScratch.Add(source);
+        }
+        if (!_dependencyBoundarySignHysteresisShadowByBlock.TryGetValue(
+                blockKey,
+                out Dictionary<StableQuadKey,
+                    DependencyBoundarySignHysteresisShadowState> states))
+        {
+            states = new Dictionary<StableQuadKey,
+                DependencyBoundarySignHysteresisShadowState>(
+                    _dependencySemanticReuseCandidateSourceScratch.Count);
+            _dependencyBoundarySignHysteresisShadowByBlock[blockKey] = states;
+        }
+        ResolveDependencyBoundarySignObservations(
+            blockKey, _dependencySemanticReuseCandidateSourceScratch, direct);
+        if (direct)
+        {
+            foreach (DependencyBoundarySignHysteresisShadowState state in states.Values)
+            {
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowDirectResetCount++;
+            }
+            states.Clear();
+            foreach (StableQuadKey source in _dependencySemanticReuseCandidateSourceScratch)
+                states[source] = new DependencyBoundarySignHysteresisShadowState();
+            LastDependencyBoundarySignHysteresisShadowDiagnosticMilliseconds +=
+                (float)((Time.realtimeSinceStartupAsDouble - diagnosticStart) * 1000.0);
+            return;
+        }
+
+        _dependencyBoundarySignHysteresisRemoveScratch.Clear();
+        float nearZero = Mathf.Clamp(
+            dependencyBoundarySignHysteresisNearZeroTsdf, 0.005f, 0.20f);
+        float farLimit = Mathf.Max(
+            nearZero,
+            Mathf.Clamp(dependencyBoundarySignHysteresisFarTsdfLimit, 0.05f, 0.50f));
+        int grace = Mathf.Clamp(
+            dependencyBoundarySignHysteresisGraceRebuilds, 1, 3);
+        foreach (KeyValuePair<StableQuadKey,
+                 DependencyBoundarySignHysteresisShadowState> pair in states)
+        {
+            StableQuadKey source = pair.Key;
+            DependencyBoundarySignHysteresisShadowState state = pair.Value;
+            if (_dependencySemanticReuseCandidateSourceScratch.Contains(source))
+            {
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowRecoveredCount++;
+                state.MissingRebuilds = 0;
+                state.RetainedLastRebuild = false;
+                continue;
+            }
+
+            if (!TryGetDependencyBoundarySameSignTsdf(
+                    source, out bool positive,
+                    out float minimumAbs, out float maximumAbs))
+            {
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowHardDroppedCount++;
+                _dependencyBoundarySignHysteresisRemoveScratch.Add(source);
+                continue;
+            }
+            LastDependencyBoundarySignHysteresisShadowSameSignMissingCount++;
+            if (positive)
+                LastDependencyBoundarySignHysteresisShadowPositiveCount++;
+            else
+                LastDependencyBoundarySignHysteresisShadowNegativeCount++;
+            if (state.MissingRebuilds == 0)
+            {
+                CreateDependencyBoundarySignObservation(
+                    blockKey, source, positive, minimumAbs, maximumAbs);
+            }
+            if (minimumAbs > nearZero)
+            {
+                LastDependencyBoundarySignHysteresisShadowNearRejectedCount++;
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowHardDroppedCount++;
+                _dependencyBoundarySignHysteresisRemoveScratch.Add(source);
+                continue;
+            }
+            if (maximumAbs > farLimit)
+            {
+                LastDependencyBoundarySignHysteresisShadowFarRejectedCount++;
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowHardDroppedCount++;
+                _dependencyBoundarySignHysteresisRemoveScratch.Add(source);
+                continue;
+            }
+            LastDependencyBoundarySignHysteresisShadowEligibleCount++;
+            state.MissingRebuilds++;
+            if (state.MissingRebuilds <= grace)
+            {
+                state.RetainedLastRebuild = true;
+                LastDependencyBoundarySignHysteresisShadowRetainedCount++;
+            }
+            else
+            {
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowExpiredCount++;
+                _dependencyBoundarySignHysteresisRemoveScratch.Add(source);
+            }
+        }
+        for (int i = 0; i < _dependencyBoundarySignHysteresisRemoveScratch.Count; i++)
+            states.Remove(_dependencyBoundarySignHysteresisRemoveScratch[i]);
+        foreach (StableQuadKey source in _dependencySemanticReuseCandidateSourceScratch)
+        {
+            if (!states.ContainsKey(source))
+                states[source] = new DependencyBoundarySignHysteresisShadowState();
+        }
+        LastDependencyBoundarySignHysteresisShadowDiagnosticMilliseconds +=
+            (float)((Time.realtimeSinceStartupAsDouble - diagnosticStart) * 1000.0);
+    }
+
+    private void FinalizeDependencyBoundaryZeroCrossSignHysteresisShadowDiagnostics()
+    {
+        foreach (Dictionary<StableQuadKey,
+                 DependencyBoundarySignHysteresisShadowState> states in
+                 _dependencyBoundarySignHysteresisShadowByBlock.Values)
+        {
+            LastDependencyBoundarySignHysteresisShadowTrackedSourceCount += states.Count;
+            foreach (DependencyBoundarySignHysteresisShadowState state in states.Values)
+            {
+                if (state.RetainedLastRebuild)
+                    LastDependencyBoundarySignHysteresisShadowActiveRetainedCount++;
+            }
+        }
+        LastDependencyBoundarySignHysteresisShadowPotentialMissingReductionRatio =
+            LastDependencyBoundarySignHysteresisShadowSameSignMissingCount > 0
+                ? LastDependencyBoundarySignHysteresisShadowRetainedCount /
+                  (float)LastDependencyBoundarySignHysteresisShadowSameSignMissingCount
+                : 0f;
+        foreach (Dictionary<StableQuadKey,
+                 DependencyBoundarySignHysteresisObservation> observations in
+                 _dependencyBoundarySignHysteresisObservationsByBlock.Values)
+            LastDependencyBoundarySignObservationPendingCount += observations.Count;
+    }
+
+    private void RecordDependencySemanticReuseShapeMismatch(
+        AuthoritativeTsdfBlockMesh candidate,
+        AuthoritativeTsdfBlockMesh accepted,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        RecordDependencySemanticReuseRemovedSourceFailures(
+            candidate, accepted, blockKey, blockVoxels);
+        bool malformedVertexKeys =
+            candidate.Vertices.Count != candidate.VertexKeys.Count ||
+            accepted.Vertices.Count != accepted.VertexKeys.Count;
+        bool vertexCountMismatch = candidate.Vertices.Count != accepted.Vertices.Count ||
+                                   candidate.VertexKeys.Count != accepted.VertexKeys.Count;
+        bool triangleCountMismatch = candidate.Triangles.Count != accepted.Triangles.Count;
+        bool sourceCountMismatch =
+            candidate.TriangleSources.Count != accepted.TriangleSources.Count;
+        if (malformedVertexKeys)
+            LastDependencySemanticReuseShapeMalformedVertexKeyBlockCount++;
+        if (vertexCountMismatch)
+            LastDependencySemanticReuseShapeVertexCountMismatchBlockCount++;
+        if (triangleCountMismatch)
+            LastDependencySemanticReuseShapeTriangleCountMismatchBlockCount++;
+        if (sourceCountMismatch)
+            LastDependencySemanticReuseShapeSourceCountMismatchBlockCount++;
+        if (candidate.MultiComponentCells != accepted.MultiComponentCells)
+            LastDependencySemanticReuseShapeMultiComponentMismatchBlockCount++;
+        if (candidate.SplitVertices != accepted.SplitVertices)
+            LastDependencySemanticReuseShapeSplitVertexMismatchBlockCount++;
+
+        int vertexDelta = candidate.VertexKeys.Count - accepted.VertexKeys.Count;
+        int triangleDelta = candidate.Triangles.Count / 3 - accepted.Triangles.Count / 3;
+        int sourceDelta = candidate.TriangleSources.Count - accepted.TriangleSources.Count;
+        LastDependencySemanticReuseShapeVertexDeltaSum += vertexDelta;
+        LastDependencySemanticReuseShapeTriangleDeltaSum += triangleDelta;
+        LastDependencySemanticReuseShapeSourceDeltaSum += sourceDelta;
+        LastDependencySemanticReuseShapeVertexDeltaMaxAbs = Mathf.Max(
+            LastDependencySemanticReuseShapeVertexDeltaMaxAbs, Mathf.Abs(vertexDelta));
+        LastDependencySemanticReuseShapeTriangleDeltaMaxAbs = Mathf.Max(
+            LastDependencySemanticReuseShapeTriangleDeltaMaxAbs, Mathf.Abs(triangleDelta));
+
+        _dependencySemanticReuseAcceptedKeyScratch.Clear();
+        _dependencySemanticReuseCandidateKeyScratch.Clear();
+        for (int i = 0; i < accepted.VertexKeys.Count; i++)
+            _dependencySemanticReuseAcceptedKeyScratch.Add(accepted.VertexKeys[i]);
+        for (int i = 0; i < candidate.VertexKeys.Count; i++)
+            _dependencySemanticReuseCandidateKeyScratch.Add(candidate.VertexKeys[i]);
+        HashSet<AuthoritativeCellComponentKey> acceptedKeys =
+            _dependencySemanticReuseAcceptedKeyScratch;
+        HashSet<AuthoritativeCellComponentKey> candidateKeys =
+            _dependencySemanticReuseCandidateKeyScratch;
+        bool hasKeyDelta = false;
+        bool hasInteriorDelta = false;
+        foreach (AuthoritativeCellComponentKey key in candidateKeys)
+        {
+            if (acceptedKeys.Contains(key))
+                continue;
+            hasKeyDelta = true;
+            LastDependencySemanticReuseShapeAddedVertexKeyCount++;
+            if (IsAuthoritativeSemanticReuseBoundaryBand(key, blockKey, blockVoxels))
+            {
+                LastDependencySemanticReuseShapeBoundaryAddedVertexKeyCount++;
+                _dependencySemanticReuseBoundaryAddedKeys.Add(key);
+                if (!_dependencySemanticReuseBoundaryAddedOwnerByKey.ContainsKey(key))
+                    _dependencySemanticReuseBoundaryAddedOwnerByKey[key] = blockKey;
+            }
+            else
+            {
+                LastDependencySemanticReuseShapeInteriorAddedVertexKeyCount++;
+                hasInteriorDelta = true;
+            }
+        }
+        foreach (AuthoritativeCellComponentKey key in acceptedKeys)
+        {
+            if (candidateKeys.Contains(key))
+                continue;
+            hasKeyDelta = true;
+            LastDependencySemanticReuseShapeRemovedVertexKeyCount++;
+            if (IsAuthoritativeSemanticReuseBoundaryBand(key, blockKey, blockVoxels))
+            {
+                LastDependencySemanticReuseShapeBoundaryRemovedVertexKeyCount++;
+                _dependencySemanticReuseBoundaryRemovedKeys.Add(key);
+                if (!_dependencySemanticReuseBoundaryRemovedOwnerByKey.ContainsKey(key))
+                    _dependencySemanticReuseBoundaryRemovedOwnerByKey[key] = blockKey;
+            }
+            else
+            {
+                LastDependencySemanticReuseShapeInteriorRemovedVertexKeyCount++;
+                hasInteriorDelta = true;
+            }
+        }
+        if (!hasKeyDelta)
+            LastDependencySemanticReuseShapeConnectivityOnlyBlockCount++;
+        else if (hasInteriorDelta)
+            LastDependencySemanticReuseShapeInteriorBlockCount++;
+        else
+            LastDependencySemanticReuseShapeBoundaryOnlyBlockCount++;
+    }
+
+    private void FinalizeDependencySemanticReuseBoundaryMigrationDiagnostics()
+    {
+        LastDependencySemanticReuseBoundaryUniqueAddedKeyCount =
+            _dependencySemanticReuseBoundaryAddedKeys.Count;
+        LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount =
+            _dependencySemanticReuseBoundaryRemovedKeys.Count;
+        foreach (AuthoritativeCellComponentKey key in
+                 _dependencySemanticReuseBoundaryAddedKeys)
+        {
+            if (!_dependencySemanticReuseBoundaryRemovedKeys.Contains(key))
+                continue;
+            LastDependencySemanticReuseBoundaryMigratedKeyCount++;
+            if (!_dependencySemanticReuseBoundaryAddedOwnerByKey.TryGetValue(
+                    key, out Vector3Int addedOwner) ||
+                !_dependencySemanticReuseBoundaryRemovedOwnerByKey.TryGetValue(
+                    key, out Vector3Int removedOwner))
+            {
+                LastDependencySemanticReuseBoundaryNonNeighbourMigrationCount++;
+                continue;
+            }
+            Vector3Int delta = addedOwner - removedOwner;
+            int dx = Mathf.Abs(delta.x);
+            int dy = Mathf.Abs(delta.y);
+            int dz = Mathf.Abs(delta.z);
+            int manhattan = dx + dy + dz;
+            int chebyshev = Mathf.Max(dx, Mathf.Max(dy, dz));
+            if (manhattan == 0)
+                LastDependencySemanticReuseBoundarySameOwnerMigrationCount++;
+            else if (manhattan == 1)
+                LastDependencySemanticReuseBoundaryFaceNeighbourMigrationCount++;
+            else if (chebyshev == 1)
+                LastDependencySemanticReuseBoundaryDiagonalNeighbourMigrationCount++;
+            else
+                LastDependencySemanticReuseBoundaryNonNeighbourMigrationCount++;
+        }
+        LastDependencySemanticReuseBoundaryUnmatchedAddedKeyCount = Mathf.Max(
+            0,
+            LastDependencySemanticReuseBoundaryUniqueAddedKeyCount -
+            LastDependencySemanticReuseBoundaryMigratedKeyCount);
+        LastDependencySemanticReuseBoundaryUnmatchedRemovedKeyCount = Mathf.Max(
+            0,
+            LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount -
+            LastDependencySemanticReuseBoundaryMigratedKeyCount);
+        int possiblePairs = Mathf.Min(
+            LastDependencySemanticReuseBoundaryUniqueAddedKeyCount,
+            LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount);
+        LastDependencySemanticReuseBoundaryMigrationRatio = possiblePairs > 0
+            ? LastDependencySemanticReuseBoundaryMigratedKeyCount /
+              (float)possiblePairs
+            : 0f;
+    }
+
+    private bool AuthoritativeTsdfBlockMeshEquivalentForSemanticReuse(
+        AuthoritativeTsdfBlockMesh candidate,
+        AuthoritativeTsdfBlockMesh accepted,
+        Vector3Int blockKey,
+        int blockVoxels)
+    {
+        LastDependencySemanticReuseCheckCount++;
+        if (candidate == null || accepted == null)
+        {
+            LastDependencySemanticReuseRejectedNullCount++;
+            return false;
+        }
+        if (candidate.Vertices.Count != candidate.VertexKeys.Count ||
+            accepted.Vertices.Count != accepted.VertexKeys.Count ||
+            candidate.Vertices.Count != accepted.Vertices.Count ||
+            candidate.VertexKeys.Count != accepted.VertexKeys.Count ||
+            candidate.Triangles.Count != accepted.Triangles.Count ||
+            candidate.TriangleSources.Count != accepted.TriangleSources.Count)
+        {
+            LastDependencySemanticReuseRejectedShapeCount++;
+            RecordDependencySemanticReuseShapeMismatch(
+                candidate, accepted, blockKey, blockVoxels);
+            return false;
+        }
+        for (int i = 0; i < candidate.VertexKeys.Count; i++)
+        {
+            if (!candidate.VertexKeys[i].Equals(accepted.VertexKeys[i]))
+            {
+                LastDependencySemanticReuseRejectedVertexKeyCount++;
+                return false;
+            }
+        }
+        for (int i = 0; i < candidate.Triangles.Count; i++)
+        {
+            if (candidate.Triangles[i] != accepted.Triangles[i])
+            {
+                LastDependencySemanticReuseRejectedTriangleCount++;
+                return false;
+            }
+        }
+        for (int i = 0; i < candidate.TriangleSources.Count; i++)
+        {
+            if (!candidate.TriangleSources[i].Equals(accepted.TriangleSources[i]))
+            {
+                LastDependencySemanticReuseRejectedTriangleSourceCount++;
+                return false;
+            }
+        }
+
+        // Identity and connectivity remain exact.  Only harmless sub-voxel vertex
+        // jitter receives hysteresis, measured against the last semantically
+        // accepted baseline rather than the moving extraction cache.
+        float tolerance = Mathf.Max(
+            0.00005f,
+            voxelSizeMeters * Mathf.Clamp(
+                dependencySemanticReusePositionToleranceVoxels, 0.01f, 0.20f));
+        float toleranceSquared = tolerance * tolerance;
+        bool positionRejected = false;
+        for (int i = 0; i < candidate.Vertices.Count; i++)
+        {
+            float driftSquared =
+                (candidate.Vertices[i] - accepted.Vertices[i]).sqrMagnitude;
+            _lastDependencySemanticReusePositionSquaredDriftSum += driftSquared;
+            LastDependencySemanticReusePositionComparedVertexCount++;
+            LastDependencySemanticReusePositionMaxDriftMeters = Mathf.Max(
+                LastDependencySemanticReusePositionMaxDriftMeters,
+                Mathf.Sqrt(driftSquared));
+            if (driftSquared > toleranceSquared)
+                positionRejected = true;
+        }
+        LastDependencySemanticReusePositionRmsDriftMeters =
+            LastDependencySemanticReusePositionComparedVertexCount > 0
+                ? Mathf.Sqrt((float)(
+                    _lastDependencySemanticReusePositionSquaredDriftSum /
+                    LastDependencySemanticReusePositionComparedVertexCount))
+                : 0f;
+        if (positionRejected)
+        {
+            LastDependencySemanticReuseRejectedPositionCount++;
+            return false;
+        }
+        LastDependencySemanticReuseAcceptedCount++;
+        return true;
     }
 
     private sealed class PlaneConstrainedZeroCrossShadowStats
@@ -3409,6 +5502,36 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         public Vector3 Normal;
         public float Area;
         public int MissingRounds;
+    }
+
+    private readonly struct ConfirmedComplexLeaseClaimKey : System.IEquatable<ConfirmedComplexLeaseClaimKey>
+    {
+        public readonly Vector3Int Block;
+        public readonly int LeaseIndex;
+
+        public ConfirmedComplexLeaseClaimKey(Vector3Int block, int leaseIndex)
+        {
+            Block = block;
+            LeaseIndex = leaseIndex;
+        }
+
+        public bool Equals(ConfirmedComplexLeaseClaimKey other)
+        {
+            return Block == other.Block && LeaseIndex == other.LeaseIndex;
+        }
+
+        public override bool Equals(object obj)
+        {
+            return obj is ConfirmedComplexLeaseClaimKey other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                return (Block.GetHashCode() * 397) ^ LeaseIndex;
+            }
+        }
     }
 
     private sealed class ComplexCandidateProbationEntry
@@ -3989,6 +6112,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private float _auditMaxSnapshotLatencyMs;
     private readonly Dictionary<int, VoxelAuditLifecycle> _voxelAuditLifecycle = new Dictionary<int, VoxelAuditLifecycle>(4096);
     private readonly Dictionary<int, VoxelWriteProvenance> _voxelWriteProvenance = new Dictionary<int, VoxelWriteProvenance>(32768);
+    private readonly Dictionary<int, GeometryMaturityState> _geometryMaturityStates =
+        new Dictionary<int, GeometryMaturityState>(32768);
+    private readonly Dictionary<int, GeometryMaturityState> _geometryMaturitySecondaryStates =
+        new Dictionary<int, GeometryMaturityState>(4096);
     private readonly Dictionary<Vector3Int, HoleCellLifecycle> _holeCellLifecycles = new Dictionary<Vector3Int, HoleCellLifecycle>(4096);
     private readonly HashSet<Vector3Int> _activeHoleLifecycleCells = new HashSet<Vector3Int>();
     private int _holeLifecycleRebuildSequence;
@@ -4642,6 +6769,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ApplyContinuityBaseFillPreset();
         ApplyOutputDisplayPipelinePreset();
         ResolveRefs();
+        EnsureQuestRoomSurfaceNetsPipeline();
         EnsureObjects();
         ApplyOutputDisplayLayerVisibility();
     }
@@ -4652,8 +6780,97 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ApplyContinuityBaseFillPreset();
         ApplyOutputDisplayPipelinePreset();
         ResolveRefs();
+        EnsureQuestRoomSurfaceNetsPipeline();
         EnsureObjects();
         ApplyOutputDisplayLayerVisibility();
+    }
+
+    private void EnsureQuestRoomSurfaceNetsPipeline()
+    {
+        if (!enableQuestRoomScanGpuProductionCandidate)
+        {
+            if (_questRoomSurfaceNetsPipeline != null)
+                _questRoomSurfaceNetsPipeline.SetRenderVisible(false);
+            return;
+        }
+
+        if (_questRoomSurfaceNetsPipeline == null)
+            _questRoomSurfaceNetsPipeline = GetComponent<ScanCoverQuestRoomSurfaceNetsPipeline>();
+        if (_questRoomSurfaceNetsPipeline == null)
+            _questRoomSurfaceNetsPipeline = gameObject.AddComponent<ScanCoverQuestRoomSurfaceNetsPipeline>();
+        _questRoomSurfaceNetsPipeline.BindOwner(this);
+        ResolveQuestRoomAcceptedStereoSources();
+        _questRoomSurfaceNetsPipeline.BindAcceptedStereoSources(
+            questRoomAcceptedLeftDepthSource,
+            questRoomAcceptedRightDepthSource);
+        _questRoomSurfaceNetsPipeline.SetRenderVisible(true);
+    }
+
+    private void ResolveQuestRoomAcceptedStereoSources()
+    {
+        ScanCoverDepthPreprocessor productionSource = rawDepthSource != null
+            ? rawDepthSource.Preprocessor
+            : null;
+        if (productionSource != null)
+        {
+            if (productionSource.CurrentSourceEye == ScanCoverDepthPreprocessor.SourceEye.Left)
+                questRoomAcceptedLeftDepthSource = productionSource;
+            else
+                questRoomAcceptedRightDepthSource = productionSource;
+        }
+
+        if (questRoomAcceptedRightDepthSource == null &&
+            productionSource != null &&
+            productionSource.CurrentSourceEye == ScanCoverDepthPreprocessor.SourceEye.Right)
+        {
+            questRoomAcceptedRightDepthSource = productionSource;
+        }
+
+        if (questRoomAcceptedLeftDepthSource != null ||
+            !createQuestRoomAcceptedLeftCompanion ||
+            questRoomAcceptedRightDepthSource == null)
+            return;
+
+        const string companionName = "ScanCover_QuestRoom_AcceptedDepth_Left";
+        Transform companionTransform = transform.Find(companionName);
+        GameObject companionObject;
+        if (companionTransform != null)
+        {
+            companionObject = companionTransform.gameObject;
+            questRoomAcceptedLeftDepthSource =
+                companionObject.GetComponent<ScanCoverDepthPreprocessor>();
+        }
+        else
+        {
+            companionObject = new GameObject(companionName);
+            companionObject.SetActive(false);
+            companionObject.transform.SetParent(transform, false);
+            questRoomAcceptedLeftDepthSource =
+                companionObject.AddComponent<ScanCoverDepthPreprocessor>();
+        }
+
+        if (questRoomAcceptedLeftDepthSource != null)
+        {
+            questRoomAcceptedLeftDepthSource.ConfigureAsStereoCompanion(
+                questRoomAcceptedRightDepthSource,
+                ScanCoverDepthPreprocessor.SourceEye.Left);
+            if (!companionObject.activeSelf)
+                companionObject.SetActive(true);
+        }
+    }
+
+    private void PrepareQuestRoomAcceptedStereoCompanionFrame()
+    {
+        if (!enableQuestRoomScanGpuProductionCandidate)
+            return;
+        EnsureQuestRoomSurfaceNetsPipeline();
+        _questRoomSurfaceNetsPipeline?.PrepareAcceptedStereoCompanionFrame();
+    }
+
+    public void NotifyQuestRoomSurfaceNetsReady()
+    {
+        ApplyDirectionalTsdfShadowDisplayMode();
+        _nextHudRefresh = 0f;
     }
 
     private bool UseLegacyAuthTsdfDisplay =>
@@ -4689,6 +6906,184 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             CycleOutputDisplayLayerView();
     }
 
+    [ContextMenu("Cycle Directional TSDF Shadow Display")]
+    public void CycleDirectionalTsdfShadowDisplay()
+    {
+        int next = ((int)directionalTsdfShadowDisplayMode + 1) % 3;
+        directionalTsdfShadowDisplayMode = (DirectionalTsdfShadowDisplayMode)next;
+        ApplyDirectionalTsdfShadowDisplayMode();
+        _nextHudRefresh = 0f;
+    }
+
+    [ContextMenu("Toggle Directional MC33 Shadow Wire")]
+    public void ToggleDirectionalDmcShadowWire()
+    {
+        showDirectionalDmcShadowWire = !showDirectionalDmcShadowWire;
+        ApplyDirectionalTsdfShadowDisplayMode();
+        _nextHudRefresh = 0f;
+    }
+
+    [ContextMenu("Toggle Hermite QEF Feature Shadow Wire")]
+    public void ToggleHermiteQefFeatureShadowWire()
+    {
+        showHermiteQefFeatureShadowWire =
+            !showHermiteQefFeatureShadowWire;
+        if (_lastDirectionalTsdfShadowMeshResult != null)
+            RebuildDirectionalTsdfShadowDisplay();
+        else
+            ApplyDirectionalTsdfShadowDisplayMode();
+        _nextHudRefresh = 0f;
+    }
+
+    private void HandleDirectionalTsdfShadowDisplayCycleInput()
+    {
+        if (!enableDirectionalTsdfShadow || !enableDirectionalTsdfShadowDisplayCycleInput)
+            return;
+        if (OVRInput.GetDown(directionalTsdfShadowDisplayCycleButton, OVRInput.Controller.LTouch))
+            CycleDirectionalTsdfShadowDisplay();
+    }
+
+    private void HandleHermiteQefFeatureShadowToggleInput()
+    {
+        if (!enableDirectionalTsdfShadow ||
+            !enableHermiteQefFeatureShadowToggleInput)
+            return;
+        if (OVRInput.GetDown(
+                hermiteQefFeatureShadowToggleButton,
+                OVRInput.Controller.RTouch))
+            ToggleHermiteQefFeatureShadowWire();
+    }
+
+    private void ApplyDirectionalTsdfShadowDisplayMode()
+    {
+        bool shadowHasGeometry = _directionalTsdfShadowMesh != null &&
+                                 _directionalTsdfShadowMesh.vertexCount > 0;
+        bool dmcHasGeometry = _directionalDmcShadowMesh != null &&
+                              _directionalDmcShadowMesh.vertexCount > 0;
+        bool showDmc = enableDirectionalTsdfShadow &&
+                       showDirectionalDmcShadowWire &&
+                       directionalTsdfShadowDisplayMode !=
+                           DirectionalTsdfShadowDisplayMode.ProductionOnly &&
+                       dmcHasGeometry;
+        bool showDirectional = enableDirectionalTsdfShadow &&
+                               directionalTsdfShadowDisplayMode != DirectionalTsdfShadowDisplayMode.ProductionOnly &&
+                               shadowHasGeometry &&
+                               !(showDmc && isolateDirectionalDmcShadowWire);
+        if (_directionalTsdfShadowObject != null)
+            _directionalTsdfShadowObject.SetActive(showDirectional);
+        if (_directionalDmcShadowObject != null)
+            _directionalDmcShadowObject.SetActive(showDmc);
+
+        bool shadowOnly = enableDirectionalTsdfShadow &&
+                          directionalTsdfShadowDisplayMode == DirectionalTsdfShadowDisplayMode.DirectionalShadowOnly;
+        if (shadowOnly && !_directionalTsdfProductionVisibilityCaptured)
+        {
+            _directionalTsdfSavedMeshObjectActive = _meshObject != null && _meshObject.activeSelf;
+            _directionalTsdfSavedWireObjectActive = _wireObject != null && _wireObject.activeSelf;
+            _directionalTsdfSavedResultObjectActive =
+                _planeConstrainedZeroCrossShadowObject != null && _planeConstrainedZeroCrossShadowObject.activeSelf;
+            _directionalTsdfSavedIssueObjectActive =
+                _planeConstrainedZeroCrossIssueObject != null && _planeConstrainedZeroCrossIssueObject.activeSelf;
+            _directionalTsdfSavedPersistentRootActive =
+                _persistentResultChunkRoot != null && _persistentResultChunkRoot.activeSelf;
+            _directionalTsdfProductionVisibilityCaptured = true;
+        }
+        if (shadowOnly)
+        {
+            if (_meshObject != null) _meshObject.SetActive(false);
+            if (_wireObject != null) _wireObject.SetActive(false);
+            if (_planeConstrainedZeroCrossShadowObject != null)
+                _planeConstrainedZeroCrossShadowObject.SetActive(false);
+            if (_planeConstrainedZeroCrossIssueObject != null)
+                _planeConstrainedZeroCrossIssueObject.SetActive(false);
+            if (_persistentResultChunkRoot != null)
+                _persistentResultChunkRoot.SetActive(false);
+        }
+        else if (_directionalTsdfProductionVisibilityCaptured)
+        {
+            if (_meshObject != null) _meshObject.SetActive(_directionalTsdfSavedMeshObjectActive);
+            if (_wireObject != null) _wireObject.SetActive(_directionalTsdfSavedWireObjectActive);
+            if (_planeConstrainedZeroCrossShadowObject != null)
+                _planeConstrainedZeroCrossShadowObject.SetActive(_directionalTsdfSavedResultObjectActive);
+            if (_planeConstrainedZeroCrossIssueObject != null)
+                _planeConstrainedZeroCrossIssueObject.SetActive(_directionalTsdfSavedIssueObjectActive);
+            if (_persistentResultChunkRoot != null)
+                _persistentResultChunkRoot.SetActive(_directionalTsdfSavedPersistentRootActive);
+            _directionalTsdfProductionVisibilityCaptured = false;
+        }
+        EnforcePromotedDirectionalFrontendVisibility();
+    }
+
+    private void EnforcePromotedDirectionalFrontendVisibility()
+    {
+        if (enableQuestRoomScanGpuProductionCandidate &&
+            _questRoomSurfaceNetsPipeline != null &&
+            _questRoomSurfaceNetsPipeline.HasRenderableSurface)
+        {
+            // The new chain becomes the sole render authority only after a GPU counter
+            // confirms real Surface Nets geometry. All legacy objects remain allocated
+            // and continue as a rollback/backend comparison, but cannot leak to camera.
+            if (_meshRenderer != null) _meshRenderer.enabled = false;
+            if (_meshObject != null) _meshObject.SetActive(false);
+            if (_wireObject != null) _wireObject.SetActive(false);
+            if (_directionalTsdfShadowObject != null) _directionalTsdfShadowObject.SetActive(false);
+            if (_directionalDmcShadowObject != null) _directionalDmcShadowObject.SetActive(false);
+            if (_incrementalPatchShadowObject != null) _incrementalPatchShadowObject.SetActive(false);
+            if (_authoritativeCyanCrackObject != null) _authoritativeCyanCrackObject.SetActive(false);
+            if (_stablePlaneShadowObject != null) _stablePlaneShadowObject.SetActive(false);
+            if (_planeConstrainedZeroCrossShadowObject != null)
+                _planeConstrainedZeroCrossShadowObject.SetActive(false);
+            if (_planeConstrainedZeroCrossIssueObject != null)
+                _planeConstrainedZeroCrossIssueObject.SetActive(false);
+            if (_persistentResultChunkRoot != null) _persistentResultChunkRoot.SetActive(false);
+            if (_referenceVolumetricObject != null) _referenceVolumetricObject.SetActive(false);
+            if (_referenceClassicBoundaryObject != null) _referenceClassicBoundaryObject.SetActive(false);
+            if (_dirtyEvidenceObject != null) _dirtyEvidenceObject.SetActive(false);
+            if (_rawDepthDebugObject != null) _rawDepthDebugObject.SetActive(false);
+            if (_holeBoundaryDiagnosticObject != null) _holeBoundaryDiagnosticObject.SetActive(false);
+            if (_diagnosticHotspotRoot != null) _diagnosticHotspotRoot.SetActive(false);
+            return;
+        }
+
+        if (!promoteDirectionalTsdfShadowFrontend || !enableDirectionalTsdfShadow ||
+            directionalTsdfShadowDisplayMode != DirectionalTsdfShadowDisplayMode.DirectionalShadowOnly)
+            return;
+
+        // Several legacy diagnostic publishers own independent refresh paths and can
+        // call SetActive(true) after the main RESULT gate.  The promoted frontend has
+        // one final render authority: all old geometry stays resident for rollback and
+        // upstream evidence, but none of its renderers may reach the camera.
+        if (_meshRenderer != null) _meshRenderer.enabled = false;
+        if (_meshObject != null) _meshObject.SetActive(false);
+        if (_wireObject != null) _wireObject.SetActive(false);
+        if (_incrementalPatchShadowObject != null) _incrementalPatchShadowObject.SetActive(false);
+        if (_authoritativeCyanCrackObject != null) _authoritativeCyanCrackObject.SetActive(false);
+        if (_stablePlaneShadowObject != null) _stablePlaneShadowObject.SetActive(false);
+        if (_planeConstrainedZeroCrossShadowObject != null)
+            _planeConstrainedZeroCrossShadowObject.SetActive(false);
+        if (_planeConstrainedZeroCrossIssueObject != null)
+            _planeConstrainedZeroCrossIssueObject.SetActive(false);
+        if (_persistentResultChunkRoot != null) _persistentResultChunkRoot.SetActive(false);
+        if (_referenceVolumetricObject != null) _referenceVolumetricObject.SetActive(false);
+        if (_referenceClassicBoundaryObject != null) _referenceClassicBoundaryObject.SetActive(false);
+        if (_dirtyEvidenceObject != null) _dirtyEvidenceObject.SetActive(false);
+        if (_rawDepthDebugObject != null) _rawDepthDebugObject.SetActive(false);
+        if (_holeBoundaryDiagnosticObject != null) _holeBoundaryDiagnosticObject.SetActive(false);
+        if (_diagnosticHotspotRoot != null) _diagnosticHotspotRoot.SetActive(false);
+
+        bool hasDirectionalGeometry = _directionalTsdfShadowMesh != null &&
+                                      _directionalTsdfShadowMesh.vertexCount > 0;
+        bool hasDmcGeometry = _directionalDmcShadowMesh != null &&
+                              _directionalDmcShadowMesh.vertexCount > 0;
+        bool showDmc = showDirectionalDmcShadowWire && hasDmcGeometry;
+        if (_directionalTsdfShadowObject != null)
+            _directionalTsdfShadowObject.SetActive(
+                hasDirectionalGeometry &&
+                !(showDmc && isolateDirectionalDmcShadowWire));
+        if (_directionalDmcShadowObject != null)
+            _directionalDmcShadowObject.SetActive(showDmc);
+    }
+
     private void RefreshOutputDisplayLayerView()
     {
         // Only the lightweight wire presentation is rebuilt from the already finalized
@@ -4720,6 +7115,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         showStablePlaneShadowWire = false;
         showPlaneConstrainedZeroCrossIssueOverlay = false;
         showPlaneConstrainedHeldOverlay = false;
+        if (promoteDirectionalTsdfShadowFrontend && enableDirectionalTsdfShadow)
+        {
+            directionalTsdfShadowDisplayMode =
+                DirectionalTsdfShadowDisplayMode.DirectionalShadowOnly;
+            enableDirectionalTsdfShadowDisplayCycleInput = false;
+        }
     }
 
     private void ApplyOutputDisplayLayerVisibility()
@@ -4779,6 +7180,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _planeConstrainedZeroCrossIssueObject.SetActive(
                 showPlaneConstrainedZeroCrossIssueOverlay && showIssues && hasIssueMesh);
         }
+        // Legacy result publishers refresh their own active state in this method.
+        // Reassert the promoted directional foreground last so none of those refreshes
+        // can leak yellow/green geometry back into the six-direction presentation.
+        ApplyDirectionalTsdfShadowDisplayMode();
     }
 
     private static void ReplaceOutputDisplayLineIndices(List<int> destination, List<int> source)
@@ -4948,8 +7353,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void OnDisable()
     {
-        if (_confidenceAuditRows != null)
+        _questRoomGpuStreamingStopRequested = true;
+        if (_captureRoutine != null)
+            StopCoroutine(_captureRoutine);
+        if (LastCaptureBatchUsedQuestRoomGpuStreaming &&
+            !_questRoomGpuStreamingSessionFinalized)
+            FinalizeQuestRoomGpuStreamingSession("component_disabled");
+        else if (_confidenceAuditRows != null)
             EndConfidenceAuditCapture(_confidenceAuditIntegratedFrames, "component disabled");
+        rawDepthSource?.SetSnapshotGridExternalControlActive(false);
         _captureRoutine = null;
         _activeCaptureBatchTargetFrames = 0;
         _activeCaptureBatchIntegratedFrames = 0;
@@ -4959,7 +7371,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void OnDestroy()
     {
-        if (_confidenceAuditRows != null)
+        _questRoomGpuStreamingStopRequested = true;
+        if (LastCaptureBatchUsedQuestRoomGpuStreaming &&
+            !_questRoomGpuStreamingSessionFinalized)
+            FinalizeQuestRoomGpuStreamingSession("component_destroyed");
+        else if (_confidenceAuditRows != null)
             EndConfidenceAuditCapture(_confidenceAuditIntegratedFrames, "component destroyed");
         if (_mesh != null)
             Destroy(_mesh);
@@ -4989,6 +7405,27 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Destroy(_incrementalPatchShadowMaterial);
         if (_incrementalPatchShadowObject != null)
             Destroy(_incrementalPatchShadowObject);
+        if (_directionalTsdfShadowMesh != null)
+            Destroy(_directionalTsdfShadowMesh);
+        if (_directionalTsdfShadowStagingMesh != null &&
+            _directionalTsdfShadowStagingMesh != _directionalTsdfShadowMesh)
+            Destroy(_directionalTsdfShadowStagingMesh);
+        for (int i = 0; i < _directionalTsdfShadowMaterials.Length; i++)
+        {
+            if (_directionalTsdfShadowMaterials[i] != null)
+                Destroy(_directionalTsdfShadowMaterials[i]);
+        }
+        if (_directionalTsdfShadowObject != null)
+            Destroy(_directionalTsdfShadowObject);
+        if (_directionalDmcShadowMesh != null)
+            Destroy(_directionalDmcShadowMesh);
+        if (_directionalDmcShadowStagingMesh != null &&
+            _directionalDmcShadowStagingMesh != _directionalDmcShadowMesh)
+            Destroy(_directionalDmcShadowStagingMesh);
+        if (_directionalDmcShadowMaterial != null)
+            Destroy(_directionalDmcShadowMaterial);
+        if (_directionalDmcShadowObject != null)
+            Destroy(_directionalDmcShadowObject);
         if (_authoritativeCyanCrackMesh != null)
             Destroy(_authoritativeCyanCrackMesh);
         for (int i = 0; i < _authoritativeCyanCrackMaterials.Length; i++)
@@ -5055,6 +7492,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private void LateUpdate()
     {
         HandleOutputDisplayLayerCycleInput();
+        HandleDirectionalTsdfShadowDisplayCycleInput();
+        // B is intentionally not consumed by the mesh display pipeline. The
+        // production system-room-mesh exporter owns that input exclusively.
+        EnforcePromotedDirectionalFrontendVisibility();
         UpdateDiagnosticHud();
     }
 
@@ -5076,11 +7517,30 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ResolveRefs();
         if (_captureRoutine != null)
         {
-            if (debugLog)
+            if (IsQuestRoomGpuStreamingActive &&
+                stopQuestRoomGpuStreamingOnRepeatedTrigger)
+            {
+                _questRoomGpuStreamingStopRequested = true;
+                if (debugLog)
+                    Debug.Log("[ScanCoverTsdfSingleShellPrototype] QuestRoom GPU streaming stop requested.", this);
+            }
+            else if (debugLog)
+            {
                 Debug.Log("[ScanCoverTsdfSingleShellPrototype] Capture batch already active; repeated trigger ignored.", this);
+            }
             return;
         }
-        _captureRoutine = StartCoroutine(CaptureRawSnapshotAndIntegrateRoutine());
+
+        bool useStreamingProduction =
+            useQuestRoomGpuStreamingProduction &&
+            enableQuestRoomScanGpuProductionCandidate &&
+            !useLegacyCpuFusionDiagnosticBatch;
+        LastCaptureBatchUsedQuestRoomGpuStreaming = useStreamingProduction;
+        _questRoomGpuStreamingStopRequested = false;
+        _captureRoutine = StartCoroutine(
+            useStreamingProduction
+                ? CaptureQuestRoomGpuStreamingRoutine()
+                : CaptureRawSnapshotAndIntegrateRoutine());
     }
 
     [ContextMenu("Integrate Latest Raw Snapshot")]
@@ -5104,20 +7564,42 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     {
         if (_captureRoutine != null)
         {
+            _questRoomGpuStreamingStopRequested = true;
+            if (LastCaptureBatchUsedQuestRoomGpuStreaming &&
+                !_questRoomGpuStreamingSessionFinalized)
+                FinalizeQuestRoomGpuStreamingSession("cleared");
             StopCoroutine(_captureRoutine);
             _captureRoutine = null;
         }
+
+        _questRoomSurfaceNetsPipeline?.ClearAll();
 
         QueueFastFusionShadowClear();
 
         _volumeInitialized = false;
         _tsdf = null;
         _weights = null;
+        _directionalTsdfShadow.Clear();
+        _lastDirectionalTsdfShadowMeshResult = null;
+        if (_directionalTsdfShadowMesh != null)
+            _directionalTsdfShadowMesh.Clear();
+        if (_directionalTsdfShadowStagingMesh != null)
+            _directionalTsdfShadowStagingMesh.Clear();
+        if (_directionalDmcShadowMesh != null)
+            _directionalDmcShadowMesh.Clear();
+        if (_directionalDmcShadowStagingMesh != null)
+            _directionalDmcShadowStagingMesh.Clear();
         _referenceClassicTsdf.Clear();
         _incrementalPatchShadow.Clear();
         _incrementalTsdfSurfaceDirtyTracker.Clear();
         _authoritativeTsdfBlocks.Clear();
+        _authoritativeSemanticReuseBaselineByBlock.Clear();
+        _dependencyBoundarySignHysteresisShadowByBlock.Clear();
+        _dependencyBoundarySignHysteresisObservationsByBlock.Clear();
+        _dependencyBoundaryTemporalFreeSpaceByBlock.Clear();
         _persistentResultLedgerByBlock.Clear();
+        _persistentFinalizedResultLedgerByBlock.Clear();
+        _persistentResultMissingStreakByBlock.Clear();
         ClearPersistentResultChunks(false);
         _confirmedComplexLeasesByBlock.Clear();
         _claimedConfirmedComplexLeaseKeys.Clear();
@@ -5130,6 +7612,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _authoritativeCyanNearPlaneProbation.Clear();
         _authoritativeCyanPlaneSupportTiles.Clear();
         _authoritativeCyanPlaneDirectSupportCells.Clear();
+        _observedFloorFillSignaturesByBlock.Clear();
         _authoritativeCyanPlaneSupportFrames.Clear();
         ResetAuthoritativeCyanLocalSupportDiagnostics();
         _authoritativeReadTsdf = null;
@@ -5154,6 +7637,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (_authoritativeCyanCrackObject != null)
             _authoritativeCyanCrackObject.SetActive(false);
         _stablePlaneRegistry.Clear();
+        _horizontalPlaneShadowRegistry.Clear();
+        _hasRetainedMatureHorizontalProductionPlane = false;
+        _retainedMatureHorizontalProductionPlane = default;
+        _retainedMatureHorizontalProductionMissingRounds = 0;
+        _retainedMatureHorizontalProductionLastSnapshot = -1;
+        _localityShadowSemanticSignatures.Clear();
+        _localityShadowRenderSignatures.Clear();
+        if (_fusionDenseStampGeneration != null)
+            System.Array.Clear(
+                _fusionDenseStampGeneration, 0, _fusionDenseStampGeneration.Length);
+        if (_fusionDenseStampSecondaryRepresentativeGeneration != null)
+            System.Array.Clear(
+                _fusionDenseStampSecondaryRepresentativeGeneration, 0,
+                _fusionDenseStampSecondaryRepresentativeGeneration.Length);
+        if (_fusionDenseStampWriteGeneration != null)
+            System.Array.Clear(
+                _fusionDenseStampWriteGeneration, 0, _fusionDenseStampWriteGeneration.Length);
+        if (_fusionDenseStampSecondaryWriteGeneration != null)
+            System.Array.Clear(
+                _fusionDenseStampSecondaryWriteGeneration, 0,
+                _fusionDenseStampSecondaryWriteGeneration.Length);
+        _fusionDenseStampCurrentGeneration = 0;
+        _fusionDenseStampTouchedVoxels.Clear();
         if (_stablePlaneShadowMesh != null)
             _stablePlaneShadowMesh.Clear();
         if (_stablePlaneShadowObject != null)
@@ -5209,6 +7715,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _surfaceChunks.Clear();
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
+        _geometryMaturityStates.Clear();
+        _geometryMaturitySecondaryStates.Clear();
+        _geometryProductionOwnerKeys = null;
+        _activeGeometryProductionContext = default;
         _voxelWriteSequence = 0;
         _holeCellLifecycles.Clear();
         _activeHoleLifecycleCells.Clear();
@@ -5338,6 +7848,28 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRejectedRobustDepthCount = 0;
         LastRobustDepthDownweightedCount = 0;
         LastRobustDepthCorrectedCount = 0;
+        LastRobustDepthCrossLayerExcludedCount = 0;
+        LastSeparatedDepthLayerRescuedCount = 0;
+        LastStrongMixedOwnershipProductionHeldCount = 0;
+        LastGeometrySecondarySlotCreatedCount = 0;
+        LastGeometrySecondarySlotMatchedCount = 0;
+        LastGeometryDistinctSurfacePreservedCount = 0;
+        LastGeometryMultiJunctionDeferredCount = 0;
+        LastGeometryFixedAngleDistinctViewCount = 0;
+        LastGeometryAdaptiveBaselineDistinctViewCount = 0;
+        LastGeometryInsufficientBaselineViewCount = 0;
+        LastGeometryTemporalMaturityAcceptedCount = 0;
+        LastGeometryTemporalReanchorAcceptedCount = 0;
+        LastGeometryTemporalStreakResetCount = 0;
+        LastGeometryProductionPrepassPreservedCount = 0;
+        LastGeometryProductionSecondarySurfaceWriteCount = 0;
+        LastGeometryProductionUnresolvedHeldCount = 0;
+        LastGeometryProductionCanonicalDirectionalRoutedCount = 0;
+        LastGeometryProductionOwnerBootstrapCount = 0;
+        LastGeometryProductionOwnerMatchedCount = 0;
+        LastGeometryProductionOwnerPreservedCount = 0;
+        LastGeometryProductionOwnerSwitchedCount = 0;
+        LastLocalReanchorCrossLayerExcludedCount = 0;
         LastRejectedDepthEdgeErosionCount = 0;
         LastDepthEdgeDownweightedCount = 0;
         LastGrazingPlaneCheckedSampleCount = 0;
@@ -5376,6 +7908,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ResetExtractionDiagnostics();
         IntegratedFrameCount = 0;
         LastRawFrameIndex = -1;
+        LastCaptureBatchUsedQuestRoomGpuStreaming = false;
+        LastQuestRoomGpuStreamingRawFrameCount = 0;
+        LastQuestRoomGpuStreamingStereoPairCount = 0;
+        LastQuestRoomGpuStreamingRejectedFrameCount = 0;
+        LastQuestRoomGpuStreamingDispatchMilliseconds = 0f;
+        LastQuestRoomGpuStreamingMaxDispatchMilliseconds = 0f;
+        _questRoomGpuStreamingStopRequested = false;
+        _questRoomGpuStreamingCaptureOpen = false;
+        _questRoomGpuStreamingSessionFinalized = true;
+        _questRoomGpuStreamingSessionRawFrames = 0;
+        _questRoomGpuStreamingSessionStereoPairs = 0;
+        _questRoomGpuStreamingSessionRejectedFrames = 0;
+        _questRoomGpuStreamingSessionTimeouts = 0;
+        _questRoomGpuStreamingSessionDispatchMilliseconds = 0f;
+        _questRoomGpuStreamingSessionMaxDispatchMilliseconds = 0f;
         LastCaptureBatchTargetFrames = 0;
         LastCaptureBatchIntegratedFrames = 0;
         LastCaptureBatchUniqueRawFrames = 0;
@@ -5396,6 +7943,93 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastCaptureBatchBudgetedFusionMaxSliceMilliseconds = 0f;
         LastCaptureBatchUniqueSurfaceVoxelWriteCount = 0;
         LastCaptureBatchMergedSurfaceVoxelWriteCount = 0;
+        LastCaptureBatchCompactedFusionSampleCount = 0;
+        LastCaptureBatchHeavyFusionSampleCount = 0;
+        LastCaptureBatchFusionPrepassMilliseconds = 0f;
+        LastCaptureBatchFusionRepresentativeBuildMilliseconds = 0f;
+        LastCaptureBatchFusionHeavyMilliseconds = 0f;
+        LastCaptureBatchFusionHeavyDecisionMilliseconds = 0f;
+        LastCaptureBatchGeometryCertificateCandidateCount = 0;
+        LastCaptureBatchGeometryCertificateCreatedCount = 0;
+        LastCaptureBatchGeometryCertificateMatureCount = 0;
+        LastCaptureBatchGeometryCertificateConflictResetCount = 0;
+        LastCaptureBatchGeometrySecondarySlotCreatedCount = 0;
+        LastCaptureBatchGeometrySecondarySlotMatchedCount = 0;
+        LastCaptureBatchGeometryDistinctSurfacePreservedCount = 0;
+        LastCaptureBatchGeometryMultiJunctionDeferredCount = 0;
+        LastCaptureBatchGeometryFixedAngleDistinctViewCount = 0;
+        LastCaptureBatchGeometryAdaptiveBaselineDistinctViewCount = 0;
+        LastCaptureBatchGeometryInsufficientBaselineViewCount = 0;
+        LastCaptureBatchGeometryTemporalMaturityAcceptedCount = 0;
+        LastCaptureBatchGeometryTemporalReanchorAcceptedCount = 0;
+        LastCaptureBatchGeometryTemporalStreakResetCount = 0;
+        LastCaptureBatchGeometryProductionPrepassPreservedCount = 0;
+        LastCaptureBatchGeometryProductionSecondarySurfaceWriteCount = 0;
+        LastCaptureBatchGeometryProductionUnresolvedHeldCount = 0;
+        LastCaptureBatchGeometryProductionCanonicalDirectionalRoutedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerBootstrapCount = 0;
+        LastCaptureBatchGeometryProductionOwnerMatchedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerPreservedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerSwitchedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathCandidateCount = 0;
+        LastCaptureBatchMatureSmoothFastPathAcceptedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathChangedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathUnsafeStateCount = 0;
+        LastCaptureBatchLocalReanchorFitCandidateCount = 0;
+        LastCaptureBatchLocalReanchorFitAcceptedCount = 0;
+        LastCaptureBatchLocalReanchorAppliedCount = 0;
+        LastCaptureBatchLocalReanchorShiftMeters = 0f;
+        LastCaptureBatchLocalReanchorCrossLayerExcludedCount = 0;
+        LastCaptureBatchRobustDepthCrossLayerExcludedCount = 0;
+        LastCaptureBatchSeparatedDepthLayerRescuedCount = 0;
+        LastCaptureBatchStrongMixedOwnershipProductionHeldCount = 0;
+        LastCaptureBatchFusionProjectiveBandMilliseconds = 0f;
+        LastCaptureBatchFusionFreeSpaceCarvingMilliseconds = 0f;
+        LastCaptureBatchFusionPrepassSampleCount = 0;
+        LastCaptureBatchFusionPrepassValidSampleCount = 0;
+        LastCaptureBatchFusionProjectiveBandCallCount = 0;
+        LastCaptureBatchFusionProjectiveDiagnosticBandCallCount = 0;
+        LastCaptureBatchFusionProjectiveBandCandidateVoxelCount = 0;
+        LastCaptureBatchFusionProjectiveBandAcceptedVoxelCount = 0;
+        LastCaptureBatchFusionFreeSpaceCarvingCallCount = 0;
+        LastCaptureBatchFusionFreeSpaceTraversedVoxelCount = 0;
+        LastCaptureBatchFusionDenseStampLookupCount = 0;
+        LastCaptureBatchFusionDenseStampMismatchCount = 0;
+        LastCaptureBatchGeometryCertificateCandidateCount = 0;
+        LastCaptureBatchGeometryCertificateCreatedCount = 0;
+        LastCaptureBatchGeometryCertificateMatureCount = 0;
+        LastCaptureBatchGeometryCertificateConflictResetCount = 0;
+        LastCaptureBatchGeometrySecondarySlotCreatedCount = 0;
+        LastCaptureBatchGeometrySecondarySlotMatchedCount = 0;
+        LastCaptureBatchGeometryDistinctSurfacePreservedCount = 0;
+        LastCaptureBatchGeometryMultiJunctionDeferredCount = 0;
+        LastCaptureBatchGeometryFixedAngleDistinctViewCount = 0;
+        LastCaptureBatchGeometryAdaptiveBaselineDistinctViewCount = 0;
+        LastCaptureBatchGeometryInsufficientBaselineViewCount = 0;
+        LastCaptureBatchGeometryTemporalMaturityAcceptedCount = 0;
+        LastCaptureBatchGeometryTemporalReanchorAcceptedCount = 0;
+        LastCaptureBatchGeometryTemporalStreakResetCount = 0;
+        LastCaptureBatchGeometryProductionPrepassPreservedCount = 0;
+        LastCaptureBatchGeometryProductionSecondarySurfaceWriteCount = 0;
+        LastCaptureBatchGeometryProductionUnresolvedHeldCount = 0;
+        LastCaptureBatchGeometryProductionCanonicalDirectionalRoutedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerBootstrapCount = 0;
+        LastCaptureBatchGeometryProductionOwnerMatchedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerPreservedCount = 0;
+        LastCaptureBatchGeometryProductionOwnerSwitchedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathCandidateCount = 0;
+        LastCaptureBatchMatureSmoothFastPathAcceptedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathChangedCount = 0;
+        LastCaptureBatchMatureSmoothFastPathUnsafeStateCount = 0;
+        LastCaptureBatchLocalReanchorFitCandidateCount = 0;
+        LastCaptureBatchLocalReanchorFitAcceptedCount = 0;
+        LastCaptureBatchLocalReanchorAppliedCount = 0;
+        LastCaptureBatchLocalReanchorShiftMeters = 0f;
+        LastCaptureBatchLocalReanchorCrossLayerExcludedCount = 0;
+        LastCaptureBatchRobustDepthCrossLayerExcludedCount = 0;
+        LastCaptureBatchSeparatedDepthLayerRescuedCount = 0;
+        LastCaptureBatchStrongMixedOwnershipProductionHeldCount = 0;
+        ResetFusionStratifiedDiagnostics();
         LastCaptureBatchComplete = false;
         CompletedCaptureBatchCount = 0;
         LastCaptureBatchTsdfGenerationStart = 0;
@@ -5405,6 +8039,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastCaptureBatchReusedAuthoritativeTsdf = false;
         LastCaptureBatchAtomicProvisionalPromotionCount = 0;
         LastCaptureBatchStrongProvisionalPromotionCount = 0;
+        LastCaptureBatchPaperQuestInputPixelCount = 0;
+        LastCaptureBatchPaperQuestAcceptedRayCount = 0;
+        LastCaptureBatchPaperQuestRangeRejectCount = 0;
+        LastCaptureBatchPaperQuestGeometryRejectCount = 0;
+        LastCaptureBatchPaperQuestMissingEyePoseCount = 0;
+        LastCaptureBatchPaperQuestIntegratedVoxelCount = 0;
+        ResetPaperSurfaceAlignmentAudit();
         LastRebaselineValid = false;
         LastRebaselineWeightedVoxelCount = 0;
         LastRebaselineWeight1VoxelCount = 0;
@@ -5466,11 +8107,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAuthoritativeBlockDependencyScheduleMilliseconds = 0f;
         LastAuthoritativeBlockExtractionMilliseconds = 0f;
         LastAuthoritativeBlockSemanticFinalizeMilliseconds = 0f;
+        LastAuthoritativePlaneConstraintApplyMilliseconds = 0f;
         LastAuthoritativeBlockCacheMergeMilliseconds = 0f;
         LastPlaneLedgerTopologyMilliseconds = 0f;
         LastPlaneLedgerIndependentAuditMilliseconds = 0f;
         LastPlaneLedgerYellowAuditMilliseconds = 0f;
         LastPlaneLedgerRelaxedAuditMilliseconds = 0f;
+        LastConfirmedComplexLeaseRebuildMilliseconds = 0f;
+        LastConfirmedComplexLeaseRebuildYieldCount = 0;
         LastPlaneLedgerClassificationMilliseconds = 0f;
         LastPlaneLedgerPresentationMilliseconds = 0f;
         LastIncrementalStablePlaneBootstrapAttempted = 0;
@@ -5548,7 +8192,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 StableBoundsDistanceMeters = incrementalTsdfDirtyBoundsMeters,
                 StableNormalDot = incrementalTsdfDirtyNormalDot,
                 MinCrossingsForNormal = incrementalTsdfDirtyMinCrossingsForNormal,
-                RetireMissingRebuilds = incrementalTsdfDirtyRetireMissingRebuilds
+                RetireMissingRebuilds = incrementalTsdfDirtyRetireMissingRebuilds,
+                BoundaryMaskConfirmRebuilds = incrementalTsdfBoundaryMaskConfirmRebuilds,
+                StabilizeBoundaryMaskChanges = stabilizeIncrementalTsdfBoundaryMaskChanges
             };
         float[] dirtyTsdf = _authoritativeReadTsdf ?? _tsdf;
         byte[] dirtyWeights = _authoritativeReadWeights ?? _weights;
@@ -5574,6 +8220,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastIncrementalTsdfDirtyChangedBlockCount = dirtyResult.ChangedBlocks;
         LastIncrementalTsdfDirtyMissingBlockCount = dirtyResult.MissingBlocks;
         LastIncrementalTsdfDirtyRetiredBlockCount = dirtyResult.RetiredBlocks;
+        LastIncrementalTsdfBoundaryMaskPendingCount =
+            dirtyResult.BoundaryMaskPendingBlocks;
+        LastIncrementalTsdfBoundaryMaskConfirmedCount =
+            dirtyResult.BoundaryMaskConfirmedBlocks;
 
         IReadOnlyDictionary<Vector3Int, ScanCoverIncrementalPatchShadow.PatchDirtyReason>
             dirtyReasons = MergeFastFusionPhaseOneDirtySchedule(
@@ -5586,20 +8236,25 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         AuthoritativeBlockRebuildState rebuildState = new AuthoritativeBlockRebuildState();
+        bool buildAuthoritativeAggregate =
+            publishesCyan || !skipAuthoritativeAggregateMeshInCurrentComposite;
         IEnumerator blockRebuildRoutine = RebuildAuthoritativeTsdfBlockShadowRoutine(
             dirtyReasons,
             patchVoxels,
             rebuildState,
             _activeIncrementalRebuildBudget,
-            runContinuityAuditDuringIncrementalProduction);
+            runContinuityAuditDuringIncrementalProduction,
+            buildAuthoritativeAggregate);
         while (blockRebuildRoutine.MoveNext())
             yield return blockRebuildRoutine.Current;
         bool rebuilt = rebuildState.Result;
         List<Vector3> vertices = rebuildState.Vertices;
         List<int> triangles = rebuildState.Triangles;
         List<Color> colors = rebuildState.Colors;
-        if (!rebuilt || vertices == null || triangles == null ||
-            vertices.Count < 3 || triangles.Count < 3)
+        if (!rebuilt ||
+            (publishesCyan &&
+             (vertices == null || triangles == null ||
+              vertices.Count < 3 || triangles.Count < 3)))
         {
             LastCaptureBatchIncrementalProductionVerdict = "block_rebuild_empty_or_failed";
             yield break;
@@ -5978,6 +8633,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             planeConstrainedPatchVertices ?? vertices,
             analysisTriangles,
             colors);
+        RebuildDirectionalTsdfShadowDisplay();
 
         if (ShouldKeepDisplayedMesh(previousTriangleCount, vertices, triangles.Count / 3))
         {
@@ -6025,6 +8681,108 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
 
         return vertices.Count > 0;
+    }
+
+    private void RebuildDirectionalTsdfShadowDisplay()
+    {
+        EnsureDirectionalTsdfShadowObjects();
+        if (!enableDirectionalTsdfShadow || !_volumeInitialized)
+        {
+            _lastDirectionalTsdfShadowMeshResult = null;
+            if (_directionalTsdfShadowMesh != null)
+                _directionalTsdfShadowMesh.Clear();
+            if (_directionalTsdfShadowStagingMesh != null)
+                _directionalTsdfShadowStagingMesh.Clear();
+            if (_directionalDmcShadowMesh != null)
+                _directionalDmcShadowMesh.Clear();
+            if (_directionalDmcShadowStagingMesh != null)
+                _directionalDmcShadowStagingMesh.Clear();
+            ApplyDirectionalTsdfShadowDisplayMode();
+            return;
+        }
+
+        _directionalTsdfShadow.Configure(
+            _dimX, _dimY, _dimZ, _volumeOriginWorld,
+            voxelSizeMeters, truncationMeters,
+            enablePaperQuestInputContractShadow
+                ? paperQuestInputMaximumWeight
+                : maxFusionWeight,
+            directionalTsdfShadowBlockVoxels,
+            enableCanonicalSixDirectionTsdfFusion,
+            enableDirectionalTsdfRefinementProbe,
+            enableDirectionalTsdfHalfVoxelShadow);
+        ScanCoverDirectionalTsdfShadow.MeshResult result =
+            enableDirectionalTsdfComposedExtraction
+                ? _directionalTsdfShadow.BuildComposedMesh(
+                    enablePaperQuestInputContractShadow
+                        ? paperQuestInputMinimumExtractionWeight
+                        : directionalTsdfShadowMinimumExtractionWeight,
+                    directionalTsdfShadowMaximumTriangles,
+                    directionalTsdfShadowMaximumScannedCells,
+                    directionalTsdfCompositionMinimumGradientDot,
+                    directionalTsdfCompositionParallelNormalDot,
+                    directionalTsdfCompositionEdgeMergeVoxelRatio,
+                    enableDirectionalTsdfSurfaceContinuity,
+                    enableDirectionalTsdfSurfaceGapBridging,
+                    directionalTsdfSurfaceLinkNormalDot,
+                    directionalTsdfSurfaceLinkPlaneOffsetVoxelRatio)
+                : _directionalTsdfShadow.BuildMesh(
+                    enablePaperQuestInputContractShadow
+                        ? paperQuestInputMinimumExtractionWeight
+                        : directionalTsdfShadowMinimumExtractionWeight,
+                    directionalTsdfShadowMaximumTriangles,
+                    directionalTsdfShadowMaximumScannedCells);
+        _lastDirectionalTsdfShadowMeshResult = result;
+
+        // Build into an invisible mesh and swap only after every submesh is ready.
+        // Clearing the currently rendered mesh made the whole room blink at each
+        // batch boundary and let legacy publishers show through for one frame.
+        Mesh completedMesh = _directionalTsdfShadowStagingMesh;
+        completedMesh.Clear();
+        completedMesh.indexFormat =
+            result.Vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        completedMesh.SetVertices(result.Vertices);
+        completedMesh.subMeshCount = ScanCoverDirectionalTsdfShadow.DirectionCount;
+        for (int direction = 0; direction < ScanCoverDirectionalTsdfShadow.DirectionCount; direction++)
+        {
+            completedMesh.SetIndices(
+                result.LinesByDirection[direction], MeshTopology.Lines, direction, false);
+        }
+        completedMesh.RecalculateBounds();
+        Mesh previousMesh = _directionalTsdfShadowMesh;
+        _directionalTsdfShadowMesh = completedMesh;
+        _directionalTsdfShadowStagingMesh = previousMesh;
+        _directionalTsdfShadowMeshFilter.sharedMesh = _directionalTsdfShadowMesh;
+
+        Mesh completedDmcMesh = _directionalDmcShadowStagingMesh;
+        completedDmcMesh.Clear();
+        bool useHermiteQefShadow =
+            showHermiteQefFeatureShadowWire &&
+            result.HermiteQefShadowEnabled &&
+            result.HermiteQefProductionEligible &&
+            result.HermiteQefShadowVertices.Count > 0 &&
+            result.HermiteQefShadowLines.Count > 0;
+        List<Vector3> displayedDmcVertices =
+            useHermiteQefShadow
+                ? result.HermiteQefShadowVertices
+                : result.DmcShadowVertices;
+        List<int> displayedDmcLines =
+            useHermiteQefShadow
+                ? result.HermiteQefShadowLines
+                : result.DmcShadowLines;
+        completedDmcMesh.indexFormat =
+            displayedDmcVertices.Count > 65535
+                ? IndexFormat.UInt32
+                : IndexFormat.UInt16;
+        completedDmcMesh.SetVertices(displayedDmcVertices);
+        completedDmcMesh.SetIndices(
+            displayedDmcLines, MeshTopology.Lines, 0, false);
+        completedDmcMesh.RecalculateBounds();
+        Mesh previousDmcMesh = _directionalDmcShadowMesh;
+        _directionalDmcShadowMesh = completedDmcMesh;
+        _directionalDmcShadowStagingMesh = previousDmcMesh;
+        _directionalDmcShadowMeshFilter.sharedMesh = _directionalDmcShadowMesh;
+        ApplyDirectionalTsdfShadowDisplayMode();
     }
 
     private void CommitPendingStableQuadDisplayHistory()
@@ -7553,10 +10311,658 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             Mathf.FloorToInt(local.z));
     }
 
+    private void BeginCompactBatchContextCapture()
+    {
+        _compactBatchContext.Reset(
+            Time.realtimeSinceStartupAsDouble,
+            _lastCompactBatchEndRealtimeSeconds);
+    }
+
+    private void ResetFusionStratifiedDiagnostics()
+    {
+        System.Array.Clear(_fusionStratumHeavySamples, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumHeavyTotalMilliseconds, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumBandCalls, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumDiagnosticBandCalls, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumBandCandidateVoxels, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumBandAcceptedVoxels, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumBandMilliseconds, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumCarvingCalls, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumCarvingTraversedVoxels, 0, FusionStratumCount);
+        System.Array.Clear(_fusionStratumCarvingMilliseconds, 0, FusionStratumCount);
+        _activeFusionDiagnosticStratum = -1;
+    }
+
+    private static int FusionDistanceBin(float depthMeters)
+    {
+        if (depthMeters < 1f) return 0;
+        if (depthMeters < 2f) return 1;
+        if (depthMeters < 3f) return 2;
+        if (depthMeters < 5f) return 3;
+        return 4;
+    }
+
+    private static int FusionAngleBin(float absoluteViewFacing)
+    {
+        // cos(40 deg) and cos(70 deg); avoids an Acos for every heavy sample.
+        if (absoluteViewFacing >= 0.7660444f) return 0;
+        if (absoluteViewFacing >= 0.3420201f) return 1;
+        return 2;
+    }
+
+    private static int FusionStructureBin(DepthOwnershipShadowEvidence evidence)
+    {
+        int layerNeighbors =
+            evidence.CloserLayerNeighbors + evidence.FartherLayerNeighbors;
+        bool bidirectionalLayers =
+            evidence.CloserLayerNeighbors > 0 && evidence.FartherLayerNeighbors > 0;
+        bool wideDepthJunction = evidence.DiscontinuityThresholdMeters > 0f &&
+            evidence.DepthSpanMeters > evidence.DiscontinuityThresholdMeters * 2.5f;
+        bool crease = evidence.NormalDiscontinuityNeighbors >= 2 &&
+            evidence.MaximumNormalDisagreement >= 0.12f;
+        if (bidirectionalLayers || (wideDepthJunction && crease))
+            return 3;
+        if (layerNeighbors > 0 ||
+            evidence.MaximumDepthDeltaMeters > evidence.DiscontinuityThresholdMeters)
+            return 1;
+        if (crease)
+            return 2;
+        return 0;
+    }
+
+    private static int FusionStratumIndex(
+        int distanceBin,
+        int angleBin,
+        int structureBin)
+    {
+        return (distanceBin * FusionAngleBinCount + angleBin) *
+               FusionStructureBinCount + structureBin;
+    }
+
+    private void BeginFusionStratifiedHeavySample(
+        float depthMeters,
+        float absoluteViewFacing,
+        DepthOwnershipShadowEvidence evidence)
+    {
+        if (!_collectBudgetedFusionPhaseDiagnostics)
+        {
+            _activeFusionDiagnosticStratum = -1;
+            return;
+        }
+        _activeFusionDiagnosticStratum = FusionStratumIndex(
+            FusionDistanceBin(depthMeters),
+            FusionAngleBin(Mathf.Clamp01(absoluteViewFacing)),
+            FusionStructureBin(evidence));
+        _fusionStratumHeavySamples[_activeFusionDiagnosticStratum]++;
+    }
+
+    private void EndFusionStratifiedHeavySample(long startTimestamp)
+    {
+        int stratum = _activeFusionDiagnosticStratum;
+        if (stratum >= 0 && stratum < FusionStratumCount && startTimestamp != 0L)
+        {
+            _fusionStratumHeavyTotalMilliseconds[stratum] +=
+                (System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp) *
+                1000d / System.Diagnostics.Stopwatch.Frequency;
+        }
+        _activeFusionDiagnosticStratum = -1;
+    }
+
+    private void AppendFusionStratifiedDiagnostics(StringBuilder summary)
+    {
+        summary.AppendLine(
+            "fusion_stratum_schema=distance,angle,structure,heavy_samples,heavy_total_ms," +
+            "decision_exclusive_ms,band_calls,diagnostic_band_calls,band_candidate_voxels," +
+            "band_accepted_voxels,band_ms,carve_calls,carve_traversed_voxels,carve_ms");
+        summary.AppendLine(
+            "fusion_stratum_thresholds=distance:<1/1-2/2-3/3-5/5+m;" +
+            "angle:<40/40-70/70+deg;structure:smooth/depth_boundary/crease/mixed_junction");
+        for (int distance = 0; distance < FusionDistanceBinCount; distance++)
+        for (int angle = 0; angle < FusionAngleBinCount; angle++)
+        for (int structure = 0; structure < FusionStructureBinCount; structure++)
+        {
+            int stratum = FusionStratumIndex(distance, angle, structure);
+            if (_fusionStratumHeavySamples[stratum] <= 0 &&
+                _fusionStratumBandCalls[stratum] <= 0 &&
+                _fusionStratumCarvingCalls[stratum] <= 0)
+                continue;
+            double decisionExclusiveMilliseconds = System.Math.Max(
+                0d,
+                _fusionStratumHeavyTotalMilliseconds[stratum] -
+                _fusionStratumBandMilliseconds[stratum] -
+                _fusionStratumCarvingMilliseconds[stratum]);
+            summary.Append("fusion_stratum_")
+                .Append(FusionDistanceBinLabels[distance]).Append('_')
+                .Append(FusionAngleBinLabels[angle]).Append('_')
+                .Append(FusionStructureBinLabels[structure]).Append('=')
+                .Append(_fusionStratumHeavySamples[stratum]).Append(',')
+                .Append(_fusionStratumHeavyTotalMilliseconds[stratum].ToString(
+                    "F3", CultureInfo.InvariantCulture)).Append(',')
+                .Append(decisionExclusiveMilliseconds.ToString(
+                    "F3", CultureInfo.InvariantCulture)).Append(',')
+                .Append(_fusionStratumBandCalls[stratum]).Append(',')
+                .Append(_fusionStratumDiagnosticBandCalls[stratum]).Append(',')
+                .Append(_fusionStratumBandCandidateVoxels[stratum]).Append(',')
+                .Append(_fusionStratumBandAcceptedVoxels[stratum]).Append(',')
+                .Append(_fusionStratumBandMilliseconds[stratum].ToString(
+                    "F3", CultureInfo.InvariantCulture)).Append(',')
+                .Append(_fusionStratumCarvingCalls[stratum]).Append(',')
+                .Append(_fusionStratumCarvingTraversedVoxels[stratum]).Append(',')
+                .AppendLine(_fusionStratumCarvingMilliseconds[stratum].ToString(
+                    "F3", CultureInfo.InvariantCulture));
+        }
+    }
+
+    private void ObserveCompactBatchSnapshot(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        if (!_compactBatchContext.Active || snapshot == null ||
+            snapshot.worldPositions == null || snapshot.resolutionWidth <= 0 ||
+            snapshot.resolutionHeight <= 0)
+            return;
+
+        CompactBatchContext context = _compactBatchContext;
+        context.SnapshotCount++;
+        Vector3 cameraPosition = snapshot.hasSnapshotCameraPose
+            ? snapshot.snapshotCameraPosition
+            : GetCameraPosition();
+        Quaternion cameraRotation = snapshot.hasSnapshotCameraPose
+            ? snapshot.snapshotCameraRotation
+            : (Camera.main != null ? Camera.main.transform.rotation : Quaternion.identity);
+        if (!context.HasPose)
+        {
+            context.HasPose = true;
+            context.FirstPosePosition = cameraPosition;
+            context.FirstPoseRotation = cameraRotation;
+            context.LastPosePosition = cameraPosition;
+            context.LastPoseRotation = cameraRotation;
+        }
+        else
+        {
+            context.PoseTravelMeters += Vector3.Distance(
+                context.LastPosePosition, cameraPosition);
+            context.PoseRotationDegrees += Quaternion.Angle(
+                context.LastPoseRotation, cameraRotation);
+            context.LastPosePosition = cameraPosition;
+            context.LastPoseRotation = cameraRotation;
+        }
+        context.MaximumTranslationFromStartMeters = Mathf.Max(
+            context.MaximumTranslationFromStartMeters,
+            Vector3.Distance(context.FirstPosePosition, cameraPosition));
+        context.MaximumRotationFromStartDegrees = Mathf.Max(
+            context.MaximumRotationFromStartDegrees,
+            Quaternion.Angle(context.FirstPoseRotation, cameraRotation));
+
+        int width = snapshot.resolutionWidth;
+        int height = snapshot.resolutionHeight;
+        int expected = Mathf.Min(width * height, snapshot.worldPositions.Length);
+        int stride = Mathf.Max(2, batchContextDepthSampleStridePixels);
+        int borderX = Mathf.Max(1, Mathf.RoundToInt(width *
+            Mathf.Clamp(observationFovBorderFraction, 0.02f, 0.20f)));
+        int borderY = Mathf.Max(1, Mathf.RoundToInt(height *
+            Mathf.Clamp(observationFovBorderFraction, 0.02f, 0.20f)));
+        float histogramMaximumDepth = Mathf.Max(0.5f, maxDepthMeters);
+        for (int y = 0; y < height; y += stride)
+        for (int x = 0; x < width; x += stride)
+        {
+            int index = y * width + x;
+            if (index < 0 || index >= expected)
+                continue;
+            context.SampledPixelCount++;
+            Vector3 point = snapshot.worldPositions[index];
+            if (!Finite(point))
+            {
+                context.InvalidDepthCount++;
+                continue;
+            }
+            float depth = Vector3.Distance(cameraPosition, point);
+            if (depth < minDepthMeters || depth > maxDepthMeters)
+            {
+                context.InvalidDepthCount++;
+                continue;
+            }
+            context.ValidDepthCount++;
+            int bin = Mathf.Clamp(
+                Mathf.FloorToInt(depth / histogramMaximumDepth *
+                    CompactBatchContext.DepthHistogramBins),
+                0, CompactBatchContext.DepthHistogramBins - 1);
+            context.DepthHistogram[bin]++;
+            if (x < borderX || x >= width - borderX ||
+                y < borderY || y >= height - borderY)
+                context.FovBorderValidCount++;
+            if (snapshot.observationMeta != null &&
+                index < snapshot.observationMeta.Length)
+            {
+                context.ConfidenceSum += Mathf.Clamp01(
+                    snapshot.observationMeta[index].g);
+                context.ConfidenceCount++;
+            }
+            if (!context.HasExtent)
+            {
+                context.HasExtent = true;
+                context.ExtentMin = point;
+                context.ExtentMax = point;
+            }
+            else
+            {
+                context.ExtentMin = Vector3.Min(context.ExtentMin, point);
+                context.ExtentMax = Vector3.Max(context.ExtentMax, point);
+            }
+        }
+    }
+
+    private void AccumulateCompactBatchFrameOutcome()
+    {
+        if (!_compactBatchContext.Active)
+            return;
+        _compactBatchContext.InputSamples += LastInputSampleCount;
+        _compactBatchContext.IntegratedSamples += LastIntegratedSampleCount;
+        _compactBatchContext.RejectedInvalid += LastRejectedInvalidPositionCount;
+        _compactBatchContext.RejectedDepthRange += LastRejectedDepthRangeCount;
+        _compactBatchContext.RejectedDepthDiscontinuity += LastRejectedDepthDiscontinuityCount;
+        _compactBatchContext.RejectedRobust += LastRejectedRobustDepthCount;
+        _compactBatchContext.RejectedSupport += LastRejectedTsdfDepthSupportCount;
+        _compactBatchContext.RejectedConfidence += LastRejectedConfidenceCount;
+        _compactBatchContext.RejectedOutside += LastRejectedOutsideVolumeCount;
+    }
+
+    private float CompactBatchDepthPercentile(float percentile)
+    {
+        int total = 0;
+        for (int i = 0; i < _compactBatchContext.DepthHistogram.Length; i++)
+            total += _compactBatchContext.DepthHistogram[i];
+        if (total <= 0)
+            return -1f;
+        int target = Mathf.Clamp(Mathf.CeilToInt(total * Mathf.Clamp01(percentile)), 1, total);
+        int cumulative = 0;
+        for (int i = 0; i < _compactBatchContext.DepthHistogram.Length; i++)
+        {
+            cumulative += _compactBatchContext.DepthHistogram[i];
+            if (cumulative >= target)
+                return (i + 0.5f) / CompactBatchContext.DepthHistogramBins *
+                       Mathf.Max(0.5f, maxDepthMeters);
+        }
+        return Mathf.Max(0.5f, maxDepthMeters);
+    }
+
+    private void AppendCompactBatchContextSummary(StringBuilder summary)
+    {
+        CompactBatchContext context = _compactBatchContext;
+        Vector3 extent = context.HasExtent
+            ? context.ExtentMax - context.ExtentMin
+            : Vector3.zero;
+        summary.AppendLine("batch_context_schema=1");
+        summary.AppendLine("batch_context_snapshot_count=" + context.SnapshotCount);
+        summary.AppendLine("batch_context_interval_s=" + AuditFloat((float)context.PreviousBatchIntervalSeconds));
+        summary.AppendLine("batch_context_pose_travel_m=" + AuditFloat(context.PoseTravelMeters));
+        summary.AppendLine("batch_context_pose_rotation_deg=" + AuditFloat(context.PoseRotationDegrees));
+        summary.AppendLine("batch_context_pose_max_translation_m=" + AuditFloat(context.MaximumTranslationFromStartMeters));
+        summary.AppendLine("batch_context_pose_max_rotation_deg=" + AuditFloat(context.MaximumRotationFromStartDegrees));
+        summary.AppendLine("batch_context_depth_p10_m=" + AuditFloat(CompactBatchDepthPercentile(0.10f)));
+        summary.AppendLine("batch_context_depth_p50_m=" + AuditFloat(CompactBatchDepthPercentile(0.50f)));
+        summary.AppendLine("batch_context_depth_p90_m=" + AuditFloat(CompactBatchDepthPercentile(0.90f)));
+        summary.AppendLine("batch_context_valid_ratio=" + AuditFloat(
+            context.SampledPixelCount > 0
+                ? (float)context.ValidDepthCount / context.SampledPixelCount : 0f));
+        summary.AppendLine("batch_context_mean_confidence=" + AuditFloat(
+            context.ConfidenceCount > 0
+                ? context.ConfidenceSum / context.ConfidenceCount : -1f));
+        summary.AppendLine("batch_context_fov_border_valid_ratio=" + AuditFloat(
+            context.ValidDepthCount > 0
+                ? (float)context.FovBorderValidCount / context.ValidDepthCount : 0f));
+        summary.AppendLine("batch_context_extent_xyz_m=" +
+            AuditFloat(extent.x) + "," + AuditFloat(extent.y) + "," + AuditFloat(extent.z));
+        summary.AppendLine("batch_context_extent_diagonal_m=" + AuditFloat(extent.magnitude));
+        summary.AppendLine("ownership_shadow_enabled=" +
+            (enableUnifiedObservationSemanticsShadow ? 1 : 0));
+        summary.AppendLine("ownership_shadow_candidates=" + context.OwnershipCandidates);
+        summary.AppendLine("ownership_shadow_production_depth_rejected=" +
+            context.OwnershipProductionDepthRejected);
+        summary.AppendLine("ownership_shadow_passed_depth_gate=" +
+            context.OwnershipPassedDepthGate);
+        summary.AppendLine("ownership_shadow_near_far_mixed=" +
+            context.OwnershipNearSideCandidates + "," +
+            context.OwnershipFarSideCandidates + "," +
+            context.OwnershipMixedCandidates);
+        summary.AppendLine("ownership_shadow_would_hold_writes=" +
+            context.OwnershipWouldHoldWrites);
+        summary.AppendLine("ownership_shadow_strong_ambiguous_writes=" +
+            context.OwnershipStrongRiskWrites + "," +
+            context.OwnershipAmbiguousWrites);
+        summary.AppendLine("ownership_shadow_fov_border_low_confidence_writes=" +
+            context.OwnershipFovBorderWrites + "," +
+            context.OwnershipLowConfidenceWrites);
+        summary.AppendLine("ownership_shadow_temporal_stable_unstable_writes=" +
+            context.OwnershipTemporalStableWrites + "," +
+            context.OwnershipTemporalUnstableWrites);
+    }
+
+    private void WriteCompactBatchContextCsv(int integratedFrames, string status)
+    {
+        if (!_compactBatchContext.Active)
+            return;
+        double endRealtime = Time.realtimeSinceStartupAsDouble;
+        try
+        {
+            if (!writeCompactBatchContextCsv)
+                return;
+            string directory = ResolveConfidenceAuditDirectory();
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, "batch_context.csv");
+            bool writeHeader = !File.Exists(path) || new FileInfo(path).Length == 0;
+            Vector3 extent = _compactBatchContext.HasExtent
+                ? _compactBatchContext.ExtentMax - _compactBatchContext.ExtentMin
+                : Vector3.zero;
+            using (StreamWriter writer = new StreamWriter(
+                       path, true, new UTF8Encoding(false), 4096))
+            {
+                if (writeHeader)
+                {
+                    writer.WriteLine(
+                        "schema,capture,round,status,start_realtime_s,duration_s,interval_s,target_frames,integrated_frames,raw_frames,timeouts," +
+                        "pose_start_x,pose_start_y,pose_start_z,pose_end_x,pose_end_y,pose_end_z,pose_travel_m,pose_rotation_deg,pose_max_translation_m,pose_max_rotation_deg," +
+                        "sampled_pixels,valid_depth,invalid_depth,valid_ratio,depth_p10_m,depth_p50_m,depth_p90_m,mean_confidence,fov_border_valid_ratio,extent_x_m,extent_y_m,extent_z_m,extent_diagonal_m," +
+                        "input_samples,integrated_samples,reject_invalid,reject_range,reject_depth_edge,reject_robust,reject_support,reject_confidence,reject_outside,unique_writes,merged_writes,dirty_blocks,dependency_candidates,rebuild_blocks," +
+                        "integration_compute_ms,integration_wall_ms,integration_max_slice_ms,rebuild_compute_ms,rebuild_wall_ms,rebuild_max_slice_ms,semantic_ms,publish_ms," +
+                        "ownership_candidates,ownership_depth_rejected,ownership_passed_depth,ownership_near_side,ownership_far_side,ownership_mixed,ownership_would_hold_writes,ownership_strong_risk_writes,ownership_ambiguous_writes,ownership_fov_border_writes,ownership_low_confidence_writes,ownership_temporal_stable_writes,ownership_temporal_unstable_writes,mean_temporal_depth_delta_m,mean_view_facing,mesh_competing_layer_edges,mesh_ambiguous_rays");
+                }
+                CompactBatchContext context = _compactBatchContext;
+                float validRatio = context.SampledPixelCount > 0
+                    ? (float)context.ValidDepthCount / context.SampledPixelCount : 0f;
+                float borderRatio = context.ValidDepthCount > 0
+                    ? (float)context.FovBorderValidCount / context.ValidDepthCount : 0f;
+                float confidenceMean = context.ConfidenceCount > 0
+                    ? context.ConfidenceSum / context.ConfidenceCount : -1f;
+                float temporalMean = context.TemporalDepthDeltaCount > 0
+                    ? context.TemporalDepthDeltaSum / context.TemporalDepthDeltaCount : -1f;
+                float facingMean = context.ViewFacingCount > 0
+                    ? context.ViewFacingSum / context.ViewFacingCount : -1f;
+                writer.WriteLine(string.Join(",", new string[]
+                {
+                    "1", _surfaceDiagnosticCaptureIndex.ToString(AuditCulture),
+                    CompletedCaptureBatchCount.ToString(AuditCulture), status,
+                    context.StartRealtimeSeconds.ToString("0.######", AuditCulture),
+                    (endRealtime - context.StartRealtimeSeconds).ToString("0.######", AuditCulture),
+                    context.PreviousBatchIntervalSeconds.ToString("0.######", AuditCulture),
+                    LastCaptureBatchTargetFrames.ToString(AuditCulture), integratedFrames.ToString(AuditCulture),
+                    LastCaptureBatchUniqueRawFrames.ToString(AuditCulture), LastCaptureBatchTimeoutCount.ToString(AuditCulture),
+                    AuditFloat(context.FirstPosePosition.x), AuditFloat(context.FirstPosePosition.y), AuditFloat(context.FirstPosePosition.z),
+                    AuditFloat(context.LastPosePosition.x), AuditFloat(context.LastPosePosition.y), AuditFloat(context.LastPosePosition.z),
+                    AuditFloat(context.PoseTravelMeters), AuditFloat(context.PoseRotationDegrees),
+                    AuditFloat(context.MaximumTranslationFromStartMeters), AuditFloat(context.MaximumRotationFromStartDegrees),
+                    context.SampledPixelCount.ToString(AuditCulture), context.ValidDepthCount.ToString(AuditCulture),
+                    context.InvalidDepthCount.ToString(AuditCulture), AuditFloat(validRatio),
+                    AuditFloat(CompactBatchDepthPercentile(0.10f)), AuditFloat(CompactBatchDepthPercentile(0.50f)),
+                    AuditFloat(CompactBatchDepthPercentile(0.90f)), AuditFloat(confidenceMean), AuditFloat(borderRatio),
+                    AuditFloat(extent.x), AuditFloat(extent.y), AuditFloat(extent.z), AuditFloat(extent.magnitude),
+                    context.InputSamples.ToString(AuditCulture), context.IntegratedSamples.ToString(AuditCulture),
+                    context.RejectedInvalid.ToString(AuditCulture), context.RejectedDepthRange.ToString(AuditCulture),
+                    context.RejectedDepthDiscontinuity.ToString(AuditCulture), context.RejectedRobust.ToString(AuditCulture),
+                    context.RejectedSupport.ToString(AuditCulture), context.RejectedConfidence.ToString(AuditCulture),
+                    context.RejectedOutside.ToString(AuditCulture), LastCaptureBatchUniqueSurfaceVoxelWriteCount.ToString(AuditCulture),
+                    LastCaptureBatchMergedSurfaceVoxelWriteCount.ToString(AuditCulture), LastIncrementalTsdfDirtyBlockCount.ToString(AuditCulture),
+                    LastAuthoritativeBlockDependencyCandidateCount.ToString(AuditCulture), LastAuthoritativeBlockRebuiltCount.ToString(AuditCulture),
+                    AuditFloat(LastCaptureBatchIntegrationMilliseconds), AuditFloat(LastCaptureBatchBudgetedFusionWallMilliseconds),
+                    AuditFloat(LastCaptureBatchBudgetedFusionMaxSliceMilliseconds), AuditFloat(LastCaptureBatchMeshRebuildMilliseconds),
+                    AuditFloat(LastCaptureBatchMeshRebuildWallMilliseconds), AuditFloat(LastCaptureBatchBudgetedRebuildMaxSliceMilliseconds),
+                    AuditFloat(LastAuthoritativeBlockSemanticFinalizeMilliseconds), AuditFloat(LastPersistentResultChunkPublishMilliseconds),
+                    context.OwnershipCandidates.ToString(AuditCulture), context.OwnershipProductionDepthRejected.ToString(AuditCulture),
+                    context.OwnershipPassedDepthGate.ToString(AuditCulture), context.OwnershipNearSideCandidates.ToString(AuditCulture),
+                    context.OwnershipFarSideCandidates.ToString(AuditCulture), context.OwnershipMixedCandidates.ToString(AuditCulture),
+                    context.OwnershipWouldHoldWrites.ToString(AuditCulture), context.OwnershipStrongRiskWrites.ToString(AuditCulture),
+                    context.OwnershipAmbiguousWrites.ToString(AuditCulture), context.OwnershipFovBorderWrites.ToString(AuditCulture),
+                    context.OwnershipLowConfidenceWrites.ToString(AuditCulture), context.OwnershipTemporalStableWrites.ToString(AuditCulture),
+                    context.OwnershipTemporalUnstableWrites.ToString(AuditCulture), AuditFloat(temporalMean), AuditFloat(facingMean),
+                    LastStableQuadAuditCompetingLayerEdgeCount.ToString(AuditCulture), _lastLayerAmbiguousRayCount.ToString(AuditCulture)
+                }));
+            }
+        }
+        catch (System.Exception error)
+        {
+            Debug.LogWarning(
+                $"[ScanCover] Compact batch context could not be written: {error.Message}",
+                this);
+        }
+        finally
+        {
+            _lastCompactBatchEndRealtimeSeconds = endRealtime;
+            _compactBatchContext.Active = false;
+        }
+    }
+
+    private bool SubmitAcceptedSnapshotToQuestRoomGpu(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        if (!enableQuestRoomScanGpuProductionCandidate ||
+            snapshot == null ||
+            snapshot.worldPositions == null ||
+            snapshot.worldPositions.Length <= 0)
+            return false;
+
+        EnsureQuestRoomSurfaceNetsPipeline();
+        if (_questRoomSurfaceNetsPipeline == null)
+            return false;
+
+        int stereoPairsBefore = _questRoomSurfaceNetsPipeline.StereoPairIntegrationCount;
+        _questRoomSurfaceNetsPipeline.OnAcceptedDepthFrame(snapshot.frameIndex, snapshot);
+        return _questRoomSurfaceNetsPipeline.StereoPairIntegrationCount > stereoPairsBefore;
+    }
+
+    private bool RefreshAndSubmitBoundStereoFrameToQuestRoomGpu()
+    {
+        EnsureQuestRoomSurfaceNetsPipeline();
+        if (_questRoomSurfaceNetsPipeline == null ||
+            questRoomAcceptedLeftDepthSource == null ||
+            questRoomAcceptedRightDepthSource == null)
+            return false;
+
+        // The production preprocessor normally runs at execution order -45. Reuse that
+        // exact dispatch when it already ran this render frame; otherwise refresh it once.
+        bool rightReadyThisFrame =
+            questRoomAcceptedRightDepthSource.IsReady &&
+            questRoomAcceptedRightDepthSource.LastSuccessfulRefreshFrame == Time.frameCount;
+        if (!rightReadyThisFrame)
+            rightReadyThisFrame = questRoomAcceptedRightDepthSource.RefreshNow();
+
+        bool leftReadyThisFrame = rightReadyThisFrame &&
+                                  _questRoomSurfaceNetsPipeline
+                                      .PrepareAcceptedStereoCompanionFrame();
+        if (!rightReadyThisFrame || !leftReadyThisFrame)
+            return false;
+
+        int stereoPairsBefore =
+            _questRoomSurfaceNetsPipeline.StereoPairIntegrationCount;
+        _questRoomGpuStreamingSubmissionOrdinal++;
+        _questRoomSurfaceNetsPipeline.OnAcceptedDepthFrame(
+            _questRoomGpuStreamingSubmissionOrdinal,
+            null);
+        return _questRoomSurfaceNetsPipeline.StereoPairIntegrationCount >
+               stereoPairsBefore;
+    }
+
+    private IEnumerator CaptureQuestRoomGpuStreamingRoutine()
+    {
+        ResolveRefs();
+        EnsureObjects();
+        EnsureQuestRoomSurfaceNetsPipeline();
+
+        LastCaptureBatchUsedQuestRoomGpuStreaming = true;
+        _questRoomGpuStreamingStopRequested = false;
+        _questRoomGpuStreamingSessionFinalized = false;
+        _questRoomGpuStreamingSessionRawFrames = 0;
+        _questRoomGpuStreamingSessionStereoPairs = 0;
+        _questRoomGpuStreamingSessionRejectedFrames = 0;
+        _questRoomGpuStreamingSessionTimeouts = 0;
+        _questRoomGpuStreamingSessionDispatchMilliseconds = 0f;
+        _questRoomGpuStreamingSessionMaxDispatchMilliseconds = 0f;
+        _activeCaptureBatchTargetFrames = 0;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
+        LastCaptureBatchTargetFrames = 0;
+        LastCaptureBatchIntegratedFrames = 0;
+        LastCaptureBatchUniqueRawFrames = 0;
+        LastCaptureBatchTimeoutCount = 0;
+        LastCaptureBatchMeshRebuildCount = 0;
+        LastCaptureBatchMeshRebuildMilliseconds = 0f;
+        LastCaptureBatchMeshRebuildWallMilliseconds = 0f;
+        LastCaptureBatchBudgetedRebuildYieldCount = 0;
+        LastCaptureBatchBudgetedRebuildMaxSliceMilliseconds = 0f;
+        LastCaptureBatchMeshRebuildSettleFrames = 0;
+        LastCaptureBatchUsedIncrementalProductionRebuild = false;
+        LastCaptureBatchIncrementalProductionFallback = false;
+        LastCaptureBatchIncrementalProductionVerdict =
+            "questroom_gpu_streaming_no_legacy_rebuild";
+        LastCaptureBatchIntegrationMilliseconds = 0f;
+        LastCaptureBatchMaxFrameIntegrationMilliseconds = 0f;
+        LastCaptureBatchBudgetedFusionYieldCount = 0;
+        LastCaptureBatchBudgetedFusionWallMilliseconds = 0f;
+        LastCaptureBatchBudgetedFusionMaxSliceMilliseconds = 0f;
+        LastCaptureBatchComplete = false;
+        LastQuestRoomGpuStreamingRawFrameCount = 0;
+        LastQuestRoomGpuStreamingStereoPairCount = 0;
+        LastQuestRoomGpuStreamingRejectedFrameCount = 0;
+        LastQuestRoomGpuStreamingDispatchMilliseconds = 0f;
+        LastQuestRoomGpuStreamingMaxDispatchMilliseconds = 0f;
+
+        if (writeQuestRoomGpuStreamingSummaryOnStop)
+        {
+            BeginConfidenceAuditCapture();
+            _questRoomGpuStreamingCaptureOpen = true;
+        }
+        else
+        {
+            _questRoomGpuStreamingCaptureOpen = false;
+        }
+
+        if (rawDepthSource == null)
+        {
+            Warn("Raw depth source is missing.");
+            FinalizeQuestRoomGpuStreamingSession("raw_depth_source_missing");
+            _captureRoutine = null;
+            yield break;
+        }
+
+        rawDepthSource.enabled = true;
+        // Production consumes the already-bound GPU textures directly. Disable the old
+        // point-cloud readback pump so five full GPU->CPU readbacks are not performed for
+        // frames that no longer enter the CPU fusion chain.
+        rawDepthSource.SetSnapshotGridExternalControlActive(true);
+        SuppressSourcePreview();
+
+        while (isActiveAndEnabled && !_questRoomGpuStreamingStopRequested)
+        {
+            _questRoomGpuStreamingSessionRawFrames++;
+            double dispatchStart = Time.realtimeSinceStartupAsDouble;
+            bool acceptedStereoPair =
+                RefreshAndSubmitBoundStereoFrameToQuestRoomGpu();
+            float dispatchMilliseconds = (float)(
+                (Time.realtimeSinceStartupAsDouble - dispatchStart) * 1000d);
+            _questRoomGpuStreamingSessionDispatchMilliseconds +=
+                dispatchMilliseconds;
+            _questRoomGpuStreamingSessionMaxDispatchMilliseconds = Mathf.Max(
+                _questRoomGpuStreamingSessionMaxDispatchMilliseconds,
+                dispatchMilliseconds);
+
+            if (acceptedStereoPair)
+            {
+                _questRoomGpuStreamingSessionStereoPairs++;
+                LastRawFrameIndex = _questRoomGpuStreamingSubmissionOrdinal;
+            }
+            else
+            {
+                _questRoomGpuStreamingSessionRejectedFrames++;
+                _questRoomGpuStreamingSessionTimeouts++;
+            }
+
+            _activeCaptureBatchIntegratedFrames =
+                _questRoomGpuStreamingSessionStereoPairs;
+            _activeCaptureBatchUniqueRawFrames =
+                _questRoomGpuStreamingSessionRawFrames;
+            _activeCaptureBatchTimeouts =
+                _questRoomGpuStreamingSessionTimeouts;
+            _nextHudRefresh = 0f;
+
+            // The GPU extraction is already submitted above. This yield advances one
+            // render frame; there is no CPU readback, fusion batch, or batch-end rebuild.
+            yield return null;
+        }
+
+        FinalizeQuestRoomGpuStreamingSession(
+            _questRoomGpuStreamingStopRequested
+                ? "streaming_stopped_by_trigger"
+                : "streaming_stopped_by_lifecycle");
+        _captureRoutine = null;
+        _activeCaptureBatchTargetFrames = 0;
+        _activeCaptureBatchIntegratedFrames = 0;
+        _activeCaptureBatchUniqueRawFrames = 0;
+        _activeCaptureBatchTimeouts = 0;
+    }
+
+    private void FinalizeQuestRoomGpuStreamingSession(string status)
+    {
+        if (_questRoomGpuStreamingSessionFinalized)
+            return;
+        _questRoomGpuStreamingSessionFinalized = true;
+
+        LastCaptureBatchTargetFrames = 0;
+        LastCaptureBatchIntegratedFrames =
+            _questRoomGpuStreamingSessionStereoPairs;
+        LastCaptureBatchUniqueRawFrames =
+            _questRoomGpuStreamingSessionRawFrames;
+        LastCaptureBatchTimeoutCount =
+            _questRoomGpuStreamingSessionTimeouts;
+        LastCaptureBatchComplete =
+            _questRoomGpuStreamingSessionStereoPairs > 0;
+        LastCaptureBatchMeshRebuildCount = 0;
+        LastCaptureBatchIntegrationMilliseconds =
+            _questRoomGpuStreamingSessionDispatchMilliseconds;
+        LastCaptureBatchMaxFrameIntegrationMilliseconds =
+            _questRoomGpuStreamingSessionMaxDispatchMilliseconds;
+        LastCaptureBatchIncrementalProductionVerdict =
+            "questroom_gpu_streaming_no_legacy_rebuild";
+        LastQuestRoomGpuStreamingRawFrameCount =
+            _questRoomGpuStreamingSessionRawFrames;
+        LastQuestRoomGpuStreamingStereoPairCount =
+            _questRoomGpuStreamingSessionStereoPairs;
+        LastQuestRoomGpuStreamingRejectedFrameCount =
+            _questRoomGpuStreamingSessionRejectedFrames;
+        LastQuestRoomGpuStreamingDispatchMilliseconds =
+            _questRoomGpuStreamingSessionDispatchMilliseconds;
+        LastQuestRoomGpuStreamingMaxDispatchMilliseconds =
+            _questRoomGpuStreamingSessionMaxDispatchMilliseconds;
+
+        if (LastCaptureBatchComplete)
+            CompletedCaptureBatchCount++;
+
+        if (_questRoomGpuStreamingCaptureOpen)
+        {
+            EndConfidenceAuditCapture(
+                _questRoomGpuStreamingSessionStereoPairs,
+                status);
+            _questRoomGpuStreamingCaptureOpen = false;
+        }
+
+        if (debugLog)
+        {
+            Debug.Log(
+                $"[ScanCoverTsdfSingleShellPrototype] QuestRoom GPU stream stopped: " +
+                $"pairs={_questRoomGpuStreamingSessionStereoPairs} " +
+                $"raw={_questRoomGpuStreamingSessionRawFrames} " +
+                $"rejected={_questRoomGpuStreamingSessionRejectedFrames} " +
+                $"timeouts={_questRoomGpuStreamingSessionTimeouts} " +
+                $"dispatchMs={_questRoomGpuStreamingSessionDispatchMilliseconds:F1} " +
+                $"maxDispatchMs={_questRoomGpuStreamingSessionMaxDispatchMilliseconds:F1} " +
+                $"legacyRebuilds=0 status={status}",
+                this);
+        }
+    }
+
     private IEnumerator CaptureRawSnapshotAndIntegrateRoutine()
     {
         ResolveRefs();
         EnsureObjects();
+        rawDepthSource?.SetSnapshotGridExternalControlActive(false);
         BeginConfidenceAuditCapture();
 
         bool fixedFrameBatch = useFixedIntegratedFrameBatch;
@@ -7589,6 +10995,25 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastCaptureBatchBudgetedFusionMaxSliceMilliseconds = 0f;
         LastCaptureBatchUniqueSurfaceVoxelWriteCount = 0;
         LastCaptureBatchMergedSurfaceVoxelWriteCount = 0;
+        LastCaptureBatchCompactedFusionSampleCount = 0;
+        LastCaptureBatchHeavyFusionSampleCount = 0;
+        LastCaptureBatchFusionPrepassMilliseconds = 0f;
+        LastCaptureBatchFusionRepresentativeBuildMilliseconds = 0f;
+        LastCaptureBatchFusionHeavyMilliseconds = 0f;
+        LastCaptureBatchFusionHeavyDecisionMilliseconds = 0f;
+        LastCaptureBatchFusionProjectiveBandMilliseconds = 0f;
+        LastCaptureBatchFusionFreeSpaceCarvingMilliseconds = 0f;
+        LastCaptureBatchFusionPrepassSampleCount = 0;
+        LastCaptureBatchFusionPrepassValidSampleCount = 0;
+        LastCaptureBatchFusionProjectiveBandCallCount = 0;
+        LastCaptureBatchFusionProjectiveDiagnosticBandCallCount = 0;
+        LastCaptureBatchFusionProjectiveBandCandidateVoxelCount = 0;
+        LastCaptureBatchFusionProjectiveBandAcceptedVoxelCount = 0;
+        LastCaptureBatchFusionFreeSpaceCarvingCallCount = 0;
+        LastCaptureBatchFusionFreeSpaceTraversedVoxelCount = 0;
+        LastCaptureBatchFusionDenseStampLookupCount = 0;
+        LastCaptureBatchFusionDenseStampMismatchCount = 0;
+        ResetFusionStratifiedDiagnostics();
         LastCaptureBatchComplete = false;
         LastCaptureBatchAtomicProvisionalPromotionCount = 0;
         LastCaptureBatchStrongProvisionalPromotionCount = 0;
@@ -7607,6 +11032,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             _volumeInitialized && LastCaptureBatchWeightedVoxelsStart > 0;
         BeginFrameConvergenceDiagnostics(targetFrames, LastCaptureBatchWeightedVoxelsStart);
         BeginFastFusionShadowBatch();
+        _directionalTsdfShadow.BeginBatch();
 
         if (rawDepthSource == null)
         {
@@ -7634,7 +11060,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 break;
 
             if (forceRawRefreshOnSnapshot && !rawDepthSource.HasPendingReadback)
-                rawDepthSource.RefreshNow(forcePreprocessorRefresh: true);
+            {
+                bool productionEyeRefreshed =
+                    rawDepthSource.RefreshNow(forcePreprocessorRefresh: true);
+                if (productionEyeRefreshed)
+                    PrepareQuestRoomAcceptedStereoCompanionFrame();
+            }
 
             float frameStart = Time.unscaledTime;
             bool integratedThisFrame = false;
@@ -7650,6 +11081,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     consumedUniqueFrame = true;
                     uniqueRawFrames++;
                     int attemptOrdinal = uniqueRawFrames;
+                    ObserveCompactBatchSnapshot(ready);
                     double integrationWallStart = Time.realtimeSinceStartupAsDouble;
                     IEnumerator integrationRoutine = IntegrateSnapshotBudgetedRoutine(ready, true);
                     while (integrationRoutine.MoveNext())
@@ -7669,6 +11101,79 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         LastBudgetedFusionMaxSliceMilliseconds);
                     LastCaptureBatchUniqueSurfaceVoxelWriteCount += LastBudgetedFusionUniqueSurfaceVoxelWriteCount;
                     LastCaptureBatchMergedSurfaceVoxelWriteCount += LastBudgetedFusionMergedSurfaceVoxelWriteCount;
+                    LastCaptureBatchCompactedFusionSampleCount += LastBudgetedFusionCompactedSampleCount;
+                    LastCaptureBatchHeavyFusionSampleCount += LastBudgetedFusionHeavySampleCount;
+                    LastCaptureBatchFusionPrepassMilliseconds +=
+                        LastBudgetedFusionPrepassMilliseconds;
+                    LastCaptureBatchFusionRepresentativeBuildMilliseconds +=
+                        LastBudgetedFusionRepresentativeBuildMilliseconds;
+                    LastCaptureBatchFusionHeavyMilliseconds +=
+                        LastBudgetedFusionHeavyMilliseconds;
+                    LastCaptureBatchFusionHeavyDecisionMilliseconds +=
+                        LastBudgetedFusionHeavyDecisionMilliseconds;
+                    LastCaptureBatchGeometryCertificateCandidateCount += LastGeometryCertificateCandidateCount;
+                    LastCaptureBatchGeometryCertificateCreatedCount += LastGeometryCertificateCreatedCount;
+                    LastCaptureBatchGeometryCertificateMatureCount += LastGeometryCertificateMatureCount;
+                    LastCaptureBatchGeometryCertificateConflictResetCount += LastGeometryCertificateConflictResetCount;
+                    LastCaptureBatchGeometrySecondarySlotCreatedCount += LastGeometrySecondarySlotCreatedCount;
+                    LastCaptureBatchGeometrySecondarySlotMatchedCount += LastGeometrySecondarySlotMatchedCount;
+                    LastCaptureBatchGeometryDistinctSurfacePreservedCount += LastGeometryDistinctSurfacePreservedCount;
+                    LastCaptureBatchGeometryMultiJunctionDeferredCount += LastGeometryMultiJunctionDeferredCount;
+                    LastCaptureBatchGeometryFixedAngleDistinctViewCount += LastGeometryFixedAngleDistinctViewCount;
+                    LastCaptureBatchGeometryAdaptiveBaselineDistinctViewCount += LastGeometryAdaptiveBaselineDistinctViewCount;
+                    LastCaptureBatchGeometryInsufficientBaselineViewCount += LastGeometryInsufficientBaselineViewCount;
+                    LastCaptureBatchGeometryTemporalMaturityAcceptedCount += LastGeometryTemporalMaturityAcceptedCount;
+                    LastCaptureBatchGeometryTemporalReanchorAcceptedCount += LastGeometryTemporalReanchorAcceptedCount;
+                    LastCaptureBatchGeometryTemporalStreakResetCount += LastGeometryTemporalStreakResetCount;
+                    LastCaptureBatchGeometryProductionPrepassPreservedCount += LastGeometryProductionPrepassPreservedCount;
+                    LastCaptureBatchGeometryProductionSecondarySurfaceWriteCount += LastGeometryProductionSecondarySurfaceWriteCount;
+                    LastCaptureBatchGeometryProductionUnresolvedHeldCount += LastGeometryProductionUnresolvedHeldCount;
+                    LastCaptureBatchGeometryProductionCanonicalDirectionalRoutedCount +=
+                        LastGeometryProductionCanonicalDirectionalRoutedCount;
+                    LastCaptureBatchGeometryProductionOwnerBootstrapCount += LastGeometryProductionOwnerBootstrapCount;
+                    LastCaptureBatchGeometryProductionOwnerMatchedCount += LastGeometryProductionOwnerMatchedCount;
+                    LastCaptureBatchGeometryProductionOwnerPreservedCount += LastGeometryProductionOwnerPreservedCount;
+                    LastCaptureBatchGeometryProductionOwnerSwitchedCount += LastGeometryProductionOwnerSwitchedCount;
+                    LastCaptureBatchMatureSmoothFastPathCandidateCount += LastMatureSmoothFastPathCandidateCount;
+                    LastCaptureBatchMatureSmoothFastPathAcceptedCount += LastMatureSmoothFastPathAcceptedCount;
+                    LastCaptureBatchMatureSmoothFastPathChangedCount += LastMatureSmoothFastPathChangedCount;
+                    LastCaptureBatchMatureSmoothFastPathUnsafeStateCount += LastMatureSmoothFastPathUnsafeStateCount;
+                    LastCaptureBatchLocalReanchorFitCandidateCount += LastLocalReanchorFitCandidateCount;
+                    LastCaptureBatchLocalReanchorFitAcceptedCount += LastLocalReanchorFitAcceptedCount;
+                    LastCaptureBatchLocalReanchorAppliedCount += LastLocalReanchorAppliedCount;
+                    LastCaptureBatchLocalReanchorShiftMeters += LastLocalReanchorShiftMeters;
+                    LastCaptureBatchLocalReanchorCrossLayerExcludedCount += LastLocalReanchorCrossLayerExcludedCount;
+                    LastCaptureBatchRobustDepthCrossLayerExcludedCount += LastRobustDepthCrossLayerExcludedCount;
+                    LastCaptureBatchSeparatedDepthLayerRescuedCount += LastSeparatedDepthLayerRescuedCount;
+                    LastCaptureBatchStrongMixedOwnershipProductionHeldCount += LastStrongMixedOwnershipProductionHeldCount;
+                    LastCaptureBatchFusionProjectiveBandMilliseconds +=
+                        LastBudgetedFusionProjectiveBandMilliseconds;
+                    LastCaptureBatchFusionFreeSpaceCarvingMilliseconds +=
+                        LastBudgetedFusionFreeSpaceCarvingMilliseconds;
+                    LastCaptureBatchFusionPrepassSampleCount +=
+                        LastBudgetedFusionPrepassSampleCount;
+                    LastCaptureBatchFusionPrepassValidSampleCount +=
+                        LastBudgetedFusionPrepassValidSampleCount;
+                    LastCaptureBatchFusionProjectiveBandCallCount +=
+                        LastBudgetedFusionProjectiveBandCallCount;
+                    LastCaptureBatchFusionProjectiveDiagnosticBandCallCount +=
+                        LastBudgetedFusionProjectiveDiagnosticBandCallCount;
+                    LastCaptureBatchFusionProjectiveBandCandidateVoxelCount +=
+                        LastBudgetedFusionProjectiveBandCandidateVoxelCount;
+                    LastCaptureBatchFusionProjectiveBandAcceptedVoxelCount +=
+                        LastBudgetedFusionProjectiveBandAcceptedVoxelCount;
+                    LastCaptureBatchFusionFreeSpaceCarvingCallCount +=
+                        LastBudgetedFusionFreeSpaceCarvingCallCount;
+                    LastCaptureBatchFusionFreeSpaceTraversedVoxelCount +=
+                        LastBudgetedFusionFreeSpaceTraversedVoxelCount;
+                    LastCaptureBatchFusionDenseStampLookupCount +=
+                        LastBudgetedFusionDenseStampLookupCount;
+                    LastCaptureBatchFusionDenseStampMismatchCount +=
+                        LastBudgetedFusionDenseStampRepresentativeMismatchCount +
+                        LastBudgetedFusionDenseStampRawHitMismatchCount +
+                        LastBudgetedFusionDenseStampScoreMismatchCount +
+                        LastBudgetedFusionDenseStampWriteMembershipMismatchCount;
+                    AccumulateCompactBatchFrameOutcome();
                     QueueFastFusionShadowFrame(
                         ready,
                         attemptOrdinal,
@@ -7770,6 +11275,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (authoritativeIncrementalFallbackToFullRebuild ||
                     !enableAuthoritativeIncrementalProductionRebuild)
                     RebuildMesh();
+            }
+            else
+            {
+                // The authoritative incremental publisher deliberately bypasses
+                // RebuildMesh().  Keep the isolated directional shadow attached to
+                // the batch boundary so both production rebuild routes produce a
+                // comparable six-direction display and the same summary counters.
+                RebuildDirectionalTsdfShadowDisplay();
             }
             LastCaptureBatchMeshRebuildWallMilliseconds =
                 (float)((Time.realtimeSinceStartupAsDouble - rebuildWallStart) * 1000.0);
@@ -8764,6 +12277,409 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastReferenceClassicMeanObservationWeight = _referenceClassicTsdf.LastMeanObservationWeight;
     }
 
+    private void IntegratePaperQuestInputContractShadow(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        if (snapshot == null ||
+            snapshot.worldPositionsRaw == null ||
+            snapshot.worldNormalsNeighbour == null ||
+            snapshot.worldNormalsNeighbourValid == null ||
+            snapshot.observationMeta == null ||
+            snapshot.resolutionWidth <= 0 || snapshot.resolutionHeight <= 0)
+        {
+            LastPaperQuestGeometryRejectCount = 1;
+            LastCaptureBatchPaperQuestGeometryRejectCount++;
+            return;
+        }
+
+        // The paper replay contract is radial from the exact observing eye.
+        // A centre-camera fallback changes both range and view-angle weights and
+        // would make the Quest shadow incomparable with the frozen offline replay.
+        if (!snapshot.hasDispatchEyePosition)
+        {
+            LastPaperQuestMissingEyePoseCount = 1;
+            LastCaptureBatchPaperQuestMissingEyePoseCount++;
+            return;
+        }
+        Vector3 eyePosition = snapshot.dispatchEyePosition;
+
+        int count = Mathf.Min(
+            snapshot.worldPositionsRaw.Length,
+            Mathf.Min(
+                snapshot.worldNormalsNeighbour.Length,
+                Mathf.Min(
+                    snapshot.worldNormalsNeighbourValid.Length,
+                    snapshot.observationMeta.Length)));
+        int expected = Mathf.Min(
+            snapshot.resolutionWidth * snapshot.resolutionHeight,
+            count);
+        if (expected <= 0)
+        {
+            LastPaperQuestGeometryRejectCount = 1;
+            LastCaptureBatchPaperQuestGeometryRejectCount++;
+            return;
+        }
+        RecordPaperQuestSnapshotProvenance(snapshot);
+
+        _directionalTsdfShadow.Configure(
+            _dimX, _dimY, _dimZ, _volumeOriginWorld,
+            voxelSizeMeters, truncationMeters,
+            paperQuestInputMaximumWeight,
+            directionalTsdfShadowBlockVoxels,
+            true,
+            enableDirectionalTsdfRefinementProbe,
+            enableDirectionalTsdfHalfVoxelShadow);
+
+        int integratedVoxelsBefore = _directionalTsdfShadow.BatchPaperIntegratedVoxels;
+        int stride = Mathf.Max(1, directionalTsdfShadowSampleStride);
+        float minimumDepth = Mathf.Max(0.01f, paperQuestInputMinimumDepthMeters);
+        float maximumDepth = Mathf.Max(minimumDepth, paperQuestInputMaximumDepthMeters);
+        int width = snapshot.resolutionWidth;
+        int height = snapshot.resolutionHeight;
+        for (int y = 0; y < height; y += stride)
+        {
+            for (int x = 0; x < width; x += stride)
+            {
+                int index = x + y * width;
+                if (index < 0 || index >= expected)
+                    continue;
+                LastPaperQuestInputPixelCount++;
+                Color observation = snapshot.observationMeta[index];
+                Vector3 point = snapshot.worldPositionsRaw[index];
+                Vector3 normal = snapshot.worldNormalsNeighbour[index];
+                bool geometryValid = observation.r >= 0.5f &&
+                    snapshot.worldNormalsNeighbourValid[index] &&
+                    Finite(point) && Finite(normal) &&
+                    normal.sqrMagnitude > 0.00000001f;
+                if (!geometryValid)
+                {
+                    LastPaperQuestGeometryRejectCount++;
+                    continue;
+                }
+
+                float depth = Vector3.Distance(eyePosition, point);
+                if (!float.IsFinite(depth) || depth < minimumDepth || depth > maximumDepth)
+                {
+                    LastPaperQuestRangeRejectCount++;
+                    continue;
+                }
+
+                if (_directionalTsdfShadow.IntegratePaperNormalRaycast(
+                        eyePosition, point, normal, minimumDepth,
+                        snapshot.frameIndex))
+                    LastPaperQuestAcceptedRayCount++;
+                else
+                    LastPaperQuestGeometryRejectCount++;
+            }
+        }
+
+        int auditStride = Mathf.Max(stride, paperSurfaceAlignmentAuditPixelStride);
+        float readbackAgeMilliseconds = snapshot.completionRealtimeSeconds >=
+                                        snapshot.dispatchRealtimeSeconds
+            ? (float)((snapshot.completionRealtimeSeconds -
+                       snapshot.dispatchRealtimeSeconds) * 1000d)
+            : -1f;
+        for (int y = 0; y < height; y += auditStride)
+        {
+            for (int x = 0; x < width; x += auditStride)
+            {
+                int index = x + y * width;
+                if (index < 0 || index >= expected)
+                    continue;
+                Color observation = snapshot.observationMeta[index];
+                Vector3 point = snapshot.worldPositionsRaw[index];
+                Vector3 normal = snapshot.worldNormalsNeighbour[index];
+                bool geometryValid = observation.r >= 0.5f &&
+                    snapshot.worldNormalsNeighbourValid[index] &&
+                    Finite(point) && Finite(normal) &&
+                    normal.sqrMagnitude > 0.00000001f;
+                if (!geometryValid)
+                    continue;
+                float depth = Vector3.Distance(eyePosition, point);
+                if (!float.IsFinite(depth) || depth < minimumDepth || depth > maximumDepth)
+                    continue;
+
+                if (_directionalTsdfShadow.TryMeasurePaperSurfaceAlignment(
+                        eyePosition, point, normal,
+                        out ScanCoverDirectionalTsdfShadow.PaperSurfaceAlignmentSample audit))
+                {
+                    RecordPaperSurfaceAlignmentAudit(
+                        audit, depth, eyePosition, point, normal,
+                        readbackAgeMilliseconds);
+                }
+                else
+                {
+                    _paperSurfaceAlignmentMissingSamples++;
+                }
+            }
+        }
+
+        LastPaperQuestIntegratedVoxelCount = Mathf.Max(
+            0,
+            _directionalTsdfShadow.BatchPaperIntegratedVoxels - integratedVoxelsBefore);
+        LastCaptureBatchPaperQuestInputPixelCount += LastPaperQuestInputPixelCount;
+        LastCaptureBatchPaperQuestAcceptedRayCount += LastPaperQuestAcceptedRayCount;
+        LastCaptureBatchPaperQuestRangeRejectCount += LastPaperQuestRangeRejectCount;
+        LastCaptureBatchPaperQuestGeometryRejectCount += LastPaperQuestGeometryRejectCount;
+        LastCaptureBatchPaperQuestMissingEyePoseCount += LastPaperQuestMissingEyePoseCount;
+        LastCaptureBatchPaperQuestIntegratedVoxelCount += LastPaperQuestIntegratedVoxelCount;
+    }
+
+    private void RecordPaperSurfaceAlignmentAudit(
+        ScanCoverDirectionalTsdfShadow.PaperSurfaceAlignmentSample audit,
+        float depth,
+        Vector3 eyePosition,
+        Vector3 surfacePoint,
+        Vector3 normal,
+        float readbackAgeMilliseconds)
+    {
+        float residual = audit.SignedResidualMeters;
+        if (!float.IsFinite(residual))
+            return;
+        float absolute = Mathf.Abs(residual);
+        _paperSurfaceAlignmentSupportedSamples++;
+        _paperSurfaceAlignmentSignedSum += residual;
+        _paperSurfaceAlignmentAbsoluteSum += absolute;
+        _paperSurfaceAlignmentSquaredSum += residual * residual;
+        _paperSurfaceAlignmentMaximumAbsolute =
+            Mathf.Max(_paperSurfaceAlignmentMaximumAbsolute, absolute);
+        _paperSurfaceAlignmentSupportVoxels += audit.SupportVoxelCount;
+        _paperSurfaceAlignmentSaturatedVoxels += audit.SaturatedVoxelCount;
+        if (_paperSurfaceAlignmentAbsoluteResiduals.Count < 131072)
+            _paperSurfaceAlignmentAbsoluteResiduals.Add(absolute);
+
+        int depthBucket = depth < 1f ? 0 : depth < 2f ? 1 : depth < 3f ? 2 : 3;
+        AddPaperSurfaceAlignmentBucket(
+            _paperSurfaceAlignmentDepthCounts,
+            _paperSurfaceAlignmentDepthAbsoluteSums,
+            depthBucket, absolute);
+
+        Vector3 towardEye = eyePosition - surfacePoint;
+        float facing = normal.sqrMagnitude > 0.00000001f &&
+                       towardEye.sqrMagnitude > 0.00000001f
+            ? Mathf.Abs(Vector3.Dot(normal.normalized, towardEye.normalized))
+            : 0f;
+        int facingBucket = facing < 0.35f ? 0 : facing < 0.70f ? 1 : 2;
+        AddPaperSurfaceAlignmentBucket(
+            _paperSurfaceAlignmentFacingCounts,
+            _paperSurfaceAlignmentFacingAbsoluteSums,
+            facingBucket, absolute);
+
+        if (audit.DominantDirection >= 0 &&
+            audit.DominantDirection < _paperSurfaceAlignmentDirectionCounts.Length)
+        {
+            AddPaperSurfaceAlignmentBucket(
+                _paperSurfaceAlignmentDirectionCounts,
+                _paperSurfaceAlignmentDirectionAbsoluteSums,
+                audit.DominantDirection, absolute);
+        }
+
+        if (readbackAgeMilliseconds >= 0f)
+        {
+            int ageBucket = readbackAgeMilliseconds <= 16f
+                ? 0
+                : readbackAgeMilliseconds <= 33f
+                    ? 1
+                    : readbackAgeMilliseconds <= 66f
+                        ? 2
+                        : 3;
+            AddPaperSurfaceAlignmentBucket(
+                _paperSurfaceAlignmentReadbackAgeCounts,
+                _paperSurfaceAlignmentReadbackAgeAbsoluteSums,
+                ageBucket, absolute);
+        }
+    }
+
+    private static void AddPaperSurfaceAlignmentBucket(
+        int[] counts,
+        double[] absoluteSums,
+        int bucket,
+        float absoluteResidual)
+    {
+        if (counts == null || absoluteSums == null || bucket < 0 ||
+            bucket >= counts.Length || bucket >= absoluteSums.Length)
+            return;
+        counts[bucket]++;
+        absoluteSums[bucket] += absoluteResidual;
+    }
+
+    private void RecordPaperQuestSnapshotProvenance(
+        ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
+    {
+        double readbackAgeMilliseconds =
+            (snapshot.completionRealtimeSeconds - snapshot.dispatchRealtimeSeconds) * 1000d;
+        if (!double.IsNaN(readbackAgeMilliseconds) &&
+            !double.IsInfinity(readbackAgeMilliseconds) &&
+            readbackAgeMilliseconds >= 0d)
+        {
+            _paperProvenanceReadbackAgeSamples++;
+            _paperProvenanceReadbackAgeMillisecondsSum += readbackAgeMilliseconds;
+            _paperProvenanceReadbackAgeMillisecondsMaximum = System.Math.Max(
+                _paperProvenanceReadbackAgeMillisecondsMaximum,
+                readbackAgeMilliseconds);
+        }
+
+        if (snapshot.hasDispatchCameraPose && snapshot.hasCompletionCameraPose)
+        {
+            double translation = Vector3.Distance(
+                snapshot.dispatchCameraPosition,
+                snapshot.completionCameraPosition);
+            double rotation = Quaternion.Angle(
+                snapshot.dispatchCameraRotation,
+                snapshot.completionCameraRotation);
+            if (!double.IsNaN(translation) && !double.IsInfinity(translation) &&
+                !double.IsNaN(rotation) && !double.IsInfinity(rotation))
+            {
+                _paperProvenanceCompletionPoseSamples++;
+                _paperProvenanceCompletionTranslationMetersSum += translation;
+                _paperProvenanceCompletionTranslationMetersMaximum = System.Math.Max(
+                    _paperProvenanceCompletionTranslationMetersMaximum,
+                    translation);
+                _paperProvenanceCompletionRotationDegreesSum += rotation;
+                _paperProvenanceCompletionRotationDegreesMaximum = System.Math.Max(
+                    _paperProvenanceCompletionRotationDegreesMaximum,
+                    rotation);
+            }
+        }
+
+        if (snapshot.hasDepthReprojectionMatrix && snapshot.hasDispatchEyePosition &&
+            TryRecoverProjectiveCameraCenter(
+                snapshot.depthReprojectionMatrix, out Vector3 depthMatrixEye))
+        {
+            double delta = Vector3.Distance(depthMatrixEye, snapshot.dispatchEyePosition);
+            if (!double.IsNaN(delta) && !double.IsInfinity(delta))
+            {
+                _paperProvenanceDepthMatrixEyeSamples++;
+                _paperProvenanceDepthMatrixEyeDeltaMetersSum += delta;
+                _paperProvenanceDepthMatrixEyeDeltaMetersMaximum = System.Math.Max(
+                    _paperProvenanceDepthMatrixEyeDeltaMetersMaximum,
+                    delta);
+                return;
+            }
+        }
+        _paperProvenanceDepthMatrixEyeMissing++;
+    }
+
+    private static bool TryRecoverProjectiveCameraCenter(
+        Matrix4x4 matrix,
+        out Vector3 cameraCenter)
+    {
+        cameraCenter = Vector3.zero;
+        float x = Determinant3x3(
+            matrix.m01, matrix.m02, matrix.m03,
+            matrix.m11, matrix.m12, matrix.m13,
+            matrix.m31, matrix.m32, matrix.m33);
+        float y = -Determinant3x3(
+            matrix.m00, matrix.m02, matrix.m03,
+            matrix.m10, matrix.m12, matrix.m13,
+            matrix.m30, matrix.m32, matrix.m33);
+        float z = Determinant3x3(
+            matrix.m00, matrix.m01, matrix.m03,
+            matrix.m10, matrix.m11, matrix.m13,
+            matrix.m30, matrix.m31, matrix.m33);
+        float w = -Determinant3x3(
+            matrix.m00, matrix.m01, matrix.m02,
+            matrix.m10, matrix.m11, matrix.m12,
+            matrix.m30, matrix.m31, matrix.m32);
+        if (!float.IsFinite(w) || Mathf.Abs(w) <= 0.00000001f)
+            return false;
+        cameraCenter = new Vector3(x / w, y / w, z / w);
+        return Finite(cameraCenter);
+    }
+
+    private static float Determinant3x3(
+        float a00, float a01, float a02,
+        float a10, float a11, float a12,
+        float a20, float a21, float a22)
+    {
+        return a00 * (a11 * a22 - a12 * a21) -
+               a01 * (a10 * a22 - a12 * a20) +
+               a02 * (a10 * a21 - a11 * a20);
+    }
+
+    private void ResetPaperSurfaceAlignmentAudit()
+    {
+        _paperSurfaceAlignmentSupportedSamples = 0;
+        _paperSurfaceAlignmentMissingSamples = 0;
+        _paperSurfaceAlignmentSignedSum = 0d;
+        _paperSurfaceAlignmentAbsoluteSum = 0d;
+        _paperSurfaceAlignmentSquaredSum = 0d;
+        _paperSurfaceAlignmentMaximumAbsolute = 0f;
+        _paperSurfaceAlignmentSupportVoxels = 0;
+        _paperSurfaceAlignmentSaturatedVoxels = 0;
+        _paperSurfaceAlignmentAbsoluteResiduals.Clear();
+        System.Array.Clear(_paperSurfaceAlignmentDepthCounts, 0,
+            _paperSurfaceAlignmentDepthCounts.Length);
+        System.Array.Clear(_paperSurfaceAlignmentDepthAbsoluteSums, 0,
+            _paperSurfaceAlignmentDepthAbsoluteSums.Length);
+        System.Array.Clear(_paperSurfaceAlignmentFacingCounts, 0,
+            _paperSurfaceAlignmentFacingCounts.Length);
+        System.Array.Clear(_paperSurfaceAlignmentFacingAbsoluteSums, 0,
+            _paperSurfaceAlignmentFacingAbsoluteSums.Length);
+        System.Array.Clear(_paperSurfaceAlignmentDirectionCounts, 0,
+            _paperSurfaceAlignmentDirectionCounts.Length);
+        System.Array.Clear(_paperSurfaceAlignmentDirectionAbsoluteSums, 0,
+            _paperSurfaceAlignmentDirectionAbsoluteSums.Length);
+        System.Array.Clear(_paperSurfaceAlignmentReadbackAgeCounts, 0,
+            _paperSurfaceAlignmentReadbackAgeCounts.Length);
+        System.Array.Clear(_paperSurfaceAlignmentReadbackAgeAbsoluteSums, 0,
+            _paperSurfaceAlignmentReadbackAgeAbsoluteSums.Length);
+        _paperProvenanceReadbackAgeSamples = 0;
+        _paperProvenanceReadbackAgeMillisecondsSum = 0d;
+        _paperProvenanceReadbackAgeMillisecondsMaximum = 0d;
+        _paperProvenanceCompletionPoseSamples = 0;
+        _paperProvenanceCompletionTranslationMetersSum = 0d;
+        _paperProvenanceCompletionTranslationMetersMaximum = 0d;
+        _paperProvenanceCompletionRotationDegreesSum = 0d;
+        _paperProvenanceCompletionRotationDegreesMaximum = 0d;
+        _paperProvenanceDepthMatrixEyeSamples = 0;
+        _paperProvenanceDepthMatrixEyeMissing = 0;
+        _paperProvenanceDepthMatrixEyeDeltaMetersSum = 0d;
+        _paperProvenanceDepthMatrixEyeDeltaMetersMaximum = 0d;
+    }
+
+    private static double PaperAuditMean(double sum, long count)
+    {
+        return count > 0 ? sum / count : 0d;
+    }
+
+    private static float PaperAuditQuantile(List<float> values, float quantile)
+    {
+        if (values == null || values.Count <= 0)
+            return 0f;
+        List<float> sorted = new List<float>(values);
+        sorted.Sort();
+        float position = Mathf.Clamp01(quantile) * (sorted.Count - 1);
+        int lower = Mathf.FloorToInt(position);
+        int upper = Mathf.Min(sorted.Count - 1, lower + 1);
+        return Mathf.Lerp(sorted[lower], sorted[upper], position - lower);
+    }
+
+    private static string FormatPaperAuditBuckets(
+        int[] counts,
+        double[] absoluteSums,
+        string[] labels)
+    {
+        StringBuilder text = new StringBuilder(128);
+        int bucketCount = Mathf.Min(
+            labels != null ? labels.Length : 0,
+            Mathf.Min(
+                counts != null ? counts.Length : 0,
+                absoluteSums != null ? absoluteSums.Length : 0));
+        for (int i = 0; i < bucketCount; i++)
+        {
+            if (i > 0)
+                text.Append('|');
+            text.Append(labels[i]);
+            text.Append(':');
+            text.Append(counts[i]);
+            text.Append(',');
+            text.Append(PaperAuditMean(absoluteSums[i], counts[i]).ToString(
+                "F6", CultureInfo.InvariantCulture));
+        }
+        return text.ToString();
+    }
+
     private bool IntegrateSnapshot(ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot snapshot)
     {
         double integrationWallStart = Time.realtimeSinceStartupAsDouble;
@@ -8774,6 +12690,275 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastBudgetedFusionWallMilliseconds =
             (float)((Time.realtimeSinceStartupAsDouble - integrationWallStart) * 1000.0);
         return _budgetedSnapshotIntegratedResult;
+    }
+
+    private void BeginFusionDenseStampFrame()
+    {
+        if ((!useFusionDenseStampProduction && !enableFusionDenseStampShadow) ||
+            _tsdf == null)
+            return;
+        int length = _tsdf.Length;
+        if (_fusionDenseStampGeneration == null ||
+            _fusionDenseStampGeneration.Length != length ||
+            _fusionDenseStampSecondaryRepresentativeGeneration == null ||
+            _fusionDenseStampSecondaryRepresentativeGeneration.Length != length)
+        {
+            _fusionDenseStampGeneration = new int[length];
+            _fusionDenseStampRepresentativeIndex = new int[length];
+            _fusionDenseStampRawHits = new int[length];
+            _fusionDenseStampRepresentativeScore = new float[length];
+            _fusionDenseStampSecondaryRepresentativeGeneration = new int[length];
+            _fusionDenseStampSecondaryRepresentativeIndex = new int[length];
+            _fusionDenseStampSecondaryRawHits = new int[length];
+            _fusionDenseStampSecondaryRepresentativeScore = new float[length];
+            _fusionDenseStampWriteGeneration = new int[length];
+            _fusionDenseStampSecondaryWriteGeneration = new int[length];
+            _fusionDenseStampCurrentGeneration = 0;
+        }
+        _fusionDenseStampTouchedVoxels.Clear();
+        if (_fusionDenseStampCurrentGeneration == int.MaxValue)
+        {
+            System.Array.Clear(
+                _fusionDenseStampGeneration, 0, _fusionDenseStampGeneration.Length);
+            System.Array.Clear(
+                _fusionDenseStampSecondaryRepresentativeGeneration, 0,
+                _fusionDenseStampSecondaryRepresentativeGeneration.Length);
+            System.Array.Clear(
+                _fusionDenseStampWriteGeneration, 0, _fusionDenseStampWriteGeneration.Length);
+            System.Array.Clear(
+                _fusionDenseStampSecondaryWriteGeneration, 0,
+                _fusionDenseStampSecondaryWriteGeneration.Length);
+            _fusionDenseStampCurrentGeneration = 0;
+        }
+        _fusionDenseStampCurrentGeneration++;
+    }
+
+    private void UpdateFusionDenseStampRepresentative(
+        int voxelIndex,
+        int sampleIndex,
+        float score)
+    {
+        if ((!useFusionDenseStampProduction && !enableFusionDenseStampShadow) ||
+            _fusionDenseStampGeneration == null ||
+            voxelIndex < 0 || voxelIndex >= _fusionDenseStampGeneration.Length)
+            return;
+        int generation = _fusionDenseStampCurrentGeneration;
+        if (_fusionDenseStampGeneration[voxelIndex] != generation)
+        {
+            bool secondaryUntouched =
+                _fusionDenseStampSecondaryRepresentativeGeneration == null ||
+                _fusionDenseStampSecondaryRepresentativeGeneration[voxelIndex] != generation;
+            _fusionDenseStampGeneration[voxelIndex] = generation;
+            _fusionDenseStampRepresentativeIndex[voxelIndex] = sampleIndex;
+            _fusionDenseStampRawHits[voxelIndex] = 1;
+            _fusionDenseStampRepresentativeScore[voxelIndex] = score;
+            if (secondaryUntouched)
+                _fusionDenseStampTouchedVoxels.Add(voxelIndex);
+            LastBudgetedFusionDenseStampRepresentativeVoxelCount++;
+            return;
+        }
+        _fusionDenseStampRawHits[voxelIndex]++;
+        if (score > _fusionDenseStampRepresentativeScore[voxelIndex])
+        {
+            _fusionDenseStampRepresentativeScore[voxelIndex] = score;
+            _fusionDenseStampRepresentativeIndex[voxelIndex] = sampleIndex;
+        }
+    }
+
+    private void UpdateFusionDenseStampSecondaryRepresentative(
+        int voxelIndex,
+        int sampleIndex,
+        float score)
+    {
+        if ((!useFusionDenseStampProduction && !enableFusionDenseStampShadow) ||
+            _fusionDenseStampSecondaryRepresentativeGeneration == null ||
+            voxelIndex < 0 ||
+            voxelIndex >= _fusionDenseStampSecondaryRepresentativeGeneration.Length)
+            return;
+        int generation = _fusionDenseStampCurrentGeneration;
+        bool primaryUntouched = _fusionDenseStampGeneration == null ||
+            _fusionDenseStampGeneration[voxelIndex] != generation;
+        if (_fusionDenseStampSecondaryRepresentativeGeneration[voxelIndex] != generation)
+        {
+            _fusionDenseStampSecondaryRepresentativeGeneration[voxelIndex] = generation;
+            _fusionDenseStampSecondaryRepresentativeIndex[voxelIndex] = sampleIndex;
+            _fusionDenseStampSecondaryRawHits[voxelIndex] = 1;
+            _fusionDenseStampSecondaryRepresentativeScore[voxelIndex] = score;
+            if (primaryUntouched)
+                _fusionDenseStampTouchedVoxels.Add(voxelIndex);
+            LastBudgetedFusionDenseStampRepresentativeVoxelCount++;
+            return;
+        }
+        _fusionDenseStampSecondaryRawHits[voxelIndex]++;
+        if (score > _fusionDenseStampSecondaryRepresentativeScore[voxelIndex])
+        {
+            _fusionDenseStampSecondaryRepresentativeScore[voxelIndex] = score;
+            _fusionDenseStampSecondaryRepresentativeIndex[voxelIndex] = sampleIndex;
+        }
+    }
+
+    private void ValidateFusionDenseStampPrepassShadow()
+    {
+        if (!enableFusionDenseStampShadow || useFusionDenseStampProduction ||
+            _fusionDenseStampGeneration == null)
+            return;
+        foreach (KeyValuePair<int, int> pair in
+                 _budgetedFusionRepresentativeBySurfaceVoxel)
+        {
+            int voxelIndex = pair.Key;
+            if (voxelIndex < 0 || voxelIndex >= _fusionDenseStampGeneration.Length ||
+                _fusionDenseStampGeneration[voxelIndex] !=
+                    _fusionDenseStampCurrentGeneration ||
+                _fusionDenseStampRepresentativeIndex[voxelIndex] != pair.Value)
+                LastBudgetedFusionDenseStampRepresentativeMismatchCount++;
+            _budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
+                voxelIndex, out int productionRawHits);
+            if (voxelIndex < 0 || voxelIndex >= _fusionDenseStampRawHits.Length ||
+                _fusionDenseStampGeneration[voxelIndex] !=
+                    _fusionDenseStampCurrentGeneration ||
+                _fusionDenseStampRawHits[voxelIndex] != productionRawHits)
+                LastBudgetedFusionDenseStampRawHitMismatchCount++;
+            _budgetedFusionRepresentativeScoreBySurfaceVoxel.TryGetValue(
+                voxelIndex, out float productionScore);
+            if (voxelIndex < 0 || voxelIndex >= _fusionDenseStampRepresentativeScore.Length ||
+                _fusionDenseStampGeneration[voxelIndex] !=
+                    _fusionDenseStampCurrentGeneration ||
+                !_fusionDenseStampRepresentativeScore[voxelIndex].Equals(productionScore))
+                LastBudgetedFusionDenseStampScoreMismatchCount++;
+        }
+        if (LastBudgetedFusionDenseStampRepresentativeVoxelCount !=
+            _budgetedFusionRepresentativeBySurfaceVoxel.Count)
+            LastBudgetedFusionDenseStampRepresentativeMismatchCount++;
+    }
+
+    private void ValidateFusionDenseStampRepresentativeLookup(int voxelIndex)
+    {
+        if (!enableFusionDenseStampShadow || useFusionDenseStampProduction ||
+            _fusionDenseStampGeneration == null)
+            return;
+        LastBudgetedFusionDenseStampLookupCount++;
+        bool productionHas = _budgetedFusionRepresentativeBySurfaceVoxel.TryGetValue(
+            voxelIndex, out int productionRepresentative);
+        bool shadowHas = voxelIndex >= 0 &&
+                         voxelIndex < _fusionDenseStampGeneration.Length &&
+                         _fusionDenseStampGeneration[voxelIndex] ==
+                            _fusionDenseStampCurrentGeneration;
+        if (productionHas != shadowHas ||
+            (productionHas && _fusionDenseStampRepresentativeIndex[voxelIndex] !=
+                productionRepresentative))
+            LastBudgetedFusionDenseStampRepresentativeMismatchCount++;
+        if (productionHas)
+        {
+            _budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
+                voxelIndex, out int productionRawHits);
+            if (_fusionDenseStampRawHits[voxelIndex] != productionRawHits)
+                LastBudgetedFusionDenseStampRawHitMismatchCount++;
+        }
+    }
+
+    private void ValidateFusionDenseStampWriteMembership(int voxelIndex)
+    {
+        if (!enableFusionDenseStampShadow || useFusionDenseStampProduction ||
+            _fusionDenseStampWriteGeneration == null)
+            return;
+        LastBudgetedFusionDenseStampLookupCount++;
+        bool productionContains = _budgetedFusionSurfaceVoxelWrites.Contains(voxelIndex);
+        bool shadowContains = voxelIndex >= 0 &&
+                              voxelIndex < _fusionDenseStampWriteGeneration.Length &&
+                              _fusionDenseStampWriteGeneration[voxelIndex] ==
+                                _fusionDenseStampCurrentGeneration;
+        if (productionContains != shadowContains)
+            LastBudgetedFusionDenseStampWriteMembershipMismatchCount++;
+    }
+
+    private bool TryGetFusionDenseStampRepresentative(
+        int voxelIndex,
+        out int representativeIndex,
+        out int rawHits)
+    {
+        representativeIndex = -1;
+        rawHits = 0;
+        LastBudgetedFusionDenseStampLookupCount++;
+        if (_fusionDenseStampGeneration == null ||
+            voxelIndex < 0 || voxelIndex >= _fusionDenseStampGeneration.Length ||
+            _fusionDenseStampGeneration[voxelIndex] != _fusionDenseStampCurrentGeneration)
+            return false;
+        representativeIndex = _fusionDenseStampRepresentativeIndex[voxelIndex];
+        rawHits = _fusionDenseStampRawHits[voxelIndex];
+        return true;
+    }
+
+    private bool TryGetFusionDenseStampRepresentative(
+        int voxelIndex,
+        bool secondarySlot,
+        out int representativeIndex,
+        out int rawHits)
+    {
+        if (!secondarySlot)
+            return TryGetFusionDenseStampRepresentative(
+                voxelIndex, out representativeIndex, out rawHits);
+        representativeIndex = -1;
+        rawHits = 0;
+        LastBudgetedFusionDenseStampLookupCount++;
+        if (_fusionDenseStampSecondaryRepresentativeGeneration == null ||
+            voxelIndex < 0 ||
+            voxelIndex >= _fusionDenseStampSecondaryRepresentativeGeneration.Length ||
+            _fusionDenseStampSecondaryRepresentativeGeneration[voxelIndex] !=
+                _fusionDenseStampCurrentGeneration)
+            return false;
+        representativeIndex = _fusionDenseStampSecondaryRepresentativeIndex[voxelIndex];
+        rawHits = _fusionDenseStampSecondaryRawHits[voxelIndex];
+        return true;
+    }
+
+    private bool HasFusionDenseStampSurfaceWrite(int voxelIndex)
+    {
+        LastBudgetedFusionDenseStampLookupCount++;
+        return _fusionDenseStampWriteGeneration != null &&
+               voxelIndex >= 0 && voxelIndex < _fusionDenseStampWriteGeneration.Length &&
+               _fusionDenseStampWriteGeneration[voxelIndex] ==
+                    _fusionDenseStampCurrentGeneration;
+    }
+
+    private bool HasFusionDenseStampSurfaceWrite(int voxelIndex, bool secondarySlot)
+    {
+        if (!secondarySlot)
+            return HasFusionDenseStampSurfaceWrite(voxelIndex);
+        LastBudgetedFusionDenseStampLookupCount++;
+        return _fusionDenseStampSecondaryWriteGeneration != null &&
+               voxelIndex >= 0 &&
+               voxelIndex < _fusionDenseStampSecondaryWriteGeneration.Length &&
+               _fusionDenseStampSecondaryWriteGeneration[voxelIndex] ==
+                   _fusionDenseStampCurrentGeneration;
+    }
+
+    private bool MarkFusionDenseStampSurfaceWrite(int voxelIndex)
+    {
+        if ((!useFusionDenseStampProduction && !enableFusionDenseStampShadow) ||
+            _fusionDenseStampWriteGeneration == null ||
+            voxelIndex < 0 || voxelIndex >= _fusionDenseStampWriteGeneration.Length)
+            return false;
+        bool firstWrite = _fusionDenseStampWriteGeneration[voxelIndex] !=
+                          _fusionDenseStampCurrentGeneration;
+        _fusionDenseStampWriteGeneration[voxelIndex] =
+            _fusionDenseStampCurrentGeneration;
+        return firstWrite;
+    }
+
+    private bool MarkFusionDenseStampSurfaceWrite(int voxelIndex, bool secondarySlot)
+    {
+        if (!secondarySlot)
+            return MarkFusionDenseStampSurfaceWrite(voxelIndex);
+        if ((!useFusionDenseStampProduction && !enableFusionDenseStampShadow) ||
+            _fusionDenseStampSecondaryWriteGeneration == null ||
+            voxelIndex < 0 ||
+            voxelIndex >= _fusionDenseStampSecondaryWriteGeneration.Length)
+            return false;
+        bool firstWrite = _fusionDenseStampSecondaryWriteGeneration[voxelIndex] !=
+                          _fusionDenseStampCurrentGeneration;
+        _fusionDenseStampSecondaryWriteGeneration[voxelIndex] =
+            _fusionDenseStampCurrentGeneration;
+        return firstWrite;
     }
 
     private IEnumerator IntegrateSnapshotBudgetedRoutine(
@@ -8787,11 +12972,37 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastBudgetedFusionMaxSliceMilliseconds = 0f;
         LastBudgetedFusionUniqueSurfaceVoxelWriteCount = 0;
         LastBudgetedFusionMergedSurfaceVoxelWriteCount = 0;
+        LastBudgetedFusionCompactedSampleCount = 0;
+        LastBudgetedFusionHeavySampleCount = 0;
+        LastBudgetedFusionPrepassMilliseconds = 0f;
+        LastBudgetedFusionRepresentativeBuildMilliseconds = 0f;
+        LastBudgetedFusionHeavyMilliseconds = 0f;
+        LastBudgetedFusionHeavyDecisionMilliseconds = 0f;
+        LastBudgetedFusionProjectiveBandMilliseconds = 0f;
+        LastBudgetedFusionFreeSpaceCarvingMilliseconds = 0f;
+        LastBudgetedFusionPrepassSampleCount = 0;
+        LastBudgetedFusionPrepassValidSampleCount = 0;
+        LastBudgetedFusionProjectiveBandCallCount = 0;
+        LastBudgetedFusionProjectiveDiagnosticBandCallCount = 0;
+        LastBudgetedFusionProjectiveBandCandidateVoxelCount = 0;
+        LastBudgetedFusionProjectiveBandAcceptedVoxelCount = 0;
+        LastBudgetedFusionFreeSpaceCarvingCallCount = 0;
+        LastBudgetedFusionFreeSpaceTraversedVoxelCount = 0;
+        LastBudgetedFusionDenseStampLookupCount = 0;
+        LastBudgetedFusionDenseStampRepresentativeVoxelCount = 0;
+        LastBudgetedFusionDenseStampRepresentativeMismatchCount = 0;
+        LastBudgetedFusionDenseStampRawHitMismatchCount = 0;
+        LastBudgetedFusionDenseStampScoreMismatchCount = 0;
+        LastBudgetedFusionDenseStampWriteMembershipMismatchCount = 0;
+        LastBudgetedFusionDenseStampEquivalent = false;
+        _collectBudgetedFusionPhaseDiagnostics = false;
         LastReferenceClassicPausedForPerformance = false;
         _budgetedFusionSurfaceVoxelWrites.Clear();
+        _budgetedFusionSecondarySurfaceVoxelWrites.Clear();
         _budgetedFusionRepresentativeBySurfaceVoxel.Clear();
         _budgetedFusionRawHitsBySurfaceVoxel.Clear();
         _budgetedFusionRepresentativeScoreBySurfaceVoxel.Clear();
+        _budgetedFusionMainSampleIndices.Clear();
         double completedComputeSeconds = 0d;
         double computeSliceStart = Time.realtimeSinceStartupAsDouble;
 
@@ -8807,7 +13018,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             yield break;
         }
 
+        // Submit the exact GPU pair associated with this accepted production snapshot
+        // before the long CPU fusion path can make those textures temporally stale.
+        if (enableQuestRoomScanGpuProductionCandidate)
+            SubmitAcceptedSnapshotToQuestRoomGpu(snapshot);
+
         EnsureVolumeInitialized();
+        BeginFusionDenseStampFrame();
         BeginFastFusionDecisionJournal(snapshot.frameIndex);
 
         Vector3 cameraPosition = GetCameraPosition();
@@ -8858,10 +13075,29 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastIntegratedSampleCount = 0;
         LastUpdatedVoxelCount = 0;
         LastNeighborFilledSampleCount = 0;
+        LastPaperQuestInputPixelCount = 0;
+        LastPaperQuestAcceptedRayCount = 0;
+        LastPaperQuestRangeRejectCount = 0;
+        LastPaperQuestGeometryRejectCount = 0;
+        LastPaperQuestMissingEyePoseCount = 0;
+        LastPaperQuestIntegratedVoxelCount = 0;
         ResetRejectCounters();
 
-        if (mergeSameFrameSurfaceVoxelWrites &&
-            selectSurfaceVoxelRepresentativeBeforeHeavyFusion)
+        if (enableDirectionalTsdfShadow && enablePaperQuestInputContractShadow)
+            IntegratePaperQuestInputContractShadow(snapshot);
+
+        bool useRepresentativePrepass =
+            mergeSameFrameSurfaceVoxelWrites &&
+            selectSurfaceVoxelRepresentativeBeforeHeavyFusion;
+        bool useDenseStampProduction =
+            useRepresentativePrepass &&
+            useFusionDenseStampProduction &&
+            _fusionDenseStampGeneration != null;
+        bool useCompactedRepresentativeIteration =
+            useRepresentativePrepass && compactFusionRepresentativeIteration;
+        double prepassComputeStartSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        if (useRepresentativePrepass)
         {
             float inverseVoxelSizeSquared =
                 1f / Mathf.Max(0.000001f, voxelSizeMeters * voxelSizeMeters);
@@ -8892,25 +13128,49 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     int preIndex = preY * width + preX;
                     if (preIndex < 0 || preIndex >= expected)
                         continue;
+                    LastBudgetedFusionPrepassSampleCount++;
                     if (!TryGetUsableSampleNoRejectCount(
                             preIndex, positions, normals, meta, cameraPosition,
                             out Vector3 representativePoint,
                             out Vector3 representativeNormal,
                             out float representativeWeight))
+                    {
+                        if (useCompactedRepresentativeIteration)
+                            _budgetedFusionMainSampleIndices.Add(preIndex);
                         continue;
+                    }
+                    LastBudgetedFusionPrepassValidSampleCount++;
                     if (!TryWorldToVoxel(
                             representativePoint,
                             out int representativeVx,
                             out int representativeVy,
                             out int representativeVz))
+                    {
+                        if (useCompactedRepresentativeIteration)
+                            _budgetedFusionMainSampleIndices.Add(preIndex);
                         continue;
+                    }
 
                     int representativeVoxelIndex =
                         Index(representativeVx, representativeVy, representativeVz);
-                    _budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
-                        representativeVoxelIndex, out int rawHits);
-                    _budgetedFusionRawHitsBySurfaceVoxel[representativeVoxelIndex] = rawHits + 1;
-
+                    bool contestedRepresentative =
+                        preserveContestedSurfaceCandidatesBeforeHeavyFusion &&
+                        GeometryVoxelHasSecondaryCertificate(representativeVoxelIndex);
+                    bool representativeSecondarySlot = false;
+                    bool resolvedRepresentativeSlot = !contestedRepresentative ||
+                        TryResolveGeometryPrepassSecondarySlot(
+                            representativeVoxelIndex,
+                            representativePoint,
+                            representativeNormal,
+                            out representativeSecondarySlot);
+                    if (contestedRepresentative)
+                        LastGeometryProductionPrepassPreservedCount++;
+                    if (contestedRepresentative && !resolvedRepresentativeSlot)
+                    {
+                        if (useCompactedRepresentativeIteration)
+                            _budgetedFusionMainSampleIndices.Add(preIndex);
+                        continue;
+                    }
                     float centerDistanceScore =
                         (representativePoint -
                          VoxelCenter(representativeVx, representativeVy, representativeVz)).sqrMagnitude *
@@ -8922,23 +13182,115 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         : 0f;
                     float representativeScore =
                         representativeWeight * 4f + facingScore - centerDistanceScore;
-                    if (!_budgetedFusionRepresentativeScoreBySurfaceVoxel.TryGetValue(
-                            representativeVoxelIndex, out float previousScore) ||
-                        representativeScore > previousScore)
+                    if (useDenseStampProduction)
                     {
-                        _budgetedFusionRepresentativeScoreBySurfaceVoxel[representativeVoxelIndex] =
-                            representativeScore;
-                        _budgetedFusionRepresentativeBySurfaceVoxel[representativeVoxelIndex] =
-                            preIndex;
+                        if (contestedRepresentative && representativeSecondarySlot)
+                            UpdateFusionDenseStampSecondaryRepresentative(
+                                representativeVoxelIndex, preIndex, representativeScore);
+                        else
+                            UpdateFusionDenseStampRepresentative(
+                                representativeVoxelIndex, preIndex, representativeScore);
+                    }
+                    else
+                    {
+                        if (contestedRepresentative && representativeSecondarySlot)
+                        {
+                            if (useCompactedRepresentativeIteration)
+                                _budgetedFusionMainSampleIndices.Add(preIndex);
+                            continue;
+                        }
+                        _budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
+                            representativeVoxelIndex, out int rawHits);
+                        _budgetedFusionRawHitsBySurfaceVoxel[representativeVoxelIndex] = rawHits + 1;
+                        if (!_budgetedFusionRepresentativeScoreBySurfaceVoxel.TryGetValue(
+                                representativeVoxelIndex, out float previousScore) ||
+                            representativeScore > previousScore)
+                        {
+                            _budgetedFusionRepresentativeScoreBySurfaceVoxel[representativeVoxelIndex] =
+                                representativeScore;
+                            _budgetedFusionRepresentativeBySurfaceVoxel[representativeVoxelIndex] =
+                                preIndex;
+                        }
+                        UpdateFusionDenseStampRepresentative(
+                            representativeVoxelIndex, preIndex, representativeScore);
                     }
                 }
             }
+            if (!useDenseStampProduction)
+                ValidateFusionDenseStampPrepassShadow();
         }
+        double prepassComputeEndSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        LastBudgetedFusionPrepassMilliseconds =
+            (float)System.Math.Max(0d, (prepassComputeEndSeconds - prepassComputeStartSeconds) * 1000d);
 
-        for (int y = 0; y < height; y += stride)
+        int sampledColumns = (width + stride - 1) / stride;
+        int sampledRows = (height + stride - 1) / stride;
+        int sampledInputCount = sampledColumns * sampledRows;
+        double representativeBuildStartSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        if (useCompactedRepresentativeIteration)
         {
-            for (int x = 0; x < width; x += stride)
+            if (useDenseStampProduction)
             {
+                for (int denseIndex = 0;
+                     denseIndex < _fusionDenseStampTouchedVoxels.Count;
+                     denseIndex++)
+                {
+                    int voxelIndex = _fusionDenseStampTouchedVoxels[denseIndex];
+                    if (_fusionDenseStampGeneration[voxelIndex] ==
+                        _fusionDenseStampCurrentGeneration)
+                        _budgetedFusionMainSampleIndices.Add(
+                            _fusionDenseStampRepresentativeIndex[voxelIndex]);
+                    if (_fusionDenseStampSecondaryRepresentativeGeneration[voxelIndex] ==
+                        _fusionDenseStampCurrentGeneration)
+                        _budgetedFusionMainSampleIndices.Add(
+                            _fusionDenseStampSecondaryRepresentativeIndex[voxelIndex]);
+                }
+            }
+            else
+            {
+                foreach (int representativeIndex in
+                         _budgetedFusionRepresentativeBySurfaceVoxel.Values)
+                    _budgetedFusionMainSampleIndices.Add(representativeIndex);
+            }
+            _budgetedFusionMainSampleIndices.Sort();
+            LastBudgetedFusionCompactedSampleCount = Mathf.Max(
+                0, sampledInputCount - _budgetedFusionMainSampleIndices.Count);
+            LastBudgetedFusionMergedSurfaceVoxelWriteCount +=
+                LastBudgetedFusionCompactedSampleCount;
+            LastInputSampleCount = sampledInputCount;
+        }
+        double representativeBuildEndSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        LastBudgetedFusionRepresentativeBuildMilliseconds =
+            (float)System.Math.Max(
+                0d,
+                (representativeBuildEndSeconds - representativeBuildStartSeconds) * 1000d);
+        int mainSampleCount = useCompactedRepresentativeIteration
+            ? _budgetedFusionMainSampleIndices.Count
+            : sampledInputCount;
+        LastBudgetedFusionHeavySampleCount = mainSampleCount;
+        double heavyComputeStartSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        _collectBudgetedFusionPhaseDiagnostics = true;
+        for (int mainSampleOrdinal = 0; mainSampleOrdinal < mainSampleCount; mainSampleOrdinal++)
+        {
+                int index;
+                int x;
+                int y;
+                if (useCompactedRepresentativeIteration)
+                {
+                    index = _budgetedFusionMainSampleIndices[mainSampleOrdinal];
+                    x = index % width;
+                    y = index / width;
+                }
+                else
+                {
+                    x = (mainSampleOrdinal % sampledColumns) * stride;
+                    y = (mainSampleOrdinal / sampledColumns) * stride;
+                    index = y * width + x;
+                }
                 if (allowYields &&
                     enableBudgetedFusionWorkQueue &&
                     workItemsInSlice > 0)
@@ -8959,11 +13311,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 }
                 workItemsInSlice++;
 
-                int index = y * width + x;
                 if (index < 0 || index >= expected)
                     continue;
 
-                LastInputSampleCount++;
+                if (!useCompactedRepresentativeIteration)
+                    LastInputSampleCount++;
                 _activeLedgerSampleIndex = index;
                 _activeLedgerPixelX = x;
                 _activeLedgerPixelY = y;
@@ -8977,8 +13329,56 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     TryWorldToVoxel(rawPoint, out int rawVx, out int rawVy, out int rawVz))
                 {
                     int rawVoxelIndex = Index(rawVx, rawVy, rawVz);
-                    if (_budgetedFusionRepresentativeBySurfaceVoxel.TryGetValue(
-                            rawVoxelIndex, out int representativeIndex))
+                    bool preserveContestedCandidate =
+                        preserveContestedSurfaceCandidatesBeforeHeavyFusion &&
+                        GeometryVoxelHasSecondaryCertificate(rawVoxelIndex);
+                    bool rawSecondarySlot = false;
+                    bool resolvedRawSlot = !preserveContestedCandidate ||
+                        TryResolveGeometryPrepassSecondarySlot(
+                            rawVoxelIndex,
+                            rawPoint,
+                            normals != null && index < normals.Length
+                                ? normals[index]
+                                : Vector3.zero,
+                            out rawSecondarySlot);
+                    int representativeIndex;
+                    int rawHits;
+                    bool hasRepresentative;
+                    if (preserveContestedCandidate && !resolvedRawSlot)
+                    {
+                        hasRepresentative = false;
+                        representativeIndex = -1;
+                        rawHits = 1;
+                    }
+                    else if (useDenseStampProduction)
+                    {
+                        hasRepresentative = TryGetFusionDenseStampRepresentative(
+                            rawVoxelIndex,
+                            preserveContestedCandidate && rawSecondarySlot,
+                            out representativeIndex,
+                            out rawHits);
+                    }
+                    else
+                    {
+                        if (preserveContestedCandidate && rawSecondarySlot)
+                        {
+                            hasRepresentative = false;
+                            representativeIndex = -1;
+                            rawHits = 1;
+                        }
+                        else
+                        {
+                            ValidateFusionDenseStampRepresentativeLookup(rawVoxelIndex);
+                            hasRepresentative =
+                                _budgetedFusionRepresentativeBySurfaceVoxel.TryGetValue(
+                                    rawVoxelIndex, out representativeIndex);
+                            rawHits = 0;
+                            if (hasRepresentative)
+                                _budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
+                                    rawVoxelIndex, out rawHits);
+                        }
+                    }
+                    if (hasRepresentative)
                     {
                         if (representativeIndex != index)
                         {
@@ -8990,9 +13390,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                                 auditThisSample);
                             continue;
                         }
-                        if (_budgetedFusionRawHitsBySurfaceVoxel.TryGetValue(
-                                rawVoxelIndex, out int rawHits))
-                            mergedRawSampleMultiplicity = Mathf.Max(1, rawHits);
+                        mergedRawSampleMultiplicity = Mathf.Max(1, rawHits);
                     }
                 }
 
@@ -9011,26 +13409,119 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     ? Mathf.Abs(Vector3.Dot(_auditSampleNormal, initialAuditViewDirection))
                     : -1f;
 
-                if (!PassDepthNeighborhoodConsistency(x, y, width, height, positions, normals, cameraPosition, point, normal, out int checkedDepthNeighbors, out int consistentDepthNeighbors))
+                long stratifiedHeavyStartTimestamp =
+                    _collectBudgetedFusionPhaseDiagnostics
+                        ? System.Diagnostics.Stopwatch.GetTimestamp()
+                        : 0L;
+                bool depthNeighborhoodPassed = PassDepthNeighborhoodConsistency(
+                    x, y, width, height, positions, normals, cameraPosition,
+                    point, normal,
+                    out int checkedDepthNeighbors,
+                    out int consistentDepthNeighbors,
+                    out DepthOwnershipShadowEvidence ownershipEvidence);
+                BeginFusionStratifiedHeavySample(
+                    ownershipEvidence.SampleDepthMeters,
+                    _auditSampleViewFacing,
+                    ownershipEvidence);
+                bool ownershipWouldHold = RecordOwnershipShadowCandidate(
+                    ownershipEvidence, x, y, width, height,
+                    depthNeighborhoodPassed,
+                    out bool ownershipStrongRisk,
+                    out bool ownershipFovBorder);
+                float ownershipRawConfidence = meta != null && index < meta.Length
+                    ? Mathf.Clamp01(meta[index].g)
+                    : 1f;
+                if (!depthNeighborhoodPassed)
                 {
                     SetObservationVote(ObservationVoteState.Reject, 0.05f, "depth_discontinuity");
                     LastRejectedDepthDiscontinuityCount++;
                     RecordRawCoverageGridSample(point, RawDepthDebugKind.DepthEdge, false, RawCoverageDecisionStage.DepthNeighborhood);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.DepthEdge);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, 0f, 0f, 0, 0, "discard", "depth_discontinuity", auditThisSample);
+                    EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
+                    continue;
+                }
+
+                bool productionOwnershipHold =
+                    enableStrongMixedOwnershipProductionHold &&
+                    ownershipWouldHold &&
+                    (!ownershipFovBorder || allowOwnershipProductionHoldAtFovBorder);
+                if (productionOwnershipHold)
+                {
+                    SetObservationVote(
+                        ObservationVoteState.Pending,
+                        0.20f,
+                        "strong_mixed_layer_ownership_hold");
+                    LastStrongMixedOwnershipProductionHeldCount++;
+                    RecordOwnershipShadowIntegratedWrite(
+                        true,
+                        ownershipStrongRisk,
+                        ownershipFovBorder,
+                        ownershipRawConfidence,
+                        -1f,
+                        _auditSampleViewFacing);
+                    RecordRawCoverageGridSample(
+                        point,
+                        RawDepthDebugKind.DepthEdge,
+                        false,
+                        RawCoverageDecisionStage.DepthNeighborhood);
+                    CacheRawDepthDebugSample(point, RawDepthDebugKind.DepthEdge);
+                    AppendConfidenceAuditRow(
+                        snapshot.frameIndex,
+                        index,
+                        x,
+                        y,
+                        point,
+                        sampleWeight,
+                        checkedDepthNeighbors,
+                        consistentDepthNeighbors,
+                        0f,
+                        0f,
+                        0,
+                        0,
+                        "hold",
+                        "strong_mixed_layer_ownership",
+                        auditThisSample);
+                    EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                     continue;
                 }
 
                 Vector3 pointBeforeRobust = point;
-                if (!ApplyRobustDepthPrefilter(x, y, width, height, positions, normals, cameraPosition, normal, ref point, ref sampleWeight))
+                Vector3 geometryCertificatePoint = point;
+                GeometryProductionContext productionContext = default;
+                bool routeUnresolvedToCanonicalDirectionalOnly = false;
+                ObservationVoteState observationVote = ObservationVoteState.Unassessed;
+                bool matureSmoothFastPathAccepted = TryUseMatureSmoothFastPath(
+                    cameraPosition, normal, ownershipEvidence, snapshot.frameIndex, ref point);
+                if (matureSmoothFastPathAccepted)
                 {
-                    SetObservationVote(ObservationVoteState.Reject, 0.10f, "robust_depth_outlier");
-                    LastRejectedRobustDepthCount++;
-                    RecordRawCoverageGridSample(point, RawDepthDebugKind.Robust, false, RawCoverageDecisionStage.RobustPrefilter);
-                    CacheRawDepthDebugSample(point, RawDepthDebugKind.Robust);
-                    AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "robust_depth_outlier", auditThisSample);
-                    continue;
+                    _auditSampleSupportRatio = checkedDepthNeighbors > 0
+                        ? (float)consistentDepthNeighbors / checkedDepthNeighbors
+                        : 0f;
+                    _auditSampleRobustShiftMeters = Vector3.Distance(pointBeforeRobust, point);
+                    Vector3 fastAuditViewDirection = (cameraPosition - point).normalized;
+                    _auditSampleViewFacing = normal.sqrMagnitude > 0.0001f
+                        ? Mathf.Abs(Vector3.Dot(normal.normalized, fastAuditViewDirection))
+                        : 0f;
+                    _auditSampleNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+                    SetObservationVote(ObservationVoteState.Accept, 1f, "geometry_mature_fast_path");
+                    observationVote = ObservationVoteState.Accept;
+                    MarkSurfaceObservationState(point, 3);
+                    RecordMergedVoteHistorySample(
+                        point, _auditSampleNormal, mergedRawSampleMultiplicity);
                 }
+                else
+                {
+                    if (!ApplyRobustDepthPrefilter(x, y, width, height, positions, normals, cameraPosition, normal, ref point, ref sampleWeight))
+                    {
+                        SetObservationVote(ObservationVoteState.Reject, 0.10f, "robust_depth_outlier");
+                        LastRejectedRobustDepthCount++;
+                        RecordRawCoverageGridSample(point, RawDepthDebugKind.Robust, false, RawCoverageDecisionStage.RobustPrefilter);
+                        CacheRawDepthDebugSample(point, RawDepthDebugKind.Robust);
+                        AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "robust_depth_outlier", auditThisSample);
+                        EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
+                        continue;
+                    }
                 _auditSampleSupportRatio = checkedDepthNeighbors > 0 ? (float)consistentDepthNeighbors / checkedDepthNeighbors : 0f;
                 _auditSampleRobustShiftMeters = Vector3.Distance(pointBeforeRobust, point);
                 Vector3 auditViewDirection = (cameraPosition - point).normalized;
@@ -9052,9 +13543,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     RecordRawCoverageGridSample(point, RawDepthDebugKind.Support, false, RawCoverageDecisionStage.TsdfSupport);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Support);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "insufficient_depth_support", auditThisSample);
+                    EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                     continue;
                 }
-                ObservationVoteState observationVote = EvaluateObservationVote(sampleWeight);
+                observationVote = EvaluateObservationVote(sampleWeight);
+                geometryCertificatePoint = point;
+                if (observationVote == ObservationVoteState.Accept)
+                {
+                    UpdateGeometryCertificateAndTryLocalReanchor(
+                        x, y, width, height, positions, normals, cameraPosition, normal,
+                        ownershipEvidence, snapshot.frameIndex, ref point);
+                }
                 if (observationVote == ObservationVoteState.Accept &&
                     WouldAtomicAcceptCreateDuplicateLayer(point, _auditSampleNormal))
                 {
@@ -9111,6 +13610,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                             break;
                     }
                 }
+                if (observationVote != ObservationVoteState.Accept)
+                {
+                    InvalidateGeometryCertificate(
+                        geometryCertificatePoint, _auditSampleNormal, snapshot.frameIndex);
+                    if ((point - geometryCertificatePoint).sqrMagnitude > 0.000001f)
+                        InvalidateGeometryCertificate(
+                            point, _auditSampleNormal, snapshot.frameIndex);
+                }
                 MarkSurfaceObservationState(point, observationVote == ObservationVoteState.Accept ? (byte)3 : observationVote == ObservationVoteState.Pending ? (byte)2 : (byte)4);
                 if (observationVote == ObservationVoteState.Accept)
                     RecordMergedVoteHistorySample(
@@ -9124,6 +13631,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     RecordRawCoverageGridSample(point, RawDepthDebugKind.Rejected, false, RawCoverageDecisionStage.VoteReject);
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "discard", "vote_reject", auditThisSample);
+                    EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                     continue;
                 }
                 if (!useAtomicObservationTsdfBands &&
@@ -9139,6 +13647,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         RecordRawCoverageGridSample(point, RawDepthDebugKind.Pending, false, RawCoverageDecisionStage.PendingHold);
                         CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                         AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0, "hold", "vote_pending_hold", auditThisSample);
+                        EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                         continue;
                     }
                     if (strongSampleSeedWrite)
@@ -9173,6 +13682,48 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     RecordMergedVoteHistorySample(
                         point, _auditSampleNormal, mergedRawSampleMultiplicity);
                 }
+                }
+                if (observationVote == ObservationVoteState.Accept)
+                {
+                    bool resolvedProductionSurface = TryResolveGeometryProductionContext(
+                        geometryCertificatePoint,
+                        _auditSampleNormal,
+                        cameraPosition,
+                        out productionContext);
+                    bool unresolvedContested = !resolvedProductionSurface &&
+                        productionContext.Contested;
+                    if (holdUnresolvedContestedProductionWrites &&
+                        unresolvedContested)
+                    {
+                        bool canonicalDirectionalFrontendActive =
+                            promoteDirectionalTsdfShadowFrontend &&
+                            enableDirectionalTsdfShadow &&
+                            enableCanonicalSixDirectionTsdfFusion;
+                        if (canonicalDirectionalFrontendActive)
+                        {
+                            // The hold was introduced for the legacy two-slot owner model.
+                            // A canonical directional field can preserve the observation in its
+                            // own normal channel, so route it there without mutating the rollback
+                            // TSDF. This is the production boundary where a real third surface
+                            // previously disappeared before directional fusion could see it.
+                            routeUnresolvedToCanonicalDirectionalOnly = true;
+                            LastGeometryProductionCanonicalDirectionalRoutedCount++;
+                        }
+                        else
+                        {
+                            LastGeometryProductionUnresolvedHeldCount++;
+                            AppendConfidenceAuditRow(
+                                snapshot.frameIndex, index, x, y, point, sampleWeight,
+                                checkedDepthNeighbors, consistentDepthNeighbors,
+                                Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0,
+                                "hold",
+                                "geometry_production_third_surface_hold",
+                                auditThisSample);
+                            EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
+                            continue;
+                        }
+                    }
+                }
                 AccumulateFrameReferenceAudit(point);
                 if (mergedRawSampleMultiplicity > 1)
                 {
@@ -9186,13 +13737,33 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 int mergedVy = 0;
                 int mergedVz = 0;
                 bool hasSurfaceVoxelWriteKey =
+                    !routeUnresolvedToCanonicalDirectionalOnly &&
                     mergeSameFrameSurfaceVoxelWrites &&
                     TryWorldToVoxel(point, out mergedVx, out mergedVy, out mergedVz);
                 int mergedVoxelIndex = hasSurfaceVoxelWriteKey
                     ? Index(mergedVx, mergedVy, mergedVz)
                     : -1;
-                if (hasSurfaceVoxelWriteKey &&
-                    _budgetedFusionSurfaceVoxelWrites.Contains(mergedVoxelIndex))
+                bool surfaceVoxelAlreadyWritten = false;
+                bool secondarySurfaceWrite = productionContext.Valid &&
+                    productionContext.Contested &&
+                    productionContext.SecondarySlot;
+                if (hasSurfaceVoxelWriteKey)
+                {
+                    if (useDenseStampProduction)
+                    {
+                        surfaceVoxelAlreadyWritten =
+                            HasFusionDenseStampSurfaceWrite(
+                                mergedVoxelIndex, secondarySurfaceWrite);
+                    }
+                    else
+                    {
+                        surfaceVoxelAlreadyWritten =
+                            secondarySurfaceWrite
+                                ? _budgetedFusionSecondarySurfaceVoxelWrites.Contains(mergedVoxelIndex)
+                                : _budgetedFusionSurfaceVoxelWrites.Contains(mergedVoxelIndex);
+                    }
+                }
+                if (hasSurfaceVoxelWriteKey && surfaceVoxelAlreadyWritten)
                 {
                     LastBudgetedFusionMergedSurfaceVoxelWriteCount++;
                     AppendConfidenceAuditRow(
@@ -9200,6 +13771,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         checkedDepthNeighbors, consistentDepthNeighbors,
                         Vector3.Distance(pointBeforeRobust, point), 0f, 0, 0,
                         "merge", "same_frame_surface_voxel_write_merged", auditThisSample);
+                    EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                     continue;
                 }
 
@@ -9221,20 +13793,42 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 _activeAtomicBandWrite = useAtomicObservationTsdfBands;
                 _activeAtomicBandVote = observationVote;
                 _activeSurfaceObservationState = observationVote == ObservationVoteState.Accept ? (byte)3 : (byte)2;
-                bool allowClearingRay = observationVote == ObservationVoteState.Accept && ShouldCarveFreeSpaceAtPixel(x, y, stride);
-                RecordShadowBlockObservation(cameraPosition, point, normal, sampleWeight, halfBandSteps, observationVote, allowClearingRay);
-                try
+                _activeGeometryProductionContext = observationVote == ObservationVoteState.Accept
+                    ? productionContext
+                    : default;
+                bool allowClearingRay = !matureSmoothFastPathAccepted &&
+                    observationVote == ObservationVoteState.Accept &&
+                    ShouldCarveFreeSpaceAtPixel(x, y, stride);
+                if (routeUnresolvedToCanonicalDirectionalOnly)
                 {
-                    touchedDenseTsdf = useProjectiveTsdfIntegration
-                        ? IntegrateProjectiveTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps, allowClearingRay)
-                        : IntegrateNormalTsdfBand(point, normal, sampleWeight, halfBandSteps);
-                }
-                finally
-                {
+                    // Keep the legacy authoritative TSDF byte-for-byte available as a rollback
+                    // path. Bounds are still checked here so an invalid sample cannot be counted
+                    // as a successful directional write.
+                    touchedDenseTsdf = TryWorldToVoxel(
+                        point, out int routedVx, out int routedVy, out int routedVz);
                     _activeAtomicBandWrite = false;
                     _activeAtomicBandVote = ObservationVoteState.Unassessed;
                     _activeSurfaceObservationState = 0;
+                    _activeGeometryProductionContext = default;
                 }
+                else
+                {
+                    RecordShadowBlockObservation(cameraPosition, point, normal, sampleWeight, halfBandSteps, observationVote, allowClearingRay);
+                    try
+                    {
+                        touchedDenseTsdf = useProjectiveTsdfIntegration
+                            ? IntegrateProjectiveTsdfBand(cameraPosition, point, sampleWeight, halfBandSteps, allowClearingRay)
+                            : IntegrateNormalTsdfBand(point, normal, sampleWeight, halfBandSteps);
+                    }
+                    finally
+                    {
+                        _activeAtomicBandWrite = false;
+                        _activeAtomicBandVote = ObservationVoteState.Unassessed;
+                        _activeSurfaceObservationState = 0;
+                        _activeGeometryProductionContext = default;
+                    }
+                }
+                EndFusionStratifiedHeavySample(stratifiedHeavyStartTimestamp);
                 if (!touchedDenseTsdf)
                 {
                     LastRejectedOutsideVolumeCount++;
@@ -9244,9 +13838,68 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     continue;
                 }
 
-                if (hasSurfaceVoxelWriteKey &&
-                    _budgetedFusionSurfaceVoxelWrites.Add(mergedVoxelIndex))
+                int directionalShadowStride = Mathf.Max(1, directionalTsdfShadowSampleStride);
+                if (enableDirectionalTsdfShadow &&
+                    !enablePaperQuestInputContractShadow &&
+                    observationVote == ObservationVoteState.Accept &&
+                    (routeUnresolvedToCanonicalDirectionalOnly ||
+                     (x % directionalShadowStride == 0 && y % directionalShadowStride == 0)))
+                {
+                    _directionalTsdfShadow.Configure(
+                        _dimX, _dimY, _dimZ, _volumeOriginWorld,
+                        voxelSizeMeters, truncationMeters,
+                        enablePaperQuestInputContractShadow
+                            ? paperQuestInputMaximumWeight
+                            : maxFusionWeight,
+                        directionalTsdfShadowBlockVoxels,
+                        enableCanonicalSixDirectionTsdfFusion,
+                        enableDirectionalTsdfRefinementProbe,
+                        enableDirectionalTsdfHalfVoxelShadow);
+                    _directionalTsdfShadow.Integrate(
+                        cameraPosition, point, normal, sampleWeight,
+                        productionContext.Valid ? productionContext.OwnerKey : 0,
+                        productionContext.Valid
+                            ? productionContext.CertificateVoxelIndex
+                            : mergedVoxelIndex,
+                        productionContext.Valid && productionContext.Contested,
+                        productionContext.Valid && productionContext.SecondarySlot,
+                        directionalTsdfShadowOwnerSwitchMargin,
+                        directionalTsdfShadowOwnerSwitchConfirmations,
+                        snapshot.frameIndex);
+                }
+
+                bool firstSurfaceVoxelWrite = false;
+                if (hasSurfaceVoxelWriteKey)
+                {
+                    if (useDenseStampProduction)
+                    {
+                        firstSurfaceVoxelWrite =
+                            MarkFusionDenseStampSurfaceWrite(
+                                mergedVoxelIndex, secondarySurfaceWrite);
+                    }
+                    else
+                    {
+                        firstSurfaceVoxelWrite =
+                            secondarySurfaceWrite
+                                ? _budgetedFusionSecondarySurfaceVoxelWrites.Add(mergedVoxelIndex)
+                                : _budgetedFusionSurfaceVoxelWrites.Add(mergedVoxelIndex);
+                        MarkFusionDenseStampSurfaceWrite(
+                            mergedVoxelIndex, secondarySurfaceWrite);
+                    }
+                }
+                if (firstSurfaceVoxelWrite)
+                {
                     LastBudgetedFusionUniqueSurfaceVoxelWriteCount++;
+                    if (secondarySurfaceWrite)
+                        LastGeometryProductionSecondarySurfaceWriteCount++;
+                }
+                RecordOwnershipShadowIntegratedWrite(
+                    ownershipWouldHold,
+                    ownershipStrongRisk,
+                    ownershipFovBorder,
+                    ownershipRawConfidence,
+                    _auditTemporalDepthDeltaMeters,
+                    _auditSampleViewFacing);
                 LastIntegratedSampleCount++;
                 bool sampleHitDirtyRepair =
                     LastReplacedDirtyTsdfCount > dirtyReplaceBeforeSample ||
@@ -9281,8 +13934,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     CacheRawDepthDebugSample(point, RawDepthDebugKind.Rejected);
                     AppendConfidenceAuditRow(snapshot.frameIndex, index, x, y, point, sampleWeight, checkedDepthNeighbors, consistentDepthNeighbors, Vector3.Distance(pointBeforeRobust, point), oldTsdfAtSurface, oldWeightAtSurface, oldPendingHitsAtSurface, "discard", "fallback_weight_weak", auditThisSample);
                 }
-            }
         }
+        _collectBudgetedFusionPhaseDiagnostics = false;
+        double heavyComputeEndSeconds = completedComputeSeconds +
+            (Time.realtimeSinceStartupAsDouble - computeSliceStart);
+        LastBudgetedFusionHeavyMilliseconds =
+            (float)System.Math.Max(0d, (heavyComputeEndSeconds - heavyComputeStartSeconds) * 1000d);
+        LastBudgetedFusionHeavyDecisionMilliseconds = Mathf.Max(
+            0f,
+            LastBudgetedFusionHeavyMilliseconds -
+            LastBudgetedFusionProjectiveBandMilliseconds -
+            LastBudgetedFusionFreeSpaceCarvingMilliseconds);
 
         FinalizeRawCoverageGridDiagnostics();
         AppendConfidenceAuditFrame(snapshot.frameIndex, snapshotLatencyMs, posePositionDelta, poseAngleDelta, cameraPosition);
@@ -9300,6 +13962,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             (float)(finalSliceSeconds * 1000.0));
         LastBudgetedFusionComputeMilliseconds =
             (float)((completedComputeSeconds + finalSliceSeconds) * 1000.0);
+        LastBudgetedFusionDenseStampEquivalent =
+            useFusionDenseStampProduction ||
+            !enableFusionDenseStampShadow ||
+            (LastBudgetedFusionDenseStampRepresentativeMismatchCount == 0 &&
+             LastBudgetedFusionDenseStampRawHitMismatchCount == 0 &&
+             LastBudgetedFusionDenseStampScoreMismatchCount == 0 &&
+             LastBudgetedFusionDenseStampWriteMembershipMismatchCount == 0);
         if (debugLog)
         {
             Debug.Log(
@@ -9735,6 +14404,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             summary.AppendLine("grazing_plane_depth_neighbors_rescued=" + LastGrazingPlaneDepthNeighborRescueCount);
             summary.AppendLine("grazing_plane_edge_exemptions=" + LastGrazingPlaneEdgeExemptionCount);
             summary.AppendLine("grazing_plane_median_corrections_skipped=" + LastGrazingPlaneMedianCorrectionSkippedCount);
+            summary.AppendLine("robust_depth_cross_layer_neighbors_excluded=" + LastRobustDepthCrossLayerExcludedCount);
+            summary.AppendLine("robust_depth_layer_aware_median=" + (keepRobustMedianWithinObservedLayer ? 1 : 0));
+            summary.AppendLine("separated_depth_layer_rescued=" + LastSeparatedDepthLayerRescuedCount);
+            summary.AppendLine("separated_depth_layer_support_enabled=" + (enableSeparatedDepthLayerSupport ? 1 : 0));
+            summary.AppendLine("strong_mixed_ownership_production_hold_enabled=" + (enableStrongMixedOwnershipProductionHold ? 1 : 0));
+            summary.AppendLine("strong_mixed_ownership_production_held=" + LastStrongMixedOwnershipProductionHeldCount);
             summary.AppendLine("raw_reject_basic_filter=" + LastRawCoverageBasicFilterCount);
             summary.AppendLine("raw_reject_depth_neighborhood=" + LastRawCoverageDepthEdgeStageCount);
             summary.AppendLine("raw_reject_robust_prefilter=" + LastRawCoverageRobustStageCount);
@@ -10860,13 +15535,134 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             LastCaptureBatchMeshRebuildCount == 1;
     }
 
+    private static void AppendQuestRoomAcceptedEyeDiagnostics(
+        StringBuilder summary,
+        string eyeName,
+        ScanCoverQuestRoomSurfaceNetsPipeline.EyeInputDiagnostics diagnostics)
+    {
+        if (summary == null || diagnostics == null)
+            return;
+
+        string prefix = "qrs_gpu_" + eyeName + "_";
+        summary.AppendLine(prefix + "attempts=" + diagnostics.attempts);
+        summary.AppendLine(prefix + "integrations=" + diagnostics.integrations);
+        summary.AppendLine(prefix + "accepted_frame=" + diagnostics.acceptedFrame);
+        summary.AppendLine(prefix + "bound=" + (diagnostics.bound ? 1 : 0));
+        summary.AppendLine(prefix + "active=" + (diagnostics.active ? 1 : 0));
+        summary.AppendLine(prefix + "ready=" + (diagnostics.ready ? 1 : 0));
+        summary.AppendLine(prefix + "expected_eye=" + (diagnostics.expectedEye ? 1 : 0));
+        summary.AppendLine(prefix + "outputs=" + (diagnostics.outputsAvailable ? 1 : 0));
+        summary.AppendLine(prefix + "reprojection=" + (diagnostics.reprojectionAvailable ? 1 : 0));
+        summary.AppendLine(prefix + "eye_pose=" + (diagnostics.eyePoseAvailable ? 1 : 0));
+        summary.AppendLine(prefix + "integrated=" + (diagnostics.integrated ? 1 : 0));
+        summary.AppendLine(prefix + "source_eye=" + diagnostics.sourceEye);
+        summary.AppendLine(prefix + "width=" + diagnostics.width);
+        summary.AppendLine(prefix + "height=" + diagnostics.height);
+        summary.AppendLine(prefix + "dispatch_frame=" + diagnostics.dispatchFrame);
+        summary.AppendLine(prefix + "dispatch_delta_ms=" +
+                           diagnostics.dispatchDeltaMilliseconds.ToString(
+                               "F3",
+                               CultureInfo.InvariantCulture));
+        summary.AppendLine(prefix + "issue=" + (diagnostics.issue ?? "none"));
+    }
+
     private void AppendCaptureBatchSummary(StringBuilder summary)
     {
-        summary.AppendLine("capture_mode=" + (useFixedIntegratedFrameBatch ? "fixed_integrated_frame_batch" : "legacy_timed_burst"));
+        string captureMode = LastCaptureBatchUsedQuestRoomGpuStreaming
+            ? "questroom_gpu_continuous_stream"
+            : useFixedIntegratedFrameBatch
+                ? "fixed_integrated_frame_batch"
+                : "legacy_timed_burst";
+        summary.AppendLine("capture_mode=" + captureMode);
+        summary.AppendLine("qrs_gpu_streaming_production_enabled=" +
+                           (useQuestRoomGpuStreamingProduction ? 1 : 0));
+        summary.AppendLine("legacy_cpu_fusion_diagnostic_batch=" +
+                           (useLegacyCpuFusionDiagnosticBatch ? 1 : 0));
         summary.AppendLine("capture_target_integrated_frames=" + LastCaptureBatchTargetFrames);
         summary.AppendLine("capture_unique_raw_frames=" + LastCaptureBatchUniqueRawFrames);
         summary.AppendLine("capture_batch_integrated_frames=" + LastCaptureBatchIntegratedFrames);
         summary.AppendLine("capture_batch_timeout_count=" + LastCaptureBatchTimeoutCount);
+        summary.AppendLine("qrs_gpu_streaming_session_raw_frames=" +
+                           LastQuestRoomGpuStreamingRawFrameCount);
+        summary.AppendLine("qrs_gpu_streaming_session_stereo_pairs=" +
+                           LastQuestRoomGpuStreamingStereoPairCount);
+        summary.AppendLine("qrs_gpu_streaming_session_rejected_frames=" +
+                           LastQuestRoomGpuStreamingRejectedFrameCount);
+        summary.AppendLine("qrs_gpu_streaming_session_dispatch_ms=" +
+                           LastQuestRoomGpuStreamingDispatchMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("qrs_gpu_streaming_session_max_dispatch_ms=" +
+                           LastQuestRoomGpuStreamingMaxDispatchMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("qrs_gpu_candidate_enabled=" +
+                           (enableQuestRoomScanGpuProductionCandidate ? 1 : 0));
+        summary.AppendLine("qrs_gpu_candidate_ready=" +
+                           (_questRoomSurfaceNetsPipeline != null &&
+                            _questRoomSurfaceNetsPipeline.HasRenderableSurface ? 1 : 0));
+        summary.AppendLine("qrs_gpu_integrations=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.IntegrationCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_vertices=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.LastVertexCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_line_indices=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.LastLineIndexCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_overflow=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.LastOverflowCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_issue=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? (_questRoomSurfaceNetsPipeline.LastIssue ?? "none")
+                               : "component_missing"));
+        summary.AppendLine("qrs_gpu_input_binding=" +
+                           (LastCaptureBatchUsedQuestRoomGpuStreaming
+                               ? "bound_stereo_gpu_textures_direct"
+                               : "accepted_frame_direct"));
+        summary.AppendLine("qrs_gpu_accepted_attempts=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.AcceptedFrameAttemptCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_stereo_pairs=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.StereoPairIntegrationCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_partial_pairs=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.PartialStereoIntegrationCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_rejected_accepted_frames=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.RejectedAcceptedFrameCount
+                               : 0));
+        summary.AppendLine("qrs_gpu_last_snapshot_frame=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.LastAcceptedSnapshotFrame
+                               : -1));
+        summary.AppendLine("qrs_gpu_companion_prepare_attempts=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.StereoCompanionPreparationAttempts
+                               : 0));
+        summary.AppendLine("qrs_gpu_companion_prepare_successes=" +
+                           (_questRoomSurfaceNetsPipeline != null
+                               ? _questRoomSurfaceNetsPipeline.StereoCompanionPreparationSuccesses
+                               : 0));
+        if (_questRoomSurfaceNetsPipeline != null)
+        {
+            AppendQuestRoomAcceptedEyeDiagnostics(
+                summary,
+                "left",
+                _questRoomSurfaceNetsPipeline.LeftEyeDiagnostics);
+            AppendQuestRoomAcceptedEyeDiagnostics(
+                summary,
+                "right",
+                _questRoomSurfaceNetsPipeline.RightEyeDiagnostics);
+        }
+        AppendCompactBatchContextSummary(summary);
         summary.AppendLine("capture_batch_mesh_rebuilds=" + LastCaptureBatchMeshRebuildCount);
         summary.AppendLine("capture_batch_mesh_rebuild_ms=" + LastCaptureBatchMeshRebuildMilliseconds.ToString("F3", CultureInfo.InvariantCulture));
         summary.AppendLine("capture_batch_mesh_rebuild_wall_ms=" +
@@ -10928,6 +15724,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                            (mergeSameFrameSurfaceVoxelWrites ? 1 : 0));
         summary.AppendLine("early_surface_voxel_representative_selection_enabled=" +
                            (selectSurfaceVoxelRepresentativeBeforeHeavyFusion ? 1 : 0));
+        summary.AppendLine("compacted_fusion_representative_iteration_enabled=" +
+                           (compactFusionRepresentativeIteration ? 1 : 0));
         summary.AppendLine("merged_surface_voxel_max_weight_scale=" +
                            maximumMergedSurfaceVoxelWeightScale.ToString(
                                "F3", CultureInfo.InvariantCulture));
@@ -10937,12 +15735,875 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                            LastCaptureBatchUniqueSurfaceVoxelWriteCount);
         summary.AppendLine("capture_batch_merged_surface_voxel_writes=" +
                            LastCaptureBatchMergedSurfaceVoxelWriteCount);
+        summary.AppendLine("capture_batch_compacted_fusion_samples=" +
+                           LastCaptureBatchCompactedFusionSampleCount);
+        summary.AppendLine("capture_batch_heavy_fusion_samples=" +
+                           LastCaptureBatchHeavyFusionSampleCount);
+        summary.AppendLine("capture_batch_fusion_prepass_ms=" +
+                           LastCaptureBatchFusionPrepassMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_representative_build_ms=" +
+                           LastCaptureBatchFusionRepresentativeBuildMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_heavy_ms=" +
+                           LastCaptureBatchFusionHeavyMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_heavy_decision_ms=" +
+                           LastCaptureBatchFusionHeavyDecisionMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_projective_band_ms=" +
+                           LastCaptureBatchFusionProjectiveBandMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_free_space_carving_ms=" +
+                           LastCaptureBatchFusionFreeSpaceCarvingMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_fusion_prepass_samples=" +
+                           LastCaptureBatchFusionPrepassSampleCount);
+        summary.AppendLine("capture_batch_fusion_prepass_valid_samples=" +
+                           LastCaptureBatchFusionPrepassValidSampleCount);
+        summary.AppendLine("capture_batch_fusion_projective_band_calls=" +
+                           LastCaptureBatchFusionProjectiveBandCallCount);
+        summary.AppendLine("capture_batch_fusion_projective_diagnostic_band_calls=" +
+                           LastCaptureBatchFusionProjectiveDiagnosticBandCallCount);
+        summary.AppendLine("capture_batch_fusion_projective_band_candidate_voxels=" +
+                           LastCaptureBatchFusionProjectiveBandCandidateVoxelCount);
+        summary.AppendLine("capture_batch_fusion_projective_band_accepted_voxels=" +
+                           LastCaptureBatchFusionProjectiveBandAcceptedVoxelCount);
+        summary.AppendLine("capture_batch_fusion_free_space_carving_calls=" +
+                           LastCaptureBatchFusionFreeSpaceCarvingCallCount);
+        summary.AppendLine("capture_batch_fusion_free_space_traversed_voxels=" +
+                           LastCaptureBatchFusionFreeSpaceTraversedVoxelCount);
+        summary.AppendLine("geometry_maturity_certificate_enabled=" +
+                           (enableMatureSmoothFastPath ? 1 : 0));
+        summary.AppendLine("bounded_multi_surface_certificates_enabled=" +
+                           (enableBoundedMultiSurfaceCertificates ? 1 : 0));
+        summary.AppendLine("multi_surface_certificate_production_fusion_enabled=" +
+                           (enableMultiSurfaceCertificateProductionFusion ? 1 : 0));
+        summary.AppendLine("multi_surface_production_assignment=" +
+                           "bounded_directional_tsdf_dominant_axis_xpos_xneg_ypos_yneg_zpos_zneg");
+        summary.AppendLine("multi_surface_prepass_candidate_preservation_enabled=" +
+                           (preserveContestedSurfaceCandidatesBeforeHeavyFusion ? 1 : 0));
+        summary.AppendLine("multi_surface_unresolved_production_hold_enabled=" +
+                           (holdUnresolvedContestedProductionWrites ? 1 : 0));
+        summary.AppendLine("adaptive_geometry_view_baseline_enabled=" +
+                           (enableAdaptiveGeometryCertificateViewBaseline ? 1 : 0));
+        summary.AppendLine("adaptive_geometry_view_baseline_voxels=" +
+                           geometryCertificateMinimumLateralBaselineVoxels.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("adaptive_geometry_view_minimum_parallax_degrees=" +
+                           geometryCertificateMinimumAdaptiveParallaxDegrees.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("temporal_geometry_certificate_maturity_enabled=" +
+                           (enableTemporalGeometryCertificateMaturity ? 1 : 0));
+        summary.AppendLine("temporal_geometry_certificate_stable_frames=" +
+                           geometryCertificateTemporalStableFrames);
+        summary.AppendLine("temporal_geometry_certificate_contested_stable_frames=" +
+                           geometryCertificateContestedTemporalStableFrames);
+        summary.AppendLine("capture_batch_robust_depth_cross_layer_neighbors_excluded=" +
+                           LastCaptureBatchRobustDepthCrossLayerExcludedCount);
+        summary.AppendLine("capture_batch_separated_depth_layer_rescued=" +
+                           LastCaptureBatchSeparatedDepthLayerRescuedCount);
+        summary.AppendLine("capture_batch_strong_mixed_ownership_production_held=" +
+                           LastCaptureBatchStrongMixedOwnershipProductionHeldCount);
+        summary.AppendLine("capture_batch_geometry_certificate_candidate=" +
+                           LastCaptureBatchGeometryCertificateCandidateCount);
+        summary.AppendLine("capture_batch_geometry_certificate_created=" +
+                           LastCaptureBatchGeometryCertificateCreatedCount);
+        summary.AppendLine("capture_batch_geometry_certificate_matured=" +
+                           LastCaptureBatchGeometryCertificateMatureCount);
+        summary.AppendLine("capture_batch_geometry_certificate_conflict_reset=" +
+                           LastCaptureBatchGeometryCertificateConflictResetCount);
+        summary.AppendLine("capture_batch_geometry_secondary_slot_created=" +
+                           LastCaptureBatchGeometrySecondarySlotCreatedCount);
+        summary.AppendLine("capture_batch_geometry_secondary_slot_matched=" +
+                           LastCaptureBatchGeometrySecondarySlotMatchedCount);
+        summary.AppendLine("capture_batch_geometry_distinct_surface_preserved=" +
+                           LastCaptureBatchGeometryDistinctSurfacePreservedCount);
+        summary.AppendLine("capture_batch_geometry_multi_junction_deferred=" +
+                           LastCaptureBatchGeometryMultiJunctionDeferredCount);
+        summary.AppendLine("capture_batch_geometry_distinct_view_fixed_angle=" +
+                           LastCaptureBatchGeometryFixedAngleDistinctViewCount);
+        summary.AppendLine("capture_batch_geometry_distinct_view_adaptive_baseline=" +
+                           LastCaptureBatchGeometryAdaptiveBaselineDistinctViewCount);
+        summary.AppendLine("capture_batch_geometry_view_insufficient_baseline=" +
+                           LastCaptureBatchGeometryInsufficientBaselineViewCount);
+        summary.AppendLine("capture_batch_geometry_temporal_maturity_accepted=" +
+                           LastCaptureBatchGeometryTemporalMaturityAcceptedCount);
+        summary.AppendLine("capture_batch_geometry_temporal_reanchor_accepted=" +
+                           LastCaptureBatchGeometryTemporalReanchorAcceptedCount);
+        summary.AppendLine("capture_batch_geometry_temporal_streak_reset=" +
+                           LastCaptureBatchGeometryTemporalStreakResetCount);
+        summary.AppendLine("capture_batch_geometry_production_prepass_preserved=" +
+                           LastCaptureBatchGeometryProductionPrepassPreservedCount);
+        summary.AppendLine("capture_batch_geometry_production_secondary_writes=" +
+                           LastCaptureBatchGeometryProductionSecondarySurfaceWriteCount);
+        summary.AppendLine("capture_batch_geometry_production_unresolved_held=" +
+                           LastCaptureBatchGeometryProductionUnresolvedHeldCount);
+        summary.AppendLine("capture_batch_geometry_production_canonical_directional_routed=" +
+                           LastCaptureBatchGeometryProductionCanonicalDirectionalRoutedCount);
+        summary.AppendLine("capture_batch_geometry_production_owner_bootstrap=" +
+                           LastCaptureBatchGeometryProductionOwnerBootstrapCount);
+        summary.AppendLine("capture_batch_geometry_production_owner_matched=" +
+                           LastCaptureBatchGeometryProductionOwnerMatchedCount);
+        summary.AppendLine("capture_batch_geometry_production_owner_preserved=" +
+                           LastCaptureBatchGeometryProductionOwnerPreservedCount);
+        summary.AppendLine("capture_batch_geometry_production_owner_switched=" +
+                           LastCaptureBatchGeometryProductionOwnerSwitchedCount);
+        ScanCoverDirectionalTsdfShadow.Metrics directionalShadowMetrics =
+            _directionalTsdfShadow.GetMetrics();
+        summary.AppendLine("directional_tsdf_shadow_enabled=" + (enableDirectionalTsdfShadow ? 1 : 0));
+        summary.AppendLine("paper_quest_input_contract_shadow_enabled=" +
+                           (enablePaperQuestInputContractShadow ? 1 : 0));
+        summary.AppendLine("paper_quest_input_contract=raw_projective_point+neighbour_normal+dispatch_eye_pose");
+        summary.AppendLine("paper_quest_input_weighting=depth_noise*view_angle*direction_sector");
+        summary.AppendLine("paper_quest_input_depth_range_m=" +
+                           paperQuestInputMinimumDepthMeters.ToString("F3", CultureInfo.InvariantCulture) + "|" +
+                           paperQuestInputMaximumDepthMeters.ToString("F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_paper_quest_input_pixels=" +
+                           LastCaptureBatchPaperQuestInputPixelCount);
+        summary.AppendLine("capture_batch_paper_quest_accepted_rays=" +
+                           LastCaptureBatchPaperQuestAcceptedRayCount);
+        summary.AppendLine("capture_batch_paper_quest_range_rejects=" +
+                           LastCaptureBatchPaperQuestRangeRejectCount);
+        summary.AppendLine("capture_batch_paper_quest_geometry_rejects=" +
+                           LastCaptureBatchPaperQuestGeometryRejectCount);
+        summary.AppendLine("capture_batch_paper_quest_missing_eye_pose=" +
+                           LastCaptureBatchPaperQuestMissingEyePoseCount);
+        summary.AppendLine("capture_batch_paper_quest_integrated_voxels=" +
+                           LastCaptureBatchPaperQuestIntegratedVoxelCount);
+        int paperAlignmentCount = _paperSurfaceAlignmentSupportedSamples;
+        double paperAlignmentSignedMean = PaperAuditMean(
+            _paperSurfaceAlignmentSignedSum, paperAlignmentCount);
+        double paperAlignmentAbsoluteMean = PaperAuditMean(
+            _paperSurfaceAlignmentAbsoluteSum, paperAlignmentCount);
+        double paperAlignmentRms = paperAlignmentCount > 0
+            ? System.Math.Sqrt(_paperSurfaceAlignmentSquaredSum / paperAlignmentCount)
+            : 0d;
+        summary.AppendLine(
+            "paper_surface_alignment_audit_semantics=signed_along_oriented_neighbour_normal;positive=stored_zero_surface_beyond_current_raw_point;read_only_after_frame_integration");
+        summary.AppendLine("paper_surface_alignment_audit_stride_pixels=" +
+                           Mathf.Max(directionalTsdfShadowSampleStride,
+                               paperSurfaceAlignmentAuditPixelStride));
+        summary.AppendLine("capture_batch_paper_surface_alignment_supported_missing=" +
+                           paperAlignmentCount + "|" +
+                           _paperSurfaceAlignmentMissingSamples);
+        summary.AppendLine("capture_batch_paper_surface_alignment_signed_mean_abs_mean_rms_p50_p90_p99_max_m=" +
+                           paperAlignmentSignedMean.ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           paperAlignmentAbsoluteMean.ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           paperAlignmentRms.ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           PaperAuditQuantile(_paperSurfaceAlignmentAbsoluteResiduals, 0.50f).ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           PaperAuditQuantile(_paperSurfaceAlignmentAbsoluteResiduals, 0.90f).ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           PaperAuditQuantile(_paperSurfaceAlignmentAbsoluteResiduals, 0.99f).ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                           _paperSurfaceAlignmentMaximumAbsolute.ToString("F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_paper_surface_alignment_support_voxels_saturated_ratio=" +
+                           _paperSurfaceAlignmentSupportVoxels + "|" +
+                           _paperSurfaceAlignmentSaturatedVoxels + "|" +
+                           PaperAuditMean(
+                               _paperSurfaceAlignmentSaturatedVoxels,
+                               _paperSurfaceAlignmentSupportVoxels).ToString(
+                                   "F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_paper_surface_alignment_by_depth_count_mean_abs_m=" +
+                           FormatPaperAuditBuckets(
+                               _paperSurfaceAlignmentDepthCounts,
+                               _paperSurfaceAlignmentDepthAbsoluteSums,
+                               new[] { "lt1", "1to2", "2to3", "ge3" }));
+        summary.AppendLine("capture_batch_paper_surface_alignment_by_facing_count_mean_abs_m=" +
+                           FormatPaperAuditBuckets(
+                               _paperSurfaceAlignmentFacingCounts,
+                               _paperSurfaceAlignmentFacingAbsoluteSums,
+                               new[] { "grazing_lt035", "oblique_035to070", "frontal_ge070" }));
+        summary.AppendLine("capture_batch_paper_surface_alignment_by_direction_count_mean_abs_m=" +
+                           FormatPaperAuditBuckets(
+                               _paperSurfaceAlignmentDirectionCounts,
+                               _paperSurfaceAlignmentDirectionAbsoluteSums,
+                               new[] { "x_pos", "x_neg", "y_pos", "y_neg", "z_pos", "z_neg" }));
+        summary.AppendLine("capture_batch_paper_surface_alignment_by_readback_age_count_mean_abs_m=" +
+                           FormatPaperAuditBuckets(
+                               _paperSurfaceAlignmentReadbackAgeCounts,
+                               _paperSurfaceAlignmentReadbackAgeAbsoluteSums,
+                               new[] { "le16ms", "16to33ms", "33to66ms", "gt66ms" }));
+        summary.AppendLine("paper_quest_provenance_readback_age_samples_mean_max_ms=" +
+                           _paperProvenanceReadbackAgeSamples + "|" +
+                           PaperAuditMean(
+                               _paperProvenanceReadbackAgeMillisecondsSum,
+                               _paperProvenanceReadbackAgeSamples).ToString(
+                                   "F3", CultureInfo.InvariantCulture) + "|" +
+                           _paperProvenanceReadbackAgeMillisecondsMaximum.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("paper_quest_provenance_dispatch_to_completion_pose_samples_translation_mean_max_m_rotation_mean_max_deg=" +
+                           _paperProvenanceCompletionPoseSamples + "|" +
+                           PaperAuditMean(
+                               _paperProvenanceCompletionTranslationMetersSum,
+                               _paperProvenanceCompletionPoseSamples).ToString(
+                                   "F6", CultureInfo.InvariantCulture) + "|" +
+                           _paperProvenanceCompletionTranslationMetersMaximum.ToString(
+                               "F6", CultureInfo.InvariantCulture) + "|" +
+                           PaperAuditMean(
+                               _paperProvenanceCompletionRotationDegreesSum,
+                               _paperProvenanceCompletionPoseSamples).ToString(
+                                   "F3", CultureInfo.InvariantCulture) + "|" +
+                           _paperProvenanceCompletionRotationDegreesMaximum.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("paper_quest_provenance_depth_matrix_eye_samples_missing_delta_mean_max_m=" +
+                           _paperProvenanceDepthMatrixEyeSamples + "|" +
+                           _paperProvenanceDepthMatrixEyeMissing + "|" +
+                           PaperAuditMean(
+                               _paperProvenanceDepthMatrixEyeDeltaMetersSum,
+                               _paperProvenanceDepthMatrixEyeSamples).ToString(
+                                   "F6", CultureInfo.InvariantCulture) + "|" +
+                           _paperProvenanceDepthMatrixEyeDeltaMetersMaximum.ToString(
+                               "F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_frontend_promoted=" +
+                           (promoteDirectionalTsdfShadowFrontend && enableDirectionalTsdfShadow ? 1 : 0));
+        summary.AppendLine("directional_tsdf_legacy_foreground_enabled=" +
+                           (directionalTsdfShadowDisplayMode ==
+                            DirectionalTsdfShadowDisplayMode.DirectionalShadowOnly ? 0 : 1));
+        summary.AppendLine("directional_tsdf_display_atomic_double_buffered=1");
+        summary.AppendLine("directional_tsdf_legacy_renderer_hard_isolation=" +
+                           (promoteDirectionalTsdfShadowFrontend ? 1 : 0));
+        summary.AppendLine("directional_tsdf_shadow_authority=" +
+                           (promoteDirectionalTsdfShadowFrontend && enableDirectionalTsdfShadow
+                               ? "foreground_directional_volume_legacy_tsdf_rollback_unchanged"
+                               : "isolated_read_only_no_production_write"));
+        summary.AppendLine("directional_tsdf_shadow_layout=" +
+                           (directionalShadowMetrics.CanonicalSixDirectionSemantics
+                               ? "sparse_blocks_canonical_six_independent_direction_channels"
+                               : "sparse_blocks_six_directions_primary_secondary_surface_slots"));
+        summary.AppendLine("directional_tsdf_canonical_six_channel_fusion_enabled=" +
+                           (enableCanonicalSixDirectionTsdfFusion ? 1 : 0));
+        summary.AppendLine("directional_tsdf_direction_correspondence_threshold=0.382683");
+        summary.AppendLine("directional_tsdf_canonical_fusion_path=" +
+                           (enablePaperQuestInputContractShadow
+                               ? "paper_neighbour_normal_ray_amanatides_woo_point_to_plane"
+                               : "legacy_surface_normal_traversal_point_to_plane"));
+        summary.AppendLine("directional_tsdf_shadow_extractor=" +
+                           (enableDirectionalTsdfComposedExtraction
+                               ? (enableDirectionalTsdfSurfaceContinuity
+                                   ? "surface_component_direction_composition_shared_faces_crease_junctions_manifold_guard"
+                                   : "conservative_direction_composition_shared_edges_manifold_guard")
+                               : "independent_directional_cube_six_tetra_consistent_diagonal"));
+        summary.AppendLine("directional_tsdf_composed_extraction=" +
+                           (enableDirectionalTsdfComposedExtraction ? 1 : 0));
+        summary.AppendLine("directional_tsdf_composition_min_gradient_dot=" +
+                           directionalTsdfCompositionMinimumGradientDot.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_composition_parallel_normal_dot=" +
+                           directionalTsdfCompositionParallelNormalDot.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_composition_edge_merge_voxel_ratio=" +
+                           directionalTsdfCompositionEdgeMergeVoxelRatio.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_surface_continuity_enabled=" +
+                           (enableDirectionalTsdfSurfaceContinuity ? 1 : 0));
+        summary.AppendLine("directional_tsdf_surface_gap_bridging_enabled=" +
+                           (enableDirectionalTsdfSurfaceGapBridging ? 1 : 0));
+        summary.AppendLine("directional_tsdf_surface_link_normal_dot=" +
+                           directionalTsdfSurfaceLinkNormalDot.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_surface_link_plane_offset_voxel_ratio=" +
+                           directionalTsdfSurfaceLinkPlaneOffsetVoxelRatio.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_saturation_semantics=capped_weight_rolling_update");
+        summary.AppendLine("directional_tsdf_mature_depth_conflict_confirmation_batches=2");
+        summary.AppendLine("directional_tsdf_mature_depth_conflict_opposing_sign_delta=0.200");
+        summary.AppendLine("directional_tsdf_mature_depth_conflict_large_delta=0.450");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_correction_semantics=" +
+                           "same_batch_three_independent_frames_or_four_plus_shared_neighbor_for_opposing_sign_local_coplanar_patch_primary_noncontested_single_bounded_step");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_min_independent_frames=3");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_opposing_sign_min_independent_frames=4");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_normal_dot=0.970");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_plane_offset_voxel_ratio=0.250");
+        summary.AppendLine("directional_tsdf_mature_depth_fast_replacement_weight_ratio=0.1250_single_step_per_voxel_per_batch");
+        summary.AppendLine("directional_tsdf_mature_depth_patch_confirmation_semantics=" +
+                           "previous_batch_neighbor_voxel_or_direction_same_slot_normal_and_bidirectional_plane_gate");
+        summary.AppendLine("directional_tsdf_mature_depth_patch_neighbor_radius_voxels=1");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_semantics=" +
+                           "local_physical_plane_identity_follows_adjacent_voxel_and_direction_channel_with_strict_normal_plane_isolation");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_stable_batches=2_safe|3_risk");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_independent_frames=4_safe|6_risk");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_spatial_voxels=2_safe|3_risk");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_normal_dot=0.940");
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_plane_offset_voxel_ratio=0.350");
+        summary.AppendLine("directional_tsdf_surface_component_plane_envelope_enabled=1");
+        summary.AppendLine("directional_tsdf_surface_certificate_composition_enabled=1");
+        summary.AppendLine("directional_tsdf_surface_certificate_composition_semantics=" +
+                           "confirmed_cross_voxel_coplanar_evidence_preferred_one_to_one_current_geometry_guard");
+        summary.AppendLine("directional_tsdf_surface_certificate_lease_batches=4");
+        summary.AppendLine("directional_tsdf_surface_certificate_guard_normal_dot=0.900");
+        summary.AppendLine("directional_tsdf_surface_certificate_guard_plane_offset_voxel_ratio=0.550");
+        summary.AppendLine("directional_tsdf_surface_certificate_direct_component_link_enabled=0");
+        summary.AppendLine("directional_tsdf_surface_certificate_direct_component_link_semantics=" +
+                           "disabled_after_real_device_false_component_merges_during_active_depth_reanchor");
+        summary.AppendLine("directional_tsdf_physical_identity_edge_owner_enabled=0");
+        summary.AppendLine("directional_tsdf_physical_identity_edge_owner_semantics=" +
+                           "disabled_after_real_device_duplicate_triangle_growth_keep_face_link_topology_only");
+        summary.AppendLine("directional_tsdf_physical_identity_edge_normal_dot=0.940");
+        summary.AppendLine("directional_tsdf_physical_identity_edge_crossing_delta_voxel_ratio=0.180");
+        summary.AppendLine("directional_tsdf_physical_identity_edge_plane_offset_voxel_ratio=0.220");
+        summary.AppendLine("directional_tsdf_surface_disagreement_semantics=split_instead_of_average");
+        summary.AppendLine("directional_tsdf_shadow_display_mode=" +
+                           directionalTsdfShadowDisplayMode.ToString().ToLowerInvariant());
+        summary.AppendLine("directional_tsdf_shadow_display_cycle_button=left_" +
+                           directionalTsdfShadowDisplayCycleButton.ToString().ToLowerInvariant());
+        summary.AppendLine("directional_tsdf_shadow_configured=" +
+                           (directionalShadowMetrics.Configured ? 1 : 0));
+        summary.AppendLine("directional_tsdf_shadow_allocated_blocks=" +
+                           directionalShadowMetrics.AllocatedBlocks);
+        summary.AppendLine("directional_tsdf_shadow_allocated_direction_layers=" +
+                           directionalShadowMetrics.AllocatedDirectionLayers);
+        summary.AppendLine("directional_tsdf_shadow_weighted_voxels=" +
+                           directionalShadowMetrics.WeightedVoxels);
+        summary.AppendLine("directional_tsdf_shadow_candidate_cells=" +
+                           directionalShadowMetrics.CandidateCells);
+        summary.AppendLine("capture_batch_directional_tsdf_shadow_samples=" +
+                           directionalShadowMetrics.BatchSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_shadow_contested_samples=" +
+                           directionalShadowMetrics.BatchContestedSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_shadow_secondary_samples=" +
+                           directionalShadowMetrics.BatchSecondarySamples);
+        summary.AppendLine("capture_batch_directional_tsdf_canonical_direction_writes=" +
+                           directionalShadowMetrics.BatchCanonicalDirectionWrites);
+        summary.AppendLine("capture_batch_directional_tsdf_canonical_fanout_1_2_3=" +
+                           directionalShadowMetrics.BatchCanonicalFanoutOne + "|" +
+                           directionalShadowMetrics.BatchCanonicalFanoutTwo + "|" +
+                           directionalShadowMetrics.BatchCanonicalFanoutThree);
+        summary.AppendLine("capture_batch_directional_tsdf_canonical_rejected_samples=" +
+                           directionalShadowMetrics.BatchCanonicalRejectedSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_shadow_voxel_updates=" +
+                           directionalShadowMetrics.BatchVoxelUpdates);
+        summary.AppendLine("capture_batch_directional_tsdf_owner_matched=" +
+                           directionalShadowMetrics.BatchOwnerMatched);
+        summary.AppendLine("capture_batch_directional_tsdf_owner_challenged=" +
+                           directionalShadowMetrics.BatchOwnerChallenged);
+        summary.AppendLine("capture_batch_directional_tsdf_owner_switched=" +
+                           directionalShadowMetrics.BatchOwnerSwitched);
+        summary.AppendLine("capture_batch_directional_tsdf_retired_direction_voxels=" +
+                           directionalShadowMetrics.BatchRetiredDirectionVoxels);
+        summary.AppendLine("capture_batch_directional_tsdf_saturated_rolling_updates=" +
+                           directionalShadowMetrics.BatchSaturatedRollingUpdates);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_conflict_candidates=" +
+                           directionalShadowMetrics.BatchMatureDepthConflictCandidates);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_conflict_held=" +
+                           directionalShadowMetrics.BatchMatureDepthConflictHeld);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_corrections=" +
+                           directionalShadowMetrics.BatchMatureDepthCorrections);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_sign_flips=" +
+                           directionalShadowMetrics.BatchMatureDepthSignFlips);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_fast_candidates=" +
+                           directionalShadowMetrics.BatchMatureDepthFastCandidates);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_fast_confirmed=" +
+                           directionalShadowMetrics.BatchMatureDepthFastConfirmed);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_fast_held=" +
+                           directionalShadowMetrics.BatchMatureDepthFastHeld);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_fast_shared_neighbors=" +
+                           directionalShadowMetrics.BatchMatureDepthFastSharedNeighbors);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_fast_risk_deferred=" +
+                           directionalShadowMetrics.BatchMatureDepthFastRiskDeferred);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_patch_candidates=" +
+                           directionalShadowMetrics.BatchMatureDepthPatchCandidates);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_patch_confirmed=" +
+                           directionalShadowMetrics.BatchMatureDepthPatchConfirmed);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_patch_shared_neighbors=" +
+                           directionalShadowMetrics.BatchMatureDepthPatchSharedNeighbors);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_persistent_candidates=" +
+                           directionalShadowMetrics.BatchMatureDepthPersistentCandidates);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_persistent_matched=" +
+                           directionalShadowMetrics.BatchMatureDepthPersistentMatched);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_persistent_cross_voxel_matched=" +
+                           directionalShadowMetrics.BatchMatureDepthPersistentCrossVoxelMatched);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_persistent_confirmed=" +
+                           directionalShadowMetrics.BatchMatureDepthPersistentConfirmed);
+        summary.AppendLine("capture_batch_directional_tsdf_mature_depth_persistent_risk_confirmed=" +
+                           directionalShadowMetrics.BatchMatureDepthPersistentRiskConfirmed);
+        summary.AppendLine("directional_tsdf_mature_depth_persistent_challenger_states=" +
+                           directionalShadowMetrics.PersistentDepthChallengerStates);
+        summary.AppendLine("capture_batch_directional_tsdf_shadow_integration_ms=" +
+                           directionalShadowMetrics.BatchIntegrationMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_shadow_extraction_ms=" +
+                           directionalShadowMetrics.LastExtractionMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_shadow_scanned_cells=" +
+                           directionalShadowMetrics.LastScannedCells);
+        summary.AppendLine("directional_tsdf_shadow_zero_crossing_cells=" +
+                           directionalShadowMetrics.LastZeroCrossingCells);
+        summary.AppendLine("directional_tsdf_shadow_multi_direction_zero_crossing_cells=" +
+                           directionalShadowMetrics.LastMultiDirectionZeroCrossingCells);
+        summary.AppendLine("directional_tsdf_shadow_three_plus_direction_hypothesis_cells=" +
+                           directionalShadowMetrics.LastThreePlusDirectionHypothesisCells);
+        summary.AppendLine("directional_tsdf_shadow_three_plus_surface_cluster_cells=" +
+                           directionalShadowMetrics.LastThreePlusSurfaceClusterCells);
+        summary.AppendLine("directional_tsdf_shadow_max_direction_hypotheses_per_cell=" +
+                           directionalShadowMetrics.LastMaximumDirectionHypothesesPerCell);
+        summary.AppendLine("directional_tsdf_shadow_max_surface_clusters_per_cell=" +
+                           directionalShadowMetrics.LastMaximumSurfaceClustersPerCell);
+        summary.AppendLine("directional_mc_shadow_enabled=" +
+                           (directionalShadowMetrics.DirectionalMcShadowEnabled ? 1 : 0));
+        summary.AppendLine("directional_mc_shadow_paper_reference=" +
+                           (directionalShadowMetrics.DirectionalMcShadowPaperReference ? 1 : 0));
+        summary.AppendLine("directional_mc_shadow_semantics=" +
+                           (directionalShadowMetrics.DirectionalMcShadowPaperReference
+                               ? "paper_reference_direction_filter_index_compatibility_dual_edge_offsets_two_combined_indices_neighbor_majority_standard_mc_local_half_voxel_same_rules_independent_wire_read_only"
+                               : "legacy_custom_dmc_shadow"));
+        summary.AppendLine("directional_mc_shadow_cells_evaluated=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowCellsEvaluated);
+        summary.AppendLine("directional_mc_shadow_raw_hypotheses=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRawHypotheses);
+        summary.AppendLine("directional_mc_shadow_incomplete_corner_hypotheses=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowIncompleteCornerHypotheses);
+        summary.AppendLine("directional_mc_shadow_intra_direction_rejected=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowIntraDirectionRejected);
+        summary.AppendLine("directional_mc_shadow_inter_direction_rejected=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowInterDirectionRejected);
+        summary.AppendLine("directional_mc_shadow_valid_hypotheses=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowValidHypotheses);
+        summary.AppendLine("directional_mc_shadow_components=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowComponents);
+        summary.AppendLine("directional_mc_shadow_single_surface_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowSingleSurfaceCells);
+        summary.AppendLine("directional_mc_shadow_double_surface_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowDoubleSurfaceCells);
+        summary.AppendLine("directional_mc_shadow_overflow_deferred_components=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOverflowDeferredComponents);
+        summary.AppendLine("directional_mc_shadow_empty_after_voting_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowEmptyAfterVotingCells);
+        summary.AppendLine("directional_mc_shadow_transition_edges_raw_combined_regularized=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRawTransitionEdges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowCombinedTransitionEdges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRegularizedTransitionEdges);
+        summary.AppendLine("directional_mc_shadow_offset_clusters=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOffsetClusters);
+        summary.AppendLine("directional_mc_shadow_dual_offset_edges=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowDualOffsetEdges);
+        summary.AppendLine("directional_mc_shadow_offset_overflow_edges=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOffsetOverflowEdges);
+        summary.AppendLine("directional_mc_shadow_neighbor_face_comparisons=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowNeighborFaceComparisons);
+        summary.AppendLine("directional_mc_shadow_neighbor_disagreements_before_after=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowNeighborDisagreementsBefore + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowNeighborDisagreementsAfter);
+        summary.AppendLine("directional_mc_shadow_regularized_corners_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRegularizedCorners + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRegularizedCells);
+        summary.AppendLine("directional_mc_shadow_regularization_deferred_pairs=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRegularizationDeferredPairs);
+        summary.AppendLine("directional_mc_shadow_persistent_changed_retired=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowPersistentDecisions + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowChangedDecisions + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowRetiredDecisions);
+        summary.AppendLine("directional_mc_shadow_unknown_deferred_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowUnknownDeferredCells);
+        summary.AppendLine("directional_mc_shadow_mc33_ambiguous_faces_interior_tests=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowAmbiguousFaces + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowInteriorTests);
+        summary.AppendLine("directional_mc_shadow_vertices_triangles=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowVertices + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowTriangles);
+        summary.AppendLine("directional_mc_shadow_fine_blocks_cells_evaluated_accepted=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineRefinementBlocks + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineCellsEvaluated + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineCellsAccepted);
+        summary.AppendLine("directional_mc_shadow_fine_promoted_boundary_deferred=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineCoarseCellsPromoted + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineBoundaryDeferredCells);
+        summary.AppendLine("directional_mc_shadow_fine_coarse_prior_incomplete_voting_empty=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineCoarsePriorCorners + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineIncompleteCells + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineVotingEmptyCells);
+        summary.AppendLine("directional_mc_shadow_fine_vertices_triangles=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineVertices + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFineTriangles);
+        summary.AppendLine("directional_mc_shadow_overflow_refinement_blocks_active=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOverflowRefinementBlocks + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOverflowRefinementActiveBlocks);
+        summary.AppendLine("directional_mc_shadow_overflow_half_voxel_resolved_unresolved=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOverflowResolvedByHalfVoxel + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowOverflowStillUnresolved);
+        summary.AppendLine("directional_mc_shadow_face_decision_candidates_conflicts_stable=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionCandidates + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionConflicts + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionStable);
+        summary.AppendLine("directional_mc_shadow_face_decision_applied_persistent_retired=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionAppliedPairs + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionPersistent + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionRetired);
+        summary.AppendLine("directional_mc_shadow_face_decision_filled_corners_changed_cells=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionFilledCorners + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionChangedCells);
+        summary.AppendLine("directional_mc_shadow_face_decision_precompleted_corners_recovered_hypotheses=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionPrecompletedCorners + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowFaceDecisionRecoveredHypotheses);
+        summary.AppendLine("directional_mc_shadow_topology_boundary_nonmanifold_duplicate_degenerate_crack_candidate=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowBoundaryEdges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowNonManifoldEdges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowDuplicateTriangles + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowDegenerateTriangles + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowCrackCandidateEdges);
+        summary.AppendLine("directional_mc_shadow_guard_conflict_face_deferred_unmeasured_cells_triangles_winding_normal_mismatch=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowConflictFaceDeferredTriangles + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowUnmeasuredEdgeDeferredCells + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowUnmeasuredEdgeDeferredTriangles + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowWindingCorrectedTriangles + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowNormalMismatchTriangles);
+        summary.AppendLine("directional_mc_shadow_shared_face_topology_comparisons_mismatches=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowSharedFaceTopologyComparisons + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowSharedFaceTopologyMismatches);
+        summary.AppendLine("directional_mc_shadow_persistent_cells_pending_atomic_commit_defer=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowPersistentDecisions + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowPendingTopologyChanges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowAtomicCommittedCells + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowAtomicDeferredCells);
+        summary.AppendLine("directional_mc_shadow_persistent_edges_surface_ids_edge_corrections_stable_batches=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowPersistentEdges + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowPersistentSurfaceIdentities + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowCanonicalEdgeCorrections + "|" +
+                           directionalShadowMetrics.LastDirectionalMcShadowTopologyStableBatches);
+        summary.AppendLine("directional_mc_shadow_half_voxel_production_promoted=" +
+                           (directionalShadowMetrics.LastDirectionalMcShadowFineCoarseCellsPromoted > 0 ? 1 : 0));
+        summary.AppendLine("directional_mc_shadow_ms=" +
+                           directionalShadowMetrics.LastDirectionalMcShadowMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("hermite_qef_shadow_enabled_displayed=" +
+                           (directionalShadowMetrics.HermiteQefShadowEnabled ? 1 : 0) + "|" +
+                           (showHermiteQefFeatureShadowWire ? 1 : 0));
+        summary.AppendLine("hermite_qef_shadow_production_eligible=" +
+                           (directionalShadowMetrics.HermiteQefProductionEligible ? 1 : 0));
+        summary.AppendLine("hermite_qef_shadow_actual_display=" +
+                           (directionalShadowMetrics.HermiteQefShadowEnabled &&
+                            directionalShadowMetrics.HermiteQefProductionEligible &&
+                            showHermiteQefFeatureShadowWire
+                               ? 1
+                               : 0));
+        summary.AppendLine("hermite_qef_scanned_samples_candidates_certified=" +
+                           directionalShadowMetrics.LastHermiteQefScannedCells + "|" +
+                           directionalShadowMetrics.LastHermiteQefHermiteSamples + "|" +
+                           directionalShadowMetrics.LastHermiteQefRawCandidates + "|" +
+                           directionalShadowMetrics.LastHermiteQefCertified);
+        summary.AppendLine("hermite_qef_reject_frame_view_sample_balance_rank_margin_displacement_residual=" +
+                           directionalShadowMetrics.LastHermiteQefFrameRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefViewRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefSampleRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefFamilyBalanceRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefRankRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefCellMarginRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefDisplacementRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefResidualRejected);
+        summary.AppendLine("hermite_qef_patch_reject_missing_multi_open_orientation=" +
+                           directionalShadowMetrics.LastHermiteQefMissingPatchRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefMultiPatchRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefOpenBoundaryRejected + "|" +
+                           directionalShadowMetrics.LastHermiteQefOrientationRejected);
+        summary.AppendLine("hermite_qef_provisional_applied_replaced_added_rollback=" +
+                           directionalShadowMetrics.LastHermiteQefProvisionalAppliedCells + "|" +
+                           directionalShadowMetrics.LastHermiteQefAppliedCells + "|" +
+                           directionalShadowMetrics.LastHermiteQefSourceTrianglesReplaced + "|" +
+                           directionalShadowMetrics.LastHermiteQefFeatureTrianglesAdded + "|" +
+                           directionalShadowMetrics.LastHermiteQefTopologyRollback);
+        summary.AppendLine("hermite_qef_topology_boundary_nonmanifold_duplicate_delta=" +
+                           directionalShadowMetrics.LastHermiteQefBoundaryEdges + "|" +
+                           directionalShadowMetrics.LastHermiteQefNonManifoldEdges + "|" +
+                           directionalShadowMetrics.LastHermiteQefDuplicateTriangles + "|" +
+                           directionalShadowMetrics.LastHermiteQefBoundaryEdgeDelta + "|" +
+                           directionalShadowMetrics.LastHermiteQefNonManifoldEdgeDelta + "|" +
+                           directionalShadowMetrics.LastHermiteQefDuplicateTriangleDelta);
+        summary.AppendLine("hermite_qef_pre_rollback_topology_boundary_nonmanifold_duplicate_delta=" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackBoundaryEdges + "|" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackNonManifoldEdges + "|" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackDuplicateTriangles + "|" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackBoundaryEdgeDelta + "|" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackNonManifoldEdgeDelta + "|" +
+                           directionalShadowMetrics.LastHermiteQefPreRollbackDuplicateTriangleDelta);
+        summary.AppendLine("hermite_qef_ms=" +
+                           directionalShadowMetrics.LastHermiteQefMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_refinement_probe_enabled=" +
+                           (directionalShadowMetrics.RefinementProbeEnabled ? 1 : 0));
+        summary.AppendLine("directional_tsdf_refinement_probe_semantics=" +
+                           "paper_projective_samples_same_direction_spread_or_distinct_normal_crease_or_dmc_double_surface_half_voxel_same_paper_rules");
+        summary.AppendLine("directional_tsdf_refinement_probe_min_samples=4");
+        summary.AppendLine("directional_tsdf_refinement_probe_min_span_voxels=0.350");
+        summary.AppendLine("directional_tsdf_refinement_probe_entries=" +
+                           directionalShadowMetrics.LastRefinementProbeEntries);
+        summary.AppendLine("directional_tsdf_refinement_same_direction_spread_cells=" +
+                           directionalShadowMetrics.LastRefinementSameDirectionSpreadCells);
+        summary.AppendLine("directional_tsdf_refinement_stable_crease_cells=" +
+                           directionalShadowMetrics.LastRefinementCreaseCells);
+        summary.AppendLine("directional_tsdf_refinement_dmc_double_surface_cells=" +
+                           directionalShadowMetrics.LastRefinementDmcDoubleSurfaceCells);
+        summary.AppendLine("directional_tsdf_refinement_dmc_double_surface_blocks=" +
+                           directionalShadowMetrics.LastRefinementDmcDoubleSurfaceBlocks);
+        summary.AppendLine("directional_tsdf_refinement_half_voxel_resolvable_cells=" +
+                           directionalShadowMetrics.LastRefinementHalfVoxelResolvableCells);
+        summary.AppendLine("directional_tsdf_refinement_half_voxel_insufficient_cells=" +
+                           directionalShadowMetrics.LastRefinementHalfVoxelInsufficientCells);
+        summary.AppendLine("directional_tsdf_refinement_candidate_blocks=" +
+                           directionalShadowMetrics.LastRefinementCandidateBlocks);
+        summary.AppendLine("directional_tsdf_refinement_persistent_blocks=" +
+                           directionalShadowMetrics.LastRefinementPersistentBlocks);
+        summary.AppendLine("directional_tsdf_extraction_dirty_blocks=" +
+                           directionalShadowMetrics.LastRefinementDirtyBlocks);
+        summary.AppendLine("directional_tsdf_extraction_clean_blocks=" +
+                           directionalShadowMetrics.LastRefinementCleanBlocks);
+        summary.AppendLine("directional_tsdf_refinement_projected_voxel_multiplier=" +
+                           directionalShadowMetrics.LastRefinementProjectedVoxelMultiplier
+                               .ToString("F3", CultureInfo.InvariantCulture));
+        int[] refinementSpanBuckets =
+            directionalShadowMetrics.LastRefinementDepthSpanBuckets ?? new int[4];
+        summary.AppendLine("directional_tsdf_refinement_depth_span_buckets=" +
+                           refinementSpanBuckets[0] + "|" +
+                           refinementSpanBuckets[1] + "|" +
+                           refinementSpanBuckets[2] + "|" +
+                           refinementSpanBuckets[3]);
+        summary.AppendLine("directional_tsdf_refinement_depth_span_bucket_layout=" +
+                           "lt0.25|0.25_0.50|0.50_0.75|ge0.75_voxel");
+        summary.AppendLine("directional_tsdf_refinement_bounds_valid=" +
+                           (directionalShadowMetrics.LastRefinementBoundsValid ? 1 : 0));
+        summary.AppendLine("directional_tsdf_refinement_bounds_min_world=" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMinimumWorld.x) + "|" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMinimumWorld.y) + "|" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMinimumWorld.z));
+        summary.AppendLine("directional_tsdf_refinement_bounds_max_world=" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMaximumWorld.x) + "|" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMaximumWorld.y) + "|" +
+                           AuditFloat(directionalShadowMetrics.LastRefinementMaximumWorld.z));
+        summary.AppendLine("directional_tsdf_refinement_top_blocks_layout=" +
+                           "bx,by,bz:spread,crease,half_resolvable,half_insufficient,dmc_double,dmc_overflow,persistent_batches");
+        summary.AppendLine("directional_tsdf_refinement_top_blocks=" +
+                           _directionalTsdfShadow.GetRefinementBlockDiagnostics(16));
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_enabled=" +
+                           (directionalShadowMetrics.HalfVoxelShadowEnabled ? 1 : 0));
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_semantics=" +
+                           "persistent_spread_or_distinct_normal_crease_or_paper_dmc_double_surface_blocks_real_six_direction_tsdf_fixed_truncation_width_paper_dmc_local_promotion");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_ab_layout=" +
+                           "A_retired_after_device_ab|B_single_active_branch");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_primary_metric_alias=" +
+                           "legacy_shadow_fields_equal_scaled_truncation_B");
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_ratio=0.500");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_activation=" +
+                           "strongest_persistent_seed_plus_six_face_neighbors_then_ranked_fill_max8");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_halo_coarse_voxels=1");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_lease_batches=2");
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_active_blocks=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowActiveBlocks);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_allocated_blocks=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowAllocatedBlocks);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_allocated_layers=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowAllocatedLayers);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_weighted_voxels=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowWeightedVoxels);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_candidate_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowCandidateCells);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_shadow_buffered_samples=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowBufferedSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_shadow_replayed_samples=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowReplayedSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_shadow_voxel_updates=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowVoxelUpdates);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_shadow_integration_ms=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowIntegrationMilliseconds
+                               .ToString("F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_evaluation_ms=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowEvaluationMilliseconds
+                               .ToString("F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_zero_crossing_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowZeroCrossingCells);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_predicted_cells_evaluated=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowPredictedCellsEvaluated);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_coarse_endpoint_resolved_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowCoarseEndpointResolvedCells);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_fine_endpoint_resolved_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowFineEndpointResolvedCells);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_recovered_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowRecoveredCells);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_missing_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowMissingCells);
+        summary.AppendLine("directional_tsdf_half_voxel_shadow_extra_envelope_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelShadowExtraEnvelopeCells);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_allocated_layers=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationAllocatedLayers);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_weighted_voxels=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationWeightedVoxels);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_candidate_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationCandidateCells);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_scaled_truncation_replayed_samples=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationReplayedSamples);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_scaled_truncation_voxel_updates=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationVoxelUpdates);
+        summary.AppendLine("capture_batch_directional_tsdf_half_voxel_scaled_truncation_integration_ms=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationIntegrationMilliseconds
+                               .ToString("F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_evaluation_ms=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationEvaluationMilliseconds
+                               .ToString("F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_zero_crossing_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationZeroCrossingCells);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_predicted_cells_evaluated=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationPredictedCellsEvaluated);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_fine_endpoint_resolved_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationFineEndpointResolvedCells);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_recovered_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationRecoveredCells);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_missing_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationMissingCells);
+        summary.AppendLine("directional_tsdf_half_voxel_scaled_truncation_extra_envelope_cells=" +
+                           directionalShadowMetrics.LastHalfVoxelScaledTruncationExtraEnvelopeCells);
+        summary.AppendLine("directional_tsdf_shadow_secondary_layer_zero_crossing_cells=" +
+                           directionalShadowMetrics.LastSecondaryLayerZeroCrossingCells);
+        summary.AppendLine("directional_tsdf_shadow_suppressed_opposite_direction_cells=" +
+                           directionalShadowMetrics.LastSuppressedOppositeDirectionCells);
+        summary.AppendLine("directional_tsdf_shadow_suppressed_coincident_secondary_cells=" +
+                           directionalShadowMetrics.LastSuppressedCoincidentSecondaryCells);
+        summary.AppendLine("directional_tsdf_shadow_preserved_close_parallel_cells=" +
+                           directionalShadowMetrics.LastPreservedCloseParallelCells);
+        summary.AppendLine("directional_tsdf_composition_invalid_direction_hypotheses=" +
+                           directionalShadowMetrics.LastInvalidDirectionHypotheses);
+        summary.AppendLine("directional_tsdf_composition_observed_normal_hypotheses=" +
+                           directionalShadowMetrics.LastObservedNormalHypotheses);
+        summary.AppendLine("directional_tsdf_composition_parallel_hypotheses_collapsed=" +
+                           directionalShadowMetrics.LastParallelHypothesesCollapsed);
+        summary.AppendLine("directional_tsdf_composition_incompatible_weak_hypotheses_dropped=" +
+                           directionalShadowMetrics.LastIncompatibleWeakHypothesesDropped);
+        summary.AppendLine("directional_tsdf_composition_edge_crossings_merged=" +
+                           directionalShadowMetrics.LastEdgeCrossingsMerged);
+        summary.AppendLine("directional_tsdf_composition_edge_crossing_overflow_dropped=" +
+                           directionalShadowMetrics.LastEdgeCrossingOverflowDropped);
+        summary.AppendLine("directional_tsdf_composition_conservative_conflict_cells=" +
+                           directionalShadowMetrics.LastConservativeConflictCells);
+        summary.AppendLine("directional_tsdf_composition_nonmanifold_triangles_dropped=" +
+                           directionalShadowMetrics.LastNonManifoldTrianglesDropped);
+        summary.AppendLine("directional_tsdf_surface_candidate_nodes=" +
+                           directionalShadowMetrics.LastSurfaceCandidateNodes);
+        summary.AppendLine("directional_tsdf_surface_components=" +
+                           directionalShadowMetrics.LastSurfaceComponents);
+        summary.AppendLine("directional_tsdf_surface_component_links=" +
+                           directionalShadowMetrics.LastSurfaceComponentLinks);
+        summary.AppendLine("directional_tsdf_surface_single_cell_gap_links=" +
+                           directionalShadowMetrics.LastSurfaceSingleCellGapLinks);
+        summary.AppendLine("directional_tsdf_surface_component_singletons=" +
+                           directionalShadowMetrics.LastSurfaceComponentSingletons);
+        summary.AppendLine("directional_tsdf_surface_gap_bridge_candidates=" +
+                           directionalShadowMetrics.LastSurfaceGapBridgeCandidates);
+        summary.AppendLine("directional_tsdf_surface_gap_bridge_triangles=" +
+                           directionalShadowMetrics.LastSurfaceGapBridgeTriangles);
+        summary.AppendLine("directional_tsdf_surface_consistent_edge_merges=" +
+                           directionalShadowMetrics.LastSurfaceConsistentEdgeMerges);
+        summary.AppendLine("directional_tsdf_surface_crease_junction_edge_merges=" +
+                           directionalShadowMetrics.LastCreaseJunctionEdgeMerges);
+        summary.AppendLine("directional_tsdf_surface_cross_surface_near_crossings_preserved=" +
+                           directionalShadowMetrics.LastCrossSurfaceNearCrossingsPreserved);
+        summary.AppendLine("directional_tsdf_surface_continuity_edge_disagreements=" +
+                           directionalShadowMetrics.LastSurfaceContinuityEdgeDisagreements);
+        summary.AppendLine("directional_tsdf_physical_surface_merger_semantics=" +
+                           "plane_normal_and_offset_before_triangulation_six_slot_one_to_one");
+        summary.AppendLine("directional_tsdf_physical_surface_correction_semantics=" +
+                           "rebuild_from_persistent_tsdf_with_two_batch_mature_depth_challenger_replacement");
+        summary.AppendLine("directional_tsdf_physical_surface_local_merges=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceLocalMerges);
+        summary.AppendLine("directional_tsdf_physical_surface_opposite_direction_merges=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceOppositeDirectionMerges);
+        summary.AppendLine("directional_tsdf_physical_surface_one_to_one_links=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceOneToOneLinks);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_candidate_pairs=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateCandidatePairs);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_links=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateLinks);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_relaxed_links=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateRelaxedLinks);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_rejected_pairs=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateRejectedPairs);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_ambiguous_pairs=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateAmbiguousPairs);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_indexed_node_pairs=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateIndexedNodePairs);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_direct_candidates=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateDirectCandidates);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_direct_links=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateDirectLinks);
+        summary.AppendLine("directional_tsdf_physical_surface_certificate_direct_rejected=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceCertificateDirectRejected);
+        summary.AppendLine("directional_tsdf_physical_surface_identity_edge_candidates=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceIdentityEdgeCandidates);
+        summary.AppendLine("directional_tsdf_physical_surface_identity_edge_merges=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceIdentityEdgeMerges);
+        summary.AppendLine("directional_tsdf_physical_surface_identity_edge_rejected=" +
+                           directionalShadowMetrics.LastPhysicalSurfaceIdentityEdgeRejected);
+        summary.AppendLine("directional_tsdf_shadow_vertices=" +
+                           directionalShadowMetrics.LastVertices);
+        summary.AppendLine("directional_tsdf_shadow_triangles=" +
+                           directionalShadowMetrics.LastTriangles);
+        summary.AppendLine("directional_tsdf_shadow_boundary_edges=" +
+                           directionalShadowMetrics.LastBoundaryEdges);
+        summary.AppendLine("directional_tsdf_shadow_nonmanifold_edges=" +
+                           directionalShadowMetrics.LastNonManifoldEdges);
+        summary.AppendLine("directional_tsdf_shadow_duplicate_triangles=" +
+                           directionalShadowMetrics.LastDuplicateTriangles);
+        summary.AppendLine("directional_tsdf_shadow_truncated=" +
+                           (directionalShadowMetrics.LastTruncated ? 1 : 0));
+        summary.AppendLine("directional_tsdf_shadow_weighted_voxels_by_direction=" +
+                           JoinDirectionalShadowCounts(directionalShadowMetrics.WeightedVoxelsByDirection));
+        summary.AppendLine("directional_tsdf_shadow_triangles_by_direction=" +
+                           JoinDirectionalShadowCounts(directionalShadowMetrics.TrianglesByDirection));
+        summary.AppendLine("geometry_certificate_state_count=" +
+                           _geometryMaturityStates.Count);
+        summary.AppendLine("geometry_certificate_secondary_state_count=" +
+                           _geometryMaturitySecondaryStates.Count);
+        summary.AppendLine("geometry_certificate_active_mature_count=" +
+                           CountMatureGeometryCertificates());
+        summary.AppendLine("capture_batch_mature_smooth_fast_candidate=" +
+                           LastCaptureBatchMatureSmoothFastPathCandidateCount);
+        summary.AppendLine("capture_batch_mature_smooth_fast_accepted=" +
+                           LastCaptureBatchMatureSmoothFastPathAcceptedCount);
+        summary.AppendLine("capture_batch_mature_smooth_fast_changed=" +
+                           LastCaptureBatchMatureSmoothFastPathChangedCount);
+        summary.AppendLine("capture_batch_mature_smooth_fast_unsafe_state=" +
+                           LastCaptureBatchMatureSmoothFastPathUnsafeStateCount);
+        summary.AppendLine("new_plane_local_reanchor_enabled=" +
+                           (enableNewPlaneLocalReanchoring ? 1 : 0));
+        summary.AppendLine("capture_batch_local_reanchor_fit_candidate=" +
+                           LastCaptureBatchLocalReanchorFitCandidateCount);
+        summary.AppendLine("capture_batch_local_reanchor_fit_accepted=" +
+                           LastCaptureBatchLocalReanchorFitAcceptedCount);
+        summary.AppendLine("capture_batch_local_reanchor_applied=" +
+                           LastCaptureBatchLocalReanchorAppliedCount);
+        summary.AppendLine("capture_batch_local_reanchor_shift_total_m=" +
+                           LastCaptureBatchLocalReanchorShiftMeters.ToString(
+                               "F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_local_reanchor_shift_mean_m=" +
+                           (LastCaptureBatchLocalReanchorAppliedCount > 0
+                               ? LastCaptureBatchLocalReanchorShiftMeters /
+                                 LastCaptureBatchLocalReanchorAppliedCount
+                               : 0f).ToString("F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("capture_batch_local_reanchor_cross_layer_neighbors_excluded=" +
+                           LastCaptureBatchLocalReanchorCrossLayerExcludedCount);
+        AppendFusionStratifiedDiagnostics(summary);
+        summary.AppendLine("fusion_dense_stamp_production_enabled=" +
+                           (useFusionDenseStampProduction ? 1 : 0));
+        summary.AppendLine("fusion_dense_stamp_shadow_enabled=" +
+                           (enableFusionDenseStampShadow ? 1 : 0));
+        summary.AppendLine("capture_batch_fusion_dense_stamp_lookups=" +
+                           LastCaptureBatchFusionDenseStampLookupCount);
+        summary.AppendLine("capture_batch_fusion_dense_stamp_mismatches=" +
+                           LastCaptureBatchFusionDenseStampMismatchCount);
         summary.AppendLine("reference_classic_paused_for_performance=" +
                            (LastReferenceClassicPausedForPerformance ? 1 : 0));
         summary.AppendLine("low_overhead_performance_measurement=" +
                            (enableLowOverheadPerformanceMeasurement ? 1 : 0));
         summary.AppendLine("persistent_result_chunk_publishing_enabled=" +
                            (enablePersistentResultChunkPublishing ? 1 : 0));
+        summary.AppendLine("persistent_result_delta_publishing_enabled=" +
+                           (enablePersistentResultDeltaPublishing ? 1 : 0));
+        summary.AppendLine("persistent_result_delta_halo_blocks=" +
+                           persistentResultDeltaHaloBlocks);
+        summary.AppendLine("persistent_result_edge_owner_halo_blocks=" +
+                           persistentResultEdgeOwnerHaloBlocks);
+        summary.AppendLine("persistent_semantic_incremental_scope_enabled=" +
+                           (enableIncrementalSemanticFinalizationScope ? 1 : 0));
+        summary.AppendLine("persistent_semantic_scope_halo_blocks=" +
+                           persistentSemanticFinalizationHaloBlocks);
+        summary.AppendLine("persistent_result_retire_confirm_rebuilds=" +
+                           persistentResultRetireConfirmRebuilds);
+        summary.AppendLine("persistent_result_double_buffering_enabled=" +
+                           (enablePersistentResultChunkDoubleBuffering ? 1 : 0));
         summary.AppendLine("persistent_result_chunk_updated=" +
                            LastPersistentResultChunkUpdatedCount);
         summary.AppendLine("persistent_result_chunk_preserved=" +
@@ -10954,15 +16615,440 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("persistent_result_chunk_publish_ms=" +
                            LastPersistentResultChunkPublishMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("persistent_result_delta_changed=" +
+                           LastPersistentResultDeltaChangedCount);
+        summary.AppendLine("persistent_result_delta_halo=" +
+                           LastPersistentResultDeltaHaloCount);
+        summary.AppendLine("persistent_result_delta_touched=" +
+                           LastPersistentResultDeltaTouchedCount);
+        summary.AppendLine("persistent_result_retire_candidates=" +
+                           LastPersistentResultRetireCandidateCount);
+        summary.AppendLine("persistent_result_retire_deferred=" +
+                           LastPersistentResultRetireDeferredCount);
+        summary.AppendLine("persistent_result_double_buffered_swaps=" +
+                           LastPersistentResultDoubleBufferedSwapCount);
+        summary.AppendLine("persistent_result_chunk_upload_max_ms=" +
+                           LastPersistentResultChunkUploadMaxMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("persistent_result_cross_category_edges_suppressed=" +
+                           LastPersistentResultCrossCategoryEdgeSuppressedCount);
+        summary.AppendLine("persistent_result_edge_owner_scope_blocks=" +
+                           LastPersistentResultEdgeOwnerScopeBlockCount);
+        summary.AppendLine("persistent_result_edge_owner_scope_entries=" +
+                           LastPersistentResultEdgeOwnerScopeEntryCount);
+        summary.AppendLine("persistent_semantic_scope_blocks=" +
+                           LastPersistentSemanticFinalizationScopeBlockCount);
+        summary.AppendLine("persistent_semantic_reused_blocks=" +
+                           LastPersistentSemanticFinalizationReusedBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_tolerance_voxels=" +
+                           dependencySemanticReusePositionToleranceVoxels.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_semantic_reuse_checks=" +
+                           LastDependencySemanticReuseCheckCount);
+        summary.AppendLine("dependency_semantic_reuse_accepted=" +
+                           LastDependencySemanticReuseAcceptedCount);
+        summary.AppendLine("dependency_semantic_reuse_reject_null=" +
+                           LastDependencySemanticReuseRejectedNullCount);
+        summary.AppendLine("dependency_semantic_reuse_reject_shape=" +
+                           LastDependencySemanticReuseRejectedShapeCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_vertex_count_blocks=" +
+                           LastDependencySemanticReuseShapeVertexCountMismatchBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_triangle_count_blocks=" +
+                           LastDependencySemanticReuseShapeTriangleCountMismatchBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_source_count_blocks=" +
+                           LastDependencySemanticReuseShapeSourceCountMismatchBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_malformed_vertex_key_blocks=" +
+                           LastDependencySemanticReuseShapeMalformedVertexKeyBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_multi_component_blocks=" +
+                           LastDependencySemanticReuseShapeMultiComponentMismatchBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_split_vertex_blocks=" +
+                           LastDependencySemanticReuseShapeSplitVertexMismatchBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_boundary_only_blocks=" +
+                           LastDependencySemanticReuseShapeBoundaryOnlyBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_interior_blocks=" +
+                           LastDependencySemanticReuseShapeInteriorBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_connectivity_only_blocks=" +
+                           LastDependencySemanticReuseShapeConnectivityOnlyBlockCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_added_vertex_keys=" +
+                           LastDependencySemanticReuseShapeAddedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_removed_vertex_keys=" +
+                           LastDependencySemanticReuseShapeRemovedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_boundary_added_vertex_keys=" +
+                           LastDependencySemanticReuseShapeBoundaryAddedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_boundary_removed_vertex_keys=" +
+                           LastDependencySemanticReuseShapeBoundaryRemovedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_interior_added_vertex_keys=" +
+                           LastDependencySemanticReuseShapeInteriorAddedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_shape_interior_removed_vertex_keys=" +
+                           LastDependencySemanticReuseShapeInteriorRemovedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_unique_added_keys=" +
+                           LastDependencySemanticReuseBoundaryUniqueAddedKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_unique_removed_keys=" +
+                           LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_migrated_keys=" +
+                           LastDependencySemanticReuseBoundaryMigratedKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_face_migrations=" +
+                           LastDependencySemanticReuseBoundaryFaceNeighbourMigrationCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_diagonal_migrations=" +
+                           LastDependencySemanticReuseBoundaryDiagonalNeighbourMigrationCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_non_neighbour_migrations=" +
+                           LastDependencySemanticReuseBoundaryNonNeighbourMigrationCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_same_owner_migrations=" +
+                           LastDependencySemanticReuseBoundarySameOwnerMigrationCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_unmatched_added_keys=" +
+                           LastDependencySemanticReuseBoundaryUnmatchedAddedKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_unmatched_removed_keys=" +
+                           LastDependencySemanticReuseBoundaryUnmatchedRemovedKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_boundary_migration_ratio=" +
+                           LastDependencySemanticReuseBoundaryMigrationRatio.ToString(
+                               "F4", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_semantic_reuse_removed_sources=" +
+                           LastDependencySemanticReuseRemovedSourceCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_boundary=" +
+                           LastDependencySemanticReuseRemovedSourceBoundaryCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_interior=" +
+                           LastDependencySemanticReuseRemovedSourceInteriorCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_invalid_axis_or_index=" +
+                           LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_outside_extraction_range=" +
+                           LastDependencySemanticReuseRemovedSourceOutsideExtractionRangeCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_weight=" +
+                           LastDependencySemanticReuseRemovedSourceWeightCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_eligibility=" +
+                           LastDependencySemanticReuseRemovedSourceEligibilityCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_nonfinite_tsdf=" +
+                           LastDependencySemanticReuseRemovedSourceNonFiniteTsdfCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_exact_zero=" +
+                           LastDependencySemanticReuseRemovedSourceExactZeroCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_same_sign=" +
+                           LastDependencySemanticReuseRemovedSourceSameSignCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_degenerate_delta=" +
+                           LastDependencySemanticReuseRemovedSourceDegenerateDeltaCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_nonfinite_crossing=" +
+                           LastDependencySemanticReuseRemovedSourceNonFiniteCrossingCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_owner_changed=" +
+                           LastDependencySemanticReuseRemovedSourceOwnerChangedCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_cell_vertex_missing=" +
+                           LastDependencySemanticReuseRemovedSourceCellVertexMissingCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_invalid=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryInvalidCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_edge=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryEdgeCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_diagonal=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryDiagonalCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_area=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryAreaCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_twist=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryTwistCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_geometry_plane=" +
+                           LastDependencySemanticReuseRemovedSourceGeometryPlaneCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_still_valid_missing=" +
+                           LastDependencySemanticReuseRemovedSourceStillValidMissingCount);
+        summary.AppendLine("dependency_semantic_reuse_removed_source_diagnostic_ms=" +
+                           LastDependencySemanticReuseRemovedSourceDiagnosticMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_boundary_sign_hysteresis_shadow_enabled=" +
+                           (enableDependencyBoundaryZeroCrossSignHysteresisShadow ? 1 : 0));
+        summary.AppendLine("dependency_boundary_sign_hysteresis_near_zero_tsdf=" +
+                           dependencyBoundarySignHysteresisNearZeroTsdf.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_boundary_sign_hysteresis_far_limit=" +
+                           dependencyBoundarySignHysteresisFarTsdfLimit.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_boundary_sign_hysteresis_grace_rebuilds=" +
+                           dependencyBoundarySignHysteresisGraceRebuilds);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_tracked_sources=" +
+                           LastDependencyBoundarySignHysteresisShadowTrackedSourceCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_same_sign_missing=" +
+                           LastDependencyBoundarySignHysteresisShadowSameSignMissingCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_eligible=" +
+                           LastDependencyBoundarySignHysteresisShadowEligibleCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_retained=" +
+                           LastDependencyBoundarySignHysteresisShadowRetainedCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_active_retained=" +
+                           LastDependencyBoundarySignHysteresisShadowActiveRetainedCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_recovered=" +
+                           LastDependencyBoundarySignHysteresisShadowRecoveredCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_expired=" +
+                           LastDependencyBoundarySignHysteresisShadowExpiredCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_hard_dropped=" +
+                           LastDependencyBoundarySignHysteresisShadowHardDroppedCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_positive=" +
+                           LastDependencyBoundarySignHysteresisShadowPositiveCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_negative=" +
+                           LastDependencyBoundarySignHysteresisShadowNegativeCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_near_rejected=" +
+                           LastDependencyBoundarySignHysteresisShadowNearRejectedCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_far_rejected=" +
+                           LastDependencyBoundarySignHysteresisShadowFarRejectedCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_direct_resets=" +
+                           LastDependencyBoundarySignHysteresisShadowDirectResetCount);
+        summary.AppendLine("dependency_boundary_sign_hysteresis_missing_reduction_ratio=" +
+                           LastDependencyBoundarySignHysteresisShadowPotentialMissingReductionRatio.ToString(
+                               "F4", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_boundary_sign_hysteresis_diagnostic_ms=" +
+                           LastDependencyBoundarySignHysteresisShadowDiagnosticMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_boundary_sign_observation_created=" +
+                           LastDependencyBoundarySignObservationCreatedCount);
+        summary.AppendLine("dependency_boundary_sign_observation_recovered=" +
+                           LastDependencyBoundarySignObservationRecoveredCount);
+        summary.AppendLine("dependency_boundary_sign_observation_expired=" +
+                           LastDependencyBoundarySignObservationExpiredCount);
+        summary.AppendLine("dependency_boundary_sign_observation_hard_dropped=" +
+                           LastDependencyBoundarySignObservationHardDroppedCount);
+        summary.AppendLine("dependency_boundary_sign_observation_direct_reset=" +
+                           LastDependencyBoundarySignObservationDirectResetCount);
+        summary.AppendLine("dependency_boundary_sign_observation_pending=" +
+                           LastDependencyBoundarySignObservationPendingCount);
+        summary.AppendLine(
+            "dependency_boundary_sign_histogram_layout=min_abs_rows_max_abs_columns_row_major");
+        summary.AppendLine(
+            "dependency_boundary_sign_histogram_min_abs_buckets=le_0.005|le_0.010|le_0.020|le_0.050|le_0.100|gt_0.100");
+        summary.AppendLine(
+            "dependency_boundary_sign_histogram_max_abs_buckets=le_0.050|le_0.100|le_0.150|le_0.250|le_0.500|gt_0.500");
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_pos_candidates",
+            _dependencyBoundarySignHistogramPositiveCandidates);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_neg_candidates",
+            _dependencyBoundarySignHistogramNegativeCandidates);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_pos_recovered",
+            _dependencyBoundarySignHistogramPositiveRecovered);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_neg_recovered",
+            _dependencyBoundarySignHistogramNegativeRecovered);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_pos_expired",
+            _dependencyBoundarySignHistogramPositiveExpired);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_neg_expired",
+            _dependencyBoundarySignHistogramNegativeExpired);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_pos_hard_dropped",
+            _dependencyBoundarySignHistogramPositiveHardDropped);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_sign_hist_neg_hard_dropped",
+            _dependencyBoundarySignHistogramNegativeHardDropped);
+        summary.AppendLine("dependency_boundary_temporal_free_space_shadow_enabled=" +
+                           (enableDependencyBoundaryTemporalFreeSpaceShadow ? 1 : 0));
+        summary.AppendLine("dependency_boundary_temporal_free_space_shadow_only=1");
+        summary.AppendLine("dependency_boundary_temporal_observation_rebuilds=" +
+                           Mathf.Clamp(dependencyBoundaryTemporalObservationRebuilds, 2, 5));
+        summary.AppendLine("dependency_boundary_temporal_view_separation_degrees=" +
+                           DependencyBoundaryTemporalViewSeparationDegrees.ToString(
+                               "F1", CultureInfo.InvariantCulture));
+        summary.AppendLine(
+            "dependency_boundary_temporal_histogram_layout=prior_present_rebuild_rows_free_space_columns_row_major");
+        summary.AppendLine(
+            "dependency_boundary_temporal_support_buckets=1|2_3|4_7|ge_8");
+        summary.AppendLine(
+            "dependency_boundary_temporal_free_space_buckets=none|pending|confirmed");
+        summary.AppendLine("dependency_boundary_temporal_created=" +
+                           LastDependencyBoundaryTemporalObservationCreatedCount);
+        summary.AppendLine("dependency_boundary_temporal_recovered_h1=" +
+                           LastDependencyBoundaryTemporalRecoveredH1Count);
+        summary.AppendLine("dependency_boundary_temporal_recovered_h2=" +
+                           LastDependencyBoundaryTemporalRecoveredH2Count);
+        summary.AppendLine("dependency_boundary_temporal_recovered_h3=" +
+                           LastDependencyBoundaryTemporalRecoveredH3Count);
+        summary.AppendLine("dependency_boundary_temporal_persistent=" +
+                           LastDependencyBoundaryTemporalPersistentCount);
+        summary.AppendLine("dependency_boundary_temporal_direct_reset=" +
+                           LastDependencyBoundaryTemporalDirectResetCount);
+        summary.AppendLine("dependency_boundary_temporal_pending=" +
+                           LastDependencyBoundaryTemporalPendingCount);
+        summary.AppendLine("dependency_boundary_temporal_free_space_confirmed_recovered=" +
+                           LastDependencyBoundaryTemporalFreeSpaceConfirmedRecoveredCount);
+        summary.AppendLine("dependency_boundary_temporal_free_space_confirmed_persistent=" +
+                           LastDependencyBoundaryTemporalFreeSpaceConfirmedPersistentCount);
+        summary.AppendLine("dependency_boundary_temporal_never_confirmed_recovered=" +
+                           LastDependencyBoundaryTemporalNeverConfirmedRecoveredCount);
+        summary.AppendLine("dependency_boundary_temporal_never_confirmed_persistent=" +
+                           LastDependencyBoundaryTemporalNeverConfirmedPersistentCount);
+        summary.AppendLine("dependency_boundary_temporal_diagnostic_ms=" +
+                           LastDependencyBoundaryTemporalDiagnosticMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_single_view_candidates",
+            _dependencyBoundaryTemporalSingleViewCandidates);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_single_view_recovered_h1",
+            _dependencyBoundaryTemporalSingleViewRecoveredH1);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_single_view_recovered_h2",
+            _dependencyBoundaryTemporalSingleViewRecoveredH2);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_single_view_recovered_h3",
+            _dependencyBoundaryTemporalSingleViewRecoveredH3);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_single_view_persistent",
+            _dependencyBoundaryTemporalSingleViewPersistent);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_multi_view_candidates",
+            _dependencyBoundaryTemporalMultiViewCandidates);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_multi_view_recovered_h1",
+            _dependencyBoundaryTemporalMultiViewRecoveredH1);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_multi_view_recovered_h2",
+            _dependencyBoundaryTemporalMultiViewRecoveredH2);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_multi_view_recovered_h3",
+            _dependencyBoundaryTemporalMultiViewRecoveredH3);
+        AppendDependencyBoundarySignHistogram(
+            summary, "dependency_boundary_temporal_multi_view_persistent",
+            _dependencyBoundaryTemporalMultiViewPersistent);
+        summary.AppendLine("dependency_semantic_reuse_shape_vertex_delta_sum=" +
+                           LastDependencySemanticReuseShapeVertexDeltaSum);
+        summary.AppendLine("dependency_semantic_reuse_shape_triangle_delta_sum=" +
+                           LastDependencySemanticReuseShapeTriangleDeltaSum);
+        summary.AppendLine("dependency_semantic_reuse_shape_source_delta_sum=" +
+                           LastDependencySemanticReuseShapeSourceDeltaSum);
+        summary.AppendLine("dependency_semantic_reuse_shape_vertex_delta_max_abs=" +
+                           LastDependencySemanticReuseShapeVertexDeltaMaxAbs);
+        summary.AppendLine("dependency_semantic_reuse_shape_triangle_delta_max_abs=" +
+                           LastDependencySemanticReuseShapeTriangleDeltaMaxAbs);
+        summary.AppendLine("dependency_semantic_reuse_reject_vertex_key=" +
+                           LastDependencySemanticReuseRejectedVertexKeyCount);
+        summary.AppendLine("dependency_semantic_reuse_reject_triangle=" +
+                           LastDependencySemanticReuseRejectedTriangleCount);
+        summary.AppendLine("dependency_semantic_reuse_reject_triangle_source=" +
+                           LastDependencySemanticReuseRejectedTriangleSourceCount);
+        summary.AppendLine("dependency_semantic_reuse_reject_position=" +
+                           LastDependencySemanticReuseRejectedPositionCount);
+        summary.AppendLine("dependency_semantic_reuse_position_vertices=" +
+                           LastDependencySemanticReusePositionComparedVertexCount);
+        summary.AppendLine("dependency_semantic_reuse_position_max_m=" +
+                           LastDependencySemanticReusePositionMaxDriftMeters.ToString(
+                               "F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_semantic_reuse_position_rms_m=" +
+                           LastDependencySemanticReusePositionRmsDriftMeters.ToString(
+                               "F6", CultureInfo.InvariantCulture));
+        summary.AppendLine("dependency_semantic_reuse_compare_ms=" +
+                           LastDependencySemanticReuseComparisonMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_aggregate_topology_skipped=" +
+                           (LastPlaneConstrainedZeroCrossAggregateTopologySkipped ? 1 : 0));
+        summary.AppendLine("plane_zero_cross_reextract_ms=" +
+                           LastPlaneConstrainedZeroCrossReextractMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_ledger_collect_ms=" +
+                           LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_aggregate_topology_ms=" +
+                           LastPlaneConstrainedZeroCrossAggregateTopologyMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_commit_ms=" +
+                           LastPlaneConstrainedZeroCrossCommitMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("locality_shadow_enabled=" +
+                           (enablePersistentResultLocalityShadow ? 1 : 0));
+        summary.AppendLine("locality_shadow_blocks_total=" + LastLocalityShadowBlocksTotal);
+        summary.AppendLine("locality_shadow_blocks_new=" + LastLocalityShadowBlocksNew);
+        summary.AppendLine("locality_shadow_blocks_removed=" + LastLocalityShadowBlocksRemoved);
+        summary.AppendLine("locality_shadow_semantic_same=" + LastLocalityShadowSemanticSame);
+        summary.AppendLine("locality_shadow_semantic_delta=" + LastLocalityShadowSemanticDelta);
+        summary.AppendLine("locality_shadow_render_same=" + LastLocalityShadowRenderSame);
+        summary.AppendLine("locality_shadow_render_delta=" + LastLocalityShadowRenderDelta);
+        summary.AppendLine("locality_shadow_mutated_but_render_same=" +
+                           LastLocalityShadowMutatedButRenderSame);
+        summary.AppendLine("locality_shadow_theoretical_upload_skip=" +
+                           LastLocalityShadowTheoreticalUploadSkip);
+        summary.AppendLine("locality_shadow_changed_to_render_delta_ratio=" +
+                           LastLocalityShadowChangedToRenderDeltaRatio.ToString(
+                               "F4", CultureInfo.InvariantCulture));
+        summary.AppendLine("horizontal_plane_shadow_enabled=" +
+                           (enableHorizontalPlaneProposalShadow ? 1 : 0));
+        summary.AppendLine("mature_horizontal_plane_production_enabled=" +
+                           (enableMatureHorizontalPlaneProduction ? 1 : 0));
+        summary.AppendLine("mature_horizontal_plane_production_active=" +
+                           LastMatureHorizontalProductionPlaneCount);
+        summary.AppendLine("mature_horizontal_plane_production_retained=" +
+                           (_hasRetainedMatureHorizontalProductionPlane ? 1 : 0));
+        summary.AppendLine("mature_horizontal_plane_production_missing_rounds=" +
+                           _retainedMatureHorizontalProductionMissingRounds);
+        summary.AppendLine("horizontal_plane_shadow_input_samples=" +
+                           LastHorizontalPlaneShadowInputSampleCount);
+        summary.AppendLine("horizontal_plane_shadow_eligible_samples=" +
+                           LastHorizontalPlaneShadowEligibleSampleCount);
+        summary.AppendLine("horizontal_plane_shadow_proposals=" +
+                           LastHorizontalPlaneShadowProposalCount);
+        summary.AppendLine("horizontal_plane_shadow_candidate_mature=" +
+                           LastHorizontalPlaneShadowCandidateCount + "/" +
+                           LastHorizontalPlaneShadowMatureCount);
+        summary.AppendLine("horizontal_plane_shadow_floor_object_ambiguous=" +
+                           LastHorizontalPlaneShadowFloorLikelyCount + "/" +
+                           LastHorizontalPlaneShadowObjectLikelyCount + "/" +
+                           LastHorizontalPlaneShadowAmbiguousCount);
+        summary.AppendLine("horizontal_plane_shadow_lowest_y=" +
+                           LastHorizontalPlaneShadowLowestY.ToString(
+                               "F4", CultureInfo.InvariantCulture));
+        summary.AppendLine("horizontal_plane_shadow_best_radius_inliers=" +
+                           LastHorizontalPlaneShadowBestRadius.ToString(
+                               "F4", CultureInfo.InvariantCulture) + "/" +
+                           LastHorizontalPlaneShadowBestInliers);
+        summary.AppendLine("horizontal_plane_shadow_ms=" +
+                           LastHorizontalPlaneShadowMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
         summary.AppendLine("incremental_dirty_tracking_ms=" +
                            LastIncrementalProductionDirtyTrackingMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("incremental_dirty_blocks=" + LastIncrementalTsdfDirtyBlockCount);
+        summary.AppendLine("incremental_dirty_new_blocks=" + LastIncrementalTsdfDirtyNewBlockCount);
+        summary.AppendLine("incremental_dirty_changed_blocks=" + LastIncrementalTsdfDirtyChangedBlockCount);
+        summary.AppendLine("incremental_dirty_missing_blocks=" + LastIncrementalTsdfDirtyMissingBlockCount);
+        summary.AppendLine("incremental_boundary_mask_confirm_rebuilds=" +
+                           incrementalTsdfBoundaryMaskConfirmRebuilds);
+        summary.AppendLine("incremental_boundary_mask_stabilization_enabled=" +
+                           (stabilizeIncrementalTsdfBoundaryMaskChanges ? 1 : 0));
+        summary.AppendLine("incremental_boundary_mask_pending_blocks=" +
+                           LastIncrementalTsdfBoundaryMaskPendingCount);
+        summary.AppendLine("incremental_boundary_mask_confirmed_blocks=" +
+                           LastIncrementalTsdfBoundaryMaskConfirmedCount);
         summary.AppendLine("incremental_dependency_localization_enabled=" +
                            (localizeAuthoritativeHaloDependencies ? 1 : 0));
+        summary.AppendLine("incremental_dependency_reciprocal_boundary_enabled=" +
+                           (requireReciprocalAuthoritativeBoundaryDependency ? 1 : 0));
+        summary.AppendLine("incremental_dependency_diagonal_reciprocal_enabled=" +
+                           (requireReciprocalDiagonalAuthoritativeDependency ? 1 : 0));
+        summary.AppendLine("incremental_legacy_relaxed_candidate_intake_localized=" +
+                           (localizeLegacyRelaxedCandidateIntake ? 1 : 0));
         summary.AppendLine("incremental_dependency_candidates=" +
                            LastAuthoritativeBlockDependencyCandidateCount);
         summary.AppendLine("incremental_dependency_pruned=" +
                            LastAuthoritativeBlockDependencyPrunedCount);
+        summary.AppendLine("incremental_dependency_reciprocal_pruned=" +
+                           LastAuthoritativeBlockDependencyReciprocalPrunedCount);
+        summary.AppendLine("incremental_dependency_face_neighbors_only=" +
+                           (authoritativeDependencyFaceNeighborsOnly ? 1 : 0));
+        summary.AppendLine("incremental_dependency_diagonal_pruned=" +
+                           LastAuthoritativeBlockDependencyDiagonalPrunedCount);
+        summary.AppendLine("incremental_plane_changed=" + LastAuthoritativePlaneChangedCount);
+        summary.AppendLine("incremental_plane_invalidated_blocks=" +
+                           LastAuthoritativePlaneInvalidatedBlockCount);
+        summary.AppendLine("incremental_plane_newly_mature=" + LastAuthoritativeNewPlaneCount);
+        summary.AppendLine("incremental_plane_newly_mature_invalidated_blocks=" +
+                           LastAuthoritativeNewPlaneInvalidatedBlockCount);
+        summary.AppendLine("incremental_structural_wall_planes=" +
+                           LastAuthoritativeCyanStructuralWallPlaneCount);
+        summary.AppendLine("incremental_structural_horizontal_planes=" +
+                           LastAuthoritativeCyanStructuralHorizontalPlaneCount);
+        summary.AppendLine("incremental_observed_floor_support_planes=" +
+                           LastObservedFloorSupportPlaneCount);
+        summary.AppendLine("incremental_observed_floor_support_candidate_cells=" +
+                           LastObservedFloorSupportCandidateCellCount);
+        summary.AppendLine("incremental_observed_floor_support_covered_cells=" +
+                           LastObservedFloorSupportCoveredCellCount);
+        summary.AppendLine("incremental_observed_floor_support_filled_cells=" +
+                           LastObservedFloorSupportFilledCellCount);
+        summary.AppendLine("incremental_observed_floor_support_triangles=" +
+                           LastObservedFloorSupportTriangleCount);
+        summary.AppendLine("incremental_observed_floor_support_blocks=" +
+                           LastObservedFloorSupportBlockCount);
+        summary.AppendLine("incremental_plane_invalidation_deferred_to_dirty=" +
+                           (deferStablePlaneInvalidationUntilBlockDirty ? 1 : 0));
         summary.AppendLine("incremental_dependency_schedule_ms=" +
                            LastAuthoritativeBlockDependencyScheduleMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
@@ -10972,9 +17058,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("incremental_semantic_finalize_ms=" +
                            LastAuthoritativeBlockSemanticFinalizeMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("incremental_plane_constraint_apply_ms=" +
+                           LastAuthoritativePlaneConstraintApplyMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
         summary.AppendLine("incremental_cache_merge_ms=" +
                            LastAuthoritativeBlockCacheMergeMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("incremental_aggregate_mesh_skipped=" +
+                           (LastAuthoritativeAggregateMeshSkipped ? 1 : 0));
+        summary.AppendLine("incremental_topology_cached_blocks=" +
+                           LastAuthoritativeTopologyCachedBlockCount);
         summary.AppendLine("semantic_topology_ms=" +
                            LastPlaneLedgerTopologyMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
@@ -10987,6 +17080,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("semantic_relaxed_audit_ms=" +
                            LastPlaneLedgerRelaxedAuditMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("semantic_complex_lease_rebuild_ms=" +
+                           LastConfirmedComplexLeaseRebuildMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("semantic_complex_lease_rebuild_yields=" +
+                           LastConfirmedComplexLeaseRebuildYieldCount);
         summary.AppendLine("semantic_classification_ms=" +
                            LastPlaneLedgerClassificationMilliseconds.ToString(
                                "F3", CultureInfo.InvariantCulture));
@@ -11617,10 +17715,27 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("authoritative_block_cached=" + LastAuthoritativeBlockCachedCount);
         summary.AppendLine("authoritative_block_dirty_attempts=" + LastAuthoritativeBlockDirtyAttemptCount);
         summary.AppendLine("authoritative_block_dependency_attempts=" + LastAuthoritativeBlockDependencyAttemptCount);
+        summary.AppendLine("authoritative_block_dependency_candidates=" + LastAuthoritativeBlockDependencyCandidateCount);
+        summary.AppendLine("authoritative_block_dependency_pruned=" + LastAuthoritativeBlockDependencyPrunedCount);
+        summary.AppendLine("authoritative_block_dependency_reciprocal_pruned=" +
+                           LastAuthoritativeBlockDependencyReciprocalPrunedCount);
+        summary.AppendLine("authoritative_block_dependency_face_neighbors_only=" +
+                           (authoritativeDependencyFaceNeighborsOnly ? 1 : 0));
+        summary.AppendLine("authoritative_block_dependency_diagonal_pruned=" +
+                           LastAuthoritativeBlockDependencyDiagonalPrunedCount);
         summary.AppendLine("authoritative_plane_changed=" + LastAuthoritativePlaneChangedCount);
         summary.AppendLine("authoritative_plane_invalidated_blocks=" + LastAuthoritativePlaneInvalidatedBlockCount);
+        summary.AppendLine("authoritative_plane_newly_mature=" + LastAuthoritativeNewPlaneCount);
+        summary.AppendLine("authoritative_plane_newly_mature_invalidated_blocks=" +
+                           LastAuthoritativeNewPlaneInvalidatedBlockCount);
         summary.AppendLine("authoritative_plane_local_invalidation=" + (localizeStablePlaneInvalidation ? 1 : 0));
+        summary.AppendLine("authoritative_plane_invalidation_deferred_to_dirty=" +
+                           (deferStablePlaneInvalidationUntilBlockDirty ? 1 : 0));
         summary.AppendLine("authoritative_block_rebuilt=" + LastAuthoritativeBlockRebuiltCount);
+        summary.AppendLine("authoritative_aggregate_mesh_skipped=" +
+                           (LastAuthoritativeAggregateMeshSkipped ? 1 : 0));
+        summary.AppendLine("authoritative_topology_cached_blocks=" +
+                           LastAuthoritativeTopologyCachedBlockCount);
         summary.AppendLine("authoritative_block_rollbacks=" + LastAuthoritativeBlockRollbackCount);
         summary.AppendLine("authoritative_block_direct_empty=" + LastAuthoritativeBlockDirectEmptyCount);
         summary.AppendLine("authoritative_block_dependency_empty=" + LastAuthoritativeBlockDependencyEmptyCount);
@@ -11708,6 +17823,20 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("cyan_structural_planes_rejected=" + LastAuthoritativeCyanStructuralPlaneRejectedCount);
         summary.AppendLine("cyan_structural_wall_planes=" + LastAuthoritativeCyanStructuralWallPlaneCount);
         summary.AppendLine("cyan_structural_horizontal_planes=" + LastAuthoritativeCyanStructuralHorizontalPlaneCount);
+        summary.AppendLine("observed_floor_support_completion_enabled=" +
+            (enableObservedFloorSupportCompletion ? 1 : 0));
+        summary.AppendLine("observed_floor_support_planes=" +
+            LastObservedFloorSupportPlaneCount);
+        summary.AppendLine("observed_floor_support_candidate_cells=" +
+            LastObservedFloorSupportCandidateCellCount);
+        summary.AppendLine("observed_floor_support_already_covered_cells=" +
+            LastObservedFloorSupportCoveredCellCount);
+        summary.AppendLine("observed_floor_support_filled_cells=" +
+            LastObservedFloorSupportFilledCellCount);
+        summary.AppendLine("observed_floor_support_triangles=" +
+            LastObservedFloorSupportTriangleCount);
+        summary.AppendLine("observed_floor_support_blocks=" +
+            LastObservedFloorSupportBlockCount);
         summary.AppendLine("cyan_structural_lowest_horizontal_y=" +
             (_authoritativeCyanHorizontalExtremaValid ? _authoritativeCyanLowestHorizontalY : 0f)
             .ToString("F6", CultureInfo.InvariantCulture));
@@ -11812,6 +17941,20 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         summary.AppendLine("plane_zero_cross_shadow_fully_owned_triangles=" + LastPlaneConstrainedZeroCrossShadowFullyOwnedTriangleCount);
         summary.AppendLine("plane_zero_cross_shadow_boundary_edges=" + LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount);
         summary.AppendLine("plane_zero_cross_shadow_nonmanifold_edges=" + LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount);
+        summary.AppendLine("plane_zero_cross_aggregate_topology_skipped=" +
+                           (LastPlaneConstrainedZeroCrossAggregateTopologySkipped ? 1 : 0));
+        summary.AppendLine("plane_zero_cross_reextract_ms=" +
+                           LastPlaneConstrainedZeroCrossReextractMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_ledger_collect_ms=" +
+                           LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_aggregate_topology_ms=" +
+                           LastPlaneConstrainedZeroCrossAggregateTopologyMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
+        summary.AppendLine("plane_zero_cross_commit_ms=" +
+                           LastPlaneConstrainedZeroCrossCommitMilliseconds.ToString(
+                               "F3", CultureInfo.InvariantCulture));
         summary.AppendLine("plane_zero_cross_ledger_triangles=" + LastPlaneConstrainedZeroCrossLedgerTriangleCount);
         summary.AppendLine("plane_zero_cross_ledger_problem_triangles=" + LastPlaneConstrainedZeroCrossLedgerProblemTriangleCount);
         summary.AppendLine("plane_zero_cross_ledger_mesh_components=" + LastPlaneConstrainedZeroCrossLedgerMeshComponentCount);
@@ -11990,6 +18133,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             (showPlaneSupportGapOverlay ? 1 : 0));
         summary.AppendLine("plane_triangle_screen_ledger_enabled=1");
         summary.AppendLine("plane_support_cells=" + LastPlaneSupportCellCount);
+        summary.AppendLine("observed_floor_support_completion_changes_tsdf=0");
+        summary.AppendLine("observed_floor_support_completion_requires_direct_depth=1");
         summary.AppendLine("plane_support_qualified_cells=" + LastPlaneSupportQualifiedCellCount);
         summary.AppendLine("plane_support_covered_cells=" + LastPlaneSupportCoveredCellCount);
         summary.AppendLine("plane_support_gap_cells=" + LastPlaneSupportGapCellCount);
@@ -12092,6 +18237,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
     private void BeginConfidenceAuditCapture()
     {
         BeginSurfaceProfileDiagnostics();
+        BeginCompactBatchContextCapture();
         ResetHardTsdfWriteAuditCounters();
         ResetRawCoverageGridDiagnostics();
         if (enableLowOverheadPerformanceMeasurement)
@@ -13542,6 +19688,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private void EndConfidenceAuditCapture(int integratedFrames, string status)
     {
+        WriteCompactBatchContextCsv(integratedFrames, status);
         if (enableLowOverheadPerformanceMeasurement)
         {
             EndLowOverheadPerformanceCapture(integratedFrames, status);
@@ -16778,6 +22925,940 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                facing >= Mathf.Clamp01(minGrazingAdaptiveViewFacing);
     }
 
+    private bool RecordOwnershipShadowCandidate(
+        DepthOwnershipShadowEvidence evidence,
+        int x,
+        int y,
+        int width,
+        int height,
+        bool productionDepthGatePassed,
+        out bool strongRisk,
+        out bool fovBorder)
+    {
+        strongRisk = false;
+        fovBorder = false;
+        if (!enableUnifiedObservationSemanticsShadow ||
+            evidence.CloserLayerNeighbors <= 0 && evidence.FartherLayerNeighbors <= 0)
+            return false;
+
+        CompactBatchContext context = _compactBatchContext;
+        context.OwnershipCandidates++;
+        if (evidence.CloserLayerNeighbors > 0 && evidence.FartherLayerNeighbors > 0)
+            context.OwnershipMixedCandidates++;
+        else if (evidence.CloserLayerNeighbors > 0)
+            context.OwnershipFarSideCandidates++;
+        else
+            context.OwnershipNearSideCandidates++;
+        if (productionDepthGatePassed)
+            context.OwnershipPassedDepthGate++;
+        else
+            context.OwnershipProductionDepthRejected++;
+
+        int borderX = Mathf.Max(1, Mathf.RoundToInt(width *
+            Mathf.Clamp(observationFovBorderFraction, 0.02f, 0.20f)));
+        int borderY = Mathf.Max(1, Mathf.RoundToInt(height *
+            Mathf.Clamp(observationFovBorderFraction, 0.02f, 0.20f)));
+        fovBorder = x < borderX || x >= width - borderX ||
+                    y < borderY || y >= height - borderY;
+        bool liesBetweenObservedLayers =
+            evidence.CloserLayerNeighbors >= Mathf.Max(1, ownershipShadowMinimumCloserNeighbors) &&
+            evidence.FartherLayerNeighbors > 0;
+        float endpointResidual = Mathf.Min(
+            evidence.SampleDepthMeters - evidence.MinimumObservedDepthMeters,
+            evidence.MaximumObservedDepthMeters - evidence.SampleDepthMeters);
+        float interiorFraction = evidence.DepthSpanMeters > 0.0001f
+            ? endpointResidual / evidence.DepthSpanMeters
+            : 0f;
+        strongRisk = liesBetweenObservedLayers &&
+                     !evidence.GrazingPlaneSupported &&
+                     evidence.DepthSpanMeters >=
+                         Mathf.Max(1f, ownershipShadowStrongDepthJumpScale) *
+                         Mathf.Max(0.001f, evidence.DiscontinuityThresholdMeters) &&
+                     endpointResidual >= Mathf.Max(
+                         0.005f, ownershipProductionMinimumEndpointResidualMeters) &&
+                     interiorFraction >= Mathf.Clamp(
+                         ownershipProductionMinimumInteriorFraction, 0.05f, 0.49f);
+
+        // A clean near or far surface remains a legal layer.  Only a sample lying
+        // between two observed depth layers is an ownership hold candidate.
+        return productionDepthGatePassed && strongRisk;
+    }
+
+    private void RecordOwnershipShadowIntegratedWrite(
+        bool wouldHold,
+        bool strongRisk,
+        bool fovBorder,
+        float rawConfidence,
+        float temporalDepthDeltaMeters,
+        float viewFacing)
+    {
+        if (!enableUnifiedObservationSemanticsShadow)
+            return;
+        CompactBatchContext context = _compactBatchContext;
+        if (temporalDepthDeltaMeters >= 0f)
+        {
+            context.TemporalDepthDeltaSum += temporalDepthDeltaMeters;
+            context.TemporalDepthDeltaCount++;
+        }
+        if (viewFacing >= 0f)
+        {
+            context.ViewFacingSum += Mathf.Clamp01(viewFacing);
+            context.ViewFacingCount++;
+        }
+        if (!wouldHold)
+            return;
+        context.OwnershipWouldHoldWrites++;
+        if (strongRisk)
+            context.OwnershipStrongRiskWrites++;
+        else
+            context.OwnershipAmbiguousWrites++;
+        if (fovBorder)
+            context.OwnershipFovBorderWrites++;
+        if (rawConfidence >= 0f && rawConfidence < 0.35f)
+            context.OwnershipLowConfidenceWrites++;
+        if (temporalDepthDeltaMeters >= 0f)
+        {
+            if (temporalDepthDeltaMeters <= Mathf.Max(0.001f, voteGoodTemporalDepthDeltaMeters))
+                context.OwnershipTemporalStableWrites++;
+            else if (temporalDepthDeltaMeters >= Mathf.Max(
+                         voteGoodTemporalDepthDeltaMeters,
+                         voteBadTemporalDepthDeltaMeters))
+                context.OwnershipTemporalUnstableWrites++;
+        }
+    }
+
+    private bool IsSmoothGeometryEvidence(DepthOwnershipShadowEvidence evidence)
+    {
+        return evidence.ValidNeighbors >= Mathf.Max(3, minDepthConsistentNeighbors) &&
+               evidence.CloserLayerNeighbors == 0 &&
+               evidence.FartherLayerNeighbors == 0 &&
+               evidence.NormalDiscontinuityNeighbors == 0 &&
+               evidence.MaximumNormalDisagreement <= 1f - Mathf.Clamp01(geometryCertificateMinimumNormalDot);
+    }
+
+    private bool GeometryCertificateCompatible(
+        GeometryMaturityState state,
+        Vector3 point,
+        Vector3 normal,
+        float maximumPlaneResidualMeters)
+    {
+        if (state.PlaneNormal.sqrMagnitude <= 0.0001f || normal.sqrMagnitude <= 0.0001f)
+            return false;
+        float normalAgreement = Mathf.Abs(Vector3.Dot(state.PlaneNormal.normalized, normal.normalized));
+        float planeResidual = Mathf.Abs(Vector3.Dot(point - state.PlanePoint, state.PlaneNormal.normalized));
+        return normalAgreement >= Mathf.Clamp01(geometryCertificateMinimumNormalDot) &&
+               planeResidual <= Mathf.Max(0.005f, maximumPlaneResidualMeters);
+    }
+
+    private float GeometryCertificateMatchScore(
+        GeometryMaturityState state,
+        Vector3 point,
+        Vector3 normal,
+        float maximumPlaneResidualMeters)
+    {
+        if (!GeometryCertificateCompatible(state, point, normal, maximumPlaneResidualMeters))
+            return float.NegativeInfinity;
+        float normalAgreement = Mathf.Abs(Vector3.Dot(state.PlaneNormal.normalized, normal.normalized));
+        float planeResidual = Mathf.Abs(Vector3.Dot(point - state.PlanePoint, state.PlaneNormal.normalized));
+        return normalAgreement * 2f - planeResidual / Mathf.Max(0.005f, maximumPlaneResidualMeters);
+    }
+
+    private bool TrySelectGeometryCertificateSlot(
+        int voxelIndex,
+        Vector3 point,
+        Vector3 normal,
+        bool requireMature,
+        float maximumPlaneResidualMeters,
+        out GeometryMaturityState state,
+        out bool secondarySlot)
+    {
+        state = default;
+        secondarySlot = false;
+        float bestScore = float.NegativeInfinity;
+        if (_geometryMaturityStates.TryGetValue(voxelIndex, out GeometryMaturityState primary) &&
+            (!requireMature || primary.Mature))
+        {
+            float score = GeometryCertificateMatchScore(
+                primary, point, normal, maximumPlaneResidualMeters);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                state = primary;
+            }
+        }
+        if (enableBoundedMultiSurfaceCertificates &&
+            _geometryMaturitySecondaryStates.TryGetValue(voxelIndex, out GeometryMaturityState secondary) &&
+            (!requireMature || secondary.Mature))
+        {
+            float score = GeometryCertificateMatchScore(
+                secondary, point, normal, maximumPlaneResidualMeters);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                state = secondary;
+                secondarySlot = true;
+            }
+        }
+        return !float.IsNegativeInfinity(bestScore);
+    }
+
+    private bool GeometryVoxelHasSecondaryCertificate(int voxelIndex)
+    {
+        return enableMultiSurfaceCertificateProductionFusion &&
+               enableBoundedMultiSurfaceCertificates &&
+               _geometryMaturitySecondaryStates.ContainsKey(voxelIndex);
+    }
+
+    private bool TryResolveGeometryPrepassSecondarySlot(
+        int voxelIndex,
+        Vector3 point,
+        Vector3 normal,
+        out bool secondarySlot)
+    {
+        secondarySlot = false;
+        if (!GeometryVoxelHasSecondaryCertificate(voxelIndex))
+            return true;
+        float residualLimit = Mathf.Max(
+            geometryCertificateMaximumPlaneResidualMeters,
+            Mathf.Max(localReanchorMaximumResidualMeters, matureSmoothMaximumChangeMeters));
+        return TrySelectGeometryCertificateSlot(
+            voxelIndex,
+            point,
+            normal,
+            false,
+            residualLimit,
+            out GeometryMaturityState ignored,
+            out secondarySlot);
+    }
+
+    private bool TryResolveGeometryProductionContext(
+        Vector3 certificatePoint,
+        Vector3 normal,
+        Vector3 cameraPosition,
+        out GeometryProductionContext context)
+    {
+        context = default;
+        if (!enableMultiSurfaceCertificateProductionFusion ||
+            !TryWorldToVoxel(certificatePoint, out int vx, out int vy, out int vz))
+            return false;
+
+        int voxelIndex = Index(vx, vy, vz);
+        bool contested = GeometryVoxelHasSecondaryCertificate(voxelIndex);
+        float residualLimit = Mathf.Max(
+            geometryCertificateMaximumPlaneResidualMeters,
+            Mathf.Max(localReanchorMaximumResidualMeters, matureSmoothMaximumChangeMeters));
+        if (!TrySelectGeometryCertificateSlot(
+                voxelIndex,
+                certificatePoint,
+                normal,
+                false,
+                residualLimit,
+                out GeometryMaturityState state,
+                out bool secondarySlot))
+        {
+            context.Contested = contested;
+            context.CertificateVoxelIndex = voxelIndex;
+            return false;
+        }
+
+        context.Valid = true;
+        context.Contested = contested;
+        context.Mature = state.Mature;
+        context.SecondarySlot = secondarySlot;
+        context.CertificateVoxelIndex = voxelIndex;
+        context.PlanePoint = state.PlanePoint;
+        context.PlaneNormal = state.PlaneNormal;
+        context.OwnerKey = GeometryProductionDirectionChannel(
+            certificatePoint, state.PlaneNormal, cameraPosition);
+        return true;
+    }
+
+    private int GeometryProductionDirectionChannel(
+        Vector3 point,
+        Vector3 normal,
+        Vector3 cameraPosition)
+    {
+        Vector3 direction = normal.sqrMagnitude > 0.0001f
+            ? normal.normalized
+            : Vector3.up;
+        Vector3 towardCamera = cameraPosition - point;
+        if (towardCamera.sqrMagnitude > 0.0001f &&
+            Vector3.Dot(direction, towardCamera) < 0f)
+            direction = -direction;
+
+        float ax = Mathf.Abs(direction.x);
+        float ay = Mathf.Abs(direction.y);
+        float az = Mathf.Abs(direction.z);
+        if (ax >= ay && ax >= az)
+            return direction.x >= 0f ? 1 : 2;
+        if (ay >= az)
+            return direction.y >= 0f ? 3 : 4;
+        return direction.z >= 0f ? 5 : 6;
+    }
+
+    private bool PrepareGeometryCertificateProductionFusion(
+        int voxelIndex,
+        float sampleTsdf,
+        float oldTsdf,
+        ref int fusionOldWeight)
+    {
+        if (!enableMultiSurfaceCertificateProductionFusion ||
+            _geometryProductionOwnerKeys == null ||
+            voxelIndex < 0 ||
+            voxelIndex >= _geometryProductionOwnerKeys.Length)
+            return true;
+
+        int oldOwner = _geometryProductionOwnerKeys[voxelIndex];
+        int newOwner = _activeGeometryProductionContext.Valid &&
+                       (_activeGeometryProductionContext.Contested ||
+                        _activeGeometryProductionContext.Mature)
+            ? _activeGeometryProductionContext.OwnerKey
+            : 0;
+        float margin = Mathf.Clamp(
+            multiSurfaceProductionOwnerSwitchMarginTsdf, 0f, 0.15f);
+
+        if (oldOwner == 0)
+        {
+            if (newOwner != 0 && _activeGeometryProductionContext.Contested)
+            {
+                fusionOldWeight = Mathf.Min(
+                    fusionOldWeight,
+                    Mathf.Max(1, multiSurfaceProductionBootstrapOldWeightCap));
+                _geometryProductionOwnerKeys[voxelIndex] = newOwner;
+                LastGeometryProductionOwnerBootstrapCount++;
+            }
+            return true;
+        }
+
+        if (newOwner == oldOwner)
+        {
+            LastGeometryProductionOwnerMatchedCount++;
+            return true;
+        }
+
+        float oldAbs = Mathf.Abs(oldTsdf);
+        float sampleAbs = Mathf.Abs(sampleTsdf);
+        if (sampleAbs + margin < oldAbs)
+        {
+            fusionOldWeight = 0;
+            _geometryProductionOwnerKeys[voxelIndex] = newOwner;
+            LastGeometryProductionOwnerSwitchedCount++;
+            return true;
+        }
+
+        // A different surface may own the same voxel, but it must not be averaged
+        // into a diagonal zero crossing. Keep the closer existing zero constraint.
+        LastGeometryProductionOwnerPreservedCount++;
+        return false;
+    }
+
+    private void StoreGeometryCertificateSlot(
+        int voxelIndex,
+        GeometryMaturityState state,
+        bool secondarySlot)
+    {
+        if (secondarySlot)
+            _geometryMaturitySecondaryStates[voxelIndex] = state;
+        else
+            _geometryMaturityStates[voxelIndex] = state;
+    }
+
+    private bool IsDistinctGeometrySurface(
+        GeometryMaturityState state,
+        Vector3 fitPoint,
+        Vector3 fitNormal)
+    {
+        if (state.PlaneNormal.sqrMagnitude <= 0.0001f || fitNormal.sqrMagnitude <= 0.0001f)
+            return false;
+        Vector3 stateNormal = state.PlaneNormal.normalized;
+        Vector3 candidateNormal = fitNormal.normalized;
+        float normalAgreement = Mathf.Abs(Vector3.Dot(stateNormal, candidateNormal));
+        float separationCos = Mathf.Cos(
+            Mathf.Clamp(multiSurfaceMinimumNormalSeparationDegrees, 1f, 89f) * Mathf.Deg2Rad);
+        bool directionallyDistinct = normalAgreement <= separationCos;
+        float statePlaneSeparation = Mathf.Abs(Vector3.Dot(fitPoint - state.PlanePoint, stateNormal));
+        float candidatePlaneSeparation = Mathf.Abs(Vector3.Dot(state.PlanePoint - fitPoint, candidateNormal));
+        bool parallelButSeparated = normalAgreement >= Mathf.Clamp01(geometryCertificateMinimumNormalDot) &&
+            Mathf.Max(statePlaneSeparation, candidatePlaneSeparation) >=
+            Mathf.Max(0.01f, multiSurfaceMinimumParallelPlaneSeparationMeters);
+        return directionallyDistinct || parallelButSeparated;
+    }
+
+    private int CountMatureGeometryCertificates()
+    {
+        int count = 0;
+        foreach (KeyValuePair<int, GeometryMaturityState> entry in _geometryMaturityStates)
+        {
+            if (entry.Value.Mature)
+                count++;
+        }
+        foreach (KeyValuePair<int, GeometryMaturityState> entry in _geometryMaturitySecondaryStates)
+        {
+            if (entry.Value.Mature)
+                count++;
+        }
+        return count;
+    }
+
+    private bool GeometryVoxelHasUnsafeTransientState(int index)
+    {
+        return index < 0 || _weights == null || index >= _weights.Length ||
+               VoxelIsDirtyQuarantined(index) ||
+               VoxelHasPendingTsdfCorrection(index) ||
+               HasProvisionalTsdfMarker(index) ||
+               (_correctionTsdfHits != null && index < _correctionTsdfHits.Length && _correctionTsdfHits[index] > 0);
+    }
+
+    private bool SurfaceVoxelSignMatchesObservation(
+        int voxelIndex,
+        int vx,
+        int vy,
+        int vz,
+        Vector3 cameraPosition,
+        Vector3 point)
+    {
+        if (_weights == null || _tsdf == null || voxelIndex < 0 || voxelIndex >= _weights.Length ||
+            _weights[voxelIndex] <= 0)
+            return false;
+
+        Vector3 ray = point - cameraPosition;
+        float surfaceDepth = ray.magnitude;
+        if (surfaceDepth <= 0.0001f)
+            return false;
+        ray /= surfaceDepth;
+        float centerDepth = Vector3.Dot(VoxelCenter(vx, vy, vz) - cameraPosition, ray);
+        float expectedTsdf = Mathf.Clamp(
+            (surfaceDepth - centerDepth) / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
+        float oldTsdf = _tsdf[voxelIndex];
+        const float nearZero = 0.20f;
+        return Mathf.Abs(expectedTsdf) <= nearZero ||
+               Mathf.Abs(oldTsdf) <= nearZero ||
+               Mathf.Sign(expectedTsdf) == Mathf.Sign(oldTsdf);
+    }
+
+    private bool TryIntersectCertifiedPlane(
+        Vector3 cameraPosition,
+        Vector3 observedPoint,
+        Vector3 planePoint,
+        Vector3 planeNormal,
+        float maximumShiftMeters,
+        out Vector3 anchoredPoint)
+    {
+        anchoredPoint = observedPoint;
+        Vector3 ray = observedPoint - cameraPosition;
+        float observedDepth = ray.magnitude;
+        if (observedDepth <= 0.0001f || planeNormal.sqrMagnitude <= 0.0001f)
+            return false;
+        ray /= observedDepth;
+        planeNormal.Normalize();
+        float denominator = Vector3.Dot(planeNormal, ray);
+        if (Mathf.Abs(denominator) < 0.15f)
+            return false;
+        float anchoredDepth = Vector3.Dot(planeNormal, planePoint - cameraPosition) / denominator;
+        if (anchoredDepth < minDepthMeters || anchoredDepth > maxDepthMeters)
+            return false;
+        Vector3 candidate = cameraPosition + ray * anchoredDepth;
+        if (!Finite(candidate) || Vector3.Distance(candidate, observedPoint) > Mathf.Max(0.005f, maximumShiftMeters))
+            return false;
+        anchoredPoint = candidate;
+        return true;
+    }
+
+    private void ObserveGeometryCertificateView(
+        ref GeometryMaturityState state,
+        Vector3 cameraPosition,
+        Vector3 point)
+    {
+        Vector3 viewDirection = point - cameraPosition;
+        if (viewDirection.sqrMagnitude <= 0.0001f)
+            return;
+        viewDirection.Normalize();
+        if (state.DistinctViews <= 0 || state.LastDiverseViewDirection.sqrMagnitude <= 0.0001f)
+        {
+            state.DistinctViews = 1;
+            state.LastDiverseViewDirection = viewDirection;
+            state.LastDiverseCameraPosition = cameraPosition;
+            return;
+        }
+        if (state.DistinctViews >= Mathf.Max(2, geometryCertificateDistinctViews))
+            return;
+
+        float separationCos = Mathf.Cos(Mathf.Clamp(geometryCertificateViewSeparationDegrees, 1f, 45f) * Mathf.Deg2Rad);
+        bool fixedAngleDistinct = Vector3.Dot(
+            state.LastDiverseViewDirection, viewDirection) <= separationCos;
+        bool adaptiveBaselineDistinct = false;
+        if (enableAdaptiveGeometryCertificateViewBaseline)
+        {
+            Vector3 cameraDelta = cameraPosition - state.LastDiverseCameraPosition;
+            float axialDelta = Vector3.Dot(cameraDelta, state.LastDiverseViewDirection);
+            Vector3 lateralDelta = cameraDelta - state.LastDiverseViewDirection * axialDelta;
+            float observationDepth = Mathf.Max(voxelSizeMeters, (point - cameraPosition).magnitude);
+            float parallaxRadians = Mathf.Clamp(
+                geometryCertificateMinimumAdaptiveParallaxDegrees, 0.25f, 15f) * Mathf.Deg2Rad;
+            float requiredLateralBaseline = Mathf.Max(
+                Mathf.Max(0.01f, voxelSizeMeters) *
+                    Mathf.Clamp(geometryCertificateMinimumLateralBaselineVoxels, 0.1f, 2f),
+                observationDepth * Mathf.Tan(parallaxRadians));
+            adaptiveBaselineDistinct = lateralDelta.magnitude >= requiredLateralBaseline;
+        }
+
+        if (fixedAngleDistinct || adaptiveBaselineDistinct)
+        {
+            state.DistinctViews++;
+            state.LastDiverseViewDirection = viewDirection;
+            state.LastDiverseCameraPosition = cameraPosition;
+            if (fixedAngleDistinct)
+                LastGeometryFixedAngleDistinctViewCount++;
+            else
+                LastGeometryAdaptiveBaselineDistinctViewCount++;
+        }
+        else
+            LastGeometryInsufficientBaselineViewCount++;
+    }
+
+    private bool TryUseMatureSmoothFastPath(
+        Vector3 cameraPosition,
+        Vector3 normal,
+        DepthOwnershipShadowEvidence evidence,
+        int frameIndex,
+        ref Vector3 point)
+    {
+        if (!enableMatureSmoothFastPath || !IsSmoothGeometryEvidence(evidence) ||
+            !TryWorldToVoxel(point, out int vx, out int vy, out int vz))
+            return false;
+
+        int voxelIndex = Index(vx, vy, vz);
+        if (!TrySelectGeometryCertificateSlot(
+                voxelIndex,
+                point,
+                normal,
+                true,
+                matureSmoothMaximumChangeMeters,
+                out GeometryMaturityState state,
+                out bool secondarySlot))
+            return false;
+        LastMatureSmoothFastPathCandidateCount++;
+        if (secondarySlot)
+            LastGeometrySecondarySlotMatchedCount++;
+
+        int frameGap = frameIndex - state.LastFrame;
+        bool recent = frameGap > 0 && frameGap <= Mathf.Max(2, geometryCertificateMaximumRecentFrameGap);
+        bool cooldownComplete = state.LastConflictFrame == int.MinValue ||
+            frameIndex - state.LastConflictFrame > Mathf.Max(0, geometryCertificateConflictCooldownFrames);
+        if (!recent || !cooldownComplete || GeometryVoxelHasUnsafeTransientState(voxelIndex) ||
+            _weights[voxelIndex] < Mathf.Clamp(geometryCertificateMinimumWeight, 1, maxFusionWeight) ||
+            !SurfaceVoxelSignMatchesObservation(voxelIndex, vx, vy, vz, cameraPosition, point))
+        {
+            LastMatureSmoothFastPathUnsafeStateCount++;
+            return false;
+        }
+
+        Vector3 unitNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+        float normalDot = unitNormal.sqrMagnitude > 0.0001f
+            ? Mathf.Abs(Vector3.Dot(unitNormal, state.PlaneNormal))
+            : 0f;
+        float planeChange = Mathf.Abs(Vector3.Dot(point - state.PlanePoint, state.PlaneNormal));
+        if (normalDot < Mathf.Clamp01(geometryCertificateMinimumNormalDot) ||
+            planeChange > Mathf.Max(0.005f, matureSmoothMaximumChangeMeters))
+        {
+            state.Mature = false;
+            state.LastConflictFrame = frameIndex;
+            state.StableObservations = 1;
+            state.ConsecutiveStableFrames = 1;
+            StoreGeometryCertificateSlot(voxelIndex, state, secondarySlot);
+            LastMatureSmoothFastPathChangedCount++;
+            LastGeometryCertificateConflictResetCount++;
+            return false;
+        }
+
+        if (!TryIntersectCertifiedPlane(
+                cameraPosition, point, state.PlanePoint, state.PlaneNormal,
+                matureSmoothMaximumChangeMeters, out Vector3 anchoredPoint))
+        {
+            LastMatureSmoothFastPathChangedCount++;
+            return false;
+        }
+
+        point = anchoredPoint;
+        float alpha = 1f / Mathf.Clamp(state.StableObservations + 1, 4, 16);
+        state.PlanePoint = Vector3.Lerp(state.PlanePoint, point, alpha);
+        if (Vector3.Dot(state.PlaneNormal, unitNormal) < 0f)
+            unitNormal = -unitNormal;
+        state.PlaneNormal = Vector3.Lerp(state.PlaneNormal, unitNormal, alpha).normalized;
+        state.PlaneResidualMeters = Mathf.Lerp(state.PlaneResidualMeters, planeChange, alpha);
+        state.StableObservations++;
+        state.ConsecutiveStableFrames++;
+        ObserveGeometryCertificateView(ref state, cameraPosition, point);
+        state.LastFrame = frameIndex;
+        StoreGeometryCertificateSlot(voxelIndex, state, secondarySlot);
+        LastMatureSmoothFastPathAcceptedCount++;
+        return true;
+    }
+
+    private bool TryFitLocalObservationPlane(
+        int x,
+        int y,
+        int width,
+        int height,
+        Vector3[] positions,
+        Vector3[] normals,
+        Vector3 cameraPosition,
+        Vector3 point,
+        Vector3 normal,
+        out Vector3 planePoint,
+        out Vector3 planeNormal,
+        out float maximumResidualMeters,
+        out int support)
+    {
+        planePoint = point;
+        planeNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+        maximumResidualMeters = float.PositiveInfinity;
+        support = 0;
+        if (positions == null || normals == null || planeNormal.sqrMagnitude <= 0.0001f)
+            return false;
+
+        LastLocalReanchorFitCandidateCount++;
+        Vector3 positionSum = Vector3.zero;
+        Vector3 normalSum = Vector3.zero;
+        float centerDepth = Vector3.Distance(cameraPosition, point);
+        float depthThreshold = Mathf.Max(maxDepthDiscontinuityMeters, centerDepth * maxDepthDiscontinuityRatio) * 1.5f;
+        float sameLayerDepthThreshold = enableBoundedMultiSurfaceCertificates
+            ? Mathf.Min(
+                depthThreshold,
+                Mathf.Max(0.015f, multiSurfaceMinimumParallelPlaneSeparationMeters * 0.75f))
+            : depthThreshold;
+        float residualLimit = Mathf.Max(0.005f, localReanchorMaximumResidualMeters);
+        float minimumNormalDot = Mathf.Clamp01(localReanchorMinimumNormalDot);
+
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int nx = x + dx;
+                int ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height)
+                    continue;
+                int index = ny * width + nx;
+                if (index < 0 || index >= positions.Length || index >= normals.Length)
+                    continue;
+                Vector3 candidate = positions[index];
+                Vector3 candidateNormal = normals[index];
+                if (!Finite(candidate) || candidateNormal.sqrMagnitude <= 0.0001f)
+                    continue;
+                candidateNormal.Normalize();
+                float normalDot = Vector3.Dot(planeNormal, candidateNormal);
+                if (normalDot < 0f)
+                {
+                    candidateNormal = -candidateNormal;
+                    normalDot = -normalDot;
+                }
+                if (normalDot < minimumNormalDot)
+                    continue;
+                float depthDelta = Mathf.Abs(Vector3.Distance(cameraPosition, candidate) - centerDepth);
+                float centerPlaneResidual = Mathf.Abs(Vector3.Dot(candidate - point, planeNormal));
+                bool sameObservedLayer = depthDelta <= sameLayerDepthThreshold ||
+                    centerPlaneResidual <= residualLimit;
+                if (!sameObservedLayer)
+                {
+                    LastLocalReanchorCrossLayerExcludedCount++;
+                    continue;
+                }
+                positionSum += candidate;
+                normalSum += candidateNormal;
+                support++;
+            }
+        }
+
+        if (support < Mathf.Max(4, localReanchorMinimumSupport) || normalSum.sqrMagnitude <= 0.0001f)
+            return false;
+        planePoint = positionSum / support;
+        planeNormal = normalSum.normalized;
+        maximumResidualMeters = 0f;
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int nx = x + dx;
+                int ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height)
+                    continue;
+                int index = ny * width + nx;
+                if (index < 0 || index >= positions.Length || index >= normals.Length || !Finite(positions[index]))
+                    continue;
+                Vector3 candidateNormal = normals[index];
+                if (candidateNormal.sqrMagnitude <= 0.0001f ||
+                    Mathf.Abs(Vector3.Dot(planeNormal, candidateNormal.normalized)) < minimumNormalDot)
+                    continue;
+                float candidateDepth = Vector3.Distance(cameraPosition, positions[index]);
+                float depthDelta = Mathf.Abs(candidateDepth - centerDepth);
+                float centerPlaneResidual = Mathf.Abs(Vector3.Dot(positions[index] - point, planeNormal));
+                if (depthDelta > sameLayerDepthThreshold && centerPlaneResidual > residualLimit)
+                    continue;
+                maximumResidualMeters = Mathf.Max(
+                    maximumResidualMeters,
+                    Mathf.Abs(Vector3.Dot(positions[index] - planePoint, planeNormal)));
+            }
+        }
+        if (maximumResidualMeters > residualLimit)
+            return false;
+        LastLocalReanchorFitAcceptedCount++;
+        return true;
+    }
+
+    private void InvalidateGeometryCertificate(Vector3 point, Vector3 normal, int frameIndex)
+    {
+        if (!TryWorldToVoxel(point, out int vx, out int vy, out int vz))
+            return;
+        int index = Index(vx, vy, vz);
+        GeometryMaturityState primary = default;
+        GeometryMaturityState secondary = default;
+        bool hasPrimary = _geometryMaturityStates.TryGetValue(index, out primary);
+        bool hasSecondary = enableBoundedMultiSurfaceCertificates &&
+            _geometryMaturitySecondaryStates.TryGetValue(index, out secondary);
+        if (!hasPrimary && !hasSecondary)
+            return;
+
+        Vector3 unitNormal = normal.sqrMagnitude > 0.0001f ? normal.normalized : Vector3.zero;
+        float primaryAgreement = hasPrimary && unitNormal.sqrMagnitude > 0.0001f
+            ? Mathf.Abs(Vector3.Dot(primary.PlaneNormal.normalized, unitNormal))
+            : -1f;
+        float secondaryAgreement = hasSecondary && unitNormal.sqrMagnitude > 0.0001f
+            ? Mathf.Abs(Vector3.Dot(secondary.PlaneNormal.normalized, unitNormal))
+            : -1f;
+        float minimumAgreement = Mathf.Clamp01(geometryCertificateMinimumNormalDot);
+        float residualScale = Mathf.Max(0.005f, matureSmoothMaximumChangeMeters);
+        float primaryResidual = hasPrimary
+            ? Mathf.Abs(Vector3.Dot(point - primary.PlanePoint, primary.PlaneNormal.normalized))
+            : float.PositiveInfinity;
+        float secondaryResidual = hasSecondary
+            ? Mathf.Abs(Vector3.Dot(point - secondary.PlanePoint, secondary.PlaneNormal.normalized))
+            : float.PositiveInfinity;
+        float primaryScore = primaryAgreement >= minimumAgreement
+            ? primaryAgreement * 2f - primaryResidual / residualScale
+            : float.NegativeInfinity;
+        float secondaryScore = secondaryAgreement >= minimumAgreement
+            ? secondaryAgreement * 2f - secondaryResidual / residualScale
+            : float.NegativeInfinity;
+        bool invalidateSecondary = secondaryScore > primaryScore &&
+            !float.IsNegativeInfinity(secondaryScore);
+        bool invalidatePrimary = !invalidateSecondary && !float.IsNegativeInfinity(primaryScore);
+        if (!invalidatePrimary && !invalidateSecondary)
+        {
+            if (hasSecondary)
+                LastGeometryDistinctSurfacePreservedCount++;
+            return;
+        }
+
+        GeometryMaturityState state = invalidateSecondary ? secondary : primary;
+        state.Mature = false;
+        state.LastConflictFrame = frameIndex;
+        state.StableObservations = Mathf.Min(state.StableObservations, 1);
+        state.ConsecutiveStableFrames = 1;
+        StoreGeometryCertificateSlot(index, state, invalidateSecondary);
+        LastGeometryCertificateConflictResetCount++;
+    }
+
+    private void UpdateGeometryCertificateAndTryLocalReanchor(
+        int x,
+        int y,
+        int width,
+        int height,
+        Vector3[] positions,
+        Vector3[] normals,
+        Vector3 cameraPosition,
+        Vector3 normal,
+        DepthOwnershipShadowEvidence evidence,
+        int frameIndex,
+        ref Vector3 point)
+    {
+        LastGeometryCertificateCandidateCount++;
+        if (!TryFitLocalObservationPlane(
+                x, y, width, height, positions, normals, cameraPosition, point, normal,
+                out Vector3 fitPoint, out Vector3 fitNormal, out float fitResidual, out int fitSupport) ||
+            !TryWorldToVoxel(point, out int vx, out int vy, out int vz))
+            return;
+
+        int voxelIndex = Index(vx, vy, vz);
+        bool observationHasLayerCompetition =
+            evidence.CloserLayerNeighbors > 0 ||
+            evidence.FartherLayerNeighbors > 0 ||
+            evidence.NormalDiscontinuityNeighbors > 0;
+        float compatibilityResidual = Mathf.Max(
+            geometryCertificateMaximumPlaneResidualMeters,
+            matureSmoothMaximumChangeMeters);
+        GeometryMaturityState primary = default;
+        GeometryMaturityState secondary = default;
+        bool primaryExists = _geometryMaturityStates.TryGetValue(
+            voxelIndex, out primary);
+        bool secondaryExists = enableBoundedMultiSurfaceCertificates &&
+            _geometryMaturitySecondaryStates.TryGetValue(
+                voxelIndex, out secondary);
+        float primaryScore = primaryExists
+            ? GeometryCertificateMatchScore(primary, fitPoint, fitNormal, compatibilityResidual)
+            : float.NegativeInfinity;
+        float secondaryScore = secondaryExists
+            ? GeometryCertificateMatchScore(secondary, fitPoint, fitNormal, compatibilityResidual)
+            : float.NegativeInfinity;
+
+        GeometryMaturityState state;
+        bool secondarySlot;
+        bool existed;
+        if (!float.IsNegativeInfinity(primaryScore) || !float.IsNegativeInfinity(secondaryScore))
+        {
+            secondarySlot = secondaryScore > primaryScore;
+            state = secondarySlot ? secondary : primary;
+            existed = true;
+            if (secondarySlot)
+                LastGeometrySecondarySlotMatchedCount++;
+        }
+        else if (!primaryExists)
+        {
+            secondarySlot = false;
+            existed = false;
+            state = default;
+        }
+        else if (enableBoundedMultiSurfaceCertificates &&
+                 IsDistinctGeometrySurface(primary, fitPoint, fitNormal))
+        {
+            if (!secondaryExists)
+            {
+                secondarySlot = true;
+                existed = false;
+                state = default;
+                LastGeometrySecondarySlotCreatedCount++;
+                LastGeometryDistinctSurfacePreservedCount++;
+            }
+            else if (IsDistinctGeometrySurface(secondary, fitPoint, fitNormal))
+            {
+                // Three coherent surfaces at one voxel cannot be represented safely by
+                // the bounded two-slot certificate. Preserve both existing surfaces and
+                // let the ordinary complex/junction path process this observation.
+                LastGeometryMultiJunctionDeferredCount++;
+                LastGeometryDistinctSurfacePreservedCount++;
+                return;
+            }
+            else
+            {
+                secondarySlot = true;
+                existed = true;
+                state = secondary;
+            }
+        }
+        else
+        {
+            secondarySlot = false;
+            existed = true;
+            state = primary;
+        }
+
+        bool compatible = existed && GeometryCertificateCompatible(
+            state, fitPoint, fitNormal, compatibilityResidual);
+        if (!existed || !compatible)
+        {
+            if (existed)
+                LastGeometryCertificateConflictResetCount++;
+            else
+                LastGeometryCertificateCreatedCount++;
+            state = new GeometryMaturityState
+            {
+                FirstFrame = frameIndex,
+                LastFrame = frameIndex,
+                LastConflictFrame = existed ? frameIndex : int.MinValue,
+                StableObservations = 1,
+                ConsecutiveStableFrames = 1,
+                DistinctViews = 0,
+                PlaneSupport = fitSupport,
+                PlanePoint = fitPoint,
+                PlaneNormal = fitNormal,
+                PlaneResidualMeters = fitResidual,
+                LayerCompetitionObserved = secondarySlot || observationHasLayerCompetition,
+                Mature = false
+            };
+            ObserveGeometryCertificateView(ref state, cameraPosition, point);
+            StoreGeometryCertificateSlot(voxelIndex, state, secondarySlot);
+            return;
+        }
+
+        int stableFrameGap = frameIndex - state.LastFrame;
+        bool newFrame = stableFrameGap != 0;
+        float alpha = 1f / Mathf.Clamp(state.StableObservations + 1, 2, 12);
+        if (Vector3.Dot(state.PlaneNormal, fitNormal) < 0f)
+            fitNormal = -fitNormal;
+        state.PlanePoint = Vector3.Lerp(state.PlanePoint, fitPoint, alpha);
+        state.PlaneNormal = Vector3.Lerp(state.PlaneNormal, fitNormal, alpha).normalized;
+        state.PlaneResidualMeters = Mathf.Lerp(state.PlaneResidualMeters, fitResidual, alpha);
+        state.PlaneSupport = Mathf.Max(state.PlaneSupport, fitSupport);
+        state.LayerCompetitionObserved |= secondarySlot || observationHasLayerCompetition;
+        if (newFrame)
+        {
+            state.StableObservations++;
+            if (stableFrameGap > 0 &&
+                stableFrameGap <= Mathf.Max(2, geometryCertificateMaximumRecentFrameGap))
+            {
+                state.ConsecutiveStableFrames++;
+            }
+            else
+            {
+                state.ConsecutiveStableFrames = 1;
+                LastGeometryTemporalStreakResetCount++;
+            }
+        }
+        ObserveGeometryCertificateView(ref state, cameraPosition, point);
+        state.LastFrame = frameIndex;
+
+        bool wasMature = state.Mature;
+        bool cooldownComplete = state.LastConflictFrame == int.MinValue ||
+            frameIndex - state.LastConflictFrame > Mathf.Max(0, geometryCertificateConflictCooldownFrames);
+        bool distinctViewEvidenceReady =
+            state.DistinctViews >= Mathf.Max(2, geometryCertificateDistinctViews);
+        int requiredTemporalFrames = state.LayerCompetitionObserved || secondarySlot
+            ? Mathf.Max(6, geometryCertificateContestedTemporalStableFrames)
+            : Mathf.Max(4, geometryCertificateTemporalStableFrames);
+        float temporalResidualLimit = Mathf.Max(
+            0.005f,
+            geometryCertificateMaximumPlaneResidualMeters *
+                Mathf.Clamp(geometryCertificateTemporalResidualScale, 0.25f, 1f));
+        bool temporalEvidenceReady = enableTemporalGeometryCertificateMaturity &&
+            state.ConsecutiveStableFrames >= requiredTemporalFrames &&
+            state.PlaneResidualMeters <= temporalResidualLimit;
+        state.Mature = state.StableObservations >= Mathf.Max(3, geometryCertificateStableObservations) &&
+            (distinctViewEvidenceReady || temporalEvidenceReady) &&
+            state.PlaneResidualMeters <= Mathf.Max(0.005f, geometryCertificateMaximumPlaneResidualMeters) &&
+            cooldownComplete &&
+            !GeometryVoxelHasUnsafeTransientState(voxelIndex) &&
+            _weights != null && voxelIndex < _weights.Length &&
+            _weights[voxelIndex] >= Mathf.Clamp(geometryCertificateMinimumWeight, 1, maxFusionWeight);
+        if (state.Mature && !wasMature)
+        {
+            LastGeometryCertificateMatureCount++;
+            if (!distinctViewEvidenceReady && temporalEvidenceReady)
+                LastGeometryTemporalMaturityAcceptedCount++;
+        }
+
+        bool localDistinctViewEvidenceReady =
+            state.DistinctViews >= Mathf.Max(1, localReanchorMinimumDistinctViews);
+        bool localReanchorEvidenceReady = localDistinctViewEvidenceReady || temporalEvidenceReady;
+        if (enableNewPlaneLocalReanchoring &&
+            state.StableObservations >= Mathf.Max(2, localReanchorMinimumStableObservations) &&
+            localReanchorEvidenceReady &&
+            cooldownComplete &&
+            TryIntersectCertifiedPlane(
+                cameraPosition, point, state.PlanePoint, state.PlaneNormal,
+                localReanchorMaximumShiftMeters, out Vector3 anchoredPoint))
+        {
+            float shift = Vector3.Distance(point, anchoredPoint);
+            if (shift > 0.0005f)
+            {
+                point = anchoredPoint;
+                LastLocalReanchorAppliedCount++;
+                LastLocalReanchorShiftMeters += shift;
+                if (!localDistinctViewEvidenceReady && temporalEvidenceReady)
+                    LastGeometryTemporalReanchorAcceptedCount++;
+            }
+        }
+        StoreGeometryCertificateSlot(voxelIndex, state, secondarySlot);
+    }
+
     private bool PassDepthNeighborhoodConsistency(
         int x,
         int y,
@@ -16789,20 +23870,26 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         Vector3 point,
         Vector3 normal,
         out int checkedNeighbors,
-        out int consistentNeighbors)
+        out int consistentNeighbors,
+        out DepthOwnershipShadowEvidence ownershipEvidence)
     {
         checkedNeighbors = 0;
         consistentNeighbors = 0;
+        ownershipEvidence = new DepthOwnershipShadowEvidence();
 
-        if (!rejectDepthDiscontinuities || positions == null)
+        if (positions == null)
             return true;
 
         float depth = (point - cameraPosition).magnitude;
+        ownershipEvidence.SampleDepthMeters = depth;
         if (!Finite(point) || depth < minDepthMeters || depth > maxDepthMeters)
             return false;
 
         int radius = Mathf.Clamp(depthDiscontinuityNeighborRadiusPixels, 1, 3);
         float maxDelta = Mathf.Max(maxDepthDiscontinuityMeters, depth * maxDepthDiscontinuityRatio);
+        ownershipEvidence.DiscontinuityThresholdMeters = maxDelta;
+        float minimumDepth = depth;
+        float maximumDepth = depth;
         bool grazingView = IsGrazingView(point, normal, cameraPosition);
         int planeCompatibleNeighbors = 0;
         if (grazingView)
@@ -16826,15 +23913,44 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
                 Vector3 neighbor = positions[neighborIndex];
                 if (!Finite(neighbor))
+                {
+                    ownershipEvidence.InvalidNeighbors++;
                     continue;
+                }
 
                 float neighborDepth = (neighbor - cameraPosition).magnitude;
                 if (neighborDepth < minDepthMeters || neighborDepth > maxDepthMeters)
+                {
+                    ownershipEvidence.InvalidNeighbors++;
                     continue;
+                }
 
                 checkedNeighbors++;
+                ownershipEvidence.ValidNeighbors++;
                 float depthDelta = Mathf.Abs(neighborDepth - depth);
+                ownershipEvidence.MaximumDepthDeltaMeters = Mathf.Max(
+                    ownershipEvidence.MaximumDepthDeltaMeters, depthDelta);
+                minimumDepth = Mathf.Min(minimumDepth, neighborDepth);
+                maximumDepth = Mathf.Max(maximumDepth, neighborDepth);
+                if (neighborDepth < depth - maxDelta)
+                    ownershipEvidence.CloserLayerNeighbors++;
+                else if (neighborDepth > depth + maxDelta)
+                    ownershipEvidence.FartherLayerNeighbors++;
                 Vector3 neighborNormal = normals != null && neighborIndex < normals.Length ? normals[neighborIndex] : Vector3.zero;
+                if (Mathf.Abs(dx) + Mathf.Abs(dy) == 1 &&
+                    normal.sqrMagnitude > 0.0001f &&
+                    neighborNormal.sqrMagnitude > 0.0001f)
+                {
+                    float normalDot = Mathf.Abs(Vector3.Dot(
+                        normal,
+                        neighborNormal.normalized));
+                    float normalDisagreement = 1f - Mathf.Clamp01(normalDot);
+                    ownershipEvidence.MaximumNormalDisagreement = Mathf.Max(
+                        ownershipEvidence.MaximumNormalDisagreement,
+                        normalDisagreement);
+                    if (normalDot < 0.8660254f)
+                        ownershipEvidence.NormalDiscontinuityNeighbors++;
+                }
                 bool planeCompatible = grazingView && IsGrazingPlaneCompatible(point, normal, neighbor, neighborNormal);
                 if (planeCompatible)
                     planeCompatibleNeighbors++;
@@ -16850,7 +23966,30 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             }
         }
 
-        if (grazingView && planeCompatibleNeighbors >= Mathf.Max(2, minGrazingPlaneCompatibleNeighbors))
+        ownershipEvidence.DepthSpanMeters = maximumDepth - minimumDepth;
+        ownershipEvidence.MinimumObservedDepthMeters = minimumDepth;
+        ownershipEvidence.MaximumObservedDepthMeters = maximumDepth;
+
+        bool oneSidedCompetingLayer =
+            (ownershipEvidence.CloserLayerNeighbors > 0) !=
+            (ownershipEvidence.FartherLayerNeighbors > 0);
+        bool separatedLayerSupported = enableSeparatedDepthLayerSupport &&
+            oneSidedCompetingLayer &&
+            consistentNeighbors >= Mathf.Max(2, minSeparatedDepthLayerNeighbors) &&
+            ownershipEvidence.MaximumDepthDeltaMeters >= maxDelta;
+        if (separatedLayerSupported)
+        {
+            // The center belongs to one coherent layer and the inconsistent
+            // neighbors form a separate near/far surface.  Judge support inside
+            // the center layer instead of penalizing a legitimate edge pixel.
+            checkedNeighbors = consistentNeighbors;
+            LastSeparatedDepthLayerRescuedCount++;
+        }
+
+        bool grazingPlaneSupported = grazingView &&
+            planeCompatibleNeighbors >= Mathf.Max(2, minGrazingPlaneCompatibleNeighbors);
+        ownershipEvidence.GrazingPlaneSupported = grazingPlaneSupported;
+        if (grazingPlaneSupported)
         {
             _auditGrazingPlaneSupported = true;
             LastGrazingPlaneSupportedSampleCount++;
@@ -16862,8 +24001,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         int minNeighbors = Mathf.Max(1, minDepthConsistentNeighbors);
         if (checkedNeighbors < minNeighbors)
-            return allowSparseDepthNeighborhood;
-        return consistentNeighbors >= minNeighbors;
+            return !rejectDepthDiscontinuities || allowSparseDepthNeighborhood;
+        return !rejectDepthDiscontinuities || consistentNeighbors >= minNeighbors;
     }
 
     private bool PassTsdfDepthSupport(int checkedNeighbors, int consistentNeighbors)
@@ -16946,9 +24085,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     planeCompatibleNeighbors++;
                 if (depthDelta <= maxDelta || planeCompatible)
                     consistentNeighbors++;
+                bool sameObservedLayer = depthDelta <= maxDelta || planeCompatible;
                 if (sampleCount < _robustDepthSamples.Length &&
-                    (!grazingView || depthDelta <= maxDelta || planeCompatible))
+                    (!keepRobustMedianWithinObservedLayer || sameObservedLayer))
+                {
                     _robustDepthSamples[sampleCount++] = neighborDepth;
+                }
+                else if (keepRobustMedianWithinObservedLayer && !sameObservedLayer)
+                {
+                    LastRobustDepthCrossLayerExcludedCount++;
+                }
 
                 if (erodeDepthEdgesBeforeTsdf && Mathf.Abs(dx) <= edgeRadius && Mathf.Abs(dy) <= edgeRadius)
                 {
@@ -17795,7 +24941,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float oldTsdf = _tsdf[index];
         float writeWeight = Mathf.Max(0.0001f, sampleWeight);
         int fusionOldWeight = oldWeight;
-        if (ShouldRecoverAcceptedSign(index, sampleTsdf, oldTsdf))
+        if (!PrepareGeometryCertificateProductionFusion(
+                index, sampleTsdf, oldTsdf, ref fusionOldWeight))
+            return;
+        if (fusionOldWeight > 0 && ShouldRecoverAcceptedSign(index, sampleTsdf, oldTsdf))
         {
             LastAcceptedSignRecoveryCandidateCount++;
             if (HasAcceptedSignRecoveryNeighborSupport(index, sampleTsdf))
@@ -19874,6 +27023,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
     private bool IntegrateProjectiveTsdfBand(Vector3 cameraPosition, Vector3 surfacePoint, float sampleWeight, int halfBandSteps, bool allowFreeSpaceCarving, bool diagnosticOnly = false)
     {
+        bool collectPhaseDiagnostics = _collectBudgetedFusionPhaseDiagnostics;
+        if (collectPhaseDiagnostics)
+        {
+            LastBudgetedFusionProjectiveBandCallCount++;
+            if (_activeFusionDiagnosticStratum >= 0 &&
+                _activeFusionDiagnosticStratum < FusionStratumCount)
+                _fusionStratumBandCalls[_activeFusionDiagnosticStratum]++;
+            if (diagnosticOnly)
+            {
+                LastBudgetedFusionProjectiveDiagnosticBandCallCount++;
+                if (_activeFusionDiagnosticStratum >= 0 &&
+                    _activeFusionDiagnosticStratum < FusionStratumCount)
+                    _fusionStratumDiagnosticBandCalls[_activeFusionDiagnosticStratum]++;
+            }
+        }
         Vector3 toSurface = surfacePoint - cameraPosition;
         float surfaceDepth = toSurface.magnitude;
         if (!Finite(toSurface) || surfaceDepth <= 0.0001f)
@@ -19889,8 +27053,34 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _activeTsdfSourceValid = true;
 
         if (allowFreeSpaceCarving)
+        {
+            long carvingStartTimestamp = collectPhaseDiagnostics
+                ? System.Diagnostics.Stopwatch.GetTimestamp()
+                : 0L;
+            if (collectPhaseDiagnostics)
+            {
+                LastBudgetedFusionFreeSpaceCarvingCallCount++;
+                if (_activeFusionDiagnosticStratum >= 0 &&
+                    _activeFusionDiagnosticStratum < FusionStratumCount)
+                    _fusionStratumCarvingCalls[_activeFusionDiagnosticStratum]++;
+            }
             CarveProjectiveFreeSpace(cameraPosition, rayDirection, surfaceDepth, sampleWeight);
+            if (collectPhaseDiagnostics)
+            {
+                double carvingMilliseconds =
+                    (System.Diagnostics.Stopwatch.GetTimestamp() - carvingStartTimestamp) *
+                    1000d / System.Diagnostics.Stopwatch.Frequency;
+                LastBudgetedFusionFreeSpaceCarvingMilliseconds += (float)carvingMilliseconds;
+                if (_activeFusionDiagnosticStratum >= 0 &&
+                    _activeFusionDiagnosticStratum < FusionStratumCount)
+                    _fusionStratumCarvingMilliseconds[_activeFusionDiagnosticStratum] +=
+                        carvingMilliseconds;
+            }
+        }
 
+        long bandStartTimestamp = collectPhaseDiagnostics
+            ? System.Diagnostics.Stopwatch.GetTimestamp()
+            : 0L;
         Vector3 segmentStart = cameraPosition + rayDirection * startDepth;
         Vector3 segmentEnd = cameraPosition + rayDirection * endDepth;
         float lateralRadius = voxel * Mathf.Clamp(projectiveVoxelCenterRadiusScale, 0.5f, 1.25f);
@@ -19904,8 +27094,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int maxX = Mathf.Clamp(Mathf.CeilToInt(maxGrid.x), 0, _dimX - 1);
         int maxY = Mathf.Clamp(Mathf.CeilToInt(maxGrid.y), 0, _dimY - 1);
         int maxZ = Mathf.Clamp(Mathf.CeilToInt(maxGrid.z), 0, _dimZ - 1);
+        if (collectPhaseDiagnostics)
+        {
+            long candidateVoxelCount =
+                (long)(maxX - minX + 1) *
+                (maxY - minY + 1) *
+                (maxZ - minZ + 1);
+            LastBudgetedFusionProjectiveBandCandidateVoxelCount += candidateVoxelCount;
+            if (_activeFusionDiagnosticStratum >= 0 &&
+                _activeFusionDiagnosticStratum < FusionStratumCount)
+                _fusionStratumBandCandidateVoxels[_activeFusionDiagnosticStratum] +=
+                    candidateVoxelCount;
+        }
         float lateralRadiusSq = lateralRadius * lateralRadius;
         float depthEpsilon = voxel * 0.5f;
+        long acceptedBandVoxelCount = 0;
 
         for (int vz = minZ; vz <= maxZ; vz++)
         {
@@ -19921,6 +27124,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     Vector3 projectedCenter = cameraPosition + rayDirection * centerDepth;
                     if ((center - projectedCenter).sqrMagnitude > lateralRadiusSq)
                         continue;
+                    if (collectPhaseDiagnostics)
+                        acceptedBandVoxelCount++;
 
                     float signedDistance = surfaceDepth - centerDepth;
                     float sampleTsdf = Mathf.Clamp(signedDistance / Mathf.Max(0.0001f, truncationMeters), -1f, 1f);
@@ -19935,6 +27140,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             }
         }
 
+        if (collectPhaseDiagnostics)
+        {
+            LastBudgetedFusionProjectiveBandAcceptedVoxelCount += acceptedBandVoxelCount;
+            double bandMilliseconds =
+                (System.Diagnostics.Stopwatch.GetTimestamp() - bandStartTimestamp) *
+                1000d / System.Diagnostics.Stopwatch.Frequency;
+            LastBudgetedFusionProjectiveBandMilliseconds += (float)bandMilliseconds;
+            if (_activeFusionDiagnosticStratum >= 0 &&
+                _activeFusionDiagnosticStratum < FusionStratumCount)
+            {
+                _fusionStratumBandAcceptedVoxels[_activeFusionDiagnosticStratum] +=
+                    acceptedBandVoxelCount;
+                _fusionStratumBandMilliseconds[_activeFusionDiagnosticStratum] +=
+                    bandMilliseconds;
+            }
+        }
         _activeTsdfSourceValid = false;
         return touchedDenseTsdf;
     }
@@ -19977,8 +27198,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float tDeltaY = stepY == 0 ? float.PositiveInfinity : voxel / Mathf.Abs(rayDirection.y);
         float tDeltaZ = stepZ == 0 ? float.PositiveInfinity : voxel / Mathf.Abs(rayDirection.z);
 
+        long traversedVoxelCount = 0;
         while (vx >= 0 && vy >= 0 && vz >= 0 && vx < _dimX && vy < _dimY && vz < _dimZ)
         {
+            traversedVoxelCount++;
             CarveFreeSpaceVoxel(Index(vx, vy, vz), carveWeight);
 
             float nextDepth = Mathf.Min(tMaxX, Mathf.Min(tMaxY, tMaxZ));
@@ -20001,6 +27224,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 vz += stepZ;
                 tMaxZ += tDeltaZ;
             }
+        }
+        if (_collectBudgetedFusionPhaseDiagnostics)
+        {
+            LastBudgetedFusionFreeSpaceTraversedVoxelCount += traversedVoxelCount;
+            if (_activeFusionDiagnosticStratum >= 0 &&
+                _activeFusionDiagnosticStratum < FusionStratumCount)
+                _fusionStratumCarvingTraversedVoxels[_activeFusionDiagnosticStratum] +=
+                    traversedVoxelCount;
         }
     }
 
@@ -20471,6 +27702,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastRejectedRobustDepthCount = 0;
         LastRobustDepthDownweightedCount = 0;
         LastRobustDepthCorrectedCount = 0;
+        LastRobustDepthCrossLayerExcludedCount = 0;
+        LastSeparatedDepthLayerRescuedCount = 0;
+        LastStrongMixedOwnershipProductionHeldCount = 0;
         LastRejectedDepthEdgeErosionCount = 0;
         LastDepthEdgeDownweightedCount = 0;
         LastGrazingPlaneCheckedSampleCount = 0;
@@ -20535,6 +27769,37 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastSkippedDirtyLightCoverCellCount = 0;
         LastBlockedDirtyLightCoverSampleCount = 0;
         LastSkippedUnstableLightCoverCellCount = 0;
+        LastGeometryCertificateCandidateCount = 0;
+        LastGeometryCertificateCreatedCount = 0;
+        LastGeometryCertificateMatureCount = 0;
+        LastGeometryCertificateConflictResetCount = 0;
+        LastGeometrySecondarySlotCreatedCount = 0;
+        LastGeometrySecondarySlotMatchedCount = 0;
+        LastGeometryDistinctSurfacePreservedCount = 0;
+        LastGeometryMultiJunctionDeferredCount = 0;
+        LastGeometryFixedAngleDistinctViewCount = 0;
+        LastGeometryAdaptiveBaselineDistinctViewCount = 0;
+        LastGeometryInsufficientBaselineViewCount = 0;
+        LastGeometryTemporalMaturityAcceptedCount = 0;
+        LastGeometryTemporalReanchorAcceptedCount = 0;
+        LastGeometryTemporalStreakResetCount = 0;
+        LastGeometryProductionPrepassPreservedCount = 0;
+        LastGeometryProductionSecondarySurfaceWriteCount = 0;
+        LastGeometryProductionUnresolvedHeldCount = 0;
+        LastGeometryProductionCanonicalDirectionalRoutedCount = 0;
+        LastGeometryProductionOwnerBootstrapCount = 0;
+        LastGeometryProductionOwnerMatchedCount = 0;
+        LastGeometryProductionOwnerPreservedCount = 0;
+        LastGeometryProductionOwnerSwitchedCount = 0;
+        LastMatureSmoothFastPathCandidateCount = 0;
+        LastMatureSmoothFastPathAcceptedCount = 0;
+        LastMatureSmoothFastPathChangedCount = 0;
+        LastMatureSmoothFastPathUnsafeStateCount = 0;
+        LastLocalReanchorFitCandidateCount = 0;
+        LastLocalReanchorFitAcceptedCount = 0;
+        LastLocalReanchorAppliedCount = 0;
+        LastLocalReanchorShiftMeters = 0f;
+        LastLocalReanchorCrossLayerExcludedCount = 0;
     }
 
     private void ResetDirtyTsdfDiagnostics()
@@ -21402,14 +28667,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int blockVoxels,
         AuthoritativeBlockRebuildState state,
         CooperativeRebuildBudget budget,
-        bool allowContinuityAudit = true)
+        bool allowContinuityAudit = true,
+        bool buildAggregateMesh = true)
     {
         LastAuthoritativeBlockDirtyAttemptCount = 0;
         LastAuthoritativeBlockDependencyAttemptCount = 0;
         LastAuthoritativeBlockDependencyCandidateCount = 0;
         LastAuthoritativeBlockDependencyPrunedCount = 0;
+        LastAuthoritativeBlockDependencyReciprocalPrunedCount = 0;
+        LastAuthoritativeBlockDependencyDiagonalPrunedCount = 0;
         LastAuthoritativePlaneChangedCount = 0;
         LastAuthoritativePlaneInvalidatedBlockCount = 0;
+        LastAuthoritativeNewPlaneCount = 0;
+        LastAuthoritativeNewPlaneInvalidatedBlockCount = 0;
         LastAuthoritativeBlockRebuiltCount = 0;
         LastAuthoritativeBlockRollbackCount = 0;
         LastAuthoritativeBlockDirectEmptyCount = 0;
@@ -21429,6 +28699,156 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAuthoritativeBlockRejectedDuplicateTriangleCount = 0;
         LastAuthoritativeBlockRejectedDegenerateTriangleCount = 0;
         LastAuthoritativeBlockRejectedMixedAxisEdgeCount = 0;
+        LastAuthoritativeTopologyCachedBlockCount = 0;
+        LastPersistentSemanticFinalizationScopeBlockCount = 0;
+        LastPersistentSemanticFinalizationReusedBlockCount = 0;
+        LastDependencySemanticReuseCheckCount = 0;
+        LastDependencySemanticReuseAcceptedCount = 0;
+        LastDependencySemanticReuseRejectedNullCount = 0;
+        LastDependencySemanticReuseRejectedShapeCount = 0;
+        LastDependencySemanticReuseShapeVertexCountMismatchBlockCount = 0;
+        LastDependencySemanticReuseShapeTriangleCountMismatchBlockCount = 0;
+        LastDependencySemanticReuseShapeSourceCountMismatchBlockCount = 0;
+        LastDependencySemanticReuseShapeMalformedVertexKeyBlockCount = 0;
+        LastDependencySemanticReuseShapeMultiComponentMismatchBlockCount = 0;
+        LastDependencySemanticReuseShapeSplitVertexMismatchBlockCount = 0;
+        LastDependencySemanticReuseShapeBoundaryOnlyBlockCount = 0;
+        LastDependencySemanticReuseShapeInteriorBlockCount = 0;
+        LastDependencySemanticReuseShapeConnectivityOnlyBlockCount = 0;
+        LastDependencySemanticReuseShapeAddedVertexKeyCount = 0;
+        LastDependencySemanticReuseShapeRemovedVertexKeyCount = 0;
+        LastDependencySemanticReuseShapeBoundaryAddedVertexKeyCount = 0;
+        LastDependencySemanticReuseShapeBoundaryRemovedVertexKeyCount = 0;
+        LastDependencySemanticReuseShapeInteriorAddedVertexKeyCount = 0;
+        LastDependencySemanticReuseShapeInteriorRemovedVertexKeyCount = 0;
+        LastDependencySemanticReuseBoundaryUniqueAddedKeyCount = 0;
+        LastDependencySemanticReuseBoundaryUniqueRemovedKeyCount = 0;
+        LastDependencySemanticReuseBoundaryMigratedKeyCount = 0;
+        LastDependencySemanticReuseBoundaryFaceNeighbourMigrationCount = 0;
+        LastDependencySemanticReuseBoundaryDiagonalNeighbourMigrationCount = 0;
+        LastDependencySemanticReuseBoundaryNonNeighbourMigrationCount = 0;
+        LastDependencySemanticReuseBoundarySameOwnerMigrationCount = 0;
+        LastDependencySemanticReuseBoundaryUnmatchedAddedKeyCount = 0;
+        LastDependencySemanticReuseBoundaryUnmatchedRemovedKeyCount = 0;
+        LastDependencySemanticReuseBoundaryMigrationRatio = 0f;
+        LastDependencySemanticReuseRemovedSourceCount = 0;
+        LastDependencySemanticReuseRemovedSourceBoundaryCount = 0;
+        LastDependencySemanticReuseRemovedSourceInteriorCount = 0;
+        LastDependencySemanticReuseRemovedSourceInvalidAxisOrIndexCount = 0;
+        LastDependencySemanticReuseRemovedSourceOutsideExtractionRangeCount = 0;
+        LastDependencySemanticReuseRemovedSourceWeightCount = 0;
+        LastDependencySemanticReuseRemovedSourceEligibilityCount = 0;
+        LastDependencySemanticReuseRemovedSourceNonFiniteTsdfCount = 0;
+        LastDependencySemanticReuseRemovedSourceExactZeroCount = 0;
+        LastDependencySemanticReuseRemovedSourceSameSignCount = 0;
+        LastDependencySemanticReuseRemovedSourceDegenerateDeltaCount = 0;
+        LastDependencySemanticReuseRemovedSourceNonFiniteCrossingCount = 0;
+        LastDependencySemanticReuseRemovedSourceOwnerChangedCount = 0;
+        LastDependencySemanticReuseRemovedSourceCellVertexMissingCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryInvalidCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryEdgeCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryDiagonalCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryAreaCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryTwistCount = 0;
+        LastDependencySemanticReuseRemovedSourceGeometryPlaneCount = 0;
+        LastDependencySemanticReuseRemovedSourceStillValidMissingCount = 0;
+        LastDependencySemanticReuseRemovedSourceDiagnosticMilliseconds = 0f;
+        LastDependencyBoundarySignHysteresisShadowTrackedSourceCount = 0;
+        LastDependencyBoundarySignHysteresisShadowSameSignMissingCount = 0;
+        LastDependencyBoundarySignHysteresisShadowEligibleCount = 0;
+        LastDependencyBoundarySignHysteresisShadowRetainedCount = 0;
+        LastDependencyBoundarySignHysteresisShadowActiveRetainedCount = 0;
+        LastDependencyBoundarySignHysteresisShadowRecoveredCount = 0;
+        LastDependencyBoundarySignHysteresisShadowExpiredCount = 0;
+        LastDependencyBoundarySignHysteresisShadowHardDroppedCount = 0;
+        LastDependencyBoundarySignHysteresisShadowPositiveCount = 0;
+        LastDependencyBoundarySignHysteresisShadowNegativeCount = 0;
+        LastDependencyBoundarySignHysteresisShadowNearRejectedCount = 0;
+        LastDependencyBoundarySignHysteresisShadowFarRejectedCount = 0;
+        LastDependencyBoundarySignHysteresisShadowDirectResetCount = 0;
+        LastDependencyBoundarySignHysteresisShadowPotentialMissingReductionRatio = 0f;
+        LastDependencyBoundarySignHysteresisShadowDiagnosticMilliseconds = 0f;
+        LastDependencyBoundarySignObservationCreatedCount = 0;
+        LastDependencyBoundarySignObservationRecoveredCount = 0;
+        LastDependencyBoundarySignObservationExpiredCount = 0;
+        LastDependencyBoundarySignObservationHardDroppedCount = 0;
+        LastDependencyBoundarySignObservationDirectResetCount = 0;
+        LastDependencyBoundarySignObservationPendingCount = 0;
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramPositiveCandidates, 0,
+            _dependencyBoundarySignHistogramPositiveCandidates.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramNegativeCandidates, 0,
+            _dependencyBoundarySignHistogramNegativeCandidates.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramPositiveRecovered, 0,
+            _dependencyBoundarySignHistogramPositiveRecovered.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramNegativeRecovered, 0,
+            _dependencyBoundarySignHistogramNegativeRecovered.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramPositiveExpired, 0,
+            _dependencyBoundarySignHistogramPositiveExpired.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramNegativeExpired, 0,
+            _dependencyBoundarySignHistogramNegativeExpired.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramPositiveHardDropped, 0,
+            _dependencyBoundarySignHistogramPositiveHardDropped.Length);
+        System.Array.Clear(
+            _dependencyBoundarySignHistogramNegativeHardDropped, 0,
+            _dependencyBoundarySignHistogramNegativeHardDropped.Length);
+        LastDependencyBoundaryTemporalObservationCreatedCount = 0;
+        LastDependencyBoundaryTemporalRecoveredH1Count = 0;
+        LastDependencyBoundaryTemporalRecoveredH2Count = 0;
+        LastDependencyBoundaryTemporalRecoveredH3Count = 0;
+        LastDependencyBoundaryTemporalPersistentCount = 0;
+        LastDependencyBoundaryTemporalDirectResetCount = 0;
+        LastDependencyBoundaryTemporalPendingCount = 0;
+        LastDependencyBoundaryTemporalFreeSpaceConfirmedRecoveredCount = 0;
+        LastDependencyBoundaryTemporalFreeSpaceConfirmedPersistentCount = 0;
+        LastDependencyBoundaryTemporalNeverConfirmedRecoveredCount = 0;
+        LastDependencyBoundaryTemporalNeverConfirmedPersistentCount = 0;
+        LastDependencyBoundaryTemporalDiagnosticMilliseconds = 0f;
+        System.Array.Clear(_dependencyBoundaryTemporalSingleViewCandidates, 0,
+            _dependencyBoundaryTemporalSingleViewCandidates.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalSingleViewRecoveredH1, 0,
+            _dependencyBoundaryTemporalSingleViewRecoveredH1.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalSingleViewRecoveredH2, 0,
+            _dependencyBoundaryTemporalSingleViewRecoveredH2.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalSingleViewRecoveredH3, 0,
+            _dependencyBoundaryTemporalSingleViewRecoveredH3.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalSingleViewPersistent, 0,
+            _dependencyBoundaryTemporalSingleViewPersistent.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalMultiViewCandidates, 0,
+            _dependencyBoundaryTemporalMultiViewCandidates.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalMultiViewRecoveredH1, 0,
+            _dependencyBoundaryTemporalMultiViewRecoveredH1.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalMultiViewRecoveredH2, 0,
+            _dependencyBoundaryTemporalMultiViewRecoveredH2.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalMultiViewRecoveredH3, 0,
+            _dependencyBoundaryTemporalMultiViewRecoveredH3.Length);
+        System.Array.Clear(_dependencyBoundaryTemporalMultiViewPersistent, 0,
+            _dependencyBoundaryTemporalMultiViewPersistent.Length);
+        _dependencySemanticReuseBoundaryAddedKeys.Clear();
+        _dependencySemanticReuseBoundaryRemovedKeys.Clear();
+        _dependencySemanticReuseBoundaryAddedOwnerByKey.Clear();
+        _dependencySemanticReuseBoundaryRemovedOwnerByKey.Clear();
+        LastDependencySemanticReuseShapeVertexDeltaSum = 0;
+        LastDependencySemanticReuseShapeTriangleDeltaSum = 0;
+        LastDependencySemanticReuseShapeSourceDeltaSum = 0;
+        LastDependencySemanticReuseShapeVertexDeltaMaxAbs = 0;
+        LastDependencySemanticReuseShapeTriangleDeltaMaxAbs = 0;
+        LastDependencySemanticReuseRejectedVertexKeyCount = 0;
+        LastDependencySemanticReuseRejectedTriangleCount = 0;
+        LastDependencySemanticReuseRejectedTriangleSourceCount = 0;
+        LastDependencySemanticReuseRejectedPositionCount = 0;
+        LastDependencySemanticReusePositionComparedVertexCount = 0;
+        LastDependencySemanticReusePositionMaxDriftMeters = 0f;
+        LastDependencySemanticReusePositionRmsDriftMeters = 0f;
+        LastDependencySemanticReuseComparisonMilliseconds = 0f;
+        _lastDependencySemanticReusePositionSquaredDriftSum = 0.0;
+        LastAuthoritativeAggregateMeshSkipped = !buildAggregateMesh;
         ResetAuthoritativeCyanPlaneSnapDiagnostics();
         ResetAuthoritativeCyanContinuityDiagnostics();
         _authoritativeBlockTopologyRows = new StringBuilder(2048);
@@ -21505,6 +28925,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             : Time.realtimeSinceStartupAsDouble;
         IReadOnlyDictionary<Vector3Int, int> dependencyBoundaryMasks =
             _incrementalTsdfSurfaceDirtyTracker.DependencyBoundaryMasks;
+        IReadOnlyDictionary<Vector3Int, int> currentBoundaryMasks =
+            _incrementalTsdfSurfaceDirtyTracker.CurrentBoundaryMasks;
         foreach (KeyValuePair<Vector3Int, ScanCoverIncrementalPatchShadow.PatchDirtyReason> pair in dirtyReasons)
         {
             if (budget != null && budget.ShouldYield())
@@ -21526,6 +28948,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (missingBlock.MissingRebuilds < retireMissing)
                     continue;
                 _authoritativeTsdfBlocks.Remove(pair.Key);
+                _authoritativeSemanticReuseBaselineByBlock.Remove(pair.Key);
+                _dependencyBoundarySignHysteresisShadowByBlock.Remove(pair.Key);
+                _dependencyBoundarySignHysteresisObservationsByBlock.Remove(pair.Key);
                 clearedResultLedgerKeys.Add(pair.Key);
                 LastAuthoritativeBlockRetiredCount++;
                 continue;
@@ -21545,11 +28970,28 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 if (!_authoritativeTsdfBlocks.ContainsKey(neighbour))
                     continue;
                 LastAuthoritativeBlockDependencyCandidateCount++;
+                if (authoritativeDependencyFaceNeighborsOnly &&
+                    Mathf.Abs(x) + Mathf.Abs(y) + Mathf.Abs(z) > 1)
+                {
+                    // Edge/corner neighbours do not own a face shared with the dirty
+                    // block. If they are independently dirty they are already in the
+                    // direct set; otherwise leave their accepted mesh untouched.
+                    LastAuthoritativeBlockDependencyPrunedCount++;
+                    LastAuthoritativeBlockDependencyDiagonalPrunedCount++;
+                    continue;
+                }
                 if (localizeAuthoritativeHaloDependencies &&
                     !AuthoritativeDirtyBoundaryTouchesNeighbour(
-                        pair.Key, x, y, z, dependencyBoundaryMasks))
+                        pair.Key, neighbour, x, y, z,
+                        dependencyBoundaryMasks, currentBoundaryMasks,
+                        requireReciprocalAuthoritativeBoundaryDependency ||
+                        (requireReciprocalDiagonalAuthoritativeDependency &&
+                         Mathf.Abs(x) + Mathf.Abs(y) + Mathf.Abs(z) > 1),
+                        out bool reciprocalRejected))
                 {
                     LastAuthoritativeBlockDependencyPrunedCount++;
+                    if (reciprocalRejected)
+                        LastAuthoritativeBlockDependencyReciprocalPrunedCount++;
                     continue;
                 }
                 rebuildKeys.Add(neighbour);
@@ -21561,16 +29003,47 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         // a full-scene rebuild.  Only a newly-added, removed or materially-moved plane
         // invalidates clean cached blocks, and then only inside that plane's footprint.
         List<ScanCoverStablePlaneRegistry.PlaneConstraint> maturePlanes =
-            _stablePlaneRegistry.GetMatureConstraints();
+            GetMatureProductionPlaneConstraints();
         LastAuthoritativePlaneChangedCount = 0;
         LastAuthoritativePlaneInvalidatedBlockCount = 0;
         if (enableAuthoritativeCyanPlaneSnap && maturePlanes.Count > 0 ||
             _lastAuthoritativePlaneConstraints.Count > 0)
         {
             List<ScanCoverStablePlaneRegistry.PlaneConstraint> changedPlanes =
-                CollectChangedAuthoritativePlanes(maturePlanes);
+                CollectChangedAuthoritativePlanes(maturePlanes, out List<ScanCoverStablePlaneRegistry.PlaneConstraint> newlyMaturePlanes);
             LastAuthoritativePlaneChangedCount = changedPlanes.Count;
-            if (!localizeStablePlaneInvalidation && changedPlanes.Count > 0)
+            LastAuthoritativeNewPlaneCount = newlyMaturePlanes.Count;
+            if (deferStablePlaneInvalidationUntilBlockDirty)
+            {
+                // Stable plane evolution is persistent state, not a reason to rewrite
+                // an otherwise clean room-sized surface. Direct dirty blocks and
+                // their reciprocal boundary halo consume the newest constraint when
+                // they are next rebuilt; untouched blocks retain their accepted mesh.
+                // A plane's first mature admission is different: without one bounded
+                // footprint wake-up an already-clean floor can never consume it.
+                if (invalidateNewlyMaturePlaneFootprintOnce && newlyMaturePlanes.Count > 0)
+                {
+                    float patchSize = voxelSizeMeters * Mathf.Clamp(blockVoxels, 2, 12);
+                    foreach (Vector3Int cachedKey in _authoritativeTsdfBlocks.Keys)
+                    {
+                        if (budget != null && budget.ShouldYield())
+                        {
+                            budget.CompleteSliceForYield();
+                            yield return null;
+                            budget.Resume();
+                        }
+                        if (missingKeys.Contains(cachedKey) ||
+                            !AuthoritativeBlockTouchesChangedPlane(cachedKey, patchSize, newlyMaturePlanes))
+                            continue;
+                        if (rebuildKeys.Add(cachedKey))
+                        {
+                            LastAuthoritativePlaneInvalidatedBlockCount++;
+                            LastAuthoritativeNewPlaneInvalidatedBlockCount++;
+                        }
+                    }
+                }
+            }
+            else if (!localizeStablePlaneInvalidation && changedPlanes.Count > 0)
             {
                 foreach (Vector3Int cachedKey in _authoritativeTsdfBlocks.Keys)
                 {
@@ -21649,6 +29122,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 // rebuild.  Remove stale cached geometry instead of calling it a rollback.
                 if (_authoritativeTsdfBlocks.Remove(key))
                     LastAuthoritativeBlockEmptyReplacementCount++;
+                _authoritativeSemanticReuseBaselineByBlock.Remove(key);
+                _dependencyBoundarySignHysteresisShadowByBlock.Remove(key);
+                _dependencyBoundarySignHysteresisObservationsByBlock.Remove(key);
                 clearedResultLedgerKeys.Add(key);
                 continue;
             }
@@ -21661,10 +29137,40 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 ? budget.GetComputeSecondsSnapshot()
                 : Time.realtimeSinceStartupAsDouble) - extractionStart) * 1000.0);
 
-        Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> relaxedRawCandidates =
-            enableLegacyRelaxedCandidateShadow
-                ? CloneAuthoritativeTsdfBlockMeshes(extractedCandidates)
-                : null;
+        Dictionary<Vector3Int, AuthoritativeTsdfBlockMesh> relaxedRawCandidates = null;
+        if (enableLegacyRelaxedCandidateShadow &&
+            !localizeLegacyRelaxedCandidateIntake)
+        {
+            AuthoritativeTsdfBlockMeshCloneState cloneState =
+                new AuthoritativeTsdfBlockMeshCloneState();
+            IEnumerator cloneRoutine = CloneAuthoritativeTsdfBlockMeshesBudgetedRoutine(
+                extractedCandidates, cloneState, budget);
+            while (cloneRoutine.MoveNext())
+                yield return cloneRoutine.Current;
+            relaxedRawCandidates = cloneState.Result;
+        }
+        if (enableDependencyBoundaryZeroCrossSignHysteresisShadow ||
+            enableDependencyBoundaryTemporalFreeSpaceShadow)
+        {
+            foreach (KeyValuePair<Vector3Int, AuthoritativeTsdfBlockMesh> pair in
+                     extractedCandidates)
+            {
+                if (budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+                bool direct = directAttempts.TryGetValue(
+                    pair.Key, out bool directValue) && directValue;
+                UpdateDependencyBoundaryZeroCrossSignHysteresisShadow(
+                    pair.Key, pair.Value, direct, blockVoxels);
+                UpdateDependencyBoundaryTemporalFreeSpaceShadow(
+                    pair.Key, pair.Value, direct, blockVoxels);
+            }
+            FinalizeDependencyBoundaryZeroCrossSignHysteresisShadowDiagnostics();
+            FinalizeDependencyBoundaryTemporalFreeSpaceDiagnostics();
+        }
         double semanticFinalizeStart = budget != null
             ? budget.GetComputeSecondsSnapshot()
             : Time.realtimeSinceStartupAsDouble;
@@ -21684,7 +29190,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             yield return null;
             budget.Resume();
         }
-        ApplyAuthoritativeCyanGlobalPlaneConstraints(extractedCandidates, directAttempts);
+        IEnumerator planeConstraintRoutine =
+            ApplyAuthoritativeCyanGlobalPlaneConstraintsRoutine(
+                extractedCandidates, directAttempts, budget);
+        while (planeConstraintRoutine.MoveNext())
+            yield return planeConstraintRoutine.Current;
         if (budget != null && budget.ShouldYield())
         {
             budget.CompleteSliceForYield();
@@ -21734,6 +29244,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     key, directAttempt, directReason, candidate, topology);
                 continue;
             }
+            candidate.HasCachedTopology = true;
+            candidate.CachedBoundaryEdges = topology.BoundaryEdges;
+            candidate.CachedNonManifoldEdges = topology.NonManifoldEdges;
+            candidate.CachedMaxEdgeIncidence = topology.MaxEdgeIncidence;
             candidate.MissingRebuilds = 0;
             _authoritativeTsdfBlocks[key] = candidate;
             LastAuthoritativeBlockRebuiltCount++;
@@ -21747,6 +29261,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             int y = a.y.CompareTo(b.y);
             return y != 0 ? y : a.x.CompareTo(b.x);
         });
+        int cachedTriangles = 0;
+        int cachedBoundaryEdges = 0;
+        int cachedNonManifoldEdges = 0;
         for (int keyIndex = 0; keyIndex < keys.Count; keyIndex++)
         {
             if (budget != null && budget.ShouldYield())
@@ -21756,21 +29273,35 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 budget.Resume();
             }
             AuthoritativeTsdfBlockMesh block = _authoritativeTsdfBlocks[keys[keyIndex]];
-            int baseVertex = publishedVertices.Count;
-            publishedVertices.AddRange(block.Vertices);
-            for (int i = 0; i < block.Vertices.Count; i++)
-                publishedColors.Add(incrementalPatchShadowWireColor);
-            for (int i = 0; i < block.Triangles.Count; i++)
-                publishedTriangles.Add(baseVertex + block.Triangles[i]);
+            if (!block.HasCachedTopology)
+            {
+                AuthoritativeBlockTopologyStats topology =
+                    AnalyzeAuthoritativeBlockTopology(block);
+                block.HasCachedTopology = true;
+                block.CachedBoundaryEdges = topology.BoundaryEdges;
+                block.CachedNonManifoldEdges = topology.NonManifoldEdges;
+                block.CachedMaxEdgeIncidence = topology.MaxEdgeIncidence;
+            }
+            LastAuthoritativeTopologyCachedBlockCount++;
+            cachedTriangles += block.Triangles.Count / 3;
+            cachedBoundaryEdges += block.CachedBoundaryEdges;
+            cachedNonManifoldEdges += block.CachedNonManifoldEdges;
+
+            if (buildAggregateMesh)
+            {
+                int baseVertex = publishedVertices.Count;
+                publishedVertices.AddRange(block.Vertices);
+                for (int i = 0; i < block.Vertices.Count; i++)
+                    publishedColors.Add(incrementalPatchShadowWireColor);
+                for (int i = 0; i < block.Triangles.Count; i++)
+                    publishedTriangles.Add(baseVertex + block.Triangles[i]);
+            }
         }
 
         LastAuthoritativeBlockCachedCount = _authoritativeTsdfBlocks.Count;
-        LastAuthoritativeBlockTriangleCount = publishedTriangles.Count / 3;
-        CountMeshEdgeTopology(publishedTriangles,
-            out int boundaryEdges,
-            out int nonManifoldEdges);
-        LastAuthoritativeBlockBoundaryEdgeCount = boundaryEdges;
-        LastAuthoritativeBlockNonManifoldEdgeCount = nonManifoldEdges;
+        LastAuthoritativeBlockTriangleCount = cachedTriangles;
+        LastAuthoritativeBlockBoundaryEdgeCount = cachedBoundaryEdges;
+        LastAuthoritativeBlockNonManifoldEdgeCount = cachedNonManifoldEdges;
         if (runAuthoritativeCyanContinuityAudit && allowContinuityAudit)
             AuditAuthoritativeCyanContinuity(keys, blockVoxels);
         else
@@ -21779,16 +29310,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             (float)(((budget != null
                 ? budget.GetComputeSecondsSnapshot()
                 : Time.realtimeSinceStartupAsDouble) - cacheMergeStart) * 1000.0);
-        state.Result = publishedTriangles.Count >= 3;
+        state.Result = cachedTriangles > 0;
     }
 
     private static bool AuthoritativeDirtyBoundaryTouchesNeighbour(
         Vector3Int dirtyKey,
+        Vector3Int neighbourKey,
         int offsetX,
         int offsetY,
         int offsetZ,
-        IReadOnlyDictionary<Vector3Int, int> dependencyBoundaryMasks)
+        IReadOnlyDictionary<Vector3Int, int> dependencyBoundaryMasks,
+        IReadOnlyDictionary<Vector3Int, int> currentBoundaryMasks,
+        bool requireReciprocalBoundary,
+        out bool reciprocalRejected)
     {
+        reciprocalRejected = false;
         // Unknown external schedules remain conservative. The geometry-only tracker
         // supplies a mask containing both the preceding and current zero-crossing
         // footprint for every ordinary New/Changed dirty block.
@@ -21809,13 +29345,38 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             required |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryNegativeZ;
         else if (offsetZ > 0)
             required |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryPositiveZ;
-        return required == 0 || (mask & required) == required;
+        if (required != 0 && (mask & required) != required)
+            return false;
+        if (!requireReciprocalBoundary)
+            return true;
+
+        int reciprocal = 0;
+        if (offsetX < 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryPositiveX;
+        else if (offsetX > 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryNegativeX;
+        if (offsetY < 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryPositiveY;
+        else if (offsetY > 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryNegativeY;
+        if (offsetZ < 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryPositiveZ;
+        else if (offsetZ > 0)
+            reciprocal |= ScanCoverTsdfSurfaceDirtyTracker.BoundaryNegativeZ;
+        if (currentBoundaryMasks != null &&
+            currentBoundaryMasks.TryGetValue(neighbourKey, out int neighbourMask) &&
+            (neighbourMask & reciprocal) == reciprocal)
+            return true;
+        reciprocalRejected = true;
+        return false;
     }
 
     private List<ScanCoverStablePlaneRegistry.PlaneConstraint> CollectChangedAuthoritativePlanes(
-        IReadOnlyList<ScanCoverStablePlaneRegistry.PlaneConstraint> current)
+        IReadOnlyList<ScanCoverStablePlaneRegistry.PlaneConstraint> current,
+        out List<ScanCoverStablePlaneRegistry.PlaneConstraint> newlyMaturePlanes)
     {
         List<ScanCoverStablePlaneRegistry.PlaneConstraint> changed = new List<ScanCoverStablePlaneRegistry.PlaneConstraint>();
+        newlyMaturePlanes = new List<ScanCoverStablePlaneRegistry.PlaneConstraint>();
         Dictionary<int, ScanCoverStablePlaneRegistry.PlaneConstraint> previousById =
             new Dictionary<int, ScanCoverStablePlaneRegistry.PlaneConstraint>(_lastAuthoritativePlaneConstraints.Count);
         for (int i = 0; i < _lastAuthoritativePlaneConstraints.Count; i++)
@@ -21829,6 +29390,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (!previousById.TryGetValue(plane.Id, out ScanCoverStablePlaneRegistry.PlaneConstraint previous))
             {
                 changed.Add(plane);
+                newlyMaturePlanes.Add(plane);
                 continue;
             }
 
@@ -21908,6 +29470,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastPlaneConstrainedZeroCrossShadowFullyOwnedTriangleCount = 0;
         LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount = 0;
         LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount = 0;
+        LastPlaneConstrainedZeroCrossAggregateTopologySkipped = false;
+        LastPlaneConstrainedZeroCrossReextractMilliseconds = 0f;
+        LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds = 0f;
+        LastPlaneConstrainedZeroCrossAggregateTopologyMilliseconds = 0f;
+        LastPlaneConstrainedZeroCrossCommitMilliseconds = 0f;
         LastPlaneConstrainedZeroCrossLedgerTriangleCount = 0;
         LastPlaneConstrainedZeroCrossLedgerProblemTriangleCount = 0;
         LastPlaneConstrainedZeroCrossLedgerMeshComponentCount = 0;
@@ -21990,6 +29557,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastIndependentStructuralIdentityConflictTriangleCount = 0;
         LastIndependentStructuralQualificationFailureTriangleCount = 0;
         LastPlaneSupportCellCount = 0;
+        LastObservedFloorSupportPlaneCount = 0;
+        LastObservedFloorSupportCandidateCellCount = 0;
+        LastObservedFloorSupportCoveredCellCount = 0;
+        LastObservedFloorSupportFilledCellCount = 0;
+        LastObservedFloorSupportTriangleCount = 0;
+        LastObservedFloorSupportBlockCount = 0;
         LastPlaneSupportQualifiedCellCount = 0;
         LastPlaneSupportCoveredCellCount = 0;
         LastPlaneSupportGapCellCount = 0;
@@ -22071,31 +29644,74 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             yield break;
         }
 
-        // The trial is deliberately local: Dirty blocks plus the one-block halo
-        // required by Surface Nets. Cached blocks elsewhere remain untouched.
+        // Extraction dependencies protect Surface-Nets topology, but they are not
+        // automatically semantic mutations.  A dependency block whose accepted
+        // canonical mesh is byte-for-byte/topologically equivalent remains cached;
+        // only direct dirty blocks and dependencies whose final snapped geometry
+        // actually changed replace RESULT ledger entries.
+        double reuseComparisonStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : Time.realtimeSinceStartupAsDouble;
         HashSet<Vector3Int> localKeys = new HashSet<Vector3Int>();
-        foreach (KeyValuePair<Vector3Int, bool> pair in directAttempts)
+        foreach (KeyValuePair<Vector3Int, AuthoritativeTsdfBlockMesh> pair in
+                 extractedCandidates)
         {
-            if (!pair.Value)
-                continue;
-            for (int z = -1; z <= 1; z++)
-            for (int y = -1; y <= 1; y++)
-            for (int x = -1; x <= 1; x++)
+            bool direct = directAttempts.TryGetValue(pair.Key, out bool directValue) &&
+                          directValue;
+            AuthoritativeTsdfBlockMesh semanticBaseline = null;
+            if (!direct &&
+                !_authoritativeSemanticReuseBaselineByBlock.TryGetValue(
+                    pair.Key, out semanticBaseline) &&
+                _authoritativeTsdfBlocks.TryGetValue(
+                    pair.Key, out AuthoritativeTsdfBlockMesh cachedBaseline))
             {
-                Vector3Int key = pair.Key + new Vector3Int(x, y, z);
-                if (extractedCandidates.ContainsKey(key))
-                    localKeys.Add(key);
+                semanticBaseline = cachedBaseline;
+                _authoritativeSemanticReuseBaselineByBlock[pair.Key] = cachedBaseline;
             }
+            if (direct ||
+                !AuthoritativeTsdfBlockMeshEquivalentForSemanticReuse(
+                    pair.Value, semanticBaseline, pair.Key, blockVoxels))
+                localKeys.Add(pair.Key);
         }
-        // The old policy's wider intake is restored only into this shadow ledger.
-        // It does not bypass the authoritative block commit or any hard topology gate.
-        if (enableLegacyRelaxedCandidateShadow)
+        FinalizeDependencySemanticReuseBoundaryMigrationDiagnostics();
+        LastDependencySemanticReuseComparisonMilliseconds =
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - reuseComparisonStart) * 1000.0);
+        // Cold publication has no accepted RESULT cache to compare against.
+        if (localKeys.Count == 0 &&
+            _persistentFinalizedResultLedgerByBlock.Count == 0 &&
+            extractedCandidates.Count > 0)
         {
             foreach (Vector3Int key in extractedCandidates.Keys)
                 localKeys.Add(key);
         }
-        List<Vector3> shadowVertices = new List<Vector3>(4096);
-        List<int> shadowTriangles = new List<int>(8192);
+        // The old policy's wider intake is restored only into this shadow ledger.
+        // It does not bypass the authoritative block commit or any hard topology gate.
+        if (enableLegacyRelaxedCandidateShadow &&
+            !localizeLegacyRelaxedCandidateIntake)
+        {
+            foreach (Vector3Int key in extractedCandidates.Keys)
+                localKeys.Add(key);
+        }
+        if (localKeys.Count == 0)
+        {
+            if (clearedBlockKeys != null && clearedBlockKeys.Count > 0)
+            {
+                IEnumerator clearedCommitRoutine = CommitPersistentResultLedgerRoutine(
+                    null, null, clearedBlockKeys, planes, blockVoxels, budget);
+                while (clearedCommitRoutine.MoveNext())
+                    yield return clearedCommitRoutine.Current;
+            }
+            yield break;
+        }
+        bool collectAggregateShadowMesh = !enableLowOverheadPerformanceMeasurement;
+        List<Vector3> shadowVertices = collectAggregateShadowMesh
+            ? new List<Vector3>(4096)
+            : null;
+        List<int> shadowTriangles = collectAggregateShadowMesh
+            ? new List<int>(8192)
+            : null;
         List<PlaneConstrainedZeroCrossTriangleLedgerEntry> triangleLedger =
             new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>(8192);
         Dictionary<AuthoritativeCellComponentKey, Vector3> rawPositionSums =
@@ -22145,9 +29761,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 : extractedCandidates[key];
             AuthoritativeBlockTopologyStats rawTopology = AnalyzeAuthoritativeBlockTopology(raw);
             PlaneConstrainedZeroCrossShadowStats stats = new PlaneConstrainedZeroCrossShadowStats();
+            double reextractStart = Time.realtimeSinceStartupAsDouble;
             bool hasShadow = TryExtractAuthoritativeTsdfBlock(
                 key, blockVoxels, out AuthoritativeTsdfBlockMesh constrained,
                 _authoritativeCyanLastPlaneByVertex, planes, stats, false);
+            LastPlaneConstrainedZeroCrossReextractMilliseconds +=
+                (float)((Time.realtimeSinceStartupAsDouble - reextractStart) * 1000.0);
 
             int unownedTriangles = 0;
             int mixedOneTriangles = 0;
@@ -22227,13 +29846,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 LastPlaneConstrainedZeroCrossShadowMixedOneTriangleCount += mixedOneTriangles;
                 LastPlaneConstrainedZeroCrossShadowMixedTwoTriangleCount += mixedTwoTriangles;
                 LastPlaneConstrainedZeroCrossShadowFullyOwnedTriangleCount += fullyOwnedTriangles;
-                int baseVertex = shadowVertices.Count;
-                shadowVertices.AddRange(constrained.Vertices);
-                for (int i = 0; i < constrained.Triangles.Count; i++)
-                    shadowTriangles.Add(baseVertex + constrained.Triangles[i]);
+                if (collectAggregateShadowMesh)
+                {
+                    int baseVertex = shadowVertices.Count;
+                    shadowVertices.AddRange(constrained.Vertices);
+                    for (int i = 0; i < constrained.Triangles.Count; i++)
+                        shadowTriangles.Add(baseVertex + constrained.Triangles[i]);
+                }
+                double collectStart = Time.realtimeSinceStartupAsDouble;
                 CollectPlaneConstrainedZeroCrossTriangleLedger(
                     triangleLedger, key, direct, constrained, planes, stats,
                     rawPositionSums, rawPositionCounts, "strict_constrained", "none");
+                LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds +=
+                    (float)((Time.realtimeSinceStartupAsDouble - collectStart) * 1000.0);
             }
             else
             {
@@ -22246,10 +29871,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                                           rollbackReason == "degenerate"
                     ? "block_" + rollbackReason
                     : "none";
+                double collectStart = Time.realtimeSinceStartupAsDouble;
                 CollectPlaneConstrainedZeroCrossTriangleLedger(
                     triangleLedger, key, direct, raw, planes, stats,
                     rawPositionSums, rawPositionCounts,
                     "legacy_relaxed_" + rollbackReason, forcedHardReject);
+                LastPlaneConstrainedZeroCrossLedgerCollectMilliseconds +=
+                    (float)((Time.realtimeSinceStartupAsDouble - collectStart) * 1000.0);
             }
 
             if (_planeConstrainedZeroCrossShadowRows != null)
@@ -22287,14 +29915,46 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ? residualBeforeSum / residualSamples : 0f;
         LastPlaneConstrainedZeroCrossShadowResidualAfterMeters = residualSamples > 0
             ? residualAfterSum / residualSamples : 0f;
-        CountMeshEdgeTopology(shadowTriangles,
-            out int boundaryEdges, out int nonManifoldEdges);
-        LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount = boundaryEdges;
-        LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount = nonManifoldEdges;
+        if (enableLowOverheadPerformanceMeasurement)
+        {
+            // Every constrained block has already passed the authoritative hard
+            // topology gate.  This aggregate dictionary is diagnostic-only and
+            // creates a needless full-scene allocation/spike in production mode.
+            LastPlaneConstrainedZeroCrossAggregateTopologySkipped = true;
+            LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount = 0;
+            LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount = 0;
+        }
+        else
+        {
+            double aggregateTopologyStart = Time.realtimeSinceStartupAsDouble;
+            CountMeshEdgeTopology(shadowTriangles,
+                out int boundaryEdges, out int nonManifoldEdges);
+            LastPlaneConstrainedZeroCrossAggregateTopologyMilliseconds =
+                (float)((Time.realtimeSinceStartupAsDouble - aggregateTopologyStart) * 1000.0);
+            LastPlaneConstrainedZeroCrossShadowBoundaryEdgeCount = boundaryEdges;
+            LastPlaneConstrainedZeroCrossShadowNonManifoldEdgeCount = nonManifoldEdges;
+        }
+        double commitStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : Time.realtimeSinceStartupAsDouble;
         IEnumerator commitRoutine = CommitPersistentResultLedgerRoutine(
             triangleLedger, localKeys, clearedBlockKeys, planes, blockVoxels, budget);
         while (commitRoutine.MoveNext())
             yield return commitRoutine.Current;
+        LastPlaneConstrainedZeroCrossCommitMilliseconds =
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - commitStart) * 1000.0);
+
+        // Advance the fixed hysteresis baseline only for blocks that actually
+        // entered the semantic commit. Reused dependency blocks retain their old
+        // baseline so repeated sub-threshold motion eventually accumulates.
+        foreach (Vector3Int key in localKeys)
+        {
+            if (extractedCandidates.TryGetValue(
+                key, out AuthoritativeTsdfBlockMesh acceptedSemanticMesh))
+                _authoritativeSemanticReuseBaselineByBlock[key] = acceptedSemanticMesh;
+        }
     }
 
     private int CountPersistentResultLedgerTriangles()
@@ -22304,6 +29964,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                  in _persistentResultLedgerByBlock.Values)
             count += blockLedger != null ? blockLedger.Count : 0;
         return count;
+    }
+
+    private bool ShouldRetirePersistentResultBlock(Vector3Int key)
+    {
+        int streak = 0;
+        _persistentResultMissingStreakByBlock.TryGetValue(key, out streak);
+        streak++;
+        _persistentResultMissingStreakByBlock[key] = streak;
+        if (streak < Mathf.Max(2, persistentResultRetireConfirmRebuilds))
+            return false;
+        _persistentResultMissingStreakByBlock.Remove(key);
+        return true;
     }
 
     private IEnumerator CommitPersistentResultLedgerRoutine(
@@ -22318,9 +29990,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastPersistentResultLedgerTrianglesBefore = CountPersistentResultLedgerTriangles();
         LastPersistentResultLedgerBlocksReplaced = 0;
         LastPersistentResultLedgerBlocksRemoved = 0;
+        LastPersistentResultRetireCandidateCount = 0;
+        LastPersistentResultRetireDeferredCount = 0;
         HashSet<Vector3Int> beforeKeys =
             new HashSet<Vector3Int>(_persistentResultLedgerByBlock.Keys);
         HashSet<Vector3Int> mutatedKeys = new HashSet<Vector3Int>();
+        HashSet<Vector3Int> retirementCheckedKeys = new HashSet<Vector3Int>();
 
         if (clearedBlockKeys != null)
         {
@@ -22332,10 +30007,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     yield return null;
                     budget.Resume();
                 }
-                if (_persistentResultLedgerByBlock.Remove(key))
+                if (_persistentResultLedgerByBlock.ContainsKey(key))
                 {
-                    LastPersistentResultLedgerBlocksRemoved++;
-                    mutatedKeys.Add(key);
+                    if (!retirementCheckedKeys.Add(key))
+                        continue;
+                    LastPersistentResultRetireCandidateCount++;
+                    if (ShouldRetirePersistentResultBlock(key) &&
+                        _persistentResultLedgerByBlock.Remove(key))
+                    {
+                        LastPersistentResultLedgerBlocksRemoved++;
+                        mutatedKeys.Add(key);
+                    }
+                    else
+                    {
+                        LastPersistentResultRetireDeferredCount++;
+                    }
                 }
             }
         }
@@ -22377,15 +30063,30 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                         out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> replacement) &&
                     replacement.Count > 0)
                 {
+                    _persistentResultMissingStreakByBlock.Remove(key);
                     _persistentResultLedgerByBlock[key] = replacement;
                     LastPersistentResultLedgerBlocksReplaced++;
                     mutatedKeys.Add(key);
                 }
-                else if (_persistentResultLedgerByBlock.Remove(key))
+                else if (_persistentResultLedgerByBlock.ContainsKey(key))
                 {
-                    // A successfully re-extracted empty block is an atomic deletion.
-                    LastPersistentResultLedgerBlocksRemoved++;
-                    mutatedKeys.Add(key);
+                    if (!retirementCheckedKeys.Add(key))
+                        continue;
+                    // Empty extraction is a retirement candidate, not an immediate
+                    // instruction to erase a mature foreground chunk. Require
+                    // repeated absence so a single occluded/noisy batch cannot make
+                    // accepted geometry regress.
+                    LastPersistentResultRetireCandidateCount++;
+                    if (ShouldRetirePersistentResultBlock(key) &&
+                        _persistentResultLedgerByBlock.Remove(key))
+                    {
+                        LastPersistentResultLedgerBlocksRemoved++;
+                        mutatedKeys.Add(key);
+                    }
+                    else
+                    {
+                        LastPersistentResultRetireDeferredCount++;
+                    }
                 }
             }
         }
@@ -22405,7 +30106,55 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
         LastPersistentResultLedgerTrianglesAfter = CountPersistentResultLedgerTriangles();
 
-        List<Vector3Int> sortedKeys = new List<Vector3Int>(_persistentResultLedgerByBlock.Keys);
+        HashSet<Vector3Int> semanticCommitKeys =
+            new HashSet<Vector3Int>(mutatedKeys);
+        HashSet<Vector3Int> semanticScope =
+            new HashSet<Vector3Int>(semanticCommitKeys);
+        bool forceFullSemanticFinalization =
+            !enableIncrementalSemanticFinalizationScope ||
+            _persistentFinalizedResultLedgerByBlock.Count == 0;
+        if (forceFullSemanticFinalization)
+        {
+            foreach (Vector3Int key in _persistentResultLedgerByBlock.Keys)
+            {
+                semanticScope.Add(key);
+                semanticCommitKeys.Add(key);
+            }
+        }
+        else
+        {
+            foreach (Vector3Int key in mutatedKeys)
+                semanticScope.Add(key);
+            int semanticHalo = Mathf.Max(0, persistentSemanticFinalizationHaloBlocks);
+            if (semanticHalo > 0)
+            {
+                List<Vector3Int> changedSemanticKeys =
+                    new List<Vector3Int>(semanticScope);
+                for (int keyIndex = 0; keyIndex < changedSemanticKeys.Count; keyIndex++)
+                {
+                    Vector3Int key = changedSemanticKeys[keyIndex];
+                    for (int z = -semanticHalo; z <= semanticHalo; z++)
+                    for (int y = -semanticHalo; y <= semanticHalo; y++)
+                    for (int x = -semanticHalo; x <= semanticHalo; x++)
+                    {
+                        Vector3Int neighbour = key + new Vector3Int(x, y, z);
+                        if (_persistentResultLedgerByBlock.ContainsKey(neighbour) ||
+                            _persistentFinalizedResultLedgerByBlock.ContainsKey(neighbour))
+                            semanticScope.Add(neighbour);
+                    }
+                }
+            }
+        }
+        LastPersistentSemanticFinalizationScopeBlockCount = semanticScope.Count;
+        LastPersistentSemanticFinalizationReusedBlockCount = Mathf.Max(
+            0, _persistentResultLedgerByBlock.Count - semanticCommitKeys.Count);
+
+        List<Vector3Int> sortedKeys = new List<Vector3Int>();
+        foreach (Vector3Int key in semanticScope)
+        {
+            if (_persistentResultLedgerByBlock.ContainsKey(key))
+                sortedKeys.Add(key);
+        }
         sortedKeys.Sort((a, b) =>
         {
             int z = a.z.CompareTo(b.z);
@@ -22413,8 +30162,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             int y = a.y.CompareTo(b.y);
             return y != 0 ? y : a.x.CompareTo(b.x);
         });
+        int scopedTriangleCapacity = 0;
+        for (int i = 0; i < sortedKeys.Count; i++)
+            scopedTriangleCapacity += _persistentResultLedgerByBlock[sortedKeys[i]].Count;
         List<PlaneConstrainedZeroCrossTriangleLedgerEntry> fullLedger =
-            new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>(LastPersistentResultLedgerTrianglesAfter);
+            new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>(scopedTriangleCapacity);
+        Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            finalizedByBlock =
+                new Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>(
+                    sortedKeys.Count);
         for (int keyIndex = 0; keyIndex < sortedKeys.Count; keyIndex++)
         {
             if (budget != null && budget.ShouldYield())
@@ -22423,8 +30179,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 yield return null;
                 budget.Resume();
             }
+            Vector3Int blockKey = sortedKeys[keyIndex];
             List<PlaneConstrainedZeroCrossTriangleLedgerEntry> blockEntries =
-                _persistentResultLedgerByBlock[sortedKeys[keyIndex]];
+                _persistentResultLedgerByBlock[blockKey];
+            if (!semanticCommitKeys.Contains(blockKey) &&
+                _persistentFinalizedResultLedgerByBlock.TryGetValue(
+                    blockKey,
+                    out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> acceptedContext) &&
+                acceptedContext != null)
+                blockEntries = acceptedContext;
+            List<PlaneConstrainedZeroCrossTriangleLedgerEntry> finalizedBlockEntries =
+                new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>(blockEntries.Count);
+            finalizedByBlock[blockKey] = finalizedBlockEntries;
             for (int entryIndex = 0; entryIndex < blockEntries.Count; entryIndex++)
             {
                 if ((entryIndex & 127) == 0 &&
@@ -22438,20 +30204,307 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     blockEntries[entryIndex].CloneForFinalization();
                 clone.LedgerId = fullLedger.Count;
                 fullLedger.Add(clone);
+                finalizedBlockEntries.Add(clone);
             }
         }
         LastPersistentResultLedgerClosureDelta =
-            LastPersistentResultLedgerTrianglesAfter - fullLedger.Count;
+            scopedTriangleCapacity - fullLedger.Count;
+        // Halo entries participate in topology/adjacency audits but are read-only
+        // lifecycle context. Only core keys may advance probation or replace leases.
+        _activeSemanticFinalizeScopeKeys = semanticCommitKeys;
         IEnumerator finalizeRoutine =
             FinalizePlaneConstrainedZeroCrossTriangleLedgerRoutine(
                 fullLedger, planes, blockVoxels, budget);
         while (finalizeRoutine.MoveNext())
             yield return finalizeRoutine.Current;
-        IEnumerator publishRoutine =
-            RebuildPlaneConstrainedZeroCrossShadowWireBudgetedRoutine(
-                fullLedger, budget);
+        _activeSemanticFinalizeScopeKeys = null;
+        IEnumerator observedFloorRoutine = AddObservedFloorSupportCompletionRoutine(
+            finalizedByBlock, mutatedKeys, planes, blockVoxels, budget);
+        while (observedFloorRoutine.MoveNext())
+            yield return observedFloorRoutine.Current;
+        IEnumerator localityShadowRoutine = AuditPersistentResultLocalityShadowRoutine(
+            finalizedByBlock, mutatedKeys, budget);
+        while (localityShadowRoutine.MoveNext())
+            yield return localityShadowRoutine.Current;
+        Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            mergedFinalizedByBlock =
+                new Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>(
+                    _persistentFinalizedResultLedgerByBlock);
+        foreach (Vector3Int key in mutatedKeys)
+            semanticCommitKeys.Add(key);
+        foreach (Vector3Int key in semanticCommitKeys)
+        {
+            if (!finalizedByBlock.ContainsKey(key))
+                mergedFinalizedByBlock.Remove(key);
+        }
+        foreach (KeyValuePair<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+                 pair in finalizedByBlock)
+        {
+            if (!semanticCommitKeys.Contains(pair.Key))
+                continue;
+            mergedFinalizedByBlock[pair.Key] = pair.Value;
+        }
+        LastPersistentSemanticFinalizationReusedBlockCount = Mathf.Max(
+            0, _persistentResultLedgerByBlock.Count - semanticCommitKeys.Count);
+
+        IEnumerator publishRoutine;
+        if (ShouldUsePersistentResultChunkPublishing() &&
+            enablePersistentResultDeltaPublishing)
+        {
+            publishRoutine = CommitAndPublishPersistentResultDeltaRoutine(
+                mergedFinalizedByBlock, semanticCommitKeys, budget);
+        }
+        else
+        {
+            List<PlaneConstrainedZeroCrossTriangleLedgerEntry> mergedLedger =
+                new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>();
+            foreach (List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries in
+                     mergedFinalizedByBlock.Values)
+            {
+                if (entries != null)
+                    mergedLedger.AddRange(entries);
+            }
+            publishRoutine =
+                RebuildPlaneConstrainedZeroCrossShadowWireBudgetedRoutine(
+                    mergedLedger, budget);
+        }
         while (publishRoutine.MoveNext())
             yield return publishRoutine.Current;
+    }
+
+    private IEnumerator AuditPersistentResultLocalityShadowRoutine(
+        IReadOnlyDictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            finalizedByBlock,
+        IReadOnlyCollection<Vector3Int> mutatedKeys,
+        CooperativeRebuildBudget budget)
+    {
+        LastLocalityShadowBlocksTotal = finalizedByBlock != null
+            ? finalizedByBlock.Count : 0;
+        LastLocalityShadowBlocksNew = 0;
+        LastLocalityShadowBlocksRemoved = 0;
+        LastLocalityShadowSemanticSame = 0;
+        LastLocalityShadowSemanticDelta = 0;
+        LastLocalityShadowRenderSame = 0;
+        LastLocalityShadowRenderDelta = 0;
+        LastLocalityShadowMutatedButRenderSame = 0;
+        LastLocalityShadowTheoreticalUploadSkip = 0;
+        LastLocalityShadowChangedToRenderDeltaRatio = 0f;
+        if (!enablePersistentResultLocalityShadow || finalizedByBlock == null)
+            yield break;
+
+        PersistentResultEdgeOwners globalOwners = new PersistentResultEdgeOwners();
+        int processed = 0;
+        foreach (KeyValuePair<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+                 pair in finalizedByBlock)
+        {
+            List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries = pair.Value;
+            if (entries == null)
+                continue;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
+                int category = GetPersistentResultOutputCategory(entry);
+                if (category >= 0)
+                {
+                    RegisterPersistentResultEdgeOwner(
+                        globalOwners, category,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyA, entry.KeyB), pair.Key);
+                    RegisterPersistentResultEdgeOwner(
+                        globalOwners, category,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyB, entry.KeyC), pair.Key);
+                    RegisterPersistentResultEdgeOwner(
+                        globalOwners, category,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyC, entry.KeyA), pair.Key);
+                }
+                processed++;
+                if (processed % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                    budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+            }
+        }
+
+        Dictionary<Vector3Int, ulong> nextSemantic =
+            new Dictionary<Vector3Int, ulong>(finalizedByBlock.Count);
+        Dictionary<Vector3Int, ulong> nextRender =
+            new Dictionary<Vector3Int, ulong>(finalizedByBlock.Count);
+        HashSet<Vector3Int> mutated = mutatedKeys != null
+            ? new HashSet<Vector3Int>(mutatedKeys)
+            : new HashSet<Vector3Int>();
+        foreach (KeyValuePair<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+                 pair in finalizedByBlock)
+        {
+            ulong semantic = ComputeLocalityShadowSemanticSignature(pair.Value);
+            ulong render = ComputeLocalityShadowRenderSignature(
+                pair.Key, pair.Value, globalOwners);
+            nextSemantic[pair.Key] = semantic;
+            nextRender[pair.Key] = render;
+            bool hadSemantic = _localityShadowSemanticSignatures.TryGetValue(
+                pair.Key, out ulong previousSemantic);
+            bool hadRender = _localityShadowRenderSignatures.TryGetValue(
+                pair.Key, out ulong previousRender);
+            if (!hadSemantic || !hadRender)
+            {
+                LastLocalityShadowBlocksNew++;
+                LastLocalityShadowSemanticDelta++;
+                LastLocalityShadowRenderDelta++;
+            }
+            else
+            {
+                if (previousSemantic == semantic)
+                    LastLocalityShadowSemanticSame++;
+                else
+                    LastLocalityShadowSemanticDelta++;
+                if (previousRender == render)
+                {
+                    LastLocalityShadowRenderSame++;
+                    if (mutated.Contains(pair.Key))
+                        LastLocalityShadowMutatedButRenderSame++;
+                }
+                else
+                {
+                    LastLocalityShadowRenderDelta++;
+                }
+            }
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+        }
+        foreach (Vector3Int previousKey in _localityShadowRenderSignatures.Keys)
+        {
+            if (!nextRender.ContainsKey(previousKey))
+            {
+                LastLocalityShadowBlocksRemoved++;
+                LastLocalityShadowSemanticDelta++;
+                LastLocalityShadowRenderDelta++;
+            }
+        }
+        LastLocalityShadowTheoreticalUploadSkip =
+            LastLocalityShadowMutatedButRenderSame;
+        LastLocalityShadowChangedToRenderDeltaRatio = mutated.Count > 0
+            ? (float)LastLocalityShadowRenderDelta / mutated.Count : 0f;
+        _localityShadowSemanticSignatures.Clear();
+        _localityShadowRenderSignatures.Clear();
+        foreach (KeyValuePair<Vector3Int, ulong> pair in nextSemantic)
+            _localityShadowSemanticSignatures[pair.Key] = pair.Value;
+        foreach (KeyValuePair<Vector3Int, ulong> pair in nextRender)
+            _localityShadowRenderSignatures[pair.Key] = pair.Value;
+    }
+
+    private ulong ComputeLocalityShadowSemanticSignature(
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries)
+    {
+        List<ulong> records = new List<ulong>(entries != null ? entries.Count : 0);
+        if (entries != null)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
+                int category = GetPersistentResultOutputCategory(entry);
+                if (category < 0)
+                    continue;
+                int a = entry.KeyA.GetHashCode();
+                int b = entry.KeyB.GetHashCode();
+                int c = entry.KeyC.GetHashCode();
+                if (a > b) { int swap = a; a = b; b = swap; }
+                if (b > c) { int swap = b; b = c; c = swap; }
+                if (a > b) { int swap = a; a = b; b = swap; }
+                ulong record = 1469598103934665603UL;
+                record = PersistentResultHash(record, category);
+                record = PersistentResultHash(record, a);
+                record = PersistentResultHash(record, b);
+                record = PersistentResultHash(record, c);
+                records.Add(record);
+            }
+        }
+        records.Sort();
+        ulong hash = 1469598103934665603UL;
+        for (int i = 0; i < records.Count; i++)
+        {
+            hash = PersistentResultHash(hash, (int)records[i]);
+            hash = PersistentResultHash(hash, (int)(records[i] >> 32));
+        }
+        return PersistentResultHash(hash, records.Count);
+    }
+
+    private ulong ComputeLocalityShadowRenderSignature(
+        Vector3Int blockKey,
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries,
+        PersistentResultEdgeOwners globalOwners)
+    {
+        HashSet<ulong> uniqueRecords = new HashSet<ulong>();
+        if (entries != null)
+        {
+            for (int i = 0; i < entries.Count; i++)
+            {
+                PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
+                int category = GetPersistentResultOutputCategory(entry);
+                if (category < 0)
+                    continue;
+                AddLocalityShadowRenderEdge(uniqueRecords, blockKey, category, globalOwners,
+                    entry.KeyA, entry.KeyB, RelaxedDisplayA(entry), RelaxedDisplayB(entry));
+                AddLocalityShadowRenderEdge(uniqueRecords, blockKey, category, globalOwners,
+                    entry.KeyB, entry.KeyC, RelaxedDisplayB(entry), RelaxedDisplayC(entry));
+                AddLocalityShadowRenderEdge(uniqueRecords, blockKey, category, globalOwners,
+                    entry.KeyC, entry.KeyA, RelaxedDisplayC(entry), RelaxedDisplayA(entry));
+            }
+        }
+        List<ulong> records = new List<ulong>(uniqueRecords);
+        records.Sort();
+        ulong hash = 1469598103934665603UL;
+        for (int i = 0; i < records.Count; i++)
+        {
+            hash = PersistentResultHash(hash, (int)records[i]);
+            hash = PersistentResultHash(hash, (int)(records[i] >> 32));
+        }
+        return PersistentResultHash(hash, records.Count);
+    }
+
+    private void AddLocalityShadowRenderEdge(
+        HashSet<ulong> records,
+        Vector3Int blockKey,
+        int category,
+        PersistentResultEdgeOwners globalOwners,
+        AuthoritativeCellComponentKey keyA,
+        AuthoritativeCellComponentKey keyB,
+        Vector3 pointA,
+        Vector3 pointB)
+    {
+        if (!IsPersistentResultEdgeOwner(
+                blockKey, category, globalOwners, keyA, keyB))
+            return;
+        float quantum = Mathf.Max(0.0001f, localityShadowPositionQuantumMeters);
+        int ax = Mathf.RoundToInt(pointA.x / quantum);
+        int ay = Mathf.RoundToInt(pointA.y / quantum);
+        int az = Mathf.RoundToInt(pointA.z / quantum);
+        int bx = Mathf.RoundToInt(pointB.x / quantum);
+        int by = Mathf.RoundToInt(pointB.y / quantum);
+        int bz = Mathf.RoundToInt(pointB.z / quantum);
+        bool swapEndpoints = ax > bx ||
+            (ax == bx && (ay > by || (ay == by && az > bz)));
+        if (swapEndpoints)
+        {
+            int swap = ax; ax = bx; bx = swap;
+            swap = ay; ay = by; by = swap;
+            swap = az; az = bz; bz = swap;
+        }
+        ulong record = 1469598103934665603UL;
+        record = PersistentResultHash(record, category);
+        record = PersistentResultHash(
+            record, MakeAuthoritativeCanonicalEdge(keyA, keyB).GetHashCode());
+        record = PersistentResultHash(record, ax);
+        record = PersistentResultHash(record, ay);
+        record = PersistentResultHash(record, az);
+        record = PersistentResultHash(record, bx);
+        record = PersistentResultHash(record, by);
+        record = PersistentResultHash(record, bz);
+        records.Add(record);
     }
 
     private int GetAppliedZeroCrossShadowPlaneId(
@@ -22464,6 +30517,245 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             planes == null || planeIndex < 0 || planeIndex >= planes.Count)
             return -1;
         return planes[planeIndex].Id;
+    }
+
+    private IEnumerator AddObservedFloorSupportCompletionRoutine(
+        Dictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>> finalizedByBlock,
+        HashSet<Vector3Int> mutatedKeys,
+        IReadOnlyList<ScanCoverStablePlaneRegistry.PlaneConstraint> planes,
+        int blockVoxels,
+        CooperativeRebuildBudget budget)
+    {
+        Dictionary<Vector3Int, ulong> nextSignatures = new Dictionary<Vector3Int, ulong>();
+        if (enableObservedFloorSupportCompletion && finalizedByBlock != null &&
+            planes != null && planes.Count > 0 &&
+            _authoritativeCyanPlaneDirectSupportCells.Count > 0)
+        {
+            PrepareAuthoritativeCyanHorizontalExtrema(planes);
+            Dictionary<int, ScanCoverStablePlaneRegistry.PlaneConstraint> floors =
+                new Dictionary<int, ScanCoverStablePlaneRegistry.PlaneConstraint>();
+            for (int i = 0; i < planes.Count; i++)
+            {
+                if (IsAuthoritativeCyanStructuralPlane(
+                        planes[i], out string kind, out _) && kind == "floor")
+                    floors[planes[i].Id] = planes[i];
+            }
+            LastObservedFloorSupportPlaneCount = floors.Count;
+            float cellSize = GetAuthoritativeCyanDirectSupportCellSize(out _);
+            float blockSize = Mathf.Max(
+                0.001f, voxelSizeMeters * Mathf.Max(1, blockVoxels));
+            int minSamples = Mathf.Clamp(authoritativeCyanDirectCellMinSamplesPerBatch, 1, 16);
+            int minConsecutive = Mathf.Clamp(observedFloorSupportMinConsecutiveBatches, 2, 4);
+            int retainMissing = Mathf.Clamp(observedFloorSupportRetainMissingBatches, 0, 2);
+            int maxCells = Mathf.Clamp(observedFloorSupportMaxCells, 32, 1024);
+            int emittedCells = 0;
+
+            foreach (KeyValuePair<AuthoritativeCyanPlaneTileKey, AuthoritativeCyanPlaneDirectSupportCell>
+                     pair in _authoritativeCyanPlaneDirectSupportCells)
+            {
+                if (budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+                if (emittedCells >= maxCells || pair.Value == null ||
+                    !floors.TryGetValue(
+                        pair.Key.PlaneId,
+                        out ScanCoverStablePlaneRegistry.PlaneConstraint plane))
+                    continue;
+                AuthoritativeCyanPlaneDirectSupportCell direct = pair.Value;
+                bool currentStable =
+                    direct.LastObservedSnapshot == LastAuthoritativeReadSnapshotSequence &&
+                    direct.LastSampleCount >= minSamples &&
+                    direct.ConsecutiveObservedBatches >= minConsecutive;
+                bool retainedStable =
+                    direct.TotalSamples >= minSamples * minConsecutive &&
+                    direct.MissingBatches > 0 && direct.MissingBatches <= retainMissing;
+                if (!currentStable && !retainedStable)
+                    continue;
+                LastObservedFloorSupportCandidateCellCount++;
+
+                AuthoritativeCyanPlaneSupportFrame frame = GetOrCreatePlaneSupportFrame(plane);
+                float minU = pair.Key.U * cellSize;
+                float maxU = minU + cellSize;
+                float minV = pair.Key.V * cellSize;
+                float maxV = minV + cellSize;
+                Vector3 a = BuildPlaneSupportPointOnCurrentPlane(plane, frame, minU, minV);
+                Vector3 b = BuildPlaneSupportPointOnCurrentPlane(plane, frame, maxU, minV);
+                Vector3 c = BuildPlaneSupportPointOnCurrentPlane(plane, frame, maxU, maxV);
+                Vector3 d = BuildPlaneSupportPointOnCurrentPlane(plane, frame, minU, maxV);
+                Vector3 center = (a + b + c + d) * 0.25f;
+                Vector3 normal = plane.Normal.sqrMagnitude > 0.5f
+                    ? plane.Normal.normalized : Vector3.up;
+                Vector3 fromCenter = center - plane.Center;
+                Vector3 tangent = fromCenter - normal * Vector3.Dot(fromCenter, normal);
+                if (tangent.magnitude > plane.Radius + cellSize * 0.75f)
+                    continue;
+
+                Vector3Int block = AuthoritativeBlockKey(center, blockSize);
+                finalizedByBlock.TryGetValue(
+                    block, out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries);
+                if (HasPublishedFloorCoverageInCell(
+                        entries, plane, frame, minU, maxU, minV, maxV))
+                {
+                    LastObservedFloorSupportCoveredCellCount++;
+                    continue;
+                }
+                if (entries == null)
+                {
+                    entries = new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>(8);
+                    finalizedByBlock[block] = entries;
+                }
+
+                AuthoritativeCellComponentKey keyA = MakeObservedFloorSupportKey(
+                    plane.Id, pair.Key.U, pair.Key.V);
+                AuthoritativeCellComponentKey keyB = MakeObservedFloorSupportKey(
+                    plane.Id, pair.Key.U + 1, pair.Key.V);
+                AuthoritativeCellComponentKey keyC = MakeObservedFloorSupportKey(
+                    plane.Id, pair.Key.U + 1, pair.Key.V + 1);
+                AuthoritativeCellComponentKey keyD = MakeObservedFloorSupportKey(
+                    plane.Id, pair.Key.U, pair.Key.V + 1);
+                entries.Add(CreateObservedFloorSupportEntry(
+                    block, plane.Id, keyA, keyB, keyC, a, b, c, 0));
+                entries.Add(CreateObservedFloorSupportEntry(
+                    block, plane.Id, keyA, keyC, keyD, a, c, d, 1));
+                LastObservedFloorSupportFilledCellCount++;
+                LastObservedFloorSupportTriangleCount += 2;
+                emittedCells++;
+
+                ulong signature = nextSignatures.TryGetValue(block, out ulong existing)
+                    ? existing : 1469598103934665603UL;
+                signature = PersistentResultHash(signature, pair.Key.PlaneId);
+                signature = PersistentResultHash(signature, pair.Key.U);
+                signature = PersistentResultHash(signature, pair.Key.V);
+                signature = PersistentResultHash(signature, a.GetHashCode());
+                signature = PersistentResultHash(signature, c.GetHashCode());
+                nextSignatures[block] = signature;
+            }
+        }
+
+        LastObservedFloorSupportBlockCount = nextSignatures.Count;
+        foreach (KeyValuePair<Vector3Int, ulong> pair in nextSignatures)
+        {
+            if (!_observedFloorFillSignaturesByBlock.TryGetValue(
+                    pair.Key, out ulong previous) || previous != pair.Value)
+                mutatedKeys?.Add(pair.Key);
+        }
+        foreach (Vector3Int previousBlock in _observedFloorFillSignaturesByBlock.Keys)
+        {
+            if (!nextSignatures.ContainsKey(previousBlock))
+                mutatedKeys?.Add(previousBlock);
+        }
+        _observedFloorFillSignaturesByBlock.Clear();
+        foreach (KeyValuePair<Vector3Int, ulong> pair in nextSignatures)
+            _observedFloorFillSignaturesByBlock[pair.Key] = pair.Value;
+    }
+
+    private bool HasPublishedFloorCoverageInCell(
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries,
+        ScanCoverStablePlaneRegistry.PlaneConstraint plane,
+        AuthoritativeCyanPlaneSupportFrame frame,
+        float minU,
+        float maxU,
+        float minV,
+        float maxV)
+    {
+        if (entries == null)
+            return false;
+        float nearBand = Mathf.Max(voxelSizeMeters * 1.25f,
+            authoritativeCyanAdaptivePlaneMaxDistanceMeters);
+        Vector3 normal = plane.Normal.sqrMagnitude > 0.5f
+            ? plane.Normal.normalized : frame.Normal;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
+            if (entry == null || entry.CandidateSource == "observed_floor_support_completion" ||
+                !IsOutputResultPromotionEligible(entry))
+                continue;
+            Vector3 a = RelaxedDisplayA(entry);
+            Vector3 b = RelaxedDisplayB(entry);
+            Vector3 c = RelaxedDisplayC(entry);
+            Vector3 centroid = (a + b + c) / 3f;
+            if (Mathf.Abs(Vector3.Dot(normal, centroid) + plane.Offset) > nearBand)
+                continue;
+            float aU = Vector3.Dot(a, frame.UAxis);
+            float bU = Vector3.Dot(b, frame.UAxis);
+            float cU = Vector3.Dot(c, frame.UAxis);
+            float aV = Vector3.Dot(a, frame.VAxis);
+            float bV = Vector3.Dot(b, frame.VAxis);
+            float cV = Vector3.Dot(c, frame.VAxis);
+            float triMinU = Mathf.Min(aU, Mathf.Min(bU, cU));
+            float triMaxU = Mathf.Max(aU, Mathf.Max(bU, cU));
+            float triMinV = Mathf.Min(aV, Mathf.Min(bV, cV));
+            float triMaxV = Mathf.Max(aV, Mathf.Max(bV, cV));
+            if (triMaxU >= minU && triMinU <= maxU &&
+                triMaxV >= minV && triMinV <= maxV)
+                return true;
+        }
+        return false;
+    }
+
+    private static AuthoritativeCellComponentKey MakeObservedFloorSupportKey(
+        int planeId, int u, int v)
+    {
+        return new AuthoritativeCellComponentKey
+        {
+            Cell = new Vector3Int(u, v, planeId),
+            Component = -1000000 - planeId
+        };
+    }
+
+    private static PlaneConstrainedZeroCrossTriangleLedgerEntry CreateObservedFloorSupportEntry(
+        Vector3Int block,
+        int planeId,
+        AuthoritativeCellComponentKey keyA,
+        AuthoritativeCellComponentKey keyB,
+        AuthoritativeCellComponentKey keyC,
+        Vector3 a,
+        Vector3 b,
+        Vector3 c,
+        int localTriangle)
+    {
+        Vector3 cross = Vector3.Cross(b - a, c - a);
+        float doubleArea = cross.magnitude;
+        return new PlaneConstrainedZeroCrossTriangleLedgerEntry
+        {
+            Block = block,
+            Direct = true,
+            LocalTriangle = localTriangle,
+            KeyA = keyA,
+            KeyB = keyB,
+            KeyC = keyC,
+            A = a,
+            B = b,
+            C = c,
+            RawA = a,
+            RawB = b,
+            RawC = c,
+            PlaneA = planeId,
+            PlaneB = planeId,
+            PlaneC = planeId,
+            AppliedPlaneA = planeId,
+            AppliedPlaneB = planeId,
+            AppliedPlaneC = planeId,
+            TargetPlaneId = planeId,
+            NearestPlaneId = planeId,
+            PlaneKind = "floor",
+            AtomicClass = "observed_support_completion",
+            Disposition = "publish_plane",
+            Reason = "direct_observed_floor_gap_completion",
+            Centroid = (a + b + c) / 3f,
+            Normal = doubleArea > 0.0000001f ? cross / doubleArea : Vector3.up,
+            Area = doubleArea * 0.5f,
+            CandidateSource = "observed_floor_support_completion",
+            HardAuditChecked = true,
+            HardLegal = true,
+            HardRejectReason = "none",
+            RelaxedClass = "formal_structural",
+            CandidateEvaluationReason = "direct_observed_floor_gap_completion",
+            WorkingPublishEligible = true
+        };
     }
 
     private void AppendPlaneConstrainedZeroCrossByPlaneRows(
@@ -22882,6 +31174,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ledger = new List<PlaneConstrainedZeroCrossTriangleLedgerEntry>();
         LastPlaneConstrainedZeroCrossLedgerTriangleCount = ledger != null ? ledger.Count : 0;
         double semanticSubphaseStart = Time.realtimeSinceStartupAsDouble;
+        double topologyComputeStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : semanticSubphaseStart;
 
         Dictionary<AuthoritativeCanonicalEdgeKey, List<int>> edgeTriangles =
             new Dictionary<AuthoritativeCanonicalEdgeKey, List<int>>(ledger.Count * 2);
@@ -22890,22 +31185,40 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             AddPlaneLedgerEdge(edgeTriangles, MakeAuthoritativeCanonicalEdge(ledger[i].KeyA, ledger[i].KeyB), i);
             AddPlaneLedgerEdge(edgeTriangles, MakeAuthoritativeCanonicalEdge(ledger[i].KeyB, ledger[i].KeyC), i);
             AddPlaneLedgerEdge(edgeTriangles, MakeAuthoritativeCanonicalEdge(ledger[i].KeyC, ledger[i].KeyA), i);
+            if ((i + 1) % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
         }
 
         int[] meshParents = CreatePlaneLedgerParents(ledger.Count);
         int[] issueParents = CreatePlaneLedgerParents(ledger.Count);
+        int attachedListIndex = 0;
         foreach (List<int> attached in edgeTriangles.Values)
         {
             if (attached.Count == 1)
             {
                 ledger[attached[0]].Boundary = true;
-                continue;
             }
-            for (int i = 1; i < attached.Count; i++)
+            else
             {
-                UnionPlaneLedger(meshParents, attached[0], attached[i]);
-                if (SamePlaneLedgerIssueFamily(ledger[attached[0]], ledger[attached[i]]))
-                    UnionPlaneLedger(issueParents, attached[0], attached[i]);
+                for (int i = 1; i < attached.Count; i++)
+                {
+                    UnionPlaneLedger(meshParents, attached[0], attached[i]);
+                    if (SamePlaneLedgerIssueFamily(ledger[attached[0]], ledger[attached[i]]))
+                        UnionPlaneLedger(issueParents, attached[0], attached[i]);
+                }
+            }
+            attachedListIndex++;
+            if (attachedListIndex % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
             }
         }
 
@@ -22930,10 +31243,19 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ledger[i].IssueComponentId = issueComponent;
             if (ledger[i].Boundary)
                 LastPlaneConstrainedZeroCrossLedgerBoundaryTriangleCount++;
+            if ((i + 1) % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
         }
 
         LastPlaneLedgerTopologyMilliseconds =
-            (float)((Time.realtimeSinceStartupAsDouble - semanticSubphaseStart) * 1000.0);
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - topologyComputeStart) * 1000.0);
         if (budget != null && budget.ShouldYield())
         {
             budget.CompleteSliceForYield();
@@ -22970,7 +31292,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ledger, planes, edgeTriangles, budget);
         while (relaxedAuditRoutine.MoveNext())
             yield return relaxedAuditRoutine.Current;
-        RebuildConfirmedComplexLeaseLedger(ledger);
+        IEnumerator leaseRebuildRoutine = RebuildConfirmedComplexLeaseLedgerRoutine(ledger, budget);
+        while (leaseRebuildRoutine.MoveNext())
+            yield return leaseRebuildRoutine.Current;
         LastPlaneLedgerRelaxedAuditMilliseconds =
             budget != null
                 ? (float)((budget.GetComputeSecondsSnapshot() - relaxedAuditComputeStart) * 1000.0)
@@ -22982,6 +31306,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             budget.Resume();
         }
         semanticSubphaseStart = Time.realtimeSinceStartupAsDouble;
+        double classificationComputeStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : semanticSubphaseStart;
         for (int i = 0; i < ledger.Count; i++)
         {
             PlaneConstrainedZeroCrossTriangleLedgerEntry entry = ledger[i];
@@ -23010,6 +31337,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             }
             if (entry.GeometricSuspect)
                 LastPlaneConstrainedZeroCrossLedgerGeometricSuspectTriangleCount++;
+            if ((i + 1) % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
         }
         LastPlaneConstrainedZeroCrossLedgerMeshComponentCount = meshComponentIds.Count;
         LastPlaneConstrainedZeroCrossLedgerProblemComponentCount = CountPlaneLedgerProblemComponents(ledger);
@@ -23030,7 +31364,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _lastOutputDisplayTriangleLedger = ledger;
         _lastOutputDisplaySupportCellLedger = supportCells;
         LastPlaneLedgerClassificationMilliseconds =
-            (float)((Time.realtimeSinceStartupAsDouble - semanticSubphaseStart) * 1000.0);
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - classificationComputeStart) * 1000.0);
         semanticSubphaseStart = Time.realtimeSinceStartupAsDouble;
 
         if (!enableLowOverheadPerformanceMeasurement)
@@ -23086,13 +31422,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastProvisionalStructuralPromotedCount = 0;
         for (int i = 0; i < ledger.Count; i++)
         {
-            if ((i & 31) == 0 && budget != null && budget.ShouldYield())
+            if (i % Mathf.Clamp(complexLeaseEntriesPerBudgetCheck, 1, 32) == 0 &&
+                budget != null && budget.ShouldYield())
             {
                 budget.CompleteSliceForYield();
                 yield return null;
                 budget.Resume();
             }
             PlaneConstrainedZeroCrossTriangleLedgerEntry entry = ledger[i];
+            if (_activeSemanticFinalizeScopeKeys != null &&
+                !_activeSemanticFinalizeScopeKeys.Contains(entry.Block))
+            {
+                // Read-only halo: its accepted classification supplies adjacency
+                // context but must not be reset, re-probated or lease-renewed.
+                continue;
+            }
             entry.HardAuditChecked = true;
             entry.HardLegal = true;
             entry.HardRejectReason = "none";
@@ -23527,6 +31871,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         foreach (KeyValuePair<Vector3Int, List<ComplexCandidateProbationEntry>> pair in
                  _complexCandidateProbationByBlock)
         {
+            if (_activeSemanticFinalizeScopeKeys != null &&
+                !_activeSemanticFinalizeScopeKeys.Contains(pair.Key))
+            {
+                // An untouched block was not re-observed, but it was not missing.
+                // Keep its probation clock neutral instead of expiring it merely
+                // because another part of the room was rebuilt.
+                for (int i = 0; i < pair.Value.Count; i++)
+                    pair.Value[i].LastSeenEpoch = _complexCandidateProbationEpoch;
+                continue;
+            }
             pair.Value.RemoveAll(candidate =>
                 candidate.LastSeenEpoch != _complexCandidateProbationEpoch);
             if (pair.Value.Count == 0) empty.Add(pair.Key);
@@ -23593,7 +31947,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 continue;
             for (int leaseIndex = 0; leaseIndex < leases.Count; leaseIndex++)
             {
-                string claimKey =
+                ConfirmedComplexLeaseClaimKey claimKey =
                     BuildConfirmedComplexLeaseClaimKey(leaseBlock, leaseIndex);
                 if (_claimedConfirmedComplexLeaseKeys.Contains(claimKey))
                     continue;
@@ -23661,23 +32015,53 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         return true;
     }
 
-    private static string BuildConfirmedComplexLeaseClaimKey(
+    private static ConfirmedComplexLeaseClaimKey BuildConfirmedComplexLeaseClaimKey(
         Vector3Int block, int leaseIndex)
     {
-        return block.x + ":" + block.y + ":" + block.z + ":" + leaseIndex;
+        return new ConfirmedComplexLeaseClaimKey(block, leaseIndex);
     }
 
-    private void RebuildConfirmedComplexLeaseLedger(
-        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> ledger)
+    private IEnumerator RebuildConfirmedComplexLeaseLedgerRoutine(
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> ledger,
+        CooperativeRebuildBudget budget)
     {
+        double computeStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : Time.realtimeSinceStartupAsDouble;
+        LastConfirmedComplexLeaseRebuildYieldCount = 0;
         int before = CountConfirmedComplexLeases();
+        int untouchedRetained = 0;
         Dictionary<Vector3Int, List<ConfirmedComplexLeaseEntry>> next =
             new Dictionary<Vector3Int, List<ConfirmedComplexLeaseEntry>>();
+        if (_activeSemanticFinalizeScopeKeys != null)
+        {
+            foreach (KeyValuePair<Vector3Int, List<ConfirmedComplexLeaseEntry>> pair in
+                     _confirmedComplexLeasesByBlock)
+            {
+                if (!_activeSemanticFinalizeScopeKeys.Contains(pair.Key) &&
+                    pair.Value != null && pair.Value.Count > 0)
+                {
+                    next[pair.Key] = new List<ConfirmedComplexLeaseEntry>(pair.Value);
+                    untouchedRetained += pair.Value.Count;
+                }
+            }
+        }
         if (ledger != null)
         {
             for (int i = 0; i < ledger.Count; i++)
             {
+                if (i % Mathf.Clamp(complexLeaseEntriesPerBudgetCheck, 1, 32) == 0 &&
+                    budget != null && budget.ShouldYield())
+                {
+                    LastConfirmedComplexLeaseRebuildYieldCount++;
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
                 PlaneConstrainedZeroCrossTriangleLedgerEntry entry = ledger[i];
+                if (_activeSemanticFinalizeScopeKeys != null &&
+                    !_activeSemanticFinalizeScopeKeys.Contains(entry.Block))
+                    continue;
                 if (!entry.HardLegal || !entry.WorkingPublishEligible ||
                     entry.RelaxedClass != "confirmed_complex")
                     continue;
@@ -23704,11 +32088,22 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             foreach (KeyValuePair<Vector3Int, List<ConfirmedComplexLeaseEntry>> pair
                      in _confirmedComplexLeasesByBlock)
             {
+                if (_activeSemanticFinalizeScopeKeys != null &&
+                    !_activeSemanticFinalizeScopeKeys.Contains(pair.Key))
+                    continue;
                 if (pair.Value == null ||
                     !_persistentResultLedgerByBlock.ContainsKey(pair.Key))
                     continue;
                 for (int leaseIndex = 0; leaseIndex < pair.Value.Count; leaseIndex++)
                 {
+                    if (leaseIndex % Mathf.Clamp(complexLeaseEntriesPerBudgetCheck, 1, 32) == 0 &&
+                        budget != null && budget.ShouldYield())
+                    {
+                        LastConfirmedComplexLeaseRebuildYieldCount++;
+                        budget.CompleteSliceForYield();
+                        yield return null;
+                        budget.Resume();
+                    }
                     if (_claimedConfirmedComplexLeaseKeys.Contains(
                             BuildConfirmedComplexLeaseClaimKey(pair.Key, leaseIndex)))
                         continue;
@@ -23737,13 +32132,27 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         }
         _confirmedComplexLeasesByBlock.Clear();
         foreach (KeyValuePair<Vector3Int, List<ConfirmedComplexLeaseEntry>> pair in next)
+        {
+            if (budget != null && budget.ShouldYield())
+            {
+                LastConfirmedComplexLeaseRebuildYieldCount++;
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
             _confirmedComplexLeasesByBlock[pair.Key] = pair.Value;
+        }
         LastConfirmedComplexLeaseAfterCount = CountConfirmedComplexLeases();
         LastConfirmedComplexLeaseExpiredCount = Mathf.Max(
             0,
             before -
             LastConfirmedComplexRenewedCount -
-            LastConfirmedComplexLeaseGraceRetainedCount);
+            LastConfirmedComplexLeaseGraceRetainedCount -
+            untouchedRetained);
+        LastConfirmedComplexLeaseRebuildMilliseconds =
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - computeStart) * 1000.0);
     }
 
     private void ApplyHeldRescueKeepPolicy(PlaneConstrainedZeroCrossTriangleLedgerEntry entry)
@@ -24769,7 +33178,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (!enablePlaneConstrainedFallbackAbsolutePlaneAudit || ledger == null)
             return;
         List<ScanCoverStablePlaneRegistry.PlaneConstraint> constraints =
-            _stablePlaneRegistry.GetMatureConstraints();
+            GetMatureProductionPlaneConstraints();
         if (constraints == null || constraints.Count == 0)
             return;
         Dictionary<int, ScanCoverStablePlaneRegistry.PlaneConstraint> byId =
@@ -26552,6 +34961,335 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                entry.HeldKeepDecision == "keep";
     }
 
+    private IEnumerator CommitAndPublishPersistentResultDeltaRoutine(
+        IReadOnlyDictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            finalizedByBlock,
+        IReadOnlyCollection<Vector3Int> changedKeys,
+        CooperativeRebuildBudget budget)
+    {
+        bool forceFull = _persistentFinalizedResultLedgerByBlock.Count == 0 ||
+                         _persistentResultChunks.Count == 0;
+        HashSet<Vector3Int> changed = new HashSet<Vector3Int>();
+        if (forceFull)
+        {
+            if (finalizedByBlock != null)
+            {
+                foreach (Vector3Int key in finalizedByBlock.Keys)
+                    changed.Add(key);
+            }
+        }
+        else if (changedKeys != null)
+        {
+            foreach (Vector3Int key in changedKeys)
+                changed.Add(key);
+        }
+
+        HashSet<Vector3Int> touched = new HashSet<Vector3Int>(changed);
+        int haloRadius = Mathf.Max(0, persistentResultDeltaHaloBlocks);
+        if (haloRadius > 0)
+        {
+            foreach (Vector3Int key in changed)
+            {
+                for (int dz = -haloRadius; dz <= haloRadius; dz++)
+                {
+                    for (int dy = -haloRadius; dy <= haloRadius; dy++)
+                    {
+                        for (int dx = -haloRadius; dx <= haloRadius; dx++)
+                        {
+                            Vector3Int neighbor = key + new Vector3Int(dx, dy, dz);
+                            if ((finalizedByBlock != null &&
+                                 finalizedByBlock.ContainsKey(neighbor)) ||
+                                _persistentFinalizedResultLedgerByBlock.ContainsKey(neighbor) ||
+                                _persistentResultChunks.ContainsKey(neighbor))
+                                touched.Add(neighbor);
+                        }
+                    }
+                }
+                if (budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+            }
+        }
+
+        LastPersistentResultDeltaChangedCount = changed.Count;
+        LastPersistentResultDeltaTouchedCount = touched.Count;
+        LastPersistentResultDeltaHaloCount = Mathf.Max(0, touched.Count - changed.Count);
+
+        foreach (Vector3Int key in touched)
+        {
+            if (finalizedByBlock != null &&
+                finalizedByBlock.TryGetValue(
+                    key,
+                    out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries))
+            {
+                _persistentFinalizedResultLedgerByBlock[key] = entries;
+            }
+            else
+            {
+                _persistentFinalizedResultLedgerByBlock.Remove(key);
+            }
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+        }
+
+        IEnumerator publishRoutine = RebuildPersistentResultChunkDeltaRoutine(
+            _persistentFinalizedResultLedgerByBlock, touched, forceFull, budget);
+        while (publishRoutine.MoveNext())
+            yield return publishRoutine.Current;
+    }
+
+    private IEnumerator RebuildPersistentResultChunkDeltaRoutine(
+        IReadOnlyDictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            finalizedByBlock,
+        IReadOnlyCollection<Vector3Int> touchedKeys,
+        bool forceFull,
+        CooperativeRebuildBudget budget)
+    {
+        double publishStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : Time.realtimeSinceStartupAsDouble;
+        LastPersistentResultChunkUpdatedCount = 0;
+        LastPersistentResultCrossCategoryEdgeSuppressedCount = 0;
+        LastPersistentResultEdgeOwnerScopeBlockCount = 0;
+        LastPersistentResultEdgeOwnerScopeEntryCount = 0;
+        LastPersistentResultChunkPreservedCount = 0;
+        LastPersistentResultChunkRemovedCount = 0;
+        LastPersistentResultDoubleBufferedSwapCount = 0;
+        LastPersistentResultChunkUploadMaxMilliseconds = 0f;
+        EnsurePlaneConstrainedZeroCrossShadowObjects();
+        EnsurePersistentResultChunkRoot();
+
+        HashSet<Vector3Int> touched = touchedKeys != null
+            ? new HashSet<Vector3Int>(touchedKeys)
+            : new HashSet<Vector3Int>();
+        List<Vector3Int> orderedTouched = new List<Vector3Int>(touched);
+        Dictionary<Vector3Int, float> viewPriorities =
+            new Dictionary<Vector3Int, float>(orderedTouched.Count);
+        for (int i = 0; i < orderedTouched.Count; i++)
+        {
+            Vector3Int key = orderedTouched[i];
+            viewPriorities[key] =
+                GetPersistentResultBlockViewPriority(key, finalizedByBlock);
+            if ((i & 15) == 15 && budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+        }
+        orderedTouched.Sort((a, b) =>
+        {
+            float aPriority = viewPriorities[a];
+            float bPriority = viewPriorities[b];
+            int priority = bPriority.CompareTo(aPriority);
+            return priority != 0 ? priority : ComparePersistentResultBlockKeys(a, b);
+        });
+        if (budget != null && budget.ShouldYield())
+        {
+            budget.CompleteSliceForYield();
+            yield return null;
+            budget.Resume();
+        }
+        PersistentResultEdgeOwners edgeOwners = new PersistentResultEdgeOwners();
+        int processedEntries = 0;
+        HashSet<Vector3Int> ownerScope = new HashSet<Vector3Int>();
+        if (forceFull)
+        {
+            if (finalizedByBlock != null)
+            {
+                foreach (Vector3Int key in finalizedByBlock.Keys)
+                    ownerScope.Add(key);
+            }
+        }
+        else
+        {
+            int ownerHaloRadius = Mathf.Max(0, persistentResultEdgeOwnerHaloBlocks);
+            foreach (Vector3Int key in touched)
+            {
+                for (int dz = -ownerHaloRadius; dz <= ownerHaloRadius; dz++)
+                {
+                    for (int dy = -ownerHaloRadius; dy <= ownerHaloRadius; dy++)
+                    {
+                        for (int dx = -ownerHaloRadius; dx <= ownerHaloRadius; dx++)
+                        {
+                            Vector3Int ownerKey = key + new Vector3Int(dx, dy, dz);
+                            if (finalizedByBlock != null && finalizedByBlock.ContainsKey(ownerKey))
+                                ownerScope.Add(ownerKey);
+                        }
+                    }
+                }
+                if (budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+            }
+        }
+        LastPersistentResultEdgeOwnerScopeBlockCount = ownerScope.Count;
+        List<Vector3Int> ownerKeys = new List<Vector3Int>(ownerScope);
+        ownerKeys.Sort(ComparePersistentResultBlockKeys);
+        foreach (Vector3Int key in ownerKeys)
+        {
+            if (finalizedByBlock == null ||
+                !finalizedByBlock.TryGetValue(
+                    key,
+                    out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries))
+                continue;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
+                int outputCategory = GetPersistentResultOutputCategory(entry);
+                if (outputCategory >= 0)
+                {
+                    RegisterPersistentResultEdgeOwner(
+                        edgeOwners, outputCategory,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyA, entry.KeyB), key);
+                    RegisterPersistentResultEdgeOwner(
+                        edgeOwners, outputCategory,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyB, entry.KeyC), key);
+                    RegisterPersistentResultEdgeOwner(
+                        edgeOwners, outputCategory,
+                        MakeAuthoritativeCanonicalEdge(entry.KeyC, entry.KeyA), key);
+                }
+                processedEntries++;
+                LastPersistentResultEdgeOwnerScopeEntryCount++;
+                if (processedEntries % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                    budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
+            }
+        }
+        LastPersistentResultCrossCategoryEdgeSuppressedCount =
+            CountPersistentResultCrossCategoryEdges(edgeOwners);
+
+        foreach (Vector3Int key in orderedTouched)
+        {
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+            if (finalizedByBlock == null ||
+                !finalizedByBlock.TryGetValue(
+                    key,
+                    out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries) ||
+                entries == null || entries.Count == 0)
+            {
+                if (_persistentResultChunks.TryGetValue(
+                        key, out PersistentResultChunk removedChunk))
+                {
+                    DestroyPersistentResultChunk(removedChunk);
+                    _persistentResultChunks.Remove(key);
+                    LastPersistentResultChunkRemovedCount++;
+                }
+                continue;
+            }
+
+            PersistentResultChunkSignatureState signatureState =
+                new PersistentResultChunkSignatureState();
+            IEnumerator signatureRoutine =
+                ComputePersistentResultChunkSignatureRoutine(
+                    key, entries, edgeOwners, signatureState, budget);
+            while (signatureRoutine.MoveNext())
+                yield return signatureRoutine.Current;
+            ulong signature = signatureState.Signature;
+            if (_persistentResultChunks.TryGetValue(
+                    key, out PersistentResultChunk existing) &&
+                existing.Signature == signature)
+            {
+                continue;
+            }
+
+            PersistentResultChunk chunk = existing ?? CreatePersistentResultChunk(key);
+            IEnumerator rebuildRoutine = RebuildPersistentResultChunkMeshRoutine(
+                key, chunk, entries, edgeOwners, signature, budget);
+            while (rebuildRoutine.MoveNext())
+                yield return rebuildRoutine.Current;
+            _persistentResultChunks[key] = chunk;
+            LastPersistentResultChunkUpdatedCount++;
+            ApplyPersistentResultChunkVisibility(chunk);
+        }
+
+        LastPersistentResultChunkPreservedCount = Mathf.Max(
+            0,
+            _persistentResultChunks.Count - LastPersistentResultChunkUpdatedCount);
+        RecountPersistentResultChunkOutput();
+        if (forceFull)
+            ApplyOutputDisplayLayerVisibility();
+        else if (_persistentResultChunkRoot != null)
+            _persistentResultChunkRoot.SetActive(_persistentResultChunks.Count > 0);
+        LastPersistentResultChunkActiveCount = CountActivePersistentResultChunks();
+        LastPersistentResultChunkPublishMilliseconds =
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - publishStart) * 1000.0);
+    }
+
+    private float GetPersistentResultBlockViewPriority(
+        Vector3Int key,
+        IReadOnlyDictionary<Vector3Int, List<PlaneConstrainedZeroCrossTriangleLedgerEntry>>
+            finalizedByBlock)
+    {
+        Camera camera = Camera.main;
+        if (camera == null)
+            return 0f;
+
+        Vector3 center = Vector3.zero;
+        int samples = 0;
+        if (finalizedByBlock != null &&
+            finalizedByBlock.TryGetValue(
+                key,
+                out List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries) &&
+            entries != null)
+        {
+            int sampleCount = Mathf.Min(8, entries.Count);
+            for (int i = 0; i < sampleCount; i++)
+            {
+                center += (RelaxedDisplayA(entries[i]) +
+                           RelaxedDisplayB(entries[i]) +
+                           RelaxedDisplayC(entries[i])) / 3f;
+                samples++;
+            }
+        }
+        if (samples > 0)
+        {
+            center /= samples;
+        }
+        else if (_persistentResultChunks.TryGetValue(
+                     key, out PersistentResultChunk chunk) &&
+                 chunk.Mesh != null && chunk.Object != null)
+        {
+            center = chunk.Object.transform.TransformPoint(chunk.Mesh.bounds.center);
+        }
+        else
+        {
+            return -10000f;
+        }
+
+        Vector3 viewport = camera.WorldToViewportPoint(center);
+        if (viewport.z <= 0f)
+            return -5000f - Mathf.Abs(viewport.z);
+        float centerDistance =
+            new Vector2(viewport.x - 0.5f, viewport.y - 0.5f).sqrMagnitude;
+        bool visible = viewport.x >= 0f && viewport.x <= 1f &&
+                       viewport.y >= 0f && viewport.y <= 1f;
+        return (visible ? 10000f : 0f) -
+               centerDistance * 100f -
+               viewport.z;
+    }
+
     private IEnumerator RebuildPlaneConstrainedZeroCrossShadowWireBudgetedRoutine(
         List<PlaneConstrainedZeroCrossTriangleLedgerEntry> ledger,
         CooperativeRebuildBudget budget)
@@ -26725,8 +35463,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             ? budget.GetComputeSecondsSnapshot()
             : Time.realtimeSinceStartupAsDouble;
         LastPersistentResultChunkUpdatedCount = 0;
+        LastPersistentResultCrossCategoryEdgeSuppressedCount = 0;
+        LastPersistentResultEdgeOwnerScopeBlockCount = 0;
+        LastPersistentResultEdgeOwnerScopeEntryCount = 0;
         LastPersistentResultChunkPreservedCount = 0;
         LastPersistentResultChunkRemovedCount = 0;
+        LastPersistentResultDeltaChangedCount = 0;
+        LastPersistentResultDeltaHaloCount = 0;
+        LastPersistentResultDeltaTouchedCount = 0;
+        LastPersistentResultDoubleBufferedSwapCount = 0;
+        LastPersistentResultChunkUploadMaxMilliseconds = 0f;
         EnsurePlaneConstrainedZeroCrossShadowObjects();
         EnsurePersistentResultChunkRoot();
 
@@ -26908,6 +35654,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             indexFormat = IndexFormat.UInt32
         };
         chunk.Mesh.MarkDynamic();
+        chunk.StagingMesh = new Mesh
+        {
+            name = $"ScanCover_RESULT_Chunk_{key.x}_{key.y}_{key.z}_Staging",
+            indexFormat = IndexFormat.UInt32
+        };
+        chunk.StagingMesh.MarkDynamic();
         chunk.Filter.sharedMesh = chunk.Mesh;
         chunk.Renderer.sharedMaterials = ResolvePersistentResultChunkMaterials();
         chunk.Renderer.sortingOrder = 105;
@@ -26937,6 +35689,21 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         PersistentResultEdgeOwners edgeOwners,
         ulong signature)
     {
+        IEnumerator routine = RebuildPersistentResultChunkMeshRoutine(
+            blockKey, chunk, entries, edgeOwners, signature, null);
+        while (routine.MoveNext())
+        {
+        }
+    }
+
+    private IEnumerator RebuildPersistentResultChunkMeshRoutine(
+        Vector3Int blockKey,
+        PersistentResultChunk chunk,
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries,
+        PersistentResultEdgeOwners edgeOwners,
+        ulong signature,
+        CooperativeRebuildBudget budget)
+    {
         chunk.StructuralLines.Clear();
         chunk.ComplexLines.Clear();
         chunk.UnclassifiedLines.Clear();
@@ -26950,13 +35717,16 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         chunk.UnclassifiedTriangles = 0;
         chunk.PromotionBlockedTriangles = 0;
 
-        List<Vector3> vertices = new List<Vector3>(entries.Count * 4);
-        HashSet<AuthoritativeCanonicalEdgeKey> structuralEdges =
-            new HashSet<AuthoritativeCanonicalEdgeKey>();
-        HashSet<AuthoritativeCanonicalEdgeKey> complexEdges =
-            new HashSet<AuthoritativeCanonicalEdgeKey>();
-        HashSet<AuthoritativeCanonicalEdgeKey> unclassifiedEdges =
-            new HashSet<AuthoritativeCanonicalEdgeKey>();
+        List<Vector3> vertices = chunk.Vertices;
+        vertices.Clear();
+        if (vertices.Capacity < entries.Count * 4)
+            vertices.Capacity = entries.Count * 4;
+        HashSet<AuthoritativeCanonicalEdgeKey> structuralEdges = chunk.StructuralEdges;
+        HashSet<AuthoritativeCanonicalEdgeKey> complexEdges = chunk.ComplexEdges;
+        HashSet<AuthoritativeCanonicalEdgeKey> unclassifiedEdges = chunk.UnclassifiedEdges;
+        structuralEdges.Clear();
+        complexEdges.Clear();
+        unclassifiedEdges.Clear();
         for (int i = 0; i < entries.Count; i++)
         {
             PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
@@ -27026,17 +35796,57 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             AddPersistentResultChunkEdge(
                 blockKey, outputCategory, edgeOwners, vertices, lines, edges,
                 entry.KeyC, entry.KeyA, c, a);
+            if ((i + 1) % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
         }
 
-        chunk.Mesh.Clear();
-        chunk.Mesh.indexFormat =
+        if (budget != null && budget.ShouldYield())
+        {
+            budget.CompleteSliceForYield();
+            yield return null;
+            budget.Resume();
+        }
+        Mesh targetMesh = enablePersistentResultChunkDoubleBuffering
+            ? chunk.StagingMesh
+            : chunk.Mesh;
+        if (targetMesh == null)
+        {
+            targetMesh = new Mesh
+            {
+                name = $"ScanCover_RESULT_Chunk_{blockKey.x}_{blockKey.y}_{blockKey.z}_Staging",
+                indexFormat = IndexFormat.UInt32
+            };
+            targetMesh.MarkDynamic();
+            chunk.StagingMesh = targetMesh;
+        }
+        double uploadStart = Time.realtimeSinceStartupAsDouble;
+        targetMesh.Clear();
+        targetMesh.indexFormat =
             vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
-        chunk.Mesh.SetVertices(vertices);
-        chunk.Mesh.subMeshCount = 4;
+        targetMesh.SetVertices(vertices);
+        targetMesh.subMeshCount = 4;
+        ApplyPersistentResultChunkIndices(chunk, targetMesh);
         if (vertices.Count > 0)
-            chunk.Mesh.RecalculateBounds();
+            targetMesh.RecalculateBounds();
+        LastPersistentResultChunkUploadMaxMilliseconds = Mathf.Max(
+            LastPersistentResultChunkUploadMaxMilliseconds,
+            (float)((Time.realtimeSinceStartupAsDouble - uploadStart) * 1000.0));
+
+        if (enablePersistentResultChunkDoubleBuffering && targetMesh != chunk.Mesh)
+        {
+            Mesh oldMesh = chunk.Mesh;
+            chunk.Mesh = targetMesh;
+            chunk.StagingMesh = oldMesh;
+            chunk.Filter.sharedMesh = chunk.Mesh;
+            LastPersistentResultDoubleBufferedSwapCount++;
+        }
         chunk.Signature = signature;
-        chunk.AppliedView = -1;
+        chunk.AppliedView = (int)outputDisplayLayerView;
     }
 
     private ulong ComputePersistentResultChunkSignature(
@@ -27048,36 +35858,66 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         {
             ulong hash = 1469598103934665603UL;
             for (int i = 0; i < entries.Count; i++)
-            {
-                PlaneConstrainedZeroCrossTriangleLedgerEntry entry = entries[i];
-                hash = PersistentResultHash(hash, entry.KeyA.GetHashCode());
-                hash = PersistentResultHash(hash, entry.KeyB.GetHashCode());
-                hash = PersistentResultHash(hash, entry.KeyC.GetHashCode());
-                hash = PersistentResultHash(hash, entry.RelaxedClass != null
-                    ? entry.RelaxedClass.GetHashCode() : 0);
-                hash = PersistentResultHash(hash, entry.Disposition != null
-                    ? entry.Disposition.GetHashCode() : 0);
-                hash = PersistentResultHash(hash, entry.HeldKeepDecision != null
-                    ? entry.HeldKeepDecision.GetHashCode() : 0);
-                hash = PersistentResultHash(hash, entry.HardAuditChecked ? 1 : 0);
-                hash = PersistentResultHash(hash, entry.HardLegal ? 1 : 0);
-                hash = PersistentResultHash(hash, entry.WorkingPublishEligible ? 1 : 0);
-                hash = PersistentResultHash(hash, RelaxedDisplayA(entry).GetHashCode());
-                hash = PersistentResultHash(hash, RelaxedDisplayB(entry).GetHashCode());
-                hash = PersistentResultHash(hash, RelaxedDisplayC(entry).GetHashCode());
-                int outputCategory = GetPersistentResultOutputCategory(entry);
-                hash = PersistentResultHash(
-                    hash, IsPersistentResultEdgeOwner(
-                        blockKey, outputCategory, edgeOwners, entry.KeyA, entry.KeyB) ? 1 : 0);
-                hash = PersistentResultHash(
-                    hash, IsPersistentResultEdgeOwner(
-                        blockKey, outputCategory, edgeOwners, entry.KeyB, entry.KeyC) ? 1 : 0);
-                hash = PersistentResultHash(
-                    hash, IsPersistentResultEdgeOwner(
-                        blockKey, outputCategory, edgeOwners, entry.KeyC, entry.KeyA) ? 1 : 0);
-            }
+                hash = AccumulatePersistentResultChunkSignature(
+                    hash, blockKey, entries[i], edgeOwners);
             return hash;
         }
+    }
+
+    private IEnumerator ComputePersistentResultChunkSignatureRoutine(
+        Vector3Int blockKey,
+        List<PlaneConstrainedZeroCrossTriangleLedgerEntry> entries,
+        PersistentResultEdgeOwners edgeOwners,
+        PersistentResultChunkSignatureState state,
+        CooperativeRebuildBudget budget)
+    {
+        ulong hash = 1469598103934665603UL;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            hash = AccumulatePersistentResultChunkSignature(
+                hash, blockKey, entries[i], edgeOwners);
+            if ((i + 1) % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+        }
+        state.Signature = hash;
+    }
+
+    private ulong AccumulatePersistentResultChunkSignature(
+        ulong hash,
+        Vector3Int blockKey,
+        PlaneConstrainedZeroCrossTriangleLedgerEntry entry,
+        PersistentResultEdgeOwners edgeOwners)
+    {
+        hash = PersistentResultHash(hash, entry.KeyA.GetHashCode());
+        hash = PersistentResultHash(hash, entry.KeyB.GetHashCode());
+        hash = PersistentResultHash(hash, entry.KeyC.GetHashCode());
+        hash = PersistentResultHash(hash, entry.RelaxedClass != null
+            ? entry.RelaxedClass.GetHashCode() : 0);
+        hash = PersistentResultHash(hash, entry.Disposition != null
+            ? entry.Disposition.GetHashCode() : 0);
+        hash = PersistentResultHash(hash, entry.HeldKeepDecision != null
+            ? entry.HeldKeepDecision.GetHashCode() : 0);
+        hash = PersistentResultHash(hash, entry.HardAuditChecked ? 1 : 0);
+        hash = PersistentResultHash(hash, entry.HardLegal ? 1 : 0);
+        hash = PersistentResultHash(hash, entry.WorkingPublishEligible ? 1 : 0);
+        hash = PersistentResultHash(hash, RelaxedDisplayA(entry).GetHashCode());
+        hash = PersistentResultHash(hash, RelaxedDisplayB(entry).GetHashCode());
+        hash = PersistentResultHash(hash, RelaxedDisplayC(entry).GetHashCode());
+        int outputCategory = GetPersistentResultOutputCategory(entry);
+        hash = PersistentResultHash(
+            hash, IsPersistentResultEdgeOwner(
+                blockKey, outputCategory, edgeOwners, entry.KeyA, entry.KeyB) ? 1 : 0);
+        hash = PersistentResultHash(
+            hash, IsPersistentResultEdgeOwner(
+                blockKey, outputCategory, edgeOwners, entry.KeyB, entry.KeyC) ? 1 : 0);
+        return PersistentResultHash(
+            hash, IsPersistentResultEdgeOwner(
+                blockKey, outputCategory, edgeOwners, entry.KeyC, entry.KeyA) ? 1 : 0);
     }
 
     private PersistentResultEdgeOwners BuildPersistentResultEdgeOwners(
@@ -27091,16 +35931,38 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (outputCategory < 0)
                 continue;
             RegisterPersistentResultEdgeOwner(
-                PersistentResultOwnerMap(owners, outputCategory),
+                owners, outputCategory,
                 MakeAuthoritativeCanonicalEdge(entry.KeyA, entry.KeyB), entry.Block);
             RegisterPersistentResultEdgeOwner(
-                PersistentResultOwnerMap(owners, outputCategory),
+                owners, outputCategory,
                 MakeAuthoritativeCanonicalEdge(entry.KeyB, entry.KeyC), entry.Block);
             RegisterPersistentResultEdgeOwner(
-                PersistentResultOwnerMap(owners, outputCategory),
+                owners, outputCategory,
                 MakeAuthoritativeCanonicalEdge(entry.KeyC, entry.KeyA), entry.Block);
         }
+        LastPersistentResultCrossCategoryEdgeSuppressedCount =
+            CountPersistentResultCrossCategoryEdges(owners);
         return owners;
+    }
+
+    private static int CountPersistentResultCrossCategoryEdges(
+        PersistentResultEdgeOwners owners)
+    {
+        if (owners == null)
+            return 0;
+        int count = 0;
+        foreach (AuthoritativeCanonicalEdgeKey edge in owners.Structural.Keys)
+        {
+            if (owners.Complex.ContainsKey(edge) || owners.Unclassified.ContainsKey(edge))
+                count++;
+        }
+        foreach (AuthoritativeCanonicalEdgeKey edge in owners.Complex.Keys)
+        {
+            if (!owners.Structural.ContainsKey(edge) &&
+                owners.Unclassified.ContainsKey(edge))
+                count++;
+        }
+        return count;
     }
 
     private int GetPersistentResultOutputCategory(
@@ -27139,6 +36001,27 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             owners[edge] = candidate;
     }
 
+    private static void RegisterPersistentResultEdgeOwner(
+        PersistentResultEdgeOwners owners,
+        int outputCategory,
+        AuthoritativeCanonicalEdgeKey edge,
+        Vector3Int candidate)
+    {
+        RegisterPersistentResultEdgeOwner(
+            PersistentResultOwnerMap(owners, outputCategory), edge, candidate);
+        if (!owners.GlobalCategory.TryGetValue(edge, out int currentCategory) ||
+            outputCategory < currentCategory)
+        {
+            owners.GlobalCategory[edge] = outputCategory;
+            owners.GlobalOwner[edge] = candidate;
+            return;
+        }
+        if (outputCategory == currentCategory &&
+            (!owners.GlobalOwner.TryGetValue(edge, out Vector3Int currentOwner) ||
+             ComparePersistentResultBlockKeys(candidate, currentOwner) < 0))
+            owners.GlobalOwner[edge] = candidate;
+    }
+
     private static int ComparePersistentResultBlockKeys(Vector3Int a, Vector3Int b)
     {
         int z = a.z.CompareTo(b.z);
@@ -27158,9 +36041,9 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (outputCategory < 0 || edgeOwners == null)
             return false;
         AuthoritativeCanonicalEdgeKey edge = MakeAuthoritativeCanonicalEdge(a, b);
-        Dictionary<AuthoritativeCanonicalEdgeKey, Vector3Int> owners =
-            PersistentResultOwnerMap(edgeOwners, outputCategory);
-        return owners.TryGetValue(edge, out Vector3Int owner) &&
+        return edgeOwners.GlobalCategory.TryGetValue(edge, out int category) &&
+               category == outputCategory &&
+               edgeOwners.GlobalOwner.TryGetValue(edge, out Vector3Int owner) &&
                owner == blockKey;
     }
 
@@ -27221,37 +36104,52 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             LastOutputResultComplexTriangleCount;
     }
 
+    private void ApplyPersistentResultChunkIndices(
+        PersistentResultChunk chunk,
+        Mesh targetMesh)
+    {
+        bool showResult = outputDisplayLayerView == OutputDisplayLayerView.Result;
+        bool showDiagnostic = outputDisplayLayerView == OutputDisplayLayerView.Diagnostic;
+        targetMesh.SetIndices(
+            showResult ? chunk.StructuralLines : EmptyOutputDisplayLineIndices,
+            MeshTopology.Lines, 0, false);
+        targetMesh.SetIndices(
+            showResult ? chunk.ComplexLines : EmptyOutputDisplayLineIndices,
+            MeshTopology.Lines, 1, false);
+        targetMesh.SetIndices(
+            EmptyOutputDisplayLineIndices, MeshTopology.Lines, 2, false);
+        targetMesh.SetIndices(
+            showDiagnostic ? chunk.UnclassifiedLines : EmptyOutputDisplayLineIndices,
+            MeshTopology.Lines, 3, false);
+    }
+
+    private void ApplyPersistentResultChunkVisibility(PersistentResultChunk chunk)
+    {
+        if (chunk == null || chunk.Mesh == null || chunk.Object == null)
+            return;
+        bool showResult = outputDisplayLayerView == OutputDisplayLayerView.Result;
+        bool showDiagnostic = outputDisplayLayerView == OutputDisplayLayerView.Diagnostic;
+        bool showShadow = showResult || showDiagnostic;
+        int appliedView = (int)outputDisplayLayerView;
+        if (chunk.AppliedView != appliedView)
+        {
+            ApplyPersistentResultChunkIndices(chunk, chunk.Mesh);
+            chunk.AppliedView = appliedView;
+        }
+        bool hasVisible = showResult
+            ? chunk.StructuralLines.Count > 0 || chunk.ComplexLines.Count > 0
+            : showDiagnostic && chunk.UnclassifiedLines.Count > 0;
+        chunk.Object.SetActive(
+            showPlaneConstrainedZeroCrossShadowWire && showShadow && hasVisible);
+    }
+
     private void ApplyPersistentResultChunkVisibility()
     {
         bool showResult = outputDisplayLayerView == OutputDisplayLayerView.Result;
         bool showDiagnostic = outputDisplayLayerView == OutputDisplayLayerView.Diagnostic;
         bool showShadow = showResult || showDiagnostic;
-        int appliedView = (int)outputDisplayLayerView;
         foreach (PersistentResultChunk chunk in _persistentResultChunks.Values)
-        {
-            if (chunk.Mesh == null || chunk.Object == null)
-                continue;
-            if (chunk.AppliedView != appliedView)
-            {
-                chunk.Mesh.SetIndices(
-                    showResult ? chunk.StructuralLines : EmptyOutputDisplayLineIndices,
-                    MeshTopology.Lines, 0, false);
-                chunk.Mesh.SetIndices(
-                    showResult ? chunk.ComplexLines : EmptyOutputDisplayLineIndices,
-                    MeshTopology.Lines, 1, false);
-                chunk.Mesh.SetIndices(
-                    EmptyOutputDisplayLineIndices, MeshTopology.Lines, 2, false);
-                chunk.Mesh.SetIndices(
-                    showDiagnostic ? chunk.UnclassifiedLines : EmptyOutputDisplayLineIndices,
-                    MeshTopology.Lines, 3, false);
-                chunk.AppliedView = appliedView;
-            }
-            bool hasVisible = showResult
-                ? chunk.StructuralLines.Count > 0 || chunk.ComplexLines.Count > 0
-                : showDiagnostic && chunk.UnclassifiedLines.Count > 0;
-            chunk.Object.SetActive(
-                showPlaneConstrainedZeroCrossShadowWire && showShadow && hasVisible);
-        }
+            ApplyPersistentResultChunkVisibility(chunk);
         if (_persistentResultChunkRoot != null)
             _persistentResultChunkRoot.SetActive(
                 showPlaneConstrainedZeroCrossShadowWire && showShadow &&
@@ -27275,6 +36173,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return;
         if (chunk.Mesh != null)
             Destroy(chunk.Mesh);
+        if (chunk.StagingMesh != null && chunk.StagingMesh != chunk.Mesh)
+            Destroy(chunk.StagingMesh);
         if (chunk.Object != null)
             Destroy(chunk.Object);
     }
@@ -27285,10 +36185,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             DestroyPersistentResultChunk(chunk);
         _persistentResultChunks.Clear();
         LastPersistentResultChunkUpdatedCount = 0;
+        LastPersistentResultCrossCategoryEdgeSuppressedCount = 0;
         LastPersistentResultChunkPreservedCount = 0;
         LastPersistentResultChunkRemovedCount = 0;
         LastPersistentResultChunkActiveCount = 0;
         LastPersistentResultChunkPublishMilliseconds = 0f;
+        LastPersistentResultDeltaChangedCount = 0;
+        LastPersistentResultDeltaHaloCount = 0;
+        LastPersistentResultDeltaTouchedCount = 0;
+        LastPersistentResultRetireCandidateCount = 0;
+        LastPersistentResultRetireDeferredCount = 0;
+        LastPersistentResultDoubleBufferedSwapCount = 0;
+        LastPersistentResultChunkUploadMaxMilliseconds = 0f;
         if (!destroyRoot || _persistentResultChunkRoot == null)
         {
             if (_persistentResultChunkRoot != null)
@@ -27537,14 +36445,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastAuthoritativeCyanPlaneMaxMoveMeters = 0f;
     }
 
-    private void ApplyAuthoritativeCyanGlobalPlaneConstraints(
+    private IEnumerator ApplyAuthoritativeCyanGlobalPlaneConstraintsRoutine(
         IReadOnlyDictionary<Vector3Int, AuthoritativeTsdfBlockMesh> blocks,
-        IReadOnlyDictionary<Vector3Int, bool> directAttempts)
+        IReadOnlyDictionary<Vector3Int, bool> directAttempts,
+        CooperativeRebuildBudget budget)
     {
+        double applyStart = budget != null
+            ? budget.GetComputeSecondsSnapshot()
+            : Time.realtimeSinceStartupAsDouble;
         IReadOnlyList<ScanCoverStablePlaneRegistry.PlaneConstraint> planes =
             GetIncrementalPlaneConstraintsWithColdStartCandidates();
-        LastAuthoritativeCyanPlaneMatureCount =
-            _stablePlaneRegistry.GetMatureConstraints().Count;
+        LastAuthoritativeCyanPlaneMatureCount = planes != null ? planes.Count : 0;
         if (!enableAuthoritativeCyanPlaneSnap || blocks == null || blocks.Count == 0 ||
             planes == null || planes.Count == 0)
         {
@@ -27556,7 +36467,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     LastAuthoritativeCyanNearPlaneProbationRevokedCount++;
             }
             _authoritativeCyanNearPlaneProbation.Clear();
-            return;
+            LastAuthoritativePlaneConstraintApplyMilliseconds =
+                (float)(((budget != null
+                    ? budget.GetComputeSecondsSnapshot()
+                    : Time.realtimeSinceStartupAsDouble) - applyStart) * 1000.0);
+            yield break;
         }
 
         AuditAuthoritativeCyanStructuralPlanes(planes);
@@ -27575,6 +36490,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         foreach (AuthoritativeTsdfBlockMesh block in blocks.Values)
         {
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
             if (block.VertexKeys.Count != block.Vertices.Count)
                 continue;
             for (int i = 0; i < block.Vertices.Count; i++)
@@ -27612,8 +36533,17 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             new Dictionary<AuthoritativeCellComponentKey, int>(pointSums.Count);
         Dictionary<AuthoritativeCellComponentKey, string> rejectByVertex =
             new Dictionary<AuthoritativeCellComponentKey, string>(pointSums.Count);
+        int matchedPointIndex = 0;
         foreach (KeyValuePair<AuthoritativeCellComponentKey, Vector3> pair in pointSums)
         {
+            matchedPointIndex++;
+            if (matchedPointIndex % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
             AuthoritativeCellComponentKey key = pair.Key;
             Vector3 point = pair.Value / Mathf.Max(1, pointCounts[key]);
             if (!normalSums.TryGetValue(key, out Vector3 normal) || normal.sqrMagnitude < 0.000001f)
@@ -27633,12 +36563,39 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             normalContributionCounts, planeByVertex, rejectByVertex,
             out Dictionary<AuthoritativeCellComponentKey, int> promotedPatchByVertex);
 
+        if (budget != null && budget.ShouldYield())
+        {
+            budget.CompleteSliceForYield();
+            yield return null;
+            budget.Resume();
+        }
+
+        int ownershipIndex = 0;
         foreach (KeyValuePair<AuthoritativeCellComponentKey, int> pair in planeByVertex)
+        {
             _authoritativeCyanLastPlaneByVertex[pair.Key] = pair.Value;
+            ownershipIndex++;
+            if (ownershipIndex % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
+        }
+        ownershipIndex = 0;
         foreach (KeyValuePair<AuthoritativeCellComponentKey, string> pair in rejectByVertex)
         {
             if (!planeByVertex.ContainsKey(pair.Key))
                 _authoritativeCyanLastRejectByVertex[pair.Key] = pair.Value;
+            ownershipIndex++;
+            if (ownershipIndex % Mathf.Max(16, persistentResultEntriesPerBudgetCheck) == 0 &&
+                budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
         }
 
         foreach (string reject in rejectByVertex.Values)
@@ -27658,6 +36615,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             bool addedLock = false;
             foreach (AuthoritativeTsdfBlockMesh block in blocks.Values)
             {
+                if (budget != null && budget.ShouldYield())
+                {
+                    budget.CompleteSliceForYield();
+                    yield return null;
+                    budget.Resume();
+                }
                 if (block.VertexKeys.Count != block.Vertices.Count)
                     continue;
                 List<Vector3> projected = BuildAuthoritativeCyanGloballyProjectedVertices(
@@ -27706,6 +36669,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float residualAfterSum = 0f;
         foreach (KeyValuePair<Vector3Int, AuthoritativeTsdfBlockMesh> pair in blocks)
         {
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
             AuthoritativeTsdfBlockMesh block = pair.Value;
             bool direct = directAttempts != null && directAttempts.TryGetValue(pair.Key, out bool isDirect) && isDirect;
             int matchedTriangles = 0;
@@ -27811,6 +36780,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         float sharedTolerance = Mathf.Max(0.00001f, authoritativeCyanWeldToleranceMeters);
         foreach (AuthoritativeTsdfBlockMesh block in blocks.Values)
         {
+            if (budget != null && budget.ShouldYield())
+            {
+                budget.CompleteSliceForYield();
+                yield return null;
+                budget.Resume();
+            }
             for (int i = 0; i < block.Vertices.Count && i < block.VertexKeys.Count; i++)
             {
                 AuthoritativeCellComponentKey key = block.VertexKeys[i];
@@ -27825,6 +36800,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                     LastAuthoritativeCyanPlaneSharedPositionMismatchCount++;
             }
         }
+        LastAuthoritativePlaneConstraintApplyMilliseconds =
+            (float)(((budget != null
+                ? budget.GetComputeSecondsSnapshot()
+                : Time.realtimeSinceStartupAsDouble) - applyStart) * 1000.0);
     }
 
     private void PropagateAuthoritativeCyanPlaneSupport(
@@ -28853,7 +37832,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         AuthoritativeTsdfBlockMesh block)
     {
         IReadOnlyList<ScanCoverStablePlaneRegistry.PlaneConstraint> planes =
-            _stablePlaneRegistry.GetMatureConstraints();
+            GetIncrementalPlaneConstraintsWithColdStartCandidates();
         LastAuthoritativeCyanPlaneMatureCount = planes != null ? planes.Count : 0;
         if (!enableAuthoritativeCyanPlaneSnap || block == null || block.Vertices.Count < 3 ||
             block.Triangles.Count < 3 || planes == null || planes.Count == 0)
@@ -29025,7 +38004,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             if (plane.Normal.sqrMagnitude < 0.5f || plane.ConsecutiveBatches < minBatches)
                 continue;
             float upDot = Mathf.Abs(Vector3.Dot(plane.Normal.normalized, Vector3.up));
-            if (upDot < authoritativeCyanStructuralHorizontalMinUpDot)
+            float minimumUpDot = IsMatureHorizontalProductionPlane(plane)
+                ? matureHorizontalProductionMinimumUpDot
+                : authoritativeCyanStructuralHorizontalMinUpDot;
+            if (upDot < minimumUpDot)
                 continue;
             _authoritativeCyanLowestHorizontalY = Mathf.Min(
                 _authoritativeCyanLowestHorizontalY, plane.Center.y);
@@ -29075,7 +38057,11 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             return true;
         }
 
-        if (upDot >= authoritativeCyanStructuralHorizontalMinUpDot)
+        bool matureHorizontalProduction = IsMatureHorizontalProductionPlane(plane);
+        float horizontalMinimumUpDot = matureHorizontalProduction
+            ? matureHorizontalProductionMinimumUpDot
+            : authoritativeCyanStructuralHorizontalMinUpDot;
+        if (upDot >= horizontalMinimumUpDot)
         {
             kind = "horizontal";
             if (!_authoritativeCyanHorizontalExtremaValid)
@@ -29112,12 +38098,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 }
                 kind = "ceiling";
             }
-            if (plane.Radius < authoritativeCyanStructuralHorizontalMinRadiusMeters)
+            float minimumRadius = matureHorizontalProduction
+                ? matureHorizontalProductionMinimumRadiusMeters
+                : authoritativeCyanStructuralHorizontalMinRadiusMeters;
+            if (plane.Radius < minimumRadius)
             {
                 rejectReason = "horizontal_radius";
                 return false;
             }
-            if (plane.TotalInliers < GetAuthoritativeCyanStructuralMinInliers(plane, kind))
+            int minimumInliers = matureHorizontalProduction
+                ? matureHorizontalProductionMinimumInliers
+                : GetAuthoritativeCyanStructuralMinInliers(plane, kind);
+            if (plane.TotalInliers < minimumInliers)
             {
                 rejectReason = "horizontal_inliers";
                 return false;
@@ -29128,6 +38120,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         kind = "oblique";
         rejectReason = "oblique_nonstructural";
         return false;
+    }
+
+    private static bool IsMatureHorizontalProductionPlane(
+        ScanCoverStablePlaneRegistry.PlaneConstraint plane)
+    {
+        return plane.Id >= 1000000;
     }
 
     private static bool IsAuthoritativeCyanCoverageOnlyStructuralReject(string rejectReason)
@@ -31091,6 +40089,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         LastIncrementalTsdfDirtyChangedBlockCount = 0;
         LastIncrementalTsdfDirtyMissingBlockCount = 0;
         LastIncrementalTsdfDirtyRetiredBlockCount = 0;
+        LastIncrementalTsdfBoundaryMaskPendingCount = 0;
+        LastIncrementalTsdfBoundaryMaskConfirmedCount = 0;
         LastAuthoritativeBlockCachedCount = _authoritativeTsdfBlocks.Count;
         LastAuthoritativeBlockDirtyAttemptCount = 0;
         LastAuthoritativeBlockDependencyAttemptCount = 0;
@@ -31211,10 +40211,103 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         GetIncrementalPlaneConstraintsWithColdStartCandidates()
     {
         List<ScanCoverStablePlaneRegistry.PlaneConstraint> mature =
+            GetMatureProductionPlaneConstraints();
+        if (mature.Count == 0 && enableIncrementalStablePlaneBootstrap)
+        {
+            mature = _stablePlaneRegistry.GetCurrentCandidateConstraints();
+            AppendMatureHorizontalProductionPlane(mature);
+        }
+        return mature;
+    }
+
+    private List<ScanCoverStablePlaneRegistry.PlaneConstraint>
+        GetMatureProductionPlaneConstraints()
+    {
+        List<ScanCoverStablePlaneRegistry.PlaneConstraint> mature =
             _stablePlaneRegistry.GetMatureConstraints();
-        if (mature.Count > 0 || !enableIncrementalStablePlaneBootstrap)
-            return mature;
-        return _stablePlaneRegistry.GetCurrentCandidateConstraints();
+        AppendMatureHorizontalProductionPlane(mature);
+        return mature;
+    }
+
+    private void AppendMatureHorizontalProductionPlane(
+        List<ScanCoverStablePlaneRegistry.PlaneConstraint> planes)
+    {
+        LastMatureHorizontalProductionPlaneCount = 0;
+        if (!enableMatureHorizontalPlaneProduction || planes == null)
+            return;
+        List<ScanCoverStablePlaneRegistry.PlaneConstraint> horizontal =
+            _horizontalPlaneShadowRegistry.GetMatureConstraints();
+        ScanCoverStablePlaneRegistry.PlaneConstraint best = default;
+        bool found = false;
+        for (int i = 0; i < horizontal.Count; i++)
+        {
+            ScanCoverStablePlaneRegistry.PlaneConstraint candidate = horizontal[i];
+            if (candidate.Normal.sqrMagnitude < 0.5f ||
+                Mathf.Abs(Vector3.Dot(candidate.Normal.normalized, Vector3.up)) <
+                    matureHorizontalProductionMinimumUpDot ||
+                candidate.Radius < matureHorizontalProductionMinimumRadiusMeters ||
+                candidate.TotalInliers < matureHorizontalProductionMinimumInliers ||
+                candidate.ConsecutiveBatches < 2)
+                continue;
+            if (!found || candidate.Center.y < best.Center.y)
+            {
+                best = candidate;
+                found = true;
+            }
+        }
+        if (found)
+        {
+            // Production identity must survive deduplication with the general
+            // stable-plane registry.  A fixed private ID keeps the floor on its
+            // conservative production thresholds across rounds.
+            best.Id = 1000001;
+            _retainedMatureHorizontalProductionPlane = best;
+            _hasRetainedMatureHorizontalProductionPlane = true;
+            _retainedMatureHorizontalProductionMissingRounds = 0;
+            _retainedMatureHorizontalProductionLastSnapshot =
+                _authoritativeReadSnapshotSequence;
+        }
+        else if (_hasRetainedMatureHorizontalProductionPlane)
+        {
+            if (_retainedMatureHorizontalProductionLastSnapshot !=
+                _authoritativeReadSnapshotSequence)
+            {
+                _retainedMatureHorizontalProductionMissingRounds++;
+                _retainedMatureHorizontalProductionLastSnapshot =
+                    _authoritativeReadSnapshotSequence;
+            }
+            if (_retainedMatureHorizontalProductionMissingRounds >
+                Mathf.Clamp(matureHorizontalProductionMissingGraceRounds, 0, 3))
+            {
+                _hasRetainedMatureHorizontalProductionPlane = false;
+                return;
+            }
+            best = _retainedMatureHorizontalProductionPlane;
+            found = true;
+        }
+        if (!found)
+            return;
+
+        for (int i = 0; i < planes.Count; i++)
+        {
+            ScanCoverStablePlaneRegistry.PlaneConstraint existing = planes[i];
+            if (existing.Normal.sqrMagnitude < 0.5f)
+                continue;
+            float normalDot = Mathf.Abs(Vector3.Dot(
+                existing.Normal.normalized, best.Normal.normalized));
+            float planeDistance = Mathf.Abs(existing.Offset - best.Offset);
+            if (normalDot >= 0.98f && planeDistance <= 0.06f)
+            {
+                // Replace the duplicate in this read-only constraint view. Keeping
+                // the general registry ID here used to silently reactivate the old
+                // 1.25m/1000-inlier gate after the first production round.
+                planes[i] = best;
+                LastMatureHorizontalProductionPlaneCount = 1;
+                return;
+            }
+        }
+        planes.Add(best);
+        LastMatureHorizontalProductionPlaneCount = 1;
     }
 
     private void ApplyStablePlaneRegistryDiagnostics(ScanCoverStablePlaneRegistry.Result result)
@@ -31252,6 +40345,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         IReadOnlyDictionary<Vector3Int, AuthoritativeTsdfBlockMesh> extractedCandidates,
         CooperativeRebuildBudget budget)
     {
+        ResetHorizontalPlaneProposalShadowDiagnostics();
         if (!enableIncrementalStablePlaneBootstrap ||
             !enableStablePlaneShadowTrial ||
             extractedCandidates == null || extractedCandidates.Count == 0)
@@ -31367,8 +40461,104 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
             (float)((Time.realtimeSinceStartupAsDouble - updateStart) * 1000.0);
         LastIncrementalStablePlaneBootstrapUpdated = updated ? 1 : 0;
         ApplyStablePlaneRegistryDiagnostics(result);
+        RunHorizontalPlaneProposalShadow(samplePoints, sampleNormals);
         UpdateAuthoritativeCyanLocalStructuralSupport(
-            samplePoints, sampleNormals, _stablePlaneRegistry.GetMatureConstraints());
+            samplePoints, sampleNormals,
+            GetIncrementalPlaneConstraintsWithColdStartCandidates());
+    }
+
+    private void RunHorizontalPlaneProposalShadow(
+        List<Vector3> samplePoints,
+        List<Vector3> sampleNormals)
+    {
+        ResetHorizontalPlaneProposalShadowDiagnostics();
+        LastHorizontalPlaneShadowInputSampleCount = samplePoints != null
+            ? samplePoints.Count : 0;
+        if (!enableHorizontalPlaneProposalShadow || samplePoints == null ||
+            sampleNormals == null || samplePoints.Count != sampleNormals.Count)
+            return;
+
+        int capacity = Mathf.Min(samplePoints.Count,
+            Mathf.Max(256, horizontalPlaneShadowMaxSamples * 2));
+        List<Vector3> horizontalPoints = new List<Vector3>(capacity);
+        List<Vector3> horizontalNormals = new List<Vector3>(capacity);
+        float minimumUpDot = Mathf.Clamp01(horizontalPlaneShadowMinimumUpDot);
+        for (int i = 0; i < samplePoints.Count && horizontalPoints.Count < capacity; i++)
+        {
+            Vector3 normal = sampleNormals[i];
+            if (!Finite(samplePoints[i]) || !Finite(normal) ||
+                normal.sqrMagnitude < 0.0001f ||
+                Mathf.Abs(Vector3.Dot(normal.normalized, Vector3.up)) < minimumUpDot)
+                continue;
+            horizontalPoints.Add(samplePoints[i]);
+            horizontalNormals.Add(normal.normalized);
+        }
+        LastHorizontalPlaneShadowEligibleSampleCount = horizontalPoints.Count;
+        if (horizontalPoints.Count < horizontalPlaneShadowMinInliers)
+            return;
+
+        ScanCoverStablePlaneRegistry.Settings settings = BuildStablePlaneRegistrySettings(
+            Mathf.Min(horizontalPlaneShadowMaxSamples, horizontalPoints.Count),
+            Mathf.Min(48, incrementalStablePlaneBootstrapRansacIterations));
+        settings.MaxPlanes = 4;
+        settings.MinInliers = Mathf.Clamp(horizontalPlaneShadowMinInliers, 16, 256);
+        settings.MatureBatches = 2;
+        double start = Time.realtimeSinceStartupAsDouble;
+        _horizontalPlaneShadowRegistry.UpdateTracksOnly(
+            horizontalPoints, horizontalNormals, settings,
+            out ScanCoverStablePlaneRegistry.Result result);
+        LastHorizontalPlaneShadowMilliseconds =
+            (float)((Time.realtimeSinceStartupAsDouble - start) * 1000.0);
+        LastHorizontalPlaneShadowProposalCount = result.ProposalCount;
+        LastHorizontalPlaneShadowCandidateCount = result.CandidatePlaneCount;
+        LastHorizontalPlaneShadowMatureCount = result.MaturePlaneCount;
+
+        List<ScanCoverStablePlaneRegistry.PlaneConstraint> constraints =
+            _horizontalPlaneShadowRegistry.GetMatureConstraints();
+        if (constraints.Count == 0)
+            constraints = _horizontalPlaneShadowRegistry.GetCurrentCandidateConstraints();
+        if (constraints.Count == 0)
+            return;
+
+        float lowestY = float.PositiveInfinity;
+        for (int i = 0; i < constraints.Count; i++)
+            lowestY = Mathf.Min(lowestY, constraints[i].Center.y);
+        LastHorizontalPlaneShadowLowestY = lowestY;
+        Vector3 head = GetCameraPosition();
+        for (int i = 0; i < constraints.Count; i++)
+        {
+            ScanCoverStablePlaneRegistry.PlaneConstraint plane = constraints[i];
+            if (plane.TotalInliers > LastHorizontalPlaneShadowBestInliers)
+            {
+                LastHorizontalPlaneShadowBestInliers = plane.TotalInliers;
+                LastHorizontalPlaneShadowBestRadius = plane.Radius;
+            }
+            float belowHead = head.y - plane.Center.y;
+            bool nearLowest = plane.Center.y <= lowestY + 0.12f;
+            if (nearLowest && belowHead >= 0.90f &&
+                plane.Radius >= 0.75f && plane.TotalInliers >= 80)
+                LastHorizontalPlaneShadowFloorLikelyCount++;
+            else if (!nearLowest || belowHead < 0.65f || plane.Radius < 0.45f)
+                LastHorizontalPlaneShadowObjectLikelyCount++;
+            else
+                LastHorizontalPlaneShadowAmbiguousCount++;
+        }
+    }
+
+    private void ResetHorizontalPlaneProposalShadowDiagnostics()
+    {
+        LastHorizontalPlaneShadowInputSampleCount = 0;
+        LastHorizontalPlaneShadowEligibleSampleCount = 0;
+        LastHorizontalPlaneShadowProposalCount = 0;
+        LastHorizontalPlaneShadowCandidateCount = 0;
+        LastHorizontalPlaneShadowMatureCount = 0;
+        LastHorizontalPlaneShadowFloorLikelyCount = 0;
+        LastHorizontalPlaneShadowObjectLikelyCount = 0;
+        LastHorizontalPlaneShadowAmbiguousCount = 0;
+        LastHorizontalPlaneShadowLowestY = 0f;
+        LastHorizontalPlaneShadowBestRadius = 0f;
+        LastHorizontalPlaneShadowBestInliers = 0;
+        LastHorizontalPlaneShadowMilliseconds = 0f;
     }
 
     private List<Vector3> RebuildStablePlaneShadow(List<Vector3> sourceVertices, List<int> sourceTriangles)
@@ -31937,6 +41127,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         int count = _dimX * _dimY * _dimZ;
         _voxelAuditLifecycle.Clear();
         _voxelWriteProvenance.Clear();
+        _geometryMaturityStates.Clear();
+        _geometryMaturitySecondaryStates.Clear();
         _voxelWriteSequence = 0;
         _holeCellLifecycles.Clear();
         _activeHoleLifecycleCells.Clear();
@@ -31960,6 +41152,8 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _captureAuditVoxels.Clear();
         _tsdf = new float[count];
         _weights = new byte[count];
+        _geometryProductionOwnerKeys = new int[count];
+        _activeGeometryProductionContext = default;
         _atomicProvisionalBandTsdf = new float[count];
         _atomicProvisionalBandWeight = new byte[count];
         _atomicProvisionalBandRetiredLastFrame = new int[count];
@@ -32019,6 +41213,20 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         ResetHardTsdfWriteAuditCounters();
 
         _referenceClassicTsdf.Reset(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters);
+
+        if (enableDirectionalTsdfShadow)
+        {
+            _directionalTsdfShadow.Configure(
+                _dimX, _dimY, _dimZ, _volumeOriginWorld,
+                voxelSizeMeters, truncationMeters,
+                enablePaperQuestInputContractShadow
+                    ? paperQuestInputMaximumWeight
+                    : maxFusionWeight,
+                directionalTsdfShadowBlockVoxels,
+                enableCanonicalSixDirectionTsdfFusion,
+                enableDirectionalTsdfRefinementProbe,
+                enableDirectionalTsdfHalfVoxelShadow);
+        }
 
         _authoritativeTsdfGeneration++;
         _volumeInitialized = true;
@@ -43039,6 +52247,7 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         _wireMeshRenderer.sharedMaterial = ResolveWireMaterial();
         _wireObject.SetActive(showMeshEdgeWireOverlay || showPlanarCoverWireOverlay);
         EnsureIncrementalPatchShadowObjects();
+        EnsureDirectionalTsdfShadowObjects();
         EnsureAuthoritativeCyanCrackObjects();
         EnsureStablePlaneShadowObjects();
         EnsurePlaneConstrainedZeroCrossShadowObjects();
@@ -43048,6 +52257,149 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         EnsureHoleBoundaryDiagnosticObjects();
         ApplyRawDepthDebugDisplayMode();
         EnsureDiagnosticHud();
+    }
+
+    private void EnsureDirectionalTsdfShadowObjects()
+    {
+        if (_directionalTsdfShadowObject == null)
+            _directionalTsdfShadowObject = new GameObject("[ScanCover] Sparse Six Direction TSDF Shadow Wire");
+        if (forceWorldSpaceDisplay)
+        {
+            _directionalTsdfShadowObject.transform.SetParent(null, true);
+            _directionalTsdfShadowObject.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _directionalTsdfShadowObject.transform.localScale = Vector3.one;
+        }
+        else if (_directionalTsdfShadowObject.transform.parent != displayRoot)
+        {
+            _directionalTsdfShadowObject.transform.SetParent(displayRoot, false);
+        }
+
+        if (_directionalTsdfShadowMeshFilter == null)
+            _directionalTsdfShadowMeshFilter = _directionalTsdfShadowObject.GetComponent<MeshFilter>();
+        if (_directionalTsdfShadowMeshFilter == null)
+            _directionalTsdfShadowMeshFilter = _directionalTsdfShadowObject.AddComponent<MeshFilter>();
+        if (_directionalTsdfShadowRenderer == null)
+            _directionalTsdfShadowRenderer = _directionalTsdfShadowObject.GetComponent<MeshRenderer>();
+        if (_directionalTsdfShadowRenderer == null)
+            _directionalTsdfShadowRenderer = _directionalTsdfShadowObject.AddComponent<MeshRenderer>();
+        if (_directionalTsdfShadowMesh == null)
+        {
+            _directionalTsdfShadowMesh = new Mesh { name = "ScanCover_SparseSixDirectionTsdfShadowWire" };
+            _directionalTsdfShadowMesh.indexFormat = IndexFormat.UInt32;
+        }
+        if (_directionalTsdfShadowStagingMesh == null)
+        {
+            _directionalTsdfShadowStagingMesh = new Mesh
+            {
+                name = "ScanCover_SparseSixDirectionTsdfShadowWire_Staging"
+            };
+            _directionalTsdfShadowStagingMesh.indexFormat = IndexFormat.UInt32;
+        }
+
+        Material source = ResolveWireMaterial();
+        for (int direction = 0; direction < _directionalTsdfShadowMaterials.Length; direction++)
+        {
+            if (_directionalTsdfShadowMaterials[direction] == null && source != null)
+            {
+                _directionalTsdfShadowMaterials[direction] = new Material(source)
+                {
+                    name = "ScanCover Directional TSDF Shadow " + DirectionalTsdfShadowDirectionName(direction)
+                };
+            }
+            Material material = _directionalTsdfShadowMaterials[direction];
+            if (material == null)
+                continue;
+            Color color = directionalTsdfShadowDirectionColors != null &&
+                          direction < directionalTsdfShadowDirectionColors.Length
+                ? directionalTsdfShadowDirectionColors[direction]
+                : new Color(0.15f, 0.75f, 1f, 0.95f);
+            ApplyMaterialColor(material, color);
+            ConfigureTransparentMaterial(material);
+            material.renderQueue = (int)RenderQueue.Transparent + 40;
+        }
+        _directionalTsdfShadowMeshFilter.sharedMesh = _directionalTsdfShadowMesh;
+        _directionalTsdfShadowRenderer.sharedMaterials = _directionalTsdfShadowMaterials;
+        _directionalTsdfShadowRenderer.sortingOrder = 120;
+
+        if (_directionalDmcShadowObject == null)
+            _directionalDmcShadowObject =
+                new GameObject("[ScanCover] Directional MC33 Shadow Wire");
+        if (forceWorldSpaceDisplay)
+        {
+            _directionalDmcShadowObject.transform.SetParent(null, true);
+            _directionalDmcShadowObject.transform.SetPositionAndRotation(
+                Vector3.zero, Quaternion.identity);
+            _directionalDmcShadowObject.transform.localScale = Vector3.one;
+        }
+        else if (_directionalDmcShadowObject.transform.parent != displayRoot)
+        {
+            _directionalDmcShadowObject.transform.SetParent(displayRoot, false);
+        }
+        if (_directionalDmcShadowMeshFilter == null)
+            _directionalDmcShadowMeshFilter =
+                _directionalDmcShadowObject.GetComponent<MeshFilter>();
+        if (_directionalDmcShadowMeshFilter == null)
+            _directionalDmcShadowMeshFilter =
+                _directionalDmcShadowObject.AddComponent<MeshFilter>();
+        if (_directionalDmcShadowRenderer == null)
+            _directionalDmcShadowRenderer =
+                _directionalDmcShadowObject.GetComponent<MeshRenderer>();
+        if (_directionalDmcShadowRenderer == null)
+            _directionalDmcShadowRenderer =
+                _directionalDmcShadowObject.AddComponent<MeshRenderer>();
+        if (_directionalDmcShadowMesh == null)
+        {
+            _directionalDmcShadowMesh =
+                new Mesh { name = "ScanCover_DirectionalMc33ShadowWire" };
+            _directionalDmcShadowMesh.indexFormat = IndexFormat.UInt32;
+        }
+        if (_directionalDmcShadowStagingMesh == null)
+        {
+            _directionalDmcShadowStagingMesh =
+                new Mesh { name = "ScanCover_DirectionalMc33ShadowWire_Staging" };
+            _directionalDmcShadowStagingMesh.indexFormat = IndexFormat.UInt32;
+        }
+        if (_directionalDmcShadowMaterial == null && source != null)
+        {
+            _directionalDmcShadowMaterial = new Material(source)
+            {
+                name = "ScanCover Directional MC33 Shadow"
+            };
+        }
+        if (_directionalDmcShadowMaterial != null)
+        {
+            ApplyMaterialColor(
+                _directionalDmcShadowMaterial, directionalDmcShadowColor);
+            ConfigureTransparentMaterial(_directionalDmcShadowMaterial);
+            _directionalDmcShadowMaterial.renderQueue =
+                (int)RenderQueue.Transparent + 45;
+            _directionalDmcShadowRenderer.sharedMaterial =
+                _directionalDmcShadowMaterial;
+        }
+        _directionalDmcShadowMeshFilter.sharedMesh = _directionalDmcShadowMesh;
+        _directionalDmcShadowRenderer.sortingOrder = 125;
+        ApplyDirectionalTsdfShadowDisplayMode();
+    }
+
+    private static string DirectionalTsdfShadowDirectionName(int direction)
+    {
+        switch (direction)
+        {
+            case 0: return "XPos";
+            case 1: return "XNeg";
+            case 2: return "YPos";
+            case 3: return "YNeg";
+            case 4: return "ZPos";
+            default: return "ZNeg";
+        }
+    }
+
+    private static string JoinDirectionalShadowCounts(int[] counts)
+    {
+        if (counts == null || counts.Length < ScanCoverDirectionalTsdfShadow.DirectionCount)
+            return "0|0|0|0|0|0";
+        return counts[0] + "|" + counts[1] + "|" + counts[2] + "|" +
+               counts[3] + "|" + counts[4] + "|" + counts[5];
     }
 
     private void EnsureIncrementalPatchShadowObjects()
@@ -43766,12 +53118,12 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         GameObject panelGO = new GameObject("Panel", typeof(RectTransform), typeof(Image));
         panelGO.transform.SetParent(root.transform, false);
         RectTransform panelRect = panelGO.GetComponent<RectTransform>();
-        panelRect.sizeDelta = new Vector2(760f, 250f);
+        panelRect.sizeDelta = new Vector2(360f, 76f);
         panelRect.anchorMin = new Vector2(0.5f, 0.5f);
         panelRect.anchorMax = new Vector2(0.5f, 0.5f);
         panelRect.pivot = new Vector2(0.5f, 0.5f);
         _hudPanel = panelGO.GetComponent<Image>();
-        _hudPanel.color = new Color(0f, 0.02f, 0.03f, 0.72f);
+        _hudPanel.color = new Color(0.015f, 0.025f, 0.08f, 0.78f);
         _hudPanel.raycastTarget = false;
 
         GameObject textGO = new GameObject("Text", typeof(RectTransform), typeof(Text));
@@ -43779,15 +53131,15 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         RectTransform textRect = textGO.GetComponent<RectTransform>();
         textRect.anchorMin = Vector2.zero;
         textRect.anchorMax = Vector2.one;
-        textRect.offsetMin = new Vector2(18f, 14f);
-        textRect.offsetMax = new Vector2(-18f, -14f);
+        textRect.offsetMin = new Vector2(12f, 8f);
+        textRect.offsetMax = new Vector2(-12f, -8f);
 
         _hudText = textGO.GetComponent<Text>();
         _hudText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
         if (_hudText.font == null)
             _hudText.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-        _hudText.fontSize = 20;
-        _hudText.alignment = TextAnchor.UpperLeft;
+        _hudText.fontSize = 32;
+        _hudText.alignment = TextAnchor.MiddleCenter;
         _hudText.horizontalOverflow = HorizontalWrapMode.Wrap;
         _hudText.verticalOverflow = VerticalWrapMode.Overflow;
         _hudText.color = hudHealthyColor;
@@ -43845,6 +53197,42 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (Time.unscaledTime < _nextHudRefresh)
             return;
         _nextHudRefresh = Time.unscaledTime + Mathf.Max(0.05f, hudRefreshIntervalSeconds);
+
+        if (compactDiagnosticHud)
+        {
+            bool minimalBatchActive = _captureRoutine != null;
+            if (LastCaptureBatchUsedQuestRoomGpuStreaming)
+            {
+                int streamingPairs = minimalBatchActive
+                    ? _questRoomGpuStreamingSessionStereoPairs
+                    : LastQuestRoomGpuStreamingStereoPairCount;
+                int streamingRound =
+                    CompletedCaptureBatchCount + (minimalBatchActive ? 1 : 0);
+                bool streamingWarning = !minimalBatchActive &&
+                                        streamingPairs <= 0;
+                _hudText.color = streamingWarning
+                    ? hudWarningColor
+                    : hudHealthyColor;
+                _hudText.text =
+                    $"PAIR {streamingPairs}    STREAM " +
+                    $"{(minimalBatchActive ? "ON" : "PAUSED")}    " +
+                    $"ROUND {streamingRound}";
+                return;
+            }
+
+            int minimalBatchTarget = minimalBatchActive
+                ? _activeCaptureBatchTargetFrames : LastCaptureBatchTargetFrames;
+            int minimalBatchIntegrated = minimalBatchActive
+                ? _activeCaptureBatchIntegratedFrames : LastCaptureBatchIntegratedFrames;
+            int minimalRound = CompletedCaptureBatchCount + (minimalBatchActive ? 1 : 0);
+            bool minimalWarning = !minimalBatchActive &&
+                                  LastCaptureBatchTargetFrames > 0 &&
+                                  !LastCaptureBatchComplete;
+            _hudText.color = minimalWarning ? hudWarningColor : hudHealthyColor;
+            _hudText.text =
+                $"BATCH {minimalBatchIntegrated}/{minimalBatchTarget}    ROUND {minimalRound}";
+            return;
+        }
 
         float acceptRatio = LastInputSampleCount > 0 ? (float)LastIntegratedSampleCount / LastInputSampleCount : 0f;
         float invalidRatio = LastInputSampleCount > 0 ? (float)LastRejectedInvalidPositionCount / LastInputSampleCount : 0f;
@@ -43948,20 +53336,23 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 "ScanCover AUTH TSDF\n" +
                 $"View RESULT  foreground=YELLOW|GREEN  backend orange/diagnostics logged\n" +
                 $"State {(_captureRoutine != null ? "FUSING" : "READY")}  Batch {hudBatchResult} {hudBatchIntegrated}/{hudBatchTarget} raw={hudBatchRaw} timeout={hudBatchTimeouts}\n" +
-                $"Dirty blocks={LastIncrementalTsdfDirtyBlockCount} new/change/miss={LastIncrementalTsdfDirtyNewBlockCount}/{LastIncrementalTsdfDirtyChangedBlockCount}/{LastIncrementalTsdfDirtyMissingBlockCount}\n" +
+                $"Dirty blocks={LastIncrementalTsdfDirtyBlockCount} new/change/miss={LastIncrementalTsdfDirtyNewBlockCount}/{LastIncrementalTsdfDirtyChangedBlockCount}/{LastIncrementalTsdfDirtyMissingBlockCount} boundary wait/ok={LastIncrementalTsdfBoundaryMaskPendingCount}/{LastIncrementalTsdfBoundaryMaskConfirmedCount}\n" +
                 $"Perf path={(LastCaptureBatchUsedIncrementalProductionRebuild ? "INC" : "FULL")} fallback={(LastCaptureBatchIncrementalProductionFallback ? 1 : 0)} why={LastCaptureBatchIncrementalProductionVerdict} integrate={LastCaptureBatchIntegrationMilliseconds:0}/{LastCaptureBatchMaxFrameIntegrationMilliseconds:0}ms rebuild={LastCaptureBatchMeshRebuildMilliseconds:0}ms\n" +
-                $"Fusion queue budget/max={fusionWorkBudgetMillisecondsPerRenderFrame:0.0}/{LastCaptureBatchBudgetedFusionMaxSliceMilliseconds:0.0}ms yields={LastCaptureBatchBudgetedFusionYieldCount} wall={LastCaptureBatchBudgetedFusionWallMilliseconds:0}ms writes unique/merged={LastCaptureBatchUniqueSurfaceVoxelWriteCount}/{LastCaptureBatchMergedSurfaceVoxelWriteCount} refPaused={(LastReferenceClassicPausedForPerformance ? 1 : 0)}\n" +
+                $"Fusion queue budget/max={fusionWorkBudgetMillisecondsPerRenderFrame:0.0}/{LastCaptureBatchBudgetedFusionMaxSliceMilliseconds:0.0}ms yields={LastCaptureBatchBudgetedFusionYieldCount} wall={LastCaptureBatchBudgetedFusionWallMilliseconds:0}ms writes unique/merged/compact/heavy={LastCaptureBatchUniqueSurfaceVoxelWriteCount}/{LastCaptureBatchMergedSurfaceVoxelWriteCount}/{LastCaptureBatchCompactedFusionSampleCount}/{LastCaptureBatchHeavyFusionSampleCount} refPaused={(LastReferenceClassicPausedForPerformance ? 1 : 0)}\n" +
+                $"3-line floor in/eligible/prop/mature/prod={LastHorizontalPlaneShadowInputSampleCount}/{LastHorizontalPlaneShadowEligibleSampleCount}/{LastHorizontalPlaneShadowProposalCount}/{LastHorizontalPlaneShadowMatureCount}/{LastMatureHorizontalProductionPlaneCount} stamp prod/q/mis={(useFusionDenseStampProduction ? 1 : 0)}/{LastCaptureBatchFusionDenseStampLookupCount}/{LastCaptureBatchFusionDenseStampMismatchCount}\n" +
                 $"Rebuild queue budget/max={incrementalRebuildBudgetMillisecondsPerRenderFrame:0.0}/{LastCaptureBatchBudgetedRebuildMaxSliceMilliseconds:0.0}ms yields={LastCaptureBatchBudgetedRebuildYieldCount} compute/wall={LastCaptureBatchMeshRebuildMilliseconds:0}/{LastCaptureBatchMeshRebuildWallMilliseconds:0}ms\n" +
-                $"Result chunks active/up/keep/drop={LastPersistentResultChunkActiveCount}/{LastPersistentResultChunkUpdatedCount}/{LastPersistentResultChunkPreservedCount}/{LastPersistentResultChunkRemovedCount} publish={LastPersistentResultChunkPublishMilliseconds:0.0}ms\n" +
-                $"Rebuild phase dirty/dep/ext/sem/merge={LastIncrementalProductionDirtyTrackingMilliseconds:0.0}/{LastAuthoritativeBlockDependencyScheduleMilliseconds:0.0}/{LastAuthoritativeBlockExtractionMilliseconds:0.0}/{LastAuthoritativeBlockSemanticFinalizeMilliseconds:0.0}/{LastAuthoritativeBlockCacheMergeMilliseconds:0.0}ms dep keep/drop={LastAuthoritativeBlockDependencyCandidateCount - LastAuthoritativeBlockDependencyPrunedCount}/{LastAuthoritativeBlockDependencyPrunedCount}\n" +
+                $"Result chunks active/up/keep/drop={LastPersistentResultChunkActiveCount}/{LastPersistentResultChunkUpdatedCount}/{LastPersistentResultChunkPreservedCount}/{LastPersistentResultChunkRemovedCount} publish/upload={LastPersistentResultChunkPublishMilliseconds:0.0}/{LastPersistentResultChunkUploadMaxMilliseconds:0.0}ms\n" +
+                $"Result delta change/halo/touch={LastPersistentResultDeltaChangedCount}/{LastPersistentResultDeltaHaloCount}/{LastPersistentResultDeltaTouchedCount} retire wait/drop={LastPersistentResultRetireDeferredCount}/{LastPersistentResultChunkRemovedCount} swaps={LastPersistentResultDoubleBufferedSwapCount} crossColor={LastPersistentResultCrossCategoryEdgeSuppressedCount}\n" +
+                $"Rebuild phase dirty/dep/ext/sem/merge={LastIncrementalProductionDirtyTrackingMilliseconds:0.0}/{LastAuthoritativeBlockDependencyScheduleMilliseconds:0.0}/{LastAuthoritativeBlockExtractionMilliseconds:0.0}/{LastAuthoritativeBlockSemanticFinalizeMilliseconds:0.0}/{LastAuthoritativeBlockCacheMergeMilliseconds:0.0}ms dep keep/drop/recip={LastAuthoritativeBlockDependencyCandidateCount - LastAuthoritativeBlockDependencyPrunedCount}/{LastAuthoritativeBlockDependencyPrunedCount}/{LastAuthoritativeBlockDependencyReciprocalPrunedCount}\n" +
                 $"Semantic topo/ind/yellow/relax/class/view={LastPlaneLedgerTopologyMilliseconds:0.0}/{LastPlaneLedgerIndependentAuditMilliseconds:0.0}/{LastPlaneLedgerYellowAuditMilliseconds:0.0}/{LastPlaneLedgerRelaxedAuditMilliseconds:0.0}/{LastPlaneLedgerClassificationMilliseconds:0.0}/{LastPlaneLedgerPresentationMilliseconds:0.0}ms\n" +
                 $"Result formal/prov/complex/pending={LastRelaxedCandidateFormalTriangleCount}/{LastRelaxedCandidateProvisionalTriangleCount}/{LastRelaxedCandidateComplexTriangleCount}/{LastRelaxedCandidatePendingTriangleCount} complex lease renew/after/expired={LastConfirmedComplexRenewedCount}/{LastConfirmedComplexLeaseAfterCount}/{LastConfirmedComplexLeaseExpiredCount}\n" +
                 $"Volume seq/vox={LastAuthoritativeReadSnapshotSequence}/{LastAuthoritativeReadSnapshotWeightedVoxelCount} legacyMut={LastAuthoritativeLegacyMutationVoxelCount} restore/mismatch={LastAuthoritativeCanonicalRestoreVoxelCount}/{LastAuthoritativeCanonicalPostRestoreMismatchCount}\n" +
                 $"Blocks cache/try/ok/empty/rb={LastAuthoritativeBlockCachedCount}/{LastAuthoritativeBlockDirtyAttemptCount}/{LastAuthoritativeBlockRebuiltCount}/{LastAuthoritativeBlockDirectEmptyCount + LastAuthoritativeBlockDependencyEmptyCount}/{LastAuthoritativeBlockRollbackCount} planeΔ={LastAuthoritativePlaneChangedCount}/{LastAuthoritativePlaneInvalidatedBlockCount}\n" +
                 $"Split cells/verts={LastAuthoritativeBlockMultiComponentCellCount}/{LastAuthoritativeBlockSplitVertexCount} reject edges/max/mix={LastAuthoritativeBlockRejectedNonManifoldEdgeCount}/{LastAuthoritativeBlockRejectedMaxEdgeIncidence}/{LastAuthoritativeBlockRejectedMixedAxisEdgeCount}\n" +
-                $"Mesh tri/edge/nonM={LastAuthoritativeBlockTriangleCount}/{LastAuthoritativeBlockBoundaryEdgeCount}/{LastAuthoritativeBlockNonManifoldEdgeCount}\n" +
+                $"Mesh tri/edge/nonM={LastAuthoritativeBlockTriangleCount}/{LastAuthoritativeBlockBoundaryEdgeCount}/{LastAuthoritativeBlockNonManifoldEdgeCount} aggSkip/cacheTopo={(LastAuthoritativeAggregateMeshSkipped ? 1 : 0)}/{LastAuthoritativeTopologyCachedBlockCount}\n" +
                 $"Plane mature/app/rb={LastAuthoritativeCyanPlaneMatureCount}/{LastAuthoritativeCyanPlaneAppliedBlockCount}/{LastAuthoritativeCyanPlaneRollbackBlockCount} tri/move/lock={LastAuthoritativeCyanPlaneMatchedTriangleCount}/{LastAuthoritativeCyanPlaneMovedVertexCount}/{LastAuthoritativeCyanPlaneCreaseLockedVertexCount} prop={LastAuthoritativeCyanPlanePropagationAcceptedCount}/{LastAuthoritativeCyanPlanePropagationCandidateCount} shared/mis={LastAuthoritativeCyanPlaneSharedVertexKeyCount}/{LastAuthoritativeCyanPlaneSharedPositionMismatchCount} res={LastAuthoritativeCyanPlaneResidualBeforeMeters:F3}>{LastAuthoritativeCyanPlaneResidualAfterMeters:F3}\n" +
                 $"Local support c/l/g={LastAuthoritativeCyanLocalSupportCandidateTileCount}/{LastAuthoritativeCyanLocalSupportQualifiedTileCount}/{LastAuthoritativeCyanLocalSupportGlobalTileCount} samp={LastAuthoritativeCyanLocalSupportMatchedSampleCount}/{LastAuthoritativeCyanLocalSupportInputSampleCount} +/-={LastAuthoritativeCyanLocalSupportPromotedTileCount}/{LastAuthoritativeCyanLocalSupportDemotedTileCount} tri={LastAuthoritativeCyanLocalSupportMatchedTriangleCount}\n" +
+                $"Floor support plane/cand/covered/fill/tri/block={LastObservedFloorSupportPlaneCount}/{LastObservedFloorSupportCandidateCellCount}/{LastObservedFloorSupportCoveredCellCount}/{LastObservedFloorSupportFilledCellCount}/{LastObservedFloorSupportTriangleCount}/{LastObservedFloorSupportBlockCount}\n" +
                 $"Result F/P/C={LastOutputResultFormalTriangleCount}/{LastOutputResultProvisionalTriangleCount}/{LastOutputResultComplexTriangleCount} held={LastOutputResultHeldRescueTriangleCount} keep/reject={LastOutputResultPromotedTriangleCount}/{LastOutputResultRejectedTriangleCount}  Diag P/I/U/B={LastOutputDiagnosticPendingTriangleCount}/{LastOutputDiagnosticIllegalTriangleCount}/{LastOutputDiagnosticUnclassifiedTriangleCount}/{LastOutputDiagnosticPromotionBlockedTriangleCount}\n" +
                 $"Audit I ok/no/id/q={LastIndependentStructuralSupportedTriangleCount}/{LastIndependentStructuralNoSupportTriangleCount}/{LastIndependentStructuralIdentityConflictTriangleCount}/{LastIndependentStructuralQualificationFailureTriangleCount} gap a/e/m/b/w/r={LastPlaneSupportGapCellCount}/{LastPlaneSupportGapNoTriangleCount}/{LastPlaneSupportGapHeldCount}/{LastPlaneSupportGapNonplanarCount}/{LastPlaneSupportGapWrongPlaneCount}/{LastPlaneSupportGapIllegalCount} dir/unobs={LastPlaneSupportDirectEvidenceCellCount}/{LastPlaneSupportUnobservedCellCount} unk={LastPlaneSupportUnknownWithTrianglesCount}/{LastPlaneSupportUnknownEmptyCount} cut={LastPlaneSupportTruncatedCellCount}\n" +
                 $"Log {logStatus}  rounds={CompletedCaptureBatchCount}";
