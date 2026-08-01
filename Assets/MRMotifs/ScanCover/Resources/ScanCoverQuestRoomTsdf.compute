@@ -5,6 +5,13 @@
 #pragma kernel Integrate
 
 RWTexture3D<float2> _Volume;
+// Read-only diagnostic sidecar for the surface extractor.  It never feeds
+// back into the production TSDF value or weight:
+//   x = accepted writes close to the measured surface
+//   y = integration ordinal of the most recent accepted free-space write
+//   z = accepted writes in the rear truncation band
+//   w = integration ordinal of the most recent direct-surface write
+RWTexture3D<float4> _EvidenceVolume;
 Texture2D<float4> _WorldPosition;
 Texture2D<float4> _WorldNormal;
 Texture2D<float4> _ObservationMeta;
@@ -20,6 +27,8 @@ float _BlendRate;
 float _Stability;
 float _WeightGrowth;
 float _MaximumWeight;
+float _EvidenceSurfaceBand;
+int _EvidenceIntegrationOrdinal;
 float4 _SourceSize;
 float4 _EyeWorldPosition;
 float4x4 _WorldToClip;
@@ -35,6 +44,27 @@ void Clear(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)_VoxelCount)) return;
     _Volume[id] = float2(1.0, 0.0);
+    _EvidenceVolume[id] = float4(0.0, -1.0, 0.0, -1.0);
+}
+
+void RecordAcceptedEvidence(uint3 id, float rayDistanceDelta)
+{
+    float4 evidence = _EvidenceVolume[id];
+    float band = max(_EvidenceSurfaceBand, 1e-4);
+    if (abs(rayDistanceDelta) <= band)
+    {
+        evidence.x = min(evidence.x + 1.0, 2048.0);
+        evidence.w = (float)_EvidenceIntegrationOrdinal;
+    }
+    else if (rayDistanceDelta > band)
+    {
+        evidence.y = (float)_EvidenceIntegrationOrdinal;
+    }
+    else
+    {
+        evidence.z = min(evidence.z + 1.0, 2048.0);
+    }
+    _EvidenceVolume[id] = evidence;
 }
 
 [numthreads(4, 4, 4)]
@@ -69,7 +99,8 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     if (facing < _MinimumNormalDot) return;
 
     float voxelDistance = distance(voxelWorld, _EyeWorldPosition.xyz);
-    float signedDistance = (surfaceDistance - voxelDistance) * facing;
+    float rayDistanceDelta = surfaceDistance - voxelDistance;
+    float signedDistance = rayDistanceDelta * facing;
     if (signedDistance < -_TruncationDistance) return;
     float normalizedDistance = min(signedDistance / _TruncationDistance, 1.0);
 
@@ -82,7 +113,10 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     if (oldWeight < 0.001)
     {
         if (quality >= 0.20)
+        {
             _Volume[id] = float2(normalizedDistance, 0.10);
+            RecordAcceptedEvidence(id, rayDistanceDelta);
+        }
         return;
     }
 
@@ -90,4 +124,5 @@ void Integrate(uint3 id : SV_DispatchThreadID)
     float updatedTsdf = lerp(oldValue.x, normalizedDistance, blend);
     float updatedWeight = min(oldWeight + q2 * _WeightGrowth, _MaximumWeight);
     _Volume[id] = float2(updatedTsdf, updatedWeight);
+    RecordAcceptedEvidence(id, rayDistanceDelta);
 }

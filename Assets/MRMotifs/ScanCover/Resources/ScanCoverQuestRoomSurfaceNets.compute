@@ -11,8 +11,11 @@
 #pragma kernel GenerateLineIndices
 #pragma kernel BuildDrawArgs
 #pragma kernel InitTemporal
+#pragma kernel InitPersistentMesh
+#pragma kernel UpdatePersistentSigns
 
 Texture3D<float2> _TsdfVolume;
+Texture3D<float4> _EvidenceVolume;
 RWStructuredBuffer<int> _CoordVertexMap;
 
 struct SurfaceVertex
@@ -25,12 +28,19 @@ struct SurfaceVertex
 
 RWStructuredBuffer<SurfaceVertex> _Vertices;
 RWStructuredBuffer<uint> _LineIndices;
-RWStructuredBuffer<uint> _Counters;       // vertex, index, dropped
+// 0 vertex, 1 line-index, 2 dropped,
+// 3..9 mutually-exclusive vertex evidence classes,
+// 10 total quads, 11..17 mutually-exclusive quad evidence classes,
+// 18 display-only suppressed line segments,
+// 19..22 topology-frozen feature QEF candidate/applied/rejected/smooth-locked.
+RWStructuredBuffer<uint> _Counters;
 RWStructuredBuffer<uint> _DispatchArgs;
 RWStructuredBuffer<uint> _DrawArgs;
 RWStructuredBuffer<float3> _SmoothPositionA;
 RWStructuredBuffer<float3> _SmoothPositionB;
 RWTexture3D<float4> _TemporalState;
+RWTexture3D<float4> _PersistentSignState;
+RWStructuredBuffer<uint> _PersistentAllocator;
 
 int3 _VoxelCount;
 int _TotalVoxelCount;
@@ -45,6 +55,55 @@ float _TemporalAlphaMinimum;
 float _TemporalDecayRate;
 float _ConvergenceThreshold;
 float _TemporalDeadzone;
+float _EvidenceIntegrationOrdinal;
+float _DiagnosticStaleIntegrationThreshold;
+float _DiagnosticFreeContradictionIntegrationThreshold;
+int _EnableFeaturePreservingQef;
+int _EnablePersistentIncrementalMesh;
+int _PersistentBirthConfirmations;
+int _PersistentCorrectionConfirmations;
+float _FeatureNormalClusterCosine;
+float _FeatureQefRegularization;
+float _FeatureQefMaximumDisplacementVoxels;
+float _FeatureQefMinimumResidualImprovement;
+
+static const uint EvidenceDirect = 1u << 0;
+static const uint EvidenceUnknownCrossing = 1u << 1;
+static const uint EvidenceRear = 1u << 2;
+static const uint EvidenceStaleDirect = 1u << 3;
+static const uint EvidenceBackCap = 1u << 4;
+static const uint EvidenceFreeContradicted = 1u << 5;
+// This bit affects vertex position/smoothing only. It is deliberately excluded
+// from evidence-class priority and from all topology decisions.
+static const uint EvidenceFeatureLocked = 1u << 6;
+// Internal lifetime flag.  Persistent slots are never interpreted as live
+// merely because their index is below the allocator high-water mark.
+static const uint EvidenceInactive = 1u << 31;
+
+static const uint CounterVertexDirect = 3;
+static const uint CounterVertexBackCap = 4;
+static const uint CounterVertexFreeContradicted = 5;
+static const uint CounterVertexUnknown = 6;
+static const uint CounterVertexRear = 7;
+static const uint CounterVertexStale = 8;
+static const uint CounterVertexUnresolved = 9;
+static const uint CounterQuadTotal = 10;
+static const uint CounterQuadDirect = 11;
+static const uint CounterQuadBackCap = 12;
+static const uint CounterQuadFreeContradicted = 13;
+static const uint CounterQuadUnknown = 14;
+static const uint CounterQuadRear = 15;
+static const uint CounterQuadStale = 16;
+static const uint CounterQuadUnresolved = 17;
+static const uint CounterSuppressedLineSegments = 18;
+static const uint CounterFeatureQefCandidate = 19;
+static const uint CounterFeatureQefApplied = 20;
+static const uint CounterFeatureQefRejected = 21;
+static const uint CounterFeatureSmoothLocked = 22;
+static const uint CounterPersistentBorn = 23;
+static const uint CounterPersistentRetired = 24;
+static const uint CounterPersistentCorrectionApplied = 25;
+static const uint CounterPersistentRetained = 26;
 
 static const int3 CornerOffset[8] =
 {
@@ -76,7 +135,44 @@ float3 VoxelToLocal(float3 c)
 float SampleSdf(int3 c)
 {
     float2 value = _TsdfVolume[c];
-    return value.y >= _MinimumWeight ? value.x : 0.0;
+    if (_EnablePersistentIncrementalMesh == 0)
+        return value.y >= _MinimumWeight ? value.x : 0.0;
+    float committedSign = _PersistentSignState[c].x;
+    if (committedSign < -0.5) return 0.0;
+    float magnitude = max(abs(value.x), 1e-4);
+    return committedSign > 0.5 ? -magnitude : magnitude;
+}
+
+bool SolveSymmetricFeatureQef(
+    float a00, float a01, float a02,
+    float a11, float a12, float a22,
+    float3 rhs,
+    out float3 solution)
+{
+    float determinant =
+        a00 * (a11 * a22 - a12 * a12) -
+        a01 * (a01 * a22 - a12 * a02) +
+        a02 * (a01 * a12 - a11 * a02);
+    if (abs(determinant) < 1e-7)
+    {
+        solution = 0.0;
+        return false;
+    }
+
+    float determinantX =
+        rhs.x * (a11 * a22 - a12 * a12) -
+        a01 * (rhs.y * a22 - a12 * rhs.z) +
+        a02 * (rhs.y * a12 - a11 * rhs.z);
+    float determinantY =
+        a00 * (rhs.y * a22 - a12 * rhs.z) -
+        rhs.x * (a01 * a22 - a12 * a02) +
+        a02 * (a01 * rhs.z - rhs.y * a02);
+    float determinantZ =
+        a00 * (a11 * rhs.z - rhs.y * a12) -
+        a01 * (a01 * rhs.z - rhs.y * a02) +
+        rhs.x * (a01 * a12 - a11 * a02);
+    solution = float3(determinantX, determinantY, determinantZ) / determinant;
+    return all(abs(solution) < 1e6);
 }
 
 [numthreads(64, 1, 1)]
@@ -84,12 +180,82 @@ void ClearCountersAndMap(uint3 id : SV_DispatchThreadID)
 {
     if (id.x == 0)
     {
-        _Counters[0] = 0;
-        _Counters[1] = 0;
-        _Counters[2] = 0;
+        [unroll]
+        for (uint counter = 0; counter < 27; counter++)
+            _Counters[counter] = 0;
     }
-    if (id.x < (uint)_TotalVoxelCount)
+    if (_EnablePersistentIncrementalMesh == 0 &&
+        id.x < (uint)_TotalVoxelCount)
         _CoordVertexMap[id.x] = -1;
+}
+
+[numthreads(64, 1, 1)]
+void InitPersistentMesh(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0) _PersistentAllocator[0] = 0;
+    if (id.x >= (uint)_TotalVoxelCount) return;
+    _CoordVertexMap[id.x] = -1;
+    int3 coord = Unflatten((int)id.x);
+    // x committed sign: -1 unknown, 0 positive/outside, 1 negative/inside.
+    // y pending sign, z consecutive pending observations, w reserved.
+    _PersistentSignState[coord] = float4(-1.0, -1.0, 0.0, 0.0);
+}
+
+[numthreads(4, 4, 4)]
+void UpdatePersistentSigns(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+    float2 sample = _TsdfVolume[id];
+    bool observed = sample.y >= _MinimumWeight;
+    float candidateSign = observed ? (sample.x < 0.0 ? 1.0 : 0.0) : -1.0;
+    float4 state = _PersistentSignState[id];
+
+    if (_EnablePersistentIncrementalMesh == 0)
+    {
+        state = float4(candidateSign, -1.0, 0.0, 0.0);
+        _PersistentSignState[id] = state;
+        return;
+    }
+
+    // Missing observations never erase a committed sign.  Corrections require
+    // repeated opposite evidence, so a depth hole cannot open a one-frame seam.
+    if (!observed)
+    {
+        state.y = -1.0;
+        state.z = 0.0;
+        _PersistentSignState[id] = state;
+        return;
+    }
+
+    if (state.x < -0.5)
+    {
+        state.z = abs(state.y - candidateSign) < 0.25 ? state.z + 1.0 : 1.0;
+        state.y = candidateSign;
+        if (state.z >= max(1, _PersistentBirthConfirmations))
+        {
+            state.x = candidateSign;
+            state.y = -1.0;
+            state.z = 0.0;
+        }
+    }
+    else if (abs(state.x - candidateSign) < 0.25)
+    {
+        state.y = -1.0;
+        state.z = 0.0;
+    }
+    else
+    {
+        state.z = abs(state.y - candidateSign) < 0.25 ? state.z + 1.0 : 1.0;
+        state.y = candidateSign;
+        if (state.z >= max(2, _PersistentCorrectionConfirmations))
+        {
+            state.x = candidateSign;
+            state.y = -1.0;
+            state.z = 0.0;
+            InterlockedAdd(_Counters[CounterPersistentCorrectionApplied], 1);
+        }
+    }
+    _PersistentSignState[id] = state;
 }
 
 [numthreads(4, 4, 4)]
@@ -110,50 +276,370 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     float3 gradient = 0.0;
     uint crossingCount = 0;
     uint observedCrossingCount = 0;
+    uint unknownCrossingCount = 0;
+    uint directCornerCount = 0;
+    uint recentFreeCornerCount = 0;
+    uint rearCornerCount = 0;
+    uint observedCornerCount = 0;
+    float mostRecentDirectIntegration = -1.0;
+    float mostRecentFreeIntegration = -1.0;
+    float cornerSdf[8];
+    float cornerWeight[8];
+    float3 hermitePoints[12];
+    float3 hermiteNormals[12];
+    uint hermiteCount = 0;
+
+    [unroll]
+    for (uint corner = 0; corner < 8; corner++)
+    {
+        int3 cornerCoord = (int3)id + CornerOffset[corner];
+        float4 evidence = _EvidenceVolume[cornerCoord];
+        float2 tsdf = _TsdfVolume[cornerCoord];
+        float committedSign = _PersistentSignState[cornerCoord].x;
+        bool committedObserved = _EnablePersistentIncrementalMesh != 0
+            ? committedSign >= -0.5
+            : tsdf.y >= _MinimumWeight;
+        float magnitude = max(abs(tsdf.x), 1e-4);
+        cornerSdf[corner] = committedObserved
+            ? (_EnablePersistentIncrementalMesh != 0
+                ? (committedSign > 0.5 ? -magnitude : magnitude)
+                : tsdf.x)
+            : 0.0;
+        cornerWeight[corner] = committedObserved
+            ? max(tsdf.y, _MinimumWeight)
+            : 0.0;
+        if (committedObserved)
+            observedCornerCount++;
+        if (evidence.x >= 0.5)
+        {
+            directCornerCount++;
+            mostRecentDirectIntegration = max(mostRecentDirectIntegration, evidence.w);
+        }
+        if (evidence.y >= 0.0)
+        {
+            mostRecentFreeIntegration = max(mostRecentFreeIntegration, evidence.y);
+            if (_EvidenceIntegrationOrdinal - evidence.y <=
+                _DiagnosticFreeContradictionIntegrationThreshold)
+                recentFreeCornerCount++;
+        }
+        if (evidence.z >= 0.5)
+            rearCornerCount++;
+    }
 
     [unroll]
     for (uint edge = 0; edge < 12; edge++)
     {
         int3 aCoord = (int3)id + CornerOffset[EdgeA[edge]];
         int3 bCoord = (int3)id + CornerOffset[EdgeB[edge]];
-        float2 a = _TsdfVolume[aCoord];
-        float2 b = _TsdfVolume[bCoord];
-        bool aObserved = a.y >= _MinimumWeight;
-        bool bObserved = b.y >= _MinimumWeight;
-        float aValue = aObserved ? a.x : 0.0;
-        float bValue = bObserved ? b.x : 0.0;
+        bool aObserved = cornerWeight[EdgeA[edge]] >= _MinimumWeight;
+        bool bObserved = cornerWeight[EdgeB[edge]] >= _MinimumWeight;
+        float aValue = cornerSdf[EdgeA[edge]];
+        float bValue = cornerSdf[EdgeB[edge]];
         float change = aValue - bValue;
         gradient += (float3)(aCoord - bCoord) * change;
         if ((aValue < 0.0) == (bValue < 0.0)) continue;
         float t = abs(change) > 1e-6 ? saturate(aValue / change) : 0.5;
         crossingPosition += (float3)aCoord + t * (float3)(bCoord - aCoord);
         crossingCount++;
-        if (aObserved && bObserved) observedCrossingCount++;
+        if (aObserved && bObserved)
+        {
+            observedCrossingCount++;
+            float3 crossingLocal = (float3)CornerOffset[EdgeA[edge]] +
+                t * (float3)(CornerOffset[EdgeB[edge]] - CornerOffset[EdgeA[edge]]);
+            float x = crossingLocal.x;
+            float y = crossingLocal.y;
+            float z = crossingLocal.z;
+            // Analytic gradient of the cell's trilinear TSDF.  It reuses the
+            // eight corner reads above instead of adding dozens of texture
+            // samples per cell on Quest.
+            float dx0 = lerp(cornerSdf[1] - cornerSdf[0],
+                             cornerSdf[2] - cornerSdf[3], z);
+            float dx1 = lerp(cornerSdf[5] - cornerSdf[4],
+                             cornerSdf[6] - cornerSdf[7], z);
+            float dy0 = lerp(lerp(cornerSdf[4], cornerSdf[5], x),
+                             lerp(cornerSdf[7], cornerSdf[6], x), z) -
+                        lerp(lerp(cornerSdf[0], cornerSdf[1], x),
+                             lerp(cornerSdf[3], cornerSdf[2], x), z);
+            float dz0 = lerp(cornerSdf[3] - cornerSdf[0],
+                             cornerSdf[2] - cornerSdf[1], x);
+            float dz1 = lerp(cornerSdf[7] - cornerSdf[4],
+                             cornerSdf[6] - cornerSdf[5], x);
+            float3 crossingGradient = float3(
+                lerp(dx0, dx1, y),
+                dy0,
+                lerp(dz0, dz1, y));
+            float crossingGradientLengthSq = dot(crossingGradient, crossingGradient);
+            if (crossingGradientLengthSq > 1e-8 && hermiteCount < 12)
+            {
+                hermitePoints[hermiteCount] =
+                    (float3)aCoord + t * (float3)(bCoord - aCoord);
+                hermiteNormals[hermiteCount] =
+                    crossingGradient * rsqrt(crossingGradientLengthSq);
+                hermiteCount++;
+            }
+        }
+        else unknownCrossingCount++;
     }
 
-    if (crossingCount < 3 || observedCrossingCount == 0) return;
+    int flatCellIndex = Flatten((int3)id);
+    bool activeCell = crossingCount >= 3 && observedCrossingCount > 0;
+    if (!activeCell)
+    {
+        if (_EnablePersistentIncrementalMesh != 0)
+        {
+            int retiredIndex = _CoordVertexMap[flatCellIndex];
+            if (retiredIndex >= 0 && retiredIndex < _MaximumVertices)
+            {
+                SurfaceVertex retired = _Vertices[retiredIndex];
+                retired.padding |= EvidenceInactive;
+                _Vertices[retiredIndex] = retired;
+                _CoordVertexMap[flatCellIndex] = -1;
+                InterlockedAdd(_Counters[CounterPersistentRetired], 1);
+            }
+        }
+        return;
+    }
     uint vertexIndex;
-    InterlockedAdd(_Counters[0], 1, vertexIndex);
+    if (_EnablePersistentIncrementalMesh != 0)
+    {
+        int existingIndex = _CoordVertexMap[flatCellIndex];
+        if (existingIndex >= 0)
+        {
+            vertexIndex = (uint)existingIndex;
+            InterlockedAdd(_Counters[CounterPersistentRetained], 1);
+        }
+        else
+        {
+            InterlockedAdd(_PersistentAllocator[0], 1, vertexIndex);
+            if (vertexIndex < (uint)_MaximumVertices)
+            {
+                _CoordVertexMap[flatCellIndex] = (int)vertexIndex;
+                InterlockedAdd(_Counters[CounterPersistentBorn], 1);
+            }
+        }
+        InterlockedAdd(_Counters[0], 1);
+    }
+    else
+    {
+        InterlockedAdd(_Counters[0], 1, vertexIndex);
+    }
     if (vertexIndex >= (uint)_MaximumVertices)
     {
         InterlockedAdd(_Counters[2], 1);
         return;
     }
 
+    float3 averageCrossingPosition = crossingPosition / crossingCount;
+    float3 selectedCrossingPosition = averageCrossingPosition;
+    bool featureLocked = false;
+
+    // Topology-frozen Hermite/QEF feature positioning.  This branch never
+    // creates/deletes a vertex, changes a cell case, or changes line indices.
+    // Any uncertainty falls back to the exact pre-feature Surface Nets mean.
+    if (_EnableFeaturePreservingQef != 0 &&
+        directCornerCount > 0 &&
+        observedCornerCount == 8 &&
+        unknownCrossingCount == 0 &&
+        recentFreeCornerCount < 4 &&
+        hermiteCount >= 3)
+    {
+        float3 clusterNormalSum[3];
+        float3 clusterPointSum[3];
+        uint clusterSampleCount[3];
+        [unroll]
+        for (uint clusterInit = 0; clusterInit < 3; clusterInit++)
+        {
+            clusterNormalSum[clusterInit] = 0.0;
+            clusterPointSum[clusterInit] = 0.0;
+            clusterSampleCount[clusterInit] = 0;
+        }
+
+        uint clusterCount = 0;
+        bool clusterOverflow = false;
+        [loop]
+        for (uint constraint = 0; constraint < hermiteCount; constraint++)
+        {
+            float3 constraintNormal = hermiteNormals[constraint];
+            int bestCluster = -1;
+            float bestAlignment = -1.0;
+            [unroll]
+            for (uint cluster = 0; cluster < 3; cluster++)
+            {
+                if (cluster >= clusterCount) continue;
+                float3 representative = normalize(clusterNormalSum[cluster]);
+                float alignment = abs(dot(constraintNormal, representative));
+                if (alignment > bestAlignment)
+                {
+                    bestAlignment = alignment;
+                    bestCluster = (int)cluster;
+                }
+            }
+
+            if (bestCluster < 0 || bestAlignment < _FeatureNormalClusterCosine)
+            {
+                if (clusterCount >= 3)
+                {
+                    clusterOverflow = true;
+                    break;
+                }
+                bestCluster = (int)clusterCount;
+                clusterCount++;
+            }
+
+            uint assignedCluster = (uint)bestCluster;
+            float orientation = clusterSampleCount[assignedCluster] > 0 &&
+                dot(constraintNormal, clusterNormalSum[assignedCluster]) < 0.0
+                    ? -1.0
+                    : 1.0;
+            clusterNormalSum[assignedCluster] += orientation * constraintNormal;
+            clusterPointSum[assignedCluster] += hermitePoints[constraint];
+            clusterSampleCount[assignedCluster]++;
+        }
+
+        if (clusterCount >= 2)
+        {
+            InterlockedAdd(_Counters[CounterFeatureQefCandidate], 1);
+            bool enoughClusterSupport = !clusterOverflow;
+            if (clusterCount == 2)
+            {
+                enoughClusterSupport = enoughClusterSupport &&
+                    clusterSampleCount[0] >= 2 && clusterSampleCount[1] >= 2;
+            }
+            else
+            {
+                enoughClusterSupport = enoughClusterSupport &&
+                    hermiteCount >= 5 &&
+                    clusterSampleCount[0] >= 1 &&
+                    clusterSampleCount[1] >= 1 &&
+                    clusterSampleCount[2] >= 1;
+            }
+
+            float a00 = 0.0;
+            float a01 = 0.0;
+            float a02 = 0.0;
+            float a11 = 0.0;
+            float a12 = 0.0;
+            float a22 = 0.0;
+            float3 rhs = 0.0;
+            if (enoughClusterSupport)
+            {
+                [unroll]
+                for (uint qefCluster = 0; qefCluster < 3; qefCluster++)
+                {
+                    if (qefCluster >= clusterCount) continue;
+                    float3 planeNormal = normalize(clusterNormalSum[qefCluster]);
+                    float3 planePoint = clusterPointSum[qefCluster] /
+                        max(1.0, (float)clusterSampleCount[qefCluster]);
+                    float planeOffset = dot(planeNormal, planePoint);
+                    a00 += planeNormal.x * planeNormal.x;
+                    a01 += planeNormal.x * planeNormal.y;
+                    a02 += planeNormal.x * planeNormal.z;
+                    a11 += planeNormal.y * planeNormal.y;
+                    a12 += planeNormal.y * planeNormal.z;
+                    a22 += planeNormal.z * planeNormal.z;
+                    rhs += planeNormal * planeOffset;
+                }
+            }
+
+            float regularization = max(1e-5, _FeatureQefRegularization);
+            a00 += regularization;
+            a11 += regularization;
+            a22 += regularization;
+            rhs += regularization * averageCrossingPosition;
+
+            float3 qefPosition = averageCrossingPosition;
+            bool solved = enoughClusterSupport && SolveSymmetricFeatureQef(
+                a00, a01, a02, a11, a12, a22, rhs, qefPosition);
+            float3 cellMinimum = (float3)id;
+            float3 cellMaximum = cellMinimum + 1.0;
+            float3 clampedQefPosition = clamp(qefPosition, cellMinimum, cellMaximum);
+            float outsideDistance = distance(qefPosition, clampedQefPosition);
+            float displacement = distance(clampedQefPosition, averageCrossingPosition);
+            float averageResidual = 0.0;
+            float qefResidual = 0.0;
+            if (solved)
+            {
+                [loop]
+                for (uint residualConstraint = 0;
+                     residualConstraint < hermiteCount;
+                     residualConstraint++)
+                {
+                    float3 constraintNormal = hermiteNormals[residualConstraint];
+                    float3 constraintPoint = hermitePoints[residualConstraint];
+                    float averageError = dot(
+                        constraintNormal,
+                        averageCrossingPosition - constraintPoint);
+                    float qefError = dot(
+                        constraintNormal,
+                        clampedQefPosition - constraintPoint);
+                    averageResidual += averageError * averageError;
+                    qefResidual += qefError * qefError;
+                }
+            }
+
+            bool residualImproved = averageResidual > 1e-7 &&
+                qefResidual <= averageResidual *
+                    (1.0 - _FeatureQefMinimumResidualImprovement);
+            if (solved &&
+                outsideDistance <= 0.10 &&
+                displacement <= _FeatureQefMaximumDisplacementVoxels &&
+                residualImproved)
+            {
+                selectedCrossingPosition = clampedQefPosition;
+                featureLocked = true;
+                InterlockedAdd(_Counters[CounterFeatureQefApplied], 1);
+            }
+            else
+            {
+                InterlockedAdd(_Counters[CounterFeatureQefRejected], 1);
+            }
+        }
+    }
+
     SurfaceVertex vertex;
-    vertex.position = VoxelToLocal(crossingPosition / crossingCount);
+    vertex.position = VoxelToLocal(selectedCrossingPosition);
     float gradientLengthSq = dot(gradient, gradient);
     vertex.normal = gradientLengthSq > 1e-8 ? normalize(gradient) : float3(0, 1, 0);
     vertex.voxelIndex = (uint)Flatten((int3)id);
-    vertex.padding = 0;
+    uint evidenceFlags = 0;
+    if (directCornerCount > 0) evidenceFlags |= EvidenceDirect;
+    if (unknownCrossingCount > 0) evidenceFlags |= EvidenceUnknownCrossing;
+    if (rearCornerCount > 0) evidenceFlags |= EvidenceRear;
+    if (directCornerCount > 0 &&
+        mostRecentDirectIntegration >= 0.0 &&
+        _EvidenceIntegrationOrdinal - mostRecentDirectIntegration >
+            _DiagnosticStaleIntegrationThreshold)
+        evidenceFlags |= EvidenceStaleDirect;
+    if (directCornerCount > 0 &&
+        recentFreeCornerCount >= 4 &&
+        mostRecentFreeIntegration - mostRecentDirectIntegration >
+            _DiagnosticFreeContradictionIntegrationThreshold)
+        evidenceFlags |= EvidenceFreeContradicted;
+    if (directCornerCount == 0 &&
+        rearCornerCount > 0 &&
+        unknownCrossingCount > 0)
+        evidenceFlags |= EvidenceBackCap;
+    if (featureLocked) evidenceFlags |= EvidenceFeatureLocked;
+    vertex.padding = evidenceFlags;
     _Vertices[vertexIndex] = vertex;
     _CoordVertexMap[vertex.voxelIndex] = (int)vertexIndex;
+
+    uint evidenceCounter = CounterVertexUnresolved;
+    if ((evidenceFlags & EvidenceFreeContradicted) != 0) evidenceCounter = CounterVertexFreeContradicted;
+    else if ((evidenceFlags & EvidenceBackCap) != 0) evidenceCounter = CounterVertexBackCap;
+    else if ((evidenceFlags & EvidenceStaleDirect) != 0) evidenceCounter = CounterVertexStale;
+    else if ((evidenceFlags & EvidenceUnknownCrossing) != 0) evidenceCounter = CounterVertexUnknown;
+    else if ((evidenceFlags & EvidenceDirect) != 0) evidenceCounter = CounterVertexDirect;
+    else if ((evidenceFlags & EvidenceRear) != 0) evidenceCounter = CounterVertexRear;
+    InterlockedAdd(_Counters[evidenceCounter], 1);
 }
 
 [numthreads(1, 1, 1)]
 void BuildDispatchArgs(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     _DispatchArgs[0] = (count + 63) / 64;
     _DispatchArgs[1] = 1;
     _DispatchArgs[2] = 1;
@@ -162,19 +648,32 @@ void BuildDispatchArgs(uint3 id : SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void InitSmooth(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     if (id.x >= count) return;
+    if ((_Vertices[id.x].padding & EvidenceInactive) != 0) return;
     _SmoothPositionA[id.x] = _Vertices[id.x].position;
+    if ((_Vertices[id.x].padding & EvidenceFeatureLocked) != 0)
+        InterlockedAdd(_Counters[CounterFeatureSmoothLocked], 1);
 }
 
 [numthreads(64, 1, 1)]
 void SmoothVertices(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     if (id.x >= count) return;
 
     SurfaceVertex vertex = _Vertices[id.x];
+    if ((vertex.padding & EvidenceInactive) != 0) return;
     float3 position = _SmoothPositionA[id.x];
+    if ((vertex.padding & EvidenceFeatureLocked) != 0)
+    {
+        _SmoothPositionB[id.x] = position;
+        return;
+    }
     int3 coord = Unflatten((int)vertex.voxelIndex);
     float3 neighbourMean = 0.0;
     float totalWeight = 0.0;
@@ -213,9 +712,12 @@ void SmoothVertices(uint3 id : SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void ApplySmooth(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     if (id.x >= count) return;
     SurfaceVertex vertex = _Vertices[id.x];
+    if ((vertex.padding & EvidenceInactive) != 0) return;
     vertex.position = _SmoothPositionA[id.x];
     _Vertices[id.x] = vertex;
 }
@@ -223,9 +725,12 @@ void ApplySmooth(uint3 id : SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void TemporalBlend(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     if (id.x >= count) return;
     SurfaceVertex vertex = _Vertices[id.x];
+    if ((vertex.padding & EvidenceInactive) != 0) return;
     int3 coord = Unflatten((int)vertex.voxelIndex);
     float4 previous = _TemporalState[coord];
     if (previous.w < 0.0)
@@ -251,21 +756,50 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     _TemporalState[coord] = float4(vertex.position, age);
 }
 
-void EmitTriangleWire(uint a, uint b, uint c)
+bool IsDisplaySuppressedVertex(uint vertexIndex)
 {
+    uint flags = _Vertices[vertexIndex].padding;
+    // Staleness is diagnostic age, not negative geometry evidence. A mature
+    // direct surface must remain visible while it is outside the current view;
+    // otherwise the refreshed/stale boundary becomes a moving empty strip and
+    // a head turn makes persistent geometry appear to regrow from nothing.
+    // Only explicit contradictory/back-cap evidence may veto a direct surface.
+    if ((flags & EvidenceFreeContradicted) != 0) return true;
+    if ((flags & EvidenceBackCap) != 0) return true;
+    if ((flags & EvidenceUnknownCrossing) != 0) return false;
+    if ((flags & EvidenceDirect) != 0) return false;
+    if ((flags & EvidenceStaleDirect) != 0) return true;
+    if ((flags & EvidenceRear) != 0) return true;
+    return false;
+}
+
+void EmitVisibleLine(uint a, uint b)
+{
+    // Display-only filter: do not remove the vertex, TSDF state, temporal
+    // state, or evidence. A later direct observation can therefore promote
+    // the same region to green and make it visible on the next extraction.
+    if (IsDisplaySuppressedVertex(a) || IsDisplaySuppressedVertex(b))
+    {
+        InterlockedAdd(_Counters[CounterSuppressedLineSegments], 1);
+        return;
+    }
+
     uint baseIndex;
-    InterlockedAdd(_Counters[1], 6, baseIndex);
-    if (baseIndex + 5 >= (uint)_MaximumLineIndices)
+    InterlockedAdd(_Counters[1], 2, baseIndex);
+    if (baseIndex + 1 >= (uint)_MaximumLineIndices)
     {
         InterlockedAdd(_Counters[2], 1);
         return;
     }
     _LineIndices[baseIndex + 0] = a;
     _LineIndices[baseIndex + 1] = b;
-    _LineIndices[baseIndex + 2] = b;
-    _LineIndices[baseIndex + 3] = c;
-    _LineIndices[baseIndex + 4] = c;
-    _LineIndices[baseIndex + 5] = a;
+}
+
+void EmitTriangleWire(uint a, uint b, uint c)
+{
+    EmitVisibleLine(a, b);
+    EmitVisibleLine(b, c);
+    EmitVisibleLine(c, a);
 }
 
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
@@ -284,6 +818,26 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
     int c = _CoordVertexMap[Flatten(coord - d1 - d2)];
     int d = _CoordVertexMap[Flatten(coord - d2)];
     if (a < 0 || b < 0 || c < 0 || d < 0) return;
+
+    uint aFlags = _Vertices[a].padding;
+    uint bFlags = _Vertices[b].padding;
+    uint cFlags = _Vertices[c].padding;
+    uint dFlags = _Vertices[d].padding;
+    uint combinedFlags = aFlags | bFlags | cFlags | dFlags;
+    bool allDirect = ((aFlags & EvidenceDirect) != 0) &&
+                     ((bFlags & EvidenceDirect) != 0) &&
+                     ((cFlags & EvidenceDirect) != 0) &&
+                     ((dFlags & EvidenceDirect) != 0);
+    uint quadCounter = CounterQuadUnresolved;
+    if ((combinedFlags & EvidenceFreeContradicted) != 0) quadCounter = CounterQuadFreeContradicted;
+    else if ((combinedFlags & EvidenceBackCap) != 0) quadCounter = CounterQuadBackCap;
+    else if ((combinedFlags & EvidenceStaleDirect) != 0) quadCounter = CounterQuadStale;
+    else if ((combinedFlags & EvidenceUnknownCrossing) != 0) quadCounter = CounterQuadUnknown;
+    else if (allDirect) quadCounter = CounterQuadDirect;
+    else if ((combinedFlags & EvidenceRear) != 0) quadCounter = CounterQuadRear;
+    InterlockedAdd(_Counters[CounterQuadTotal], 1);
+    InterlockedAdd(_Counters[quadCounter], 1);
+
     if (aValue < 0.0)
     {
         EmitTriangleWire(c, b, a);
@@ -299,8 +853,11 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
 [numthreads(64, 1, 1)]
 void GenerateLineIndices(uint3 id : SV_DispatchThreadID)
 {
-    uint count = min(_Counters[0], (uint)_MaximumVertices);
+    uint count = _EnablePersistentIncrementalMesh != 0
+        ? min(_PersistentAllocator[0], (uint)_MaximumVertices)
+        : min(_Counters[0], (uint)_MaximumVertices);
     if (id.x >= count) return;
+    if ((_Vertices[id.x].padding & EvidenceInactive) != 0) return;
     int3 coord = Unflatten((int)_Vertices[id.x].voxelIndex);
     TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0));
     TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1));
