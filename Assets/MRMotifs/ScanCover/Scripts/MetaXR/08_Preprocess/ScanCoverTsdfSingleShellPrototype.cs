@@ -15617,13 +15617,13 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                                : 0));
         summary.AppendLine("qrs_gpu_evidence_schema=surface_source_v1_read_only");
         summary.AppendLine("qrs_gpu_evidence_changes_production_geometry=0");
-        summary.AppendLine("qrs_gpu_evidence_display_filter=hide_visible_red_magenta_blue_keep_stale_direct_as_green_yellow_green_gray");
+        summary.AppendLine("qrs_gpu_evidence_display_filter=hide_visible_red_magenta_cyan_blue_keep_yellow_green_gray");
         summary.AppendLine("qrs_gpu_evidence_display_filter_changes_tsdf_or_vertices=0");
         summary.AppendLine("qrs_gpu_evidence_direct_definition=cell_has_direct_surface_band_voxel_and_no_higher_risk_flag");
         summary.AppendLine("qrs_gpu_evidence_backcap_definition=no_direct_surface_corner_and_rear_band_corner_and_unknown_assisted_zero_crossing");
         summary.AppendLine("qrs_gpu_evidence_free_contradicted_definition=old_direct_surface_cell_receives_newer_free_space_evidence_on_at_least_four_corners");
         summary.AppendLine("qrs_gpu_evidence_unknown_definition=zero_crossing_uses_at_least_one_below_weight_endpoint");
-        summary.AppendLine("qrs_gpu_evidence_stale_definition=diagnostic_age_only_direct_surface_remains_visible_and_persistent");
+        summary.AppendLine("qrs_gpu_evidence_stale_definition=direct_surface_support_older_than_configured_integration_threshold");
         summary.AppendLine("qrs_gpu_evidence_vertex_direct=" +
                            (_questRoomSurfaceNetsPipeline != null
                                ? _questRoomSurfaceNetsPipeline.LastDiagnosticDirectVertexCount
@@ -15688,47 +15688,6 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                            (_questRoomSurfaceNetsPipeline != null
                                ? _questRoomSurfaceNetsPipeline.LastDiagnosticSuppressedLineSegmentCount
                                : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_enabled=" +
-                           (_questRoomSurfaceNetsPipeline != null &&
-                            _questRoomSurfaceNetsPipeline.FeaturePreservingQefEnabled ? 1 : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_changes_topology=0");
-        summary.AppendLine("qrs_gpu_feature_qef_fallback=surface_nets_crossing_average");
-        summary.AppendLine("qrs_gpu_feature_qef_candidate=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.LastFeatureQefCandidateCount
-                               : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_applied=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.LastFeatureQefAppliedCount
-                               : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_rejected=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.LastFeatureQefRejectedCount
-                               : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_smooth_locked=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.LastFeatureSmoothLockedCount
-                               : 0));
-        summary.AppendLine("qrs_gpu_feature_qef_normal_cluster_angle_deg=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.FeatureNormalClusterAngleDegrees.ToString(
-                                   "F3", CultureInfo.InvariantCulture)
-                               : "0.000"));
-        summary.AppendLine("qrs_gpu_feature_qef_regularization=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.FeatureQefRegularization.ToString(
-                                   "F5", CultureInfo.InvariantCulture)
-                               : "0.00000"));
-        summary.AppendLine("qrs_gpu_feature_qef_max_displacement_voxels=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.FeatureQefMaximumDisplacementVoxels.ToString(
-                                   "F3", CultureInfo.InvariantCulture)
-                               : "0.000"));
-        summary.AppendLine("qrs_gpu_feature_qef_min_residual_improvement=" +
-                           (_questRoomSurfaceNetsPipeline != null
-                               ? _questRoomSurfaceNetsPipeline.FeatureQefMinimumResidualImprovement.ToString(
-                                   "F3", CultureInfo.InvariantCulture)
-                               : "0.000"));
         summary.AppendLine("qrs_gpu_issue=" +
                            (_questRoomSurfaceNetsPipeline != null
                                ? (_questRoomSurfaceNetsPipeline.LastIssue ?? "none")

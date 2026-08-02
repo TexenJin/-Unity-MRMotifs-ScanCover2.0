@@ -109,27 +109,12 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     [SerializeField, Range(0.001f, 0.03f)] private float convergenceThresholdMeters = 0.005f;
     [SerializeField, Range(0.0001f, 0.01f)] private float temporalDeadzoneMeters = 0.001f;
 
-    [Header("Persistent incremental mesh")]
-    [Tooltip("Rollback switch. Off restores the previous full remap/re-emit path.")]
-    [SerializeField] private bool enablePersistentIncrementalMesh = true;
-    [SerializeField, Range(1, 4)] private int persistentBirthConfirmations = 2;
-    [SerializeField, Range(2, 8)] private int persistentCorrectionConfirmations = 3;
-
-    [Header("Feature-preserving corner localization")]
-    [Tooltip("Rollback switch. Off reproduces the pre-QEF Surface Nets vertex path.")]
-    [SerializeField] private bool enableFeaturePreservingQef = true;
-    [SerializeField, Range(20f, 70f)] private float featureNormalClusterAngleDegrees = 40f;
-    [SerializeField, Range(0.001f, 0.50f)] private float featureQefRegularization = 0.08f;
-    [SerializeField, Range(0.10f, 0.50f)] private float featureQefMaximumDisplacementVoxels = 0.40f;
-    [SerializeField, Range(0f, 0.50f)] private float featureQefMinimumResidualImprovement = 0.08f;
-
     [Header("Diagnostics")]
     [SerializeField] private bool debugLog = true;
     [SerializeField] private bool renderEvidenceDiagnostics = true;
     [SerializeField, Range(0.25f, 1.5f)]
     private float directSurfaceBandInVoxels = 0.75f;
     [SerializeField, Range(4, 240)]
-    [Tooltip("Diagnostic age threshold only; mature persistent geometry is no longer hidden when stale.")]
     private int staleDirectSupportIntegrationThreshold = 48;
     [SerializeField, Range(1, 48)]
     private int freeSpaceContradictionIntegrationThreshold = 4;
@@ -158,20 +143,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     public uint LastDiagnosticStaleQuadCount { get; private set; }
     public uint LastDiagnosticUnresolvedQuadCount { get; private set; }
     public uint LastDiagnosticSuppressedLineSegmentCount { get; private set; }
-    public uint LastFeatureQefCandidateCount { get; private set; }
-    public uint LastFeatureQefAppliedCount { get; private set; }
-    public uint LastFeatureQefRejectedCount { get; private set; }
-    public uint LastFeatureSmoothLockedCount { get; private set; }
-    public uint LastPersistentBornCount { get; private set; }
-    public uint LastPersistentRetiredCount { get; private set; }
-    public uint LastPersistentCorrectionAppliedCount { get; private set; }
-    public uint LastPersistentRetainedSignCount { get; private set; }
-    public bool PersistentIncrementalMeshEnabled => enablePersistentIncrementalMesh;
-    public bool FeaturePreservingQefEnabled => enableFeaturePreservingQef;
-    public float FeatureNormalClusterAngleDegrees => featureNormalClusterAngleDegrees;
-    public float FeatureQefRegularization => featureQefRegularization;
-    public float FeatureQefMaximumDisplacementVoxels => featureQefMaximumDisplacementVoxels;
-    public float FeatureQefMinimumResidualImprovement => featureQefMinimumResidualImprovement;
     public string LastIssue { get; private set; }
     public int AcceptedFrameAttemptCount { get; private set; }
     public int StereoPairIntegrationCount { get; private set; }
@@ -184,14 +155,12 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     public EyeInputDiagnostics RightEyeDiagnostics => _rightEyeDiagnostics;
 
     private const int VertexStride = 32;
-    private const int SurfaceCounterCount = 27;
     private ComputeShader _tsdfCompute;
     private ComputeShader _surfaceCompute;
     private Material _wireMaterial;
     private RenderTexture _tsdfVolume;
     private RenderTexture _evidenceVolume;
     private RenderTexture _temporalState;
-    private RenderTexture _persistentSignState;
     private GraphicsBuffer _coordVertexMap;
     private GraphicsBuffer _vertices;
     private GraphicsBuffer _lineIndices;
@@ -200,7 +169,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     private GraphicsBuffer _drawArgs;
     private GraphicsBuffer _smoothPositionA;
     private GraphicsBuffer _smoothPositionB;
-    private GraphicsBuffer _persistentAllocator;
     private int _maximumVertices;
     private int _maximumLineIndices;
     private int _totalVoxelCount;
@@ -216,14 +184,11 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     private int _generateLinesKernel = -1;
     private int _buildDrawArgsKernel = -1;
     private int _initTemporalKernel = -1;
-    private int _initPersistentMeshKernel = -1;
-    private int _updatePersistentSignsKernel = -1;
     private Matrix4x4 _volumeLocalToWorld = Matrix4x4.identity;
     private Bounds _worldBounds;
     private bool _volumePlaced;
     private bool _resourcesReady;
     private bool _counterReadbackPending;
-    private bool _lastPersistentIncrementalMode;
     private int _lastAcceptedFrameOrdinal = -1;
     private int _evidenceIntegrationOrdinal;
     private ScanCoverTsdfSingleShellPrototype _owner;
@@ -475,7 +440,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         BindTsdfVolumes();
         DispatchVolume(_tsdfCompute, _clearTsdfKernel);
         DispatchVolume(_surfaceCompute, _initTemporalKernel);
-        DispatchPersistentMeshInitialization();
         HasRenderableSurface = false;
         IntegrationCount = 0;
         LastVertexCount = 0;
@@ -551,8 +515,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             _generateLinesKernel = _surfaceCompute.FindKernel("GenerateLineIndices");
             _buildDrawArgsKernel = _surfaceCompute.FindKernel("BuildDrawArgs");
             _initTemporalKernel = _surfaceCompute.FindKernel("InitTemporal");
-            _initPersistentMeshKernel = _surfaceCompute.FindKernel("InitPersistentMesh");
-            _updatePersistentSignsKernel = _surfaceCompute.FindKernel("UpdatePersistentSigns");
         }
         catch (Exception ex)
         {
@@ -574,9 +536,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         _temporalState = CreateVolume(
             "ScanCover_QuestRoom_Temporal",
             GraphicsFormat.R16G16B16A16_SFloat);
-        _persistentSignState = CreateVolume(
-            "ScanCover_QuestRoom_PersistentSigns",
-            GraphicsFormat.R16G16B16A16_SFloat);
 
         _coordVertexMap = new GraphicsBuffer(
             GraphicsBuffer.Target.Structured,
@@ -590,10 +549,7 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             GraphicsBuffer.Target.Structured,
             _maximumLineIndices,
             sizeof(uint));
-        _counters = new GraphicsBuffer(
-            GraphicsBuffer.Target.Structured,
-            SurfaceCounterCount,
-            sizeof(uint));
+        _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 19, sizeof(uint));
         GraphicsBuffer.Target indirect =
             GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.IndirectArguments;
         _dispatchArgs = new GraphicsBuffer(indirect, 3, sizeof(uint));
@@ -606,10 +562,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             GraphicsBuffer.Target.Structured,
             _maximumVertices,
             sizeof(float) * 3);
-        _persistentAllocator = new GraphicsBuffer(
-            GraphicsBuffer.Target.Structured,
-            1,
-            sizeof(uint));
         _wireMaterial = new Material(wireShader)
         {
             name = "ScanCover_QuestRoom_SurfaceNets_Wire"
@@ -620,13 +572,11 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         BindTsdfVolumes();
         DispatchVolume(_tsdfCompute, _clearTsdfKernel);
         DispatchVolume(_surfaceCompute, _initTemporalKernel);
-        DispatchPersistentMeshInitialization();
         _resourcesReady = true;
-        _lastPersistentIncrementalMode = enablePersistentIncrementalMesh;
 
         if (debugLog)
         {
-            long approximateBytes = (long)_totalVoxelCount * (4 + 8 + 8 + 8 + 4) +
+            long approximateBytes = (long)_totalVoxelCount * (4 + 8 + 8 + 4) +
                                     (long)_maximumVertices * VertexStride +
                                     (long)_maximumLineIndices * 4 +
                                     (long)_maximumVertices * sizeof(float) * 3 * 2;
@@ -687,11 +637,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
 
     private void ExtractSurface()
     {
-        if (_lastPersistentIncrementalMode != enablePersistentIncrementalMesh)
-        {
-            DispatchPersistentMeshInitialization();
-            _lastPersistentIncrementalMode = enablePersistentIncrementalMesh;
-        }
         SetSurfaceConstants();
         BindSurfaceBuffers();
         _surfaceCompute.SetTexture(_classifyKernel, TsdfVolumeId, _tsdfVolume);
@@ -700,7 +645,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
 
         int clearGroups = Mathf.CeilToInt(_totalVoxelCount / 64f);
         _surfaceCompute.Dispatch(_clearSurfaceKernel, clearGroups, 1, 1);
-        DispatchVolume(_surfaceCompute, _updatePersistentSignsKernel);
         DispatchVolume(_surfaceCompute, _classifyKernel);
         _surfaceCompute.Dispatch(_buildDispatchKernel, 1, 1, 1);
 
@@ -745,7 +689,7 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         _counterReadbackPending = false;
         if (!this || request.hasError) return;
         var values = request.GetData<uint>();
-        if (values.Length < SurfaceCounterCount) return;
+        if (values.Length < 19) return;
         LastVertexCount = Math.Min(values[0], (uint)_maximumVertices);
         LastLineIndexCount = Math.Min(values[1], (uint)_maximumLineIndices);
         LastOverflowCount = values[2];
@@ -765,14 +709,6 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         LastDiagnosticStaleQuadCount = values[16];
         LastDiagnosticUnresolvedQuadCount = values[17];
         LastDiagnosticSuppressedLineSegmentCount = values[18];
-        LastFeatureQefCandidateCount = values[19];
-        LastFeatureQefAppliedCount = values[20];
-        LastFeatureQefRejectedCount = values[21];
-        LastFeatureSmoothLockedCount = values[22];
-        LastPersistentBornCount = values[23];
-        LastPersistentRetiredCount = values[24];
-        LastPersistentCorrectionAppliedCount = values[25];
-        LastPersistentRetainedSignCount = values[26];
         bool wasReady = HasRenderableSurface;
         HasRenderableSurface = StereoPairIntegrationCount > 0 &&
                                LastVertexCount > 0 &&
@@ -793,15 +729,7 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
                 $"{LastDiagnosticUnknownQuadCount}/" +
                 $"{LastDiagnosticRearQuadCount}/{LastDiagnosticStaleQuadCount}/" +
                 $"{LastDiagnosticUnresolvedQuadCount} " +
-                $"displaySuppressedLines={LastDiagnosticSuppressedLineSegmentCount} " +
-                $"featureQef candidate/applied/rejected/locked=" +
-                $"{LastFeatureQefCandidateCount}/{LastFeatureQefAppliedCount}/" +
-                $"{LastFeatureQefRejectedCount}/{LastFeatureSmoothLockedCount} " +
-                $"persistent born/retired/corrected/retained=" +
-                $"{LastPersistentBornCount}/" +
-                $"{LastPersistentRetiredCount}/" +
-                $"{LastPersistentCorrectionAppliedCount}/" +
-                $"{LastPersistentRetainedSignCount}",
+                $"displaySuppressedLines={LastDiagnosticSuppressedLineSegmentCount}",
                 this);
         }
     }
@@ -810,60 +738,29 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     {
         SetBuffer(_clearSurfaceKernel, CoordVertexMapId, _coordVertexMap);
         SetBuffer(_clearSurfaceKernel, CountersId, _counters);
-        SetBuffer(_clearSurfaceKernel, "_PersistentAllocator", _persistentAllocator);
-        SetBuffer(_initPersistentMeshKernel, CoordVertexMapId, _coordVertexMap);
-        SetBuffer(_initPersistentMeshKernel, "_PersistentAllocator", _persistentAllocator);
-        _surfaceCompute.SetTexture(
-            _initPersistentMeshKernel,
-            "_PersistentSignState",
-            _persistentSignState);
-        SetBuffer(_updatePersistentSignsKernel, CountersId, _counters);
-        _surfaceCompute.SetTexture(
-            _updatePersistentSignsKernel,
-            TsdfVolumeId,
-            _tsdfVolume);
-        _surfaceCompute.SetTexture(
-            _updatePersistentSignsKernel,
-            "_PersistentSignState",
-            _persistentSignState);
         SetBuffer(_classifyKernel, CoordVertexMapId, _coordVertexMap);
         SetBuffer(_classifyKernel, VerticesId, _vertices);
         SetBuffer(_classifyKernel, CountersId, _counters);
-        SetBuffer(_classifyKernel, "_PersistentAllocator", _persistentAllocator);
-        _surfaceCompute.SetTexture(
-            _classifyKernel,
-            "_PersistentSignState",
-            _persistentSignState);
         SetBuffer(_buildDispatchKernel, CountersId, _counters);
         SetBuffer(_buildDispatchKernel, DispatchArgsId, _dispatchArgs);
-        SetBuffer(_buildDispatchKernel, "_PersistentAllocator", _persistentAllocator);
         SetBuffer(_initSmoothKernel, VerticesId, _vertices);
         SetBuffer(_initSmoothKernel, SmoothPositionAId, _smoothPositionA);
         SetBuffer(_initSmoothKernel, CountersId, _counters);
-        SetBuffer(_initSmoothKernel, "_PersistentAllocator", _persistentAllocator);
         SetBuffer(_smoothKernel, VerticesId, _vertices);
         SetBuffer(_smoothKernel, CoordVertexMapId, _coordVertexMap);
         SetBuffer(_smoothKernel, SmoothPositionAId, _smoothPositionA);
         SetBuffer(_smoothKernel, SmoothPositionBId, _smoothPositionB);
         SetBuffer(_smoothKernel, CountersId, _counters);
-        SetBuffer(_smoothKernel, "_PersistentAllocator", _persistentAllocator);
         SetBuffer(_applySmoothKernel, VerticesId, _vertices);
         SetBuffer(_applySmoothKernel, SmoothPositionAId, _smoothPositionA);
         SetBuffer(_applySmoothKernel, CountersId, _counters);
-        SetBuffer(_applySmoothKernel, "_PersistentAllocator", _persistentAllocator);
         SetBuffer(_temporalKernel, VerticesId, _vertices);
         SetBuffer(_temporalKernel, CountersId, _counters);
-        SetBuffer(_temporalKernel, "_PersistentAllocator", _persistentAllocator);
         _surfaceCompute.SetTexture(_temporalKernel, TemporalStateId, _temporalState);
         SetBuffer(_generateLinesKernel, CoordVertexMapId, _coordVertexMap);
         SetBuffer(_generateLinesKernel, VerticesId, _vertices);
         SetBuffer(_generateLinesKernel, LineIndicesId, _lineIndices);
         SetBuffer(_generateLinesKernel, CountersId, _counters);
-        SetBuffer(_generateLinesKernel, "_PersistentAllocator", _persistentAllocator);
-        _surfaceCompute.SetTexture(
-            _generateLinesKernel,
-            "_PersistentSignState",
-            _persistentSignState);
         SetBuffer(_buildDrawArgsKernel, CountersId, _counters);
         SetBuffer(_buildDrawArgsKernel, DrawArgsId, _drawArgs);
         _surfaceCompute.SetTexture(_initTemporalKernel, TemporalStateId, _temporalState);
@@ -893,47 +790,12 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         _surfaceCompute.SetFloat(
             "_DiagnosticFreeContradictionIntegrationThreshold",
             Mathf.Max(1, freeSpaceContradictionIntegrationThreshold));
-        _surfaceCompute.SetInt(
-            "_EnableFeaturePreservingQef",
-            enableFeaturePreservingQef ? 1 : 0);
-        _surfaceCompute.SetInt(
-            "_EnablePersistentIncrementalMesh",
-            enablePersistentIncrementalMesh ? 1 : 0);
-        _surfaceCompute.SetInt(
-            "_PersistentBirthConfirmations",
-            Mathf.Max(1, persistentBirthConfirmations));
-        _surfaceCompute.SetInt(
-            "_PersistentCorrectionConfirmations",
-            Mathf.Max(2, persistentCorrectionConfirmations));
-        _surfaceCompute.SetFloat(
-            "_FeatureNormalClusterCosine",
-            Mathf.Cos(Mathf.Clamp(featureNormalClusterAngleDegrees, 1f, 89f) * Mathf.Deg2Rad));
-        _surfaceCompute.SetFloat(
-            "_FeatureQefRegularization",
-            Mathf.Max(0.00001f, featureQefRegularization));
-        _surfaceCompute.SetFloat(
-            "_FeatureQefMaximumDisplacementVoxels",
-            Mathf.Clamp(featureQefMaximumDisplacementVoxels, 0.05f, 0.50f));
-        _surfaceCompute.SetFloat(
-            "_FeatureQefMinimumResidualImprovement",
-            Mathf.Clamp01(featureQefMinimumResidualImprovement));
     }
 
     private void BindTsdfVolumes()
     {
         _tsdfCompute.SetTexture(_clearTsdfKernel, VolumeId, _tsdfVolume);
         _tsdfCompute.SetTexture(_clearTsdfKernel, EvidenceVolumeId, _evidenceVolume);
-    }
-
-    private void DispatchPersistentMeshInitialization()
-    {
-        if (_initPersistentMeshKernel < 0 || _persistentAllocator == null ||
-            _persistentSignState == null)
-            return;
-        SetSurfaceConstants();
-        BindSurfaceBuffers();
-        int groups = Mathf.CeilToInt(_totalVoxelCount / 64f);
-        _surfaceCompute.Dispatch(_initPersistentMeshKernel, groups, 1, 1);
     }
 
     private void ResetEvidenceDiagnosticCounts()
@@ -954,22 +816,9 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         LastDiagnosticStaleQuadCount = 0;
         LastDiagnosticUnresolvedQuadCount = 0;
         LastDiagnosticSuppressedLineSegmentCount = 0;
-        LastFeatureQefCandidateCount = 0;
-        LastFeatureQefAppliedCount = 0;
-        LastFeatureQefRejectedCount = 0;
-        LastFeatureSmoothLockedCount = 0;
-        LastPersistentBornCount = 0;
-        LastPersistentRetiredCount = 0;
-        LastPersistentCorrectionAppliedCount = 0;
-        LastPersistentRetainedSignCount = 0;
     }
 
     private void SetBuffer(int kernel, int property, GraphicsBuffer buffer)
-    {
-        _surfaceCompute.SetBuffer(kernel, property, buffer);
-    }
-
-    private void SetBuffer(int kernel, string property, GraphicsBuffer buffer)
     {
         _surfaceCompute.SetBuffer(kernel, property, buffer);
     }
@@ -1021,11 +870,9 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         ReleaseBuffer(ref _drawArgs);
         ReleaseBuffer(ref _smoothPositionA);
         ReleaseBuffer(ref _smoothPositionB);
-        ReleaseBuffer(ref _persistentAllocator);
         ReleaseTexture(ref _tsdfVolume);
         ReleaseTexture(ref _evidenceVolume);
         ReleaseTexture(ref _temporalState);
-        ReleaseTexture(ref _persistentSignState);
         if (_wireMaterial != null) Destroy(_wireMaterial);
         _wireMaterial = null;
         _resourcesReady = false;
