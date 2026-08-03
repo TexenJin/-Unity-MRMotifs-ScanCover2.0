@@ -51,7 +51,7 @@ Shader "ScanCover/QuestRoomSurfaceNetsWire"
                 if ((flags & EvidenceBackCap) != 0)
                     return float4(1.0, 0.05, 0.72, 0.98); // likely rear-band cap
                 if ((flags & EvidenceStaleDirect) != 0)
-                    return float4(0.05, 0.92, 1.0, 0.98); // old direct support
+                    return float4(0.12, 1.0, 0.22, 0.98); // retained old direct support
                 if ((flags & EvidenceUnknownCrossing) != 0)
                     return float4(1.0, 0.86, 0.05, 0.98); // unknown-assisted
                 if ((flags & EvidenceDirect) != 0)

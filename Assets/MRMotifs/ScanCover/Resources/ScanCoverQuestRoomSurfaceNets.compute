@@ -11,9 +11,13 @@
 #pragma kernel GenerateLineIndices
 #pragma kernel BuildDrawArgs
 #pragma kernel InitTemporal
+#pragma kernel EvaluateShadowDepthConsistency
+#pragma kernel EvaluateShadowDuplicateShells
 
 Texture3D<float2> _TsdfVolume;
 Texture3D<float4> _EvidenceVolume;
+Texture2D<float4> _ShadowWorldPosition;
+Texture2D<float4> _ShadowObservationMeta;
 RWStructuredBuffer<int> _CoordVertexMap;
 
 struct SurfaceVertex
@@ -36,6 +40,23 @@ RWStructuredBuffer<uint> _DrawArgs;
 RWStructuredBuffer<float3> _SmoothPositionA;
 RWStructuredBuffer<float3> _SmoothPositionB;
 RWTexture3D<float4> _TemporalState;
+// Read-only diagnostic sidecar. This state is never consumed by geometry,
+// visibility, fusion, smoothing, or temporal position decisions.
+RWStructuredBuffer<uint> _DiagnosticPreviousCellState;
+// Packed, diagnostic-only state. It is initialized and cleared with the
+// diagnostic sidecar and is never consumed by production geometry:
+// bits 0..7 flags, 8..19 inactive-start ordinal, 20..31 last current-depth
+// support ordinal. Ordinals use a 1..4095 wrapping diagnostic clock.
+RWStructuredBuffer<uint> _DiagnosticShadowCellState;
+// Independent cross-view ray-layer ledger. No production kernel reads it.
+// bits 0..5 real baseline/parallax threshold flags, 6..12 aligned
+// confirmations, 13..19 free-space confirmations, 20..26 behind-current
+// confirmations. The flags replace the former six dominant-axis buckets.
+RWStructuredBuffer<uint> _DiagnosticShadowRayState;
+// First accepted eye position for each cell, quantized in volume-local space:
+// 10 bits per axis, bit 30 initialized, bit 31 first eye was volume-clamped.
+// It is diagnostic-only and never feeds production geometry or visibility.
+RWStructuredBuffer<uint> _DiagnosticShadowViewOriginState;
 
 int3 _VoxelCount;
 int _TotalVoxelCount;
@@ -53,6 +74,31 @@ float _TemporalDeadzone;
 float _EvidenceIntegrationOrdinal;
 float _DiagnosticStaleIntegrationThreshold;
 float _DiagnosticFreeContradictionIntegrationThreshold;
+int _EnableLifecycleDiagnostics;
+int _EnableShadowDiagnostics;
+int _EnableProductionLegalityGate;
+int _ShadowMaximumVertices;
+int _ShadowDuplicateSearchVoxels;
+float _ShadowDepthTolerance;
+float _ShadowParallelNormalDot;
+float _ShadowDuplicateMinimumSeparation;
+float _ShadowDuplicateMaximumSeparation;
+float _ShadowDuplicateMaximumTangentialDistance;
+int _ShadowRecentSupportWindow;
+int _ShadowRayFreeMinimumConfirmations;
+int _ShadowRayFreeSingleViewConfirmations;
+int _ShadowRayBehindMinimumConfirmations;
+float _ShadowViewBaselineNear;
+float _ShadowViewBaselineStrong;
+float _ShadowViewBaselineWide;
+float _ShadowViewParallaxNearCos;
+float _ShadowViewParallaxStrongCos;
+float _ShadowViewParallaxWideCos;
+float4 _ShadowSourceSize;
+float4 _ShadowEyeWorldPosition;
+float4 _ShadowEyeLocalPosition;
+float4x4 _ShadowWorldToClip;
+float4x4 _VolumeLocalToWorld;
 
 static const uint EvidenceDirect = 1u << 0;
 static const uint EvidenceUnknownCrossing = 1u << 1;
@@ -60,6 +106,10 @@ static const uint EvidenceRear = 1u << 2;
 static const uint EvidenceStaleDirect = 1u << 3;
 static const uint EvidenceBackCap = 1u << 4;
 static const uint EvidenceFreeContradicted = 1u << 5;
+// Display-only production quarantine. The fixed-cell ray ledger owns this
+// bit; TSDF, evidence and temporal geometry remain untouched so later direct
+// alignment can restore the surface without rebuilding its history.
+static const uint EvidenceLegalitySuppressed = 1u << 6;
 
 static const uint CounterVertexDirect = 3;
 static const uint CounterVertexBackCap = 4;
@@ -77,6 +127,138 @@ static const uint CounterQuadRear = 15;
 static const uint CounterQuadStale = 16;
 static const uint CounterQuadUnresolved = 17;
 static const uint CounterSuppressedLineSegments = 18;
+static const uint CounterLifecycleActive = 19;
+static const uint CounterLifecycleVisible = 20;
+static const uint CounterLifecycleHidden = 21;
+static const uint CounterLifecycleVisibleToHidden = 22;
+static const uint CounterLifecycleHiddenToVisible = 23;
+static const uint CounterLifecycleFreshDirectToStale = 24;
+static const uint CounterLifecycleActiveToInactive = 25;
+static const uint CounterLifecycleInactiveToActive = 26;
+static const uint CounterLifecycleClassChanged = 27;
+static const uint CounterLifecycleDirectAge0To7 = 28;
+static const uint CounterLifecycleDirectAge8To15 = 29;
+static const uint CounterLifecycleDirectAge16To31 = 30;
+static const uint CounterLifecycleDirectAge32To47 = 31;
+static const uint CounterLifecycleDirectAge48Plus = 32;
+static const uint CounterTemporalFirstSeen = 33;
+static const uint CounterTemporalDeadzoneHeld = 34;
+static const uint CounterTemporalSmallBlend = 35;
+static const uint CounterTemporalLargeReset = 36;
+static const uint CounterLifecycleHiddenDirectBearing = 37;
+static const uint CounterLifecycleYellowUnknown = 38;
+static const uint CounterLifecycleGreenDirect = 39;
+static const uint CounterLifecycleVisibleUnresolved = 40;
+// 41..56 split the visible stale-direct population without changing any
+// production decision. Corner and write buckets are mutually exclusive;
+// crossing buckets are mutually exclusive; conflict hints may overlap.
+static const uint CounterStaleDirectCorners1 = 41;
+static const uint CounterStaleDirectCorners2To3 = 42;
+static const uint CounterStaleDirectCorners4Plus = 43;
+static const uint CounterStaleDirectWrites1To3 = 44;
+static const uint CounterStaleDirectWrites4To15 = 45;
+static const uint CounterStaleDirectWrites16To63 = 46;
+static const uint CounterStaleDirectWrites64Plus = 47;
+static const uint CounterStaleDirectCrossingNoDirectEndpoint = 48;
+static const uint CounterStaleDirectCrossingOneSidedOnly = 49;
+static const uint CounterStaleDirectCrossingAnyTwoSided = 50;
+static const uint CounterStaleDirectRecentFreeBelowGate = 51;
+static const uint CounterStaleDirectNewerFreeBelowGate = 52;
+static const uint CounterStaleDirectRearMixed = 53;
+static const uint CounterStaleDirectNoConflictHint = 54;
+static const uint CounterStaleDirectStrongCandidate = 55;
+static const uint CounterStaleDirectWeakCandidate = 56;
+// 57..91 are read-only hold/legality-shadow diagnostics. They do not feed
+// production TSDF, extraction, smoothing, visibility, or draw decisions.
+static const uint CounterShadowMatureActive = 57;
+static const uint CounterShadowMatureInactive = 58;
+static const uint CounterShadowHoldAge0To8 = 59;
+static const uint CounterShadowHoldAge9To24 = 60;
+static const uint CounterShadowHoldAge25To64 = 61;
+static const uint CounterShadowHoldExpired65Plus = 62;
+static const uint CounterShadowHoldContradicted = 63;
+static const uint CounterShadowRecovered0To8 = 64;
+static const uint CounterShadowRecovered9To24 = 65;
+static const uint CounterShadowRecovered25To64 = 66;
+static const uint CounterShadowRecovered65Plus = 67;
+static const uint CounterShadowInactiveCrossingBelow3 = 68;
+static const uint CounterShadowInactiveNoObservedCrossing = 69;
+static const uint CounterShadowInactiveTemporalPositionAvailable = 70;
+static const uint CounterShadowDepthEvaluated = 71;
+static const uint CounterShadowDepthAligned = 72;
+static const uint CounterShadowDepthFreeContradicted = 73;
+static const uint CounterShadowDepthBehindCurrent = 74;
+static const uint CounterShadowDepthUnobserved = 75;
+static const uint CounterShadowDuplicatePairs = 76;
+static const uint CounterShadowDuplicateFrontAligned = 77;
+static const uint CounterShadowDuplicateBackAligned = 78;
+static const uint CounterShadowDuplicateBackFreeContradicted = 79;
+static const uint CounterShadowDuplicateBackBehindCurrent = 80;
+static const uint CounterShadowDuplicateBackUnobserved = 81;
+static const uint CounterShadowDuplicateRevokeCandidate = 82;
+static const uint CounterShadowDuplicateAmbiguous = 83;
+static const uint CounterShadowDuplicateBackRecentlySupported = 84;
+static const uint CounterShadowDuplicateBackSupportStale = 85;
+static const uint CounterShadowEverRecovered = 86;
+static const uint CounterShadowEverContradicted = 87;
+static const uint CounterShadowEverExpired = 88;
+static const uint CounterShadowEverDuplicateCandidate = 89;
+static const uint CounterShadowEverRevokeCandidate = 90;
+static const uint CounterShadowEverAmbiguous = 91;
+// 92..115 are the independent cross-view ray-layer history snapshot.
+static const uint CounterShadowRayTracked = 92;
+static const uint CounterShadowRayEverAligned = 93;
+static const uint CounterShadowRayEverFree = 94;
+static const uint CounterShadowRayEverBehind = 95;
+static const uint CounterShadowRayMultiView2Plus = 96;
+static const uint CounterShadowRayMultiView3Plus = 97;
+static const uint CounterShadowRayFreeCandidate = 98;
+static const uint CounterShadowRayBehindOnlySuspect = 99;
+static const uint CounterShadowRayAmbiguous = 100;
+static const uint CounterShadowRayNeverAligned = 101;
+static const uint CounterShadowRayRecentlySupported = 102;
+static const uint CounterShadowRayFreeAlignedMixed = 103;
+static const uint CounterShadowRayBehindAlignedMixed = 104;
+static const uint CounterShadowRayDiversityFlagTotal = 105;
+static const uint CounterShadowRayBaselineNear = 106;
+static const uint CounterShadowRayBaselineStrong = 107;
+static const uint CounterShadowRayBaselineWide = 108;
+static const uint CounterShadowRayParallaxNear = 109;
+static const uint CounterShadowRayParallaxStrong = 110;
+static const uint CounterShadowRayParallaxWide = 111;
+static const uint CounterShadowRayDiverse = 112;
+static const uint CounterShadowRayStrongDiverse = 113;
+static const uint CounterShadowRaySingleViewFreeRepeat = 114;
+static const uint CounterShadowRayOriginClamped = 115;
+static const uint CounterProductionLegalitySuppressed = 116;
+static const uint CounterShadowRayRevisited2Plus = 117;
+static const uint CounterShadowRayRevisited4Plus = 118;
+static const uint CounterShadowRayRevisitedWithoutBaseline = 119;
+static const uint CounterProductionDuplicateSuppressedPairs = 120;
+static const uint CounterProductionDuplicateAwaitingRepeat = 121;
+static const uint CounterProductionDuplicateRejectedRayHistory = 122;
+static const uint CounterProductionLegalityRecoveredAligned = 123;
+static const uint CounterCount = 124;
+
+static const uint ShadowFlagMatureHistory = 1u << 0;
+static const uint ShadowFlagHoldingNow = 1u << 1;
+static const uint ShadowFlagEverRecovered = 1u << 2;
+static const uint ShadowFlagEverContradicted = 1u << 3;
+static const uint ShadowFlagEverExpired = 1u << 4;
+static const uint ShadowFlagEverDuplicateCandidate = 1u << 5;
+static const uint ShadowFlagEverRevokeCandidate = 1u << 6;
+static const uint ShadowFlagEverAmbiguous = 1u << 7;
+static const uint ShadowFlagsMask = 0xffu;
+static const uint ShadowOrdinalMask = 0xfffu;
+
+static const uint DiagnosticCellInactive = 0;
+static const uint DiagnosticCellGreenDirect = 1;
+static const uint DiagnosticCellYellowUnknown = 2;
+static const uint DiagnosticCellVisibleUnresolved = 3;
+static const uint DiagnosticCellStaleDirect = 4;
+static const uint DiagnosticCellHiddenBackCap = 5;
+static const uint DiagnosticCellHiddenContradicted = 6;
+static const uint DiagnosticCellHiddenRear = 7;
 
 static const int3 CornerOffset[8] =
 {
@@ -117,7 +299,7 @@ void ClearCountersAndMap(uint3 id : SV_DispatchThreadID)
     if (id.x == 0)
     {
         [unroll]
-        for (uint counter = 0; counter < 19; counter++)
+        for (uint counter = 0; counter < CounterCount; counter++)
             _Counters[counter] = 0;
     }
     if (id.x < (uint)_TotalVoxelCount)
@@ -129,6 +311,313 @@ void InitTemporal(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)_VoxelCount)) return;
     _TemporalState[id] = float4(0.0, 0.0, 0.0, -1.0);
+    int flatCellIndex = Flatten((int3)id);
+    _DiagnosticPreviousCellState[flatCellIndex] = DiagnosticCellInactive;
+    _DiagnosticShadowCellState[flatCellIndex] = 0;
+    _DiagnosticShadowRayState[flatCellIndex] = 0;
+    _DiagnosticShadowViewOriginState[flatCellIndex] = 0;
+}
+
+uint ShadowEncodeOrdinal()
+{
+    return ((uint)_EvidenceIntegrationOrdinal % 4095u) + 1u;
+}
+
+uint ShadowOrdinalAge(uint currentOrdinal, uint previousOrdinal)
+{
+    if (previousOrdinal == 0u) return 4095u;
+    uint currentIndex = currentOrdinal - 1u;
+    uint previousIndex = previousOrdinal - 1u;
+    return (currentIndex + 4095u - previousIndex) % 4095u;
+}
+
+uint ShadowPackState(uint flags, uint inactiveStart, uint lastCurrentSupport)
+{
+    return (flags & ShadowFlagsMask) |
+           ((inactiveStart & ShadowOrdinalMask) << 8) |
+           ((lastCurrentSupport & ShadowOrdinalMask) << 20);
+}
+
+void ShadowUnpackState(
+    uint packed,
+    out uint flags,
+    out uint inactiveStart,
+    out uint lastCurrentSupport)
+{
+    flags = packed & ShadowFlagsMask;
+    inactiveStart = (packed >> 8) & ShadowOrdinalMask;
+    lastCurrentSupport = (packed >> 20) & ShadowOrdinalMask;
+}
+
+void CountShadowEverFlags(uint flags)
+{
+    if ((flags & ShadowFlagEverRecovered) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverRecovered], 1);
+    if ((flags & ShadowFlagEverContradicted) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverContradicted], 1);
+    if ((flags & ShadowFlagEverExpired) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverExpired], 1);
+    if ((flags & ShadowFlagEverDuplicateCandidate) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverDuplicateCandidate], 1);
+    if ((flags & ShadowFlagEverRevokeCandidate) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverRevokeCandidate], 1);
+    if ((flags & ShadowFlagEverAmbiguous) != 0)
+        InterlockedAdd(_Counters[CounterShadowEverAmbiguous], 1);
+}
+
+void UpdateMatureHoldShadow(
+    uint flatCellIndex,
+    bool currentActive,
+    uint directCornerCount,
+    float directWriteSum,
+    uint twoSidedDirectCrossingCount,
+    uint recentFreeCornerCount,
+    float mostRecentDirectIntegration,
+    float mostRecentFreeIntegration)
+{
+    if (_EnableShadowDiagnostics == 0) return;
+
+    uint flags;
+    uint inactiveStart;
+    uint lastCurrentSupport;
+    ShadowUnpackState(
+        _DiagnosticShadowCellState[flatCellIndex],
+        flags,
+        inactiveStart,
+        lastCurrentSupport);
+    uint currentOrdinal = ShadowEncodeOrdinal();
+    bool matureNow = currentActive &&
+                     directCornerCount >= 4 &&
+                     directWriteSum >= 64.0 &&
+                     twoSidedDirectCrossingCount > 0;
+    bool strongFreeContradiction = recentFreeCornerCount >= 4 &&
+                                   mostRecentFreeIntegration >= 0.0 &&
+                                   (mostRecentDirectIntegration < 0.0 ||
+                                    mostRecentFreeIntegration -
+                                        mostRecentDirectIntegration >
+                                        _DiagnosticFreeContradictionIntegrationThreshold);
+
+    if (currentActive)
+    {
+        if ((flags & ShadowFlagHoldingNow) != 0 && inactiveStart != 0u)
+        {
+            uint recoveryAge = ShadowOrdinalAge(currentOrdinal, inactiveStart);
+            flags |= ShadowFlagEverRecovered;
+            if (recoveryAge <= 8u)
+                InterlockedAdd(_Counters[CounterShadowRecovered0To8], 1);
+            else if (recoveryAge <= 24u)
+                InterlockedAdd(_Counters[CounterShadowRecovered9To24], 1);
+            else if (recoveryAge <= 64u)
+                InterlockedAdd(_Counters[CounterShadowRecovered25To64], 1);
+            else
+                InterlockedAdd(_Counters[CounterShadowRecovered65Plus], 1);
+        }
+
+        flags &= ~ShadowFlagHoldingNow;
+        inactiveStart = 0u;
+        if (matureNow)
+        {
+            flags |= ShadowFlagMatureHistory;
+            InterlockedAdd(_Counters[CounterShadowMatureActive], 1);
+        }
+    }
+    else if ((flags & ShadowFlagMatureHistory) != 0)
+    {
+        InterlockedAdd(_Counters[CounterShadowMatureInactive], 1);
+        if (strongFreeContradiction)
+        {
+            flags &= ~ShadowFlagHoldingNow;
+            flags |= ShadowFlagEverContradicted;
+            inactiveStart = 0u;
+            InterlockedAdd(_Counters[CounterShadowHoldContradicted], 1);
+        }
+        else
+        {
+            if (inactiveStart == 0u) inactiveStart = currentOrdinal;
+            uint inactiveAge = ShadowOrdinalAge(currentOrdinal, inactiveStart);
+            if (inactiveAge <= 64u)
+            {
+                flags |= ShadowFlagHoldingNow;
+                if (inactiveAge <= 8u)
+                    InterlockedAdd(_Counters[CounterShadowHoldAge0To8], 1);
+                else if (inactiveAge <= 24u)
+                    InterlockedAdd(_Counters[CounterShadowHoldAge9To24], 1);
+                else
+                    InterlockedAdd(_Counters[CounterShadowHoldAge25To64], 1);
+            }
+            else
+            {
+                flags &= ~ShadowFlagHoldingNow;
+                flags |= ShadowFlagEverExpired;
+                InterlockedAdd(_Counters[CounterShadowHoldExpired65Plus], 1);
+            }
+        }
+    }
+
+    _DiagnosticShadowCellState[flatCellIndex] =
+        ShadowPackState(flags, inactiveStart, lastCurrentSupport);
+    CountShadowEverFlags(flags);
+}
+
+uint DiagnosticClassFromEvidence(uint evidenceFlags)
+{
+    // Match the shader/display priority exactly without feeding the result
+    // back into the production path.
+    if ((evidenceFlags & EvidenceFreeContradicted) != 0)
+        return DiagnosticCellHiddenContradicted;
+    if ((evidenceFlags & EvidenceBackCap) != 0)
+        return DiagnosticCellHiddenBackCap;
+    if ((evidenceFlags & EvidenceStaleDirect) != 0)
+        return DiagnosticCellStaleDirect;
+    if ((evidenceFlags & EvidenceUnknownCrossing) != 0)
+        return DiagnosticCellYellowUnknown;
+    if ((evidenceFlags & EvidenceDirect) != 0)
+        return DiagnosticCellGreenDirect;
+    if ((evidenceFlags & EvidenceRear) != 0)
+        return DiagnosticCellHiddenRear;
+    return DiagnosticCellVisibleUnresolved;
+}
+
+bool DiagnosticClassIsVisible(uint diagnosticClass)
+{
+    return (diagnosticClass >= DiagnosticCellGreenDirect &&
+            diagnosticClass <= DiagnosticCellVisibleUnresolved) ||
+           diagnosticClass == DiagnosticCellStaleDirect;
+}
+
+void UpdateLifecycleDiagnostic(
+    uint flatCellIndex,
+    uint currentClass,
+    uint evidenceFlags,
+    float mostRecentDirectIntegration)
+{
+    if (_EnableLifecycleDiagnostics == 0) return;
+
+    uint previousClass = _DiagnosticPreviousCellState[flatCellIndex];
+    bool previousActive = previousClass != DiagnosticCellInactive;
+    bool currentActive = currentClass != DiagnosticCellInactive;
+    bool previousVisible = DiagnosticClassIsVisible(previousClass);
+    bool currentVisible = DiagnosticClassIsVisible(currentClass);
+
+    if (currentActive)
+    {
+        InterlockedAdd(_Counters[CounterLifecycleActive], 1);
+        if (currentVisible)
+            InterlockedAdd(_Counters[CounterLifecycleVisible], 1);
+        else
+            InterlockedAdd(_Counters[CounterLifecycleHidden], 1);
+
+        if (currentClass == DiagnosticCellYellowUnknown)
+            InterlockedAdd(_Counters[CounterLifecycleYellowUnknown], 1);
+        else if (currentClass == DiagnosticCellGreenDirect)
+            InterlockedAdd(_Counters[CounterLifecycleGreenDirect], 1);
+        else if (currentClass == DiagnosticCellVisibleUnresolved)
+            InterlockedAdd(_Counters[CounterLifecycleVisibleUnresolved], 1);
+
+        if (!currentVisible && (evidenceFlags & EvidenceDirect) != 0)
+            InterlockedAdd(_Counters[CounterLifecycleHiddenDirectBearing], 1);
+
+        if ((evidenceFlags & EvidenceDirect) != 0 &&
+            mostRecentDirectIntegration >= 0.0)
+        {
+            float directAge = max(
+                0.0,
+                _EvidenceIntegrationOrdinal - mostRecentDirectIntegration);
+            uint ageCounter = CounterLifecycleDirectAge48Plus;
+            if (directAge < 8.0) ageCounter = CounterLifecycleDirectAge0To7;
+            else if (directAge < 16.0) ageCounter = CounterLifecycleDirectAge8To15;
+            else if (directAge < 32.0) ageCounter = CounterLifecycleDirectAge16To31;
+            else if (directAge < 48.0) ageCounter = CounterLifecycleDirectAge32To47;
+            InterlockedAdd(_Counters[ageCounter], 1);
+        }
+    }
+
+    if (previousVisible && currentActive && !currentVisible)
+        InterlockedAdd(_Counters[CounterLifecycleVisibleToHidden], 1);
+    if (previousActive && !previousVisible && currentVisible)
+        InterlockedAdd(_Counters[CounterLifecycleHiddenToVisible], 1);
+    if (previousClass == DiagnosticCellGreenDirect &&
+        currentClass == DiagnosticCellStaleDirect)
+        InterlockedAdd(_Counters[CounterLifecycleFreshDirectToStale], 1);
+    if (previousActive && !currentActive)
+        InterlockedAdd(_Counters[CounterLifecycleActiveToInactive], 1);
+    if (!previousActive && currentActive)
+        InterlockedAdd(_Counters[CounterLifecycleInactiveToActive], 1);
+    if (previousActive && currentActive && previousClass != currentClass)
+        InterlockedAdd(_Counters[CounterLifecycleClassChanged], 1);
+
+    _DiagnosticPreviousCellState[flatCellIndex] = currentClass;
+}
+
+void UpdateStaleDirectSupportDiagnostic(
+    uint diagnosticClass,
+    uint directCornerCount,
+    float directWriteSum,
+    uint noDirectEndpointCrossingCount,
+    uint oneSidedDirectCrossingCount,
+    uint twoSidedDirectCrossingCount,
+    uint recentFreeCornerCount,
+    uint rearCornerCount,
+    float mostRecentDirectIntegration,
+    float mostRecentFreeIntegration)
+{
+    if (_EnableLifecycleDiagnostics == 0 ||
+        diagnosticClass != DiagnosticCellStaleDirect)
+        return;
+
+    if (directCornerCount <= 1)
+        InterlockedAdd(_Counters[CounterStaleDirectCorners1], 1);
+    else if (directCornerCount <= 3)
+        InterlockedAdd(_Counters[CounterStaleDirectCorners2To3], 1);
+    else
+        InterlockedAdd(_Counters[CounterStaleDirectCorners4Plus], 1);
+
+    if (directWriteSum <= 3.0)
+        InterlockedAdd(_Counters[CounterStaleDirectWrites1To3], 1);
+    else if (directWriteSum <= 15.0)
+        InterlockedAdd(_Counters[CounterStaleDirectWrites4To15], 1);
+    else if (directWriteSum <= 63.0)
+        InterlockedAdd(_Counters[CounterStaleDirectWrites16To63], 1);
+    else
+        InterlockedAdd(_Counters[CounterStaleDirectWrites64Plus], 1);
+
+    if (twoSidedDirectCrossingCount > 0)
+        InterlockedAdd(_Counters[CounterStaleDirectCrossingAnyTwoSided], 1);
+    else if (oneSidedDirectCrossingCount > 0)
+        InterlockedAdd(_Counters[CounterStaleDirectCrossingOneSidedOnly], 1);
+    else
+        InterlockedAdd(_Counters[CounterStaleDirectCrossingNoDirectEndpoint], 1);
+
+    bool recentFreeBelowGate = recentFreeCornerCount > 0 &&
+                               recentFreeCornerCount < 4;
+    bool newerFreeBelowGate = mostRecentFreeIntegration >= 0.0 &&
+                              mostRecentDirectIntegration >= 0.0 &&
+                              mostRecentFreeIntegration >
+                                  mostRecentDirectIntegration &&
+                              recentFreeCornerCount < 4;
+    bool rearMixed = rearCornerCount > 0;
+    if (recentFreeBelowGate)
+        InterlockedAdd(_Counters[CounterStaleDirectRecentFreeBelowGate], 1);
+    if (newerFreeBelowGate)
+        InterlockedAdd(_Counters[CounterStaleDirectNewerFreeBelowGate], 1);
+    if (rearMixed)
+        InterlockedAdd(_Counters[CounterStaleDirectRearMixed], 1);
+    if (!recentFreeBelowGate && !newerFreeBelowGate && !rearMixed)
+        InterlockedAdd(_Counters[CounterStaleDirectNoConflictHint], 1);
+
+    bool strongCandidate = directCornerCount >= 4 &&
+                           directWriteSum >= 64.0 &&
+                           twoSidedDirectCrossingCount > 0 &&
+                           !recentFreeBelowGate &&
+                           !newerFreeBelowGate &&
+                           !rearMixed;
+    bool weakCandidate = directCornerCount <= 1 ||
+                         directWriteSum <= 3.0 ||
+                         noDirectEndpointCrossingCount > 0;
+    if (strongCandidate)
+        InterlockedAdd(_Counters[CounterStaleDirectStrongCandidate], 1);
+    if (weakCandidate)
+        InterlockedAdd(_Counters[CounterStaleDirectWeakCandidate], 1);
 }
 
 [numthreads(4, 4, 4)]
@@ -146,6 +635,11 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint directCornerCount = 0;
     uint recentFreeCornerCount = 0;
     uint rearCornerCount = 0;
+    uint directCornerMask = 0;
+    float directWriteSum = 0.0;
+    uint noDirectEndpointCrossingCount = 0;
+    uint oneSidedDirectCrossingCount = 0;
+    uint twoSidedDirectCrossingCount = 0;
     float mostRecentDirectIntegration = -1.0;
     float mostRecentFreeIntegration = -1.0;
 
@@ -157,6 +651,8 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         if (evidence.x >= 0.5)
         {
             directCornerCount++;
+            directCornerMask |= 1u << corner;
+            directWriteSum += evidence.x;
             mostRecentDirectIntegration = max(mostRecentDirectIntegration, evidence.w);
         }
         if (evidence.y >= 0.0)
@@ -187,11 +683,88 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         float t = abs(change) > 1e-6 ? saturate(aValue / change) : 0.5;
         crossingPosition += (float3)aCoord + t * (float3)(bCoord - aCoord);
         crossingCount++;
+        bool aDirect = (directCornerMask & (1u << EdgeA[edge])) != 0;
+        bool bDirect = (directCornerMask & (1u << EdgeB[edge])) != 0;
+        if (aDirect && bDirect) twoSidedDirectCrossingCount++;
+        else if (aDirect || bDirect) oneSidedDirectCrossingCount++;
+        else noDirectEndpointCrossingCount++;
         if (aObserved && bObserved) observedCrossingCount++;
         else unknownCrossingCount++;
     }
 
-    if (crossingCount < 3 || observedCrossingCount == 0) return;
+    uint flatCellIndex = (uint)Flatten((int3)id);
+    bool currentActive = crossingCount >= 3 && observedCrossingCount > 0;
+    UpdateMatureHoldShadow(
+        flatCellIndex,
+        currentActive,
+        directCornerCount,
+        directWriteSum,
+        twoSidedDirectCrossingCount,
+        recentFreeCornerCount,
+        mostRecentDirectIntegration,
+        mostRecentFreeIntegration);
+    if (!currentActive)
+    {
+        if (_EnableShadowDiagnostics != 0)
+        {
+            if (crossingCount < 3)
+                InterlockedAdd(
+                    _Counters[CounterShadowInactiveCrossingBelow3], 1);
+            if (observedCrossingCount == 0)
+                InterlockedAdd(
+                    _Counters[CounterShadowInactiveNoObservedCrossing], 1);
+            if (_TemporalState[id].w >= 0.0)
+                InterlockedAdd(
+                    _Counters[CounterShadowInactiveTemporalPositionAvailable],
+                    1);
+        }
+        UpdateLifecycleDiagnostic(
+            flatCellIndex,
+            DiagnosticCellInactive,
+            0,
+            mostRecentDirectIntegration);
+        return;
+    }
+
+    // Duplicate the existing evidence classification strictly for the
+    // diagnostic sidecar. The production evidenceFlags block below remains
+    // unchanged so diagnostics cannot alter geometry or display behavior.
+    uint diagnosticEvidenceFlags = 0;
+    if (directCornerCount > 0) diagnosticEvidenceFlags |= EvidenceDirect;
+    if (unknownCrossingCount > 0) diagnosticEvidenceFlags |= EvidenceUnknownCrossing;
+    if (rearCornerCount > 0) diagnosticEvidenceFlags |= EvidenceRear;
+    if (directCornerCount > 0 &&
+        mostRecentDirectIntegration >= 0.0 &&
+        _EvidenceIntegrationOrdinal - mostRecentDirectIntegration >
+            _DiagnosticStaleIntegrationThreshold)
+        diagnosticEvidenceFlags |= EvidenceStaleDirect;
+    if (directCornerCount > 0 &&
+        recentFreeCornerCount >= 4 &&
+        mostRecentFreeIntegration - mostRecentDirectIntegration >
+            _DiagnosticFreeContradictionIntegrationThreshold)
+        diagnosticEvidenceFlags |= EvidenceFreeContradicted;
+    if (directCornerCount == 0 &&
+        rearCornerCount > 0 &&
+        unknownCrossingCount > 0)
+        diagnosticEvidenceFlags |= EvidenceBackCap;
+    uint diagnosticClass = DiagnosticClassFromEvidence(diagnosticEvidenceFlags);
+    UpdateLifecycleDiagnostic(
+        flatCellIndex,
+        diagnosticClass,
+        diagnosticEvidenceFlags,
+        mostRecentDirectIntegration);
+    UpdateStaleDirectSupportDiagnostic(
+        diagnosticClass,
+        directCornerCount,
+        directWriteSum,
+        noDirectEndpointCrossingCount,
+        oneSidedDirectCrossingCount,
+        twoSidedDirectCrossingCount,
+        recentFreeCornerCount,
+        rearCornerCount,
+        mostRecentDirectIntegration,
+        mostRecentFreeIntegration);
+
     uint vertexIndex;
     InterlockedAdd(_Counters[0], 1, vertexIndex);
     if (vertexIndex >= (uint)_MaximumVertices)
@@ -223,6 +796,9 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         rearCornerCount > 0 &&
         unknownCrossingCount > 0)
         evidenceFlags |= EvidenceBackCap;
+    if (_EnableProductionLegalityGate != 0 &&
+        (_DiagnosticShadowRayState[flatCellIndex] & (1u << 31)) != 0u)
+        evidenceFlags |= EvidenceLegalitySuppressed;
     vertex.padding = evidenceFlags;
     _Vertices[vertexIndex] = vertex;
     _CoordVertexMap[vertex.voxelIndex] = (int)vertexIndex;
@@ -317,6 +893,8 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     float4 previous = _TemporalState[coord];
     if (previous.w < 0.0)
     {
+        if (_EnableLifecycleDiagnostics != 0)
+            InterlockedAdd(_Counters[CounterTemporalFirstSeen], 1);
         _TemporalState[coord] = float4(vertex.position, 0.0);
         return;
     }
@@ -324,13 +902,24 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     float delta = distance(vertex.position, previous.xyz);
     if (delta < _TemporalDeadzone)
     {
+        if (_EnableLifecycleDiagnostics != 0)
+            InterlockedAdd(_Counters[CounterTemporalDeadzoneHeld], 1);
         vertex.position = previous.xyz;
         _Vertices[id.x] = vertex;
         _TemporalState[coord] = float4(previous.xyz, previous.w + 1.0);
         return;
     }
 
-    float age = delta > _ConvergenceThreshold ? 0.0 : previous.w + 1.0;
+    bool largeReset = delta > _ConvergenceThreshold;
+    if (_EnableLifecycleDiagnostics != 0)
+    {
+        InterlockedAdd(
+            _Counters[largeReset
+                ? CounterTemporalLargeReset
+                : CounterTemporalSmallBlend],
+            1);
+    }
+    float age = largeReset ? 0.0 : previous.w + 1.0;
     float alpha = _TemporalAlphaMinimum +
         (_TemporalAlphaMaximum - _TemporalAlphaMinimum) * exp(-age * _TemporalDecayRate);
     vertex.position = lerp(previous.xyz, vertex.position, alpha);
@@ -338,16 +927,602 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     _TemporalState[coord] = float4(vertex.position, age);
 }
 
+static const uint ShadowDepthUnobserved = 0;
+static const uint ShadowDepthAligned = 1;
+static const uint ShadowDepthFreeContradicted = 2;
+static const uint ShadowDepthBehindCurrent = 3;
+
+static const uint ShadowRayDiversityMask = 0x3fu;
+static const uint ShadowRayConfirmationMask = 0x7fu;
+static const uint ShadowRayRevisitMask = 0x0fu;
+static const uint ShadowRayProductionSuppressed = 1u << 31;
+static const uint ShadowViewOriginInitialized = 1u << 30;
+static const uint ShadowViewOriginClamped = 1u << 31;
+static const uint ShadowDiversityBaselineNear = 1u << 0;
+static const uint ShadowDiversityBaselineStrong = 1u << 1;
+static const uint ShadowDiversityBaselineWide = 1u << 2;
+static const uint ShadowDiversityParallaxNear = 1u << 3;
+static const uint ShadowDiversityParallaxStrong = 1u << 4;
+static const uint ShadowDiversityParallaxWide = 1u << 5;
+
+float3 ShadowVolumeExtent()
+{
+    return max(
+        (float3)_VoxelCount * _VoxelSize,
+        float3(1e-4, 1e-4, 1e-4));
+}
+
+uint ShadowPackFirstEye(float3 eyeLocal)
+{
+    float3 extent = ShadowVolumeExtent();
+    float3 normalized = eyeLocal / extent + 0.5;
+    bool clamped = any(normalized < 0.0) || any(normalized > 1.0);
+    uint3 quantized = (uint3)round(saturate(normalized) * 1023.0);
+    return (quantized.x & 1023u) |
+           ((quantized.y & 1023u) << 10) |
+           ((quantized.z & 1023u) << 20) |
+           ShadowViewOriginInitialized |
+           (clamped ? ShadowViewOriginClamped : 0u);
+}
+
+float3 ShadowUnpackFirstEye(uint packed)
+{
+    uint3 quantized = uint3(
+        packed & 1023u,
+        (packed >> 10) & 1023u,
+        (packed >> 20) & 1023u);
+    return (((float3)quantized / 1023.0) - 0.5) * ShadowVolumeExtent();
+}
+
+void ShadowAccumulateViewDiversity(
+    uint flatCellIndex,
+    float3 localPosition,
+    inout uint diversityFlags)
+{
+    diversityFlags &= ShadowRayDiversityMask;
+    uint packedOrigin = _DiagnosticShadowViewOriginState[flatCellIndex];
+    if ((packedOrigin & ShadowViewOriginInitialized) == 0u)
+    {
+        _DiagnosticShadowViewOriginState[flatCellIndex] =
+            ShadowPackFirstEye(_ShadowEyeLocalPosition.xyz);
+        return;
+    }
+
+    float3 firstEye = ShadowUnpackFirstEye(packedOrigin);
+    float3 currentEye = _ShadowEyeLocalPosition.xyz;
+    float baseline = distance(firstEye, currentEye);
+    if (baseline >= _ShadowViewBaselineNear)
+        diversityFlags |= ShadowDiversityBaselineNear;
+    if (baseline >= _ShadowViewBaselineStrong)
+        diversityFlags |= ShadowDiversityBaselineStrong;
+    if (baseline >= _ShadowViewBaselineWide)
+        diversityFlags |= ShadowDiversityBaselineWide;
+
+    float3 firstRay = localPosition - firstEye;
+    float3 currentRay = localPosition - currentEye;
+    float firstLengthSq = dot(firstRay, firstRay);
+    float currentLengthSq = dot(currentRay, currentRay);
+    if (firstLengthSq > 1e-8 && currentLengthSq > 1e-8)
+    {
+        float rayDot = dot(
+            firstRay * rsqrt(firstLengthSq),
+            currentRay * rsqrt(currentLengthSq));
+        if (rayDot <= _ShadowViewParallaxNearCos)
+            diversityFlags |= ShadowDiversityParallaxNear;
+        if (rayDot <= _ShadowViewParallaxStrongCos)
+            diversityFlags |= ShadowDiversityParallaxStrong;
+        if (rayDot <= _ShadowViewParallaxWideCos)
+            diversityFlags |= ShadowDiversityParallaxWide;
+    }
+}
+
+uint ShadowRaySaturatingIncrement(uint value)
+{
+    return min(value + 1u, ShadowRayConfirmationMask);
+}
+
+uint ShadowRayPack(
+    uint diversityFlags,
+    uint alignedCount,
+    uint freeCount,
+    uint behindCount,
+    uint revisitCount,
+    bool productionSuppressed)
+{
+    return (diversityFlags & ShadowRayDiversityMask) |
+           ((alignedCount & ShadowRayConfirmationMask) << 6) |
+           ((freeCount & ShadowRayConfirmationMask) << 13) |
+           ((behindCount & ShadowRayConfirmationMask) << 20) |
+           ((revisitCount & ShadowRayRevisitMask) << 27) |
+           (productionSuppressed ? ShadowRayProductionSuppressed : 0u);
+}
+
+void ShadowRayUnpack(
+    uint packed,
+    out uint diversityFlags,
+    out uint alignedCount,
+    out uint freeCount,
+    out uint behindCount,
+    out uint revisitCount,
+    out bool productionSuppressed)
+{
+    diversityFlags = packed & ShadowRayDiversityMask;
+    alignedCount = (packed >> 6) & ShadowRayConfirmationMask;
+    freeCount = (packed >> 13) & ShadowRayConfirmationMask;
+    behindCount = (packed >> 20) & ShadowRayConfirmationMask;
+    revisitCount = (packed >> 27) & ShadowRayRevisitMask;
+    productionSuppressed =
+        (packed & ShadowRayProductionSuppressed) != 0u;
+}
+
+bool UpdateShadowRayHistory(
+    SurfaceVertex vertex,
+    uint depthClass,
+    uint lastCurrentSupport)
+{
+    uint previousPacked = _DiagnosticShadowRayState[vertex.voxelIndex];
+    if (depthClass == ShadowDepthUnobserved)
+        return (previousPacked & ShadowRayProductionSuppressed) != 0u;
+
+    // Initialize explicitly for Vulkan compilers that do not prove definite
+    // assignment through HLSL out-parameters. ShadowRayUnpack overwrites all
+    // values, but deterministic zeroes avoid undefined GPU state if a driver
+    // optimizer ever fails to preserve that contract.
+    uint diversityFlags = 0u;
+    uint alignedCount = 0u;
+    uint freeCount = 0u;
+    uint behindCount = 0u;
+    uint revisitCount = 0u;
+    bool productionSuppressed = false;
+    ShadowRayUnpack(
+        previousPacked,
+        diversityFlags,
+        alignedCount,
+        freeCount,
+        behindCount,
+        revisitCount,
+        productionSuppressed);
+    revisitCount = min(revisitCount + 1u, ShadowRayRevisitMask);
+    ShadowAccumulateViewDiversity(
+        vertex.voxelIndex,
+        vertex.position,
+        diversityFlags);
+    if (depthClass == ShadowDepthAligned)
+        alignedCount = ShadowRaySaturatingIncrement(alignedCount);
+    else if (depthClass == ShadowDepthFreeContradicted)
+        freeCount = ShadowRaySaturatingIncrement(freeCount);
+    else if (depthClass == ShadowDepthBehindCurrent)
+        behindCount = ShadowRaySaturatingIncrement(behindCount);
+
+    uint diversityFlagCount = countbits(diversityFlags);
+    bool diverse =
+        (diversityFlags & ShadowDiversityBaselineNear) != 0u &&
+        (diversityFlags & ShadowDiversityParallaxNear) != 0u;
+    bool strongDiverse =
+        (diversityFlags & ShadowDiversityBaselineStrong) != 0u &&
+        (diversityFlags & ShadowDiversityParallaxStrong) != 0u;
+    uint supportAge = ShadowOrdinalAge(
+        ShadowEncodeOrdinal(),
+        lastCurrentSupport);
+    bool recentlySupported =
+        supportAge <= (uint)_ShadowRecentSupportWindow;
+    bool neverAligned = alignedCount == 0u;
+    bool freeCandidate = neverAligned && !recentlySupported && diverse &&
+        freeCount >= (uint)_ShadowRayFreeMinimumConfirmations;
+    bool singleViewFreeRepeat = neverAligned && !recentlySupported &&
+        !diverse &&
+        freeCount >= (uint)_ShadowRayFreeSingleViewConfirmations;
+    // Behind-current is occlusion rather than contradiction. Keep it in a
+    // separate suspect bucket even when repeated from several directions.
+    bool behindOnlySuspect = neverAligned && !recentlySupported &&
+        behindCount >= (uint)_ShadowRayBehindMinimumConfirmations &&
+        strongDiverse;
+
+    // Only a multi-view free-space contradiction can enter production. A
+    // behind-current result remains occlusion-only. Any genuine aligned hit
+    // clears quarantine immediately; ambiguous/unobserved evidence cannot.
+    if (alignedCount > 0u)
+    {
+        if (productionSuppressed)
+        {
+            InterlockedAdd(
+                _Counters[CounterProductionLegalityRecoveredAligned], 1);
+        }
+        productionSuppressed = false;
+    }
+    else if (_EnableProductionLegalityGate != 0 && freeCandidate)
+        productionSuppressed = true;
+
+    _DiagnosticShadowRayState[vertex.voxelIndex] = ShadowRayPack(
+        diversityFlags,
+        alignedCount,
+        freeCount,
+        behindCount,
+        revisitCount,
+        productionSuppressed);
+
+    InterlockedAdd(_Counters[CounterShadowRayTracked], 1);
+    InterlockedAdd(
+        _Counters[CounterShadowRayDiversityFlagTotal],
+        diversityFlagCount);
+    if (alignedCount > 0u)
+        InterlockedAdd(_Counters[CounterShadowRayEverAligned], 1);
+    if (freeCount > 0u)
+        InterlockedAdd(_Counters[CounterShadowRayEverFree], 1);
+    if (behindCount > 0u)
+        InterlockedAdd(_Counters[CounterShadowRayEverBehind], 1);
+    if (diverse)
+        InterlockedAdd(_Counters[CounterShadowRayMultiView2Plus], 1);
+    if (strongDiverse)
+        InterlockedAdd(_Counters[CounterShadowRayMultiView3Plus], 1);
+    if (freeCandidate)
+        InterlockedAdd(_Counters[CounterShadowRayFreeCandidate], 1);
+    if (behindOnlySuspect)
+        InterlockedAdd(_Counters[CounterShadowRayBehindOnlySuspect], 1);
+    if (singleViewFreeRepeat)
+        InterlockedAdd(_Counters[CounterShadowRaySingleViewFreeRepeat], 1);
+    if (!freeCandidate && !behindOnlySuspect &&
+        (freeCount > 0u || behindCount > 0u))
+        InterlockedAdd(_Counters[CounterShadowRayAmbiguous], 1);
+    if (neverAligned)
+        InterlockedAdd(_Counters[CounterShadowRayNeverAligned], 1);
+    if (recentlySupported)
+        InterlockedAdd(_Counters[CounterShadowRayRecentlySupported], 1);
+    if (alignedCount > 0u && freeCount > 0u)
+        InterlockedAdd(_Counters[CounterShadowRayFreeAlignedMixed], 1);
+    if (alignedCount > 0u && behindCount > 0u)
+        InterlockedAdd(_Counters[CounterShadowRayBehindAlignedMixed], 1);
+    if ((diversityFlags & ShadowDiversityBaselineNear) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayBaselineNear], 1);
+    if ((diversityFlags & ShadowDiversityBaselineStrong) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayBaselineStrong], 1);
+    if ((diversityFlags & ShadowDiversityBaselineWide) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayBaselineWide], 1);
+    if ((diversityFlags & ShadowDiversityParallaxNear) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayParallaxNear], 1);
+    if ((diversityFlags & ShadowDiversityParallaxStrong) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayParallaxStrong], 1);
+    if ((diversityFlags & ShadowDiversityParallaxWide) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayParallaxWide], 1);
+    if (diverse)
+        InterlockedAdd(_Counters[CounterShadowRayDiverse], 1);
+    if (strongDiverse)
+        InterlockedAdd(_Counters[CounterShadowRayStrongDiverse], 1);
+    if ((_DiagnosticShadowViewOriginState[vertex.voxelIndex] &
+         ShadowViewOriginClamped) != 0u)
+        InterlockedAdd(_Counters[CounterShadowRayOriginClamped], 1);
+    if (revisitCount >= 2u)
+        InterlockedAdd(_Counters[CounterShadowRayRevisited2Plus], 1);
+    if (revisitCount >= 4u)
+        InterlockedAdd(_Counters[CounterShadowRayRevisited4Plus], 1);
+    if (revisitCount >= 2u &&
+        (diversityFlags & ShadowDiversityBaselineNear) == 0u)
+        InterlockedAdd(
+            _Counters[CounterShadowRayRevisitedWithoutBaseline], 1);
+    return productionSuppressed;
+}
+
+uint EvaluateShadowDepthClass(float3 localPosition)
+{
+    float3 worldPosition = mul(
+        _VolumeLocalToWorld,
+        float4(localPosition, 1.0)).xyz;
+    float4 clip = mul(_ShadowWorldToClip, float4(worldPosition, 1.0));
+    if (abs(clip.w) < 1e-6) return ShadowDepthUnobserved;
+    float3 ndc = clip.xyz / clip.w;
+    if (any(ndc.xy < -0.985) || any(ndc.xy > 0.985))
+        return ShadowDepthUnobserved;
+
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    int2 pixel = int2(
+        saturate(uv) * max(_ShadowSourceSize.xy - 1.0, 0.0));
+    float4 meta = _ShadowObservationMeta.Load(int3(pixel, 0));
+    if (meta.x < 0.5 || meta.w < 0.5)
+        return ShadowDepthUnobserved;
+
+    float3 measuredWorld = _ShadowWorldPosition.Load(int3(pixel, 0)).xyz;
+    float measuredDistance = distance(
+        measuredWorld,
+        _ShadowEyeWorldPosition.xyz);
+    float candidateDistance = distance(
+        worldPosition,
+        _ShadowEyeWorldPosition.xyz);
+    if (measuredDistance < 1e-4 || candidateDistance < 1e-4)
+        return ShadowDepthUnobserved;
+
+    float residual = measuredDistance - candidateDistance;
+    float tolerance = max(_ShadowDepthTolerance, 1e-4);
+    if (abs(residual) <= tolerance) return ShadowDepthAligned;
+    // Candidate lies before the currently measured surface: the valid current
+    // ray traverses the candidate's depth, so this is a free-space conflict.
+    if (residual > tolerance) return ShadowDepthFreeContradicted;
+    // Candidate lies behind the current measurement. This is only occluded;
+    // it is not a contradiction by itself.
+    return ShadowDepthBehindCurrent;
+}
+
+[numthreads(64, 1, 1)]
+void EvaluateShadowDepthConsistency(uint3 id : SV_DispatchThreadID)
+{
+    if (_EnableShadowDiagnostics == 0) return;
+    uint count = min(
+        min(_Counters[0], (uint)_MaximumVertices),
+        (uint)_ShadowMaximumVertices);
+    if (id.x >= count) return;
+
+    SurfaceVertex vertex = _Vertices[id.x];
+    uint depthClass = EvaluateShadowDepthClass(vertex.position);
+    uint flags;
+    uint inactiveStart;
+    uint lastCurrentSupport;
+    ShadowUnpackState(
+        _DiagnosticShadowCellState[vertex.voxelIndex],
+        flags,
+        inactiveStart,
+        lastCurrentSupport);
+    InterlockedAdd(_Counters[CounterShadowDepthEvaluated], 1);
+    if (depthClass == ShadowDepthAligned)
+    {
+        InterlockedAdd(_Counters[CounterShadowDepthAligned], 1);
+        lastCurrentSupport = ShadowEncodeOrdinal();
+        _DiagnosticShadowCellState[vertex.voxelIndex] = ShadowPackState(
+            flags,
+            inactiveStart,
+            lastCurrentSupport);
+    }
+    else if (depthClass == ShadowDepthFreeContradicted)
+        InterlockedAdd(_Counters[CounterShadowDepthFreeContradicted], 1);
+    else if (depthClass == ShadowDepthBehindCurrent)
+        InterlockedAdd(_Counters[CounterShadowDepthBehindCurrent], 1);
+    else
+        InterlockedAdd(_Counters[CounterShadowDepthUnobserved], 1);
+
+    bool productionSuppressed = UpdateShadowRayHistory(
+        vertex,
+        depthClass,
+        lastCurrentSupport);
+    // Re-apply the current ledger decision after this observation so an
+    // aligned hit can restore the vertex in the same extraction.
+    vertex.padding &= ~EvidenceLegalitySuppressed;
+    if (_EnableProductionLegalityGate != 0 && productionSuppressed)
+    {
+        vertex.padding |= EvidenceLegalitySuppressed;
+        InterlockedAdd(
+            _Counters[CounterProductionLegalitySuppressed], 1);
+    }
+    _Vertices[id.x] = vertex;
+}
+
+bool IsShadowCoordInside(int3 coord)
+{
+    return all(coord >= 0) && all(coord < _VoxelCount);
+}
+
+void EvaluateShadowDuplicatePair(
+    uint firstVertexIndex,
+    uint secondVertexIndex)
+{
+    SurfaceVertex first = _Vertices[firstVertexIndex];
+    SurfaceVertex second = _Vertices[secondVertexIndex];
+    float3 firstWorld = mul(
+        _VolumeLocalToWorld,
+        float4(first.position, 1.0)).xyz;
+    float3 secondWorld = mul(
+        _VolumeLocalToWorld,
+        float4(second.position, 1.0)).xyz;
+    float firstEyeDistance = distance(
+        firstWorld,
+        _ShadowEyeWorldPosition.xyz);
+    float secondEyeDistance = distance(
+        secondWorld,
+        _ShadowEyeWorldPosition.xyz);
+    SurfaceVertex front;
+    SurfaceVertex back;
+    uint backVertexIndex;
+    if (firstEyeDistance <= secondEyeDistance)
+    {
+        front = first;
+        back = second;
+        backVertexIndex = secondVertexIndex;
+    }
+    else
+    {
+        front = second;
+        back = first;
+        backVertexIndex = firstVertexIndex;
+    }
+    uint frontDepthClass = EvaluateShadowDepthClass(front.position);
+    uint backDepthClass = EvaluateShadowDepthClass(back.position);
+
+    InterlockedAdd(_Counters[CounterShadowDuplicatePairs], 1);
+    InterlockedOr(
+        _DiagnosticShadowCellState[back.voxelIndex],
+        ShadowFlagEverDuplicateCandidate);
+    if (frontDepthClass == ShadowDepthAligned)
+        InterlockedAdd(_Counters[CounterShadowDuplicateFrontAligned], 1);
+
+    if (backDepthClass == ShadowDepthAligned)
+        InterlockedAdd(_Counters[CounterShadowDuplicateBackAligned], 1);
+    else if (backDepthClass == ShadowDepthFreeContradicted)
+        InterlockedAdd(
+            _Counters[CounterShadowDuplicateBackFreeContradicted], 1);
+    else if (backDepthClass == ShadowDepthBehindCurrent)
+        InterlockedAdd(
+            _Counters[CounterShadowDuplicateBackBehindCurrent], 1);
+    else
+        InterlockedAdd(_Counters[CounterShadowDuplicateBackUnobserved], 1);
+
+    uint backFlags = 0u;
+    uint backInactiveStart = 0u;
+    uint backLastCurrentSupport = 0u;
+    ShadowUnpackState(
+        _DiagnosticShadowCellState[back.voxelIndex],
+        backFlags,
+        backInactiveStart,
+        backLastCurrentSupport);
+    uint supportAge = ShadowOrdinalAge(
+        ShadowEncodeOrdinal(),
+        backLastCurrentSupport);
+    bool recentlySupported = supportAge <= (uint)_ShadowRecentSupportWindow;
+    if (recentlySupported)
+        InterlockedAdd(
+            _Counters[CounterShadowDuplicateBackRecentlySupported], 1);
+    else
+        InterlockedAdd(
+            _Counters[CounterShadowDuplicateBackSupportStale], 1);
+
+    bool revokeCandidate = frontDepthClass == ShadowDepthAligned &&
+        (backDepthClass == ShadowDepthFreeContradicted ||
+         (backDepthClass == ShadowDepthBehindCurrent && !recentlySupported));
+    bool hadPriorRevokeCandidate =
+        (backFlags & ShadowFlagEverRevokeCandidate) != 0u;
+
+    uint backDiversityFlags = 0u;
+    uint backAlignedCount = 0u;
+    uint backFreeCount = 0u;
+    uint backBehindCount = 0u;
+    uint backRevisitCount = 0u;
+    bool backAlreadySuppressed = false;
+    ShadowRayUnpack(
+        _DiagnosticShadowRayState[back.voxelIndex],
+        backDiversityFlags,
+        backAlignedCount,
+        backFreeCount,
+        backBehindCount,
+        backRevisitCount,
+        backAlreadySuppressed);
+    bool backNeverAligned = backAlignedCount == 0u;
+    bool backStrongDiverse =
+        (backDiversityFlags & ShadowDiversityBaselineStrong) != 0u &&
+        (backDiversityFlags & ShadowDiversityParallaxStrong) != 0u;
+    bool backRepeatedlyEvaluated = backRevisitCount >= 4u;
+    bool backRepeatedDepthEvidence =
+        (backDepthClass == ShadowDepthFreeContradicted &&
+         backFreeCount >= (uint)_ShadowRayFreeMinimumConfirmations) ||
+        (backDepthClass == ShadowDepthBehindCurrent &&
+         backBehindCount >= (uint)_ShadowRayBehindMinimumConfirmations);
+    bool productionDuplicateCandidate =
+        _EnableProductionLegalityGate != 0 &&
+        revokeCandidate &&
+        hadPriorRevokeCandidate &&
+        backNeverAligned &&
+        backStrongDiverse &&
+        backRepeatedlyEvaluated &&
+        backRepeatedDepthEvidence;
+    if (revokeCandidate)
+    {
+        InterlockedAdd(
+            _Counters[CounterShadowDuplicateRevokeCandidate], 1);
+        InterlockedOr(
+            _DiagnosticShadowCellState[back.voxelIndex],
+            ShadowFlagEverRevokeCandidate);
+
+        if (!hadPriorRevokeCandidate)
+        {
+            // First matching evaluation only arms the fixed-cell ledger. A
+            // later independent evaluation must confirm the same back cell.
+            InterlockedAdd(
+                _Counters[CounterProductionDuplicateAwaitingRepeat], 1);
+        }
+        else if (productionDuplicateCandidate)
+        {
+            // Quarantine visibility only. The TSDF, evidence, temporal state
+            // and vertex remain intact, so a later aligned observation can
+            // clear bit 31 in UpdateShadowRayHistory and restore this cell.
+            if (!backAlreadySuppressed)
+            {
+                InterlockedOr(
+                    _DiagnosticShadowRayState[back.voxelIndex],
+                    ShadowRayProductionSuppressed);
+            }
+            InterlockedOr(
+                _Vertices[backVertexIndex].padding,
+                EvidenceLegalitySuppressed);
+            InterlockedAdd(
+                _Counters[CounterProductionDuplicateSuppressedPairs], 1);
+        }
+        else
+        {
+            InterlockedAdd(
+                _Counters[CounterProductionDuplicateRejectedRayHistory], 1);
+        }
+    }
+    else
+    {
+        InterlockedAdd(_Counters[CounterShadowDuplicateAmbiguous], 1);
+        InterlockedOr(
+            _DiagnosticShadowCellState[back.voxelIndex],
+            ShadowFlagEverAmbiguous);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void EvaluateShadowDuplicateShells(uint3 id : SV_DispatchThreadID)
+{
+    if (_EnableShadowDiagnostics == 0) return;
+    uint count = min(
+        min(_Counters[0], (uint)_MaximumVertices),
+        (uint)_ShadowMaximumVertices);
+    if (id.x >= count) return;
+
+    SurfaceVertex vertex = _Vertices[id.x];
+    float3 normal = normalize(vertex.normal);
+    float3 absoluteNormal = abs(normal);
+    int3 axis = absoluteNormal.x >= absoluteNormal.y &&
+                absoluteNormal.x >= absoluteNormal.z
+        ? int3(1, 0, 0)
+        : (absoluteNormal.y >= absoluteNormal.z
+            ? int3(0, 1, 0)
+            : int3(0, 0, 1));
+    int3 coord = Unflatten((int)vertex.voxelIndex);
+
+    [loop]
+    for (int directionIndex = 0; directionIndex < 2; directionIndex++)
+    {
+        int direction = directionIndex == 0 ? -1 : 1;
+        [loop]
+        for (int step = 1; step <= _ShadowDuplicateSearchVoxels; step++)
+        {
+            int3 neighbourCoord = coord + axis * (step * direction);
+            if (!IsShadowCoordInside(neighbourCoord)) break;
+            int neighbourIndex = _CoordVertexMap[Flatten(neighbourCoord)];
+            if (neighbourIndex < 0 || neighbourIndex >= (int)count) continue;
+            SurfaceVertex neighbour = _Vertices[neighbourIndex];
+            if (neighbour.voxelIndex <= vertex.voxelIndex) break;
+
+            float normalAgreement = abs(dot(
+                normalize(vertex.normal),
+                normalize(neighbour.normal)));
+            float3 delta = neighbour.position - vertex.position;
+            float signedNormalSeparation = dot(delta, normal);
+            float normalSeparation = abs(signedNormalSeparation);
+            float tangentialDistance = length(
+                delta - normal * signedNormalSeparation);
+            if (normalAgreement >= _ShadowParallelNormalDot &&
+                normalSeparation >= _ShadowDuplicateMinimumSeparation &&
+                normalSeparation <= _ShadowDuplicateMaximumSeparation &&
+                tangentialDistance <=
+                    _ShadowDuplicateMaximumTangentialDistance)
+            {
+                EvaluateShadowDuplicatePair(id.x, (uint)neighbourIndex);
+                break;
+            }
+        }
+    }
+}
+
 bool IsDisplaySuppressedVertex(uint vertexIndex)
 {
     uint flags = _Vertices[vertexIndex].padding;
     // Match EvidenceColor's visible priority exactly. The user-facing filter is
     // defined by what appears in the headset, not by an internal flag name:
-    // red contradiction, magenta back-cap, cyan stale and blue rear are hidden.
+    // Red contradiction, magenta back-cap and blue rear are hidden. Stale is
+    // retained as a read-only evidence flag, but direct-supported stale cells
+    // stay visible so global evidence age cannot erase established coverage.
     // Yellow unknown-assisted and green direct surfaces remain visible.
+    if ((flags & EvidenceLegalitySuppressed) != 0) return true;
     if ((flags & EvidenceFreeContradicted) != 0) return true;
     if ((flags & EvidenceBackCap) != 0) return true;
-    if ((flags & EvidenceStaleDirect) != 0) return true;
     if ((flags & EvidenceUnknownCrossing) != 0) return false;
     if ((flags & EvidenceDirect) != 0) return false;
     if ((flags & EvidenceRear) != 0) return true;

@@ -3,6 +3,12 @@
 // (https://github.com/arghyasur1991/QuestRoomScan, MIT License).
 #pragma kernel Clear
 #pragma kernel Integrate
+#pragma kernel ClearCompatibilityVolume
+#pragma kernel ClearCompatibilityCounters
+#pragma kernel InitCompatibilityDilation
+#pragma kernel CompatibilityDilationStep
+#pragma kernel IntegrateCompatibility
+#pragma kernel CountCompatibilitySurfaceCells
 
 RWTexture3D<float2> _Volume;
 // Read-only diagnostic sidecar for the surface extractor.  It never feeds
@@ -15,6 +21,20 @@ RWTexture3D<float4> _EvidenceVolume;
 Texture2D<float4> _WorldPosition;
 Texture2D<float4> _WorldNormal;
 Texture2D<float4> _ObservationMeta;
+
+// Read-only QuestRoomScan compatibility chain.  These resources never feed
+// production integration or rendering.
+RWTexture3D<float2> _CompatibilityVolume;
+Texture2D<float4> _CompatibilityDilationSource;
+RWTexture2D<float4> _CompatibilityDilationDestination;
+RWStructuredBuffer<uint> _CompatibilityCounters;
+int _CompatibilityDilationStep;
+float _CompatibilityDepthDisparityThreshold;
+float _CompatibilityMinimumDepth;
+float _CompatibilityMaximumDepth;
+float _CompatibilityMinimumMeshWeight;
+float _CompatibilityDepthTolerance;
+float _CompatibilityStaleIntegrationThreshold;
 
 int3 _VoxelCount;
 float _VoxelSize;
@@ -45,6 +65,397 @@ void Clear(uint3 id : SV_DispatchThreadID)
     if (any(id >= (uint3)_VoxelCount)) return;
     _Volume[id] = float2(1.0, 0.0);
     _EvidenceVolume[id] = float4(0.0, -1.0, 0.0, -1.0);
+}
+
+[numthreads(4, 4, 4)]
+void ClearCompatibilityVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+    // Match QuestRoomScan's empty sentinel.  Weight remains authoritative.
+    _CompatibilityVolume[id] = float2(-1.0, 0.0);
+}
+
+[numthreads(16, 1, 1)]
+void ClearCompatibilityCounters(uint id : SV_DispatchThreadID)
+{
+    if (id < 40) _CompatibilityCounters[id] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void InitCompatibilityDilation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SourceSize.x || id.y >= (uint)_SourceSize.y) return;
+    int2 pixel = int2(id.xy);
+    float4 meta = _ObservationMeta.Load(int3(pixel, 0));
+    float4 world = _WorldPosition.Load(int3(pixel, 0));
+    bool valid = meta.x >= 0.5 && world.w >= 0.5 &&
+                 meta.z >= _CompatibilityMinimumDepth &&
+                 meta.z <= _CompatibilityMaximumDepth;
+    float depth = valid
+        ? distance(world.xyz, _EyeWorldPosition.xyz)
+        : 0.0;
+    _CompatibilityDilationDestination[pixel] =
+        float4((float2)pixel, depth, valid ? 1.0 : 0.0);
+}
+
+static const int2 kCompatibilityDilationOffsets[8] =
+{
+    int2(1, 0), int2(1, 1), int2(0, 1), int2(-1, 1),
+    int2(-1, 0), int2(-1, -1), int2(0, -1), int2(1, -1)
+};
+
+[numthreads(8, 8, 1)]
+void CompatibilityDilationStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SourceSize.x || id.y >= (uint)_SourceSize.y) return;
+    int2 pixel = int2(id.xy);
+    int2 sourceSize = max(int2(_SourceSize.xy), int2(1, 1));
+    float4 best = _CompatibilityDilationSource.Load(int3(pixel, 0));
+    float focalLength = max(
+        1e-4,
+        max(abs(_WorldToClip._m00), abs(_WorldToClip._m11)));
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 candidatePixel = pixel +
+            kCompatibilityDilationOffsets[i] * _CompatibilityDilationStep;
+        if (candidatePixel.x < 0 || candidatePixel.y < 0 ||
+            candidatePixel.x >= sourceSize.x || candidatePixel.y >= sourceSize.y)
+            continue;
+
+        float4 candidate =
+            _CompatibilityDilationSource.Load(int3(candidatePixel, 0));
+        if (candidate.w < 0.5 || candidate.z <= 0.0) continue;
+
+        float pixelSize = 2.0 * candidate.z /
+            max(focalLength * _SourceSize.x, 1e-4);
+        float radiusPixels = (_TruncationDistance + _VoxelSize) /
+            max(pixelSize, 1e-5);
+        float2 delta = candidate.xy - (float2)pixel;
+        bool withinRadius = dot(delta, delta) <=
+            radiusPixels * radiusPixels;
+        bool nearer = best.w < 0.5 || candidate.z < best.z;
+        if (withinRadius && nearer) best = candidate;
+    }
+
+    _CompatibilityDilationDestination[pixel] = best;
+}
+
+[numthreads(4, 4, 4)]
+void IntegrateCompatibility(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+
+    float3 voxelWorld = mul(
+        _VolumeLocalToWorld,
+        float4(VoxelToLocal(id), 1.0)).xyz;
+    float4 clip = mul(_WorldToClip, float4(voxelWorld, 1.0));
+    if (abs(clip.w) < 1e-6) return;
+
+    float3 ndc = clip.xyz / clip.w;
+    if (any(ndc.xy < -0.98) || any(ndc.xy > 0.98)) return;
+
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    int2 pixel = int2(saturate(uv) * max(_SourceSize.xy - 1.0, 0.0));
+    float4 meta = _ObservationMeta.Load(int3(pixel, 0));
+    float4 measured = _WorldPosition.Load(int3(pixel, 0));
+    float4 normalSample = _WorldNormal.Load(int3(pixel, 0));
+    if (meta.x < 0.5 || measured.w < 0.5 || normalSample.w < 0.5)
+        return;
+    if (meta.z < _CompatibilityMinimumDepth ||
+        meta.z > _CompatibilityMaximumDepth)
+        return;
+
+    float3 surfaceNormal = normalSample.xyz;
+    float normalLengthSq = dot(surfaceNormal, surfaceNormal);
+    if (normalLengthSq < 1e-5) return;
+    surfaceNormal *= rsqrt(normalLengthSq);
+
+    float3 eyeToVoxel = voxelWorld - _EyeWorldPosition.xyz;
+    float voxelDistance = length(eyeToVoxel);
+    if (voxelDistance < 1e-4) return;
+    float3 eyeToSurface = measured.xyz - _EyeWorldPosition.xyz;
+    float surfaceDistance = length(eyeToSurface);
+    if (surfaceDistance < 1e-4) return;
+    float facing = saturate(-dot(eyeToVoxel / voxelDistance, surfaceNormal));
+
+    float signedDistanceMeters = (surfaceDistance - voxelDistance) * facing;
+    bool empty = signedDistanceMeters >= 1.0;
+    float normalizedDistance = min(
+        signedDistanceMeters / max(_TruncationDistance, 1e-4),
+        1.0);
+    // QuestRoomScan uses voxelMin / voxelSize (0.1 / 0.05 by default).
+    bool withinRearBand = normalizedDistance >=
+        -(0.10 / max(_VoxelSize, 1e-4));
+    bool validNormal = empty || facing > 0.30;
+    if (!withinRearBand || !validNormal) return;
+
+    InterlockedAdd(_CompatibilityCounters[0], 1);
+    float4 dilated =
+        _CompatibilityDilationSource.Load(int3(pixel, 0));
+    if (dilated.w < 0.5 || dilated.z <= 0.0)
+    {
+        InterlockedAdd(_CompatibilityCounters[9], 1);
+        return;
+    }
+    bool acceptableDepthDisparity =
+        surfaceDistance < dilated.z + _CompatibilityDepthDisparityThreshold;
+    bool unoccludedByDilation =
+        voxelDistance < dilated.z || acceptableDepthDisparity;
+    if (!unoccludedByDilation)
+    {
+        InterlockedAdd(_CompatibilityCounters[3], 1);
+        return;
+    }
+
+    float distanceFactor = saturate(
+        1.0 - voxelDistance / max(_CompatibilityMaximumDepth, 1e-4));
+    float quality = distanceFactor * saturate(facing);
+    float q2 = quality * quality;
+    float2 oldValue = _CompatibilityVolume[id];
+    float oldWeight = max(oldValue.y, 0.0);
+    if (oldWeight < 0.001)
+    {
+        if (quality < 0.25)
+        {
+            InterlockedAdd(_CompatibilityCounters[4], 1);
+            return;
+        }
+        _CompatibilityVolume[id] = float2(normalizedDistance, 0.10);
+        InterlockedAdd(_CompatibilityCounters[1], 1);
+        return;
+    }
+
+    float blend = q2 * _BlendRate / (1.0 + oldWeight * _Stability);
+    blend = clamp(blend, 0.0, 0.70);
+    if (blend < 0.005)
+    {
+        InterlockedAdd(_CompatibilityCounters[8], 1);
+        return;
+    }
+    _CompatibilityVolume[id] = float2(
+        lerp(oldValue.x, normalizedDistance, blend),
+        min(oldWeight + q2 * _WeightGrowth, _MaximumWeight));
+    InterlockedAdd(_CompatibilityCounters[2], 1);
+}
+
+static const int3 kCompatibilityCorners[8] =
+{
+    int3(0, 0, 0), int3(1, 0, 0), int3(1, 1, 0), int3(0, 1, 0),
+    int3(0, 0, 1), int3(1, 0, 1), int3(1, 1, 1), int3(0, 1, 1)
+};
+static const uint kCompatibilityEdgeA[12] =
+    { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3 };
+static const uint kCompatibilityEdgeB[12] =
+    { 1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7 };
+
+static const uint kCrossDepthUnobserved = 0;
+static const uint kCrossDepthAligned = 1;
+static const uint kCrossDepthFreeContradicted = 2;
+static const uint kCrossDepthBehindCurrent = 3;
+
+float3 CompatibilityVoxelCoordinateToLocal(float3 coordinate)
+{
+    return (coordinate + 0.5 - (float3)_VoxelCount * 0.5) * _VoxelSize;
+}
+
+uint EvaluateCompatibilityCrossDepthClass(float3 localPosition)
+{
+    float3 worldPosition = mul(
+        _VolumeLocalToWorld,
+        float4(localPosition, 1.0)).xyz;
+    float4 clip = mul(_WorldToClip, float4(worldPosition, 1.0));
+    if (abs(clip.w) < 1e-6) return kCrossDepthUnobserved;
+    float3 ndc = clip.xyz / clip.w;
+    if (any(ndc.xy < -0.985) || any(ndc.xy > 0.985))
+        return kCrossDepthUnobserved;
+
+    float2 uv = ndc.xy * 0.5 + 0.5;
+    int2 pixel = int2(
+        saturate(uv) * max(_SourceSize.xy - 1.0, 0.0));
+    float4 meta = _ObservationMeta.Load(int3(pixel, 0));
+    float4 measured = _WorldPosition.Load(int3(pixel, 0));
+    if (meta.x < 0.5 || meta.w < 0.5 || measured.w < 0.5)
+        return kCrossDepthUnobserved;
+
+    float measuredDistance = distance(
+        measured.xyz,
+        _EyeWorldPosition.xyz);
+    float candidateDistance = distance(
+        worldPosition,
+        _EyeWorldPosition.xyz);
+    if (measuredDistance < 1e-4 || candidateDistance < 1e-4)
+        return kCrossDepthUnobserved;
+
+    float residual = measuredDistance - candidateDistance;
+    float tolerance = max(_CompatibilityDepthTolerance, 1e-4);
+    if (abs(residual) <= tolerance) return kCrossDepthAligned;
+    if (residual > tolerance) return kCrossDepthFreeContradicted;
+    return kCrossDepthBehindCurrent;
+}
+
+[numthreads(4, 4, 4)]
+void CountCompatibilitySurfaceCells(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)(_VoxelCount.x - 1) ||
+        id.y >= (uint)(_VoxelCount.y - 1) ||
+        id.z >= (uint)(_VoxelCount.z - 1)) return;
+    uint compatibilityCrossings = 0;
+    uint compatibilityBadCrossings = 0;
+    uint productionCrossings = 0;
+    uint productionBadCrossings = 0;
+    float3 compatibilityCrossingPosition = 0.0;
+    float3 productionCrossingPosition = 0.0;
+    [unroll]
+    for (uint edge = 0; edge < 12; edge++)
+    {
+        int3 aCoord = (int3)id +
+            kCompatibilityCorners[kCompatibilityEdgeA[edge]];
+        int3 bCoord = (int3)id +
+            kCompatibilityCorners[kCompatibilityEdgeB[edge]];
+        float2 compatibilityA = _CompatibilityVolume[aCoord];
+        float2 compatibilityB = _CompatibilityVolume[bCoord];
+        // Match QuestRoomScan SurfaceNetsExtract: the empty sentinel remains
+        // empty even if a stale/non-zero weight happens to survive beside it.
+        bool compatibilityEmptyA =
+            compatibilityA.x <= -0.99 ||
+            abs(compatibilityA.y) < _CompatibilityMinimumMeshWeight;
+        bool compatibilityEmptyB =
+            compatibilityB.x <= -0.99 ||
+            abs(compatibilityB.y) < _CompatibilityMinimumMeshWeight;
+        float compatibilityValueA = compatibilityEmptyA ? 0.0 : compatibilityA.x;
+        float compatibilityValueB = compatibilityEmptyB ? 0.0 : compatibilityB.x;
+        if ((compatibilityValueA < 0.0) != (compatibilityValueB < 0.0))
+        {
+            compatibilityCrossings++;
+            float compatibilityChange =
+                compatibilityValueA - compatibilityValueB;
+            float compatibilityT = abs(compatibilityChange) > 1e-6
+                ? saturate(compatibilityValueA / compatibilityChange)
+                : 0.5;
+            compatibilityCrossingPosition +=
+                (float3)aCoord + compatibilityT * (float3)(bCoord - aCoord);
+            if (compatibilityEmptyA || compatibilityEmptyB)
+                compatibilityBadCrossings++;
+        }
+
+        float2 productionA = _Volume[aCoord];
+        float2 productionB = _Volume[bCoord];
+        bool productionEmptyA =
+            abs(productionA.y) < _CompatibilityMinimumMeshWeight;
+        bool productionEmptyB =
+            abs(productionB.y) < _CompatibilityMinimumMeshWeight;
+        float productionValueA = productionEmptyA ? 0.0 : productionA.x;
+        float productionValueB = productionEmptyB ? 0.0 : productionB.x;
+        if ((productionValueA < 0.0) != (productionValueB < 0.0))
+        {
+            productionCrossings++;
+            float productionChange = productionValueA - productionValueB;
+            float productionT = abs(productionChange) > 1e-6
+                ? saturate(productionValueA / productionChange)
+                : 0.5;
+            productionCrossingPosition +=
+                (float3)aCoord + productionT * (float3)(bCoord - aCoord);
+            if (productionEmptyA || productionEmptyB)
+                productionBadCrossings++;
+        }
+    }
+
+    bool compatibilityCandidate = compatibilityCrossings >= 3;
+    bool compatibilityActive =
+        compatibilityCandidate &&
+        compatibilityCrossings != compatibilityBadCrossings;
+    bool productionCandidate = productionCrossings >= 3;
+    bool productionActive =
+        productionCandidate &&
+        productionCrossings != productionBadCrossings;
+
+    if (compatibilityCandidate)
+    {
+        InterlockedAdd(_CompatibilityCounters[7], 1);
+        if (!compatibilityActive)
+            InterlockedAdd(_CompatibilityCounters[6], 1);
+        else
+            InterlockedAdd(_CompatibilityCounters[5], 1);
+    }
+    if (productionActive) InterlockedAdd(_CompatibilityCounters[10], 1);
+    if (productionActive && compatibilityActive)
+        InterlockedAdd(_CompatibilityCounters[11], 1);
+    else if (productionActive)
+        InterlockedAdd(_CompatibilityCounters[12], 1);
+    else if (compatibilityActive)
+        InterlockedAdd(_CompatibilityCounters[13], 1);
+
+    // Read-only cross ledger.  Counters 14..33 split production-only cells by
+    // current-depth consistency and by the existing evidence sidecar.  No
+    // value from this block is consumed by production integration or drawing.
+    if (productionActive && !compatibilityActive)
+    {
+        float3 localPosition = CompatibilityVoxelCoordinateToLocal(
+            productionCrossingPosition / max((float)productionCrossings, 1.0));
+        uint depthClass = EvaluateCompatibilityCrossDepthClass(localPosition);
+
+        uint directCornerCount = 0;
+        uint rearCornerCount = 0;
+        float mostRecentDirectIntegration = -1.0;
+        [unroll]
+        for (uint corner = 0; corner < 8; corner++)
+        {
+            float4 evidence =
+                _EvidenceVolume[(int3)id + kCompatibilityCorners[corner]];
+            if (evidence.x >= 0.5)
+            {
+                directCornerCount++;
+                mostRecentDirectIntegration = max(
+                    mostRecentDirectIntegration,
+                    evidence.w);
+            }
+            if (evidence.z >= 0.5) rearCornerCount++;
+        }
+
+        bool hasDirect = directCornerCount > 0;
+        bool hasRear = rearCornerCount > 0;
+        bool isStale = hasDirect &&
+            mostRecentDirectIntegration >= 0.0 &&
+            _EvidenceIntegrationOrdinal - mostRecentDirectIntegration >
+                _CompatibilityStaleIntegrationThreshold;
+
+        uint depthBase = depthClass == kCrossDepthAligned ? 14 :
+            (depthClass == kCrossDepthFreeContradicted ? 15 :
+             (depthClass == kCrossDepthBehindCurrent ? 16 : 17));
+        InterlockedAdd(_CompatibilityCounters[depthBase], 1);
+        if (hasDirect) InterlockedAdd(_CompatibilityCounters[18], 1);
+        if (isStale) InterlockedAdd(_CompatibilityCounters[19], 1);
+        if (hasRear) InterlockedAdd(_CompatibilityCounters[20], 1);
+        if (!hasDirect && !hasRear)
+            InterlockedAdd(_CompatibilityCounters[21], 1);
+
+        uint intersectionBase = depthClass == kCrossDepthAligned ? 22 :
+            (depthClass == kCrossDepthFreeContradicted ? 25 :
+             (depthClass == kCrossDepthBehindCurrent ? 28 : 31));
+        if (hasDirect)
+            InterlockedAdd(_CompatibilityCounters[intersectionBase], 1);
+        if (isStale)
+            InterlockedAdd(_CompatibilityCounters[intersectionBase + 1], 1);
+        if (hasRear)
+            InterlockedAdd(_CompatibilityCounters[intersectionBase + 2], 1);
+    }
+
+    // Shadow-only cells are also classified against the current real depth.
+    // This distinguishes genuine production misses from unobserved shadow
+    // history without borrowing production evidence to legitimize them.
+    if (compatibilityActive && !productionActive)
+    {
+        float3 localPosition = CompatibilityVoxelCoordinateToLocal(
+            compatibilityCrossingPosition /
+            max((float)compatibilityCrossings, 1.0));
+        uint depthClass = EvaluateCompatibilityCrossDepthClass(localPosition);
+        uint counter = depthClass == kCrossDepthAligned ? 34 :
+            (depthClass == kCrossDepthFreeContradicted ? 35 :
+             (depthClass == kCrossDepthBehindCurrent ? 36 : 37));
+        InterlockedAdd(_CompatibilityCounters[counter], 1);
+    }
 }
 
 void RecordAcceptedEvidence(uint3 id, float rayDistanceDelta)
