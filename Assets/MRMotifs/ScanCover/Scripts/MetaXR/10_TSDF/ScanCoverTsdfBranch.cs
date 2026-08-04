@@ -17,17 +17,27 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     public ScanCoverDepthPreprocessor.SourceEye preferredEye = ScanCoverDepthPreprocessor.SourceEye.Right;
     public bool autoResolveRefs = true;
     public bool integrateWhileScanning = true;
-    [Min(0.05f)] public float integrateIntervalSeconds = 0.20f;
+    [Min(0.01f)] public float integrateIntervalSeconds = 0.0333f;
 
     [Header("TSDF Volume")]
-    [Min(0.03f)] public float voxelSizeMeters = 0.10f;
-    [Min(16)] public int volumeSizeX = 96;
-    [Min(16)] public int volumeSizeY = 48;
-    [Min(16)] public int volumeSizeZ = 96;
+    [Min(0.03f)] public float voxelSizeMeters = 0.05f;
+    [Min(16)] public int volumeSizeX = 192;
+    [Min(16)] public int volumeSizeY = 96;
+    [Min(16)] public int volumeSizeZ = 192;
     public Vector3 volumeCenterLocal = new Vector3(0f, 1.4f, 0f);
-    [Min(0.05f)] public float truncationPositiveMeters = 0.35f;
-    public float truncationNegativeMeters = -0.15f;
-    [Min(1f)] public float maxIntegratedWeight = 24f;
+    [Min(0.05f)] public float truncationPositiveMeters = 0.15f;
+    [Tooltip("负侧截断（米），QRS为负2体素=0.10（voxelMin），比正侧窄可减少背面渗色")]
+    public float truncationNegativeMeters = -0.10f;
+    [Tooltip("QuestRoomScan语义：0.5，低上限保证旧值永远可被矛盾证据纠正")]
+    [Range(0.1f, 2f)] public float maxIntegratedWeight = 0.5f;
+
+    [Header("TSDF Blending (QuestRoomScan semantics)")]
+    [Tooltip("混合速率，QuestRoomScan默认0.8")]
+    [Range(0.1f, 2f)] public float blendRate = 0.8f;
+    [Tooltip("权重阻力系数，QuestRoomScan默认2.5")]
+    [Range(0.5f, 5f)] public float stability = 2.5f;
+    [Tooltip("权重增长率，QuestRoomScan默认0.025")]
+    [Range(0.005f, 0.1f)] public float weightGrowth = 0.025f;
 
     [Header("Observation Filter")]
     [Range(0f, 1f)] public float minObservationConfidence = 0.18f;
@@ -35,20 +45,58 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     [Min(0f)] public float minDepthMeters = 0.35f;
     [Min(0f)] public float maxDepthMeters = 6f;
 
+    [Header("Occlusion Gating (QuestRoomScan)")]
+    [Tooltip("遮挡门控：膨胀深度拒绝在已观测表面后方写入TSDF，防止幽灵后壳")]
+    public bool enableOcclusionGating = true;
+    [Tooltip("深度差异阈值（米），QuestRoomScan默认0.5")]
+    [Range(0.1f, 1f)] public float depthDisparityThreshold = 0.5f;
+    [Tooltip("膨胀步数（jump-flood迭代次数）")]
+    [Range(2, 10)] public int dilationSteps = 8;
+
     [Header("Surface Output")]
     public bool renderDebugSurfaceObject = false;
     public bool hideSurfaceWhileScanning = true;
     public bool showSurfaceWhenFrozen = true;
     public bool buildCollider = false;
     [Min(0)] public int minTrianglesToShow = 24;
-    [Range(0.01f, 4f)] public float minObservedWeightForMeshing = 0.5f;
+    [Tooltip("QuestRoomScan语义：0.08，与maxIntegratedWeight=0.5配套")]
+    [Range(0.01f, 0.5f)] public float minObservedWeightForMeshing = 0.08f;
     public Color surfaceColor = new Color(0.18f, 0.58f, 1.0f, 0.85f);
 
     [Header("Voxel Shell Supplement")]
     public bool mergeVoxelShell = true;
     [Min(1)] public int voxelShellMinHits = 2;
-    [Min(0f)] public float voxelShellSkipIfTsdfWeightAtLeast = 1.5f;
+    [Tooltip("QuestRoomScan语义：与minObservedWeightForMeshing一致")]
+    [Min(0f)] public float voxelShellSkipIfTsdfWeightAtLeast = 0.08f;
     [Min(0f)] public float voxelShellInflateMeters = 0.002f;
+
+    [Header("Surface Smoothing (QuestRoomScan)")]
+    [Tooltip("HC-Laplacian平滑迭代次数，QuestRoomScan默认1")]
+    [Range(0, 4)] public int smoothIterations = 1;
+    [Tooltip("Laplacian混合率，QuestRoomScan默认0.33")]
+    [Range(0f, 1f)] public float smoothLambda = 0.33f;
+    [Tooltip("HC收缩校正，QuestRoomScan默认0.5")]
+    [Range(0f, 1f)] public float smoothBeta = 0.5f;
+
+    [Header("Temporal Blend (QuestRoomScan)")]
+    [Tooltip("时序混合：顶点位置帧间阻尼，减少跳动")]
+    public bool enableTemporalBlend = true;
+    [Tooltip("时序混合最小alpha，QuestRoomScan默认0.1")]
+    [Range(0f, 1f)] public float temporalAlphaMin = 0.1f;
+    [Tooltip("时序混合最大alpha，QuestRoomScan默认0.85")]
+    [Range(0f, 1f)] public float temporalAlphaMax = 0.85f;
+    [Tooltip("时序衰减率，QuestRoomScan默认0.15")]
+    [Range(0.01f, 1f)] public float temporalDecayRate = 0.15f;
+    [Tooltip("时序死区（米），QuestRoomScan默认0.001")]
+    [Range(0.0001f, 0.01f)] public float temporalDeadzone = 0.001f;
+    [Tooltip("收敛阈值（米）：顶点位移超过此值视为表面真实更新，age清零快速跟随。QuestRoomScan默认0.005")]
+    [Range(0.001f, 0.02f)] public float temporalConvergeThreshold = 0.005f;
+
+    [Header("GPU Extraction (QuestRoomScan)")]
+    [Tooltip("开启后TSDF→网格提取在GPU完成（QuestRoomScan同构surface nets，含平滑+时序混合）；关闭回退CPU mesher")]
+    public bool useGpuExtraction = true;
+    [Tooltip("开启后网格直接由GPU缓冲间接渲染（QRS GPUMeshRenderer同构，需场景中有ScanCoverGpuMeshRenderer），提取随融合30Hz刷新且零CPU回读；快照/导出仍走BuildSurfaceNow原路径")]
+    public bool useIndirectRendering = true;
 
     [Header("Debug")]
     public bool debugLog = false;
@@ -80,15 +128,30 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     private static readonly int MinDepthMetersId = Shader.PropertyToID("_MinDepthMeters");
     private static readonly int MaxDepthMetersId = Shader.PropertyToID("_MaxDepthMeters");
     private static readonly int MaxIntegratedWeightId = Shader.PropertyToID("_MaxIntegratedWeight");
+    private static readonly int BlendRateId = Shader.PropertyToID("_BlendRate");
+    private static readonly int StabilityId = Shader.PropertyToID("_Stability");
+    private static readonly int WeightGrowthId = Shader.PropertyToID("_WeightGrowth");
     private static readonly int CameraWorldPositionId = Shader.PropertyToID("_CameraWorldPosition");
+    private static readonly int VoxelOffsetId = Shader.PropertyToID("_VoxelOffset");
     private static readonly int WorldToClipId = Shader.PropertyToID("_WorldToClip");
     private static readonly int VolumeLocalToWorldId = Shader.PropertyToID("_VolumeLocalToWorld");
+    private static readonly int DilationSrcId = Shader.PropertyToID("_DilationSrc");
+    private static readonly int DilationDstId = Shader.PropertyToID("_DilationDst");
+    private static readonly int DilationStepSizeId = Shader.PropertyToID("_DilationStepSize");
+    private static readonly int DilationFocalLengthId = Shader.PropertyToID("_DilationFocalLength");
+    private static readonly int DepthDisparityThresholdId = Shader.PropertyToID("_DepthDisparityThreshold");
+    private static readonly int EnableOcclusionGatingId = Shader.PropertyToID("_EnableOcclusionGating");
 
     private ComputeShader _computeShader;
     private int _clearKernel = -1;
     private int _integrateKernel = -1;
     private int _copyVolumeToBufferKernel = -1;
+    private int _pruneKernel = -1;
+    private int _initDilationKernel = -1;
+    private int _dilationStepKernel = -1;
     private RenderTexture _tsdfVolume;
+    private RenderTexture _dilationTexA;
+    private RenderTexture _dilationTexB;
     private RenderTexture _weightVolume;
     private ComputeBuffer _tsdfReadbackBuffer;
     private ComputeBuffer _weightReadbackBuffer;
@@ -99,6 +162,19 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     private Mesh _mesh;
     private Material _runtimeMaterial;
     private float _nextIntegrateTime;
+    private float _nextPruneTime;
+
+    // Temporal blend state: cellIndex → (position, age) from previous frame.
+    private readonly Dictionary<int, TemporalVertexState> _temporalState = new Dictionary<int, TemporalVertexState>();
+    private struct TemporalVertexState
+    {
+        public Vector3 Position;
+        public float Age;
+    }
+    private readonly List<int> _cellIndices = new List<int>(16384);
+    private int _integrationCountSinceClear;
+    private const int WarmupIntegrations = 3;
+    private const float PruneIntervalSeconds = 3f;
     private bool _hasPendingReadback;
     private AsyncGPUReadbackRequest _tsdfReadbackRequest;
     private AsyncGPUReadbackRequest _weightReadbackRequest;
@@ -107,6 +183,22 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     private readonly HashSet<ScanCoverSkeletonBuilder_A.VoxelKey> _confirmedVoxels = new HashSet<ScanCoverSkeletonBuilder_A.VoxelKey>();
     private readonly List<Vector3> _combinedVertices = new List<Vector3>(65536);
     private readonly List<int> _combinedTriangles = new List<int>(131072);
+    private readonly List<Vector3> _combinedNormals = new List<Vector3>(65536);
+
+    // GPU surface nets extraction (QuestRoomScan-faithful path).
+    private ComputeShader _gpuSurfaceNetsShader;
+    private ScanCoverGpuSurfaceNets _gpuSurfaceNets;
+    private ScanCoverGpuMeshRenderer _gpuMeshRenderer;
+    private bool _hasGpuRenderData;
+    // GPU 间接渲染健康监测：每 ~1s 回读 20 字节 draw args（QRS 也只回读计数）。
+    // 连续 3 次抽取索引为 0 → 判定间接渲染静默失败，自动回退 CPU 网格显示。
+    private AsyncGPUReadbackRequest _gpuDrawArgsRequest;
+    private bool _gpuDrawArgsReadbackPending;
+    private float _nextGpuDrawArgsCheckTime;
+    private int _gpuZeroDrawStreak;
+    private Matrix4x4 _gpuRenderLocalToWorld = Matrix4x4.identity;
+    private readonly List<Vector3> _gpuVertices = new List<Vector3>(65536);
+    private readonly List<int> _gpuTriangles = new List<int>(131072);
     private readonly List<Vector3> _surfaceVertices = new List<Vector3>(65536);
     private readonly List<int> _surfaceTriangles = new List<int>(131072);
     private float[] _latestTsdfData;
@@ -117,6 +209,7 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     {
         ResolveRefs();
         EnsureShader();
+        EnsureGpuMeshRenderer();
     }
 
     private void OnEnable()
@@ -130,16 +223,47 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         if (_hasPendingReadback)
             UpdatePendingReadback();
 
+        if (useGpuExtraction && _gpuSurfaceNets != null && _gpuSurfaceNets.HasPendingReadback)
+            UpdatePendingGpuMesh();
+
+        ConsumeGpuDrawArgsReadback();
+
         UpdateSurfaceVisibility();
 
         if (!integrateWhileScanning || builder == null || !builder.scanEnabled)
             return;
 
+        // QuestRoomScan warmup: discard the first N integrations to avoid
+        // Quest 3 depth sensor startup calibration noise.
+        if (_integrationCountSinceClear > 0 &&
+            _integrationCountSinceClear <= WarmupIntegrations &&
+            Time.time >= _nextIntegrateTime)
+        {
+            ClearVolumes();
+            _integrationCountSinceClear = 0;
+            if (debugLog)
+                Debug.Log("[ScanCoverTsdfBranch] Warmup clear after initial integrations.");
+        }
+
+        // QuestRoomScan periodic prune: reset very-low-weight voxels to empty.
+        if (_pruneKernel >= 0 && Time.time >= _nextPruneTime)
+        {
+            _nextPruneTime = Time.time + PruneIntervalSeconds;
+            _computeShader.SetInts(VolumeSizeId, volumeSizeX, volumeSizeY, volumeSizeZ);
+            _computeShader.SetTexture(_pruneKernel, TsdfVolumeId, _tsdfVolume);
+            _computeShader.SetTexture(_pruneKernel, WeightVolumeId, _weightVolume);
+            DispatchVolumeKernel(_pruneKernel);
+        }
+
         if (Time.time < _nextIntegrateTime)
             return;
 
-        _nextIntegrateTime = Time.time + Mathf.Max(0.05f, integrateIntervalSeconds);
-        IntegrateNow();
+        _nextIntegrateTime = Time.time + Mathf.Max(0.01f, integrateIntervalSeconds);
+        if (IntegrateNow() && useGpuExtraction && useIndirectRendering)
+        {
+            RunGpuExtractionForDisplay();
+            RequestGpuDrawArgsReadback();
+        }
     }
 
     private void OnDisable()
@@ -151,6 +275,8 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     {
         ReleaseVolumes();
         ReleaseSurface();
+        _gpuSurfaceNets?.Dispose();
+        _gpuSurfaceNets = null;
     }
 
     public void EnsureInitialized()
@@ -204,14 +330,34 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         _computeShader.SetFloat(MinNormalFacingDotId, minNormalFacingDot);
         _computeShader.SetFloat(MinDepthMetersId, minDepthMeters);
         _computeShader.SetFloat(MaxDepthMetersId, Mathf.Max(minDepthMeters + 0.01f, maxDepthMeters));
-        _computeShader.SetFloat(MaxIntegratedWeightId, Mathf.Max(1f, maxIntegratedWeight));
+        _computeShader.SetFloat(MaxIntegratedWeightId, Mathf.Max(0.1f, maxIntegratedWeight));
+        _computeShader.SetFloat(BlendRateId, blendRate);
+        _computeShader.SetFloat(StabilityId, stability);
+        _computeShader.SetFloat(WeightGrowthId, weightGrowth);
+
+        // Occlusion gating: update dilated depth, then bind to Integrate.
+        RenderTexture dilatedResult = null;
+        if (enableOcclusionGating &&
+            _initDilationKernel >= 0 && _dilationStepKernel >= 0 &&
+            EnsureDilationTextures(observationMeta.width, observationMeta.height))
+        {
+            UpdateDilation(observationMeta, worldToClip);
+            dilatedResult = _dilationTexA; // UpdateDilation leaves result in A
+        }
+        _computeShader.SetInt(EnableOcclusionGatingId,
+            enableOcclusionGating && dilatedResult != null ? 1 : 0);
+        _computeShader.SetFloat(DepthDisparityThresholdId, depthDisparityThreshold);
+        if (dilatedResult != null)
+            _computeShader.SetTexture(_integrateKernel, DilationSrcId, dilatedResult);
+
         _computeShader.SetVector(CameraWorldPositionId, new Vector4(cameraWorldPosition.x, cameraWorldPosition.y, cameraWorldPosition.z, 1f));
         _computeShader.SetMatrix(WorldToClipId, worldToClip);
         _computeShader.SetMatrix(VolumeLocalToWorldId, volumeLocalToWorld);
 
-        DispatchVolumeKernel(_integrateKernel);
+        DispatchIntegrateFrustumKernel(worldToClip, volumeLocalToWorld);
 
         IntegrationCount++;
+        _integrationCountSinceClear++;
         LastIssue = null;
 
         if (debugLog)
@@ -225,6 +371,9 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     {
         EnsureInitialized();
         if (_hasPendingReadback)
+            return false;
+
+        if (useGpuExtraction && _gpuSurfaceNets != null && _gpuSurfaceNets.HasPendingReadback)
             return false;
 
         if (_tsdfVolume == null || _weightVolume == null)
@@ -251,10 +400,204 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         _hasPendingReadback = true;
         LastIssue = null;
 
+        if (useGpuExtraction)
+        {
+            // QuestRoomScan GPU surface nets: extraction + smoothing +
+            // temporal blend all run on GPU directly from the volume
+            // textures (no CPU volume readback involved in meshing).
+            if (!RunGpuExtractionForDisplay())
+                return false;
+
+            _gpuSurfaceNets.RequestMeshReadback();
+        }
+
         if (debugLog)
             Debug.Log("[ScanCoverTsdfBranch] Requested TSDF readback.");
 
         return true;
+    }
+
+    private bool EnsureGpuSurfaceNets()
+    {
+        if (_gpuSurfaceNets != null)
+            return true;
+
+        if (_gpuSurfaceNetsShader == null)
+            _gpuSurfaceNetsShader = Resources.Load<ComputeShader>("ScanCoverGpuSurfaceNets");
+
+        if (_gpuSurfaceNetsShader == null)
+            return SetIssue("ScanCoverGpuSurfaceNets.compute was not found in Resources.");
+
+        _gpuSurfaceNets = new ScanCoverGpuSurfaceNets(_gpuSurfaceNetsShader);
+        return true;
+    }
+
+    /// <summary>
+    /// Runs GPU surface nets extraction so the GPU buffers hold the latest
+    /// mesh.  Used both by the 30Hz indirect-rendering display path and by
+    /// BuildSurfaceNow (which additionally requests a CPU readback for the
+    /// snapshot/export consumers).
+    /// </summary>
+    private bool RunGpuExtractionForDisplay()
+    {
+        if (!EnsureGpuSurfaceNets())
+            return false;
+
+        _gpuSurfaceNets.MinMeshWeight = Mathf.Max(0.01f, minObservedWeightForMeshing);
+        _gpuSurfaceNets.SmoothIterations = smoothIterations;
+        _gpuSurfaceNets.SmoothLambda = smoothLambda;
+        _gpuSurfaceNets.SmoothBeta = smoothBeta;
+        _gpuSurfaceNets.TemporalAlphaMax = enableTemporalBlend ? temporalAlphaMax : 1f;
+        _gpuSurfaceNets.TemporalAlphaMin = temporalAlphaMin;
+        _gpuSurfaceNets.TemporalDecayRate = temporalDecayRate;
+        _gpuSurfaceNets.ConvergenceThreshold = temporalConvergeThreshold;
+        _gpuSurfaceNets.TemporalDeadzone = temporalDeadzone;
+        _gpuSurfaceNets.EnsureBuffers(new Vector3Int(volumeSizeX, volumeSizeY, volumeSizeZ));
+        _gpuSurfaceNets.Extract(_tsdfVolume, _weightVolume, voxelSizeMeters);
+
+        Transform baseFrame = referenceFrame != null ? referenceFrame : transform;
+        _gpuRenderLocalToWorld = baseFrame.localToWorldMatrix * Matrix4x4.TRS(volumeCenterLocal, Quaternion.identity, Vector3.one);
+        _hasGpuRenderData = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Indirect-rendering data outlet for ScanCoverGpuMeshRenderer (QRS
+    /// GPUMeshRenderer pattern): GPU buffers + transform, no CPU readback.
+    /// </summary>
+    public bool TryGetGpuRenderData(
+        out GraphicsBuffer vertices,
+        out GraphicsBuffer indices,
+        out GraphicsBuffer drawArgs,
+        out Matrix4x4 localToWorld)
+    {
+        localToWorld = _gpuRenderLocalToWorld;
+        vertices = null;
+        indices = null;
+        drawArgs = null;
+
+        if (!_hasGpuRenderData || _gpuSurfaceNets == null || !useGpuExtraction || !useIndirectRendering)
+            return false;
+
+        vertices = _gpuSurfaceNets.VertexBuffer;
+        indices = _gpuSurfaceNets.IndexBuffer;
+        drawArgs = _gpuSurfaceNets.DrawIndirectArgsBuffer;
+        localToWorld = _gpuRenderLocalToWorld;
+        return vertices != null && indices != null && drawArgs != null;
+    }
+
+    public Bounds GetGpuRenderWorldBounds()
+    {
+        Vector3 half = new Vector3(volumeSizeX, volumeSizeY, volumeSizeZ) * (voxelSizeMeters * 0.5f) + Vector3.one * 0.25f;
+        Vector3 center = _gpuRenderLocalToWorld.GetColumn(3);
+        return new Bounds(center, half * 2f);
+    }
+
+    public uint LastGpuDrawIndexCount { get; private set; }
+    public int GpuZeroDrawStreak => _gpuZeroDrawStreak;
+    /// <summary>间接渲染连续 3 次抽取为空 → 已自动回退 CPU 网格显示。</summary>
+    public bool IndirectRenderingSuspect =>
+        useGpuExtraction && useIndirectRendering && _gpuZeroDrawStreak >= 3;
+    public string GpuRendererIssue => _gpuMeshRenderer != null ? _gpuMeshRenderer.LastIssue : null;
+
+    private void RequestGpuDrawArgsReadback()
+    {
+        if (_gpuDrawArgsReadbackPending || _gpuSurfaceNets == null ||
+            _gpuSurfaceNets.DrawIndirectArgsBuffer == null ||
+            Time.unscaledTime < _nextGpuDrawArgsCheckTime)
+            return;
+        _nextGpuDrawArgsCheckTime = Time.unscaledTime + 1f;
+        _gpuDrawArgsReadbackPending = true;
+        _gpuDrawArgsRequest = AsyncGPUReadback.Request(_gpuSurfaceNets.DrawIndirectArgsBuffer);
+    }
+
+    private void ConsumeGpuDrawArgsReadback()
+    {
+        if (!_gpuDrawArgsReadbackPending || !_gpuDrawArgsRequest.done)
+            return;
+        _gpuDrawArgsReadbackPending = false;
+        if (_gpuDrawArgsRequest.hasError)
+        {
+            _gpuZeroDrawStreak++;
+        }
+        else
+        {
+            var args = _gpuDrawArgsRequest.GetData<uint>();
+            LastGpuDrawIndexCount = args.Length > 0 ? args[0] : 0u;
+            _gpuZeroDrawStreak = LastGpuDrawIndexCount == 0 ? _gpuZeroDrawStreak + 1 : 0;
+        }
+        if (_gpuZeroDrawStreak == 3)
+        {
+            Debug.LogWarning(
+                "[ScanCoverTsdfBranch] 间接渲染连续3次抽取索引为0——已自动回退CPU网格显示。" +
+                "疑似设备端 shader 被剥离或提取为空。", this);
+        }
+    }
+
+    private void UpdatePendingGpuMesh()
+    {
+        string gpuIssue;
+        if (!_gpuSurfaceNets.TryConsumeMeshReadback(_gpuVertices, _gpuTriangles, out gpuIssue))
+            return;
+
+        if (!string.IsNullOrEmpty(gpuIssue))
+        {
+            SetIssue(gpuIssue);
+            return;
+        }
+
+        BuildMeshFromGpuData(_gpuVertices, _gpuTriangles);
+    }
+
+    /// <summary>
+    /// Builds the display/snapshot mesh from GPU-extracted surface nets
+    /// data.  Positions are already volume-local and smoothing/temporal
+    /// blending were applied on GPU, so this only feeds the existing
+    /// mesh/snapshot path (hybrid receiver, collider, diagnostics).
+    /// </summary>
+    private void BuildMeshFromGpuData(List<Vector3> vertices, List<int> triangleIndices)
+    {
+        EnsureSurfaceResources();
+        if (_mesh == null)
+        {
+            SetIssue("TSDF mesh is missing.");
+            return;
+        }
+
+        _combinedVertices.Clear();
+        _combinedTriangles.Clear();
+        _combinedVertices.AddRange(vertices);
+        _combinedTriangles.AddRange(triangleIndices);
+
+        int triangles = _combinedTriangles.Count / 3;
+        TriangleCount = triangles;
+        bool visible = triangles >= Mathf.Max(0, minTrianglesToShow);
+
+        _surfaceVertices.Clear();
+        _surfaceTriangles.Clear();
+
+        _mesh.Clear();
+        if (visible)
+        {
+            _mesh.SetVertices(_combinedVertices);
+            _mesh.SetTriangles(_combinedTriangles, 0, true);
+            _mesh.RecalculateNormals();
+            _mesh.RecalculateBounds();
+            _surfaceVertices.AddRange(_combinedVertices);
+            _surfaceTriangles.AddRange(_combinedTriangles);
+        }
+
+        if (_meshCollider != null)
+            _meshCollider.sharedMesh = null;
+        if (renderDebugSurfaceObject && buildCollider && visible && _meshCollider != null)
+            _meshCollider.sharedMesh = _mesh;
+
+        SetSurfaceVisible(visible && (!hideSurfaceWhileScanning || builder == null || builder.IsFrozen));
+        LastIssue = visible ? null : "TSDF surface generated too few triangles.";
+        SurfaceDataUpdated?.Invoke(this);
+
+        if (debugLog)
+            Debug.Log($"[ScanCoverTsdfBranch] GPU surface build verts={vertices.Count}, triangles={triangles}, visible={visible}");
     }
 
     public void ClearAll()
@@ -263,6 +606,7 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         EnsureVolumes();
         ClearVolumes();
         IntegrationCount = 0;
+        _integrationCountSinceClear = 0;
         TriangleCount = 0;
         LastIssue = null;
         _hasPendingReadback = false;
@@ -274,7 +618,16 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         _surfaceTriangles.Clear();
         _latestTsdfData = null;
         _latestWeightData = null;
+        _hasGpuRenderData = false;
+        _gpuSurfaceNets?.ResetTemporal();
         _latestVolumeSize = default;
+        _temporalState.Clear();
+        _cellIndices.Clear();
+        _combinedNormals.Clear();
+        _gpuSurfaceNets?.ResetTemporal();
+        LastGpuDrawIndexCount = 0;
+        _gpuZeroDrawStreak = 0;
+        _gpuDrawArgsReadbackPending = false;
         UpdateSurfaceVisibility();
         SurfaceDataUpdated?.Invoke(this);
     }
@@ -294,6 +647,19 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
 
         float[] tsdf = _tsdfReadbackRequest.GetData<float>().ToArray();
         float[] weights = _weightReadbackRequest.GetData<float>().ToArray();
+
+        if (useGpuExtraction)
+        {
+            // GPU extraction owns meshing (ScanCoverGpuSurfaceNets); the
+            // CPU volume arrays are kept only for weight queries and
+            // diagnostics consumers (TryGetWeightAtReferenceLocalPosition,
+            // fused point cloud, reference shell).
+            _latestTsdfData = tsdf;
+            _latestWeightData = weights;
+            _latestVolumeSize = _pendingVolumeSize;
+            return;
+        }
+
         BuildMeshFromData(tsdf, weights, _pendingVolumeSize);
     }
 
@@ -309,6 +675,8 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         bool hasSurface;
         int triangles;
         string mesherIssue;
+        _cellIndices.Clear();
+        _combinedNormals.Clear();
         try
         {
             hasSurface = ScanCoverTsdfMesherUtil.BuildMesh(
@@ -319,7 +687,9 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
                 Mathf.Max(0.01f, minObservedWeightForMeshing),
                 _mesh,
                 out triangles,
-                out mesherIssue);
+                out mesherIssue,
+                _cellIndices,
+                _combinedNormals);
         }
         catch (System.Exception ex)
         {
@@ -355,6 +725,23 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         {
             _mesh.GetVertices(_combinedVertices);
             _combinedTriangles.AddRange(_mesh.triangles);
+
+            // QuestRoomScan extraction post-processing:
+            // 1. HC-Laplacian smoothing — grid 6-neighborhood weighted by
+            //    normal agreement (corners preserved), ping-pong update.
+            if (smoothIterations > 0)
+            {
+                ScanCoverTsdfMesherUtil.SmoothMesh(
+                    _combinedVertices, _combinedNormals, _cellIndices,
+                    volumeSize, smoothLambda, smoothBeta, smoothIterations);
+            }
+
+            // 2. Temporal blend — damps vertex positions between frames,
+            //    preventing jitter and flicker.
+            if (enableTemporalBlend)
+            {
+                ApplyTemporalBlend(_combinedVertices, _cellIndices);
+            }
         }
 
         triangles = _combinedTriangles.Count / 3;
@@ -386,6 +773,79 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
 
         if (debugLog)
             Debug.Log($"[ScanCoverTsdfBranch] Surface build triangles={triangles}, visible={visible}");
+    }
+
+    /// <summary>
+    /// QuestRoomScan TemporalBlend kernel — adaptive per-vertex damping.
+    /// Each cell index maps to at most one vertex per frame, so the cell
+    /// index serves as the temporal key.  Deadzone prevents micro-jitter;
+    /// age-based alpha decay lets the mesh converge smoothly.
+    /// </summary>
+    private void ApplyTemporalBlend(List<Vector3> vertices, List<int> cellIndices)
+    {
+        if (vertices == null || cellIndices == null ||
+            vertices.Count == 0 || vertices.Count != cellIndices.Count)
+        {
+            _temporalState.Clear();
+            return;
+        }
+
+        var newState = new Dictionary<int, TemporalVertexState>(vertices.Count);
+
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            int cellIdx = cellIndices[i];
+            Vector3 currentPos = vertices[i];
+
+            if (!_temporalState.TryGetValue(cellIdx, out TemporalVertexState prev))
+            {
+                // First sighting: no blending, just record.
+                newState[cellIdx] = new TemporalVertexState
+                {
+                    Position = currentPos,
+                    Age = 0f
+                };
+                continue;
+            }
+
+            float dist = Vector3.Distance(currentPos, prev.Position);
+
+            if (dist < temporalDeadzone)
+            {
+                // Within deadzone: hold previous position exactly.
+                vertices[i] = prev.Position;
+                newState[cellIdx] = new TemporalVertexState
+                {
+                    Position = prev.Position,
+                    Age = prev.Age + 1f
+                };
+                continue;
+            }
+
+            // QuestRoomScan TemporalBlend: displacement beyond the converge
+            // threshold means the surface genuinely updated — reset age to 0
+            // so alpha jumps to alphaMax and the vertex follows quickly.
+            // (Without this reset, converged vertices stay frozen at
+            // alphaMin and lag behind the refining TSDF, producing ghost
+            // duplicate layers and tangled bridging triangles.)
+            float age = (dist > temporalConvergeThreshold) ? 0f : prev.Age + 1f;
+            float alpha = temporalAlphaMin +
+                (temporalAlphaMax - temporalAlphaMin) *
+                Mathf.Exp(-age * temporalDecayRate);
+
+            vertices[i] = Vector3.Lerp(prev.Position, currentPos, alpha);
+            newState[cellIdx] = new TemporalVertexState
+            {
+                Position = vertices[i],
+                Age = age
+            };
+        }
+
+        // Replace old state with new state (cells not seen this frame are
+        // dropped, matching QuestRoomScan's stateless temporal behavior).
+        _temporalState.Clear();
+        foreach (var kvp in newState)
+            _temporalState[kvp.Key] = kvp.Value;
     }
 
     private int AppendVoxelShellFallback(
@@ -583,6 +1043,15 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
 
         if (_copyVolumeToBufferKernel < 0)
             _copyVolumeToBufferKernel = _computeShader.FindKernel("CopyVolumeToBuffer");
+
+        if (_pruneKernel < 0)
+            _pruneKernel = _computeShader.FindKernel("Prune");
+
+        if (_initDilationKernel < 0)
+            _initDilationKernel = _computeShader.FindKernel("InitDilation");
+
+        if (_dilationStepKernel < 0)
+            _dilationStepKernel = _computeShader.FindKernel("DilationStep");
     }
 
     private bool EnsureVolumes()
@@ -604,6 +1073,81 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         _weightVolume = CreateVolumeTexture("ScanCover_TSDFWeight");
         ClearVolumes();
         return _tsdfVolume != null && _weightVolume != null;
+    }
+
+    private bool EnsureDilationTextures(int width, int height)
+    {
+        if (_dilationTexA != null && _dilationTexB != null &&
+            _dilationTexA.width == width && _dilationTexA.height == height)
+            return true;
+
+        ReleaseDilationTextures();
+        _dilationTexA = CreateDilationTexture("ScanCover_DilationA", width, height);
+        _dilationTexB = CreateDilationTexture("ScanCover_DilationB", width, height);
+        return _dilationTexA != null && _dilationTexB != null;
+    }
+
+    private void UpdateDilation(RenderTexture observationMeta, Matrix4x4 worldToClip)
+    {
+        int width = observationMeta.width;
+        int height = observationMeta.height;
+        float focalLength = worldToClip.m00;
+
+        // Init: copy depth from observation meta to both ping-pong textures.
+        _computeShader.SetVector(SourceSizeId, new Vector4(width, height, 0f, 0f));
+        _computeShader.SetTexture(_initDilationKernel, SourceObservationMetaTextureId, observationMeta);
+        _computeShader.SetTexture(_initDilationKernel, DilationSrcId, _dilationTexA);
+        _computeShader.SetTexture(_initDilationKernel, DilationDstId, _dilationTexB);
+        _computeShader.Dispatch(_initDilationKernel,
+            Mathf.CeilToInt(width / 8f), Mathf.CeilToInt(height / 8f), 1);
+
+        // Jump-flood steps: propagate minimum depth with exponentially
+        // decreasing step sizes.  Ping-pong between A and B.
+        RenderTexture src = _dilationTexA;
+        RenderTexture dst = _dilationTexB;
+        for (int i = dilationSteps - 1; i >= 0; i--)
+        {
+            int stepSize = 1 << i;
+            _computeShader.SetInt(DilationStepSizeId, stepSize);
+            _computeShader.SetFloat(DilationFocalLengthId, focalLength);
+            _computeShader.SetFloat(TruncationPositiveId, Mathf.Max(0.05f, truncationPositiveMeters));
+            _computeShader.SetFloat(VoxelSizeId, voxelSizeMeters);
+            _computeShader.SetVector(SourceSizeId, new Vector4(width, height, 0f, 0f));
+            _computeShader.SetTexture(_dilationStepKernel, DilationSrcId, src);
+            _computeShader.SetTexture(_dilationStepKernel, DilationDstId, dst);
+            _computeShader.Dispatch(_dilationStepKernel,
+                Mathf.CeilToInt(width / 8f), Mathf.CeilToInt(height / 8f), 1);
+            (src, dst) = (dst, src);
+        }
+
+        // After the loop, src holds the final dilated result.  Copy it back
+        // to _dilationTexA so the caller can always read from A.
+        if (src != _dilationTexA)
+        {
+            Graphics.Blit(src, _dilationTexA);
+        }
+    }
+
+    private static RenderTexture CreateDilationTexture(string name, int width, int height)
+    {
+        var tex = new RenderTexture(width, height, 0)
+        {
+            name = name,
+            enableRandomWrite = true,
+            graphicsFormat = GraphicsFormat.R32G32B32A32_SFloat,
+            wrapMode = TextureWrapMode.Clamp,
+            filterMode = FilterMode.Point,
+            useMipMap = false,
+            autoGenerateMips = false,
+        };
+        tex.Create();
+        return tex;
+    }
+
+    private void ReleaseDilationTextures()
+    {
+        ReleaseTexture(ref _dilationTexA);
+        ReleaseTexture(ref _dilationTexB);
     }
 
     private void ClearVolumes()
@@ -645,6 +1189,67 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
         _computeShader.Dispatch(kernel, dispatchX, dispatchY, dispatchZ);
     }
 
+    /// <summary>
+    /// Frustum sub-dispatch (QRS sparse-dispatch equivalent): Integrate only
+    /// runs over the voxel AABB covering frustum∩volume, which is what makes
+    /// 30Hz affordable on Quest.  The shader's per-voxel NDC test remains the
+    /// authoritative acceptance check; this only prunes thread groups that
+    /// cannot possibly contribute.  z=-1/0/1 are all unprojected so the AABB
+    /// is valid regardless of the platform's clip-z convention.
+    /// </summary>
+    private void DispatchIntegrateFrustumKernel(Matrix4x4 worldToClip, Matrix4x4 volumeLocalToWorld)
+    {
+        Matrix4x4 clipToWorld = worldToClip.inverse;
+        Matrix4x4 worldToVolume = volumeLocalToWorld.inverse;
+
+        Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+        bool any = false;
+        for (int zi = 0; zi < 3; zi++)
+        {
+            float z = zi - 1f; // -1, 0, 1
+            for (int yi = 0; yi < 2; yi++)
+            for (int xi = 0; xi < 2; xi++)
+            {
+                Vector4 clip = new Vector4(xi == 0 ? -1f : 1f, yi == 0 ? -1f : 1f, z, 1f);
+                Vector4 world = clipToWorld * clip;
+                if (Mathf.Abs(world.w) < 1e-6f)
+                    continue;
+                Vector3 worldPos = ((Vector3)world) / world.w;
+                Vector3 localPos = worldToVolume.MultiplyPoint(worldPos);
+                Vector3 voxel = localPos / voxelSizeMeters +
+                    new Vector3(volumeSizeX, volumeSizeY, volumeSizeZ) * 0.5f;
+                min = Vector3.Min(min, voxel);
+                max = Vector3.Max(max, voxel);
+                any = true;
+            }
+        }
+
+        if (!any)
+        {
+            _computeShader.SetInts(VoxelOffsetId, 0, 0, 0);
+            return;
+        }
+
+        const int margin = 1;
+        int x0 = Mathf.Clamp(Mathf.FloorToInt(min.x) - margin, 0, volumeSizeX - 1);
+        int y0 = Mathf.Clamp(Mathf.FloorToInt(min.y) - margin, 0, volumeSizeY - 1);
+        int z0 = Mathf.Clamp(Mathf.FloorToInt(min.z) - margin, 0, volumeSizeZ - 1);
+        int x1 = Mathf.Clamp(Mathf.CeilToInt(max.x) + margin, 0, volumeSizeX - 1);
+        int y1 = Mathf.Clamp(Mathf.CeilToInt(max.y) + margin, 0, volumeSizeY - 1);
+        int z1 = Mathf.Clamp(Mathf.CeilToInt(max.z) + margin, 0, volumeSizeZ - 1);
+
+        _computeShader.SetInts(VoxelOffsetId, x0, y0, z0);
+        uint threadX;
+        uint threadY;
+        uint threadZ;
+        _computeShader.GetKernelThreadGroupSizes(_integrateKernel, out threadX, out threadY, out threadZ);
+        _computeShader.Dispatch(_integrateKernel,
+            Mathf.CeilToInt((x1 - x0 + 1) / (float)threadX),
+            Mathf.CeilToInt((y1 - y0 + 1) / (float)threadY),
+            Mathf.CeilToInt((z1 - z0 + 1) / (float)threadZ));
+    }
+
     private void DispatchLinearKernel(int kernel, int itemCount)
     {
         uint threadX;
@@ -677,6 +1282,7 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
     {
         ReleaseTexture(ref _tsdfVolume);
         ReleaseTexture(ref _weightVolume);
+        ReleaseDilationTextures();
         ReleaseReadbackBuffers();
     }
 
@@ -797,7 +1403,37 @@ public sealed class ScanCoverTsdfBranch : MonoBehaviour
             (!hideSurfaceWhileScanning || builder == null || builder.IsFrozen) &&
             (showSurfaceWhenFrozen || builder == null || !builder.IsFrozen);
 
+        // Indirect rendering (QRS GPUMeshRenderer pattern) replaces the CPU
+        // mesh display entirely; the snapshot mesh stays data-only.
+        // Self-heal: if the indirect path keeps producing zero indices
+        // (device shader stripping, extraction failure...), stop hiding the
+        // CPU mesh so the legacy display path takes over again.
+        if (useGpuExtraction && useIndirectRendering && _gpuZeroDrawStreak < 3)
+            shouldShow = false;
+
         SetSurfaceVisible(shouldShow);
+    }
+
+    /// <summary>
+    /// Runtime-created indirect renderer (same pattern as the QuestRoom
+    /// pipeline's runtime AddComponent), so no scene/prefab wiring is needed
+    /// and serialized defaults cannot fight the code.
+    /// </summary>
+    private void EnsureGpuMeshRenderer()
+    {
+        if (!useGpuExtraction || !useIndirectRendering)
+            return;
+
+        if (_gpuMeshRenderer == null)
+        {
+            _gpuMeshRenderer = GetComponent<ScanCoverGpuMeshRenderer>();
+            if (_gpuMeshRenderer == null)
+                _gpuMeshRenderer = gameObject.AddComponent<ScanCoverGpuMeshRenderer>();
+        }
+
+        _gpuMeshRenderer.branch = this;
+        _gpuMeshRenderer.surfaceColor = surfaceColor;
+        _gpuMeshRenderer.renderVisible = true;
     }
 
     private void SetSurfaceVisible(bool visible)

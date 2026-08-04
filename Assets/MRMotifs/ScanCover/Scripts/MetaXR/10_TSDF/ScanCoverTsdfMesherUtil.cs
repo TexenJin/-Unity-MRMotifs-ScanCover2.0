@@ -32,6 +32,21 @@ public static class ScanCoverTsdfMesherUtil
         out int triangleCount,
         out string issue)
     {
+        return BuildMesh(tsdf, weights, volumeSize, metersPerVoxel, minWeight, mesh, out triangleCount, out issue, null, null);
+    }
+
+    public static bool BuildMesh(
+        float[] tsdf,
+        float[] weights,
+        Vector3Int volumeSize,
+        float metersPerVoxel,
+        float minWeight,
+        Mesh mesh,
+        out int triangleCount,
+        out string issue,
+        List<int> cellIndicesOut,
+        List<Vector3> normalsOut = null)
+    {
         triangleCount = 0;
         issue = null;
 
@@ -81,6 +96,7 @@ public static class ScanCoverTsdfMesherUtil
         var triangles = new List<int>(Mathf.Max(2048, cellCount / 2));
         Vector3 halfVolume = 0.5f * new Vector3(volumeSize.x, volumeSize.y, volumeSize.z);
         float[] values = new float[8];
+        bool[] observedFlags = new bool[8];
         Vector3[] positions = new Vector3[8];
 
         for (int z = 0; z < cellSizeZ; z++)
@@ -105,9 +121,15 @@ public static class ScanCoverTsdfMesherUtil
                             return false;
                         }
                         bool observed = weights[dataIndex] >= minWeight;
-                        float value = observed ? tsdf[dataIndex] : 1f;
+                        // QuestRoomScan semantics: unobserved corner = TSDF 0
+                        // (exactly at surface), NOT free space (+1).  This
+                        // prevents phantom zero-crossings at the boundary of
+                        // observed space — the root cause of mesh "skirts"
+                        // and corner gaps.
+                        float value = observed ? tsdf[dataIndex] : 0f;
 
                         values[c] = value;
+                        observedFlags[c] = observed;
                         positions[c] = coord;
                         hasObserved |= observed;
                         hasNegative |= value < 0f;
@@ -118,7 +140,9 @@ public static class ScanCoverTsdfMesherUtil
                         continue;
 
                     Vector3 vertexPosition = Vector3.zero;
+                    Vector3 gradientDirection = Vector3.zero;
                     int crossingCount = 0;
+                    int badCrossingCount = 0;
 
                     for (int edge = 0; edge < 12; edge++)
                     {
@@ -126,6 +150,12 @@ public static class ScanCoverTsdfMesherUtil
                         int b = EdgeCornerB[edge];
                         float va = values[a];
                         float vb = values[b];
+
+                        // QuestRoomScan ClassifyAndEmit: the gradient accumulates
+                        // over ALL 12 edges (not just crossings) and becomes the
+                        // extraction normal used by the normal-aware smoother.
+                        gradientDirection += (positions[a] - positions[b]) * (va - vb);
+
                         if ((va < 0f) == (vb < 0f))
                             continue;
 
@@ -133,12 +163,23 @@ public static class ScanCoverTsdfMesherUtil
                         if (Mathf.Abs(denom) < 1e-6f)
                             continue;
 
+                        if (!observedFlags[a] || !observedFlags[b])
+                            badCrossingCount++;
+
                         float t = Mathf.Clamp01(va / denom);
                         vertexPosition += Vector3.LerpUnclamped(positions[a], positions[b], t);
                         crossingCount++;
                     }
 
-                    if (crossingCount <= 0)
+                    // QuestRoomScan extraction gates:
+                    //   1. numCrossings >= 3 — at least 3 edge crossings to
+                    //      form a reliable surface vertex (filters isolated
+                    //      single-edge noise).
+                    //   2. numCrossings != numBadCrossings — at least one
+                    //      crossing between two confirmed voxels (prevents
+                    //      surfaces from forming at the observed/unobserved
+                    //      boundary).
+                    if (crossingCount < 3 || crossingCount == badCrossingCount)
                         continue;
 
                     vertexPosition /= crossingCount;
@@ -147,6 +188,13 @@ public static class ScanCoverTsdfMesherUtil
                     int vertexIndex = vertices.Count;
                     vertices.Add(vertexPosition);
                     cellVertexIndices[CellIndex(cell, cellSizeX, cellSizeY)] = vertexIndex;
+                    cellIndicesOut?.Add(CellIndex(cell, cellSizeX, cellSizeY));
+                    if (normalsOut != null)
+                    {
+                        normalsOut.Add(gradientDirection.sqrMagnitude > 1e-12f
+                            ? gradientDirection.normalized
+                            : Vector3.up);
+                    }
                 }
             }
         }
@@ -177,6 +225,120 @@ public static class ScanCoverTsdfMesherUtil
         return triangleCount > 0;
     }
 
+    /// <summary>
+    /// HC-Laplacian smoothing, faithful port of QuestRoomScan's
+    /// SmoothVertices kernel:
+    ///   - neighbors are the 6 grid-adjacent cells (via the cell-vertex map),
+    ///     NOT triangle-edge adjacency (which adds diagonal neighbors);
+    ///   - each neighbor is weighted by max(0, dot(n_i, n_j)) so corners
+    ///     (perpendicular normals => ~0 weight) are preserved;
+    ///   - ping-pong buffers (all vertices update simultaneously, no
+    ///     in-place Gauss-Seidel bias).
+    /// QuestRoomScan defaults: lambda=0.33, beta=0.5, 1 iteration.
+    /// </summary>
+    public static void SmoothMesh(
+        List<Vector3> vertices,
+        List<Vector3> normals,
+        List<int> cellIndices,
+        Vector3Int volumeSize,
+        float lambda,
+        float beta,
+        int iterations)
+    {
+        if (vertices == null || normals == null || cellIndices == null ||
+            vertices.Count == 0 || iterations <= 0 ||
+            vertices.Count != normals.Count || vertices.Count != cellIndices.Count)
+            return;
+
+        int cellSizeX = volumeSize.x - 1;
+        int cellSizeY = volumeSize.y - 1;
+        int cellSizeZ = volumeSize.z - 1;
+        if (cellSizeX < 1 || cellSizeY < 1 || cellSizeZ < 1)
+            return;
+
+        // cell flat index -> vertex index (-1 = no vertex)
+        int cellCount = cellSizeX * cellSizeY * cellSizeZ;
+        var cellVertexMap = new int[cellCount];
+        for (int i = 0; i < cellVertexMap.Length; i++)
+            cellVertexMap[i] = -1;
+        for (int i = 0; i < cellIndices.Count; i++)
+        {
+            int cellIdx = cellIndices[i];
+            if (cellIdx >= 0 && cellIdx < cellCount)
+                cellVertexMap[cellIdx] = i;
+        }
+
+        var original = vertices.ToArray();
+        var bufferA = vertices.ToArray();
+        var bufferB = new Vector3[vertices.Count];
+
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            for (int i = 0; i < bufferA.Length; i++)
+            {
+                int cellIdx = cellIndices[i];
+                if (cellIdx < 0 || cellIdx >= cellCount)
+                {
+                    bufferB[i] = bufferA[i];
+                    continue;
+                }
+
+                Vector3Int coord = UnflattenCell(cellIdx, cellSizeX, cellSizeY);
+                Vector3 normal = normals[i];
+
+                Vector3 laplacian = Vector3.zero;
+                float totalWeight = 0f;
+
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    for (int dir = -1; dir <= 1; dir += 2)
+                    {
+                        Vector3Int nc = coord;
+                        nc[axis] += dir;
+                        if (nc.x < 0 || nc.y < 0 || nc.z < 0 ||
+                            nc.x >= cellSizeX || nc.y >= cellSizeY || nc.z >= cellSizeZ)
+                            continue;
+
+                        int nbrVert = cellVertexMap[CellIndex(nc, cellSizeX, cellSizeY)];
+                        if (nbrVert < 0)
+                            continue;
+
+                        float nw = Mathf.Max(0f, Vector3.Dot(normal, normals[nbrVert]));
+                        laplacian += bufferA[nbrVert] * nw;
+                        totalWeight += nw;
+                    }
+                }
+
+                if (totalWeight < 0.001f)
+                {
+                    bufferB[i] = bufferA[i];
+                    continue;
+                }
+
+                laplacian /= totalWeight;
+                Vector3 q = Vector3.Lerp(bufferA[i], laplacian, lambda);
+                // HC correction: pull back toward the original position to
+                // prevent shrinkage.
+                bufferB[i] = q - beta * (q - original[i]);
+            }
+
+            (bufferA, bufferB) = (bufferB, bufferA);
+        }
+
+        for (int i = 0; i < vertices.Count; i++)
+            vertices[i] = bufferA[i];
+    }
+
+    private static Vector3Int UnflattenCell(int cellIdx, int cellSizeX, int cellSizeY)
+    {
+        int sliceXY = cellSizeX * cellSizeY;
+        int z = cellIdx / sliceXY;
+        int rem = cellIdx - z * sliceXY;
+        int y = rem / cellSizeX;
+        int x = rem - y * cellSizeX;
+        return new Vector3Int(x, y, z);
+    }
+
     private static void AddFace(
         float[] tsdf,
         float[] weights,
@@ -193,8 +355,11 @@ public static class ScanCoverTsdfMesherUtil
     {
         int ia = GridIndex(cell, volumeSize);
         int ib = GridIndex(cell + axis, volumeSize);
-        float va = weights[ia] >= minWeight ? tsdf[ia] : 1f;
-        float vb = weights[ib] >= minWeight ? tsdf[ib] : 1f;
+        // QuestRoomScan SampleSDF: low-weight or unobserved = 0 (surface),
+        // not free space (+1).  This prevents quad generation from using
+        // phantom crossings at the observed/unobserved boundary.
+        float va = weights[ia] >= minWeight ? tsdf[ia] : 0f;
+        float vb = weights[ib] >= minWeight ? tsdf[ib] : 0f;
 
         bool negA = va < 0f;
         bool negB = vb < 0f;

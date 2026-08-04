@@ -1,6 +1,9 @@
 #pragma kernel Clear
 #pragma kernel Integrate
 #pragma kernel CopyVolumeToBuffer
+#pragma kernel Prune
+#pragma kernel InitDilation
+#pragma kernel DilationStep
 
 Texture2D<float4> _SourceWorldPositionTexture;
 Texture2D<float4> _SourceWorldNormalTexture;
@@ -10,6 +13,10 @@ RWTexture3D<float> _TsdfVolume;
 RWTexture3D<float> _WeightVolume;
 RWStructuredBuffer<float> _TsdfReadbackBuffer;
 RWStructuredBuffer<float> _WeightReadbackBuffer;
+
+// Dilation textures for occlusion gating (ping-pong).
+RWTexture2D<float4> _DilationSrc;
+RWTexture2D<float4> _DilationDst;
 
 float4 _SourceSize;
 int3 _VolumeSize;
@@ -22,9 +29,21 @@ float _MinNormalFacingDot;
 float _MinDepthMeters;
 float _MaxDepthMeters;
 float _MaxIntegratedWeight;
+// QuestRoomScan-style quality-modulated blending parameters.
+float _BlendRate;
+float _Stability;
+float _WeightGrowth;
+// Occlusion gating parameters.
+int _DilationStepSize;
+float _DilationFocalLength;
+float _DepthDisparityThreshold;
+int _EnableOcclusionGating;
 float4 _CameraWorldPosition;
 float4x4 _WorldToClip;
 float4x4 _VolumeLocalToWorld;
+// Frustum sub-dispatch: Integrate only runs over the frustum∩volume AABB
+// (QRS sparse-dispatch equivalent); zero for full-volume kernels.
+int3 _VoxelOffset;
 
 float3 VoxelIndexToLocalPosition(uint3 id)
 {
@@ -45,10 +64,11 @@ void Clear(uint3 id : SV_DispatchThreadID)
 [numthreads(4, 4, 4)]
 void Integrate(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= (uint)_VolumeSize.x || id.y >= (uint)_VolumeSize.y || id.z >= (uint)_VolumeSize.z)
+    uint3 gid = (uint3)((int3)id + _VoxelOffset);
+    if (gid.x >= (uint)_VolumeSize.x || gid.y >= (uint)_VolumeSize.y || gid.z >= (uint)_VolumeSize.z)
         return;
 
-    float3 voxelLocal = VoxelIndexToLocalPosition(id);
+    float3 voxelLocal = VoxelIndexToLocalPosition(gid);
     float3 voxelWorld = mul(_VolumeLocalToWorld, float4(voxelLocal, 1.0)).xyz;
     float4 clip = mul(_WorldToClip, float4(voxelWorld, 1.0));
     if (clip.w <= 1e-5)
@@ -78,24 +98,151 @@ void Integrate(uint3 id : SV_DispatchThreadID)
 
     float3 rayDir = ray * rsqrt(rayLengthSq);
     float normalDot = -dot(rayDir, normalize(sampleNormal));
-    if (normalDot < _MinNormalFacingDot)
-        return;
+
+    // Occlusion gating (QuestRoomScan #2): reject voxels behind the dilated
+    // depth surface.  The dilated depth propagates the NEAREST observed depth
+    // outward by (truncation + voxelSize), so any voxel deeper than the
+    // dilated value is occluded by a closer surface from this viewpoint.
+    if (_EnableOcclusionGating != 0)
+    {
+        float4 dilatedSample = _DilationSrc.Load(int3(pixel, 0));
+        float dilatedDepth = dilatedSample.z;
+        if (dilatedDepth > 0.0)
+        {
+            float surfaceDistance = sqrt(rayLengthSq);
+            float voxelViewDepth = length(voxelWorld - _CameraWorldPosition.xyz);
+            bool acceptableDisparity =
+                surfaceDistance < dilatedDepth + _DepthDisparityThreshold;
+            bool unoccluded =
+                voxelViewDepth < dilatedDepth || acceptableDisparity;
+            if (!unoccluded) return;
+        }
+    }
 
     float signedDistance = dot(sampleWorld - voxelWorld, rayDir);
-    if (signedDistance <= _TruncationNegativeMeters || signedDistance >= _TruncationPositiveMeters)
+    // QuestRoomScan grazing-angle attenuation: compress SDF for oblique
+    // observations so noisy grazing hits have proportionally less effect.
+    signedDistance *= saturate(normalDot);
+    // Negative truncation only: reject voxels too far BEHIND the observed
+    // surface.  Positive truncation no longer rejects — voxels between the
+    // truncation band and the camera still receive free-space updates so
+    // stale surfaces are actively flipped to air (QuestRoomScan semantics).
+    if (signedDistance <= _TruncationNegativeMeters)
         return;
 
+    // Free-space voxels (clearly in front of the surface) skip the normal
+    // facing gate — carving does not need surface normal agreement.
+    bool empty = signedDistance >= 1.0;
+    if (!empty && normalDot < _MinNormalFacingDot)
+        return;
+
+    // Clamp normalized TSDF: positive side caps at +1 (free space) but the
+    // voxel is still updated, unlike the old code which rejected it.
     float normalizedTsdf = signedDistance / _TruncationPositiveMeters;
     float minNormalized = _TruncationNegativeMeters / _TruncationPositiveMeters;
     normalizedTsdf = clamp(normalizedTsdf, minNormalized, 1.0);
 
-    float oldWeight = _WeightVolume[id];
-    float newWeight = min(oldWeight + 1.0, _MaxIntegratedWeight);
-    float oldTsdf = _TsdfVolume[id];
-    float blendedTsdf = (oldWeight > 0.0) ? ((oldTsdf * oldWeight) + normalizedTsdf) / (oldWeight + 1.0) : normalizedTsdf;
+    // QuestRoomScan-style quality: distance × facing, squared for blend.
+    float3 eyeToVoxel = voxelWorld - _CameraWorldPosition.xyz;
+    float voxelDistance = length(eyeToVoxel);
+    float distanceFactor = saturate(1.0 - voxelDistance / max(_MaxDepthMeters, 1e-4));
+    float facingFactor = saturate(normalDot);
+    float quality = distanceFactor * facingFactor;
+    float q2 = quality * quality;
 
-    _TsdfVolume[id] = blendedTsdf;
-    _WeightVolume[id] = newWeight;
+    float oldWeight = _WeightVolume[gid];
+    float oldTsdf = _TsdfVolume[gid];
+
+    // Seeding: low-quality observations cannot create new voxels.
+    if (oldWeight < 0.001)
+    {
+        if (quality < 0.25) return;
+        _TsdfVolume[gid] = normalizedTsdf;
+        _WeightVolume[gid] = 0.10;
+        return;
+    }
+
+    // Quality-modulated blend: high weight no longer locks in stale values
+    // because maxWeight is low (0.5) and blend stays meaningful (~0.36*q2).
+    float blend = q2 * _BlendRate / (1.0 + oldWeight * _Stability);
+    blend = clamp(blend, 0.0, 0.7);
+    if (blend < 0.005) return;
+
+    _TsdfVolume[gid] = lerp(oldTsdf, normalizedTsdf, blend);
+    _WeightVolume[gid] = min(oldWeight + q2 * _WeightGrowth, _MaxIntegratedWeight);
+}
+
+// QuestRoomScan periodic prune: reset voxels with very low weight (seeded
+// but never confirmed) back to empty so they cannot form ghost geometry.
+[numthreads(4, 4, 4)]
+void Prune(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_VolumeSize.x || id.y >= (uint)_VolumeSize.y || id.z >= (uint)_VolumeSize.z)
+        return;
+
+    float weight = _WeightVolume[id];
+    if (weight > 0.0 && weight < 0.05)
+    {
+        _TsdfVolume[id] = 1.0;
+        _WeightVolume[id] = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Jump-flood depth dilation (QuestRoomScan occlusion gating).
+// Propagates the NEAREST observed depth outward so that voxels behind the
+// closest surface can be identified and rejected during integration.
+// ---------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void InitDilation(uint2 coord : SV_DispatchThreadID)
+{
+    float4 meta = _SourceObservationMetaTexture.Load(int3(coord, 0));
+    bool valid = meta.x > 0.5 && meta.z > 0.0;
+    float depth = valid ? meta.z : 0.0;
+    float4 val = float4((float2)coord, depth, 0);
+    _DilationSrc[coord] = val;
+    _DilationDst[coord] = val;
+}
+
+static const int2 kDilationOffsets[8] =
+{
+    int2(1, 0), int2(1, 1), int2(0, 1), int2(-1, 1),
+    int2(-1, 0), int2(-1, -1), int2(0, -1), int2(1, -1)
+};
+
+[numthreads(8, 8, 1)]
+void DilationStep(uint2 coord : SV_DispatchThreadID)
+{
+    float4 val = _DilationSrc[coord];
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 srcCoord = (int2)coord + kDilationOffsets[i] * _DilationStepSize;
+        if (srcCoord.x < 0 || srcCoord.y < 0 ||
+            srcCoord.x >= (int)_SourceSize.x || srcCoord.y >= (int)_SourceSize.y)
+            continue;
+
+        float4 srcVal = _DilationSrc[(uint2)srcCoord];
+        float srcDepth = srcVal.z;
+        if (srcDepth <= 0.0) continue;
+
+        // Pixel size in world units at the candidate's depth.
+        float pixelSize = 2.0 * srcDepth /
+            (_DilationFocalLength * _SourceSize.x);
+        float radiusMeters = _TruncationPositiveMeters + _VoxelSize;
+        float radiusPixels = radiusMeters / max(pixelSize, 1e-6);
+
+        float2 diff = srcVal.xy - (float2)coord;
+        bool withinRadius = dot(diff, diff) < radiusPixels * radiusPixels;
+        bool newMinimum = srcVal.z < val.z;
+
+        if (withinRadius && newMinimum)
+            val = srcVal;
+    }
+
+    _DilationDst[coord] = val;
 }
 
 [numthreads(64, 1, 1)]

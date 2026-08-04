@@ -794,15 +794,15 @@ MonoBehaviour:
   preferredEye: 1
   autoResolveRefs: 1
   integrateWhileScanning: 1
-  integrateIntervalSeconds: 0.2
-  voxelSizeMeters: 0.1
-  volumeSizeX: 96
-  volumeSizeY: 48
-  volumeSizeZ: 96
+  integrateIntervalSeconds: 0.0333
+  voxelSizeMeters: 0.05
+  volumeSizeX: 192
+  volumeSizeY: 96
+  volumeSizeZ: 192
   volumeCenterLocal: {x: 0, y: 1.4, z: 0}
-  truncationPositiveMeters: 0.35
-  truncationNegativeMeters: -0.15
-  maxIntegratedWeight: 24
+  truncationPositiveMeters: 0.15
+  truncationNegativeMeters: -0.1
+  maxIntegratedWeight: 0.5
   minObservationConfidence: 0.18
   minNormalFacingDot: 0.2
   minDepthMeters: 0.35
@@ -812,11 +812,11 @@ MonoBehaviour:
   showSurfaceWhenFrozen: 1
   buildCollider: 0
   minTrianglesToShow: 24
-  minObservedWeightForMeshing: 0.5
+  minObservedWeightForMeshing: 0.08
   surfaceColor: {r: 0.18, g: 0.58, b: 1, a: 0.85}
   mergeVoxelShell: 0
   voxelShellMinHits: 2
-  voxelShellSkipIfTsdfWeightAtLeast: 1.5
+  voxelShellSkipIfTsdfWeightAtLeast: 0.08
   voxelShellInflateMeters: 0.002
   debugLog: 1
 --- !u!1 &5710583793539256057

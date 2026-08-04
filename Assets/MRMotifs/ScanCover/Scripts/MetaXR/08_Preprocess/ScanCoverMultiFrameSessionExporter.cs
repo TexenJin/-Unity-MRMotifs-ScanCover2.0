@@ -549,6 +549,10 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
     private Text _hudText;
     private Image _hudPanelImage;
     private float _nextHudRefreshTime;
+    // 网格链诊断行：2s 节流查找，判空即跳过（两链都是运行时创建）。
+    private ScanCoverTsdfBranch _diagTsdfBranch;
+    private ScanCoverQuestRoomSurfaceNetsPipeline _diagQuestRoomPipeline;
+    private float _nextDiagLookupTime;
     private GameObject _roomRawCoverageViewFrameRoot;
     private LineRenderer _roomRawCoverageViewFrameLine;
     private Material _roomRawCoverageViewFrameMaterial;
@@ -3878,6 +3882,7 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.Append("  F9/F10: editor").AppendLine();
         builder.Append("Frames: ").Append(_capturedFrameCount).Append('/').Append(maxFramesPerSession)
             .Append("  DepthFrame: ").Append(depthGridPointCloud != null ? depthGridPointCloud.CurrentSurfaceMeshFrameIndex : -1).AppendLine();
+        AppendMeshChainDiagnosticLine(builder);
 
         string captureMode = ShouldUseRoomRawCoverageHudOnlyCapture()
             ? "view-window raw depth"
@@ -3950,6 +3955,69 @@ public sealed class ScanCoverMultiFrameSessionExporter : MonoBehaviour
         builder.Append("Dir: ").Append(directory);
 
         _hudText.text = builder.ToString();
+    }
+
+    /// <summary>
+    /// 一瞥定位"扫描在跑但无网格"：A 链（积分/GPU三角形/间接渲染状态）+
+    /// B 链（积分/顶点/线索引/双眼配对 + 各眼 issue）。只读、判空即略。
+    /// </summary>
+    private void AppendMeshChainDiagnosticLine(StringBuilder builder)
+    {
+        if (Time.unscaledTime >= _nextDiagLookupTime)
+        {
+            _nextDiagLookupTime = Time.unscaledTime + 2f;
+            if (_diagTsdfBranch == null)
+                _diagTsdfBranch = FindFirstObjectByType<ScanCoverTsdfBranch>(FindObjectsInactive.Include);
+            if (_diagQuestRoomPipeline == null)
+                _diagQuestRoomPipeline = FindFirstObjectByType<ScanCoverQuestRoomSurfaceNetsPipeline>(FindObjectsInactive.Include);
+        }
+
+        if (_diagTsdfBranch == null && _diagQuestRoomPipeline == null)
+            return;
+
+        builder.Append("网格 A[");
+        if (_diagTsdfBranch != null)
+        {
+            builder.Append("积分").Append(_diagTsdfBranch.IntegrationCount)
+                .Append(" 三角").Append(_diagTsdfBranch.LastGpuDrawIndexCount)
+                .Append(" 间接").Append(_diagTsdfBranch.useIndirectRendering ? "开" : "关");
+            if (_diagTsdfBranch.IndirectRenderingSuspect)
+                builder.Append("(空→已回退CPU)");
+            string gpuIssue = _diagTsdfBranch.GpuRendererIssue;
+            if (!string.IsNullOrEmpty(gpuIssue))
+                builder.Append(' ').Append(gpuIssue);
+        }
+        else
+        {
+            builder.Append("无");
+        }
+
+        builder.Append("] B[");
+        if (_diagQuestRoomPipeline != null)
+        {
+            builder.Append("积分").Append(_diagQuestRoomPipeline.IntegrationCount)
+                .Append(" 顶点").Append(_diagQuestRoomPipeline.LastVertexCount)
+                .Append(" 线").Append(_diagQuestRoomPipeline.LastLineIndexCount)
+                .Append(" 双眼").Append(_diagQuestRoomPipeline.StereoPairIntegrationCount)
+                .Append('/').Append(_diagQuestRoomPipeline.PartialStereoIntegrationCount);
+            if (!string.IsNullOrEmpty(_diagQuestRoomPipeline.LastIssue))
+                builder.Append(' ').Append(_diagQuestRoomPipeline.LastIssue);
+            if (_diagQuestRoomPipeline.LastVertexCount == 0)
+            {
+                string topReject = _diagQuestRoomPipeline.GetTopRejectReason();
+                if (topReject != null)
+                    builder.Append(" 拒:").Append(topReject);
+                builder.Append(" 预L[").Append(_diagQuestRoomPipeline.GetLeftPrepStatsCompact())
+                    .Append("] 预R[").Append(_diagQuestRoomPipeline.GetRightPrepStatsCompact())
+                    .Append(']');
+            }
+        }
+        else
+        {
+            builder.Append("无");
+        }
+
+        builder.Append(']').AppendLine();
     }
 
     private void RefreshQuestCloneCaptureHudText()

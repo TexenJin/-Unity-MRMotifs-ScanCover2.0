@@ -1,6 +1,7 @@
 using Meta.XR.EnvironmentDepth;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.Rendering;
 
 [DefaultExecutionOrder(-45)]
 [DisallowMultipleComponent]
@@ -30,6 +31,17 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
 
     [Header("Smoothing")]
     [SerializeField, Min(0f)] private float smoothingDepthDeltaMeters = 0.08f;
+
+    [Header("Bilateral depth filter (QRS-style, depth-only guide)")]
+    [SerializeField] private bool useBilateralDepthFilter = true;
+    [SerializeField, Range(0.5f, 4f)] private float bilateralSigmaSpatial = 1.5f;
+    [SerializeField, Range(0.005f, 0.2f)] private float bilateralSigmaDepthMeters = 0.03f;
+    [SerializeField, Range(1, 4)] private int bilateralFilterRadius = 2;
+
+    [Header("RGB guide (QRS joint bilateral, passthrough camera)")]
+    [Tooltip("开启后双边滤波加入RGB颜色项（QRS BilateralDepthFilter同构）：颜色一致区大胆平滑、颜色边缘保边。PCA帧不可用时自动退回纯深度项")]
+    [SerializeField] private bool useRgbGuide = true;
+    [SerializeField, Range(0.02f, 0.5f)] private float bilateralSigmaColor = 0.1f;
 
     [Header("Debug")]
     [SerializeField] private bool debugLog;
@@ -67,17 +79,27 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     private static readonly int MinLinearDepthMetersId = Shader.PropertyToID("_MinLinearDepthMeters");
     private static readonly int MaxLinearDepthMetersId = Shader.PropertyToID("_MaxLinearDepthMeters");
     private static readonly int SmoothingDepthDeltaMetersId = Shader.PropertyToID("_SmoothingDepthDeltaMeters");
+    private static readonly int UseBilateralDepthFilterId = Shader.PropertyToID("_UseBilateralDepthFilter");
+    private static readonly int BilateralSigmaSpatialId = Shader.PropertyToID("_BilateralSigmaSpatial");
+    private static readonly int BilateralSigmaDepthMetersId = Shader.PropertyToID("_BilateralSigmaDepthMeters");
+    private static readonly int BilateralFilterRadiusId = Shader.PropertyToID("_BilateralFilterRadius");
+    private static readonly int RgbGuideId = Shader.PropertyToID("_RGBGuide");
+    private static readonly int UseRgbGuideId = Shader.PropertyToID("_UseRgbGuide");
+    private static readonly int BilateralSigmaColorId = Shader.PropertyToID("_BilateralSigmaColor");
     private static readonly int CameraWorldPositionId = Shader.PropertyToID("_CameraWorldPosition");
     private static readonly int WorldPositionRawTextureId = Shader.PropertyToID("_WorldPositionRawTexture");
     private static readonly int WorldPositionTextureId = Shader.PropertyToID("_WorldPositionTexture");
     private static readonly int WorldNormalTextureId = Shader.PropertyToID("_WorldNormalTexture");
     private static readonly int WorldNormalNeighbourTextureId = Shader.PropertyToID("_WorldNormalNeighbourTexture");
     private static readonly int ObservationMetaTextureId = Shader.PropertyToID("_ObservationMetaTexture");
+    private static readonly int PrepStatsId = Shader.PropertyToID("_PrepStats");
     private static readonly int GlobalWorldPositionTextureId = Shader.PropertyToID("_ScanCoverDepthWorldPositionTexture");
     private static readonly int GlobalWorldNormalTextureId = Shader.PropertyToID("_ScanCoverDepthWorldNormalTexture");
     private static readonly int GlobalObservationMetaTextureId = Shader.PropertyToID("_ScanCoverDepthObservationMetaTexture");
 
     private readonly Matrix4x4[] _inverseReprojectionMatrices = new Matrix4x4[2];
+    private ScanCoverRgbGuideProvider _rgbGuideProvider;
+    private ScanCoverDepthPreprocessor _rgbGuideTemplate;
     private RenderTexture _worldPositionRawTexture;
     private RenderTexture _worldPositionTexture;
     private RenderTexture _worldNormalTexture;
@@ -87,6 +109,15 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     private int _kernelIndex = -1;
     private int _neighbourNormalKernelIndex = -1;
     private bool _isReady;
+
+    // Write census (read-only diagnostic): mirrors what CSMain actually did on
+    // the GPU so a dead dispatch is distinguishable from dead content.
+    // Slots: 0=executed threads 1=valid pixels 2=invalid pixels 3=valid normals.
+    private GraphicsBuffer _prepStats;
+    private bool _prepStatsReadbackPending;
+    public uint[] LastPrepStats { get; } = new uint[4];
+    public bool HasPrepStats { get; private set; }
+    private static readonly uint[] ZeroPrepStats = new uint[4];
 
     private void Awake()
     {
@@ -175,6 +206,15 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         computeShader.SetFloat(MinLinearDepthMetersId, minLinearDepthMeters);
         computeShader.SetFloat(MaxLinearDepthMetersId, maxLinearDepthMeters);
         computeShader.SetFloat(SmoothingDepthDeltaMetersId, smoothingDepthDeltaMeters);
+        computeShader.SetInt(UseBilateralDepthFilterId, useBilateralDepthFilter ? 1 : 0);
+        computeShader.SetFloat(BilateralSigmaSpatialId, bilateralSigmaSpatial);
+        computeShader.SetFloat(BilateralSigmaDepthMetersId, bilateralSigmaDepthMeters);
+        computeShader.SetInt(BilateralFilterRadiusId, bilateralFilterRadius);
+        Texture rgbGuideFrame = ResolveRgbGuideFrame();
+        computeShader.SetInt(UseRgbGuideId, rgbGuideFrame != null ? 1 : 0);
+        computeShader.SetFloat(BilateralSigmaColorId, bilateralSigmaColor);
+        if (rgbGuideFrame != null)
+            computeShader.SetTexture(_kernelIndex, RgbGuideId, rgbGuideFrame);
         Camera sourceCamera = Camera.main;
         Vector3 cameraWorldPosition = ResolveSelectedEyeWorldPosition(sourceCamera, out bool hasEyePosition);
         HasLastDispatchEyePosition = hasEyePosition;
@@ -189,6 +229,12 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         computeShader.SetTexture(_kernelIndex, WorldNormalTextureId, _worldNormalTexture);
         computeShader.SetTexture(_kernelIndex, WorldNormalNeighbourTextureId, _worldNormalNeighbourTexture);
         computeShader.SetTexture(_kernelIndex, ObservationMetaTextureId, _observationMetaTexture);
+        if (_prepStats == null)
+        {
+            _prepStats = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 4, sizeof(uint));
+            _prepStats.SetData(ZeroPrepStats);
+        }
+        computeShader.SetBuffer(_kernelIndex, PrepStatsId, _prepStats);
 
         uint threadX;
         uint threadY;
@@ -201,6 +247,7 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         computeShader.SetVector(OutputSizeId, new Vector4(_outputResolution.x, _outputResolution.y, 0f, 0f));
         computeShader.SetTexture(_neighbourNormalKernelIndex, WorldPositionRawTextureId, _worldPositionRawTexture);
         computeShader.SetTexture(_neighbourNormalKernelIndex, WorldPositionTextureId, _worldPositionTexture);
+        computeShader.SetTexture(_neighbourNormalKernelIndex, WorldNormalTextureId, _worldNormalTexture);
         computeShader.SetTexture(_neighbourNormalKernelIndex, WorldNormalNeighbourTextureId, _worldNormalNeighbourTexture);
         computeShader.GetKernelThreadGroupSizes(_neighbourNormalKernelIndex, out threadX, out threadY, out threadZ);
         dispatchX = Mathf.CeilToInt(_outputResolution.x / (float)threadX);
@@ -250,6 +297,13 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         minLinearDepthMeters = productionTemplate.minLinearDepthMeters;
         maxLinearDepthMeters = productionTemplate.maxLinearDepthMeters;
         smoothingDepthDeltaMeters = productionTemplate.smoothingDepthDeltaMeters;
+        useBilateralDepthFilter = productionTemplate.useBilateralDepthFilter;
+        bilateralSigmaSpatial = productionTemplate.bilateralSigmaSpatial;
+        bilateralSigmaDepthMeters = productionTemplate.bilateralSigmaDepthMeters;
+        bilateralFilterRadius = productionTemplate.bilateralFilterRadius;
+        useRgbGuide = productionTemplate.useRgbGuide;
+        bilateralSigmaColor = productionTemplate.bilateralSigmaColor;
+        _rgbGuideTemplate = productionTemplate;
         debugLog = false;
         ResolveRefs();
         ResolveKernel();
@@ -265,6 +319,72 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     public void SetRefreshEveryFrame(bool enabled)
     {
         refreshEveryFrame = enabled;
+    }
+
+    /// <summary>
+    /// Returns the passthrough RGB frame for the joint bilateral filter, or
+    /// null when unavailable (the shader then runs depth-only).  The provider
+    /// is runtime-created on first use (no scene wiring); a stereo companion
+    /// reuses its template's provider so both eyes share ONE PCA instance —
+    /// same as QRS feeding both eyes from a single RGB guide.
+    /// </summary>
+    private Texture ResolveRgbGuideFrame()
+    {
+        if (!useRgbGuide)
+            return null;
+
+        if (_rgbGuideProvider == null && _rgbGuideTemplate != null)
+            _rgbGuideProvider = _rgbGuideTemplate._rgbGuideProvider;
+
+        if (_rgbGuideProvider == null)
+        {
+            _rgbGuideProvider = GetComponent<ScanCoverRgbGuideProvider>();
+            if (_rgbGuideProvider == null)
+                _rgbGuideProvider = gameObject.AddComponent<ScanCoverRgbGuideProvider>();
+            _rgbGuideProvider.SetCameraPosition(sourceEye == SourceEye.Left
+                ? Meta.XR.PassthroughCameraAccess.CameraPositionType.Left
+                : Meta.XR.PassthroughCameraAccess.CameraPositionType.Right);
+            _rgbGuideProvider.StartCapture();
+        }
+
+        return _rgbGuideProvider.IsReady ? _rgbGuideProvider.CurrentFrame : null;
+    }
+
+    /// <summary>异步回读 CSMain 写入普查；由外部驱动者按慢节奏调用（本组件可能在禁用物体上，Update 不跑）。</summary>
+    public void RequestPrepStatsReadback()
+    {
+        if (_prepStats == null || _prepStatsReadbackPending)
+            return;
+        _prepStatsReadbackPending = true;
+        AsyncGPUReadback.Request(_prepStats, OnPrepStatsReadback);
+    }
+
+    private void OnPrepStatsReadback(AsyncGPUReadbackRequest request)
+    {
+        _prepStatsReadbackPending = false;
+        if (!this || request.hasError) return;
+        var values = request.GetData<uint>();
+        int count = Mathf.Min(values.Length, LastPrepStats.Length);
+        for (int i = 0; i < count; i++)
+            LastPrepStats[i] = values[i];
+        HasPrepStats = true;
+    }
+
+    private static string FormatPrepCount(uint value)
+    {
+        if (value >= 1000000) return (value / 1000000f).ToString("F1") + "M";
+        if (value >= 1000) return (value / 1000f).ToString("F1") + "k";
+        return value.ToString();
+    }
+
+    /// <summary>如 "线程77.8M 有效61.2M 无效16.6M 法线60.1M"；无数据返回 "无数据"。</summary>
+    public string GetPrepStatsCompact()
+    {
+        if (!HasPrepStats) return "无数据";
+        return "线程" + FormatPrepCount(LastPrepStats[0]) +
+               " 有效" + FormatPrepCount(LastPrepStats[1]) +
+               " 无效" + FormatPrepCount(LastPrepStats[2]) +
+               " 法线" + FormatPrepCount(LastPrepStats[3]);
     }
 
     public bool TryGetOutputs(
@@ -302,6 +422,12 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         ReleaseTexture(ref _worldNormalTexture);
         ReleaseTexture(ref _worldNormalNeighbourTexture);
         ReleaseTexture(ref _observationMetaTexture);
+        if (_prepStats != null)
+        {
+            _prepStats.Release();
+            _prepStats = null;
+        }
+        HasPrepStats = false;
         _outputResolution = Vector2Int.zero;
     }
 

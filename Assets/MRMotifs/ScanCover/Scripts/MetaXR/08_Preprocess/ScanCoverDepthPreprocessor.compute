@@ -1,5 +1,7 @@
 #pragma kernel CSMain
 #pragma kernel CSNeighbourNormals
+#pragma kernel CSInitDilation
+#pragma kernel CSDilateStep
 
 Texture2DArray<float> _SourceDepthTexture;
 RWTexture2D<float4> _WorldPositionRawTexture;
@@ -7,6 +9,13 @@ RWTexture2D<float4> _WorldPositionTexture;
 RWTexture2D<float4> _WorldNormalTexture;
 RWTexture2D<float4> _WorldNormalNeighbourTexture;
 RWTexture2D<float4> _ObservationMetaTexture;
+// Write census (read-only diagnostic, never feeds back into processing):
+//   0=executed threads  1=valid pixels  2=invalid pixels  3=valid normals
+RWStructuredBuffer<uint> _PrepStats;
+// Jump-flood minimum-range dilation (ported from QuestRoomScan
+// DepthDilation.compute). xy = source pixel, z = linear range, w unused.
+RWTexture2D<float4> _DilationSrc;
+RWTexture2D<float4> _DilationDest;
 
 float4x4 _InverseReprojectionMatrices[2];
 float4 _SourceSize;
@@ -19,6 +28,25 @@ float _DepthEdgeSoftness;
 float _MinLinearDepthMeters;
 float _MaxLinearDepthMeters;
 float _SmoothingDepthDeltaMeters;
+// Depth-only joint bilateral filter (ported from QuestRoomScan
+// BilateralDepthFilter.compute, RGB guide dropped). QRS defaults:
+// sigmaSpatial=3.0 @ ~512px depth, sigmaDepth=0.02m, radius=2.
+// Our output grid is 160x160, so the adapted default sigmaSpatial is 1.5.
+int _UseBilateralDepthFilter;
+float _BilateralSigmaSpatial;
+float _BilateralSigmaDepthMeters;
+int _BilateralFilterRadius;
+// RGB-guided joint bilateral (QRS BilateralDepthFilter.compute:8,30,56-58).
+// When a passthrough camera frame is bound, color edges preserve depth
+// edges; the depth-range term stays as the robustness fallback.
+Texture2D<float4> _RGBGuide;
+SamplerState sampler_RGBGuide;
+int _UseRgbGuide;
+float _BilateralSigmaColor;
+// Dilation (QRS: radius = voxDist + voxSize = 0.15 + 0.05 = 0.2m)
+int _DilateStepSize;
+float _DilationRadiusMeters;
+float _DilationFocal;
 
 float SampleDepth01(int2 outputPixel)
 {
@@ -107,6 +135,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (id.x >= (uint)_OutputSize.x || id.y >= (uint)_OutputSize.y)
         return;
 
+    InterlockedAdd(_PrepStats[0], 1);
     int2 pixel = int2(id.xy);
     float3 centerWorld;
     float centerDepth01;
@@ -115,6 +144,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     if (!centerValid)
     {
+        InterlockedAdd(_PrepStats[2], 1);
         _WorldPositionRawTexture[pixel] = 0.0.xxxx;
         _WorldPositionTexture[pixel] = 0.0.xxxx;
         _WorldNormalTexture[pixel] = float4(0.0, 0.0, 0.0, 0.0);
@@ -153,34 +183,89 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         upValid ? upDepth01 : centerDepth01);
 
     float3 filteredWorld = centerWorld;
-    float filteredWeight = 1.0;
-    float depthDeltaThreshold = max(0.0, _SmoothingDepthDeltaMeters);
 
-    if (leftValid && abs(leftLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+    if (_UseBilateralDepthFilter != 0)
     {
-        filteredWorld += leftWorld;
-        filteredWeight += 1.0;
-    }
+        // QRS-style bilateral: spatial gaussian x linear-depth gaussian.
+        // Flying pixels between two surfaces get |depthDelta| >> sigmaDepth
+        // and are suppressed instead of being averaged into the surface.
+        float3 accum = 0.0.xxx;
+        float weightSum = 0.0;
+        float invSigmaS2 = -0.5 / max(1e-6, _BilateralSigmaSpatial * _BilateralSigmaSpatial);
+        float invSigmaD2 = -0.5 / max(1e-8, _BilateralSigmaDepthMeters * _BilateralSigmaDepthMeters);
+        int radius = clamp(_BilateralFilterRadius, 1, 4);
 
-    if (rightValid && abs(rightLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+        // RGB guide (QRS joint bilateral): same-UV mapping, assumes roughly
+        // co-registered FOVs.  Color-uniform regions smooth aggressively,
+        // color edges preserve the depth edge.
+        float3 centerColor = 0.0.xxx;
+        float invSigmaC2 = 0.0;
+        if (_UseRgbGuide != 0)
+        {
+            float2 centerUv = (float2(pixel) + 0.5) / max(_OutputSize.xy, float2(1.0, 1.0));
+            centerColor = _RGBGuide.SampleLevel(sampler_RGBGuide, centerUv, 0).rgb;
+            invSigmaC2 = -0.5 / max(1e-6, _BilateralSigmaColor * _BilateralSigmaColor);
+        }
+
+        for (int dy = -radius; dy <= radius; dy++)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                float3 tapWorld;
+                float tapDepth01;
+                float tapLinearDepthMeters;
+                if (!TryReconstructWorldPosition(pixel + int2(dx, dy), tapWorld, tapDepth01, tapLinearDepthMeters))
+                    continue;
+                float depthDelta = tapLinearDepthMeters - centerLinearDepthMeters;
+                float spatialWeight = exp((float)(dx * dx + dy * dy) * invSigmaS2);
+                float depthWeight = exp(depthDelta * depthDelta * invSigmaD2);
+                float tapWeight = spatialWeight * depthWeight;
+                if (_UseRgbGuide != 0)
+                {
+                    float2 tapUv = (float2(pixel + int2(dx, dy)) + 0.5) / max(_OutputSize.xy, float2(1.0, 1.0));
+                    float3 tapColor = _RGBGuide.SampleLevel(sampler_RGBGuide, tapUv, 0).rgb;
+                    float3 colorDelta = centerColor - tapColor;
+                    tapWeight *= exp(dot(colorDelta, colorDelta) * invSigmaC2);
+                }
+                accum += tapWorld * tapWeight;
+                weightSum += tapWeight;
+            }
+        }
+        if (weightSum > 1e-6)
+            filteredWorld = accum / weightSum;
+    }
+    else
     {
-        filteredWorld += rightWorld;
-        filteredWeight += 1.0;
-    }
+        // Legacy cross-box smoothing (pre-bilateral path, kept for A/B).
+        float filteredWeight = 1.0;
+        float depthDeltaThreshold = max(0.0, _SmoothingDepthDeltaMeters);
 
-    if (downValid && abs(downLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
-    {
-        filteredWorld += downWorld;
-        filteredWeight += 1.0;
-    }
+        if (leftValid && abs(leftLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+        {
+            filteredWorld += leftWorld;
+            filteredWeight += 1.0;
+        }
 
-    if (upValid && abs(upLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
-    {
-        filteredWorld += upWorld;
-        filteredWeight += 1.0;
-    }
+        if (rightValid && abs(rightLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+        {
+            filteredWorld += rightWorld;
+            filteredWeight += 1.0;
+        }
 
-    filteredWorld /= filteredWeight;
+        if (downValid && abs(downLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+        {
+            filteredWorld += downWorld;
+            filteredWeight += 1.0;
+        }
+
+        if (upValid && abs(upLinearDepthMeters - centerLinearDepthMeters) <= depthDeltaThreshold)
+        {
+            filteredWorld += upWorld;
+            filteredWeight += 1.0;
+        }
+
+        filteredWorld /= filteredWeight;
+    }
 
     float neighborSupport = (leftValid ? 1.0 : 0.0) + (rightValid ? 1.0 : 0.0) + (downValid ? 1.0 : 0.0) + (upValid ? 1.0 : 0.0);
     confidence *= saturate((neighborSupport + 1.0) / 5.0);
@@ -205,6 +290,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     _WorldPositionTexture[pixel] = float4(filteredWorld, 1.0);
     _WorldNormalTexture[pixel] = float4(worldNormal, normalValid);
     _ObservationMetaTexture[pixel] = float4(1.0, confidence, centerLinearDepthMeters, normalValid);
+    InterlockedAdd(_PrepStats[1], 1);
+    if (normalValid > 0.5)
+        InterlockedAdd(_PrepStats[3], 1);
 }
 
 float3 SafeNeighbourNormal(float3 horizontal, float3 vertical)
@@ -230,19 +318,140 @@ void CSNeighbourNormals(uint3 id : SV_DispatchThreadID)
 
     int width = max(1, (int)_OutputSize.x);
     int height = max(1, (int)_OutputSize.y);
-    int2 leftPixel = int2(max(pixel.x - 1, 0), pixel.y);
-    int2 rightPixel = int2(min(pixel.x + 1, width - 1), pixel.y);
-    int2 downPixel = int2(pixel.x, max(pixel.y - 1, 0));
-    int2 upPixel = int2(pixel.x, min(pixel.y + 1, height - 1));
 
-    float4 left = _WorldPositionTexture[leftPixel];
-    float4 right = _WorldPositionTexture[rightPixel];
-    float4 down = _WorldPositionTexture[downPixel];
-    float4 up = _WorldPositionTexture[upPixel];
-    bool supported = left.w > 0.0 && right.w > 0.0 && down.w > 0.0 && up.w > 0.0;
-    float3 normal = supported
-        ? SafeNeighbourNormal(right.xyz - left.xyz, up.xyz - down.xyz)
+    if (_UseBilateralDepthFilter != 0)
+    {
+        // QRS DepthNormals.compute semantics: normals come ONLY from the
+        // filtered positions, at +/-2px (QRS uses +2px forward differences).
+        // Partial support falls back to one-sided differences against the
+        // filtered centre — the pass-1 raw-neighbour normal is never kept,
+        // because junction normals built from raw edge pixels were feeding
+        // garbage into the TSDF facing gate (dents/bumps at wall junctions).
+        int2 leftPixel = int2(max(pixel.x - 2, 0), pixel.y);
+        int2 rightPixel = int2(min(pixel.x + 2, width - 1), pixel.y);
+        int2 downPixel = int2(pixel.x, max(pixel.y - 2, 0));
+        int2 upPixel = int2(pixel.x, min(pixel.y + 2, height - 1));
+
+        float4 centre = _WorldPositionTexture[pixel];
+        float4 left = _WorldPositionTexture[leftPixel];
+        float4 right = _WorldPositionTexture[rightPixel];
+        float4 down = _WorldPositionTexture[downPixel];
+        float4 up = _WorldPositionTexture[upPixel];
+
+        bool leftValid = leftPixel.x != pixel.x && left.w > 0.0;
+        bool rightValid = rightPixel.x != pixel.x && right.w > 0.0;
+        bool downValid = downPixel.y != pixel.y && down.w > 0.0;
+        bool upValid = upPixel.y != pixel.y && up.w > 0.0;
+
+        float horizontalValid;
+        float verticalValid;
+        float3 horizontalDerivative = SelectDerivative(leftValid, left.xyz, rightValid, right.xyz, centre.xyz, horizontalValid);
+        float3 verticalDerivative = SelectDerivative(downValid, down.xyz, upValid, up.xyz, centre.xyz, verticalValid);
+
+        float3 normal = 0.0.xxx;
+        float valid = 0.0;
+        if (horizontalValid > 0.5 && verticalValid > 0.5)
+        {
+            normal = SafeNeighbourNormal(horizontalDerivative, verticalDerivative);
+            valid = dot(normal, normal) > 0.5 ? 1.0 : 0.0;
+        }
+
+        _WorldNormalNeighbourTexture[pixel] = float4(normal, valid);
+        if (valid > 0.5)
+        {
+            // Invariant: meta.w==1 (pass 1) must never pair with a zero
+            // normal — ScanCoverTSDF.compute normalize()s it unchecked.
+            // Degenerate pixels (isolated slivers) keep the pass-1 normal;
+            // with the one-sided fallback above that population is ~zero.
+            _WorldNormalTexture[pixel] = float4(normal, 1.0);
+        }
+        return;
+    }
+
+    // Legacy path (bilateral off, kept for A/B): +/-1px, all-4-required,
+    // diagnostic neighbour texture only — pass-1 normal stays authoritative.
+    int2 leftPixelL = int2(max(pixel.x - 1, 0), pixel.y);
+    int2 rightPixelL = int2(min(pixel.x + 1, width - 1), pixel.y);
+    int2 downPixelL = int2(pixel.x, max(pixel.y - 1, 0));
+    int2 upPixelL = int2(pixel.x, min(pixel.y + 1, height - 1));
+
+    float4 leftL = _WorldPositionTexture[leftPixelL];
+    float4 rightL = _WorldPositionTexture[rightPixelL];
+    float4 downL = _WorldPositionTexture[downPixelL];
+    float4 upL = _WorldPositionTexture[upPixelL];
+    bool supported = leftL.w > 0.0 && rightL.w > 0.0 && downL.w > 0.0 && upL.w > 0.0;
+    float3 normalL = supported
+        ? SafeNeighbourNormal(rightL.xyz - leftL.xyz, upL.xyz - downL.xyz)
         : 0.0.xxx;
-    float valid = dot(normal, normal) > 0.5 ? 1.0 : 0.0;
-    _WorldNormalNeighbourTexture[pixel] = float4(normal, valid);
+    float validL = dot(normalL, normalL) > 0.5 ? 1.0 : 0.0;
+    _WorldNormalNeighbourTexture[pixel] = float4(normalL, validL);
+}
+
+// ---------------------------------------------------------------------------
+// Jump-flood minimum-range dilation (QRS DepthDilation.compute port).
+// Propagates the NEAREST valid linear range within a world-space radius
+// (_DilationRadiusMeters) so the TSDF integrator can reject voxels that sit
+// in the occlusion shadow of a closer surface edge.
+// QRS converts the radius to pixels via focal length; ours runs on the
+// downsampled output grid, so the focal/width pair refers to this grid.
+// ---------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSInitDilation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_OutputSize.x || id.y >= (uint)_OutputSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float4 meta = _ObservationMetaTexture[pixel];
+    float range = meta.x > 0.5 ? meta.z : 0.0;
+    float4 val = float4((float2)pixel, range, 0.0);
+    _DilationSrc[pixel] = val;
+    _DilationDest[pixel] = val;
+}
+
+static const int2 DilationOffsets[8] =
+{
+    int2(1, 0),
+    int2(1, 1),
+    int2(0, 1),
+    int2(-1, 1),
+    int2(-1, 0),
+    int2(-1, -1),
+    int2(0, -1),
+    int2(1, -1)
+};
+
+[numthreads(8, 8, 1)]
+void CSDilateStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_OutputSize.x || id.y >= (uint)_OutputSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float4 val = _DilationSrc[pixel];
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int2 srcPixel = pixel + DilationOffsets[i] * _DilateStepSize;
+        if (srcPixel.x < 0 || srcPixel.y < 0 ||
+            srcPixel.x >= (int)_OutputSize.x || srcPixel.y >= (int)_OutputSize.y)
+            continue;
+
+        float4 srcVal = _DilationSrc[srcPixel];
+        // QRS: pixelSize = 2 * depthLinear / (focal * width), radius in px.
+        float pixelSize = 2.0 * srcVal.z / max(1e-6, _DilationFocal * _OutputSize.x);
+        float radius = _DilationRadiusMeters / max(1e-6, pixelSize);
+
+        float2 diff = srcVal.xy - (float2)pixel;
+        bool withinRadius = dot(diff, diff) < radius * radius;
+        bool newMinimum = srcVal.z < val.z;
+        bool notZero = srcVal.z != 0.0;
+
+        if (withinRadius && newMinimum && notZero)
+            val = srcVal;
+    }
+
+    _DilationDest[pixel] = val;
 }
