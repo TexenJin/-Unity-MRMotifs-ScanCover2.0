@@ -11,13 +11,17 @@
 
 RWTexture3D<float2> gsVolumeRW;
 RWTexture3D<float4> gsColorVolumeRW;
+RWStructuredBuffer<uint> _CarveStats; // 矛盾票普查：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹
 float gsDepthDispThresh;
 float gsMaxUpdateDist;
+float gsMinUpdateDist;        // 近距采样闸：测量距离小于此值的深度样本整票作废（0=关闭，由 VolumeIntegrator.rejectNearSamples 控制）
+float gsCarveInsideExclusion; // 排除区不对称：1=排除区内只拦写（播种/增长）不拦抹（矛盾扣减放行）
 
 #define EXCLUSION_TOP 0.25
 #define EXCLUSION_BOTTOM 1.7
-#define EXCLUSION_RADIUS 0.6
 #define MIN_DOT 0.3
+
+float gsExclusionRadius; // 排除区半径（原写死 0.6，现由 VolumeIntegrator.exclusionRadius 下发）
 
 #define MIN_QUALITY_SEED 0.25
 #define SEED_WEIGHT 0.10
@@ -28,6 +32,7 @@ float gsBlendRate;
 float gsStability;
 float gsWeightGrowth;
 float gsMaxWeight;
+float gsCarveGain;
 
 Texture2D<float4> gsCamRGB;
 int gsCamAvailable;
@@ -108,6 +113,10 @@ void Integrate(uint id : SV_DispatchThreadID)
 
     float3 eyeToDepth = depthPos - eyePos;
     float depthEyeDist = length(eyeToDepth);
+    // 近距采样闸：近距深度噪声大，且胸口/手臂等身体观测会反向加固身前幽灵
+    //（背景比幽灵更近 → sDist<0 → 按固体增长，幽灵越盯越牢）。minUpdateDist 原本只闸
+    // 视锥体素（VolumeIntegrator.SetupFrustumVolume:636），此处对齐到采样侧；0=关闭。
+    if (depthEyeDist < gsMinUpdateDist) return;
     float normDot = -dot(eyeToVox, depthNorm) / voxEyeDist;
 
     float sDist = depthEyeDist - voxEyeDist;
@@ -129,7 +138,7 @@ void Integrate(uint id : SV_DispatchThreadID)
     {
         float3 headPos = gsExclusionHeads[p];
         float2 diff = vWorldPos.xz - headPos.xz;
-        if (dot(diff, diff) < EXCLUSION_RADIUS * EXCLUSION_RADIUS &&
+        if (dot(diff, diff) < gsExclusionRadius * gsExclusionRadius &&
             vWorldPos.y < headPos.y + EXCLUSION_TOP &&
             vWorldPos.y > headPos.y - EXCLUSION_BOTTOM)
         {
@@ -137,7 +146,39 @@ void Integrate(uint id : SV_DispatchThreadID)
         }
     }
 
-    bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByDilation;
+bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByDilation;
+
+    // 矛盾票普查：不论门禁是否放行，先记录"本可投反对票"（新观测比存量更空>0.2）的体素流向。
+    // 只统计有存量的体素（y>0.001），空体素无所谓矛盾。
+    float2 oldCensus = gsVolumeRW[coord];
+    bool contradictedCensus = oldCensus.y > 0.001 && sDistNorm > oldCensus.x + 0.2;
+    // 排除区不对称放行（治"排除区双向封锁"）：排除圆柱内只拦写不拦抹——播种/增长照旧禁止
+    //（防手入网），但矛盾扣减放行。幽灵落进头周圆柱会被冻结永驻（实机：手挥到身体前方留下
+    // 的幽灵永不消，右半画面伸展手臂留下的能消——中线分界=手臂伸展/回收决定的圆柱内外）。
+    // 区内本就种不进合法几何，扣减只杀"头曾在别处时溜进来"的存量，零误伤。
+    bool exclCarve = gsCarveInsideExclusion > 0.5 && !outsideExclusions;
+    if (contradictedCensus)
+    {
+        if (valid)                      InterlockedAdd(_CarveStats[0], 1); // 票投出
+        else if (exclCarve)             InterlockedAdd(_CarveStats[5], 1); // 排内抹（不对称放行，实际扣减）
+        else if (!outsideExclusions)    InterlockedAdd(_CarveStats[1], 1); // 排除区拦（不对称开关关闭时）
+        else if (!validSurfaceNormal)   InterlockedAdd(_CarveStats[2], 1); // 法线闸拦（掠射）
+        else if (!unoccludedByDilation) InterlockedAdd(_CarveStats[3], 1); // 遮挡闸拦
+        else                            InterlockedAdd(_CarveStats[4], 1); // 截断带外拦
+    }
+
+    // 排除区内矛盾体素：跳过全部写路径，只扣信心不动 TSDF（与 blend 地板分支同语义，
+    // 同样保底 1 个 R8G8_SNorm 量化步长防吞票）
+    if (!valid && exclCarve && contradictedCensus)
+    {
+        float exDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float exAngF = saturate(normDot);
+        float exQ2 = exDistF * exDistF * exAngF * exAngF;
+        float exStep = max(exQ2 * gsCarveGain, 1.0 / 127.0);
+        gsVolumeRW[coord] = float2(oldCensus.x, max(oldCensus.y - exStep, 0.0));
+        return;
+    }
+
     if (!valid) return;
 
     float distFactor = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
@@ -171,12 +212,32 @@ void Integrate(uint id : SV_DispatchThreadID)
         return;
     }
 
+    // 矛盾扣减（投票制反对票）：新观测认为该体素比存量"更空"（超出 0.2≈3cm 噪声带）
+    // → 直接扣信心 weight -= carveStep，不走 blend 地板——q 再小也照扣，
+    // 把"低质量方向永不可抹"变成"慢但必然"。weight 跌破 minMeshWeight 网格消失，
+    // 跌破 PRUNE_WEIGHT 被周期 Prune 回收，完成新陈代谢闭环。
+    // 注意必须 clamp 到 0：负 weight 是 frozen 编码，不能误入。
+    // v2 修复两个吞票缺陷：
+    //  ① 矛盾帧不再加赞成增长（否则 -0.075q2 被同帧 +0.025q2 稀释）；
+    //  ② carveStep 保底 1 个量化步长——体积是 R8G8_SNorm，weight 步长 1/127≈0.0079，
+    //     Δw 小于半步(≈0.004)会被四舍五入归零，反对票投了但写盘无效（实机：普查"投"涨而幽灵不动）。
+    bool contradicted = sDistNorm > oldVal + 0.2;
+    float carveStep = max(q2 * gsCarveGain, 1.0 / 127.0);
+    float carvedWeight = contradicted ? max(weight - carveStep, 0.0) : weight;
+
     float blend = q2 * gsBlendRate / (1.0 + weight * gsStability);
     blend = clamp(blend, 0.0, 0.7);
-    if (blend < 0.005) return;
+    if (blend < 0.005)
+    {
+        // 赞成票太弱不配改写 TSDF，但反对票仍然生效（只扣信心，不动距离值）
+        if (contradicted)
+            gsVolumeRW[coord] = float2(oldVal, carvedWeight);
+        return;
+    }
 
     float newTsdf = lerp(oldVal, sDistNorm, blend);
-    float newWeight = min(weight + q2 * gsWeightGrowth, gsMaxWeight);
+    // 矛盾帧只扣不增：反对票与赞成票同帧抵消是设计缺陷（v2 修复①）
+    float newWeight = contradicted ? carvedWeight : min(weight + q2 * gsWeightGrowth, gsMaxWeight);
     gsVolumeRW[coord] = float2(newTsdf, newWeight);
 
     if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)

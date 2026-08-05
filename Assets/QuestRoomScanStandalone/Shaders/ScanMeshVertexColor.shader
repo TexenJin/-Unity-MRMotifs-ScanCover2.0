@@ -3,13 +3,16 @@ Shader "Genesis/ScanMeshVertexColor"
     Properties { }
     SubShader
     {
-        Tags { "RenderType"="Opaque" "RenderPipeline"="UniversalPipeline" "Queue"="Geometry" }
+        Tags { "RenderType"="Transparent" "RenderPipeline"="UniversalPipeline" "Queue"="Transparent+40" }
 
         Pass
         {
             Name "VertexColorUnlit"
             Tags { "LightMode"="SRPDefaultUnlit" }
-            ZWrite On
+            // 对齐原 SC 工程 B 链线框外观：alpha 混合、不写深度（透视 cage 效果）。
+            // 实体模式是调试档，在透明队列下自遮挡略弱，可接受。
+            Blend SrcAlpha OneMinusSrcAlpha
+            ZWrite Off
             ZTest LEqual
 
             HLSLPROGRAM
@@ -169,28 +172,26 @@ Shader "Genesis/ScanMeshVertexColor"
                 // 2. Apply freeze tint
                 baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
 
-                // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
-                if (_RSWireframe > 0.5)
-                {
-                    float thickness = max(_RSWireThickness, 0.2);
-                    float3 bary = IN.barycentric;
-                    float3 dx = ddx(bary);
-                    float3 dy = ddy(bary);
-                    float3 edgeWidth = sqrt(dx * dx + dy * dy);
-                    float3 edge = smoothstep(0.0, edgeWidth * thickness, bary);
-                    float minEdge = min(edge.x, min(edge.y, edge.z));
+            // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
+            if (_RSWireframe > 0.5)
+            {
+                float thickness = max(_RSWireThickness, 0.2);
+                float3 bary = IN.barycentric;
+                float3 dx = ddx(bary);
+                float3 dy = ddy(bary);
+                float3 edgeWidth = sqrt(dx * dx + dy * dy);
+                float3 edge = smoothstep(0.0, edgeWidth * thickness, bary);
+                float minEdge = min(edge.x, min(edge.y, edge.z));
 
-                    // Discard interior — threshold scales inversely with thickness
-                    float discardThreshold = saturate(1.0 - thickness * 0.15);
-                    if (minEdge > discardThreshold)
-                        discard;
+                // Discard interior — threshold scales inversely with thickness
+                float discardThreshold = saturate(1.0 - thickness * 0.15);
+                if (minEdge > discardThreshold)
+                    discard;
 
-                    // Vertex proximity: 1 at vertex, ~0.5 at edge midpoint
-                    float vertexProximity = max(bary.x, max(bary.y, bary.z));
-                    float vertBlend = smoothstep(0.35, 0.85, vertexProximity);
-                    half3 wireColor = lerp(half3(0.9, 0.9, 0.92), baseColor, vertBlend);
-                    return half4(wireColor, 1);
-                }
+                // 对齐原 SC 工程 B 链外观：统一橙色 (1, 0.62, 0.02)、alpha 0.96，
+                // 不做 QRS 原版的顶点白 blend（那边的白线+彩色顶点与 SC 不像）。
+                return half4(half3(1.0, 0.62, 0.02), 0.96h);
+            }
 
                 return half4(baseColor, 1);
             }

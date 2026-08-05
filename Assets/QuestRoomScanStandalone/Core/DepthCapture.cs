@@ -88,6 +88,9 @@ namespace Genesis.RoomScan
         /// <summary>True once a valid depth frame has been received from the AR occlusion subsystem.</summary>
         public static bool DepthAvailable { get; private set; }
 
+        /// <summary>已接收的深度帧总数（诊断"帧是否还在流"：盯着不动时此数仍应持续增长）。</summary>
+        public int FrameCount => _frameCount;
+
         /// <summary>
         /// True after USE_SCENE permission is confirmed and the initial subsystem check passes.
         /// Until this is set, <see cref="StartDepthCapture"/> is a no-op.

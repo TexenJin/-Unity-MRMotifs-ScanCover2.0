@@ -27,7 +27,10 @@ namespace Genesis.RoomScan
         [Header("Integration")]
         [SerializeField] private float depthDisparityThreshold = 0.5f;
         [SerializeField] private float maxUpdateDist = 5f;
-        [SerializeField] private float minUpdateDist = 0.5f;
+        [Tooltip("最近更新距离：视锥内距相机小于此值的体素不积分。原 0.5m 会在头周留下覆盖空洞，0.15 贴脸也覆盖（近距深度噪声大，如出现贴脸飞面可调回 0.3）")]
+        [SerializeField] private float minUpdateDist = 0.15f;
+        [Tooltip("头部排除区半径（仅 StandaloneRoomScanner 开启排除区时生效）。0.6 = QRS 原版（防手入网但头周覆盖空洞大），0.35 = 折中")]
+        [SerializeField, Range(0.1f, 1f)] private float exclusionRadius = 0.35f;
         [SerializeField] private int maxFrustumPositions = 1000000;
 
         [Header("Convergence")]
@@ -39,6 +42,16 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.005f, 0.1f)] private float weightGrowth = 0.025f;
         [Tooltip("Maximum weight any voxel can reach. Lower = all areas correct equally fast. (default 0.5)")]
         [SerializeField, Range(0.1f, 1f)] private float maxWeight = 0.5f;
+        [Tooltip("矛盾扣减率（投票制反对票）。新观测与存量矛盾（更空 >3cm）时每帧扣 q²·carveGain；weight 跌破 minMeshWeight 网格消失、跌破 0.05 被 Prune 回收。0 = 关闭，恢复 QRS 原版纯驻留行为。 (default 0.075)")]
+        [SerializeField, Range(0f, 0.3f)] private float carveGain = 0.075f;
+        [Tooltip("排除区不对称：开=排除区内只拦写（播种/增长）不拦抹（矛盾扣减放行，治头周圆柱内幽灵冻结永驻）；关=QRS 原版双向封锁。 (default true)")]
+        [SerializeField] private bool carveInsideExclusion = true;
+        [Tooltip("近距采样闸：测量距离 < minUpdateDist 的深度样本整票作废（挡胸口/手臂近距观测对身前幽灵的反向加固），与视锥体素闸语义对齐。 (default true)")]
+        [SerializeField] private bool rejectNearSamples = true;
+
+        [Header("运动闸")]
+        [Tooltip("头显角速度超过此值（°/s）时整帧停笔：不写入、不增长、不矛盾扣减（预览/提取照常）。根治位姿-深度不同帧欠账下转头把表面抹出搓衣板褶皱、错位矛盾票啃真表面。消幽灵的正确姿势变为\"停下来正对看一秒\"。0 = 关闭。 (default 90)")]
+        [SerializeField, Range(0f, 360f)] private float motionGateDegPerSec = 90f;
 
         [Header("Meshing")]
         [Tooltip("Min voxel confidence weight for Surface Nets to generate mesh. Higher = fewer phantom surfaces. (default 0.08)")]
@@ -72,11 +85,15 @@ namespace Genesis.RoomScan
         private static readonly int DepthDispThreshID = Shader.PropertyToID("gsDepthDispThresh");
         private static readonly int NumExclusionsID = Shader.PropertyToID("gsNumExclusions");
         private static readonly int ExclusionHeadsID = Shader.PropertyToID("gsExclusionHeads");
+        private static readonly int ExclusionRadiusID = Shader.PropertyToID("gsExclusionRadius");
         private static readonly int MaxUpdateDistID = Shader.PropertyToID("gsMaxUpdateDist");
         private static readonly int BlendRateID = Shader.PropertyToID("gsBlendRate");
         private static readonly int StabilityID = Shader.PropertyToID("gsStability");
         private static readonly int WeightGrowthID = Shader.PropertyToID("gsWeightGrowth");
         private static readonly int MaxWeightID = Shader.PropertyToID("gsMaxWeight");
+        private static readonly int CarveGainID = Shader.PropertyToID("gsCarveGain");
+        private static readonly int MinUpdateDistID = Shader.PropertyToID("gsMinUpdateDist");
+        private static readonly int CarveInsideExclusionID = Shader.PropertyToID("gsCarveInsideExclusion");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
         private static readonly int CamAvailableID = Shader.PropertyToID("gsCamAvailable");
         private static readonly int CamPosID = Shader.PropertyToID("gsCamPos");
@@ -114,6 +131,16 @@ namespace Genesis.RoomScan
         private static readonly int CoverageCountersID = Shader.PropertyToID("_CoverageCounters");
         private static readonly int ColorVolumeReadID = Shader.PropertyToID("gsColorVolumeRead");
 
+        // 矛盾票普查：诊断"幽灵抹不掉"——反对票到底投没投出、被哪道门禁拦住
+        private ComputeBuffer _carveStats;
+        private bool _carveStatsReadbackPending;
+        private static readonly uint[] ZeroCarveStats = new uint[8];
+        /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
+        public readonly uint[] LastCarveStats = new uint[8];
+        /// <summary>是否已有至少一轮矛盾票读回。</summary>
+        public bool HasCarveStats { get; private set; }
+        private static readonly int CarveStatsID = Shader.PropertyToID("_CarveStats");
+
         [Header("Coverage Metrics")]
         [Tooltip("Dispatch coverage count every N integrations (0 = disabled). Higher = less GPU overhead.")]
         [SerializeField] private int coverageUpdateInterval = 30;
@@ -149,6 +176,16 @@ namespace Genesis.RoomScan
         private Vector2 _pendingCurrentRes;
         private RenderTexture _camFrameCopy;
         private Texture2D _dummyCamTex;
+
+        // 运动闸：积分位姿角速度（EMA 平滑）。深度位姿按帧阶跃更新，瞬时速度含 0/2× 交替噪声，EMA 收敛到真实转速。
+        private Quaternion _lastIntegrateRot;
+        private float _lastIntegrateTime;
+        private bool _hasLastIntegrateRot;
+        private float _smoothedAngSpeed;
+        private int _motionGatedSinceStats;
+        private int _lastMotionGatedCount;
+        /// <summary>平滑后的积分位姿角速度（°/s），调试用。</summary>
+        public float SmoothedAngularSpeed => _smoothedAngSpeed;
 
         private void Awake()
         {
@@ -203,6 +240,10 @@ namespace Genesis.RoomScan
             _coverageKernel.Set(CoverageCountersID, _coverageCounters);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
 
+            _carveStats = new ComputeBuffer(8, sizeof(uint));
+            _carveStats.SetData(ZeroCarveStats);
+            _integrateKernel.Set(CarveStatsID, _carveStats);
+
             _dummyCamTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
             _dummyCamTex.SetPixel(0, 0, Color.black);
             _dummyCamTex.Apply(false, true);
@@ -213,6 +254,8 @@ namespace Genesis.RoomScan
             ReleaseVolumes();
             _coverageCounters?.Release();
             _coverageCounters = null;
+            _carveStats?.Release();
+            _carveStats = null;
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
         }
@@ -314,6 +357,41 @@ namespace Genesis.RoomScan
             ColoredSurfaceCount = (int)data[2];
         }
 
+        private void RequestCarveStatsReadback()
+        {
+            if (_carveStats == null || _carveStatsReadbackPending) return;
+            _carveStatsReadbackPending = true;
+            AsyncGPUReadback.Request(_carveStats, OnCarveStatsReadback);
+        }
+
+        private void OnCarveStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _carveStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 6) return;
+            for (int i = 0; i < 6; i++) LastCarveStats[i] = data[i];
+            HasCarveStats = true;
+            _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
+            _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
+            _motionGatedSinceStats = 0;
+        }
+
+        private static string FormatCarveCount(uint v)
+        {
+            return v >= 10000u ? (v / 10000f).ToString("0.0") + "万" : v.ToString();
+        }
+
+        /// <summary>矛盾票普查的一行中文摘要（HUD 用）。</summary>
+        public string GetCarveStatsCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"投{FormatCarveCount(LastCarveStats[0])} 排抹{FormatCarveCount(LastCarveStats[5])} " +
+                   $"排拦{FormatCarveCount(LastCarveStats[1])} 法拦{FormatCarveCount(LastCarveStats[2])} " +
+                   $"遮拦{FormatCarveCount(LastCarveStats[3])} 带拦{FormatCarveCount(LastCarveStats[4])}" +
+                   (_lastMotionGatedCount > 0 ? $" 动闸{_lastMotionGatedCount}" : "");
+        }
+
         private void CreateVolume()
         {
             long tsdfBytes = (long)voxelCount.x * voxelCount.y * voxelCount.z * 2;
@@ -361,6 +439,9 @@ namespace Genesis.RoomScan
             compute.SetFloat(StabilityID, stability);
             compute.SetFloat(WeightGrowthID, weightGrowth);
             compute.SetFloat(MaxWeightID, maxWeight);
+            compute.SetFloat(CarveGainID, carveGain);
+            compute.SetFloat(MinUpdateDistID, rejectNearSamples ? minUpdateDist : 0f);
+            compute.SetFloat(CarveInsideExclusionID, carveInsideExclusion ? 1f : 0f);
 
             Shader.SetGlobalTexture(VolumeID, _volume);
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
@@ -377,6 +458,8 @@ namespace Genesis.RoomScan
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.DispatchFit(_volume);
+            _carveStats?.SetData(ZeroCarveStats);
+            HasCarveStats = false;
             Cleared?.Invoke();
         }
 
@@ -614,6 +697,33 @@ namespace Genesis.RoomScan
             if (!_frustumReady) SetupFrustumVolume();
             if (!_frustumReady) return;
 
+            // 运动闸：转头时积分位姿与深度帧存在帧差，写入会切向涂抹成搓衣板褶皱、
+            // 矛盾票也会按错位投影啃到真表面。超阈值整帧停笔（不集成、不扣减），
+            // 停下来正对目标时票照投——消幽灵的姿势是"停住看"，不是"转着磨"。
+            if (motionGateDegPerSec > 0f)
+            {
+                var viewInv = dc.ViewInv;
+                if (viewInv != null && viewInv.Length > 0)
+                {
+                    Quaternion curRot = viewInv[0].rotation;
+                    float dt = Time.unscaledTime - _lastIntegrateTime;
+                    if (_hasLastIntegrateRot && dt > 1e-5f)
+                    {
+                        float inst = Quaternion.Angle(_lastIntegrateRot, curRot) / dt;
+                        _smoothedAngSpeed = Mathf.Lerp(_smoothedAngSpeed, inst, 0.35f);
+                    }
+                    _lastIntegrateRot = curRot;
+                    _lastIntegrateTime = Time.unscaledTime;
+                    _hasLastIntegrateRot = true;
+                    if (_smoothedAngSpeed > motionGateDegPerSec)
+                    {
+                        _motionGatedSinceStats++;
+                        _pendingCamFrame = null; // 丢弃过期颜色帧，防与下一帧位姿错配
+                        return;
+                    }
+                }
+            }
+
             dc.UpdateDilationIfNeeded();
 
             compute.SetMatrixArray(DepthCapture.ViewID, dc.View);
@@ -629,11 +739,15 @@ namespace Genesis.RoomScan
             }
             compute.SetInt(NumExclusionsID, numExclusions);
             compute.SetVectorArray(ExclusionHeadsID, _exclusionPositions);
+            compute.SetFloat(ExclusionRadiusID, exclusionRadius);
 
             compute.SetFloat(BlendRateID, blendRate);
             compute.SetFloat(StabilityID, stability);
             compute.SetFloat(WeightGrowthID, weightGrowth);
             compute.SetFloat(MaxWeightID, maxWeight);
+            compute.SetFloat(CarveGainID, carveGain);
+            compute.SetFloat(MinUpdateDistID, rejectNearSamples ? minUpdateDist : 0f);
+            compute.SetFloat(CarveInsideExclusionID, carveInsideExclusion ? 1f : 0f);
 
             EnsureCamFrameCopy();
             if (_pendingCamFrame != null && _camFrameCopy != null)
@@ -685,6 +799,7 @@ namespace Genesis.RoomScan
                 {
                     _integrationsSinceCoverage = 0;
                     DispatchCoverageCount();
+                    RequestCarveStatsReadback();
                 }
             }
 

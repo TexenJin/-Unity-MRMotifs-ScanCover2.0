@@ -156,6 +156,17 @@ namespace Genesis.RoomScan.Editor
                 Debug.Log("[QRS独立链] 已开启 OVRManager.isInsightPassthroughEnabled。");
             }
 
+            // 扫描要满屋走动：抑制边界蓝网（走近 Guardian 不再弹网格墙）。
+            // 注意：这只是应用侧能关的部分——走出安全区时系统强制切透视是
+            // OS 级安全行为，应用关不掉；要真正自由行走需在头显设置里
+            // 改大房间级边界或开发者模式关闭边界（见 HUD/文档说明）。
+            if (!ovrManager.shouldBoundaryVisibilityBeSuppressed)
+            {
+                ovrManager.shouldBoundaryVisibilityBeSuppressed = true;
+                EditorUtility.SetDirty(ovrManager);
+                Debug.Log("[QRS独立链] 已开启 OVRManager.shouldBoundaryVisibilityBeSuppressed（边界蓝网抑制）。");
+            }
+
             // 启动时请求 HEADSET_CAMERA 权限（该字段是 internal，走序列化层写）
             using (var so = new SerializedObject(ovrManager))
             {

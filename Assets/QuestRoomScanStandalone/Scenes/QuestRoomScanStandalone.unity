@@ -217,9 +217,12 @@ MonoBehaviour:
   integrationHz: 30
   meshExtractionHz: 30
   wireframeMode: 1
-  wireThickness: 1.5
+  wireThickness: 1
+  enableHeadExclusion: 1
   logLevel: 1
   showDebugHud: 1
+  showDepthPreview: 0
+  showDepthPointCloud: 0
 --- !u!114 &170429782
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -266,11 +269,16 @@ MonoBehaviour:
   depthDisparityThreshold: 0.5
   maxUpdateDist: 5
   minUpdateDist: 0.5
+  exclusionRadius: 0.6
   maxFrustumPositions: 1000000
   blendRate: 0.8
   stability: 2.5
   weightGrowth: 0.025
   maxWeight: 0.5
+  carveGain: 0.075
+  carveInsideExclusion: 1
+  rejectNearSamples: 1
+  motionGateDegPerSec: 0
   minMeshWeight: 0.08
   cameraExposure: 3
   warmupIntegrations: 3
@@ -1234,7 +1242,7 @@ MonoBehaviour:
   mrcActivationMode: 0
   launchSimultaneousHandsControllersOnStartup: 0
   isInsightPassthroughEnabled: 1
-  shouldBoundaryVisibilityBeSuppressed: 0
+  shouldBoundaryVisibilityBeSuppressed: 1
   requestBodyTrackingPermissionOnStartup: 0
   requestFaceTrackingPermissionOnStartup: 0
   requestEyeTrackingPermissionOnStartup: 0

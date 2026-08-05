@@ -25,8 +25,12 @@ namespace Genesis.RoomScan
         [Header("渲染")]
         [SerializeField, Tooltip("主显示形态：开=线框（QRS Wireframe，重心坐标边缘检测）；关=顶点色实体（QRS Vertex）")]
         private bool wireframeMode = true;
-        [SerializeField, Range(0.2f, 5f), Tooltip("线框模式的线条粗细倍率")]
-        private float wireThickness = 1.5f;
+        [SerializeField, Range(0.2f, 5f), Tooltip("线框模式的线条粗细倍率（1.0 对齐原 SC 工程细线观感，可按需调）")]
+        private float wireThickness = 1.0f;
+
+        [Header("覆盖范围")]
+        [SerializeField, Tooltip("头部排除区（QRS 原版防自扫）：开=头周圆柱内永不生成网格（半径在 VolumeIntegrator.exclusionRadius 调）；关=周围近距也能覆盖网格")]
+        private bool enableHeadExclusion = true;
 
         /// <summary>当前是否线框显示。</summary>
         public bool IsWireframe => wireframeMode;
@@ -95,7 +99,8 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            SetupHeadExclusion();
+            if (enableHeadExclusion) SetupHeadExclusion();
+            if (showDepthPointCloud) gameObject.AddComponent<DepthPointCloudOverlay>();
             StartCoroutine(ConfigureCameraForPassthrough());
             if (showDebugHud)
                 StartCoroutine(CreateHudWhenCameraReady());
@@ -125,6 +130,12 @@ namespace Genesis.RoomScan
 
         [Header("调试面板")]
         [SerializeField] private bool showDebugHud = true;
+        [SerializeField, Tooltip("在面板右上角开一个当前深度实时预览小窗（青=近 绿=中 红=远 暗=无效）。" +
+            "用途：盯着幽灵网格时看深度画面里那个斑块还在不在——在=深度自洽幻觉（Meta侧时序锁定）；转头后斑块从预览消失=深度刷新")]
+        private bool showDepthPreview = true;
+        [SerializeField, Tooltip("世界空间实时深度点云叠加层：当前深度以 3D 点云叠在网格上同屏对照。" +
+            "幽灵位置有点云覆盖=深度自洽幻觉；空空如也却有网格=矛盾在我们侧")]
+        private bool showDepthPointCloud = true;
 
         private UnityEngine.UI.Text _hudText;
         private RectTransform _hudRect;
@@ -164,14 +175,16 @@ namespace Genesis.RoomScan
             _hudText.font = font;
             _hudText.fontSize = 34;
             _hudText.color = Color.white;
-            _hudText.alignment = TextAnchor.MiddleLeft;
-            _hudText.horizontalOverflow = HorizontalWrapMode.Overflow;
+            _hudText.alignment = TextAnchor.UpperLeft;
+            // Wrap：开预览时文字区收窄到左侧，长行折行而不是溢到小窗底下
+            _hudText.horizontalOverflow = showDepthPreview ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
             _hudText.verticalOverflow = VerticalWrapMode.Overflow;
             var rt = textGo.GetComponent<RectTransform>();
             rt.anchorMin = Vector2.zero;
             rt.anchorMax = Vector2.one;
             rt.offsetMin = new Vector2(20f, 0f);
-            rt.offsetMax = new Vector2(-20f, 0f);
+            // 开深度预览时右侧留出 320px 给小窗，文字不压图
+            rt.offsetMax = new Vector2(showDepthPreview ? -340f : -20f, 0f);
 
             // 半透明黑底，保证在透视画面上可读
             var bgGo = new GameObject("Bg");
@@ -185,7 +198,38 @@ namespace Genesis.RoomScan
             brt.offsetMin = Vector2.zero;
             brt.offsetMax = Vector2.zero;
 
+            if (showDepthPreview) CreateDepthPreview(canvasGo.transform);
+
             Logger.Info("调试面板已创建");
+        }
+
+        /// <summary>
+        /// 深度实时预览小窗：RawImage 挂 QRS/DepthPreview 材质，
+        /// shader 直接采样全局 gsDepthTex，零 C# 侧每帧拷贝，零额外接线。
+        /// shader 在 Resources 下（防打包裁剪），找不到就静默跳过不影响面板。
+        /// </summary>
+        private void CreateDepthPreview(Transform parent)
+        {
+            var shader = Resources.Load<Shader>("DepthPreview");
+            if (shader == null)
+            {
+                Logger.Warning("深度预览 shader 未找到（Resources/DepthPreview），小窗跳过");
+                return;
+            }
+
+            var go = new GameObject("DepthPreview");
+            go.transform.SetParent(parent, false);
+            var raw = go.AddComponent<UnityEngine.UI.RawImage>();
+            raw.texture = Texture2D.whiteTexture; // 防空纹理剔除，shader 实际采样全局 gsDepthTex
+            raw.material = new Material(shader);
+            raw.raycastTarget = false;
+            var prt = go.GetComponent<RectTransform>();
+            // 右上角贴边，文字区已收窄折行，互不遮挡
+            prt.anchorMin = new Vector2(1f, 1f);
+            prt.anchorMax = new Vector2(1f, 1f);
+            prt.pivot = new Vector2(1f, 1f);
+            prt.anchoredPosition = new Vector2(-12f, -12f);
+            prt.sizeDelta = new Vector2(300f, 170f);
         }
 
         private void UpdateHud()
@@ -213,8 +257,10 @@ namespace Genesis.RoomScan
 
             _hudText.text =
                 $"【QRS独立链】{_hudStatus}\n" +
-                $"深度:{(DepthCapture.DepthAvailable ? "可用" : "无")}  相机:{(camPlaying ? "运行" : "未运行")}  融合:{integrated}帧\n" +
+                $"深度:{(DepthCapture.DepthAvailable ? "可用" : "无")}#{(_depthCapture != null ? _depthCapture.FrameCount : 0)}  相机:{(camPlaying ? "运行" : "未运行")}  融合:{integrated}帧\n" +
                 $"顶点:{verts}  三角:{tris}\n" +
+                $"矛盾票:{(_volumeIntegrator != null ? _volumeIntegrator.GetCarveStatsCompact() : "无")}" +
+                $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s\n" +
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续 A=暂停 B=清空 摇杆按=切显示" +
