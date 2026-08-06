@@ -11,11 +11,16 @@
 
 RWTexture3D<float2> gsVolumeRW;
 RWTexture3D<float4> gsColorVolumeRW;
-RWStructuredBuffer<uint> _CarveStats; // 矛盾票普查：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹
+RWStructuredBuffer<uint> _CarveStats; // 矛盾票普查：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹 6胀绕抹 7法绕抹
 float gsDepthDispThresh;
 float gsMaxUpdateDist;
 float gsMinUpdateDist;        // 近距采样闸：测量距离小于此值的深度样本整票作废（0=关闭，由 VolumeIntegrator.rejectNearSamples 控制）
 float gsCarveInsideExclusion; // 排除区不对称：1=排除区内只拦写（播种/增长）不拦抹（矛盾扣减放行）
+float gsCarveBypassDilation;  // 膨胀闸不对称：1=被膨胀足迹罩住的体素只拦写不拦抹（矛盾扣减绕行，治缝隙幽灵永驻）
+float gsCarveBypassNormal;    // 法线闸不对称：1=掠射观测只拦写不拦抹（强裕量矛盾扣减绕行，治斜视时反对票被法线闸全拦）
+float gsCarveBypassMargin;    // 法绕抹专用矛盾裕量（带宽单位，1=gsVoxDist）：掠射深度噪声大，要求新观测比存量空出更多才扣减
+float gsCarveBypassBoost;     // 绕行扣减独立倍率（默认 1）：绕行通道自带双重保险（被闸拦+强裕量），可加力清尸体而不动 carveGain 护真面
+float gsAbstainSeedGuard;     // 弃权邻域写闸：1=弃权像素周边 1px 只拦写（播种/增长）不拦抹（矛盾扣减照常），治帘锚点漏网裙边零星复种
 
 #define EXCLUSION_TOP 0.25
 #define EXCLUSION_BOTTOM 1.7
@@ -119,6 +124,25 @@ void Integrate(uint id : SV_DispatchThreadID)
     if (depthEyeDist < gsMinUpdateDist) return;
     float normDot = -dot(eyeToVox, depthNorm) / voxEyeDist;
 
+    // 弃权邻域写闸（第四不对称：只拦写不拦抹）：边缘清洗的弃权像素（0=近端）周边 1px 内的样本
+    // 不许播种/增长——帘锚点旁的漏网裙边（双眼扇面重合、③e 证伪盲区）必紧贴弃权带。
+    // 真折角切口旁的体素晚一两帧种上（视角一晃投影就挪出邻域），代价可忽略。
+    // 8 邻域（含对角）：裙边样本常落在弃权像素的 45° 对角位，4 邻域管不到。
+    bool nearAbstain = false;
+    if (gsAbstainSeedGuard > 0.5)
+    {
+        int2 dpx = int2(voxNDC.xy * float2(gsDepthTexSize));
+        int2 dmax = int2((int)gsDepthTexSize.x - 1, (int)gsDepthTexSize.y - 1);
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2( 1, 0), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2(-1, 0), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2( 0, 1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2( 0,-1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2( 1, 1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2( 1,-1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2(-1, 1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+        if (gsDepthTex[uint3(uint2(clamp(dpx + int2(-1,-1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
+    }
+
     float sDist = depthEyeDist - voxEyeDist;
     sDist *= saturate(normDot);
 
@@ -148,6 +172,23 @@ void Integrate(uint id : SV_DispatchThreadID)
 
 bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByDilation;
 
+    // 膨胀闸不对称（与排除区不对称同哲学）：被近表面膨胀足迹罩住的体素，播种/增长仍拦（防隔物写字），
+    // 但当帧原始深度确实看穿它（sDist>0 且超存量 0.2 已是矛盾前提）时反对票放行。
+    // 治：缝隙区（柜边↔侧墙）整个被罩进前景膨胀足迹 → 幽灵一旦种入永不收反对票 → 桥只长不消。
+    // validCarve 与 valid 唯一差别就是摘掉膨胀闸；!valid && validCarve ⇒ 仅被膨胀闸拦。
+    bool validCarve = withinBand & outsideExclusions & validSurfaceNormal;
+    bool dilationBypass = gsCarveBypassDilation > 0.5 && !valid && validCarve;
+
+    // 法线闸不对称（第三不对称通道）：掠射观测的深度位置噪声大所以拦写有理，
+    // 但"射线沿途为空"的证据与表面朝向无关 → 拦抹没道理。实机普查：法拦1.6万 vs 投1853。
+    // 防误抹真面：此通道要求更强矛盾裕量（gsCarveBypassMargin，默认 0.6 带宽≈9cm，普通通道 0.2≈3cm），
+    // 掠射深度抖动几厘米翻不过这道槛，而桥后墙隔着几十厘米轻松翻过。
+    // 裕量随距离放大（1.5m 内不变，之外按 voxEyeDist/1.5 线性加宽）：远距掠射噪声 5~10cm
+    // 与固定裕量同量级，会把真地板自己的噪声采样误判成"看穿尸体"→ 法绕误啃地板出裂口（实机）。
+    bool validCarveLoose = withinBand & outsideExclusions;
+    bool normalBypass = gsCarveBypassNormal > 0.5 && !valid && validCarveLoose && !validSurfaceNormal;
+    float nrMargin = gsCarveBypassMargin * max(voxEyeDist / 1.5, 1.0);
+
     // 矛盾票普查：不论门禁是否放行，先记录"本可投反对票"（新观测比存量更空>0.2）的体素流向。
     // 只统计有存量的体素（y>0.001），空体素无所谓矛盾。
     float2 oldCensus = gsVolumeRW[coord];
@@ -162,8 +203,22 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (valid)                      InterlockedAdd(_CarveStats[0], 1); // 票投出
         else if (exclCarve)             InterlockedAdd(_CarveStats[5], 1); // 排内抹（不对称放行，实际扣减）
         else if (!outsideExclusions)    InterlockedAdd(_CarveStats[1], 1); // 排除区拦（不对称开关关闭时）
-        else if (!validSurfaceNormal)   InterlockedAdd(_CarveStats[2], 1); // 法线闸拦（掠射）
-        else if (!unoccludedByDilation) InterlockedAdd(_CarveStats[3], 1); // 遮挡闸拦
+        else if (!validSurfaceNormal)
+        {
+            if (normalBypass && sDistNorm > oldCensus.x + nrMargin)
+                InterlockedAdd(_CarveStats[7], 1); // 法绕抹（法线闸不对称放行，强裕量，实际扣减）
+            else
+                InterlockedAdd(_CarveStats[2], 1); // 法线闸拦（掠射）
+        }
+        else if (!unoccludedByDilation)
+        {
+            // 胀绕同样走强裕量（与法绕共用 nrMargin）：腿/脚等近物的膨胀足迹 25cm 永久罩住周边真地板，
+            // 被罩体素只扣不长；0.2 普通裕量下地板噪声读深 3cm 就假矛盾→真地板永被啃出洞（实机 胀绕3966）。
+            // 真目标（缝隙幽灵）墙隔几十厘米照样翻过。
+            if (dilationBypass && sDistNorm > oldCensus.x + nrMargin)
+                InterlockedAdd(_CarveStats[6], 1); // 胀绕抹（膨胀闸不对称放行，强裕量，实际扣减）
+            else                        InterlockedAdd(_CarveStats[3], 1); // 遮挡闸拦
+        }
         else                            InterlockedAdd(_CarveStats[4], 1); // 截断带外拦
     }
 
@@ -179,6 +234,27 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         return;
     }
 
+    // 膨胀闸绕行扣减：只扣信心不动 TSDF，保底 1 量化步长。强裕量（nrMargin，距离自适应）——
+    // 适用对象=缝隙区被前景膨胀足迹罩住、但当帧原始深度确实看穿且墙明确在存量后方的体素。
+    if (!valid && dilationBypass && oldCensus.y > 0.001 && sDistNorm > oldCensus.x + nrMargin)
+    {
+        float byDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float byAngF = saturate(normDot);
+        float byQ2 = byDistF * byDistF * byAngF * byAngF;
+        float byStep = max(byQ2 * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
+        gsVolumeRW[coord] = float2(oldCensus.x, max(oldCensus.y - byStep, 0.0));
+        return;
+    }
+
+    // 法线闸绕行扣减（强裕量版）：角因子不计（法线不可信正是被拦原因），距离因子+保底步长慢速必达。
+    if (!valid && normalBypass && oldCensus.y > 0.001 && sDistNorm > oldCensus.x + nrMargin)
+    {
+        float nrDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float nrStep = max(nrDistF * nrDistF * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
+        gsVolumeRW[coord] = float2(oldCensus.x, max(oldCensus.y - nrStep, 0.0));
+        return;
+    }
+
     if (!valid) return;
 
     float distFactor = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
@@ -191,6 +267,15 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float oldVal = old.x;
     float weight = max(old.y, 0);
     bool wasEmpty = weight < 0.001;
+
+    // 弃权邻域写闸执行：只扣（矛盾成立时）不种/不长——切断帘锚点的零星复种
+    if (nearAbstain)
+    {
+        bool c0 = sDistNorm > oldVal + 0.2;
+        if (!wasEmpty && c0)
+            gsVolumeRW[coord] = float2(oldVal, max(weight - max(q2 * gsCarveGain, 1.0 / 127.0), 0.0));
+        return;
+    }
 
     if (wasEmpty)
     {

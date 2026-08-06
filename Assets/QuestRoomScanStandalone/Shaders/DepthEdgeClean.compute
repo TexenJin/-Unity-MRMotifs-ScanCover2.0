@@ -1,0 +1,392 @@
+// Genesis RoomScan - Depth edge clean (v0.2 IsDepthEdgeTexCoord 的 GPU 移植)
+// 三段式判决：① 邻域深度范围检查 → ② 局部平面拟合拒绝（斜面非边缘）→ ③ 双聚类间隙验证。
+// 判为边缘的像素写 0（NDC 0 = 近端 ≈near plane）：融合侧近距采样闸/截断带自然拦下 = 弃权不投票，
+// 绝不投"远=空"票误伤缝隙后墙。治好折角/缝隙的假网格桥接，让 TSDF 零先验区恢复系统级 45° 自然倒角。
+// 本 pass 是 DepthCapture 内的独立预处理（夹在双边滤波与法线之间），融合 shader 零改动。
+
+#pragma kernel DepthEdgeClean
+
+Texture2DArray<float>   _SrcDepth;
+RWTexture2DArray<float> _DstDepth;
+RWStructuredBuffer<uint> _EdgeStats; // [0] = 本统计周期边缘像素计数
+
+uint  _DepthW, _DepthH;
+float4x4 _DepthProjInv[2];
+float4x4 _DepthViewInv[2];
+float4 _LinearizeAB[2]; // 每眼 (Proj[2][2], Proj[2][3], 0, 0)，用于 NDC→线性米
+
+int   _ProbeRadius;              // 1=3x3(9探针) 2=5x5(25探针)
+float _EdgeJumpBase;             // 断崖跳变基数（米）
+float _EdgeJumpDistScale;        // 跳变距离系数
+int   _UsePlaneReject;           // 1=启用局部平面拟合拒绝
+float _PlaneResidualBase;        // 平面残差基数（米）
+float _PlaneResidualDistScale;   // 残差距离系数
+float _PlaneMinInlierRatio;      // 平面内点比阈值
+int   _PlaneMinNeighbors;        // 平面拟合最少探针数
+float _TwoClusterMinFraction;    // 双聚类最小群占比
+int   _SkirtVetoEnabled;         // 1=启用前景遮蔽否决（③b，治带断崖的斜视裙边桥）
+int   _SkirtMinNearProbes;       // 前景群最少探针数
+int   _GrazingVetoEnabled;       // 1=启用掠射面片否决（③c，治连续斜坡状飞点帘）
+float _GrazingMinFacingDot;      // 面片法线·视线 最小朝向（低于=沿视线拉出的帘子，杀）
+float _GrazingRangeBase;         // ③c 专属低跨度门槛基数（米）：缓坡帘绕过①号断崖门槛的入口
+float _GrazingRangeScale;        // ③c 低跨度门槛距离系数
+int   _CrossEyeEnabled;          // 1=启用双眼交叉证伪（③e，终极飞点签名）
+float _CrossEyeMarginBase;       // 交叉证伪深度差基数（米）
+float _CrossEyeMarginScale;      // 深度差距离系数
+float _CrossEyeMinOtherFacing;   // 面片朝向另一眼的最小 dot（背向=另一眼本来看不见，不杀）
+float4x4 _DepthProj[2];          // 正投影（跨眼投影用，逆矩阵已有 _DepthProjInv）
+float4x4 _DepthView[2];
+
+#define MAX_PROBES 25
+
+float ToLinear(float ndc, uint eye)
+{
+    float z = ndc * 2.0 - 1.0;
+    return abs(_LinearizeAB[eye].y / (z + _LinearizeAB[eye].x));
+}
+
+float3 NdcToWorld(float3 ndc, uint eye)
+{
+    float4 hcs = float4(ndc * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_DepthViewInv[eye], mul(_DepthProjInv[eye], hcs));
+    return worldH.xyz / worldH.w;
+}
+
+// v0.2 TrySmallestEigenVectorSymmetric：对称 3x3 Jacobi 迭代（24 轮），
+// 返回最小特征值对应的特征向量（= 局部平面法线）。
+bool SmallestEigenVector(float xx, float xy, float xz, float yy, float yz, float zz, out float3 normal)
+{
+    normal = float3(0, 1, 0);
+    // Vulkan/SPIR-V 不允许矩阵元素的动态下标写（a[k][p]=...），摊平成普通 float 数组
+    // （走本地内存可寻址），k 循环加 [loop] 禁止编译器强行展开。
+    float a[9];
+    a[0] = xx; a[1] = xy; a[2] = xz;
+    a[3] = xy; a[4] = yy; a[5] = yz;
+    a[6] = xz; a[7] = yz; a[8] = zz;
+    float v[9];
+    v[0] = 1; v[1] = 0; v[2] = 0;
+    v[3] = 0; v[4] = 1; v[5] = 0;
+    v[6] = 0; v[7] = 0; v[8] = 1;
+
+    for (int iter = 0; iter < 24; iter++)
+    {
+        int p = 0;
+        int q = 1;
+        float maxOff = abs(a[1]);   // a[0][1]
+        float abs02 = abs(a[2]);    // a[0][2]
+        float abs12 = abs(a[5]);    // a[1][2]
+        if (abs02 > maxOff) { maxOff = abs02; p = 0; q = 2; }
+        if (abs12 > maxOff) { maxOff = abs12; p = 1; q = 2; }
+        if (maxOff < 1e-8) break;
+
+        float app = a[p * 3 + p];
+        float aqq = a[q * 3 + q];
+        float apq = a[p * 3 + q];
+        float phi = 0.5 * atan2(2.0 * apq, aqq - app);
+        float c = cos(phi);
+        float s = sin(phi);
+
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float akp = a[k * 3 + p];
+            float akq = a[k * 3 + q];
+            a[k * 3 + p] = c * akp - s * akq;
+            a[k * 3 + q] = s * akp + c * akq;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float apk = a[p * 3 + k];
+            float aqk = a[q * 3 + k];
+            a[p * 3 + k] = c * apk - s * aqk;
+            a[q * 3 + k] = s * apk + c * aqk;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float vkp = v[k * 3 + p];
+            float vkq = v[k * 3 + q];
+            v[k * 3 + p] = c * vkp - s * vkq;
+            v[k * 3 + q] = s * vkp + c * vkq;
+        }
+    }
+
+    int smallest = 0;
+    if (a[4] < a[smallest * 3 + smallest]) smallest = 1;
+    if (a[8] < a[smallest * 3 + smallest]) smallest = 2;
+
+    normal = float3(v[smallest], v[3 + smallest], v[6 + smallest]);
+    if (any(isnan(normal)) || any(isinf(normal)) || dot(normal, normal) < 1e-8)
+        return false;
+    normal = normalize(normal);
+    return true;
+}
+
+void InsertionSort(inout float arr[MAX_PROBES], int count)
+{
+    for (int i = 1; i < count; i++)
+    {
+        float key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key)
+        {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+// ②③c 共用：局部协方差 + Jacobi 最小特征向量 = 面片法线
+bool FitLocalPlaneNormal(float3 worlds[MAX_PROBES], int count, out float3 normal)
+{
+    normal = float3(0, 1, 0);
+    float3 probeCenter = 0;
+    for (int i = 0; i < count; i++) probeCenter += worlds[i];
+    probeCenter /= (float)count;
+
+    float xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+    for (int i = 0; i < count; i++)
+    {
+        float3 d = worlds[i] - probeCenter;
+        xx += d.x * d.x; xy += d.x * d.y; xz += d.x * d.z;
+        yy += d.y * d.y; yz += d.y * d.z; zz += d.z * d.z;
+    }
+    float inv = 1.0 / (float)count;
+    xx *= inv; xy *= inv; xz *= inv; yy *= inv; yz *= inv; zz *= inv;
+
+    return SmallestEigenVector(xx, xy, xz, yy, yz, zz, normal);
+}
+
+// ③c 共用：面片法线几乎侧对视线（|dot| 低于阈值）= 沿视线拉出的飞点帘签名。
+// 飞点帘上所有点被边缘附近的视线族扫在同一个"过视线的竖直扇面"里 → 拟合平面必含
+// 视线方向 → 法线 ⊥ 视线，与坡度无关（陡坡缓坡同签名）。真实面片二维铺开，法线必朝向视线一侧。
+bool IsGrazingCurtainDirection(float3 normal, uint eye, uint2 pixel, float centerNdc)
+{
+    float3 camPos = float3(_DepthViewInv[eye]._m03,
+                           _DepthViewInv[eye]._m13,
+                           _DepthViewInv[eye]._m23);
+    float2 cuv = float2((pixel.x + 0.5) / (float)_DepthW,
+                        (pixel.y + 0.5) / (float)_DepthH);
+    float3 centerWorld = NdcToWorld(float3(cuv, centerNdc), eye);
+    float3 viewDir = normalize(centerWorld - camPos);
+    return abs(dot(normal, viewDir)) < _GrazingMinFacingDot;
+}
+
+// ③e 双眼交叉证伪：飞点帘绕每只眼各自的视点生成——本眼帘上的点投到另一眼视线里，
+// 另一眼多半看到更远的真实表面 = 该点浮在另一眼已知的自由空间里 → 杀。
+// 真实表面两眼观测一致（不杀）；另一眼看到更近物 = 正常遮挡（不杀）；
+// 面片背向另一眼 = 另一眼本来看不见它，"看到更远"不算证据（不杀）；
+// 另一眼中的弃权像素（0→near）永不构成"看到更远"（不误杀）。
+bool CrossEyeRefuted(float3 worldPos, float3 normal, uint eye)
+{
+    uint other = 1 - eye;
+    float3 camO = _DepthViewInv[other]._m03_m13_m23;
+    float3 toPt = worldPos - camO;
+    float distO = length(toPt);
+    // 面片须同时朝向另一眼（阈值 0.2≈78°：掠射真实面天然被此闸保护）
+    if (dot(normal, -toPt / distO) < _CrossEyeMinOtherFacing) return false;
+
+    float4 vO = mul(_DepthView[other], float4(worldPos, 1));
+    if (vO.z > -0.05) return false; // 在另一眼背后
+    float4 cO = mul(_DepthProj[other], vO);
+    float2 uvO = cO.xy / cO.w * 0.5 + 0.5;
+    if (any(uvO < 0.001) || any(uvO > 0.999)) return false;
+
+    float otherNdc = _SrcDepth[uint3(uint2(uvO * float2(_DepthW, _DepthH)), other)];
+    float otherLin = ToLinear(otherNdc, other);
+    float margin = max(_CrossEyeMarginBase, distO * _CrossEyeMarginScale);
+    return (-vO.z) < otherLin - margin; // 本点比另一眼所见表面近 margin 以上 = 浮在已知空域
+}
+
+[numthreads(8, 8, 1)]
+void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _DepthW || id.y >= _DepthH) return;
+    uint eye = id.z;
+    uint3 coord = uint3(id.xy, eye);
+
+    float centerNdc = _SrcDepth[coord];
+    float centerLin = ToLinear(centerNdc, eye);
+
+    // 探针采集（含中心，对齐 v0.2）
+    float linDepths[MAX_PROBES];
+    float3 worlds[MAX_PROBES];
+    int count = 0;
+    float minD = centerLin;
+    float maxD = centerLin;
+
+    int radius = clamp(_ProbeRadius, 1, 2);
+    for (int dy = -radius; dy <= radius; dy++)
+    {
+        for (int dx = -radius; dx <= radius; dx++)
+        {
+            int2 nb = int2(id.xy) + int2(dx, dy);
+            if (nb.x < 0 || nb.y < 0 || nb.x >= (int)_DepthW || nb.y >= (int)_DepthH)
+                continue;
+
+            float ndc = _SrcDepth[uint3(nb, eye)];
+            float lin = ToLinear(ndc, eye);
+            float2 uv = float2((nb.x + 0.5) / (float)_DepthW,
+                               (nb.y + 0.5) / (float)_DepthH);
+            linDepths[count] = lin;
+            worlds[count] = NdcToWorld(float3(uv, ndc), eye);
+            count++;
+            minD = min(minD, lin);
+            maxD = max(maxD, lin);
+        }
+    }
+
+    bool isEdge = false;
+    bool grazingKill = false; // ③c 掠射否决击杀归因（HUD"掠:"读数）
+    if (count >= 3)
+    {
+        float jumpLimit = max(_EdgeJumpBase, centerLin * _EdgeJumpDistScale);
+        float grazingRangeLimit = max(_GrazingRangeBase, centerLin * _GrazingRangeScale);
+        bool spanOverGrazing = maxD - minD > grazingRangeLimit;
+        float3 planeNormal = float3(0, 1, 0);
+        bool havePlaneNormal = false;
+
+        // ① 邻域深度范围：最大跨度不超阈值 = 无断崖，信任
+        if (maxD - minD > jumpLimit)
+        {
+            // 排序 + 最大间隙（③b 前景否决与 ③ 双聚类共用）
+            float sorted[MAX_PROBES];
+            for (int i = 0; i < count; i++) sorted[i] = linDepths[i];
+            InsertionSort(sorted, count);
+
+            float largestGap = 0;
+            int splitIndex = -1;
+            for (int i = 0; i < count - 1; i++)
+            {
+                float gap = sorted[i + 1] - sorted[i];
+                if (gap > largestGap)
+                {
+                    largestGap = gap;
+                    splitIndex = i + 1;
+                }
+            }
+            bool hasGap = splitIndex > 0 && splitIndex < count && largestGap > jumpLimit;
+
+            // ③b 前景遮蔽否决（治斜视裙边/飞点桥，先于平面拒绝执行——裙边斜坡能通过平面拟合）：
+            // 邻域存在平坦前景群 + 真断崖间隙 + 中心远在间隙之后 = 中心是前景边缘拖出的飞点，杀。
+            // 连续斜坡（地面/桌面）深度渐变无断崖间隙 → hasGap 假 → 不触发，真斜坡安全。
+            if (_SkirtVetoEnabled != 0 && hasGap)
+            {
+                float flatTol = max(_PlaneResidualBase, centerLin * _PlaneResidualDistScale);
+                float nearMax = minD + flatTol;
+                int nearCount = 0;
+                for (int i = 0; i < count; i++)
+                    if (linDepths[i] <= nearMax) nearCount++;
+
+                if (nearCount >= max(2, _SkirtMinNearProbes) &&
+                    centerLin > nearMax + jumpLimit &&
+                    centerLin >= sorted[splitIndex] - 0.001)
+                    isEdge = true;
+            }
+
+            bool planeTrusted = false;
+
+            // ② 局部平面拟合拒绝 / ③c 掠射面片否决（共用协方差+特征向量）：
+            // 残差小且内点比高 = 斜面/斜坡，非边缘，信任；
+            // 但面片法线几乎侧对视线 = 沿视线拉出的飞点帘，平面拟合再好也杀。
+            // 阈值对齐融合法线闸 MIN_DOT 0.3——只弃权融合反正不会用的掠射样本。
+            bool needPlane = (_UsePlaneReject != 0 || _GrazingVetoEnabled != 0 || _CrossEyeEnabled != 0);
+            if (!isEdge && needPlane && count >= max(3, _PlaneMinNeighbors))
+            {
+                float3 normal;
+                if (FitLocalPlaneNormal(worlds, count, normal))
+                {
+                    planeNormal = normal;
+                    havePlaneNormal = true;
+
+                    if (_GrazingVetoEnabled != 0 &&
+                        IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
+                    { isEdge = true; grazingKill = true; }
+
+                    if (!isEdge && _UsePlaneReject != 0)
+                    {
+                        float3 probeCenter = 0;
+                        for (int i = 0; i < count; i++) probeCenter += worlds[i];
+                        probeCenter /= (float)count;
+
+                        float residualLimit = max(_PlaneResidualBase, centerLin * _PlaneResidualDistScale);
+                        float residuals[MAX_PROBES];
+                        int inliers = 0;
+                        for (int i = 0; i < count; i++)
+                        {
+                            residuals[i] = abs(dot(worlds[i] - probeCenter, normal));
+                            if (residuals[i] <= residualLimit) inliers++;
+                        }
+                        InsertionSort(residuals, count);
+                        float p95 = residuals[min((int)floor(count * 0.95), count - 1)];
+
+                        if ((float)inliers / (float)count >= _PlaneMinInlierRatio && p95 <= residualLimit)
+                            planeTrusted = true;
+                    }
+                }
+            }
+
+            if (!isEdge && !planeTrusted)
+            {
+                if (_UsePlaneReject == 0)
+                {
+                    isEdge = true; // 平面拒绝关闭时：范围超标即边缘（v0.2 同语义）
+                }
+                else if (hasGap)
+                {
+                    // ③ 双聚类间隙验证：两群各占比 ≥ 阈值 = 真断崖
+                    float nearFraction = splitIndex / (float)count;
+                    float farFraction = (count - splitIndex) / (float)count;
+                    isEdge = nearFraction >= _TwoClusterMinFraction &&
+                             farFraction >= _TwoClusterMinFraction;
+                }
+            }
+        }
+        // ③c-补（缓坡帘专用低门槛入口）：小掠射角下飞点帘又长又缓，3×3 深度跨度只有几厘米，
+        // ①号断崖门槛不触发、融合法线闸也因梯度缓而放行（两闸盲区在小角度重叠=越小越易成桥）。
+        // 但"面片包含视线方向"的几何签名与坡度无关 → 用更低的跨度门槛单独喂给朝向否决。
+        // 真实缓坡（地板/桌面）法线朝向视线一侧，不触发；平面区域（跨度低于门槛）零开销。
+        else if ((_GrazingVetoEnabled != 0 || _CrossEyeEnabled != 0) &&
+                 spanOverGrazing &&
+                 count >= max(3, _PlaneMinNeighbors))
+        {
+            float3 normal;
+            if (FitLocalPlaneNormal(worlds, count, normal))
+            {
+                planeNormal = normal;
+                havePlaneNormal = true;
+                if (_GrazingVetoEnabled != 0 &&
+                    IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
+                { isEdge = true; grazingKill = true; }
+            }
+        }
+
+        // ③e 双眼交叉证伪（最后关卡：①③b③c②③ 全部放行的"合法面"才走到这）。
+        // 飞点帘绕每只眼各自视点生成，本眼帘点投到另一眼视线里多半落在更远真表面前面
+        // = 浮在已知空域 → 杀。真实面两眼一致；背向另一眼的面受朝向闸保护。
+        if (!isEdge && _CrossEyeEnabled != 0 && havePlaneNormal && spanOverGrazing)
+        {
+            float2 cuvE = float2((id.x + 0.5) / (float)_DepthW,
+                                 (id.y + 0.5) / (float)_DepthH);
+            float3 centerWorldE = NdcToWorld(float3(cuvE, centerNdc), eye);
+            float3 camE = _DepthViewInv[eye]._m03_m13_m23;
+            float3 nE = planeNormal;
+            if (dot(nE, camE - centerWorldE) < 0) nE = -nE; // 法线统一朝向来眼
+            if (CrossEyeRefuted(centerWorldE, nE, eye))
+                isEdge = true;
+        }
+    }
+
+    if (isEdge)
+    {
+        _DstDepth[coord] = 0.0; // 弃权：NDC 0 = 近端，融合侧近距闸/截断带双保险拦下
+        InterlockedAdd(_EdgeStats[0], 1);
+        if (grazingKill) InterlockedAdd(_EdgeStats[1], 1); // 掠射否决归因计数
+    }
+    else
+    {
+        _DstDepth[coord] = centerNdc;
+    }
+}

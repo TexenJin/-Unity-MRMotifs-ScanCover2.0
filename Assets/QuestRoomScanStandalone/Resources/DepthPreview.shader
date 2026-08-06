@@ -13,7 +13,7 @@ Shader "QRS/DepthPreview"
     }
     SubShader
     {
-        Tags { "Queue"="Transparent" "RenderType"="Transparent" "IgnoreProjector"="True" }
+        Tags { "Queue"="Overlay" "RenderType"="Transparent" "IgnoreProjector"="True" }
         Cull Off
         ZWrite Off
         ZTest Always

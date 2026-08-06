@@ -48,6 +48,21 @@ namespace Genesis.RoomScan
         [SerializeField] private bool carveInsideExclusion = true;
         [Tooltip("近距采样闸：测量距离 < minUpdateDist 的深度样本整票作废（挡胸口/手臂近距观测对身前幽灵的反向加固），与视锥体素闸语义对齐。 (default true)")]
         [SerializeField] private bool rejectNearSamples = true;
+        [Tooltip("膨胀闸不对称：被近表面膨胀足迹罩住的体素只拦写（播种/增长）不拦抹——当帧原始深度确实看穿时矛盾扣减绕行。" +
+                 "治缝隙区（柜边↔侧墙）幽灵一旦种入永不收反对票、假桥只长不消。关=恢复遮挡闸双向封锁。 (default true)")]
+        [SerializeField] private bool carveBypassDilation = true;
+        [Tooltip("法线闸不对称：掠射观测只拦写不拦抹——'射线沿途为空'的证据与表面朝向无关。" +
+                 "治斜视时矛盾票被法线闸全拦（普查法拦暴涨）、桥只有正视能消。此通道用 carveBypassMargin 强裕量防误抹真面。 (default true)")]
+        [SerializeField] private bool carveBypassNormal = true;
+        [Tooltip("法绕抹的矛盾裕量（带宽单位，1=截断带宽 0.15m）：掠射深度噪声大，新观测要比存量空出这么多才扣减。" +
+                 "默认 0.6≈9cm；实机按距离放大——1.5m 内不变，之外乘 voxEyeDist/1.5（远距掠射噪声 5~10cm 防误啃真地板）。误抹真面=调大，桥消不动=调小。 (default 0.6)")]
+        [SerializeField, Range(0.2f, 1.5f)] private float carveBypassMargin = 0.6f;
+        [Tooltip("绕行扣减（胀绕/法绕）独立倍率：绕行通道自带双重保险（被闸拦+强裕量才触发），加力只加速清尸体，" +
+                 "不动 carveGain 主通道护真面。尸体消得慢=调大；真面被误扣=先查 margin 再调回 1。 (default 2)")]
+        [SerializeField, Range(1f, 4f)] private float carveBypassBoost = 2f;
+        [Tooltip("弃权邻域写闸：边缘清洗弃权像素周边 1px 内只拦写（播种/增长）不拦抹（矛盾扣减照常）。" +
+                 "治帘锚点旁漏网裙边零星复种导致桥闪断闪连。真折角切口旁晚一两帧种上，代价可忽略。 (default true)")]
+        [SerializeField] private bool abstainSeedGuard = true;
 
         [Header("运动闸")]
         [Tooltip("头显角速度超过此值（°/s）时整帧停笔：不写入、不增长、不矛盾扣减（预览/提取照常）。根治位姿-深度不同帧欠账下转头把表面抹出搓衣板褶皱、错位矛盾票啃真表面。消幽灵的正确姿势变为\"停下来正对看一秒\"。0 = 关闭。 (default 90)")]
@@ -94,6 +109,11 @@ namespace Genesis.RoomScan
         private static readonly int CarveGainID = Shader.PropertyToID("gsCarveGain");
         private static readonly int MinUpdateDistID = Shader.PropertyToID("gsMinUpdateDist");
         private static readonly int CarveInsideExclusionID = Shader.PropertyToID("gsCarveInsideExclusion");
+        private static readonly int CarveBypassDilationID = Shader.PropertyToID("gsCarveBypassDilation");
+        private static readonly int CarveBypassNormalID = Shader.PropertyToID("gsCarveBypassNormal");
+        private static readonly int CarveBypassMarginID = Shader.PropertyToID("gsCarveBypassMargin");
+        private static readonly int CarveBypassBoostID = Shader.PropertyToID("gsCarveBypassBoost");
+        private static readonly int AbstainSeedGuardID = Shader.PropertyToID("gsAbstainSeedGuard");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
         private static readonly int CamAvailableID = Shader.PropertyToID("gsCamAvailable");
         private static readonly int CamPosID = Shader.PropertyToID("gsCamPos");
@@ -370,7 +390,7 @@ namespace Genesis.RoomScan
             if (request.hasError) return;
             var data = request.GetData<uint>();
             if (data.Length < 6) return;
-            for (int i = 0; i < 6; i++) LastCarveStats[i] = data[i];
+            for (int i = 0; i < 8; i++) LastCarveStats[i] = data[i];
             HasCarveStats = true;
             _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
             _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
@@ -387,6 +407,7 @@ namespace Genesis.RoomScan
         {
             if (!HasCarveStats) return "统计中";
             return $"投{FormatCarveCount(LastCarveStats[0])} 排抹{FormatCarveCount(LastCarveStats[5])} " +
+                   $"胀绕{FormatCarveCount(LastCarveStats[6])} 法绕{FormatCarveCount(LastCarveStats[7])} " +
                    $"排拦{FormatCarveCount(LastCarveStats[1])} 法拦{FormatCarveCount(LastCarveStats[2])} " +
                    $"遮拦{FormatCarveCount(LastCarveStats[3])} 带拦{FormatCarveCount(LastCarveStats[4])}" +
                    (_lastMotionGatedCount > 0 ? $" 动闸{_lastMotionGatedCount}" : "");
@@ -442,6 +463,11 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveGainID, carveGain);
             compute.SetFloat(MinUpdateDistID, rejectNearSamples ? minUpdateDist : 0f);
             compute.SetFloat(CarveInsideExclusionID, carveInsideExclusion ? 1f : 0f);
+            compute.SetFloat(CarveBypassDilationID, carveBypassDilation ? 1f : 0f);
+            compute.SetFloat(CarveBypassNormalID, carveBypassNormal ? 1f : 0f);
+            compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
+            compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
+            compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
 
             Shader.SetGlobalTexture(VolumeID, _volume);
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
@@ -748,6 +774,11 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveGainID, carveGain);
             compute.SetFloat(MinUpdateDistID, rejectNearSamples ? minUpdateDist : 0f);
             compute.SetFloat(CarveInsideExclusionID, carveInsideExclusion ? 1f : 0f);
+            compute.SetFloat(CarveBypassDilationID, carveBypassDilation ? 1f : 0f);
+            compute.SetFloat(CarveBypassNormalID, carveBypassNormal ? 1f : 0f);
+            compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
+            compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
+            compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
 
             EnsureCamFrameCopy();
             if (_pendingCamFrame != null && _camFrameCopy != null)

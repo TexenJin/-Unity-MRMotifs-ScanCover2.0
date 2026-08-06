@@ -269,6 +269,7 @@ namespace Genesis.RoomScan.Editor
                 AssignCompute(so, "depthNormalCompute", SHADER_DIR + "DepthNormals.compute");
                 AssignCompute(so, "depthDilationCompute", SHADER_DIR + "DepthDilation.compute");
                 AssignCompute(so, "bilateralFilterCompute", SHADER_DIR + "BilateralDepthFilter.compute");
+                AssignCompute(so, "depthEdgeCleanCompute", SHADER_DIR + "DepthEdgeClean.compute");
                 so.ApplyModifiedPropertiesWithoutUndo();
                 EditorUtility.SetDirty(dc);
             }

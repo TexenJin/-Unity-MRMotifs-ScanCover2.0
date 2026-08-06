@@ -169,6 +169,12 @@ namespace Genesis.RoomScan
             _hudRect.sizeDelta = new Vector2(900f, 360f);
             canvasGo.transform.localScale = Vector3.one * 0.0009f;
 
+            // 置顶材质：WorldSpace Canvas 走 UI/Default 时 ZTest=LEqual 会被网格/墙面挡住，
+            // 换 QRS/HUDAlwaysOnTop（ZTest Always + Overlay 队列）。Resources 加载防裁剪，找不到静默回退。
+            Material hudMat = null;
+            var hudShader = Resources.Load<Shader>("HUDAlwaysOnTop");
+            if (hudShader != null) hudMat = new Material(hudShader);
+
             var textGo = new GameObject("Text");
             textGo.transform.SetParent(canvasGo.transform, false);
             _hudText = textGo.AddComponent<UnityEngine.UI.Text>();
@@ -176,6 +182,7 @@ namespace Genesis.RoomScan
             _hudText.fontSize = 34;
             _hudText.color = Color.white;
             _hudText.alignment = TextAnchor.UpperLeft;
+            if (hudMat != null) _hudText.material = hudMat;
             // Wrap：开预览时文字区收窄到左侧，长行折行而不是溢到小窗底下
             _hudText.horizontalOverflow = showDepthPreview ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
             _hudText.verticalOverflow = VerticalWrapMode.Overflow;
@@ -192,6 +199,7 @@ namespace Genesis.RoomScan
             bgGo.transform.SetAsFirstSibling();
             var img = bgGo.AddComponent<UnityEngine.UI.Image>();
             img.color = new Color(0f, 0f, 0f, 0.55f);
+            if (hudMat != null) img.material = hudMat;
             var brt = bgGo.GetComponent<RectTransform>();
             brt.anchorMin = Vector2.zero;
             brt.anchorMax = Vector2.one;
@@ -255,12 +263,22 @@ namespace Genesis.RoomScan
             int integrated = _volumeIntegrator != null ? _volumeIntegrator.IntegrationCount : 0;
             bool camPlaying = _cameraProvider != null && _cameraProvider.IsPlaying;
 
+            string edgeStat = "—";
+            if (_depthCapture != null && _depthCapture.HasEdgeCleanStats)
+            {
+                uint ec = _depthCapture.LastEdgeCleanCount;
+                uint gz = _depthCapture.LastGrazingKillCount;
+                edgeStat = (ec >= 10000u ? (ec / 10000f).ToString("0.0") + "万" : ec.ToString()) +
+                           " 掠:" + (gz >= 10000u ? (gz / 10000f).ToString("0.0") + "万" : gz.ToString());
+            }
+
             _hudText.text =
                 $"【QRS独立链】{_hudStatus}\n" +
                 $"深度:{(DepthCapture.DepthAvailable ? "可用" : "无")}#{(_depthCapture != null ? _depthCapture.FrameCount : 0)}  相机:{(camPlaying ? "运行" : "未运行")}  融合:{integrated}帧\n" +
                 $"顶点:{verts}  三角:{tris}\n" +
                 $"矛盾票:{(_volumeIntegrator != null ? _volumeIntegrator.GetCarveStatsCompact() : "无")}" +
-                $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s\n" +
+                $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s" +
+                $" 缘:{edgeStat}\n" +
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续 A=暂停 B=清空 摇杆按=切显示" +

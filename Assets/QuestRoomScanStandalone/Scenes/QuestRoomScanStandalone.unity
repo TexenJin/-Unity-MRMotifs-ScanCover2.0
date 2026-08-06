@@ -278,6 +278,11 @@ MonoBehaviour:
   carveGain: 0.075
   carveInsideExclusion: 1
   rejectNearSamples: 1
+  carveBypassDilation: 1
+  carveBypassNormal: 1
+  carveBypassMargin: 0.5
+  carveBypassBoost: 2
+  abstainSeedGuard: 1
   motionGateDegPerSec: 0
   minMeshWeight: 0.08
   cameraExposure: 3
@@ -299,11 +304,32 @@ MonoBehaviour:
   depthNormalCompute: {fileID: 7200000, guid: 8710642145bdc454bbfdcf8df2904ede, type: 3}
   depthDilationCompute: {fileID: 7200000, guid: 0d6a7d2279e7547dd9ab3b58d73f99e8, type: 3}
   bilateralFilterCompute: {fileID: 7200000, guid: bde882d2fb87a4de7ae342e8acf27418, type: 3}
+  depthEdgeCleanCompute: {fileID: 7200000, guid: b4f6bc291209432ca9515fbaa165c03e, type: 3}
   enableBilateralFilter: 1
   sigmaSpatial: 3
   sigmaColor: 0.1
   sigmaDepth: 0.02
   filterRadius: 2
+  enableDepthEdgeClean: 1
+  edgeProbeRadiusPixels: 1
+  edgeJumpBaseMeters: 0.035
+  edgeJumpDistanceScale: 0.018
+  edgeUseLocalPlaneReject: 1
+  edgePlaneResidualBaseMeters: 0.012
+  edgePlaneResidualDistanceScale: 0.006
+  edgePlaneMinInlierRatio: 0.65
+  edgePlaneMinNeighborPoints: 5
+  edgeTwoClusterMinFraction: 0.25
+  edgeSkirtVetoEnabled: 1
+  edgeSkirtMinNearProbes: 2
+  edgeGrazingVetoEnabled: 1
+  edgeGrazingMinFacingDot: 0.3
+  edgeGrazingRangeBaseMeters: 0.02
+  edgeGrazingRangeScale: 0.008
+  edgeCrossEyeEnabled: 1
+  edgeCrossEyeMarginBaseMeters: 0.05
+  edgeCrossEyeMarginScale: 0.03
+  edgeCrossEyeMinOtherFacing: 0.2
   dilationSteps: 8
   voxelDistance: 0.2
   voxelSize: 0.05
