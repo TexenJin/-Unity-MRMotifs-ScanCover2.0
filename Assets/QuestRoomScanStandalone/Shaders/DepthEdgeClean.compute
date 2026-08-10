@@ -8,6 +8,7 @@
 
 Texture2DArray<float>   _SrcDepth;
 RWTexture2DArray<float> _DstDepth;
+RWTexture2DArray<uint>  _EdgeReason;
 RWStructuredBuffer<uint> _EdgeStats; // [0] = 本统计周期边缘像素计数
 
 uint  _DepthW, _DepthH;
@@ -239,18 +240,28 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
     }
 
     bool isEdge = false;
+    bool spanOverJumpSignature = false;
+    bool spanOverGrazingSignature = false;
+    bool gapSignature = false;
+    bool skirtSignature = false;
+    bool planeTrustedSignature = false;
+    bool grazingSignature = false;
+    bool dualClusterSignature = false;
+    bool crossEyeSignature = false;
     bool grazingKill = false; // ③c 掠射否决击杀归因（HUD"掠:"读数）
     if (count >= 3)
     {
         float jumpLimit = max(_EdgeJumpBase, centerLin * _EdgeJumpDistScale);
         float grazingRangeLimit = max(_GrazingRangeBase, centerLin * _GrazingRangeScale);
         bool spanOverGrazing = maxD - minD > grazingRangeLimit;
+        spanOverGrazingSignature = spanOverGrazing;
         float3 planeNormal = float3(0, 1, 0);
         bool havePlaneNormal = false;
 
         // ① 邻域深度范围：最大跨度不超阈值 = 无断崖，信任
         if (maxD - minD > jumpLimit)
         {
+            spanOverJumpSignature = true;
             // 排序 + 最大间隙（③b 前景否决与 ③ 双聚类共用）
             float sorted[MAX_PROBES];
             for (int i = 0; i < count; i++) sorted[i] = linDepths[i];
@@ -268,6 +279,14 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                 }
             }
             bool hasGap = splitIndex > 0 && splitIndex < count && largestGap > jumpLimit;
+            gapSignature = hasGap;
+            if (hasGap)
+            {
+                float nearFractionDiag = splitIndex / (float)count;
+                float farFractionDiag = (count - splitIndex) / (float)count;
+                dualClusterSignature = nearFractionDiag >= _TwoClusterMinFraction &&
+                                       farFractionDiag >= _TwoClusterMinFraction;
+            }
 
             // ③b 前景遮蔽否决（治斜视裙边/飞点桥，先于平面拒绝执行——裙边斜坡能通过平面拟合）：
             // 邻域存在平坦前景群 + 真断崖间隙 + 中心远在间隙之后 = 中心是前景边缘拖出的飞点，杀。
@@ -283,7 +302,10 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                 if (nearCount >= max(2, _SkirtMinNearProbes) &&
                     centerLin > nearMax + jumpLimit &&
                     centerLin >= sorted[splitIndex] - 0.001)
+                {
+                    skirtSignature = true;
                     isEdge = true;
+                }
             }
 
             bool planeTrusted = false;
@@ -303,7 +325,7 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
 
                     if (_GrazingVetoEnabled != 0 &&
                         IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
-                    { isEdge = true; grazingKill = true; }
+                    { grazingSignature = true; isEdge = true; grazingKill = true; }
 
                     if (!isEdge && _UsePlaneReject != 0)
                     {
@@ -323,7 +345,10 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                         float p95 = residuals[min((int)floor(count * 0.95), count - 1)];
 
                         if ((float)inliers / (float)count >= _PlaneMinInlierRatio && p95 <= residualLimit)
+                        {
                             planeTrusted = true;
+                            planeTrustedSignature = true;
+                        }
                     }
                 }
             }
@@ -359,7 +384,7 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                 havePlaneNormal = true;
                 if (_GrazingVetoEnabled != 0 &&
                     IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
-                { isEdge = true; grazingKill = true; }
+                { grazingSignature = true; isEdge = true; grazingKill = true; }
             }
         }
 
@@ -375,9 +400,25 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
             float3 nE = planeNormal;
             if (dot(nE, camE - centerWorldE) < 0) nE = -nE; // 法线统一朝向来眼
             if (CrossEyeRefuted(centerWorldE, nE, eye))
+            {
+                crossEyeSignature = true;
                 isEdge = true;
+            }
         }
     }
+
+    // Read-only per-pixel attribution. These bits never participate in the clean decision.
+    uint reason = 0;
+    if (spanOverJumpSignature)     reason |= 1u << 0;
+    if (gapSignature)             reason |= 1u << 1;
+    if (skirtSignature)           reason |= 1u << 2;
+    if (planeTrustedSignature)    reason |= 1u << 3;
+    if (grazingSignature)         reason |= 1u << 4;
+    if (dualClusterSignature)     reason |= 1u << 5;
+    if (crossEyeSignature)        reason |= 1u << 6;
+    if (isEdge)                   reason |= 1u << 7;
+    if (spanOverGrazingSignature) reason |= 1u << 8;
+    _EdgeReason[coord] = reason;
 
     if (isEdge)
     {

@@ -63,6 +63,16 @@ namespace Genesis.RoomScan
         [Tooltip("弃权邻域写闸：边缘清洗弃权像素周边 1px 内只拦写（播种/增长）不拦抹（矛盾扣减照常）。" +
                  "治帘锚点旁漏网裙边零星复种导致桥闪断闪连。真折角切口旁晚一两帧种上，代价可忽略。 (default true)")]
         [SerializeField] private bool abstainSeedGuard = true;
+        [Tooltip("平面外推闸：投影 SDF 声称接近表面时，还要求未投影的沿视线距离仍在双向 TSDF 窄带内。只拦播种/增长，不拦矛盾扣减。 (default true)")]
+        [SerializeField] private bool rawSeedGate = true;
+        [Tooltip("双向原始沿视线带宽，单位为 voxelDistance。1.0 表示标准的一个 TSDF 截断带。 (default 1.0)")]
+        [SerializeField, Range(0.5f, 4f)] private float rawSeedBand = 1.0f;
+
+        [Header("只读深度断层影子")]
+        [Tooltip("只读诊断：复用 DepthEdgeClean 的距离自适应断层阈值下限。仅统计若接入会拦多少供料，不改变生产 TSDF。")]
+        [SerializeField, Min(0.001f)] private float diagnosticDepthGapBaseMeters = 0.035f;
+        [Tooltip("只读诊断：断层阈值随深度增长系数，阈值=max(下限, 深度×系数)。仅统计，不参与生产。")]
+        [SerializeField, Min(0f)] private float diagnosticDepthGapDistanceScale = 0.018f;
 
         [Header("运动闸")]
         [Tooltip("头显角速度超过此值（°/s）时整帧停笔：不写入、不增长、不矛盾扣减（预览/提取照常）。根治位姿-深度不同帧欠账下转头把表面抹出搓衣板褶皱、错位矛盾票啃真表面。消幽灵的正确姿势变为\"停下来正对看一秒\"。0 = 关闭。 (default 90)")]
@@ -73,17 +83,28 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.01f, 0.5f)] private float minMeshWeight = 0.08f;
         public float MinMeshWeight => minMeshWeight;
 
+        [Header("Projective TSDF A/B")]
+        [SerializeField, Tooltip("建立一份只读 KinectFusion 式 raw-projective TSDF 影子体。生产体仍使用现有 raw×法向余弦；影子体只用于对照统计和手动切换显示。")]
+        private bool enableProjectiveShadow = false;
+
         [Header("Camera Color")]
         [Tooltip("Exposure boost for camera texture. Quest 3 passthrough cameras produce dim images. (default 3.0)")]
         [SerializeField, Range(1f, 10f)] private float cameraExposure = 3f;
 
         private RenderTexture _volume;
         private RenderTexture _colorVolume;
+        private RenderTexture _projectiveShadowVolume;
+        private RenderTexture _admissionTraceVolume;
 
         /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
+        /// <summary>只读 A/B 影子体：使用 raw projective SDF，但不写颜色、不替换生产体。</summary>
+        public RenderTexture ProjectiveShadowVolume => _projectiveShadowVolume;
+        public bool ProjectiveShadowEnabled => enableProjectiveShadow && _projectiveShadowVolume != null;
         /// <summary>3D RenderTexture (RGBA8_UNorm) storing per-voxel accumulated color.</summary>
         public RenderTexture ColorVolume => _colorVolume;
+        /// <summary>Read-only provenance sidecar for dilation admission. Never changes TSDF production decisions.</summary>
+        public RenderTexture AdmissionTraceVolume => _admissionTraceVolume;
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
         public float VoxelDistance => voxelDistance;
@@ -114,6 +135,10 @@ namespace Genesis.RoomScan
         private static readonly int CarveBypassMarginID = Shader.PropertyToID("gsCarveBypassMargin");
         private static readonly int CarveBypassBoostID = Shader.PropertyToID("gsCarveBypassBoost");
         private static readonly int AbstainSeedGuardID = Shader.PropertyToID("gsAbstainSeedGuard");
+        private static readonly int RawSeedGateID = Shader.PropertyToID("gsRawSeedGate");
+        private static readonly int RawSeedBandID = Shader.PropertyToID("gsRawSeedBand");
+        private static readonly int DiagDepthGapBaseID = Shader.PropertyToID("gsDiagDepthGapBase");
+        private static readonly int DiagDepthGapScaleID = Shader.PropertyToID("gsDiagDepthGapScale");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
         private static readonly int CamAvailableID = Shader.PropertyToID("gsCamAvailable");
         private static readonly int CamPosID = Shader.PropertyToID("gsCamPos");
@@ -123,6 +148,11 @@ namespace Genesis.RoomScan
         private static readonly int CamSensorResID = Shader.PropertyToID("gsCamSensorRes");
         private static readonly int CamCurrentResID = Shader.PropertyToID("gsCamCurrentRes");
         private static readonly int CamExposureID = Shader.PropertyToID("gsCamExposure");
+        private static readonly int UseRawProjectiveSdfID = Shader.PropertyToID("gsUseRawProjectiveSdf");
+        private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
+        private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
+        private static readonly int WriteAdmissionTraceID = Shader.PropertyToID("gsWriteAdmissionTrace");
+        private static readonly int BakeSrcAdmissionTraceID = Shader.PropertyToID("gsBakeSrcAdmissionTrace");
 
         public float CameraExposure => cameraExposure;
 
@@ -154,11 +184,20 @@ namespace Genesis.RoomScan
         // 矛盾票普查：诊断"幽灵抹不掉"——反对票到底投没投出、被哪道门禁拦住
         private ComputeBuffer _carveStats;
         private bool _carveStatsReadbackPending;
-        private static readonly uint[] ZeroCarveStats = new uint[8];
+        private ComputeBuffer _projectiveShadowCarveStats;
+        private bool _projectiveShadowCarveStatsReadbackPending;
+        // 0..27: existing contradiction/supply/edge ledgers.
+        // 28..44: read-only dilation-donor provenance ledger.
+        // 45..49: read-only donor-path classification ledger.
+        // 50..59: read-only direct-fill versus relay provenance ledger.
+        private const int CarveStatsCount = 60;
+        private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
-        public readonly uint[] LastCarveStats = new uint[8];
+        public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
+        public readonly uint[] LastProjectiveShadowCarveStats = new uint[CarveStatsCount];
         /// <summary>是否已有至少一轮矛盾票读回。</summary>
         public bool HasCarveStats { get; private set; }
+        public bool HasProjectiveShadowCarveStats { get; private set; }
         private static readonly int CarveStatsID = Shader.PropertyToID("_CarveStats");
 
         [Header("Coverage Metrics")]
@@ -239,14 +278,17 @@ namespace Genesis.RoomScan
             _clearKernel = new ComputeKernelHelper(compute, "Clear");
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
 
             _integrateKernel = new ComputeKernelHelper(compute, "Integrate");
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
 
             _pruneKernel = new ComputeKernelHelper(compute, "Prune");
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
 
             _freezeKernel = new ComputeKernelHelper(compute, "FreezeInFrustum");
             _freezeKernel.Set(VolumeRWID, _volume);
@@ -260,9 +302,15 @@ namespace Genesis.RoomScan
             _coverageKernel.Set(CoverageCountersID, _coverageCounters);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
 
-            _carveStats = new ComputeBuffer(8, sizeof(uint));
+            _carveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
             _carveStats.SetData(ZeroCarveStats);
             _integrateKernel.Set(CarveStatsID, _carveStats);
+
+            if (enableProjectiveShadow)
+            {
+                _projectiveShadowCarveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
+                _projectiveShadowCarveStats.SetData(ZeroCarveStats);
+            }
 
             _dummyCamTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
             _dummyCamTex.SetPixel(0, 0, Color.black);
@@ -276,6 +324,8 @@ namespace Genesis.RoomScan
             _coverageCounters = null;
             _carveStats?.Release();
             _carveStats = null;
+            _projectiveShadowCarveStats?.Release();
+            _projectiveShadowCarveStats = null;
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
         }
@@ -292,6 +342,8 @@ namespace Genesis.RoomScan
             _frustumReady = false;
             if (_volume) { Destroy(_volume); _volume = null; }
             if (_colorVolume) { Destroy(_colorVolume); _colorVolume = null; }
+            if (_projectiveShadowVolume) { Destroy(_projectiveShadowVolume); _projectiveShadowVolume = null; }
+            if (_admissionTraceVolume) { Destroy(_admissionTraceVolume); _admissionTraceVolume = null; }
             IntegrationCount = 0;
             Logger.Info("VolumeIntegrator: GPU volumes released");
         }
@@ -344,10 +396,13 @@ namespace Genesis.RoomScan
         {
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _freezeKernel.Set(VolumeRWID, _volume);
             _unfreezeKernel.Set(VolumeRWID, _volume);
             _coverageKernel.Set(VolumeRWID, _volume);
@@ -389,12 +444,30 @@ namespace Genesis.RoomScan
             _carveStatsReadbackPending = false;
             if (request.hasError) return;
             var data = request.GetData<uint>();
-            if (data.Length < 6) return;
-            for (int i = 0; i < 8; i++) LastCarveStats[i] = data[i];
+            if (data.Length < CarveStatsCount) return;
+            for (int i = 0; i < CarveStatsCount; i++) LastCarveStats[i] = data[i];
             HasCarveStats = true;
             _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
             _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
             _motionGatedSinceStats = 0;
+        }
+
+        private void RequestProjectiveShadowCarveStatsReadback()
+        {
+            if (_projectiveShadowCarveStats == null || _projectiveShadowCarveStatsReadbackPending) return;
+            _projectiveShadowCarveStatsReadbackPending = true;
+            AsyncGPUReadback.Request(_projectiveShadowCarveStats, OnProjectiveShadowCarveStatsReadback);
+        }
+
+        private void OnProjectiveShadowCarveStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _projectiveShadowCarveStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < CarveStatsCount) return;
+            for (int i = 0; i < CarveStatsCount; i++) LastProjectiveShadowCarveStats[i] = data[i];
+            HasProjectiveShadowCarveStats = true;
+            _projectiveShadowCarveStats.SetData(ZeroCarveStats);
         }
 
         private static string FormatCarveCount(uint v)
@@ -409,8 +482,105 @@ namespace Genesis.RoomScan
             return $"投{FormatCarveCount(LastCarveStats[0])} 排抹{FormatCarveCount(LastCarveStats[5])} " +
                    $"胀绕{FormatCarveCount(LastCarveStats[6])} 法绕{FormatCarveCount(LastCarveStats[7])} " +
                    $"排拦{FormatCarveCount(LastCarveStats[1])} 法拦{FormatCarveCount(LastCarveStats[2])} " +
-                   $"遮拦{FormatCarveCount(LastCarveStats[3])} 带拦{FormatCarveCount(LastCarveStats[4])}" +
+                   $"遮拦{FormatCarveCount(LastCarveStats[3])} 带拦{FormatCarveCount(LastCarveStats[4])} " +
+                   $"前延{FormatCarveCount(LastCarveStats[8])} 后延{FormatCarveCount(LastCarveStats[9])}" +
                    (_lastMotionGatedCount > 0 ? $" 动闸{_lastMotionGatedCount}" : "");
+        }
+
+        /// <summary>只读近零供料分账；不参与融合、裁剪或提取。</summary>
+        public string GetSupplyLedgerCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"内{FormatCarveCount(LastCarveStats[10])} 外{FormatCarveCount(LastCarveStats[11])} " +
+                   $"邻差≤5:{FormatCarveCount(LastCarveStats[12])} " +
+                   $"5~15:{FormatCarveCount(LastCarveStats[13])} " +
+                   $"15~30:{FormatCarveCount(LastCarveStats[14])} " +
+                   $">30:{FormatCarveCount(LastCarveStats[15])}";
+        }
+
+        /// <summary>只读自适应深度断层闸账；过=影子放行，掠/斜/正=按入射角拆分的影子拦截。</summary>
+        public string GetAdaptiveGapShadowCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"过{FormatCarveCount(LastCarveStats[16])} " +
+                   $"拦掠{FormatCarveCount(LastCarveStats[17])} " +
+                   $"拦斜{FormatCarveCount(LastCarveStats[18])} " +
+                   $"拦正{FormatCarveCount(LastCarveStats[19])}";
+        }
+
+        /// <summary>只读：把被融合端接受的近零供料追溯到边缘清洗器的具体判定来源。</summary>
+        public string GetEdgeSourceLedgerCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"净{FormatCarveCount(LastCarveStats[20])} " +
+                   $"平保{FormatCarveCount(LastCarveStats[21])} " +
+                   $"裙{FormatCarveCount(LastCarveStats[22])} " +
+                   $"双簇{FormatCarveCount(LastCarveStats[23])} " +
+                   $"掠{FormatCarveCount(LastCarveStats[24])} " +
+                   $"跨眼{FormatCarveCount(LastCarveStats[25])} " +
+                   $"杀漏{FormatCarveCount(LastCarveStats[26])} " +
+                   $"余疑{FormatCarveCount(LastCarveStats[27])}";
+        }
+
+        /// <summary>
+        /// 只读：追溯膨胀深度实际从哪个像素传播而来。第一行按传播像素距离分桶；
+        /// 第二行仅统计发生传播的供料，并按深度差与供体边缘原因拆分。
+        /// </summary>
+        public string GetDilationDonorLedgerCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"距自{FormatCarveCount(LastCarveStats[28])} ≤2:{FormatCarveCount(LastCarveStats[29])} " +
+                   $"2~4:{FormatCarveCount(LastCarveStats[30])} 4~8:{FormatCarveCount(LastCarveStats[31])} " +
+                   $">8:{FormatCarveCount(LastCarveStats[32])}\n" +
+                   $"差≤5:{FormatCarveCount(LastCarveStats[33])} 5~15:{FormatCarveCount(LastCarveStats[34])} " +
+                   $"15~30:{FormatCarveCount(LastCarveStats[35])} >30:{FormatCarveCount(LastCarveStats[36])} " +
+                   $"源净{FormatCarveCount(LastCarveStats[37])} 平{FormatCarveCount(LastCarveStats[38])} " +
+                   $"疑{FormatCarveCount(LastCarveStats[39])} 裙{FormatCarveCount(LastCarveStats[40])} " +
+                   $"掠{FormatCarveCount(LastCarveStats[41])} 双{FormatCarveCount(LastCarveStats[42])} " +
+                   $"跨{FormatCarveCount(LastCarveStats[43])} 杀{FormatCarveCount(LastCarveStats[44])}";
+        }
+
+        /// <summary>Read-only dilation path ledger: clean, edge, invalid, jump, sparse.</summary>
+        public string GetDilationPathLedgerCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"净{FormatCarveCount(LastCarveStats[45])} " +
+                   $"边{FormatCarveCount(LastCarveStats[46])} " +
+                   $"空{FormatCarveCount(LastCarveStats[47])} " +
+                   $"跳{FormatCarveCount(LastCarveStats[48])} " +
+                   $"稀{FormatCarveCount(LastCarveStats[49])}";
+        }
+
+        /// <summary>
+        /// Read-only jump-flood provenance ledger. 直补 is a one-hop raw-depth
+        /// hole-fill candidate; 接力 reused a dilated result for two or more hops.
+        /// Each side is split into clean / barrier / sparse path evidence.
+        /// </summary>
+        public string GetDilationRelayLedgerCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"直补{FormatCarveCount(LastCarveStats[50])}" +
+                   $"(净{FormatCarveCount(LastCarveStats[51])}/险{FormatCarveCount(LastCarveStats[52])}/稀{FormatCarveCount(LastCarveStats[53])}) " +
+                   $"接力{FormatCarveCount(LastCarveStats[54])}" +
+                   $"(净{FormatCarveCount(LastCarveStats[55])}/险{FormatCarveCount(LastCarveStats[56])}/稀{FormatCarveCount(LastCarveStats[57])}) " +
+                   $"二跳{FormatCarveCount(LastCarveStats[58])}/多跳{FormatCarveCount(LastCarveStats[59])}";
+        }
+
+        /// <summary>KinectFusion raw-projective 影子体的独立矛盾票摘要。</summary>
+        public string GetProjectiveShadowStatsCompact()
+        {
+            if (!ProjectiveShadowEnabled) return "关闭";
+            if (!HasProjectiveShadowCarveStats) return "统计中";
+            return $"投{FormatCarveCount(LastProjectiveShadowCarveStats[0])} " +
+                   $"排抹{FormatCarveCount(LastProjectiveShadowCarveStats[5])} " +
+                   $"胀绕{FormatCarveCount(LastProjectiveShadowCarveStats[6])} " +
+                   $"法绕{FormatCarveCount(LastProjectiveShadowCarveStats[7])} " +
+                   $"排拦{FormatCarveCount(LastProjectiveShadowCarveStats[1])} " +
+                   $"法拦{FormatCarveCount(LastProjectiveShadowCarveStats[2])} " +
+                   $"遮拦{FormatCarveCount(LastProjectiveShadowCarveStats[3])} " +
+                   $"带拦{FormatCarveCount(LastProjectiveShadowCarveStats[4])} " +
+                   $"前延{FormatCarveCount(LastProjectiveShadowCarveStats[8])} " +
+                   $"后延{FormatCarveCount(LastProjectiveShadowCarveStats[9])}";
         }
 
         private void CreateVolume()
@@ -430,6 +600,21 @@ namespace Genesis.RoomScan
             };
             _volume.Create();
 
+            if (enableProjectiveShadow)
+            {
+                _projectiveShadowVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, GraphicsFormat.R8G8_SNorm, 0)
+                {
+                    dimension = TextureDimension.Tex3D,
+                    volumeDepth = voxelCount.z,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Bilinear,
+                    wrapMode = TextureWrapMode.Clamp,
+                    name = "ProjectiveTSDFShadow"
+                };
+                _projectiveShadowVolume.Create();
+                Logger.Info($"Projective TSDF A/B shadow: {voxelCount} RG8_SNorm = {tsdfBytes / (1024 * 1024)}MB");
+            }
+
             _colorVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, GraphicsFormat.R8G8B8A8_UNorm, 0)
             {
                 dimension = TextureDimension.Tex3D,
@@ -439,6 +624,23 @@ namespace Genesis.RoomScan
                 wrapMode = TextureWrapMode.Clamp
             };
             _colorVolume.Create();
+
+            GraphicsFormat traceFormat = SystemInfo.IsFormatSupported(GraphicsFormat.R8_UNorm, FormatUsage.LoadStore)
+                ? GraphicsFormat.R8_UNorm
+                : GraphicsFormat.R16_SFloat;
+            _admissionTraceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "DilationAdmissionTrace"
+            };
+            _admissionTraceVolume.Create();
+            long traceBytesPerVoxel = traceFormat == GraphicsFormat.R8_UNorm ? 1L : 2L;
+            Logger.Info($"Dilation admission trace: {voxelCount} {traceFormat} = " +
+                        $"{(traceBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
         }
 
         private void SetShaderConstants()
@@ -468,6 +670,13 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
             compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
             compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
+            compute.SetFloat(RawSeedGateID, rawSeedGate ? 1f : 0f);
+            compute.SetFloat(RawSeedBandID, rawSeedBand);
+            compute.SetFloat(DiagDepthGapBaseID, diagnosticDepthGapBaseMeters);
+            compute.SetFloat(DiagDepthGapScaleID, diagnosticDepthGapDistanceScale);
+            compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            compute.SetFloat(WriteColorID, 1f);
+            compute.SetFloat(WriteAdmissionTraceID, 1f);
 
             Shader.SetGlobalTexture(VolumeID, _volume);
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
@@ -481,12 +690,46 @@ namespace Genesis.RoomScan
         public void Clear()
         {
             if (_volume == null || _clearKernel.Shader == null) return;
+
+            compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            compute.SetFloat(WriteColorID, 1f);
+            compute.SetFloat(WriteAdmissionTraceID, 1f);
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _clearKernel.DispatchFit(_volume);
+
+            if (_projectiveShadowVolume != null)
+            {
+                compute.SetFloat(UseRawProjectiveSdfID, 1f);
+                compute.SetFloat(WriteColorID, 0f);
+                compute.SetFloat(WriteAdmissionTraceID, 0f);
+                _clearKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _clearKernel.Set(ColorVolumeRWID, _colorVolume); // bound but guarded from writes
+                _clearKernel.DispatchFit(_projectiveShadowVolume);
+            }
+
+            // Restore production defaults for every unrelated kernel/caller.
+            compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            compute.SetFloat(WriteColorID, 1f);
+            compute.SetFloat(WriteAdmissionTraceID, 1f);
+            _clearKernel.Set(VolumeRWID, _volume);
             _carveStats?.SetData(ZeroCarveStats);
+            _projectiveShadowCarveStats?.SetData(ZeroCarveStats);
             HasCarveStats = false;
+            HasProjectiveShadowCarveStats = false;
             Cleared?.Invoke();
+        }
+
+        /// <summary>
+        /// Reset counters that belong to a user-visible scan session. Kept out
+        /// of <see cref="Clear"/> because the warm-up path also clears textures
+        /// and must not restart its own IntegrationCount threshold forever.
+        /// </summary>
+        public void ResetSessionCounters()
+        {
+            IntegrationCount = 0;
+            _integrationsSinceCoverage = 0;
         }
 
         /// <summary>
@@ -521,27 +764,73 @@ namespace Genesis.RoomScan
             };
             dstColor.Create();
 
+            var dstAdmissionTrace = new RenderTexture(vc.x, vc.y, 0, _admissionTraceVolume.graphicsFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = vc.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "DilationAdmissionTrace"
+            };
+            dstAdmissionTrace.Create();
+
+            RenderTexture dstProjectiveShadow = null;
+            if (_projectiveShadowVolume != null)
+            {
+                dstProjectiveShadow = new RenderTexture(vc.x, vc.y, 0, _projectiveShadowVolume.graphicsFormat, 0)
+                {
+                    dimension = TextureDimension.Tex3D,
+                    volumeDepth = vc.z,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Bilinear,
+                    wrapMode = TextureWrapMode.Clamp,
+                    name = "ProjectiveTSDFShadow"
+                };
+                dstProjectiveShadow.Create();
+            }
+
             int kernel = compute.FindKernel("BakeRelocation");
             compute.SetInts(Shader.PropertyToID("gsVoxCount"), vc.x, vc.y, vc.z);
             compute.SetFloat(Shader.PropertyToID("gsVoxSize"), voxelSize);
             compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcTsdf"), _volume);
             compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcColor"), _colorVolume);
+            compute.SetTexture(kernel, BakeSrcAdmissionTraceID, _admissionTraceVolume);
             compute.SetTexture(kernel, VolumeRWID, dstTsdf);
             compute.SetTexture(kernel, ColorVolumeRWID, dstColor);
+            compute.SetTexture(kernel, AdmissionTraceRWID, dstAdmissionTrace);
             compute.SetMatrix(Shader.PropertyToID("gsBakeInvRelocation"), invRelocation);
+            compute.SetFloat(WriteColorID, 1f);
+            compute.SetFloat(WriteAdmissionTraceID, 1f);
 
             int tx = Mathf.CeilToInt(vc.x / 4f);
             int ty = Mathf.CeilToInt(vc.y / 4f);
             int tz = Mathf.CeilToInt(vc.z / 4f);
             compute.Dispatch(kernel, tx, ty, tz);
+
+            if (dstProjectiveShadow != null)
+            {
+                compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcTsdf"), _projectiveShadowVolume);
+                compute.SetTexture(kernel, VolumeRWID, dstProjectiveShadow);
+                compute.SetTexture(kernel, ColorVolumeRWID, dstColor); // write-guarded
+                compute.SetFloat(WriteColorID, 0f);
+                compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.Dispatch(kernel, tx, ty, tz);
+                compute.SetFloat(WriteColorID, 1f);
+                compute.SetFloat(WriteAdmissionTraceID, 1f);
+            }
             GL.Flush();
 
             // Swap volumes: destroy old, adopt baked textures.
             // Avoids Graphics.CopyTexture on 3D RTs which can silently fail on Vulkan/Quest.
             Destroy(_volume);
             Destroy(_colorVolume);
+            if (_projectiveShadowVolume) Destroy(_projectiveShadowVolume);
+            if (_admissionTraceVolume) Destroy(_admissionTraceVolume);
             _volume = dstTsdf;
             _colorVolume = dstColor;
+            _projectiveShadowVolume = dstProjectiveShadow;
+            _admissionTraceVolume = dstAdmissionTrace;
 
             // Rebind global texture references (used by render shader for freeze tint etc.)
             Shader.SetGlobalTexture(VolumeID, _volume);
@@ -577,6 +866,12 @@ namespace Genesis.RoomScan
                 focalLen, principalPt, sensorRes, currentRes);
             _freezeKernel.Set(VolumeRWID, _volume);
             _freezeKernel.DispatchFit(_volume);
+            if (_projectiveShadowVolume != null)
+            {
+                _freezeKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _freezeKernel.DispatchFit(_projectiveShadowVolume);
+                _freezeKernel.Set(VolumeRWID, _volume);
+            }
             Logger.Info("FreezeInView dispatched");
         }
 
@@ -595,6 +890,12 @@ namespace Genesis.RoomScan
                 focalLen, principalPt, sensorRes, currentRes);
             _unfreezeKernel.Set(VolumeRWID, _volume);
             _unfreezeKernel.DispatchFit(_volume);
+            if (_projectiveShadowVolume != null)
+            {
+                _unfreezeKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _unfreezeKernel.DispatchFit(_projectiveShadowVolume);
+                _unfreezeKernel.Set(VolumeRWID, _volume);
+            }
             Logger.Info("UnfreezeInView dispatched");
         }
 
@@ -779,9 +1080,14 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
             compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
             compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
+            compute.SetFloat(RawSeedGateID, rawSeedGate ? 1f : 0f);
+            compute.SetFloat(RawSeedBandID, rawSeedBand);
+            compute.SetFloat(DiagDepthGapBaseID, diagnosticDepthGapBaseMeters);
+            compute.SetFloat(DiagDepthGapScaleID, diagnosticDepthGapDistanceScale);
 
             EnsureCamFrameCopy();
-            if (_pendingCamFrame != null && _camFrameCopy != null)
+            bool productionCamAvailable = _pendingCamFrame != null && _camFrameCopy != null;
+            if (productionCamAvailable)
             {
                 compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID, _camFrameCopy);
                 compute.SetInt(CamAvailableID, 1);
@@ -802,8 +1108,39 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(DepthCapture.DepthTexID, dc.DepthTex);
             _integrateKernel.Set(DepthCapture.NormTexID, dc.NormTex);
             _integrateKernel.Set(DepthCapture.DilatedDepthTexID, dc.DilatedDepthTex);
+            _integrateKernel.Set(DepthCapture.EdgeReasonTexID, dc.EdgeReasonTex);
 
+            // A: unchanged production path (projective difference scaled by normal cosine).
+            compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            compute.SetFloat(WriteColorID, 1f);
+            compute.SetFloat(WriteAdmissionTraceID, 1f);
+            _integrateKernel.Set(VolumeRWID, _volume);
+            _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(CarveStatsID, _carveStats);
             _integrateKernel.DispatchFit(_frustumVolume.count, 1);
+
+            // B: read-only KinectFusion-style projective TSDF shadow. It receives the
+            // exact same depth, pose, gates, quality and carve settings, but stores the
+            // unscaled ray-depth difference. No color/global production state is written.
+            if (_projectiveShadowVolume != null && _projectiveShadowCarveStats != null)
+            {
+                compute.SetFloat(UseRawProjectiveSdfID, 1f);
+                compute.SetFloat(WriteColorID, 0f);
+                compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.SetInt(CamAvailableID, 0);
+                _integrateKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _integrateKernel.Set(ColorVolumeRWID, _colorVolume); // write-guarded
+                _integrateKernel.Set(CarveStatsID, _projectiveShadowCarveStats);
+                _integrateKernel.DispatchFit(_frustumVolume.count, 1);
+
+                // Restore production bindings so external callers never inherit B state.
+                compute.SetFloat(UseRawProjectiveSdfID, 0f);
+                compute.SetFloat(WriteColorID, 1f);
+                compute.SetFloat(WriteAdmissionTraceID, 1f);
+                compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
+                _integrateKernel.Set(VolumeRWID, _volume);
+                _integrateKernel.Set(CarveStatsID, _carveStats);
+            }
 
             IntegrationCount++;
             _pendingCamFrame = null;
@@ -820,7 +1157,21 @@ namespace Genesis.RoomScan
                 _lastPruneTime = t;
                 _pruneKernel.Set(VolumeRWID, _volume);
                 _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+                compute.SetFloat(WriteColorID, 1f);
+                compute.SetFloat(WriteAdmissionTraceID, 1f);
                 _pruneKernel.DispatchFit(_volume);
+
+                if (_projectiveShadowVolume != null)
+                {
+                    compute.SetFloat(WriteColorID, 0f);
+                    compute.SetFloat(WriteAdmissionTraceID, 0f);
+                    _pruneKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                    _pruneKernel.Set(ColorVolumeRWID, _colorVolume); // write-guarded
+                    _pruneKernel.DispatchFit(_projectiveShadowVolume);
+                    compute.SetFloat(WriteColorID, 1f);
+                    compute.SetFloat(WriteAdmissionTraceID, 1f);
+                    _pruneKernel.Set(VolumeRWID, _volume);
+                }
             }
 
             if (coverageUpdateInterval > 0 && !_coverageReadbackPending)
@@ -831,6 +1182,7 @@ namespace Genesis.RoomScan
                     _integrationsSinceCoverage = 0;
                     DispatchCoverageCount();
                     RequestCarveStatsReadback();
+                    RequestProjectiveShadowCarveStatsReadback();
                 }
             }
 
@@ -877,6 +1229,22 @@ namespace Genesis.RoomScan
             colorTex.Apply(false, false);
             Graphics.CopyTexture(colorTex, _colorVolume);
             Destroy(colorTex);
+
+            // A saved production TSDF cannot be converted into the raw-projective
+            // counterfactual. Start B empty; it will accumulate only subsequent live frames.
+            if (_projectiveShadowVolume != null)
+            {
+                compute.SetFloat(WriteColorID, 0f);
+                compute.SetFloat(WriteAdmissionTraceID, 0f);
+                _clearKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+                _clearKernel.DispatchFit(_projectiveShadowVolume);
+                compute.SetFloat(WriteColorID, 1f);
+                compute.SetFloat(WriteAdmissionTraceID, 1f);
+                _clearKernel.Set(VolumeRWID, _volume);
+                _projectiveShadowCarveStats?.SetData(ZeroCarveStats);
+                HasProjectiveShadowCarveStats = false;
+            }
 
             GL.Flush();
 

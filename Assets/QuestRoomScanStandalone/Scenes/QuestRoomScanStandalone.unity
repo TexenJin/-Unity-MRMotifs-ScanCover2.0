@@ -283,12 +283,17 @@ MonoBehaviour:
   carveBypassMargin: 0.5
   carveBypassBoost: 2
   abstainSeedGuard: 1
+  rawSeedGate: 1
+  rawSeedBand: 1
+  diagnosticDepthGapBaseMeters: 0.035
+  diagnosticDepthGapDistanceScale: 0.018
   motionGateDegPerSec: 0
   minMeshWeight: 0.08
   cameraExposure: 3
   warmupIntegrations: 3
   pruneIntervalSeconds: 3
   coverageUpdateInterval: 30
+  enableProjectiveShadow: 0
 --- !u!114 &170429784
 MonoBehaviour:
   m_ObjectHideFlags: 0

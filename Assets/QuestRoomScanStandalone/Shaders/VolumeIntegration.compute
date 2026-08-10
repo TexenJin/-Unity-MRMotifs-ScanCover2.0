@@ -11,7 +11,14 @@
 
 RWTexture3D<float2> gsVolumeRW;
 RWTexture3D<float4> gsColorVolumeRW;
-RWStructuredBuffer<uint> _CarveStats; // 矛盾票普查：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹 6胀绕抹 7法绕抹
+RWTexture3D<float> gsAdmissionTraceRW;
+Texture2DArray<uint> gsEdgeReasonTex;
+RWStructuredBuffer<uint> _CarveStats; // 0..9=矛盾/延拦；10..27=现有只读账；28..44=膨胀供体出生证明（只读）
+// Projective TSDF A/B controls. The production pass keeps both at 0/1;
+// the read-only KinectFusion-style shadow pass sets raw=1, writeColor=0.
+float gsUseRawProjectiveSdf;
+float gsWriteColor;
+float gsWriteAdmissionTrace;
 float gsDepthDispThresh;
 float gsMaxUpdateDist;
 float gsMinUpdateDist;        // 近距采样闸：测量距离小于此值的深度样本整票作废（0=关闭，由 VolumeIntegrator.rejectNearSamples 控制）
@@ -21,6 +28,10 @@ float gsCarveBypassNormal;    // 法线闸不对称：1=掠射观测只拦写不
 float gsCarveBypassMargin;    // 法绕抹专用矛盾裕量（带宽单位，1=gsVoxDist）：掠射深度噪声大，要求新观测比存量空出更多才扣减
 float gsCarveBypassBoost;     // 绕行扣减独立倍率（默认 1）：绕行通道自带双重保险（被闸拦+强裕量），可加力清尸体而不动 carveGain 护真面
 float gsAbstainSeedGuard;     // 弃权邻域写闸：1=弃权像素周边 1px 只拦写（播种/增长）不拦抹（矛盾扣减照常），治帘锚点漏网裙边零星复种
+float gsRawSeedGate;          // 平面外推闸：投影后近表面、但原始沿视线距离已离开 TSDF 窄带时只拦写不拦抹
+float gsRawSeedBand;          // 双向原始沿视线允许带宽，单位=gsVoxDist
+float gsDiagDepthGapBase;     // 只读影子：深度断层阈值下限（米），不参与生产融合
+float gsDiagDepthGapScale;    // 只读影子：随距离增长系数；阈值=max(base, depth*scale)
 
 #define EXCLUSION_TOP 0.25
 #define EXCLUSION_BOTTOM 1.7
@@ -32,6 +43,84 @@ float gsExclusionRadius; // 排除区半径（原写死 0.6，现由 VolumeInteg
 #define SEED_WEIGHT 0.10
 #define PRUNE_WEIGHT 0.05
 #define COLOR_SURFACE_BAND 0.5
+#define DILATION_PATH_PROBES 12
+
+// Persistent, diagnostic-only packed provenance. One compact R8 sidecar holds
+// two independent ledgers without changing production TSDF decisions:
+//   bits 0..1 = immutable admission source for this voxel lifetime
+//               0 untracked, 1 self, 2 direct fill, 3 relay fill
+//   bit 2     = current geometry has received a receiver-side raw-depth
+//               confirmation consistent with the stored TSDF
+// Source is a birth certificate and is never OR-merged with later observations.
+// Confirmation is a geometric state, not a synonym for "raw pixel existed".
+uint DecodeAdmissionTrace(float encoded)
+{
+    return (uint)clamp((int)round(saturate(encoded) * 7.0), 0, 7);
+}
+
+float EncodeAdmissionTrace(uint packed)
+{
+    return saturate((float)(packed & 7u) / 7.0);
+}
+
+// Read-only donor-to-receiver path classification. This does not change the
+// production TSDF admission decision; it only records what the dilation path
+// crossed so the existing edge map can be evaluated as a future hard barrier.
+uint ClassifyDilationDonorPath(int2 donorPx, int2 receiverPx, float donorDistancePx)
+{
+    int2 pmax = int2(gsDepthTexSize) - 1;
+    int probes = clamp((int)ceil(donorDistancePx * 0.5), 2, DILATION_PATH_PROBES);
+    float sampleSpacingPx = donorDistancePx / max((float)probes, 1.0);
+    bool crossedKnownEdge = false;
+    bool crossedInvalid = false;
+    bool crossedDepthJump = false;
+
+    int2 startPx = clamp(donorPx, int2(0, 0), pmax);
+    float startNdc = gsDepthTex[uint3(uint2(startPx), 0)];
+    bool previousValid = startNdc > 0.0;
+    float previousLinear = previousValid ? gsDepthNDCToLinear(startNdc) : 0.0;
+
+    [loop]
+    for (int i = 1; i <= DILATION_PATH_PROBES; i++)
+    {
+        if (i > probes) break;
+        float t = (float)i / (float)probes;
+        int2 pathPx = clamp(
+            int2(round(lerp(float2(donorPx), float2(receiverPx), t))),
+            int2(0, 0), pmax);
+
+        uint pathReason = gsEdgeReasonTex[uint3(uint2(pathPx), 0)];
+        if ((pathReason & (1u << 7)) != 0)
+            crossedKnownEdge = true;
+
+        float pathNdc = gsDepthTex[uint3(uint2(pathPx), 0)];
+        bool currentValid = pathNdc > 0.0;
+        if (!currentValid)
+        {
+            crossedInvalid = true;
+            previousValid = false;
+            continue;
+        }
+
+        float currentLinear = gsDepthNDCToLinear(pathNdc);
+        if (previousValid)
+        {
+            float jumpLimit = max(gsDiagDepthGapBase, currentLinear * gsDiagDepthGapScale)
+                            * max(sampleSpacingPx, 1.0);
+            if (abs(currentLinear - previousLinear) > jumpLimit)
+                crossedDepthJump = true;
+        }
+
+        previousLinear = currentLinear;
+        previousValid = true;
+    }
+
+    if (crossedKnownEdge) return 1u;
+    if (crossedInvalid) return 2u;
+    if (crossedDepthJump) return 3u;
+    if (sampleSpacingPx > 2.0) return 4u;
+    return 0u;
+}
 
 float gsBlendRate;
 float gsStability;
@@ -73,7 +162,10 @@ float2 ProjectToCameraUV(float3 worldPos)
 void Clear(uint3 id : SV_DispatchThreadID)
 {
     gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
-    gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+    if (gsWriteColor > 0.5)
+        gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+    if (gsWriteAdmissionTrace > 0.5)
+        gsAdmissionTraceRW[id] = 0.0;
 }
 
 #pragma kernel Prune
@@ -86,7 +178,10 @@ void Prune(uint3 id : SV_DispatchThreadID)
     if (val.y > 0 && val.y < PRUNE_WEIGHT)
     {
         gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
-        gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+        if (gsWriteColor > 0.5)
+            gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+        if (gsWriteAdmissionTrace > 0.5)
+            gsAdmissionTraceRW[id] = 0.0;
     }
 }
 
@@ -143,12 +238,22 @@ void Integrate(uint id : SV_DispatchThreadID)
         if (gsDepthTex[uint3(uint2(clamp(dpx + int2(-1,-1), int2(0, 0), dmax)), 0)] == 0) nearAbstain = true;
     }
 
-    float sDist = depthEyeDist - voxEyeDist;
-    sDist *= saturate(normDot);
+    float rawProjectiveSdf = depthEyeDist - voxEyeDist;
+    float sDist = lerp(rawProjectiveSdf * saturate(normDot),
+                       rawProjectiveSdf,
+                       saturate(gsUseRawProjectiveSdf));
 
     bool empty = sDist >= 1.0;
     float sDistNorm = min(sDist / gsVoxDist, 1);
     bool withinBand = sDistNorm >= -gsVoxMin / gsVoxSize;
+    // 标准 TSDF 窄带约束：法线投影只能改变融合权重/方向语义，不能把原始射线上已经
+    // 远离观测表面的体素压成“近零交叉”。前表面(+raw)与后表面(-raw)必须双向约束。
+    // 只阻止播种/增长，下面的矛盾扣减通道仍可清理既有错误。
+    float rawSeedLimit = gsRawSeedBand * gsVoxDist;
+    bool rawGateBlock = gsRawSeedGate > 0.5 &&
+                        abs(sDistNorm) < 0.5 &&
+                        abs(rawProjectiveSdf) > rawSeedLimit;
+    bool rawGateFront = rawProjectiveSdf > rawSeedLimit;
 
     float dilatedDepthNDC = gsSampleDilatedDepth(voxNDC.xy);
     float dilatedDepthLinear = gsDepthNDCToLinear(dilatedDepthNDC);
@@ -262,6 +367,156 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float quality = distFactor * angleFactor;
     float q2 = quality * quality;
 
+    // Classify the source that allowed this voxel through the dilation gate.
+    // This is provenance of admission only; sDist itself still comes from raw depth.
+    int2 admissionPx = clamp(int2(voxNDC.xy * float2(gsDepthTexSize)),
+                             int2(0, 0), int2(gsDepthTexSize) - 1);
+    float4 admissionDonorRecord = gsDilatedDepth.Load(int3(admissionPx, 0));
+    int2 admissionDonorPx = clamp(int2(admissionDonorRecord.xy + 0.5),
+                                  int2(0, 0), int2(gsDepthTexSize) - 1);
+    float admissionDonorDistancePx = length(float2(admissionDonorPx - admissionPx));
+    uint admissionDonorHops = (uint)round(max(admissionDonorRecord.w, 0.0));
+
+    // Ledger A records the source that first admitted this voxel. Ledger B is
+    // evaluated only after an accepted write and additionally requires the raw
+    // receiver measurement to agree with the local zero-crossing geometry.
+    // gsDepthTex is Texture2DArray<float>: xy, array slice, mip level.
+    float receiverRawDepthNdc = gsDepthTex.Load(int4(admissionPx, 0, 0));
+    bool receiverOwnsRawDepth = receiverRawDepthNdc > 0.0;
+    uint admissionSource = admissionDonorDistancePx <= 0.5 ? 1u :
+                           (admissionDonorHops <= 1u ? 2u : 3u);
+    bool rawGeometryConfirmed = receiverOwnsRawDepth && !rawGateBlock &&
+                                abs(rawProjectiveSdf) <= rawSeedLimit &&
+                                abs(sDistNorm) <= 0.5;
+
+    // 只读供料分账：只统计“现有生产规则本来就会允许写入”的近零候选，绝不参与任何闸门。
+    // 原始射线距离拆成内半带/外半带；当前深度与膨胀近景的差值用于判断是否贴着深度断层。
+    bool supplyLedgerCandidate = !nearAbstain && !rawGateBlock &&
+                                 quality >= MIN_QUALITY_SEED &&
+                                 abs(sDistNorm) < 0.5 &&
+                                 abs(rawProjectiveSdf) <= rawSeedLimit;
+    if (supplyLedgerCandidate)
+    {
+        float rawRatio = abs(rawProjectiveSdf) / max(rawSeedLimit, 1e-5);
+        InterlockedAdd(_CarveStats[rawRatio <= 0.5 ? 10 : 11], 1);
+
+        float localDepthGap = max(depthLinear - dilatedDepthLinear, 0.0);
+        uint gapSlot = localDepthGap <= 0.05 ? 12 :
+                       (localDepthGap <= 0.15 ? 13 :
+                       (localDepthGap <= 0.30 ? 14 : 15));
+        InterlockedAdd(_CarveStats[gapSlot], 1);
+
+        // 自适应深度断层闸只读影子：严格复用 DepthEdgeClean 的距离阈值形式，
+        // 但此处只记账、不改变 valid/播种/增长/矛盾扣减。按入射角拆账，用来识别
+        // 候选闸是否主要命中危险的掠射供料，还是会大量误伤正视的真实表面。
+        float adaptiveGapLimit = max(gsDiagDepthGapBase,
+                                     depthLinear * gsDiagDepthGapScale);
+        if (localDepthGap <= adaptiveGapLimit)
+        {
+            InterlockedAdd(_CarveStats[16], 1);
+        }
+        else if (normDot < 0.5)
+        {
+            InterlockedAdd(_CarveStats[17], 1);
+        }
+        else if (normDot < 0.7)
+        {
+            InterlockedAdd(_CarveStats[18], 1);
+        }
+        else
+        {
+            InterlockedAdd(_CarveStats[19], 1);
+        }
+
+        // Read-only cross-ledger. Slots 20..25/27 are exclusive and therefore sum to
+        // the accepted near-zero supply population. Slot 26 is an overlap alarm: the
+        // cleaner marked the exact source pixel killed but fusion still saw it as supply.
+        int2 reasonPx = admissionPx;
+        uint edgeReason = gsEdgeReasonTex[uint3(uint2(reasonPx), 0)];
+        bool rKilled = (edgeReason & (1u << 7)) != 0;
+        bool rSkirt = (edgeReason & (1u << 2)) != 0;
+        bool rCrossEye = (edgeReason & (1u << 6)) != 0;
+        bool rGrazing = (edgeReason & (1u << 4)) != 0;
+        bool rDual = (edgeReason & (1u << 5)) != 0;
+        bool rPlane = (edgeReason & (1u << 3)) != 0;
+        bool rSpanOrGap = (edgeReason & ((1u << 0) | (1u << 1) | (1u << 8))) != 0;
+        uint reasonSlot = rSkirt ? 22 :
+                          (rCrossEye ? 25 :
+                          (rGrazing ? 24 :
+                          (rDual ? 23 :
+                          (rPlane ? 21 :
+                          (rSpanOrGap ? 27 : 20)))));
+        InterlockedAdd(_CarveStats[reasonSlot], 1);
+        if (rKilled) InterlockedAdd(_CarveStats[26], 1);
+
+        // 膨胀供体“出生证明”只读分账。
+        // Jump Flood 的 float4 本来就保存了 donor.xy + donorDepth；这里仅追溯它，
+        // 不改变 production 使用的 dilatedDepth、valid、TSDF 写入或网格提取。
+        float4 donorRecord = admissionDonorRecord;
+        int2 donorPx = admissionDonorPx;
+        float donorDistancePx = admissionDonorDistancePx;
+        uint donorDistanceSlot = donorDistancePx <= 0.5 ? 28 :
+                                 (donorDistancePx <= 2.0 ? 29 :
+                                 (donorDistancePx <= 4.0 ? 30 :
+                                 (donorDistancePx <= 8.0 ? 31 : 32)));
+        InterlockedAdd(_CarveStats[donorDistanceSlot], 1);
+
+        // 只有真正从邻像素传播来的供料才进入“供体差/供体来源”两本账。
+        // 33..36 是互斥深度差桶；37..44 是互斥供体原因桶，二者各自求和
+        // 都应等于传播供料总数，可用于检查统计链是否自洽。
+        if (donorDistancePx > 0.5)
+        {
+            uint donorGapSlot = localDepthGap <= 0.05 ? 33 :
+                                (localDepthGap <= 0.15 ? 34 :
+                                (localDepthGap <= 0.30 ? 35 : 36));
+            InterlockedAdd(_CarveStats[donorGapSlot], 1);
+
+            uint donorReason = gsEdgeReasonTex[uint3(uint2(donorPx), 0)];
+            bool dKilled = (donorReason & (1u << 7)) != 0;
+            bool dSkirt = (donorReason & (1u << 2)) != 0;
+            bool dCrossEye = (donorReason & (1u << 6)) != 0;
+            bool dGrazing = (donorReason & (1u << 4)) != 0;
+            bool dDual = (donorReason & (1u << 5)) != 0;
+            bool dPlane = (donorReason & (1u << 3)) != 0;
+            bool dSpanOrGap = (donorReason & ((1u << 0) | (1u << 1) | (1u << 8))) != 0;
+
+            // 优先把“已杀却仍成为供体”单列为报警，其余原因保持互斥。
+            uint donorReasonSlot = dKilled ? 44 :
+                                   (dSkirt ? 40 :
+                                   (dCrossEye ? 43 :
+                                   (dGrazing ? 41 :
+                                   (dDual ? 42 :
+                                   (dPlane ? 38 :
+                                   (dSpanOrGap ? 39 : 37))))));
+            InterlockedAdd(_CarveStats[donorReasonSlot], 1);
+
+            // 45..49 are mutually exclusive and should sum to propagated
+            // donors (29..32): clean / known edge / invalid / jump / sparse.
+            uint pathClass = ClassifyDilationDonorPath(donorPx, reasonPx, donorDistancePx);
+            InterlockedAdd(_CarveStats[45 + pathClass], 1);
+
+            // 50..59 split long-range dilation by its actual jump-flood
+            // provenance rather than inferring relay from endpoint distance.
+            // One hop is a direct raw-depth fill candidate; two or more hops
+            // reused an already-dilated result and are relay candidates.
+            uint donorHops = (uint)round(max(donorRecord.w, 0.0));
+            bool directFill = donorHops <= 1u;
+            bool pathBarrier = pathClass >= 1u && pathClass <= 3u;
+            bool pathSparse = pathClass == 4u;
+            if (directFill)
+            {
+                InterlockedAdd(_CarveStats[50], 1); // direct total
+                InterlockedAdd(_CarveStats[pathSparse ? 53 : (pathBarrier ? 52 : 51)], 1);
+            }
+            else
+            {
+                InterlockedAdd(_CarveStats[54], 1); // relay total
+                InterlockedAdd(_CarveStats[pathSparse ? 57 : (pathBarrier ? 56 : 55)], 1);
+                InterlockedAdd(_CarveStats[donorHops == 2u ? 58 : 59], 1);
+            }
+        }
+    }
+
     float2 old = gsVolumeRW[coord];
     if (old.y < 0) return; // frozen voxel — skip integration
     float oldVal = old.x;
@@ -273,17 +528,35 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     {
         bool c0 = sDistNorm > oldVal + 0.2;
         if (!wasEmpty && c0)
-            gsVolumeRW[coord] = float2(oldVal, max(weight - max(q2 * gsCarveGain, 1.0 / 127.0), 0.0));
+        {
+            float abstainWeight = max(weight - max(q2 * gsCarveGain, 1.0 / 127.0), 0.0);
+            gsVolumeRW[coord] = float2(oldVal, abstainWeight);
+            if (gsWriteAdmissionTrace > 0.5)
+            {
+                uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
+                gsAdmissionTraceRW[coord] = abstainWeight > 0.001
+                    ? EncodeAdmissionTrace(oldTrace & 3u)
+                    : 0.0;
+            }
+        }
         return;
     }
 
     if (wasEmpty)
     {
-        if (quality >= MIN_QUALITY_SEED)
+        if (quality >= MIN_QUALITY_SEED && !rawGateBlock)
         {
             gsVolumeRW[coord] = float2(sDistNorm, SEED_WEIGHT);
+            // Diagnostic sidecar follows every accepted TSDF write.  Restricting it
+            // to the colour band leaves many Surface-Nets cell corners unclassified
+            // even though those corners genuinely participated in the zero crossing.
+            if (gsWriteAdmissionTrace > 0.5)
+            {
+                uint seedTrace = admissionSource | (rawGeometryConfirmed ? 4u : 0u);
+                gsAdmissionTraceRW[coord] = EncodeAdmissionTrace(seedTrace);
+            }
 
-            if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
+            if (gsWriteColor > 0.5 && gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
             {
                 float2 uv = ProjectToCameraUV(voxPos);
                 if (uv.x > 0.02 && uv.x < 0.98 && uv.y > 0.02 && uv.y < 0.98)
@@ -293,6 +566,10 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                     gsColorVolumeRW[coord] = float4(boosted, quality * 0.1);
                 }
             }
+        }
+        else if (quality >= MIN_QUALITY_SEED && rawGateBlock)
+        {
+            InterlockedAdd(_CarveStats[rawGateFront ? 8 : 9], 1);
         }
         return;
     }
@@ -310,13 +587,41 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float carveStep = max(q2 * gsCarveGain, 1.0 / 127.0);
     float carvedWeight = contradicted ? max(weight - carveStep, 0.0) : weight;
 
+    // 外推闸只阻止假近表面的增长。若当前射线明确反证已有存量，照常扣权，
+    // 避免把闸变成“只许旧错活、不许新证据改”的冻结通道。
+    if (rawGateBlock)
+    {
+        InterlockedAdd(_CarveStats[rawGateFront ? 8 : 9], 1);
+        if (contradicted)
+        {
+            gsVolumeRW[coord] = float2(oldVal, carvedWeight);
+            if (gsWriteAdmissionTrace > 0.5)
+            {
+                uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
+                gsAdmissionTraceRW[coord] = carvedWeight > 0.001
+                    ? EncodeAdmissionTrace(oldTrace & 3u)
+                    : 0.0;
+            }
+        }
+        return;
+    }
+
     float blend = q2 * gsBlendRate / (1.0 + weight * gsStability);
     blend = clamp(blend, 0.0, 0.7);
     if (blend < 0.005)
     {
         // 赞成票太弱不配改写 TSDF，但反对票仍然生效（只扣信心，不动距离值）
         if (contradicted)
+        {
             gsVolumeRW[coord] = float2(oldVal, carvedWeight);
+            if (gsWriteAdmissionTrace > 0.5)
+            {
+                uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
+                gsAdmissionTraceRW[coord] = carvedWeight > 0.001
+                    ? EncodeAdmissionTrace(oldTrace & 3u)
+                    : 0.0;
+            }
+        }
         return;
     }
 
@@ -324,8 +629,31 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // 矛盾帧只扣不增：反对票与赞成票同帧抵消是设计缺陷（v2 修复①）
     float newWeight = contradicted ? carvedWeight : min(weight + q2 * gsWeightGrowth, gsMaxWeight);
     gsVolumeRW[coord] = float2(newTsdf, newWeight);
+    if (gsWriteAdmissionTrace > 0.5)
+    {
+        uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
+        uint birthSource = oldTrace & 3u;
+        if (birthSource == 0u)
+            birthSource = admissionSource;
 
-    if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
+        // A raw sample confirms geometry only when it agrees with both the
+        // current projective narrow band and the already stored TSDF. A
+        // contradiction revokes confirmation; a tiny stable update preserves
+        // it so brief dropouts do not turn the ledger into a frame-presence bit.
+        bool agreesWithStoredTsdf = abs(oldVal - sDistNorm) <= 0.35;
+        bool confirmedNow = !contradicted && newWeight > 0.001 &&
+                            rawGeometryConfirmed && agreesWithStoredTsdf;
+        bool preserveStableConfirmation = !contradicted &&
+                                          ((oldTrace & 4u) != 0u) &&
+                                          abs(newTsdf - oldVal) <= 0.05;
+        uint updatedTrace = birthSource |
+                            ((confirmedNow || preserveStableConfirmation) ? 4u : 0u);
+        gsAdmissionTraceRW[coord] = newWeight > 0.001
+            ? EncodeAdmissionTrace(updatedTrace)
+            : 0.0;
+    }
+
+    if (gsWriteColor > 0.5 && gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
     {
         float2 uv = ProjectToCameraUV(voxPos);
         if (uv.x > 0.02 && uv.x < 0.98 && uv.y > 0.02 && uv.y < 0.98)
@@ -415,6 +743,7 @@ void CountSurfaceCoverage(uint3 id : SV_DispatchThreadID)
 
 Texture3D<float2> gsBakeSrcTsdf;
 Texture3D<float4> gsBakeSrcColor;
+Texture3D<float> gsBakeSrcAdmissionTrace;
 float4x4 gsBakeInvRelocation;
 
 [numthreads(4, 4, 4)]
@@ -429,6 +758,9 @@ void BakeRelocation(uint3 id : SV_DispatchThreadID)
     float3 uvw = srcGrid / (float3)gsVoxCount;
 
     bool oob = any(uvw < 0.0) || any(uvw > 1.0);
-    gsVolumeRW[id]      = oob ? float2(GS_EMPTY_VOXEL, 0) : gsBakeSrcTsdf.SampleLevel(gsVolLinearClampSampler, uvw, 0);
-    gsColorVolumeRW[id] = oob ? float4(0, 0, 0, 0)        : gsBakeSrcColor.SampleLevel(gsVolLinearClampSampler, uvw, 0);
+    gsVolumeRW[id] = oob ? float2(GS_EMPTY_VOXEL, 0) : gsBakeSrcTsdf.SampleLevel(gsVolLinearClampSampler, uvw, 0);
+    if (gsWriteColor > 0.5)
+        gsColorVolumeRW[id] = oob ? float4(0, 0, 0, 0) : gsBakeSrcColor.SampleLevel(gsVolLinearClampSampler, uvw, 0);
+    if (gsWriteAdmissionTrace > 0.5)
+        gsAdmissionTraceRW[id] = oob ? 0.0 : gsBakeSrcAdmissionTrace.SampleLevel(gsVolPointClampSampler, uvw, 0);
 }

@@ -11,7 +11,7 @@ namespace Genesis.RoomScan
     ///
     /// 所有兄弟组件挂在同一个 GameObject 上自动解析。
     /// 输入由 <see cref="StandaloneScanInput"/> 处理：
-    ///   右手柄扳机 = 开始/继续扫描，A = 暂停，B = 停止并清空重扫。
+    ///   右手柄扳机 = 开始/继续扫描，A = 暂停，B = 保存累计账并清空重扫。
     /// </summary>
     [RequireComponent(typeof(DepthCapture), typeof(VolumeIntegrator), typeof(MeshExtractor))]
     public class StandaloneRoomScanner : MonoBehaviour
@@ -82,6 +82,10 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            // Runtime lock: serialized scene values cannot accidentally revive
+            // the in-headset HUD or the diagnostic ROI frame.
+            showDebugHud = false;
+            showDiagnosticRoiFrame = false;
             Logger.Level = logLevel;
             _depthCapture = GetComponent<DepthCapture>();
             _volumeIntegrator = GetComponent<VolumeIntegrator>();
@@ -129,16 +133,19 @@ namespace Genesis.RoomScan
         // ─────────────────────────────────────────────────────────────
 
         [Header("调试面板")]
-        [SerializeField] private bool showDebugHud = true;
+        [SerializeField] private bool showDebugHud = false;
         [SerializeField, Tooltip("在面板右上角开一个当前深度实时预览小窗（青=近 绿=中 红=远 暗=无效）。" +
             "用途：盯着幽灵网格时看深度画面里那个斑块还在不在——在=深度自洽幻觉（Meta侧时序锁定）；转头后斑块从预览消失=深度刷新")]
         private bool showDepthPreview = true;
         [SerializeField, Tooltip("世界空间实时深度点云叠加层：当前深度以 3D 点云叠在网格上同屏对照。" +
             "幽灵位置有点云覆盖=深度自洽幻觉；空空如也却有网格=矛盾在我们侧")]
         private bool showDepthPointCloud = true;
+        [SerializeField, Tooltip("显示只读断崖样本框：左侧近面、中间边缘、右侧远景。只影响诊断计数与导出。")]
+        private bool showDiagnosticRoiFrame = false;
 
         private UnityEngine.UI.Text _hudText;
         private RectTransform _hudRect;
+        private GameObject _diagnosticRoiFrame;
         private string _hudStatus = "就绪";
         private string _hudLastError = "";
         private string _hudLastInput = "无";
@@ -166,8 +173,10 @@ namespace Genesis.RoomScan
             var canvas = canvasGo.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.WorldSpace;
             _hudRect = canvasGo.GetComponent<RectTransform>();
-            _hudRect.sizeDelta = new Vector2(900f, 360f);
-            canvasGo.transform.localScale = Vector3.one * 0.0009f;
+            // Keep approximately the same physical width as the old panel, but add
+            // vertical room for the diagnostic ledgers so wrapped rows remain visible.
+            _hudRect.sizeDelta = new Vector2(1080f, 650f);
+            canvasGo.transform.localScale = Vector3.one * 0.00072f;
 
             // 置顶材质：WorldSpace Canvas 走 UI/Default 时 ZTest=LEqual 会被网格/墙面挡住，
             // 换 QRS/HUDAlwaysOnTop（ZTest Always + Overlay 队列）。Resources 加载防裁剪，找不到静默回退。
@@ -179,19 +188,20 @@ namespace Genesis.RoomScan
             textGo.transform.SetParent(canvasGo.transform, false);
             _hudText = textGo.AddComponent<UnityEngine.UI.Text>();
             _hudText.font = font;
-            _hudText.fontSize = 34;
+            _hudText.fontSize = 28;
+            _hudText.lineSpacing = 0.88f;
             _hudText.color = Color.white;
             _hudText.alignment = TextAnchor.UpperLeft;
             if (hudMat != null) _hudText.material = hudMat;
             // Wrap：开预览时文字区收窄到左侧，长行折行而不是溢到小窗底下
-            _hudText.horizontalOverflow = showDepthPreview ? HorizontalWrapMode.Wrap : HorizontalWrapMode.Overflow;
+            _hudText.horizontalOverflow = HorizontalWrapMode.Wrap;
             _hudText.verticalOverflow = VerticalWrapMode.Overflow;
             var rt = textGo.GetComponent<RectTransform>();
             rt.anchorMin = Vector2.zero;
             rt.anchorMax = Vector2.one;
-            rt.offsetMin = new Vector2(20f, 0f);
+            rt.offsetMin = new Vector2(18f, 12f);
             // 开深度预览时右侧留出 320px 给小窗，文字不压图
-            rt.offsetMax = new Vector2(showDepthPreview ? -340f : -20f, 0f);
+            rt.offsetMax = new Vector2(showDepthPreview ? -258f : -18f, -12f);
 
             // 半透明黑底，保证在透视画面上可读
             var bgGo = new GameObject("Bg");
@@ -207,6 +217,8 @@ namespace Genesis.RoomScan
             brt.offsetMax = Vector2.zero;
 
             if (showDepthPreview) CreateDepthPreview(canvasGo.transform);
+            if (showDiagnosticRoiFrame && _meshExtractor != null && _meshExtractor.DiagnosticRoiEnabled)
+                CreateDiagnosticRoiFrame(Camera.main, font, hudMat);
 
             Logger.Info("调试面板已创建");
         }
@@ -216,6 +228,106 @@ namespace Genesis.RoomScan
         /// shader 直接采样全局 gsDepthTex，零 C# 侧每帧拷贝，零额外接线。
         /// shader 在 Resources 下（防打包裁剪），找不到就静默跳过不影响面板。
         /// </summary>
+        /// <summary>
+        /// 只读断崖样本框。框与计算着色器使用同一组归一化范围：
+        /// 左栏放近面，中间窄栏压住断崖边，右栏放远景。
+        /// 该 Canvas 不参与射线、融合、提取或准入，只给操作者对准诊断 ROI。
+        /// </summary>
+        private void CreateDiagnosticRoiFrame(Camera cam, Font font, Material hudMat)
+        {
+            if (cam == null || _meshExtractor == null) return;
+
+            var go = new GameObject("[QRS] 断崖诊断框");
+            _diagnosticRoiFrame = go;
+            go.transform.SetParent(cam.transform, false);
+
+            var canvas = go.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.WorldSpace;
+            canvas.overrideSorting = true;
+            canvas.sortingOrder = 32760;
+
+            const float distance = 1f;
+            const float canvasWidthPx = 1000f;
+            float viewHeight = 2f * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) * distance;
+            float viewWidth = viewHeight * Mathf.Max(0.1f, cam.aspect);
+            float canvasHeightPx = canvasWidthPx * viewHeight / Mathf.Max(0.001f, viewWidth);
+
+            var root = go.GetComponent<RectTransform>();
+            root.sizeDelta = new Vector2(canvasWidthPx, canvasHeightPx);
+            go.transform.localPosition = Vector3.forward * distance;
+            go.transform.localRotation = Quaternion.identity;
+            go.transform.localScale = Vector3.one * (viewWidth / canvasWidthPx);
+
+            Vector4 r = _meshExtractor.DiagnosticRoiRect;
+            float x0 = Mathf.Clamp01(Mathf.Min(r.x, r.z));
+            float y0 = Mathf.Clamp01(Mathf.Min(r.y, r.w));
+            float x1 = Mathf.Clamp01(Mathf.Max(r.x, r.z));
+            float y1 = Mathf.Clamp01(Mathf.Max(r.y, r.w));
+            Vector2 splits = _meshExtractor.DiagnosticRoiSplitX;
+            float sx0 = Mathf.Clamp(splits.x, x0, x1);
+            float sx1 = Mathf.Clamp(splits.y, sx0, x1);
+
+            Color outer = new Color(1f, 1f, 1f, 0.85f);
+            Color divider = new Color(1f, 0.82f, 0.18f, 0.9f);
+            const float linePx = 3f;
+
+            AddDiagnosticRoiLine(go.transform, "左边", new Vector2(x0, y0), new Vector2(x0, y1),
+                new Vector2(linePx, 0f), outer, hudMat);
+            AddDiagnosticRoiLine(go.transform, "右边", new Vector2(x1, y0), new Vector2(x1, y1),
+                new Vector2(linePx, 0f), outer, hudMat);
+            AddDiagnosticRoiLine(go.transform, "下边", new Vector2(x0, y0), new Vector2(x1, y0),
+                new Vector2(0f, linePx), outer, hudMat);
+            AddDiagnosticRoiLine(go.transform, "上边", new Vector2(x0, y1), new Vector2(x1, y1),
+                new Vector2(0f, linePx), outer, hudMat);
+            AddDiagnosticRoiLine(go.transform, "近面边界", new Vector2(sx0, y0), new Vector2(sx0, y1),
+                new Vector2(linePx, 0f), divider, hudMat);
+            AddDiagnosticRoiLine(go.transform, "远景边界", new Vector2(sx1, y0), new Vector2(sx1, y1),
+                new Vector2(linePx, 0f), divider, hudMat);
+
+            AddDiagnosticRoiLabel(go.transform, "近面", (x0 + sx0) * 0.5f, y1, font, hudMat);
+            AddDiagnosticRoiLabel(go.transform, "边缘", (sx0 + sx1) * 0.5f, y1, font, hudMat);
+            AddDiagnosticRoiLabel(go.transform, "远景", (sx1 + x1) * 0.5f, y1, font, hudMat);
+        }
+
+        private static void AddDiagnosticRoiLine(
+            Transform parent, string name, Vector2 anchorMin, Vector2 anchorMax,
+            Vector2 sizeDelta, Color color, Material material)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            var image = go.AddComponent<UnityEngine.UI.Image>();
+            image.color = color;
+            image.raycastTarget = false;
+            if (material != null) image.material = material;
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = anchorMin;
+            rt.anchorMax = anchorMax;
+            rt.anchoredPosition = Vector2.zero;
+            rt.sizeDelta = sizeDelta;
+        }
+
+        private static void AddDiagnosticRoiLabel(
+            Transform parent, string label, float x, float y, Font font, Material material)
+        {
+            var go = new GameObject(label);
+            go.transform.SetParent(parent, false);
+            var text = go.AddComponent<UnityEngine.UI.Text>();
+            text.text = label;
+            text.font = font;
+            text.fontSize = 28;
+            text.fontStyle = FontStyle.Bold;
+            text.alignment = TextAnchor.UpperCenter;
+            text.color = new Color(1f, 0.9f, 0.35f, 0.95f);
+            text.raycastTarget = false;
+            if (material != null) text.material = material;
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = new Vector2(x, y);
+            rt.anchorMax = new Vector2(x, y);
+            rt.pivot = new Vector2(0.5f, 1f);
+            rt.anchoredPosition = new Vector2(0f, -8f);
+            rt.sizeDelta = new Vector2(130f, 42f);
+        }
+
         private void CreateDepthPreview(Transform parent)
         {
             var shader = Resources.Load<Shader>("DepthPreview");
@@ -237,7 +349,7 @@ namespace Genesis.RoomScan
             prt.anchorMax = new Vector2(1f, 1f);
             prt.pivot = new Vector2(1f, 1f);
             prt.anchoredPosition = new Vector2(-12f, -12f);
-            prt.sizeDelta = new Vector2(300f, 170f);
+            prt.sizeDelta = new Vector2(228f, 128f);
         }
 
         private void UpdateHud()
@@ -248,7 +360,7 @@ namespace Genesis.RoomScan
             if (cam != null)
             {
                 var ct = cam.transform;
-                Vector3 targetPos = ct.position + ct.forward * 1.1f + Vector3.down * 0.25f;
+                Vector3 targetPos = ct.position + ct.forward * 1.1f + Vector3.down * 0.18f;
                 _hudRect.position = Vector3.Lerp(_hudRect.position, targetPos, Time.deltaTime * 4f);
                 _hudRect.rotation = Quaternion.LookRotation(
                     _hudRect.position - ct.position, Vector3.up);
@@ -279,9 +391,22 @@ namespace Genesis.RoomScan
                 $"矛盾票:{(_volumeIntegrator != null ? _volumeIntegrator.GetCarveStatsCompact() : "无")}" +
                 $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s" +
                 $" 缘:{edgeStat}\n" +
+                $"供料账:{(_volumeIntegrator != null ? _volumeIntegrator.GetSupplyLedgerCompact() : "无")}\n" +
+                $"断层影:{(_volumeIntegrator != null ? _volumeIntegrator.GetAdaptiveGapShadowCompact() : "无")}\n" +
+                $"边缘源:{(_volumeIntegrator != null ? _volumeIntegrator.GetEdgeSourceLedgerCompact() : "无")}\n" +
+                $"供体证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationDonorLedgerCompact() : "无")}\n" +
+                $"路径证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationPathLedgerCompact() : "无")}\n" +
+                $"接力账:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationRelayLedgerCompact() : "无")}\n" +
+                $"准入来源:{(_meshExtractor != null ? _meshExtractor.GetAdmissionSourceStatsCompact() : "无")}\n" +
+                $"真实确认:{(_meshExtractor != null ? _meshExtractor.GetRealConfirmationStatsCompact() : "无")}\n" +
+                $"双轨视图:{(_meshExtractor != null ? _meshExtractor.GetJointDiagnosticStatsCompact() : "无")}\n" +
+                $"累计账:{(_meshExtractor != null ? _meshExtractor.GetLedgerSessionStatsCompact() : "无")}\n" +
+                $"框内三栏:{(_meshExtractor != null ? _meshExtractor.GetDiagnosticRoiStatsCompact() : "无")}\n" +
+                $"提取:生产  严格:{(_meshExtractor != null ? _meshExtractor.GetStrictObservedStatsCompact() : "无")}\n" +
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
-                $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续 A=暂停 B=清空 摇杆按=切显示" +
+                $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续  A=暂停  B=保存并清空\n" +
+                $"摇杆按=线框  Y=生产A/候选B" +
                 (_hudLastError.Length > 0 ? $"\n<color=#FF6060>错误:{_hudLastError}</color>" : "");
         }
 
@@ -309,6 +434,8 @@ namespace Genesis.RoomScan
         private void OnDestroy()
         {
             Application.logMessageReceived -= OnLogMessage;
+            if (_diagnosticRoiFrame != null)
+                Destroy(_diagnosticRoiFrame);
         }
 
         private void OnDisable()
@@ -386,6 +513,8 @@ namespace Genesis.RoomScan
                 _depthCapture.StartDepthCapture();
 
                 bool resuming = HasStarted;
+                if (!resuming)
+                    _meshExtractor.BeginLedgerSession();
                 HasStarted = true;
                 _hudStatus = resuming ? "扫描中(继续)" : "扫描中";
                 _hudLastError = "";
@@ -411,26 +540,52 @@ namespace Genesis.RoomScan
             _cameraProvider?.StopCapture();
             _depthCapture.StopDepthCapture();
 
-            Logger.Info("已暂停 — 扳机继续，B 停止清空");
+            Logger.Info("已暂停 — 扳机继续，B 保存累计账并清空");
             _hudStatus = "已暂停";
             ScanStopped?.Invoke();
         }
 
-        /// <summary>停止并清空 TSDF 与网格，回到未开始状态（下一次扳机 = 全新扫描）。</summary>
+        /// <summary>
+        /// 将本次累计账导出后，原子式清空 TSDF、网格、融合计数与记账会话。
+        /// A 暂停不会触发这里；下一次扳机将开始全新扫描和全新账簿。
+        /// </summary>
         public void StopAndClearScan()
         {
             bool wasActive = IsScanning || HasStarted;
             PauseScanning();
+            string ledgerPath = _meshExtractor != null
+                ? _meshExtractor.FinalizeAndExportLedger("B键保存并清空")
+                : "";
+
+            // B is a save-then-clear transaction.  If persistence failed, keep
+            // the volume, mesh and open ledger intact so the user can retry.
+            if (wasActive && string.IsNullOrEmpty(ledgerPath))
+            {
+                _hudStatus = "账簿保存失败，未清空";
+                Logger.Error("累计账簿保存失败：已中止清空，扫描数据仍保留");
+                return;
+            }
+
+            // Invalidate outstanding GPU readbacks before touching the volume;
+            // otherwise an old callback can repopulate a freshly cleared HUD.
+            _meshExtractor?.ResetLedgerSessionAfterClear();
             HasStarted = false;
             _integrateCount = 0;
 
             _volumeIntegrator.Clear();
+            _volumeIntegrator.ResetSessionCounters();
             if (_meshExtractor.IsInitialized)
                 _meshExtractor.Reinitialize(); // 同时重置时序混合状态
 
             if (wasActive)
-                Logger.Info("已停止并清空 — 扳机开始全新扫描");
-            _hudStatus = "已清空(未开始)";
+                Logger.Info($"已保存并清空 — 账簿={ledgerPath}；扳机开始全新扫描");
+            _hudStatus = ledgerPath.Length > 0 ? "已保存并清空" : "已清空(账簿为空)";
+        }
+
+        /// <summary>严格生产网格已锁定；保留入口仅为旧输入/场景兼容。</summary>
+        public void ToggleJointDiagnosticDisplay()
+        {
+            _meshExtractor?.ToggleJointDiagnosticDisplay();
         }
 
         // ─────────────────────────────────────────────────────────────

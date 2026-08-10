@@ -21,12 +21,17 @@
 #pragma kernel GenerateIndices
 #pragma kernel BuildIndirectArgs
 #pragma kernel InitTemporal
+#pragma kernel ClearCandidateHistory
+
+#include "DepthKit.hlsl"
 
 // ──────────────────────────────────────────────────────────────────
 //  Volume textures (bound by VolumeIntegrator, read-only here)
 // ──────────────────────────────────────────────────────────────────
 Texture3D<float2> _TsdfVolume;     // R = signed distance [-1,1], G = weight [0,1]
 Texture3D<float4> _ColorVolume;    // RGBA8 UNorm
+Texture3D<float>  _AdmissionTraceVolume; // diagnostic-only dilation admission provenance
+Texture2DArray<uint> gsEdgeReasonTex;
 
 // ──────────────────────────────────────────────────────────────────
 //  Parameters
@@ -45,6 +50,14 @@ float  _TemporalAlphaMin;
 float  _TemporalDecayRate;
 float  _ConvergeThreshold;
 float  _TemporalDeadzone;
+float  _StrictObservedEdges;
+float  _CurrentDepthEvidenceAvailable;
+float  _CurrentEdgeEvidenceAvailable;
+float  _DiagnosticRoiEnabled;
+float4 _DiagnosticRoiRect;   // xMin, yMin, xMax, yMax in stereo depth UV
+float2 _DiagnosticRoiSplitX; // near|edge and edge|far separators
+uint   _CandidateExtractionEpoch;
+uint   _CandidateHistoryUpdateEnabled;
 
 // ──────────────────────────────────────────────────────────────────
 //  GPU Vertex (32 bytes, matches StructuredBuffer in render shader)
@@ -63,6 +76,10 @@ struct GPUVertex
 RWStructuredBuffer<int>       _CoordVertMap;     // [totalVoxels] flat idx -> compact vert idx (-1 = none)
 RWStructuredBuffer<GPUVertex> _Vertices;         // [maxVertices] compact vertex output
 RWStructuredBuffer<uint>      _Indices;          // [maxIndices]  triangle index output
+// Packed read-only settlement classes per emitted cell:
+// bits 0..2 = settled admission source (0=untracked, 1=self, 2=direct, 3=relay, 4=mixed)
+// bits 3..4 = settled real confirmation (0=untracked, 1=pending, 2=confirmed, 3=mixed)
+RWStructuredBuffer<uint>      _VertexAdmissionClass;
 
 RWStructuredBuffer<uint>      _Counters;         // [0] = vertex count, [1] = index count
 RWStructuredBuffer<uint>      _DispatchArgs;     // [0,1,2] = indirect dispatch group counts
@@ -70,6 +87,8 @@ RWStructuredBuffer<uint>      _DrawIndirectArgs; // [0..4]  = DrawProceduralIndi
 
 RWStructuredBuffer<float3>    _SmoothPosA;       // [maxVertices] ping-pong smoothing
 RWStructuredBuffer<float3>    _SmoothPosB;       // [maxVertices] ping-pong smoothing
+RWStructuredBuffer<uint>      _CandidateHistoryKeys;
+RWStructuredBuffer<uint>      _CandidateHistoryStates;
 
 RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, w = age (-1 = uninit)
 
@@ -124,14 +143,124 @@ float SampleSDF(int3 coord)
     return s.x;
 }
 
+bool TrySampleObservedSDF(int3 coord, out float value)
+{
+    float2 s = _TsdfVolume[coord];
+    // Weight is the authoritative observation mask. A valid truncated TSDF can
+    // legitimately saturate at -1, so the distance channel is not an emptiness flag.
+    bool observed = abs(s.y) >= _MinWeight;
+    value = observed ? s.x : 0.0;
+    return observed;
+}
+
+// Read-only final split for residual vertices that contain an unknown admission
+// source.  This projects the already-emitted Surface-Nets vertex into the current
+// stereo depth frame; it never changes TSDF fusion, extraction, or topology.
+// Return classes: 0=current depth support, 1=history only,
+// 2=current free-space contradiction, 3=edge/multi-hop evidence insufficient.
+uint ClassifyUnknownResidualEvidence(float3 worldPos, uint knownSourceMask, out uint roiZone)
+{
+    roiZone = 3u; // outside the diagnostic frame
+    bool anyValidEye = false;
+    bool anySupport = false;
+    bool anyContradiction = false;
+    bool anyOtherObservation = false;
+    bool edgeEvidence = false;
+    float2 projectedUvSum = float2(0.0, 0.0);
+    uint projectedEyeCount = 0u;
+    const float supportBandVoxels = 1.5;
+    const float contradictionBandVoxels = 2.0;
+
+    if (_CurrentDepthEvidenceAvailable > 0.5)
+    {
+        [unroll]
+        for (int eye = 0; eye < 2; eye++)
+        {
+            float3 viewPos = mul(gsDepthView[eye], float4(worldPos, 1.0)).xyz;
+            if (viewPos.z > -0.05)
+                continue;
+
+            float3 ndc = gsDepthWorldToNDC(worldPos, eye);
+            if (ndc.x < 0.01 || ndc.x > 0.99 || ndc.y < 0.01 || ndc.y > 0.99)
+                continue;
+
+            // ROI membership is a projection fact, not a depth-validity fact.
+            // Record it before rejecting invalid depth so the three-column sample
+            // can still expose history-only and insufficient-evidence geometry.
+            projectedUvSum += ndc.xy;
+            projectedEyeCount++;
+
+            float depthNdc = gsDepthSample(ndc.xy, eye);
+            if (depthNdc <= 0.0 || depthNdc >= 1.0)
+                continue;
+
+            float3 depthWorld = gsDepthNDCtoWorld(float3(ndc.xy, depthNdc), eye);
+            float3 eyePos = gsDepthEyePos(eye);
+            float candidateRange = length(worldPos - eyePos);
+            float measuredRange = length(depthWorld - eyePos);
+            float gap = measuredRange - candidateRange;
+            anyValidEye = true;
+
+            if (abs(gap) <= _VoxSize * supportBandVoxels)
+                anySupport = true;
+            else if (gap > _VoxSize * contradictionBandVoxels)
+                anyContradiction = true; // candidate lies in observed free space
+            else
+                anyOtherObservation = true; // candidate is occluded/behind the current hit
+
+            if (_CurrentEdgeEvidenceAvailable > 0.5)
+            {
+                int2 maxPx = int2((int)gsDepthTexSize.x - 1, (int)gsDepthTexSize.y - 1);
+                int2 px = clamp(int2(ndc.xy * float2(gsDepthTexSize)), int2(0, 0), maxPx);
+                edgeEvidence = edgeEvidence || gsEdgeReasonTex[uint3(uint2(px), (uint)eye)] != 0u;
+            }
+        }
+    }
+
+    if (_DiagnosticRoiEnabled > 0.5 && projectedEyeCount > 0u)
+    {
+        float2 uv = projectedUvSum / (float)projectedEyeCount;
+        bool inside = uv.x >= _DiagnosticRoiRect.x && uv.x <= _DiagnosticRoiRect.z &&
+                      uv.y >= _DiagnosticRoiRect.y && uv.y <= _DiagnosticRoiRect.w;
+        if (inside)
+            roiZone = uv.x < _DiagnosticRoiSplitX.x ? 0u :
+                      (uv.x < _DiagnosticRoiSplitX.y ? 1u : 2u);
+    }
+
+    bool multiKnownSource = knownSourceMask != 0u &&
+                            (knownSourceMask & (knownSourceMask - 1u)) != 0u;
+    bool relayOrMultiHop = (knownSourceMask & 4u) != 0u || multiKnownSource;
+
+    // Conflicting stereo evidence is deliberately not promoted to support or
+    // contradiction.  It belongs to the insufficient-evidence bucket.
+    if (anySupport && anyContradiction)
+        return 3u;
+    if (anySupport)
+        return 0u;
+    if (anyContradiction && !anyOtherObservation)
+        return 2u;
+    if (edgeEvidence || relayOrMultiHop || (anyContradiction && anyOtherObservation))
+        return 3u;
+    return 1u; // no current observation, or only an occluded historical shell
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  Kernel 0 : ClearCounters
 // ══════════════════════════════════════════════════════════════════
 [numthreads(1, 1, 1)]
 void ClearCounters(uint3 id : SV_DispatchThreadID)
 {
-    _Counters[0] = 0;
-    _Counters[1] = 0;
+    [unroll]
+    for (uint i = 0; i < 138; i++)
+        _Counters[i] = 0;
+}
+
+[numthreads(256, 1, 1)]
+void ClearCandidateHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= 524288u) return;
+    _CandidateHistoryKeys[id.x] = 0u;
+    _CandidateHistoryStates[id.x] = 0u;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -159,6 +288,21 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     float3 gradDir  = 0;
     uint numCrossings    = 0;
     uint numBadCrossings = 0;
+    uint rejectedUnknownEdges = 0;
+    bool anyObservedEndpoint = false;
+    bool strictObserved = _StrictObservedEdges > 0.5;
+    bool traceEndpointSeen = false;
+    uint firstAdmissionSource = 0u;
+    uint firstConfirmationState = 0u;
+    bool admissionSourceMixed = false;
+    bool confirmationStateMixed = false;
+    // Read-only combination ledger payload. These masks retain the exact
+    // endpoint classes collapsed into one Surface-Nets vertex. They never
+    // participate in extraction, topology, or vertex placement.
+    uint admissionSourceMask = 0u;       // bits 0..3: unknown/self/direct/relay
+    uint confirmationStateMask = 0u;     // bits 0..2: unknown/pending/confirmed
+    uint pendingSourceMask = 0u;         // bits 0..2: self/direct/relay seen pending
+    uint confirmedSourceMask = 0u;       // bits 0..2: self/direct/relay seen confirmed
 
     [unroll]
     for (uint e = 0; e < 12; e++)
@@ -169,11 +313,27 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         float2 sA = _TsdfVolume[cA];
         float2 sB = _TsdfVolume[cB];
 
-        bool emptyA = (sA.x <= -0.99);
-        bool emptyB = (sB.x <= -0.99);
+        bool emptyA;
+        bool emptyB;
+        if (strictObserved)
+        {
+            emptyA = abs(sA.y) < _MinWeight;
+            emptyB = abs(sB.y) < _MinWeight;
+        }
+        else
+        {
+            emptyA = (sA.x <= -0.99);
+            emptyB = (sB.x <= -0.99);
+            if (!emptyA && abs(sA.y) < _MinWeight) emptyA = true;
+            if (!emptyB && abs(sB.y) < _MinWeight) emptyB = true;
+        }
 
-        if (!emptyA && abs(sA.y) < _MinWeight) emptyA = true;
-        if (!emptyB && abs(sB.y) < _MinWeight) emptyB = true;
+        anyObservedEndpoint = anyObservedEndpoint || !emptyA || !emptyB;
+        if (strictObserved && (emptyA || emptyB))
+        {
+            rejectedUnknownEdges++;
+            continue;
+        }
 
         float valA = emptyA ? 0.0 : sA.x;
         float valB = emptyB ? 0.0 : sB.x;
@@ -188,7 +348,44 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             float t = valA / change;
             posCoord += (float3)cA + t * (float3)(cB - cA);
             numCrossings++;
+
+            // Only endpoints of edges that actually contributed a zero
+            // crossing may settle the emitted cell's ledgers. Reading all eight
+            // corners lets unrelated nearby history contaminate the result.
+            uint traceA = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cA]) * 7.0), 0, 7);
+            uint traceB = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cB]) * 7.0), 0, 7);
+            uint sourceA = traceA & 3u;
+            uint sourceB = traceB & 3u;
+            uint confirmA = sourceA == 0u ? 0u : (((traceA & 4u) != 0u) ? 2u : 1u);
+            uint confirmB = sourceB == 0u ? 0u : (((traceB & 4u) != 0u) ? 2u : 1u);
+
+            admissionSourceMask |= 1u << sourceA;
+            admissionSourceMask |= 1u << sourceB;
+            confirmationStateMask |= 1u << confirmA;
+            confirmationStateMask |= 1u << confirmB;
+            if (sourceA > 0u && confirmA == 1u) pendingSourceMask |= 1u << (sourceA - 1u);
+            if (sourceB > 0u && confirmB == 1u) pendingSourceMask |= 1u << (sourceB - 1u);
+            if (sourceA > 0u && confirmA == 2u) confirmedSourceMask |= 1u << (sourceA - 1u);
+            if (sourceB > 0u && confirmB == 2u) confirmedSourceMask |= 1u << (sourceB - 1u);
+
+            if (!traceEndpointSeen)
+            {
+                firstAdmissionSource = sourceA;
+                firstConfirmationState = confirmA;
+                traceEndpointSeen = true;
+            }
+            admissionSourceMixed = admissionSourceMixed || sourceA != firstAdmissionSource;
+            confirmationStateMixed = confirmationStateMixed || confirmA != firstConfirmationState;
+            admissionSourceMixed = admissionSourceMixed || sourceB != firstAdmissionSource;
+            confirmationStateMixed = confirmationStateMixed || confirmB != firstConfirmationState;
         }
+    }
+
+    if (strictObserved && anyObservedEndpoint && rejectedUnknownEdges > 0)
+    {
+        InterlockedAdd(_Counters[2], rejectedUnknownEdges);
+        if (numCrossings > 0)
+            InterlockedAdd(_Counters[3], 1);
     }
 
     if (numCrossings < 3 || numCrossings == numBadCrossings)
@@ -211,6 +408,133 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
 
     if (compactIdx >= _MaxVertices)
         return;
+
+    if (strictObserved)
+        InterlockedAdd(_Counters[5], 1);
+
+    // Ledger A = immutable birth source; Ledger B = geometric confirmation.
+    // Unknown mixed with known is deliberately "mixed", never silently promoted.
+    uint pathClass = !traceEndpointSeen ? 0u :
+                     (admissionSourceMixed ? 4u : firstAdmissionSource);
+    uint confirmationClass = !traceEndpointSeen ? 0u :
+                             (confirmationStateMixed ? 3u : firstConfirmationState);
+
+    // Read-only per-vertex evidence used by the two-colour temporal display.
+    // It is packed into previously-unused high bits and never feeds extraction.
+    uint diagnosticKnownSourceMask = (admissionSourceMask >> 1u) & 7u;
+    uint diagnosticRoiZone = 3u;
+    uint diagnosticEvidenceClass = 1u;
+    if (_DiagnosticRoiEnabled > 0.5)
+        diagnosticEvidenceClass = ClassifyUnknownResidualEvidence(
+            worldPos, diagnosticKnownSourceMask, diagnosticRoiZone);
+
+    // Keep the original low five bits byte-for-byte compatible with the
+    // renderer. High bits are diagnostic-only masks.
+    _VertexAdmissionClass[compactIdx] = pathClass |
+                                        (confirmationClass << 3u) |
+                                        (admissionSourceMask << 5u) |
+                                        (confirmationStateMask << 9u) |
+                                        (pendingSourceMask << 12u) |
+                                        (confirmedSourceMask << 15u) |
+                                        (diagnosticEvidenceClass << 18u) |
+                                        (diagnosticRoiZone << 20u);
+    InterlockedAdd(_Counters[6u + (pathClass == 0u ? 4u : pathClass - 1u)], 1u);
+    InterlockedAdd(_Counters[11u + (confirmationClass == 0u ? 3u : confirmationClass - 1u)], 1u);
+    // Read-only joint ledger: 5 admission classes x 4 confirmation classes.
+    // 24..43 are emitted cells. This does not participate in admission.
+    InterlockedAdd(_Counters[24u + pathClass * 4u + confirmationClass], 1u);
+
+    // 75..93: unique emitted-vertex combination ledger for the dominant
+    // same-vertex double-mixed population. Each of the three partitions
+    // independently sums to counter 75.
+    if (pathClass == 4u && confirmationClass == 3u)
+    {
+        InterlockedAdd(_Counters[75u], 1u);
+
+        uint knownSourceMask = (admissionSourceMask >> 1u) & 7u;
+        bool hasUnknownSource = (admissionSourceMask & 1u) != 0u;
+        uint sourceBucket = hasUnknownSource ? 76u :
+                            (knownSourceMask == 3u ? 77u :
+                            (knownSourceMask == 5u ? 78u :
+                            (knownSourceMask == 6u ? 79u :
+                            (knownSourceMask == 7u ? 80u : 81u))));
+        InterlockedAdd(_Counters[sourceBucket], 1u);
+
+        uint confirmationBucket = confirmationStateMask == 3u ? 82u :
+                                  (confirmationStateMask == 5u ? 83u :
+                                  (confirmationStateMask == 6u ? 84u :
+                                  (confirmationStateMask == 7u ? 85u : 86u)));
+        InterlockedAdd(_Counters[confirmationBucket], 1u);
+
+        uint associationBucket = 93u;
+        if (!hasUnknownSource && knownSourceMask == 3u &&
+            pendingSourceMask == 1u && confirmedSourceMask == 2u)
+            associationBucket = 87u;
+        else if (!hasUnknownSource && knownSourceMask == 3u &&
+                 pendingSourceMask == 2u && confirmedSourceMask == 1u)
+            associationBucket = 88u;
+        else if (!hasUnknownSource && knownSourceMask == 5u &&
+                 pendingSourceMask == 1u && confirmedSourceMask == 4u)
+            associationBucket = 89u;
+        else if (!hasUnknownSource && knownSourceMask == 5u &&
+                 pendingSourceMask == 4u && confirmedSourceMask == 1u)
+            associationBucket = 90u;
+        else if (!hasUnknownSource && knownSourceMask == 6u &&
+                 pendingSourceMask == 2u && confirmedSourceMask == 4u)
+            associationBucket = 91u;
+        else if (!hasUnknownSource && knownSourceMask == 6u &&
+                 pendingSourceMask == 4u && confirmedSourceMask == 2u)
+            associationBucket = 92u;
+        InterlockedAdd(_Counters[associationBucket], 1u);
+
+        // 94..115: exhaustive read-only split of the old association fallback
+        // (counter 93).  The first 16 buckets form a 4x4 cross-table for
+        // unknown-source vertices.  The final six buckets explain every
+        // known-source-only residual.  Exactly one sub-bucket is incremented
+        // whenever associationBucket == 93, so 94..115 must sum to counter 93.
+        if (associationBucket == 93u)
+        {
+            uint residualBucket;
+            if (hasUnknownSource)
+            {
+                // Rows: unknown+self, unknown+direct, unknown+relay,
+                // unknown+multiple/other known sources.
+                uint knownGroup = knownSourceMask == 1u ? 0u :
+                                  (knownSourceMask == 2u ? 1u :
+                                  (knownSourceMask == 4u ? 2u : 3u));
+                // Columns: unknown+pending, unknown+confirmed,
+                // pending+confirmed, all-three/other confirmation states.
+                uint confirmationGroup = confirmationStateMask == 3u ? 0u :
+                                         (confirmationStateMask == 5u ? 1u :
+                                         (confirmationStateMask == 6u ? 2u : 3u));
+                residualBucket = 94u + knownGroup * 4u + confirmationGroup;
+
+                // 116..119: final, mutually exclusive decision-oriented split
+                // of the unknown-source residual subset (94..109).  These four
+                // counters must sum exactly to counters 94..109.
+                InterlockedAdd(_Counters[116u + diagnosticEvidenceClass], 1u);
+                if (diagnosticRoiZone < 3u)
+                    InterlockedAdd(_Counters[120u + diagnosticRoiZone * 4u + diagnosticEvidenceClass], 1u);
+            }
+            else
+            {
+                bool hasUnknownConfirmation = (confirmationStateMask & 1u) != 0u;
+                uint overlapMask = pendingSourceMask & confirmedSourceMask;
+                bool pendingMulti = (pendingSourceMask & (pendingSourceMask - 1u)) != 0u;
+                bool confirmedMulti = (confirmedSourceMask & (confirmedSourceMask - 1u)) != 0u;
+
+                // Hierarchical, disjoint explanation of known-source-only
+                // residuals.  Counter 115 is an invariant-violation sentinel,
+                // not a normal catch-all category.
+                residualBucket = hasUnknownConfirmation ? 110u :
+                                 (overlapMask != 0u ? 111u :
+                                 (knownSourceMask == 7u ? 112u :
+                                 (pendingSourceMask == 0u || confirmedSourceMask == 0u ? 113u :
+                                 (pendingMulti || confirmedMulti ? 114u : 115u))));
+            }
+            InterlockedAdd(_Counters[residualBucket], 1u);
+        }
+    }
 
     GPUVertex v;
     v.pos          = worldPos;
@@ -359,14 +683,156 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
 //  Kernel 7 : GenerateIndices
 //  Per vertex: check 3 axes for quad emission
 // ══════════════════════════════════════════════════════════════════
-void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
+static const uint kCandidateHistoryMask = 524287u;
+static const uint kCandidateIndexMask = 0x3FFFFFFFu;
+
+uint CandidateHash(uint key)
+{
+    key ^= key >> 16u;
+    key *= 0x7feb352du;
+    key ^= key >> 15u;
+    key *= 0x846ca68bu;
+    key ^= key >> 16u;
+    return key & kCandidateHistoryMask;
+}
+
+bool CandidateFindSlot(uint key, bool allowCreate, out uint slot, out uint state)
+{
+    uint start = CandidateHash(key);
+    [unroll]
+    for (uint probe = 0u; probe < 16u; probe++)
+    {
+        slot = (start + probe) & kCandidateHistoryMask;
+        uint observedKey = _CandidateHistoryKeys[slot];
+        if (observedKey == key)
+        {
+            state = _CandidateHistoryStates[slot];
+            return true;
+        }
+
+        if (observedKey == 0u)
+        {
+            if (!allowCreate)
+                break;
+
+            uint priorKey;
+            InterlockedCompareExchange(_CandidateHistoryKeys[slot], 0u, key, priorKey);
+            if (priorKey == 0u || priorKey == key)
+            {
+                state = _CandidateHistoryStates[slot];
+                return true;
+            }
+        }
+    }
+
+    slot = 0u;
+    state = 0u;
+    if (allowCreate)
+        InterlockedAdd(_Counters[137], 1u);
+    return false;
+}
+
+uint CandidateTriangleClass(uint stableKey, uint p0, uint p1, uint p2)
+{
+    uint e0 = (p0 >> 18u) & 3u;
+    uint e1 = (p1 >> 18u) & 3u;
+    uint e2 = (p2 >> 18u) & 3u;
+    uint supportCount = (e0 == 0u ? 1u : 0u) +
+                        (e1 == 0u ? 1u : 0u) +
+                        (e2 == 0u ? 1u : 0u);
+    bool contradicted = e0 == 2u || e1 == 2u || e2 == 2u;
+    bool updateEnabled = _CandidateHistoryUpdateEnabled != 0u;
+
+    uint slot;
+    uint packedState;
+    bool found = CandidateFindSlot(stableKey, updateEnabled, slot, packedState);
+    uint previousMode = packedState & 15u;
+    uint previousEpoch = packedState >> 4u;
+    bool consecutive = found && previousEpoch != 0u && previousEpoch + 1u == _CandidateExtractionEpoch;
+
+    uint candidateClass = 0u;
+    uint nextMode = 0u;
+
+    if (!updateEnabled)
+    {
+        // Save/export extraction is read-only.  It may show only a triangle
+        // that was already mature and still has full current support.
+        candidateClass = !contradicted && supportCount == 3u && previousMode == 2u
+            ? 2u
+            : 0u;
+
+        if (candidateClass == 2u)
+            InterlockedAdd(_Counters[133], 1u);
+        else if (!contradicted && supportCount == 3u && previousMode == 1u)
+            InterlockedAdd(_Counters[132], 1u);
+        else
+            InterlockedAdd(_Counters[136], 1u);
+    }
+    else if (contradicted || supportCount != 3u)
+    {
+        // No leniency in production: losing one support point, unstable
+        // support, or a free-space contradiction retires the whole triangle.
+        // Classes 1/3 remain reserved for ledger compatibility but are never
+        // emitted by this path.
+        nextMode = 0u;
+        candidateClass = 0u;
+        InterlockedAdd(_Counters[136], 1u);
+    }
+    else if (supportCount == 3u)
+    {
+        if (consecutive && previousMode == 1u)
+        {
+            nextMode = 2u;
+            candidateClass = 2u;
+            InterlockedAdd(_Counters[133], 1u);
+        }
+        else if (consecutive && previousMode == 2u)
+        {
+            nextMode = 2u;
+            candidateClass = 2u;
+            InterlockedAdd(_Counters[133], 1u);
+        }
+        else
+        {
+            nextMode = 1u;
+            candidateClass = 0u;
+            InterlockedAdd(_Counters[132], 1u);
+        }
+    }
+    if (updateEnabled && found)
+        _CandidateHistoryStates[slot] = (_CandidateExtractionEpoch << 4u) | nextMode;
+
+    return candidateClass;
+}
+
+uint EncodeCandidateIndex(uint vertexIndex, uint candidateClass)
+{
+    return (vertexIndex & kCandidateIndexMask) | ((candidateClass & 3u) << 30u);
+}
+
+void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
     if (any(coord - d1 < 0))       return;
     if (any(coord - d2 < 0))       return;
     if (any(coord + axis >= (int3)_VoxCount)) return;
 
-    float va = SampleSDF(coord);
-    float vb = SampleSDF(coord + axis);
+    float va;
+    float vb;
+    if (_StrictObservedEdges > 0.5)
+    {
+        bool observedA = TrySampleObservedSDF(coord, va);
+        bool observedB = TrySampleObservedSDF(coord + axis, vb);
+        if (!observedA || !observedB)
+        {
+            InterlockedAdd(_Counters[4], 1);
+            return;
+        }
+    }
+    else
+    {
+        va = SampleSDF(coord);
+        vb = SampleSDF(coord + axis);
+    }
     if ((va < 0) == (vb < 0)) return;
 
     int a = _CoordVertMap[Flatten(coord)];
@@ -375,26 +841,148 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2)
     int d = _CoordVertMap[Flatten(coord - d2)];
     if (a < 0 || b < 0 || c < 0 || d < 0) return;
 
+    uint pa = _VertexAdmissionClass[(uint)a];
+    uint pb = _VertexAdmissionClass[(uint)b];
+    uint pc = _VertexAdmissionClass[(uint)c];
+    uint pd = _VertexAdmissionClass[(uint)d];
+
+    uint pathA = pa & 7u;
+    uint pathB = pb & 7u;
+    uint pathC = pc & 7u;
+    uint pathD = pd & 7u;
+    uint pathQuadClass = (pathA == pathB && pathA == pathC && pathA == pathD)
+        ? min(pathA, 4u)
+        : 4u;
+
+    uint confirmationA = (pa >> 3u) & 3u;
+    uint confirmationB = (pb >> 3u) & 3u;
+    uint confirmationC = (pc >> 3u) & 3u;
+    uint confirmationD = (pd >> 3u) & 3u;
+    uint confirmationQuadClass = (confirmationA == confirmationB &&
+                                  confirmationA == confirmationC &&
+                                  confirmationA == confirmationD)
+        ? min(confirmationA, 3u)
+        : 3u;
+
+    // One quad produces two triangles. Both ledgers are audit-only and never
+    // change topology, winding, vertex positions, or production admission.
+    InterlockedAdd(_Counters[15u + (pathQuadClass == 0u ? 4u : pathQuadClass - 1u)], 2u);
+    InterlockedAdd(_Counters[20u + (confirmationQuadClass == 0u ? 3u : confirmationQuadClass - 1u)], 2u);
+    // 44..63 are emitted *triangles* in the same 5 x 4 joint ledger.
+    // Count the two real output triangles separately.  A quad-wide class can
+    // be mixed because of its fourth corner even when one emitted triangle is
+    // homogeneous; using the actual three vertices keeps this ledger exactly
+    // aligned with the diagnostic colour drawn for that triangle.
+    uint pathTriABC = (pathA == pathB && pathA == pathC) ? min(pathA, 4u) : 4u;
+    uint confirmTriABC = (confirmationA == confirmationB && confirmationA == confirmationC)
+        ? min(confirmationA, 3u)
+        : 3u;
+    uint pathTriACD = (pathA == pathC && pathA == pathD) ? min(pathA, 4u) : 4u;
+    uint confirmTriACD = (confirmationA == confirmationC && confirmationA == confirmationD)
+        ? min(confirmationA, 3u)
+        : 3u;
+    InterlockedAdd(_Counters[44u + pathTriABC * 4u + confirmTriABC], 1u);
+    InterlockedAdd(_Counters[44u + pathTriACD * 4u + confirmTriACD], 1u);
+
+    // White in the joint view used to be one opaque bucket.  Split it without
+    // changing admission or topology:
+    //   64 boundary: the vertices are individually classified but disagree;
+    //   65 pending: at least one vertex still awaits real confirmation;
+    //   66 internal: at least one vertex is already internally mixed.
+    // Counters 67..69 split counter 66 into three disjoint causes:
+    //   67 admission source only, 68 real confirmation only, 69 both ledgers.
+    // Counters 70..71 partition counter 69 by whether both mixed states occur
+    // on the same vertex or only on different vertices.  Counters 72..74 then
+    // partition counter 70 by the number (1/2/3) of double-mixed vertices.
+    // Internal mixed wins over pending so the three buckets are disjoint.
+    bool whiteABC = pathTriABC == 4u && confirmTriABC == 3u;
+    if (whiteABC)
+    {
+        bool admissionInternalABC = pathA == 4u || pathB == 4u || pathC == 4u;
+        bool confirmationInternalABC = confirmationA == 3u || confirmationB == 3u || confirmationC == 3u;
+        bool internalABC = admissionInternalABC || confirmationInternalABC;
+        bool pendingABC = confirmationA == 1u || confirmationB == 1u || confirmationC == 1u;
+        uint bucketABC = internalABC ? 66u : (pendingABC ? 65u : 64u);
+        InterlockedAdd(_Counters[bucketABC], 1u);
+        if (internalABC)
+        {
+            uint internalBucketABC = admissionInternalABC
+                ? (confirmationInternalABC ? 69u : 67u)
+                : 68u;
+            InterlockedAdd(_Counters[internalBucketABC], 1u);
+            if (internalBucketABC == 69u)
+            {
+                uint doubleMixedCountABC =
+                    ((pathA == 4u && confirmationA == 3u) ? 1u : 0u) +
+                    ((pathB == 4u && confirmationB == 3u) ? 1u : 0u) +
+                    ((pathC == 4u && confirmationC == 3u) ? 1u : 0u);
+                if (doubleMixedCountABC == 0u)
+                    InterlockedAdd(_Counters[71u], 1u);
+                else
+                {
+                    InterlockedAdd(_Counters[70u], 1u);
+                    InterlockedAdd(_Counters[71u + doubleMixedCountABC], 1u);
+                }
+            }
+        }
+    }
+
+    bool whiteACD = pathTriACD == 4u && confirmTriACD == 3u;
+    if (whiteACD)
+    {
+        bool admissionInternalACD = pathA == 4u || pathC == 4u || pathD == 4u;
+        bool confirmationInternalACD = confirmationA == 3u || confirmationC == 3u || confirmationD == 3u;
+        bool internalACD = admissionInternalACD || confirmationInternalACD;
+        bool pendingACD = confirmationA == 1u || confirmationC == 1u || confirmationD == 1u;
+        uint bucketACD = internalACD ? 66u : (pendingACD ? 65u : 64u);
+        InterlockedAdd(_Counters[bucketACD], 1u);
+        if (internalACD)
+        {
+            uint internalBucketACD = admissionInternalACD
+                ? (confirmationInternalACD ? 69u : 67u)
+                : 68u;
+            InterlockedAdd(_Counters[internalBucketACD], 1u);
+            if (internalBucketACD == 69u)
+            {
+                uint doubleMixedCountACD =
+                    ((pathA == 4u && confirmationA == 3u) ? 1u : 0u) +
+                    ((pathC == 4u && confirmationC == 3u) ? 1u : 0u) +
+                    ((pathD == 4u && confirmationD == 3u) ? 1u : 0u);
+                if (doubleMixedCountACD == 0u)
+                    InterlockedAdd(_Counters[71u], 1u);
+                else
+                {
+                    InterlockedAdd(_Counters[70u], 1u);
+                    InterlockedAdd(_Counters[71u + doubleMixedCountACD], 1u);
+                }
+            }
+        }
+    }
+
+    uint faceBaseKey = (uint)Flatten(coord) * 6u + axisSlot * 2u + 1u;
+    uint candidateABC = CandidateTriangleClass(faceBaseKey, pa, pb, pc);
+    uint candidateACD = CandidateTriangleClass(faceBaseKey + 1u, pa, pc, pd);
+
     uint baseIdx;
     InterlockedAdd(_Counters[1], 6, baseIdx);
 
     if (va < 0)
     {
-        _Indices[baseIdx    ] = (uint)c;
-        _Indices[baseIdx + 1] = (uint)b;
-        _Indices[baseIdx + 2] = (uint)a;
-        _Indices[baseIdx + 3] = (uint)d;
-        _Indices[baseIdx + 4] = (uint)c;
-        _Indices[baseIdx + 5] = (uint)a;
+        _Indices[baseIdx    ] = EncodeCandidateIndex((uint)c, candidateABC);
+        _Indices[baseIdx + 1] = EncodeCandidateIndex((uint)b, candidateABC);
+        _Indices[baseIdx + 2] = EncodeCandidateIndex((uint)a, candidateABC);
+        _Indices[baseIdx + 3] = EncodeCandidateIndex((uint)d, candidateACD);
+        _Indices[baseIdx + 4] = EncodeCandidateIndex((uint)c, candidateACD);
+        _Indices[baseIdx + 5] = EncodeCandidateIndex((uint)a, candidateACD);
     }
     else
     {
-        _Indices[baseIdx    ] = (uint)a;
-        _Indices[baseIdx + 1] = (uint)c;
-        _Indices[baseIdx + 2] = (uint)d;
-        _Indices[baseIdx + 3] = (uint)a;
-        _Indices[baseIdx + 4] = (uint)b;
-        _Indices[baseIdx + 5] = (uint)c;
+        _Indices[baseIdx    ] = EncodeCandidateIndex((uint)a, candidateACD);
+        _Indices[baseIdx + 1] = EncodeCandidateIndex((uint)c, candidateACD);
+        _Indices[baseIdx + 2] = EncodeCandidateIndex((uint)d, candidateACD);
+        _Indices[baseIdx + 3] = EncodeCandidateIndex((uint)a, candidateABC);
+        _Indices[baseIdx + 4] = EncodeCandidateIndex((uint)b, candidateABC);
+        _Indices[baseIdx + 5] = EncodeCandidateIndex((uint)c, candidateABC);
     }
 }
 
@@ -406,9 +994,9 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
 
-    TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0));
-    TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1));
-    TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0));
+    TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0), 0u);
+    TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1), 1u);
+    TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0), 2u);
 }
 
 // ══════════════════════════════════════════════════════════════════

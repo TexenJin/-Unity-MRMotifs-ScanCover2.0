@@ -108,6 +108,7 @@ namespace Genesis.RoomScan
         public static readonly int DilateDestID = Shader.PropertyToID("gsDilateDest");
         public static readonly int DilateStepSizeID = Shader.PropertyToID("gsDilateStepSize");
         public static readonly int DilatedDepthTexID = Shader.PropertyToID("gsDilatedDepth");
+        public static readonly int EdgeReasonTexID = Shader.PropertyToID("gsEdgeReasonTex");
         public static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
         public static readonly int VoxSizeShaderID = Shader.PropertyToID("gsVoxSize");
 
@@ -124,6 +125,7 @@ namespace Genesis.RoomScan
 
         // Depth edge clean property IDs（_SrcDepth/_DstDepth/_DepthW/_DepthH 与双边同名同 ID，复用）
         private static readonly int EdgeStatsID = Shader.PropertyToID("_EdgeStats");
+        private static readonly int EdgeReasonRWID = Shader.PropertyToID("_EdgeReason");
         private static readonly int EdgeProjInvID = Shader.PropertyToID("_DepthProjInv");
         private static readonly int EdgeViewInvID = Shader.PropertyToID("_DepthViewInv");
         private static readonly int EdgeLinearizeABID = Shader.PropertyToID("_LinearizeAB");
@@ -192,6 +194,8 @@ namespace Genesis.RoomScan
         private RenderTexture _simulatedDepthTex;
         private RenderTexture _filteredDepthTex;
         private RenderTexture _edgeCleanedDepthTex;
+        private RenderTexture _edgeReasonTex;
+        public RenderTexture EdgeReasonTex => _edgeReasonTex;
         private ComputeBuffer _edgeStats;
         private bool _edgeStatsReadbackPending;
         private int _edgeCleansSinceStats;
@@ -478,6 +482,7 @@ namespace Genesis.RoomScan
             if (_simulatedDepthTex) { Destroy(_simulatedDepthTex); _simulatedDepthTex = null; }
             if (_filteredDepthTex) { Destroy(_filteredDepthTex); _filteredDepthTex = null; }
             if (_edgeCleanedDepthTex) { Destroy(_edgeCleanedDepthTex); _edgeCleanedDepthTex = null; }
+            if (_edgeReasonTex) { Destroy(_edgeReasonTex); _edgeReasonTex = null; }
             _edgeStats?.Release();
             _edgeStats = null;
             _edgeStatsReadbackPending = false;
@@ -684,6 +689,20 @@ namespace Genesis.RoomScan
                 _edgeCleanedDepthTex.Create();
             }
 
+            if (_edgeReasonTex == null || _edgeReasonTex.width != w || _edgeReasonTex.height != h)
+            {
+                if (_edgeReasonTex) Destroy(_edgeReasonTex);
+                _edgeReasonTex = new RenderTexture(w, h, 0, GraphicsFormat.R32_UInt, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _edgeReasonTex.Create();
+            }
+
             if (_edgeStats == null)
             {
                 _edgeStats = new ComputeBuffer(2, sizeof(uint));
@@ -693,6 +712,7 @@ namespace Genesis.RoomScan
             var cs = depthEdgeCleanCompute;
             _edgeCleanKernel.Set(BilSrcDepthID, _depthTex);
             _edgeCleanKernel.Set(BilDstDepthID, _edgeCleanedDepthTex);
+            _edgeCleanKernel.Set(EdgeReasonRWID, _edgeReasonTex);
             _edgeCleanKernel.Set(EdgeStatsID, _edgeStats);
             cs.SetMatrixArray(EdgeProjInvID, _projInv);
             cs.SetMatrixArray(EdgeViewInvID, _viewInv);

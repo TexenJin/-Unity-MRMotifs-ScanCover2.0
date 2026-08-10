@@ -19,6 +19,10 @@ void InitDepthDilation(uint2 coord : SV_DispatchThreadID)
     float4 val = float4(0, 0, 0, 0);
     val.xy = (float2)coord.xy;
     val.z = depth;
+    // w is a read-only provenance counter. Raw depth starts at hop 0;
+    // every jump-flood hand-off increments it once. Production sampling only
+    // consumes z, so this cannot alter the reconstructed surface.
+    val.w = 0.0;
 
     gsDilateSrc[coord] = val;
     gsDilateDest[coord] = val;
@@ -66,7 +70,10 @@ void DilateDepthStep(uint2 coord : SV_DispatchThreadID)
         bool notZero = srcVal.z != 0;
 
         if (withinTexBounds & withinRadius & newMinimum & notZero)
+        {
             val = srcVal;
+            val.w = min(srcVal.w + 1.0, 2047.0);
+        }
     }
 
     gsDilateDest[coord] = val;
