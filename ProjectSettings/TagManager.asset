@@ -2,8 +2,35 @@
 %TAG !u! tag:unity3d.com,2011:
 --- !u!78 &1
 TagManager:
-  serializedVersion: 2
-  tags: []
+  serializedVersion: 3
+  tags:
+  - QDSUIPrimaryButton
+  - QDSUITextSecondaryInvertedColor
+  - QDSUIAccentColor
+  - QDSUITextInvertedColor
+  - QDSUISecondaryButton
+  - QDSUIIcon
+  - QDSUIDestructiveButton
+  - QDSUISharedThemeColor
+  - QDSUIBorderlessButton
+  - QDSUIBackplate
+  - QDSUIBackplateGradient
+  - QDSUIToggleButton
+  - QDSUITextSecondaryColor
+  - QDSUITooltip
+  - QDSUIToggleBorderlessButton
+  - QDSUISection
+  - QDSUITextInputField
+  - QDSUILineDrawing
+  - QDSUIToggleSwitch
+  - QDSUIToggleCheckboxRadio
+  - QDSUIToggleThumbnail
+  - SamplesInfoPanel
+  - Locomotion
+  - PassThroughButton
+  - LocoButton
+  - LocoText
+  - PassThrough
   layers:
   - Default
   - TransparentFX
@@ -50,27 +77,3 @@ TagManager:
   - Light Layer 5
   - Light Layer 6
   - Light Layer 7
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 
-  - 

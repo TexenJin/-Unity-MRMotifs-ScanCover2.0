@@ -214,10 +214,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 3f9a1c4e8b2d4f6a9c0e1b3d5f708192, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.StandaloneRoomScanner
-  integrationHz: 30
-  meshExtractionHz: 30
+  integrationHz: 20
+  meshExtractionHz: 12
   wireframeMode: 1
-  wireThickness: 1
+  wireThickness: 2
   enableHeadExclusion: 1
   logLevel: 1
   showDebugHud: 1
@@ -244,8 +244,11 @@ MonoBehaviour:
   convergenceThreshold: 0.005
   temporalDeadzone: 0.001
   scanMeshMaterial: {fileID: 2100000, guid: 374fc058b2cae144b8593e94ef080faa, type: 2}
+  renderProductionMesh: 1
   surfaceNetsCompute: {fileID: 7200000, guid: 642ed88bf212b4bc38e224b13f42362e, type: 3}
+  coarseSkinCompute: {fileID: 7200000, guid: b63ebfaab5fc49b7b8f3ca0d93f4110a, type: 3}
   gpuVertexBudgetPercent: 0.08
+  diagnosticReadbackHz: 2
 --- !u!114 &170429783
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -260,9 +263,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.VolumeIntegrator
   compute: {fileID: 7200000, guid: 6bdf7fc95400b4f52aae8f59e74a4905, type: 3}
   voxelCount:
-    x: 256
-    y: 256
-    z: 256
+    x: 192
+    y: 128
+    z: 192
   voxelSize: 0.05
   voxelDistance: 0.15
   voxelMin: 0.1
@@ -287,12 +290,17 @@ MonoBehaviour:
   rawSeedBand: 1
   diagnosticDepthGapBaseMeters: 0.035
   diagnosticDepthGapDistanceScale: 0.018
-  motionGateDegPerSec: 0
+  dilationProductionGate: 1
+  dilationBlockRelayWrites: 1
+  dilationBlockSparseWrites: 1
+  provisionalSeedWeight: 0.06
+  motionGateDegPerSec: 90
   minMeshWeight: 0.08
   cameraExposure: 3
   warmupIntegrations: 3
   pruneIntervalSeconds: 3
-  coverageUpdateInterval: 30
+  pruneSlicesPerIntegration: 8
+  coverageUpdateInterval: 120
   enableProjectiveShadow: 0
 --- !u!114 &170429784
 MonoBehaviour:
@@ -331,6 +339,10 @@ MonoBehaviour:
   edgeGrazingMinFacingDot: 0.3
   edgeGrazingRangeBaseMeters: 0.02
   edgeGrazingRangeScale: 0.008
+  edgeGrazingPlaneExemptionEnabled: 1
+  edgeGrazingPlaneMaxResidualMeters: 0.035
+  edgeGrazingPlaneMinSupportRatio: 0.6
+  edgeGrazingPlaneMinSupportPoints: 5
   edgeCrossEyeEnabled: 1
   edgeCrossEyeMarginBaseMeters: 0.05
   edgeCrossEyeMarginScale: 0.03

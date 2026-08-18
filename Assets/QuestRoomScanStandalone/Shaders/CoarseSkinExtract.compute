@@ -1,0 +1,222 @@
+// ──────────────────────────────────────────────────────────────────
+//  CoarseSkinExtract.compute（08-19 路线A：粗皮提取）
+//  与 SurfaceNetsExtract 同一份 TSDF 原料、同一套 Surface Nets 思想，
+//  但按 _SkinStride 粗晶格（默认 4 → 网眼 20cm）二次提取，产出几何级
+//  大三角形网格 = Meta 系统网格观感本尊。三角形量 ~1/16，光栅大降。
+//
+//  纯只读 _TsdfVolume，不回写、不碰融合层（只读叠加战略）。
+//  诊断红绿类不继承（那些活在细网顶点缓冲）——粗皮定位=产品态显示层。
+//
+//  四内核：SkinClear → SkinClassifyAndEmit（顶点）→ SkinGenerateIndices
+//  （四边形）→ SkinBuildArgs（间接绘制参数）。结构对齐细网管线同名内核，
+//  但砍掉了平滑/时序/账簿/诊断——皮只要几何。
+// ──────────────────────────────────────────────────────────────────
+#pragma kernel SkinClear
+#pragma kernel SkinClassifyAndEmit
+#pragma kernel SkinGenerateIndices
+#pragma kernel SkinBuildArgs
+
+Texture3D<float2> _TsdfVolume;     // R = signed distance, G = weight（冻结块 g<0 也算有数据）
+
+int3  _VoxCount;                   // 细体积尺寸（192/128/192）
+float _VoxSize;                    // 0.05
+int   _SkinStride;                 // 粗晶格步长（细体素数），4 = 20cm 网眼
+float _SkinMinWeight;              // 皮的数据有效性门槛（比出网门槛低，要覆盖面）
+uint  _SkinMaxVertices;
+uint  _SkinMaxIndices;
+int3  _SkinCellCount;              // 粗格 cell 数 = (VoxCount-1)/stride
+
+RWStructuredBuffer<int>    _SkinCellVertMap;   // [totalCells] flat cell idx -> compact vert idx (-1=none)
+RWStructuredBuffer<float4> _SkinVerts;         // [maxVerts] xyz=worldPos
+RWStructuredBuffer<int>    _SkinVertCells;     // [maxVerts] compact vert idx -> flat cell idx（索引生成反查用）
+RWStructuredBuffer<uint>   _SkinIndices;       // [maxIndices]
+RWStructuredBuffer<uint>   _SkinCounters;      // 0=vertCount 1=indexCount 2=overflowVerts 3=overflowIndices
+RWStructuredBuffer<uint>   _SkinDrawArgs;      // 5 uint 间接绘制参数
+
+static const int3 kCornerOffs[8] = {
+    int3(0,0,0), int3(1,0,0), int3(1,1,0), int3(0,1,0),
+    int3(0,0,1), int3(1,0,1), int3(1,1,1), int3(0,1,1)
+};
+static const uint kEdgeA[12] = { 0,1,2,3, 4,5,6,7, 0,1,2,3 };
+static const uint kEdgeB[12] = { 1,2,3,0, 5,6,7,4, 4,5,6,7 };
+
+int SkinFlatten(int3 c)
+{
+    return c.x + c.y * _SkinCellCount.x + c.z * _SkinCellCount.x * _SkinCellCount.y;
+}
+
+int3 SkinUnflatten(int idx)
+{
+    uint uidx = (uint)idx;
+    uint sliceXY = (uint)(_SkinCellCount.x * _SkinCellCount.y);
+    uint z = uidx / sliceXY;
+    uint rem = uidx - z * sliceXY;
+    uint y = rem / (uint)_SkinCellCount.x;
+    uint x = rem - y * (uint)_SkinCellCount.x;
+    return int3((int)x, (int)y, (int)z);
+}
+
+// 细网 VoxelCoordToWorld 同一约定：体素中心在整数坐标 +0.5。
+float3 SkinFineCoordToWorld(float3 fineCoord)
+{
+    return (fineCoord + 0.5 - (float3)_VoxCount * 0.5) * _VoxSize;
+}
+
+// cell 的细坐标角点：base0 = cell*stride，base1 = min(base0+stride, N-1)
+// （远侧边界 cell 被钳到体积内壁，20cm 尺度下不可见）。
+int3 SkinCornerFine(int3 base0, int3 span, uint cornerIdx)
+{
+    return base0 + kCornerOffs[cornerIdx] * span;
+}
+
+// ══════════════════════════════════════════════════════════════════
+[numthreads(1, 1, 1)]
+void SkinClear(uint3 id : SV_DispatchThreadID)
+{
+    _SkinCounters[0] = 0u;
+    _SkinCounters[1] = 0u;
+    _SkinCounters[2] = 0u;
+    _SkinCounters[3] = 0u;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  每粗 cell：8 角全有数据（|weight|≥门槛；冻结块 g<0 取绝对值=有数据）
+//  且 12 边有 ≥3 个翻号交叉 → 交叉点平均出顶点（naive Surface Nets，
+//  不平滑——粗晶格本身已平均掉噪声）。
+// ══════════════════════════════════════════════════════════════════
+[numthreads(4, 4, 4)]
+void SkinClassifyAndEmit(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_SkinCellCount))
+        return;
+
+    int3 cell = (int3)id;
+    int flat = SkinFlatten(cell);
+    int3 base0 = cell * _SkinStride;
+    int3 span = min(base0 + _SkinStride, _VoxCount - 1) - base0;
+
+    float cornerSd[8];
+    [unroll]
+    for (uint c = 0; c < 8; c++)
+    {
+        float2 s = _TsdfVolume[SkinCornerFine(base0, span, c)];
+        if (abs(s.y) < _SkinMinWeight)
+        {
+            _SkinCellVertMap[flat] = -1;
+            return;
+        }
+        cornerSd[c] = s.x;
+    }
+
+    float3 posSum = 0.0;
+    uint crossings = 0;
+    [unroll]
+    for (uint e = 0; e < 12; e++)
+    {
+        float sdA = cornerSd[kEdgeA[e]];
+        float sdB = cornerSd[kEdgeB[e]];
+        if ((sdA < 0) == (sdB < 0))
+            continue;
+        int3 fA = SkinCornerFine(base0, span, kEdgeA[e]);
+        int3 fB = SkinCornerFine(base0, span, kEdgeB[e]);
+        float t = sdA / (sdA - sdB);
+        posSum += lerp((float3)fA, (float3)fB, t);
+        crossings++;
+    }
+
+    if (crossings < 3)
+    {
+        _SkinCellVertMap[flat] = -1;
+        return;
+    }
+
+    uint compactIdx;
+    InterlockedAdd(_SkinCounters[0], 1, compactIdx);
+    if (compactIdx >= _SkinMaxVertices)
+    {
+        InterlockedAdd(_SkinCounters[2], 1u);
+        _SkinCellVertMap[flat] = -1;
+        return;
+    }
+
+    _SkinVerts[compactIdx] = float4(SkinFineCoordToWorld(posSum / (float)crossings), 1.0);
+    _SkinVertCells[compactIdx] = flat;
+    _SkinCellVertMap[flat] = (int)compactIdx;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  每顶点（=每表面 cell）负责从自己 min 角出发的 3 条主轴边：
+//  边翻号且共享该边的 4 个 cell 都有顶点 → 拼一个四边形（2 三角形）。
+//  与细网 TryEmitQuad 同构，诊断账簿全部砍掉。
+// ══════════════════════════════════════════════════════════════════
+void SkinTryEmitQuad(int3 cell, int3 axis, int3 d1, int3 d2)
+{
+    if (any(cell - d1 < 0)) return;
+    if (any(cell - d2 < 0)) return;
+
+    int3 fA = min(cell * _SkinStride, _VoxCount - 1);
+    int3 fB = min((cell + axis) * _SkinStride, _VoxCount - 1);
+    if (all(fA == fB)) return; // 边界钳位后无真实边
+
+    float2 sA = _TsdfVolume[fA];
+    float2 sB = _TsdfVolume[fB];
+    if (abs(sA.y) < _SkinMinWeight || abs(sB.y) < _SkinMinWeight) return;
+    if ((sA.x < 0) == (sB.x < 0)) return;
+
+    int a = _SkinCellVertMap[SkinFlatten(cell)];
+    int b = _SkinCellVertMap[SkinFlatten(cell - d1)];
+    int c = _SkinCellVertMap[SkinFlatten(cell - d1 - d2)];
+    int d = _SkinCellVertMap[SkinFlatten(cell - d2)];
+    if (a < 0 || b < 0 || c < 0 || d < 0) return;
+
+    uint baseIdx;
+    InterlockedAdd(_SkinCounters[1], 6, baseIdx);
+    if (baseIdx + 6u > _SkinMaxIndices)
+    {
+        InterlockedAdd(_SkinCounters[3], 1u);
+        return;
+    }
+
+    if (sA.x < 0)
+    {
+        _SkinIndices[baseIdx    ] = (uint)c;
+        _SkinIndices[baseIdx + 1] = (uint)b;
+        _SkinIndices[baseIdx + 2] = (uint)a;
+        _SkinIndices[baseIdx + 3] = (uint)d;
+        _SkinIndices[baseIdx + 4] = (uint)c;
+        _SkinIndices[baseIdx + 5] = (uint)a;
+    }
+    else
+    {
+        _SkinIndices[baseIdx    ] = (uint)a;
+        _SkinIndices[baseIdx + 1] = (uint)c;
+        _SkinIndices[baseIdx + 2] = (uint)d;
+        _SkinIndices[baseIdx + 3] = (uint)a;
+        _SkinIndices[baseIdx + 4] = (uint)b;
+        _SkinIndices[baseIdx + 5] = (uint)c;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void SkinGenerateIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint vertCount = min(_SkinCounters[0], _SkinMaxVertices);
+    if (id.x >= vertCount) return;
+
+    int3 cell = SkinUnflatten(_SkinVertCells[id.x]);
+
+    SkinTryEmitQuad(cell, int3(1,0,0), int3(0,0,1), int3(0,1,0));
+    SkinTryEmitQuad(cell, int3(0,1,0), int3(1,0,0), int3(0,0,1));
+    SkinTryEmitQuad(cell, int3(0,0,1), int3(0,1,0), int3(1,0,0));
+}
+
+// ══════════════════════════════════════════════════════════════════
+[numthreads(1, 1, 1)]
+void SkinBuildArgs(uint3 id : SV_DispatchThreadID)
+{
+    _SkinDrawArgs[0] = min(_SkinCounters[1], _SkinMaxIndices); // indexCount
+    _SkinDrawArgs[1] = 1;                                      // instanceCount
+    _SkinDrawArgs[2] = 0;                                      // startIndex
+    _SkinDrawArgs[3] = 0;                                      // baseVertex
+    _SkinDrawArgs[4] = 0;                                      // startInstance
+}

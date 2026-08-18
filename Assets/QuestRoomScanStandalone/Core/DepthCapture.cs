@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Unity.XR.CoreUtils.Collections;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
@@ -62,6 +63,12 @@ namespace Genesis.RoomScan
                  "治小掠射角下的假桥（跨度只有几厘米、能过融合法线闸的那种）。误杀远处噪面=调大。 (default 0.02)")]
         [SerializeField, Min(0.001f)] private float edgeGrazingRangeBaseMeters = 0.02f;
         [SerializeField, Min(0f)] private float edgeGrazingRangeScale = 0.008f;
+        [Tooltip("v2.1 同平面斜视豁免：掠射样本若有足够局部点贴合中心平面，不因朝向一项直接弃权；" +
+                 "深度双层、裙边和跨眼自由空间证伪仍拥有最高否决权。 (default true)")]
+        [SerializeField] private bool edgeGrazingPlaneExemptionEnabled = true;
+        [SerializeField, Min(0.005f)] private float edgeGrazingPlaneMaxResidualMeters = 0.035f;
+        [SerializeField, Range(0.3f, 1f)] private float edgeGrazingPlaneMinSupportRatio = 0.6f;
+        [SerializeField, Range(3, 25)] private int edgeGrazingPlaneMinSupportPoints = 5;
         [Tooltip("双眼交叉证伪（③e，最后关卡）：把像素世界点投到另一眼，若另一眼在同一视线上看到更远表面" +
                  "（该点浮在已知空域）且面片也朝向另一眼 = 飞行像素，杀。飞点帘绕每只眼各自视点生成，" +
                  "真实表面两眼一致；背向另一眼的面受朝向闸保护。治斜视缓坡帘（单帧无签名的那种）。 (default true)")]
@@ -91,6 +98,37 @@ namespace Genesis.RoomScan
         public Matrix4x4[] ViewInv => _viewInv;
         /// <summary>Near and far clip distances (x = near, y = far) for the current depth frame.</summary>
         public Vector2 Planes => _planes;
+
+        // 深度位姿角速度（EMA，°/s）：在深度帧到达事件里用原始 XR Pose 四元数计算，
+        // dt = 真实深度帧间隔。融合端不得用"积分间隔 ÷ 矩阵.rotation 增量"推算——
+        // 深度帧率低于积分率时系统性放大，且带负行列式（ScaleFlipZ）的矩阵做
+        // 四元数提取存在分支不连续风险（曾致诊断运动位 100% 饱和失效）。
+        private bool _hasLastDepthRot;
+        private Quaternion _lastDepthRot;
+        private float _lastDepthRotTime;
+        private float _smoothedDepthAngSpeed;
+
+        /// <summary>平滑后的深度位姿角速度（°/s），随深度帧到达更新。</summary>
+        public float SmoothedDepthAngularSpeed => _smoothedDepthAngSpeed;
+
+        private void TrackDepthAngularSpeed(Quaternion rot)
+        {
+            float now = Time.unscaledTime;
+            if (_hasLastDepthRot)
+            {
+                float dt = now - _lastDepthRotTime;
+                if (dt > 1e-4f)
+                {
+                    float inst = Quaternion.Angle(_lastDepthRot, rot) / dt;
+                    // 帧时间戳毛刺会产生上万度的假尖峰，截断保护 EMA
+                    _smoothedDepthAngSpeed = Mathf.Lerp(
+                        _smoothedDepthAngSpeed, Mathf.Min(inst, 2000f), 0.35f);
+                }
+            }
+            _lastDepthRot = rot;
+            _lastDepthRotTime = now;
+            _hasLastDepthRot = true;
+        }
 
         // Shader property IDs
         public static readonly int DepthTexID = Shader.PropertyToID("gsDepthTex");
@@ -144,18 +182,71 @@ namespace Genesis.RoomScan
         private static readonly int GrazingMinFacingDotID = Shader.PropertyToID("_GrazingMinFacingDot");
         private static readonly int GrazingRangeBaseID = Shader.PropertyToID("_GrazingRangeBase");
         private static readonly int GrazingRangeScaleID = Shader.PropertyToID("_GrazingRangeScale");
+        private static readonly int GrazingPlaneExemptionEnabledID = Shader.PropertyToID("_GrazingPlaneExemptionEnabled");
+        private static readonly int GrazingPlaneMaxResidualID = Shader.PropertyToID("_GrazingPlaneMaxResidual");
+        private static readonly int GrazingPlaneMinSupportRatioID = Shader.PropertyToID("_GrazingPlaneMinSupportRatio");
+        private static readonly int GrazingPlaneMinSupportPointsID = Shader.PropertyToID("_GrazingPlaneMinSupportPoints");
         private static readonly int CrossEyeEnabledID = Shader.PropertyToID("_CrossEyeEnabled");
         private static readonly int CrossEyeMarginBaseID = Shader.PropertyToID("_CrossEyeMarginBase");
         private static readonly int CrossEyeMarginScaleID = Shader.PropertyToID("_CrossEyeMarginScale");
         private static readonly int CrossEyeMinOtherFacingID = Shader.PropertyToID("_CrossEyeMinOtherFacing");
         private static readonly int EdgeProjFwdID = Shader.PropertyToID("_DepthProj");
         private static readonly int EdgeViewFwdID = Shader.PropertyToID("_DepthView");
+        // 双边/缘洗共用同名 uniform，同 ID 复用（逐眼交替的眼偏移）
+        private static readonly int EyeOffsetID = Shader.PropertyToID("_EyeOffset");
+
+        /// <summary>逐眼交替节拍：每次融合前预处理只洗一只眼，0/1 翻转。</summary>
+        private int _preprocessEye;
 
         /// <summary>True once a valid depth frame has been received from the AR occlusion subsystem.</summary>
         public static bool DepthAvailable { get; private set; }
 
         /// <summary>已接收的深度帧总数（诊断"帧是否还在流"：盯着不动时此数仍应持续增长）。</summary>
         public int FrameCount => _frameCount;
+
+        // ── 中心深度采样（实时轨落点锚定）──
+        // 08-18 实机视频定案：实时轨落点写死 1.5m，站 2.5m 外看墙时落点飘在半空，
+        // slab 七块全是空块 → "空块不排" → 正眼盯着的墙永远不长网。改为每次巡视
+        // 从深度图中心 8×8（左眼片）取中位数距离，落点钉在实际表面略后方。
+        private bool _centerDepthPending;
+
+        /// <summary>最近一次中心深度中位数（米，左眼线性化）；&lt;0 = 尚无有效样本。</summary>
+        public float LastCenterDepthMeters { get; private set; } = -1f;
+
+        /// <summary>发起一次中心 8×8 深度采样（异步回读，结果落 LastCenterDepthMeters）。</summary>
+        public void RequestCenterDepthSample()
+        {
+            if (_centerDepthPending || _depthTex == null || !DepthAvailable) return;
+            int w = _depthTex.width, h = _depthTex.height;
+            if (w < 16 || h < 16) return;
+            _centerDepthPending = true;
+            AsyncGPUReadback.Request(_depthTex, 0, w / 2 - 4, h / 2 - 4, 8, 8, 0, 1,
+                TextureFormat.RFloat, OnCenterDepthReadback);
+        }
+
+        private void OnCenterDepthReadback(AsyncGPUReadbackRequest request)
+        {
+            _centerDepthPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<float>();
+            if (data.Length < 8) return;
+            float a = _linearizeAB[0].x, b = _linearizeAB[0].y;
+            _centerSamples.Clear();
+            for (int i = 0; i < data.Length; i++)
+            {
+                float ndc = data[i];
+                float z = ndc * 2f - 1f;
+                float denom = z + a;
+                if (Mathf.Abs(denom) < 1e-6f) continue;
+                float lin = Mathf.Abs(b / denom);
+                if (lin < 0.3f || lin > 15f) continue; // 弃权像素（写0=near）/超程
+                _centerSamples.Add(lin);
+            }
+            if (_centerSamples.Count < 4) return; // 样本太少=中心正好在缝/弃权区，沿用上次
+            _centerSamples.Sort();
+            LastCenterDepthMeters = _centerSamples[_centerSamples.Count / 2];
+        }
+        private readonly List<float> _centerSamples = new List<float>(64);
 
         /// <summary>
         /// True after USE_SCENE permission is confirmed and the initial subsystem check passes.
@@ -200,13 +291,17 @@ namespace Genesis.RoomScan
         private bool _edgeStatsReadbackPending;
         private int _edgeCleansSinceStats;
         private readonly Vector4[] _linearizeAB = new Vector4[2];
-        private static readonly uint[] ZeroEdgeStats = new uint[2];
+        private static readonly uint[] ZeroEdgeStats = new uint[4];
         private int _dilationMaxStep;
 
         /// <summary>本统计周期被判为深度边缘并作废的像素数（HUD"缘:"读数）。</summary>
         public uint LastEdgeCleanCount { get; private set; }
         /// <summary>其中由③c 掠射否决击杀的像素数（HUD"掠:"读数）——定责：桥区此数高=清洗在打但桥不在深度里；低=没抓到。</summary>
         public uint LastGrazingKillCount { get; private set; }
+        /// <summary>局部中心平面支持成立的掠射像素数；跨眼证伪仍可能最终击杀。</summary>
+        public uint LastGrazingPlaneSupportedCount { get; private set; }
+        /// <summary>依靠同平面证据免于纯朝向击杀的掠射像素数。</summary>
+        public uint LastGrazingPlaneRescuedCount { get; private set; }
         /// <summary>边缘清洗统计是否已有首批读数。</summary>
         public bool HasEdgeCleanStats { get; private set; }
 
@@ -517,13 +612,37 @@ namespace Genesis.RoomScan
 
             if (!DepthAvailable) return;
 
+            // JIT 化（08-18 实机：预处理链 30Hz 全速跑吃掉 24→72 帧的差价）：
+            // 深度帧到达只记账不加工；双边/缘洗/法线挪到 PreprocessLatestFrame
+            // 由 scanner 在每次融合前调用——加工节拍=融合节拍（20Hz），
+            // 且运动闸挡掉的帧、融合间隙帧一律零加工。被融合消费的每一帧
+            // 拿到的仍是同样过滤过的深度，质量零变化，纯省 1/3+ 开销。
+            _preprocessDirty = true;
+            Updated?.Invoke();
+        }
+
+        private bool _preprocessDirty;
+
+        /// <summary>
+        /// 融合前预处理：双边滤波 → 边缘清洗 → 全局属性 → 法线 → 标膨胀脏。
+        /// 只在 scanner 即将 Integrate 时调用；无新深度帧则空转早退。
+        /// </summary>
+        public void PreprocessLatestFrame()
+        {
+            if (!_preprocessDirty || !DepthAvailable) return;
+            _preprocessDirty = false;
+
+            // 逐眼交替（08-18 帧率手术第三刀）：每次只洗一只眼，左右轮换。
+            // 每眼有效清洗率=融合频率/2（10Hz@20Hz 融合），陈旧度仅一拍（50ms）；
+            // 快转时运动闸本就拦融合，静态/慢动场景 50ms 陈旧无感。开销直接腰斩。
+            // 注意：HUD"缘:"统计随之减半（每次只数一只眼），属预期。
+            _preprocessEye = 1 - _preprocessEye;
+
             ApplyBilateralFilter();
             ApplyDepthEdgeClean();
             SetGlobalShaderProperties();
             ComputeNormals();
             _dilationDirty = true;
-
-            Updated?.Invoke();
         }
 
         /// <summary>
@@ -565,6 +684,8 @@ namespace Genesis.RoomScan
             if (!_mainCam) _mainCam = Camera.main;
             if (!_mainCam) return;
 
+            TrackDepthAngularSpeed(_mainCam.transform.rotation);
+
             Matrix4x4 p = _mainCam.projectionMatrix;
             Matrix4x4 pi = p.inverse;
             Transform ct = _mainCam.transform;
@@ -597,6 +718,8 @@ namespace Genesis.RoomScan
 
             if (!DepthAvailable) return;
 
+            TrackDepthAngularSpeed(poses[0].rotation);
+
             for (int i = 0; i < 2; i++)
             {
                 _proj[i] = CalculateProjectionMatrix(fovs[i], depthPlanes);
@@ -614,6 +737,35 @@ namespace Genesis.RoomScan
             }
 
             _planes = new Vector2(depthPlanes.nearZ, depthPlanes.farZ);
+        }
+
+        /// <summary>双边滤波开关状态（HUD 用）。</summary>
+        public bool BilateralEnabled => enableBilateralFilter;
+        /// <summary>边缘清洗开关状态（HUD 用）。</summary>
+        public bool EdgeCleanEnabled => enableDepthEdgeClean;
+
+        /// <summary>
+        /// 性能二分热键（scanner 转发）：深度预处理三态循环——
+        /// 全开 → 半（关双边留缘洗，定位链内主猪/保幽灵桥防护）→ 全关 → 全开。
+        /// 两个 pass 都由各自 enable 字段自门控、原位替换 _depthTex，运行时翻转
+        /// 即下游自动读回原始深度，管线零改线。法线不在此刀范围（融合 quality 要用）。
+        /// 返回新档位：0=全开 1=半 2=全关。
+        /// </summary>
+        public int CycleDepthPreprocessingMode()
+        {
+            if (enableBilateralFilter && enableDepthEdgeClean)
+            {
+                enableBilateralFilter = false;
+                return 1;
+            }
+            if (!enableBilateralFilter && enableDepthEdgeClean)
+            {
+                enableDepthEdgeClean = false;
+                return 2;
+            }
+            enableBilateralFilter = true;
+            enableDepthEdgeClean = true;
+            return 0;
         }
 
         private bool _loggedBilateralSkip;
@@ -657,8 +809,9 @@ namespace Genesis.RoomScan
             cs.SetFloat(BilSigmaColorID, sigmaColor);
             cs.SetFloat(BilSigmaDepthID, sigmaDepth);
             cs.SetInt(BilFilterRadiusID, filterRadius);
+            cs.SetInt(EyeOffsetID, _preprocessEye);
 
-            _bilateralKernel.DispatchFit(w, h, 2);
+            _bilateralKernel.DispatchFit(w, h, 1);
 
             _depthTex = _filteredDepthTex;
         }
@@ -705,7 +858,7 @@ namespace Genesis.RoomScan
 
             if (_edgeStats == null)
             {
-                _edgeStats = new ComputeBuffer(2, sizeof(uint));
+                _edgeStats = new ComputeBuffer(4, sizeof(uint));
                 _edgeStats.SetData(ZeroEdgeStats);
             }
 
@@ -736,14 +889,19 @@ namespace Genesis.RoomScan
             cs.SetFloat(GrazingMinFacingDotID, edgeGrazingMinFacingDot);
             cs.SetFloat(GrazingRangeBaseID, edgeGrazingRangeBaseMeters);
             cs.SetFloat(GrazingRangeScaleID, edgeGrazingRangeScale);
+            cs.SetInt(GrazingPlaneExemptionEnabledID, edgeGrazingPlaneExemptionEnabled ? 1 : 0);
+            cs.SetFloat(GrazingPlaneMaxResidualID, edgeGrazingPlaneMaxResidualMeters);
+            cs.SetFloat(GrazingPlaneMinSupportRatioID, edgeGrazingPlaneMinSupportRatio);
+            cs.SetInt(GrazingPlaneMinSupportPointsID, edgeGrazingPlaneMinSupportPoints);
             cs.SetInt(CrossEyeEnabledID, edgeCrossEyeEnabled ? 1 : 0);
             cs.SetFloat(CrossEyeMarginBaseID, edgeCrossEyeMarginBaseMeters);
             cs.SetFloat(CrossEyeMarginScaleID, edgeCrossEyeMarginScale);
             cs.SetFloat(CrossEyeMinOtherFacingID, edgeCrossEyeMinOtherFacing);
             cs.SetMatrixArray(EdgeProjFwdID, _proj);
             cs.SetMatrixArray(EdgeViewFwdID, _view);
+            cs.SetInt(EyeOffsetID, _preprocessEye);
 
-            _edgeCleanKernel.DispatchFit(w, h, 2);
+            _edgeCleanKernel.DispatchFit(w, h, 1);
 
             _depthTex = _edgeCleanedDepthTex;
 
@@ -762,9 +920,11 @@ namespace Genesis.RoomScan
             _edgeStatsReadbackPending = false;
             if (request.hasError) return;
             var data = request.GetData<uint>();
-            if (data.Length < 2) return;
+            if (data.Length < 4) return;
             LastEdgeCleanCount = data[0];
             LastGrazingKillCount = data[1];
+            LastGrazingPlaneSupportedCount = data[2];
+            LastGrazingPlaneRescuedCount = data[3];
             HasEdgeCleanStats = true;
             _edgeStats?.SetData(ZeroEdgeStats);
         }

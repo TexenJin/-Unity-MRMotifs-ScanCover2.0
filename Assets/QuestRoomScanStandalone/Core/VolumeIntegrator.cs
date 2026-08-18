@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
@@ -19,7 +21,7 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader compute;
 
         [Header("Volume")]
-        [SerializeField] private int3 voxelCount = new(256, 256, 256);
+        [SerializeField] private int3 voxelCount = new(192, 128, 192);
         [SerializeField] private float voxelSize = 0.05f;
         [SerializeField] private float voxelDistance = 0.15f;
         [SerializeField] private float voxelMin = 0.1f;
@@ -42,7 +44,7 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.005f, 0.1f)] private float weightGrowth = 0.025f;
         [Tooltip("Maximum weight any voxel can reach. Lower = all areas correct equally fast. (default 0.5)")]
         [SerializeField, Range(0.1f, 1f)] private float maxWeight = 0.5f;
-        [Tooltip("矛盾扣减率（投票制反对票）。新观测与存量矛盾（更空 >3cm）时每帧扣 q²·carveGain；weight 跌破 minMeshWeight 网格消失、跌破 0.05 被 Prune 回收。0 = 关闭，恢复 QRS 原版纯驻留行为。 (default 0.075)")]
+        [Tooltip("矛盾扣减率（投票制反对票）。新观测与存量矛盾（更空 >3cm）时每帧扣 q²·carveGain；weight 跌破 minMeshWeight 网格消失、跌破 PRUNE_WEIGHT(08-18 起 0.03) 被 Prune 回收。0 = 关闭，恢复 QRS 原版纯驻留行为。 (default 0.075)")]
         [SerializeField, Range(0f, 0.3f)] private float carveGain = 0.075f;
         [Tooltip("排除区不对称：开=排除区内只拦写（播种/增长）不拦抹（矛盾扣减放行，治头周圆柱内幽灵冻结永驻）；关=QRS 原版双向封锁。 (default true)")]
         [SerializeField] private bool carveInsideExclusion = true;
@@ -60,6 +62,12 @@ namespace Genesis.RoomScan
         [Tooltip("绕行扣减（胀绕/法绕）独立倍率：绕行通道自带双重保险（被闸拦+强裕量才触发），加力只加速清尸体，" +
                  "不动 carveGain 主通道护真面。尸体消得慢=调大；真面被误扣=先查 margin 再调回 1。 (default 2)")]
         [SerializeField, Range(1f, 4f)] private float carveBypassBoost = 2f;
+        [Tooltip("自由空间对称扣减倍率：只乘主矛盾通道（正式反对票），新鲜正式面 2~3 票扣死（混合斜坡伪造品的多帧一致性反而加速其死亡），" +
+                 "成熟面权重基数大且有持续正视赞成票补给、天然免疫。不动 carveGain 本体、不动绕行通道（它们用 carveBypassBoost）。1 = 关回旧行为。 (default 2)")]
+        [SerializeField, Range(1f, 4f)] private float freeSpaceCarveBoost = 2f;
+        [Tooltip("救援样本播种资格审查改用距离分：救援标记=上游边缘清洗已用同平面连贯性背书，掠射本地法线测不准，播种闸不再重复罚角度。" +
+                 "治天棚远场掠射面质量分永远够不到 0.25 播种线、点阵集体卡黄。增长/扣减仍按真实质量分，防假桥三道门不动。关=恢复按真实质量审查。 (default true)")]
+        [SerializeField] private bool rescueSeedDistOnly = true;
         [Tooltip("弃权邻域写闸：边缘清洗弃权像素周边 1px 内只拦写（播种/增长）不拦抹（矛盾扣减照常）。" +
                  "治帘锚点旁漏网裙边零星复种导致桥闪断闪连。真折角切口旁晚一两帧种上，代价可忽略。 (default true)")]
         [SerializeField] private bool abstainSeedGuard = true;
@@ -68,20 +76,58 @@ namespace Genesis.RoomScan
         [Tooltip("双向原始沿视线带宽，单位为 voxelDistance。1.0 表示标准的一个 TSDF 截断带。 (default 1.0)")]
         [SerializeField, Range(0.5f, 4f)] private float rawSeedBand = 1.0f;
 
-        [Header("只读深度断层影子")]
-        [Tooltip("只读诊断：复用 DepthEdgeClean 的距离自适应断层阈值下限。仅统计若接入会拦多少供料，不改变生产 TSDF。")]
+        [Header("深度断层与膨胀路径闸")]
+        [Tooltip("复用 DepthEdgeClean 的距离自适应断层阈值下限。用于诊断，也用于判断膨胀供体到接收点之间是否跨越深度断层。")]
         [SerializeField, Min(0.001f)] private float diagnosticDepthGapBaseMeters = 0.035f;
-        [Tooltip("只读诊断：断层阈值随深度增长系数，阈值=max(下限, 深度×系数)。仅统计，不参与生产。")]
+        [Tooltip("断层阈值随深度增长系数，阈值=max(下限, 深度×系数)。")]
         [SerializeField, Min(0f)] private float diagnosticDepthGapDistanceScale = 0.018f;
+        [Tooltip("把已有的膨胀路径分类接入正式写入：跨已杀边缘、无效带或深度跳变的供料只拦播种/增长，" +
+                 "自由空间矛盾扣减仍然放行。 (default true)")]
+        [SerializeField] private bool dilationProductionGate = true;
+        [Tooltip("两跳及以上的 Jump Flood 接力供料不得播种或增长正式 TSDF；一跳且路径干净的局部供料仍允许。 (default true)")]
+        [SerializeField] private bool dilationBlockRelayWrites = true;
+        [Tooltip("供体距离过长、固定探针无法密集覆盖整条路径时，不允许其播种或增长正式 TSDF。 (default true)")]
+        [SerializeField] private bool dilationBlockSparseWrites = true;
+
+        [Header("Provisional TSDF 生命周期")]
+        [Tooltip("新体素首次写入时的暂存权重，运行时会被限制在 prune 阈值之上、正式出网阈值之下。" +
+                 "重复一致观测使其越过 minMeshWeight 后才进入网格。 (default 0.06)")]
+        [SerializeField, Range(0.031f, 0.079f)] private float provisionalSeedWeight = 0.06f;
 
         [Header("运动闸")]
         [Tooltip("头显角速度超过此值（°/s）时整帧停笔：不写入、不增长、不矛盾扣减（预览/提取照常）。根治位姿-深度不同帧欠账下转头把表面抹出搓衣板褶皱、错位矛盾票啃真表面。消幽灵的正确姿势变为\"停下来正对看一秒\"。0 = 关闭。 (default 90)")]
         [SerializeField, Range(0f, 360f)] private float motionGateDegPerSec = 90f;
+        [Tooltip("运动种子闸（°/s）：角速度超阈的帧只长不种——假面 77% 出生于 60~90°/s 放行带，本闸只断假面出生口，增长/矛盾扣减照常。" +
+                 "与整帧闸分工：整帧闸 90 防涂抹，种子闸 60 保覆盖生产力（天棚慢扫帧多在 60 以下）。0 = 关闭。 (default 60)")]
+        [SerializeField, Range(0f, 360f)] private float motionSeedBlockDegPerSec = 60f;
+
+        [Header("逐块可逆冻结")]
+        [Tooltip("逐块可逆冻结总开关：开=冻结体素记穿越票+成熟度普查可用；关=票/普查全停（掩码冻结/解冻 API 仍可用）。" +
+                 "冻结=weight 翻符号不销毁 TSDF，提取层 abs 透明，解冻=翻回。 (default true)")]
+        [SerializeField] private bool frozenBlockEnable = true;
+        [Tooltip("穿越票最低质量分：冻结体素只接受质量分达标的观测投票（防低质掠射噪声买票解冻）。与播种线 0.25 对齐。 (default 0.25)")]
+        [SerializeField, Range(0.05f, 0.6f)] private float frozenVoteQualityMin = 0.25f;
+        [Tooltip("穿越票矛盾杆（归一化单位，1=截断距离）：shader 内按 margin×max(dist/1.5,1) 随距离放大。" +
+                 "固定 0.2≈3cm 在 2m 外被深度噪声日常踩破——纯噪声把票箱刷热导致冻-解振荡（实机：解=冻的 2~3 倍）。" +
+                 "家具级真矛盾 ≥30cm，杆随距离抬到 ~10cm 也不误伤修复。 (default 0.2)")]
+        [SerializeField, Range(0.1f, 1f)] private float frozenVoteMargin = 0.2f;
+        [Tooltip("冻结块边长（体素），独立于提取块 64。32=1.6m——64³(3.2m) 全场只有 18 块，天棚和墙会同块被冻（实机：身周整片锁死）；32³=144 块，天棚单独成块。 (default 32)")]
+        [SerializeField, Min(8)] private int frozenChunkSize = 32;
+        [Tooltip("长熟体素权重门槛：成熟度普查只数权重大于此值的体素。必须远高于种子出生 0.06——否则毛坯脚手架与长熟墙计数无差别，块在毛坯期就被冻死（实机：天棚冻在 0.06 卡黄、确认红定格）。速冻 0.15≈连续观测 3 帧（红线：不得逼近出网阈值 0.08，观感红偏多就退回 0.2）。 (default 0.15)")]
+        [SerializeField, Range(0.08f, 0.5f)] private float frozenMatureWeight = 0.15f;
 
         [Header("Meshing")]
         [Tooltip("Min voxel confidence weight for Surface Nets to generate mesh. Higher = fewer phantom surfaces. (default 0.08)")]
         [SerializeField, Range(0.01f, 0.5f)] private float minMeshWeight = 0.08f;
         public float MinMeshWeight => minMeshWeight;
+
+        [Header("Incremental Meshing")]
+        [Tooltip("Persistent extraction chunk edge length in voxels. This only schedules remeshing; it does not change TSDF admission.")]
+        [SerializeField, Min(8)] private int extractionChunkSize = 64;
+        [Tooltip("Minimum normalized TSDF movement near the zero crossing before a stable chunk is remeshed.")]
+        [SerializeField, Range(0.002f, 0.25f)] private float dirtyTsdfThreshold = 0.02f;
+        [Tooltip("Only changes inside this normalized zero-crossing band can dirty an already observed surface.")]
+        [SerializeField, Range(0.25f, 1f)] private float dirtySurfaceBand = 1f;
 
         [Header("Projective TSDF A/B")]
         [SerializeField, Tooltip("建立一份只读 KinectFusion 式 raw-projective TSDF 影子体。生产体仍使用现有 raw×法向余弦；影子体只用于对照统计和手动切换显示。")]
@@ -134,11 +180,20 @@ namespace Genesis.RoomScan
         private static readonly int CarveBypassNormalID = Shader.PropertyToID("gsCarveBypassNormal");
         private static readonly int CarveBypassMarginID = Shader.PropertyToID("gsCarveBypassMargin");
         private static readonly int CarveBypassBoostID = Shader.PropertyToID("gsCarveBypassBoost");
+        private static readonly int FreeSpaceCarveBoostID = Shader.PropertyToID("gsFreeSpaceCarveBoost");
+        private static readonly int RescueSeedDistOnlyID = Shader.PropertyToID("gsRescueSeedDistOnly");
+        private static readonly int MotionSeedBlockID = Shader.PropertyToID("gsMotionSeedBlock");
         private static readonly int AbstainSeedGuardID = Shader.PropertyToID("gsAbstainSeedGuard");
         private static readonly int RawSeedGateID = Shader.PropertyToID("gsRawSeedGate");
         private static readonly int RawSeedBandID = Shader.PropertyToID("gsRawSeedBand");
         private static readonly int DiagDepthGapBaseID = Shader.PropertyToID("gsDiagDepthGapBase");
         private static readonly int DiagDepthGapScaleID = Shader.PropertyToID("gsDiagDepthGapScale");
+        private static readonly int DilationProductionGateID = Shader.PropertyToID("gsDilationProductionGate");
+        private static readonly int DilationBlockRelayID = Shader.PropertyToID("gsDilationBlockRelay");
+        private static readonly int DilationBlockSparseID = Shader.PropertyToID("gsDilationBlockSparse");
+        private static readonly int ProvisionalSeedWeightID = Shader.PropertyToID("gsProvisionalSeedWeight");
+        private static readonly int FormalSurfaceWeightID = Shader.PropertyToID("gsFormalSurfaceWeight");
+        private static readonly int DiagnosticAngularSpeedID = Shader.PropertyToID("gsDiagnosticAngularSpeed");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
         private static readonly int CamAvailableID = Shader.PropertyToID("gsCamAvailable");
         private static readonly int CamPosID = Shader.PropertyToID("gsCamPos");
@@ -153,6 +208,28 @@ namespace Genesis.RoomScan
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
         private static readonly int WriteAdmissionTraceID = Shader.PropertyToID("gsWriteAdmissionTrace");
         private static readonly int BakeSrcAdmissionTraceID = Shader.PropertyToID("gsBakeSrcAdmissionTrace");
+        private static readonly int PruneZOffsetID = Shader.PropertyToID("gsPruneZOffset");
+        private static readonly int PruneZCountID = Shader.PropertyToID("gsPruneZCount");
+        private static readonly int DirtyChunkEpochsID = Shader.PropertyToID("_DirtyChunkEpochs");
+        private static readonly int DirtyBoundaryEpochsID = Shader.PropertyToID("_DirtyBoundaryEpochs");
+        private static readonly int DirtyChunkCountID = Shader.PropertyToID("gsDirtyChunkCount");
+        private static readonly int DirtyChunkSizeID = Shader.PropertyToID("gsDirtyChunkSize");
+        private static readonly int TrackDirtyChunksID = Shader.PropertyToID("gsTrackDirtyChunks");
+        private static readonly int DirtyChunkEpochID = Shader.PropertyToID("gsDirtyChunkEpoch");
+        private static readonly int DirtyBoundaryHaloID = Shader.PropertyToID("gsDirtyBoundaryHalo");
+        private static readonly int DirtyTsdfThresholdID = Shader.PropertyToID("gsDirtyTsdfThreshold");
+        private static readonly int DirtySurfaceBandID = Shader.PropertyToID("gsDirtySurfaceBand");
+        private static readonly int DirtyMinWeightID = Shader.PropertyToID("gsDirtyMinWeight");
+        private static readonly int ChunkFreezeSetMaskID = Shader.PropertyToID("_ChunkFreezeSetMask");
+        private static readonly int ChunkFreezeClearMaskID = Shader.PropertyToID("_ChunkFreezeClearMask");
+        private static readonly int FrozenChunkVotesID = Shader.PropertyToID("_FrozenChunkVotes");
+        private static readonly int ChunkMaturityID = Shader.PropertyToID("_ChunkMaturity");
+        private static readonly int FrozenBlockEnableID = Shader.PropertyToID("gsFrozenBlockEnable");
+        private static readonly int FrozenVoteQualityMinID = Shader.PropertyToID("gsFrozenVoteQualityMin");
+        private static readonly int FrozenVoteMarginID = Shader.PropertyToID("gsFrozenVoteMargin");
+        private static readonly int FrozenChunkCountID = Shader.PropertyToID("gsFrozenChunkCount");
+        private static readonly int FrozenChunkSizeID = Shader.PropertyToID("gsFrozenChunkSize");
+        private static readonly int FrozenMatureWeightID = Shader.PropertyToID("gsFrozenMatureWeight");
 
         public float CameraExposure => cameraExposure;
 
@@ -162,16 +239,35 @@ namespace Genesis.RoomScan
 
         [Header("Pruning")]
         [SerializeField] private float pruneIntervalSeconds = 3f;
+        [SerializeField, Min(1), Tooltip("Number of Z slices pruned after each integration while a prune cycle is active.")]
+        private int pruneSlicesPerIntegration = 8;
 
         private ComputeKernelHelper _clearKernel;
         private ComputeKernelHelper _integrateKernel;
         private ComputeKernelHelper _pruneKernel;
         private ComputeKernelHelper _freezeKernel;
         private ComputeKernelHelper _unfreezeKernel;
+        private ComputeKernelHelper _applyFreezeMaskKernel;
+        private ComputeKernelHelper _clearVotesKernel;
+        private ComputeKernelHelper _maturityKernel;
 
         private ComputeBuffer _frustumVolume;
+        private ComputeBuffer _dirtyChunkEpochs;
+        private ComputeBuffer _dirtyBoundaryEpochs;
+        private ComputeBuffer _chunkFreezeSetMask;
+        private ComputeBuffer _chunkFreezeClearMask;
+        private ComputeBuffer _frozenChunkVotes;
+        private ComputeBuffer _chunkMaturity;
+        private uint[] _voteZeros;
+        private uint[] _maturityZeros;
+        private int3 _frozenChunkCount;
+        private int3 _dirtyChunkCount;
+        private int _dirtyBoundaryHaloVoxels = 2;
+        private uint _dirtyEpoch = 1;
         private bool _frustumReady;
         private float _lastPruneTime;
+        private bool _pruneCycleActive;
+        private int _nextPruneSlice;
 
         // Coverage metrics
         private ComputeKernelHelper _coverageKernel;
@@ -189,12 +285,18 @@ namespace Genesis.RoomScan
         // 0..27: existing contradiction/supply/edge ledgers.
         // 28..44: read-only dilation-donor provenance ledger.
         // 45..49: read-only donor-path classification ledger.
-        // 50..59: read-only direct-fill versus relay provenance ledger.
-        private const int CarveStatsCount = 60;
+        // 50..59: direct-fill versus relay provenance ledger.
+        // 60..65: production dilation-gate reason counters.
+        // 66..67: actual seed/growth writes blocked by that gate.
+        // 68..70: provisional seeds, promotions and formal-surface demotions.
+        // 71..89: read-only lifecycle forensics: seed source/risk, promotion
+        // mechanism, promotion-time risk and immutable birth source.
+        private const int CarveStatsCount = 91;
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
         public readonly uint[] LastProjectiveShadowCarveStats = new uint[CarveStatsCount];
+        public readonly ulong[] CumulativeCarveStats = new ulong[CarveStatsCount];
         /// <summary>是否已有至少一轮矛盾票读回。</summary>
         public bool HasCarveStats { get; private set; }
         public bool HasProjectiveShadowCarveStats { get; private set; }
@@ -202,7 +304,7 @@ namespace Genesis.RoomScan
 
         [Header("Coverage Metrics")]
         [Tooltip("Dispatch coverage count every N integrations (0 = disabled). Higher = less GPU overhead.")]
-        [SerializeField] private int coverageUpdateInterval = 30;
+        [SerializeField] private int coverageUpdateInterval = 120;
 
         /// <summary>Number of voxels near the zero-crossing with sufficient weight (surface voxels).</summary>
         public int SurfaceVoxelCount { get; private set; }
@@ -225,6 +327,38 @@ namespace Genesis.RoomScan
         public event Action Integrated;
         /// <summary>Raised after the volume is cleared.</summary>
         public event Action Cleared;
+        /// <summary>Raised when relocation/load invalidates every persistent mesh chunk.</summary>
+        public event Action TopologyInvalidated;
+
+        public ComputeBuffer DirtyChunkEpochs => _dirtyChunkEpochs;
+
+        /// <summary>最新脏块 epoch 快照（CPU 侧，实时轨内容闸用；异步回读，帧级新鲜）。</summary>
+        public uint[] LatestDirtyChunkEpochs { get; private set; }
+        private bool _dirtyEpochReadbackPending;
+
+        /// <summary>
+        /// 发起脏块 epoch 回读（3×2×3=18 个 uint，72B，实时轨每巡视一次；在途时自动合并）。
+        /// 内容闸信号源（T1a）：脏账由 MarkDirtyChunk 在几何级变化（新生/穿越/位移）时
+        /// InterlockedMax 推进，权重纯积累不记账——比 2s 普查快照新鲜两个数量级。
+        /// </summary>
+        public void RequestDirtyChunkEpochs()
+        {
+            if (_dirtyEpochReadbackPending || _dirtyChunkEpochs == null) return;
+            _dirtyEpochReadbackPending = true;
+            AsyncGPUReadback.Request(_dirtyChunkEpochs, req =>
+            {
+                _dirtyEpochReadbackPending = false;
+                if (req.hasError) return;
+                var data = req.GetData<uint>();
+                if (LatestDirtyChunkEpochs == null || LatestDirtyChunkEpochs.Length != data.Length)
+                    LatestDirtyChunkEpochs = new uint[data.Length];
+                data.CopyTo(LatestDirtyChunkEpochs);
+            });
+        }
+        public ComputeBuffer DirtyBoundaryEpochs => _dirtyBoundaryEpochs;
+        public int3 DirtyChunkCount => _dirtyChunkCount;
+        public int ExtractionChunkSize => Mathf.Max(8, extractionChunkSize);
+        public uint DirtyEpoch => _dirtyEpoch;
 
         private Texture _pendingCamFrame;
         private Vector3 _pendingCamPos;
@@ -236,14 +370,12 @@ namespace Genesis.RoomScan
         private RenderTexture _camFrameCopy;
         private Texture2D _dummyCamTex;
 
-        // 运动闸：积分位姿角速度（EMA 平滑）。深度位姿按帧阶跃更新，瞬时速度含 0/2× 交替噪声，EMA 收敛到真实转速。
-        private Quaternion _lastIntegrateRot;
-        private float _lastIntegrateTime;
-        private bool _hasLastIntegrateRot;
+        // 运动闸：角速度镜像自 DepthCapture.SmoothedDepthAngularSpeed（深度帧事件内、
+        // 原始 Pose 四元数、真实帧间隔计算），供 HUD 读数与运动闸共用。
         private float _smoothedAngSpeed;
         private int _motionGatedSinceStats;
         private int _lastMotionGatedCount;
-        /// <summary>平滑后的积分位姿角速度（°/s），调试用。</summary>
+        /// <summary>平滑后的深度位姿角速度（°/s），调试用。</summary>
         public float SmoothedAngularSpeed => _smoothedAngSpeed;
 
         private void Awake()
@@ -284,17 +416,36 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
 
             _pruneKernel = new ComputeKernelHelper(compute, "Prune");
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
 
             _freezeKernel = new ComputeKernelHelper(compute, "FreezeInFrustum");
             _freezeKernel.Set(VolumeRWID, _volume);
 
             _unfreezeKernel = new ComputeKernelHelper(compute, "UnfreezeInFrustum");
             _unfreezeKernel.Set(VolumeRWID, _volume);
+
+            _applyFreezeMaskKernel = new ComputeKernelHelper(compute, "ApplyChunkFreezeMask");
+            _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
+            _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+
+            _clearVotesKernel = new ComputeKernelHelper(compute, "ClearFrozenChunkVotes");
+            _clearVotesKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+
+            _maturityKernel = new ComputeKernelHelper(compute, "CountChunkMaturity");
+            _maturityKernel.Set(VolumeRWID, _volume);
+            _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+
+            _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
 
             _coverageKernel = new ComputeKernelHelper(compute, "CountSurfaceCoverage");
             _coverageKernel.Set(VolumeRWID, _volume);
@@ -326,6 +477,7 @@ namespace Genesis.RoomScan
             _carveStats = null;
             _projectiveShadowCarveStats?.Release();
             _projectiveShadowCarveStats = null;
+            ReleaseFrozenBlockBuffers();
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
         }
@@ -340,6 +492,11 @@ namespace Genesis.RoomScan
             _frustumVolume?.Release();
             _frustumVolume = null;
             _frustumReady = false;
+            _dirtyChunkEpochs?.Release();
+            _dirtyChunkEpochs = null;
+            _dirtyBoundaryEpochs?.Release();
+            _dirtyBoundaryEpochs = null;
+            _dirtyChunkCount = int3.zero;
             if (_volume) { Destroy(_volume); _volume = null; }
             if (_colorVolume) { Destroy(_colorVolume); _colorVolume = null; }
             if (_projectiveShadowVolume) { Destroy(_projectiveShadowVolume); _projectiveShadowVolume = null; }
@@ -377,6 +534,7 @@ namespace Genesis.RoomScan
             bool firstAlloc = (_clearKernel.Shader == null);
 
             CreateVolume();
+            EnsureDirtyChunkBuffer();
 
             if (firstAlloc) InitKernels();
             else            RebindKernelTextures();
@@ -394,19 +552,145 @@ namespace Genesis.RoomScan
 
         private void RebindKernelTextures()
         {
+            EnsureDirtyChunkBuffer();
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _freezeKernel.Set(VolumeRWID, _volume);
             _unfreezeKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
+            _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+            _maturityKernel.Set(VolumeRWID, _volume);
+            _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+            _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
             _coverageKernel.Set(VolumeRWID, _volume);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
+        }
+
+        private void EnsureDirtyChunkBuffer()
+        {
+            int chunkSize = ExtractionChunkSize;
+            int3 required = new int3(
+                Mathf.CeilToInt(voxelCount.x / (float)chunkSize),
+                Mathf.CeilToInt(voxelCount.y / (float)chunkSize),
+                Mathf.CeilToInt(voxelCount.z / (float)chunkSize));
+            int requiredCount = required.x * required.y * required.z;
+            int boundaryCount = Mathf.Max(1, requiredCount * 6);
+            int fChunkSize = Mathf.Max(8, frozenChunkSize);
+            int3 frozenRequired = new int3(
+                Mathf.CeilToInt(voxelCount.x / (float)fChunkSize),
+                Mathf.CeilToInt(voxelCount.y / (float)fChunkSize),
+                Mathf.CeilToInt(voxelCount.z / (float)fChunkSize));
+            int frozenRequiredCount = frozenRequired.x * frozenRequired.y * frozenRequired.z;
+            if (_dirtyChunkEpochs != null && _dirtyChunkEpochs.count == requiredCount &&
+                _dirtyBoundaryEpochs != null && _dirtyBoundaryEpochs.count == boundaryCount &&
+                _frozenChunkVotes != null && _frozenChunkVotes.count == Mathf.Max(1, frozenRequiredCount))
+            {
+                _dirtyChunkCount = required;
+                _frozenChunkCount = frozenRequired;
+                return;
+            }
+
+            _dirtyChunkEpochs?.Release();
+            _dirtyBoundaryEpochs?.Release();
+            _dirtyChunkEpochs = new ComputeBuffer(Mathf.Max(1, requiredCount), sizeof(uint));
+            _dirtyBoundaryEpochs = new ComputeBuffer(boundaryCount, sizeof(uint));
+            _dirtyChunkCount = required;
+            _dirtyChunkEpochs.SetData(new uint[Mathf.Max(1, requiredCount)]);
+            _dirtyBoundaryEpochs.SetData(new uint[boundaryCount]);
+
+            ReleaseFrozenBlockBuffers();
+            _frozenChunkCount = frozenRequired;
+            int frozenCount = Mathf.Max(1, frozenRequiredCount);
+            int maskWords = Mathf.Max(1, (frozenRequiredCount + 31) / 32);
+            _chunkFreezeSetMask = new ComputeBuffer(maskWords, sizeof(uint));
+            _chunkFreezeClearMask = new ComputeBuffer(maskWords, sizeof(uint));
+            _frozenChunkVotes = new ComputeBuffer(frozenCount, sizeof(uint) * 2);
+            _chunkMaturity = new ComputeBuffer(frozenCount, sizeof(uint) * 4);
+            _voteZeros = new uint[frozenCount * 2];
+            _maturityZeros = new uint[frozenCount * 4];
+            _chunkFreezeSetMask.SetData(new uint[maskWords]);
+            _chunkFreezeClearMask.SetData(new uint[maskWords]);
+            _frozenChunkVotes.SetData(_voteZeros);
+            _chunkMaturity.SetData(_maturityZeros);
+        }
+
+        private void ReleaseFrozenBlockBuffers()
+        {
+            _chunkFreezeSetMask?.Release();
+            _chunkFreezeSetMask = null;
+            _chunkFreezeClearMask?.Release();
+            _chunkFreezeClearMask = null;
+            _frozenChunkVotes?.Release();
+            _frozenChunkVotes = null;
+            _chunkMaturity?.Release();
+            _chunkMaturity = null;
+            _voteZeros = null;
+            _maturityZeros = null;
+        }
+
+        public void SetDirtyBoundaryHalo(int haloVoxels)
+        {
+            _dirtyBoundaryHaloVoxels = Mathf.Clamp(haloVoxels, 1, Mathf.Max(1, ExtractionChunkSize / 2));
+            if (compute != null)
+                compute.SetInt(DirtyBoundaryHaloID, _dirtyBoundaryHaloVoxels);
+        }
+
+        private void ConfigureDirtyTracking(bool enabled)
+        {
+            compute.SetInts(DirtyChunkCountID, _dirtyChunkCount.x, _dirtyChunkCount.y, _dirtyChunkCount.z);
+            compute.SetInt(DirtyChunkSizeID, ExtractionChunkSize);
+            compute.SetInt(TrackDirtyChunksID, enabled && _dirtyChunkEpochs != null ? 1 : 0);
+            compute.SetInt(DirtyChunkEpochID, unchecked((int)_dirtyEpoch));
+            compute.SetInt(DirtyBoundaryHaloID, _dirtyBoundaryHaloVoxels);
+            compute.SetFloat(DirtyTsdfThresholdID, dirtyTsdfThreshold);
+            compute.SetFloat(DirtySurfaceBandID, dirtySurfaceBand);
+            compute.SetFloat(DirtyMinWeightID, minMeshWeight);
+            compute.SetInts(FrozenChunkCountID, _frozenChunkCount.x, _frozenChunkCount.y, _frozenChunkCount.z);
+            compute.SetInt(FrozenChunkSizeID, Mathf.Max(8, frozenChunkSize));
+            compute.SetFloat(FrozenMatureWeightID, frozenMatureWeight);
+        }
+
+        private void BeginDirtyEpoch()
+        {
+            _dirtyEpoch++;
+            if (_dirtyEpoch == 0)
+            {
+                _dirtyEpoch = 1;
+                if (_dirtyChunkEpochs != null)
+                    _dirtyChunkEpochs.SetData(new uint[_dirtyChunkEpochs.count]);
+                if (_dirtyBoundaryEpochs != null)
+                    _dirtyBoundaryEpochs.SetData(new uint[_dirtyBoundaryEpochs.count]);
+            }
+            ConfigureDirtyTracking(true);
+        }
+
+        public void MarkAllChunksDirty()
+        {
+            EnsureDirtyChunkBuffer();
+            _dirtyEpoch++;
+            if (_dirtyEpoch == 0) _dirtyEpoch = 1;
+            var all = new uint[_dirtyChunkEpochs.count];
+            for (int i = 0; i < all.Length; i++) all[i] = _dirtyEpoch;
+            _dirtyChunkEpochs.SetData(all);
+            // A global invalidation already covers every owner.  Old face-halo
+            // epochs must not survive a clear/load and manufacture neighbour
+            // work in the following scan session.
+            if (_dirtyBoundaryEpochs != null)
+                _dirtyBoundaryEpochs.SetData(new uint[_dirtyBoundaryEpochs.count]);
         }
 
         private void DispatchCoverageCount()
@@ -445,7 +729,11 @@ namespace Genesis.RoomScan
             if (request.hasError) return;
             var data = request.GetData<uint>();
             if (data.Length < CarveStatsCount) return;
-            for (int i = 0; i < CarveStatsCount; i++) LastCarveStats[i] = data[i];
+            for (int i = 0; i < CarveStatsCount; i++)
+            {
+                LastCarveStats[i] = data[i];
+                CumulativeCarveStats[i] += data[i];
+            }
             HasCarveStats = true;
             _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
             _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
@@ -540,7 +828,7 @@ namespace Genesis.RoomScan
                    $"跨{FormatCarveCount(LastCarveStats[43])} 杀{FormatCarveCount(LastCarveStats[44])}";
         }
 
-        /// <summary>Read-only dilation path ledger: clean, edge, invalid, jump, sparse.</summary>
+        /// <summary>Dilation path ledger: clean, edge, invalid, jump, sparse.</summary>
         public string GetDilationPathLedgerCompact()
         {
             if (!HasCarveStats) return "统计中";
@@ -552,7 +840,7 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Read-only jump-flood provenance ledger. 直补 is a one-hop raw-depth
+        /// Jump-flood provenance ledger. 直补 is a one-hop raw-depth
         /// hole-fill candidate; 接力 reused a dilated result for two or more hops.
         /// Each side is split into clean / barrier / sparse path evidence.
         /// </summary>
@@ -564,6 +852,84 @@ namespace Genesis.RoomScan
                    $"接力{FormatCarveCount(LastCarveStats[54])}" +
                    $"(净{FormatCarveCount(LastCarveStats[55])}/险{FormatCarveCount(LastCarveStats[56])}/稀{FormatCarveCount(LastCarveStats[57])}) " +
                    $"二跳{FormatCarveCount(LastCarveStats[58])}/多跳{FormatCarveCount(LastCarveStats[59])}";
+        }
+
+        /// <summary>正式膨胀路径闸：命中原因与最终实际拦下的播种/增长次数。</summary>
+        public string GetDilationProductionGateCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"命中{FormatCarveCount(LastCarveStats[60])} " +
+                   $"边{FormatCarveCount(LastCarveStats[61])}/空{FormatCarveCount(LastCarveStats[62])}/" +
+                   $"跳{FormatCarveCount(LastCarveStats[63])}/接{FormatCarveCount(LastCarveStats[64])}/" +
+                   $"稀{FormatCarveCount(LastCarveStats[65])} " +
+                   $"拦种{FormatCarveCount(LastCarveStats[66])}/拦长{FormatCarveCount(LastCarveStats[67])}";
+        }
+
+        /// <summary>暂存 TSDF 的出生、晋升为正式表面及被反证降回阈值以下的次数。</summary>
+        public string GetProvisionalLifecycleCompact()
+        {
+            if (!HasCarveStats) return "统计中";
+            return $"暂生{FormatCarveCount(LastCarveStats[68])} " +
+                   $"转正{FormatCarveCount(LastCarveStats[69])} " +
+                   $"降级{FormatCarveCount(LastCarveStats[70])}";
+        }
+
+        /// <summary>
+        /// Request the final partial integration period before a frozen replay.
+        /// The callback folds the GPU period into the cumulative CPU ledger;
+        /// this method never stalls the render thread or changes fusion rules.
+        /// </summary>
+        public void FlushForensicLedger()
+        {
+            RequestCarveStatsReadback();
+        }
+
+        /// <summary>Append the cumulative, read-only integration causal ledger.</summary>
+        public void AppendForensicLedgerReport(StringBuilder sb)
+        {
+            if (sb == null) return;
+            static string U(ulong value) => value.ToString(CultureInfo.InvariantCulture);
+
+            ulong seedSourceSum = CumulativeCarveStats[71] +
+                                  CumulativeCarveStats[72] +
+                                  CumulativeCarveStats[73];
+            ulong promotionMechanismSum = CumulativeCarveStats[77] +
+                                          CumulativeCarveStats[78];
+            ulong promotionBirthSum = CumulativeCarveStats[82] +
+                                      CumulativeCarveStats[83] +
+                                      CumulativeCarveStats[84] +
+                                      CumulativeCarveStats[89];
+
+            sb.AppendLine();
+            sb.AppendLine("integration_forensic_ledger:");
+            sb.AppendLine("scope=cumulative_production_tsdf_since_last_clear;diagnostic_only=true");
+            sb.AppendLine($"flush_pending={_carveStatsReadbackPending.ToString().ToLowerInvariant()}");
+            sb.AppendLine($"seed_total={U(CumulativeCarveStats[68])}");
+            sb.AppendLine($"seed_source_self={U(CumulativeCarveStats[71])}");
+            sb.AppendLine($"seed_source_direct_fill={U(CumulativeCarveStats[72])}");
+            sb.AppendLine($"seed_source_relay_fill={U(CumulativeCarveStats[73])}");
+            sb.AppendLine($"seed_plane_rescue_overlap={U(CumulativeCarveStats[74])}");
+            sb.AppendLine($"seed_near_abstain_overlap={U(CumulativeCarveStats[75])}");
+            sb.AppendLine($"seed_motion_gt_60_overlap={U(CumulativeCarveStats[76])}");
+            sb.AppendLine($"seed_motion_gate_block={U(CumulativeCarveStats[90])}");
+            sb.AppendLine($"seed_source_reconcile_delta={(long)CumulativeCarveStats[68] - (long)seedSourceSum}");
+            sb.AppendLine($"promotion_total={U(CumulativeCarveStats[69])}");
+            sb.AppendLine($"promotion_natural_growth={U(CumulativeCarveStats[77])}");
+            sb.AppendLine($"promotion_fast_second_raw={U(CumulativeCarveStats[78])}");
+            sb.AppendLine($"promotion_current_plane_rescue_overlap={U(CumulativeCarveStats[79])}");
+            sb.AppendLine($"promotion_current_near_abstain_overlap={U(CumulativeCarveStats[80])}");
+            sb.AppendLine($"promotion_current_motion_gt_60_overlap={U(CumulativeCarveStats[81])}");
+            sb.AppendLine($"promotion_birth_self={U(CumulativeCarveStats[82])}");
+            sb.AppendLine($"promotion_birth_direct_fill={U(CumulativeCarveStats[83])}");
+            sb.AppendLine($"promotion_birth_relay_fill={U(CumulativeCarveStats[84])}");
+            sb.AppendLine($"promotion_birth_unknown={U(CumulativeCarveStats[89])}");
+            sb.AppendLine($"promotion_combo_plane_near_abstain={U(CumulativeCarveStats[85])}");
+            sb.AppendLine($"promotion_combo_plane_motion_gt_60={U(CumulativeCarveStats[86])}");
+            sb.AppendLine($"promotion_combo_near_abstain_motion_gt_60={U(CumulativeCarveStats[87])}");
+            sb.AppendLine($"promotion_fast_with_any_current_risk={U(CumulativeCarveStats[88])}");
+            sb.AppendLine($"promotion_mechanism_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionMechanismSum}");
+            sb.AppendLine($"promotion_birth_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionBirthSum}");
+            sb.AppendLine($"formal_demotion_total={U(CumulativeCarveStats[70])}");
         }
 
         /// <summary>KinectFusion raw-projective 影子体的独立矛盾票摘要。</summary>
@@ -669,14 +1035,27 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveBypassNormalID, carveBypassNormal ? 1f : 0f);
             compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
             compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
+            compute.SetFloat(FreeSpaceCarveBoostID, freeSpaceCarveBoost);
+            compute.SetFloat(RescueSeedDistOnlyID, rescueSeedDistOnly ? 1f : 0f);
+            compute.SetFloat(MotionSeedBlockID, motionSeedBlockDegPerSec);
             compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
             compute.SetFloat(RawSeedGateID, rawSeedGate ? 1f : 0f);
             compute.SetFloat(RawSeedBandID, rawSeedBand);
             compute.SetFloat(DiagDepthGapBaseID, diagnosticDepthGapBaseMeters);
             compute.SetFloat(DiagDepthGapScaleID, diagnosticDepthGapDistanceScale);
+            compute.SetFloat(DilationProductionGateID, dilationProductionGate ? 1f : 0f);
+            compute.SetFloat(DilationBlockRelayID, dilationBlockRelayWrites ? 1f : 0f);
+            compute.SetFloat(DilationBlockSparseID, dilationBlockSparseWrites ? 1f : 0f);
+            compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
+            compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
+            compute.SetFloat(DiagnosticAngularSpeedID, 0f);
+            compute.SetFloat(FrozenBlockEnableID, frozenBlockEnable ? 1f : 0f);
+            compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
+            compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            ConfigureDirtyTracking(false);
 
             Shader.SetGlobalTexture(VolumeID, _volume);
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
@@ -690,6 +1069,9 @@ namespace Genesis.RoomScan
         public void Clear()
         {
             if (_volume == null || _clearKernel.Shader == null) return;
+
+            _pruneCycleActive = false;
+            _nextPruneSlice = 0;
 
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
@@ -716,8 +1098,13 @@ namespace Genesis.RoomScan
             _clearKernel.Set(VolumeRWID, _volume);
             _carveStats?.SetData(ZeroCarveStats);
             _projectiveShadowCarveStats?.SetData(ZeroCarveStats);
+            // 清卷同时清冻结账：旧票箱/成熟度指向已销毁内容，必须同步归零。
+            if (_frozenChunkVotes != null) _frozenChunkVotes.SetData(_voteZeros);
+            if (_chunkMaturity != null) _chunkMaturity.SetData(_maturityZeros);
+            Array.Clear(CumulativeCarveStats, 0, CumulativeCarveStats.Length);
             HasCarveStats = false;
             HasProjectiveShadowCarveStats = false;
+            MarkAllChunksDirty();
             Cleared?.Invoke();
         }
 
@@ -838,6 +1225,8 @@ namespace Genesis.RoomScan
 
             // Rebind per-kernel UAV references so subsequent integrations/clears use new textures
             RebindVolumeTextures();
+            MarkAllChunksDirty();
+            TopologyInvalidated?.Invoke();
 
             Logger.Info($"BakeRelocation complete — resampled {vc} voxels, " +
                       $"reloc row0={relocationMatrix.GetRow(0)}, inv row0={invRelocation.GetRow(0)}");
@@ -897,6 +1286,59 @@ namespace Genesis.RoomScan
                 _unfreezeKernel.Set(VolumeRWID, _volume);
             }
             Logger.Info("UnfreezeInView dispatched");
+        }
+
+        // ── 逐块可逆冻结公共 API ─────────────────────────────────────
+        /// <summary>冻结票箱（每块 uint2：x=自由空间票 y=遮挡票），调度器周期回读。</summary>
+        public ComputeBuffer FrozenChunkVotes => _frozenChunkVotes;
+        /// <summary>成熟度账（每块 uint4：x=surface体素数 y=其中已冻结），调度器周期回读。</summary>
+        public ComputeBuffer ChunkMaturity => _chunkMaturity;
+        /// <summary>冻结 API 是否可用（GPU 资源已惰性分配）。</summary>
+        public bool FrozenBlockReady => _volume != null && _frozenChunkVotes != null &&
+                                        _applyFreezeMaskKernel.Shader != null;
+        /// <summary>冻结单元块总数（独立于脏账本网格，frozenChunkSize 边长）。</summary>
+        public int FrozenBlockCount => _frozenChunkCount.x * _frozenChunkCount.y * _frozenChunkCount.z;
+        /// <summary>冻结块网格维度（供调度器解码块坐标）。</summary>
+        public int3 FrozenChunkCount => _frozenChunkCount;
+
+        /// <summary>
+        /// 上传 set/clear 块位图并翻符号：set=冻结（weight 正→负），clear=解冻（负→正），
+        /// 解冻块票箱同批清零。主卷与影子卷各执行一次。掩码一次性消费——返回时两个
+        /// 传入数组已被清零，GPU 侧掩码同步复位，残留位不会误伤下一批。
+        /// 提取层 abs(weight) 对符号透明：本调用不标脏、不触发重提网格。
+        /// </summary>
+        public void ApplyChunkFreezeMasks(uint[] setMask, uint[] clearMask)
+        {
+            if (!FrozenBlockReady || setMask == null || clearMask == null) return;
+            _chunkFreezeSetMask.SetData(setMask);
+            _chunkFreezeClearMask.SetData(clearMask);
+            _applyFreezeMaskKernel.DispatchFit(_volume);
+            if (_projectiveShadowVolume != null)
+            {
+                _applyFreezeMaskKernel.Set(VolumeRWID, _projectiveShadowVolume);
+                _applyFreezeMaskKernel.DispatchFit(_projectiveShadowVolume);
+                _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            }
+            _clearVotesKernel.DispatchFit(_frozenChunkVotes.count, 1, 1);
+            System.Array.Clear(setMask, 0, setMask.Length);
+            System.Array.Clear(clearMask, 0, clearMask.Length);
+            _chunkFreezeSetMask.SetData(setMask);
+            _chunkFreezeClearMask.SetData(clearMask);
+        }
+
+        /// <summary>清零成熟度账并重新普查一遍（调度器每窗调用，回读 ChunkMaturity）。</summary>
+        public void RefreshChunkMaturity()
+        {
+            if (!FrozenBlockReady) return;
+            _chunkMaturity.SetData(_maturityZeros);
+            _maturityKernel.DispatchFit(_volume);
+        }
+
+        /// <summary>清零全部冻结票箱（调度器每窗回读后调用，进入下一统计窗）。</summary>
+        public void ClearAllFrozenVotes()
+        {
+            if (!FrozenBlockReady) return;
+            _frozenChunkVotes.SetData(_voteZeros);
         }
 
         private void SetFrustumCameraUniforms(ComputeKernelHelper kernel, Vector3 camPos,
@@ -1027,27 +1469,18 @@ namespace Genesis.RoomScan
             // 运动闸：转头时积分位姿与深度帧存在帧差，写入会切向涂抹成搓衣板褶皱、
             // 矛盾票也会按错位投影啃到真表面。超阈值整帧停笔（不集成、不扣减），
             // 停下来正对目标时票照投——消幽灵的姿势是"停住看"，不是"转着磨"。
-            if (motionGateDegPerSec > 0f)
+            // 角速度由 DepthCapture 在深度帧到达时用原始 Pose 四元数计算
+            // （dt=真实深度帧间隔），这里只消费。旧实现用积分间隔 ÷ 矩阵.rotation
+            // 增量：深度帧率低于积分率时系统性放大，且 ScaleFlipZ 负行列式矩阵的
+            // 四元数提取有分支不连续风险——曾致诊断运动位 100% 饱和失效。
+            if (dc.ViewInv != null && dc.ViewInv.Length > 0)
             {
-                var viewInv = dc.ViewInv;
-                if (viewInv != null && viewInv.Length > 0)
+                _smoothedAngSpeed = dc.SmoothedDepthAngularSpeed;
+                if (motionGateDegPerSec > 0f && _smoothedAngSpeed > motionGateDegPerSec)
                 {
-                    Quaternion curRot = viewInv[0].rotation;
-                    float dt = Time.unscaledTime - _lastIntegrateTime;
-                    if (_hasLastIntegrateRot && dt > 1e-5f)
-                    {
-                        float inst = Quaternion.Angle(_lastIntegrateRot, curRot) / dt;
-                        _smoothedAngSpeed = Mathf.Lerp(_smoothedAngSpeed, inst, 0.35f);
-                    }
-                    _lastIntegrateRot = curRot;
-                    _lastIntegrateTime = Time.unscaledTime;
-                    _hasLastIntegrateRot = true;
-                    if (_smoothedAngSpeed > motionGateDegPerSec)
-                    {
-                        _motionGatedSinceStats++;
-                        _pendingCamFrame = null; // 丢弃过期颜色帧，防与下一帧位姿错配
-                        return;
-                    }
+                    _motionGatedSinceStats++;
+                    _pendingCamFrame = null; // 丢弃过期颜色帧，防与下一帧位姿错配
+                    return;
                 }
             }
 
@@ -1079,11 +1512,23 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveBypassNormalID, carveBypassNormal ? 1f : 0f);
             compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
             compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
+            compute.SetFloat(FreeSpaceCarveBoostID, freeSpaceCarveBoost);
+            compute.SetFloat(RescueSeedDistOnlyID, rescueSeedDistOnly ? 1f : 0f);
+            compute.SetFloat(MotionSeedBlockID, motionSeedBlockDegPerSec);
             compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
             compute.SetFloat(RawSeedGateID, rawSeedGate ? 1f : 0f);
             compute.SetFloat(RawSeedBandID, rawSeedBand);
             compute.SetFloat(DiagDepthGapBaseID, diagnosticDepthGapBaseMeters);
             compute.SetFloat(DiagDepthGapScaleID, diagnosticDepthGapDistanceScale);
+            compute.SetFloat(DilationProductionGateID, dilationProductionGate ? 1f : 0f);
+            compute.SetFloat(DilationBlockRelayID, dilationBlockRelayWrites ? 1f : 0f);
+            compute.SetFloat(DilationBlockSparseID, dilationBlockSparseWrites ? 1f : 0f);
+            compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
+            compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
+            compute.SetFloat(DiagnosticAngularSpeedID, _smoothedAngSpeed);
+            compute.SetFloat(FrozenBlockEnableID, frozenBlockEnable ? 1f : 0f);
+            compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
+            compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
 
             EnsureCamFrameCopy();
             bool productionCamAvailable = _pendingCamFrame != null && _camFrameCopy != null;
@@ -1111,6 +1556,7 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(DepthCapture.EdgeReasonTexID, dc.EdgeReasonTex);
 
             // A: unchanged production path (projective difference scaled by normal cosine).
+            BeginDirtyEpoch();
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
@@ -1127,6 +1573,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
+                ConfigureDirtyTracking(false);
                 compute.SetInt(CamAvailableID, 0);
                 _integrateKernel.Set(VolumeRWID, _projectiveShadowVolume);
                 _integrateKernel.Set(ColorVolumeRWID, _colorVolume); // write-guarded
@@ -1137,6 +1584,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(UseRawProjectiveSdfID, 0f);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
+                ConfigureDirtyTracking(true);
                 compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
                 _integrateKernel.Set(VolumeRWID, _volume);
                 _integrateKernel.Set(CarveStatsID, _carveStats);
@@ -1152,25 +1600,49 @@ namespace Genesis.RoomScan
             }
 
             float t = Time.time;
-            if (t - _lastPruneTime >= pruneIntervalSeconds)
+            if (!_pruneCycleActive && t - _lastPruneTime >= pruneIntervalSeconds)
             {
                 _lastPruneTime = t;
+                _nextPruneSlice = 0;
+                _pruneCycleActive = true;
+            }
+
+            // Pruning used to scan the entire 3D volume in one dispatch.  Keep the
+            // exact same voxel rule, but amortize it over integrations to avoid a
+            // periodic full-volume GPU spike on Quest.
+            if (_pruneCycleActive)
+            {
+                int sliceCount = Mathf.Min(Mathf.Max(1, pruneSlicesPerIntegration),
+                    voxelCount.z - _nextPruneSlice);
+                compute.SetInt(PruneZOffsetID, _nextPruneSlice);
+                compute.SetInt(PruneZCountID, sliceCount);
+
                 _pruneKernel.Set(VolumeRWID, _volume);
                 _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
-                _pruneKernel.DispatchFit(_volume);
+                ConfigureDirtyTracking(true);
+                _pruneKernel.DispatchFit(voxelCount.x, voxelCount.y, sliceCount);
 
                 if (_projectiveShadowVolume != null)
                 {
                     compute.SetFloat(WriteColorID, 0f);
                     compute.SetFloat(WriteAdmissionTraceID, 0f);
+                    ConfigureDirtyTracking(false);
                     _pruneKernel.Set(VolumeRWID, _projectiveShadowVolume);
                     _pruneKernel.Set(ColorVolumeRWID, _colorVolume); // write-guarded
-                    _pruneKernel.DispatchFit(_projectiveShadowVolume);
+                    _pruneKernel.DispatchFit(voxelCount.x, voxelCount.y, sliceCount);
                     compute.SetFloat(WriteColorID, 1f);
                     compute.SetFloat(WriteAdmissionTraceID, 1f);
+                    ConfigureDirtyTracking(true);
                     _pruneKernel.Set(VolumeRWID, _volume);
+                }
+
+                _nextPruneSlice += sliceCount;
+                if (_nextPruneSlice >= voxelCount.z)
+                {
+                    _nextPruneSlice = 0;
+                    _pruneCycleActive = false;
                 }
             }
 
@@ -1250,6 +1722,8 @@ namespace Genesis.RoomScan
 
             IntegrationCount = integrationCount;
             _frustumReady = false;
+            MarkAllChunksDirty();
+            TopologyInvalidated?.Invoke();
 
             Logger.Info($"Volumes loaded: {s}, integrationCount={integrationCount}");
             return true;

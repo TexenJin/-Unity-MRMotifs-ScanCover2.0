@@ -15,12 +15,13 @@ float _SigmaSpatial;
 float _SigmaColor;
 float _SigmaDepth;
 int   _FilterRadius;
+uint  _EyeOffset; // 逐眼交替：id.z 恒 0，真眼号 = _EyeOffset（08-18 帧率手术）
 
 [numthreads(8, 8, 1)]
 void BilateralFilter(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= _DepthW || id.y >= _DepthH) return;
-    uint eye = id.z;
+    uint eye = id.z + _EyeOffset;
 
     float centerDepth = _SrcDepth[uint3(id.xy, eye)];
 

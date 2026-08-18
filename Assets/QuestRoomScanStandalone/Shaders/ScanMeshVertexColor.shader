@@ -9,11 +9,18 @@ Shader "Genesis/ScanMeshVertexColor"
         {
             Name "VertexColorUnlit"
             Tags { "LightMode"="SRPDefaultUnlit" }
-            // 对齐原 SC 工程 B 链线框外观：alpha 混合、不写深度（透视 cage 效果）。
-            // 实体模式是调试档，在透明队列下自遮挡略弱，可接受。
+            // 08-18 晚帧率手术：ZWrite 改开。原"不写深度"在满屏微三角形下=透明队列
+            // 无 early-Z，每像素被 N 层三角形各跑一次完整片元（实机定罪：光栅化主猪
+            // 独吃 20~30 帧）。线框模式 discard 的内部不写深度，格栅透视感保留；
+            // 实体模式重叠层被深度剔除=视觉变"实"，诊断可读性不变。
+            // 点云(Transparent)/覆盖片(+20)队列更浅先画且不写深度，互不影响。
             Blend SrcAlpha OneMinusSrcAlpha
-            ZWrite Off
+            ZWrite On
             ZTest LEqual
+            // The reconstructed room shell is viewed from its interior.  Do
+            // not make triangle winding a visibility/admission rule: ceiling
+            // triangles can legitimately be wound away from the headset.
+            Cull Off
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -61,10 +68,13 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSNormalFallback;
             float _RSWireframe;
             float _RSWireThickness;
+            float _RSMeshStride;
+            float _RSGridSpacing;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
             float _RSSuppressPink;
             float _RSTemporalIllegalActive;
+            float _RSHeraReplayActive;
 
             #define DEPTH_TOLERANCE 0.015
 
@@ -221,12 +231,41 @@ Shader "Genesis/ScanMeshVertexColor"
                 return float3(0.10, 1.00, 0.25);
             }
 
+            float3 HeraRouteColor(bool delegated)
+            {
+                return delegated ? float3(1.0, 0.18, 0.32) : float3(0.12, 1.0, 0.28);
+            }
+
             Varyings vert(uint vertID : SV_VertexID)
             {
                 Varyings OUT = (Varyings)0;
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(OUT);
 
-                uint idx = _SurfaceIndices[vertID] & 0x3FFFFFFFu;
+                // 08-18 大网眼抽稀（用户方案）：只画落在粗格线带上的三角形，
+                // 其余三顶点输出同一裁剪外坐标=零面积被光栅化整批丢弃。
+                // 08-19 实机判定：条带抽稀观感先天残疾（5cm 微三角形锯齿条带，
+                // 做不出 Meta 几何级粗网），默认回 1=关闭，仅留作帧率应急杠杆；
+                // 观感修复改由片元级世界格线画法承担（见 frag 线框分支）。
+                uint meshStride = (uint)max(_RSMeshStride, 1.0);
+                if (meshStride > 1u)
+                {
+                    uint anchorFlat = _SurfaceVerts[_SurfaceIndices[(vertID / 3u) * 3u] & 0x3FFFFFFFu].voxelFlatIdx;
+                    uint3 vc3 = (uint3)gsVoxCount.xyz;
+                    uint sliceXY = vc3.x * vc3.y;
+                    uint vz = anchorFlat / sliceXY;
+                    uint vrem = anchorFlat - vz * sliceXY;
+                    uint vy = vrem / vc3.x;
+                    uint vx = vrem - vy * vc3.x;
+                    bool onGrid = vx % meshStride == 0u || vy % meshStride == 0u || vz % meshStride == 0u;
+                    if (!onGrid)
+                    {
+                        OUT.positionHCS = float4(2.0, 2.0, 2.0, 1.0);
+                        return OUT;
+                    }
+                }
+
+                uint encoded = _SurfaceIndices[vertID];
+                uint idx = encoded & 0x3FFFFFFFu;
                 GPUVertex gv = _SurfaceVerts[idx];
 
                 OUT.positionWS  = gv.pos;
@@ -249,16 +288,79 @@ Shader "Genesis/ScanMeshVertexColor"
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
 
+                bool heraDelegated = _RSHeraReplayActive > 0.5 && IN.diagnosticClass == 3u;
+
                 // Pink is quarantined at presentation only.  Its evidence and
                 // counters remain available, and it can reappear after its
                 // confirmation class changes on a later extraction.
-                if (_RSJointDiagnostic < 0.5 && _RSSuppressPink > 0.5 && IN.legacyDiagnosticClass == 5u)
+                if (_RSHeraReplayActive < 0.5 && _RSJointDiagnostic < 0.5 &&
+                    _RSSuppressPink > 0.5 && IN.legacyDiagnosticClass == 5u)
                     discard;
 
                 // Strict production B keeps pending/retired triangles in the
                 // common buffers for audit, but never presents them.
                 if (_RSJointDiagnostic > 0.5 && IN.diagnosticClass == 0u)
                     discard;
+
+            // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
+            // 08-18 晚帧率手术：整块上移到 baseColor/freeze-tint 之前——线框分支
+            // 根本不读 baseColor 和 normal，原顺序让每根线框像素（含被 discard 的
+            // 内部片元）白跑三平面 6 次纹理采样+冻结着色 3D 采样再扔掉。
+            // Class 1 was the retired 2/3 leniency path.  Production no longer
+            // emits it; retaining this guard keeps old GPU buffers harmless.
+            bool diagnosticBoundaryOnly = _RSJointDiagnostic > 0.5 &&
+                                          IN.diagnosticClass == 1u;
+            if (_RSWireframe > 0.5 || diagnosticBoundaryOnly)
+            {
+                float thickness = max(_RSWireThickness, 0.2);
+
+                if (diagnosticBoundaryOnly)
+                {
+                    // A boundary triangle with only two supported vertices must
+                    // not expose its unsupported sides.  Keep just the edge that
+                    // joins the two currently depth-supported endpoints.
+                    float3 bary = IN.barycentric;
+                    float3 dx = ddx(bary);
+                    float3 dy = ddy(bary);
+                    float3 edgeWidth = sqrt(dx * dx + dy * dy);
+                    float3 edge = smoothstep(0.0, edgeWidth * thickness, bary);
+                    float minEdge = min(edge.x, min(edge.y, edge.z));
+                    uint mask = IN.diagnosticSupportMask;
+                    minEdge = mask == 3u ? edge.z :
+                              mask == 5u ? edge.y :
+                              mask == 6u ? edge.x : 1.0;
+
+                    // Discard interior — threshold scales inversely with thickness
+                    float discardThreshold = saturate(1.0 - thickness * 0.15);
+                    if (minEdge > discardThreshold)
+                        discard;
+                }
+                else
+                {
+                    // 08-19 碎网修复：世界空间格线画法替代条带抽稀（观感对标
+                    // Meta 系统网格）。根因：Meta 的网眼是几何上就粗的大三角形
+                    // 经纬网；顶点侧按体素格挑条带只能得到 5cm 微三角形锯齿条带，
+                    // 先天做不出干净经纬线。这里片元级直接画：像素世界坐标距最近
+                    // 格平面（x/y/z = k×spacing）小于约 1 像素宽即判在线上，
+                    // fwidth 抗锯齿、屏宽恒定；任意朝向墙面都得笔直经纬网。
+                    // 线连续无缺口，顶点抽稀因此同步回 1（关）。
+                    float spacing = max(_RSGridSpacing, 0.05);
+                    float3 gridDist = abs(frac(IN.positionWS / spacing + 0.5) - 0.5) * spacing;
+                    float3 pxWidth = fwidth(IN.positionWS) * thickness;
+                    float3 lineI = 1.0 - smoothstep(float3(0.0, 0.0, 0.0), pxWidth, gridDist);
+                    if (max(lineI.x, max(lineI.y, lineI.z)) < 0.5)
+                        discard;
+                }
+
+                // Display-only A/B color supplied by GPUMeshRenderer:
+                // production = orange, strict-observed = green.
+                float3 lineColor = _RSHeraReplayActive > 0.5
+                    ? HeraRouteColor(heraDelegated)
+                    : _RSJointDiagnostic > 0.5
+                        ? IN.diagnosticColor
+                        : _RSExtractionColor.rgb;
+                return half4(lineColor, _RSExtractionColor.a);
+            }
 
                 float3 normal = normalize(IN.normalWS);
 
@@ -281,48 +383,11 @@ Shader "Genesis/ScanMeshVertexColor"
                 // 2. Apply freeze tint
                 baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
 
-            // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
-            // Class 1 was the retired 2/3 leniency path.  Production no longer
-            // emits it; retaining this guard keeps old GPU buffers harmless.
-            bool diagnosticBoundaryOnly = _RSJointDiagnostic > 0.5 &&
-                                          IN.diagnosticClass == 1u;
-            if (_RSWireframe > 0.5 || diagnosticBoundaryOnly)
-            {
-                float thickness = max(_RSWireThickness, 0.2);
-                float3 bary = IN.barycentric;
-                float3 dx = ddx(bary);
-                float3 dy = ddy(bary);
-                float3 edgeWidth = sqrt(dx * dx + dy * dy);
-                float3 edge = smoothstep(0.0, edgeWidth * thickness, bary);
-                float minEdge = min(edge.x, min(edge.y, edge.z));
-
-                // A boundary triangle with only two supported vertices must
-                // not expose its unsupported sides.  Keep just the edge that
-                // joins the two currently depth-supported endpoints.
-                if (diagnosticBoundaryOnly)
-                {
-                    uint mask = IN.diagnosticSupportMask;
-                    minEdge = mask == 3u ? edge.z :
-                              mask == 5u ? edge.y :
-                              mask == 6u ? edge.x : 1.0;
-                }
-
-                // Discard interior — threshold scales inversely with thickness
-                float discardThreshold = saturate(1.0 - thickness * 0.15);
-                if (minEdge > discardThreshold)
-                    discard;
-
-                // Display-only A/B color supplied by GPUMeshRenderer:
-                // production = orange, strict-observed = green.
-                float3 lineColor = _RSJointDiagnostic > 0.5
-                    ? IN.diagnosticColor
-                    : _RSExtractionColor.rgb;
-                return half4(lineColor, _RSExtractionColor.a);
-            }
-
-                return _RSJointDiagnostic > 0.5
-                    ? half4(IN.diagnosticColor, 1)
-                    : half4(baseColor, 1);
+                return _RSHeraReplayActive > 0.5
+                    ? half4(HeraRouteColor(heraDelegated), 1)
+                    : _RSJointDiagnostic > 0.5
+                        ? half4(IN.diagnosticColor, 1)
+                        : half4(baseColor, 1);
             }
             ENDHLSL
         }
@@ -333,6 +398,7 @@ Shader "Genesis/ScanMeshVertexColor"
             Tags { "LightMode"="DepthOnly" }
             ZWrite On
             ColorMask 0
+            Cull Off
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -350,6 +416,7 @@ Shader "Genesis/ScanMeshVertexColor"
             StructuredBuffer<GPUVertex> _SurfaceVerts;
             StructuredBuffer<uint>      _SurfaceIndices;
             float _RSJointDiagnostic;
+            float _RSHeraReplayActive;
 
             struct Varyings
             {
@@ -384,6 +451,7 @@ Shader "Genesis/ScanMeshVertexColor"
             Name "DepthNormals"
             Tags { "LightMode"="DepthNormals" }
             ZWrite On
+            Cull Off
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -401,6 +469,7 @@ Shader "Genesis/ScanMeshVertexColor"
             StructuredBuffer<GPUVertex> _SurfaceVerts;
             StructuredBuffer<uint>      _SurfaceIndices;
             float _RSJointDiagnostic;
+            float _RSHeraReplayActive;
 
             struct Varyings
             {

@@ -22,6 +22,16 @@
 #pragma kernel BuildIndirectArgs
 #pragma kernel InitTemporal
 #pragma kernel ClearCandidateHistory
+#pragma kernel CopyMeshSnapshot
+#pragma kernel CopyAdditiveMergePayload
+#pragma kernel AppendNovelMatureTriangles
+#pragma kernel BuildAdditiveMergeArgs
+#pragma kernel CopyHeraVertexPayload
+#pragma kernel FilterHeraCleanTriangles
+#pragma kernel BuildHeraFilteredArgs
+#pragma kernel ClassifyHeraInternalMixed
+#pragma kernel BuildHeraInteriorShadowArgs
+#pragma kernel BuildHeraBoundaryShadowArgs
 
 #include "DepthKit.hlsl"
 
@@ -37,6 +47,10 @@ Texture2DArray<uint> gsEdgeReasonTex;
 //  Parameters
 // ──────────────────────────────────────────────────────────────────
 uint3  _VoxCount;
+int3   _MapMin;
+uint3  _MapCount;
+int3   _CoreMin;
+int3   _CoreMax;
 float  _VoxSize;
 float  _MinWeight;
 uint   _TotalVoxels;
@@ -58,6 +72,8 @@ float4 _DiagnosticRoiRect;   // xMin, yMin, xMax, yMax in stereo depth UV
 float2 _DiagnosticRoiSplitX; // near|edge and edge|far separators
 uint   _CandidateExtractionEpoch;
 uint   _CandidateHistoryUpdateEnabled;
+uint   _CandidateHistoryCapacity;
+uint   _CandidateHistoryMask;
 
 // ──────────────────────────────────────────────────────────────────
 //  GPU Vertex (32 bytes, matches StructuredBuffer in render shader)
@@ -80,6 +96,48 @@ RWStructuredBuffer<uint>      _Indices;          // [maxIndices]  triangle index
 // bits 0..2 = settled admission source (0=untracked, 1=self, 2=direct, 3=relay, 4=mixed)
 // bits 3..4 = settled real confirmation (0=untracked, 1=pending, 2=confirmed, 3=mixed)
 RWStructuredBuffer<uint>      _VertexAdmissionClass;
+RWStructuredBuffer<GPUVertex> _SnapshotVertices;
+RWStructuredBuffer<uint>      _SnapshotIndices;
+RWStructuredBuffer<uint>      _SnapshotAdmissionClass;
+uint _SnapshotVertexCount;
+uint _SnapshotIndexCount;
+
+// Conservative partial-publish path.  A spatially destructive candidate is
+// never allowed to rewrite the accepted front buffer.  It may only append
+// mature triangles whose exact 16^3 ownership cell was absent before.
+StructuredBuffer<GPUVertex>   _PreviousVertices;
+StructuredBuffer<uint>        _PreviousIndices;
+StructuredBuffer<uint>        _PreviousAdmissionClass;
+StructuredBuffer<uint>        _AcceptedSpatialOccupancy;
+RWStructuredBuffer<GPUVertex> _MergeVertices;
+RWStructuredBuffer<uint>      _MergeIndices;
+RWStructuredBuffer<uint>      _MergeAdmissionClass;
+RWStructuredBuffer<uint>      _MergeCounters;
+RWStructuredBuffer<uint>      _MergeDrawIndirectArgs;
+uint _PreviousVertexCount;
+uint _PreviousIndexCount;
+uint _CandidateVertexCount;
+uint _CandidateIndexCount;
+
+// HERA shadow extraction.  The source page remains immutable and is always the
+// resident 32^3 baseline.  A 16^3 request is additive rescue/diagnosis only: it
+// must never remove the corresponding parent triangle.
+// [0] stored indices, [1] resident parent triangles, [2] fine-tier requests;
+// [21] displayed red triangles; [22..25] confirmation classes.
+// Read-only internal_mixed split (never affects heraClass or output indices).
+// Broad contact ledger (any triangle touching an internal_mixed vertex):
+// [3] real edge/corner, [4] suspected centre false conflict, [5] ambiguous.
+// Final delegated ledger (only triangles actually delegated by HERA):
+// [6] real edge/corner, [7] suspected centre false conflict, [8] ambiguous.
+// [9] delegated transition without an internal_mixed vertex.
+// [10] broad contact total: any triangle touching internal_mixed.
+RWStructuredBuffer<uint>      _HeraFilterCounters;
+RWStructuredBuffer<uint>      _HeraDrawIndirectArgs;
+RWStructuredBuffer<uint>      _HeraInteriorShadowIndices;
+RWStructuredBuffer<uint>      _HeraInteriorShadowDrawIndirectArgs;
+RWStructuredBuffer<uint>      _HeraBoundaryShadowIndices;
+RWStructuredBuffer<uint>      _HeraBoundaryShadowDrawIndirectArgs;
+uint _HeraSourceIndexCount;
 
 RWStructuredBuffer<uint>      _Counters;         // [0] = vertex count, [1] = index count
 RWStructuredBuffer<uint>      _DispatchArgs;     // [0,1,2] = indirect dispatch group counts
@@ -143,6 +201,19 @@ float SampleSDF(int3 coord)
     return s.x;
 }
 
+bool InsideMap(int3 c)
+{
+    int3 local = c - _MapMin;
+    return all(local >= 0) && all(local < (int3)_MapCount);
+}
+
+int MapFlatten(int3 c)
+{
+    int3 local = c - _MapMin;
+    return local.x + local.y * (int)_MapCount.x +
+           local.z * (int)_MapCount.x * (int)_MapCount.y;
+}
+
 bool TrySampleObservedSDF(int3 coord, out float value)
 {
     float2 s = _TsdfVolume[coord];
@@ -153,12 +224,13 @@ bool TrySampleObservedSDF(int3 coord, out float value)
     return observed;
 }
 
-// Read-only final split for residual vertices that contain an unknown admission
-// source.  This projects the already-emitted Surface-Nets vertex into the current
-// stereo depth frame; it never changes TSDF fusion, extraction, or topology.
+// Read-only current-geometry evidence for every emitted Surface-Nets vertex.
+// This projects the already-emitted vertex into the current stereo depth frame;
+// it never changes TSDF fusion, extraction, or topology. The older residual
+// ledger consumes a subset, while the forensic ledger consumes the full set.
 // Return classes: 0=current depth support, 1=history only,
 // 2=current free-space contradiction, 3=edge/multi-hop evidence insufficient.
-uint ClassifyUnknownResidualEvidence(float3 worldPos, uint knownSourceMask, out uint roiZone)
+uint ClassifyCurrentGeometryEvidence(float3 worldPos, uint knownSourceMask, out uint roiZone)
 {
     roiZone = 3u; // outside the diagnostic frame
     bool anyValidEye = false;
@@ -250,15 +322,15 @@ uint ClassifyUnknownResidualEvidence(float3 worldPos, uint knownSourceMask, out 
 [numthreads(1, 1, 1)]
 void ClearCounters(uint3 id : SV_DispatchThreadID)
 {
-    [unroll]
-    for (uint i = 0; i < 138; i++)
+    [loop]
+    for (uint i = 0; i < 1420; i++)
         _Counters[i] = 0;
 }
 
 [numthreads(256, 1, 1)]
 void ClearCandidateHistory(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= 524288u) return;
+    if (id.x >= _CandidateHistoryCapacity) return;
     _CandidateHistoryKeys[id.x] = 0u;
     _CandidateHistoryStates[id.x] = 0u;
 }
@@ -271,14 +343,15 @@ void ClearCandidateHistory(uint3 id : SV_DispatchThreadID)
 [numthreads(4, 4, 4)]
 void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
 {
-    if (any(id >= _VoxCount))
+    if (any(id >= _MapCount))
         return;
 
-    int flatIdx = Flatten((int3)id);
+    int3 coord = _MapMin + (int3)id;
+    int flatIdx = MapFlatten(coord);
 
-    if (id.x >= _VoxCount.x - 1 ||
-        id.y >= _VoxCount.y - 1 ||
-        id.z >= _VoxCount.z - 1)
+    if (coord.x >= (int)_VoxCount.x - 1 ||
+        coord.y >= (int)_VoxCount.y - 1 ||
+        coord.z >= (int)_VoxCount.z - 1)
     {
         _CoordVertMap[flatIdx] = -1;
         return;
@@ -303,12 +376,13 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint confirmationStateMask = 0u;     // bits 0..2: unknown/pending/confirmed
     uint pendingSourceMask = 0u;         // bits 0..2: self/direct/relay seen pending
     uint confirmedSourceMask = 0u;       // bits 0..2: self/direct/relay seen confirmed
+    uint lifecycleRiskMask = 0u;         // bits 0..4: plane/near-abstain/motion(birth-frozen)/retired/fast-promotion
 
     [unroll]
     for (uint e = 0; e < 12; e++)
     {
-        int3 cA = (int3)id + kCornerOffs[kEdgeA[e]];
-        int3 cB = (int3)id + kCornerOffs[kEdgeB[e]];
+        int3 cA = coord + kCornerOffs[kEdgeA[e]];
+        int3 cB = coord + kCornerOffs[kEdgeB[e]];
 
         float2 sA = _TsdfVolume[cA];
         float2 sB = _TsdfVolume[cB];
@@ -352,8 +426,8 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             // Only endpoints of edges that actually contributed a zero
             // crossing may settle the emitted cell's ledgers. Reading all eight
             // corners lets unrelated nearby history contaminate the result.
-            uint traceA = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cA]) * 7.0), 0, 7);
-            uint traceB = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cB]) * 7.0), 0, 7);
+            uint traceA = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cA]) * 255.0), 0, 255);
+            uint traceB = (uint)clamp((int)round(saturate(_AdmissionTraceVolume[cB]) * 255.0), 0, 255);
             uint sourceA = traceA & 3u;
             uint sourceB = traceB & 3u;
             uint confirmA = sourceA == 0u ? 0u : (((traceA & 4u) != 0u) ? 2u : 1u);
@@ -367,6 +441,8 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             if (sourceB > 0u && confirmB == 1u) pendingSourceMask |= 1u << (sourceB - 1u);
             if (sourceA > 0u && confirmA == 2u) confirmedSourceMask |= 1u << (sourceA - 1u);
             if (sourceB > 0u && confirmB == 2u) confirmedSourceMask |= 1u << (sourceB - 1u);
+            lifecycleRiskMask |= (traceA >> 3u) & 31u;
+            lifecycleRiskMask |= (traceB >> 3u) & 31u;
 
             if (!traceEndpointSeen)
             {
@@ -398,7 +474,7 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     float3 worldPos = VoxelCoordToWorld(posCoord);
     float3 norm     = normalize(gradDir);
 
-    float4 col = _ColorVolume[(int3)id];
+    float4 col = _ColorVolume[coord];
     // Threshold must stay below ~2/255: after save/load, coverage alpha is quantized to 8-bit
     // and can dip slightly below 0.04 even when rgb is valid — old cutoff forced dark gray verts.
     uint packed = (col.a > 0.008) ? PackColor(col) : PackColor(float4(0.078, 0.078, 0.098, 1.0));
@@ -425,7 +501,7 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint diagnosticRoiZone = 3u;
     uint diagnosticEvidenceClass = 1u;
     if (_DiagnosticRoiEnabled > 0.5)
-        diagnosticEvidenceClass = ClassifyUnknownResidualEvidence(
+        diagnosticEvidenceClass = ClassifyCurrentGeometryEvidence(
             worldPos, diagnosticKnownSourceMask, diagnosticRoiZone);
 
     // Keep the original low five bits byte-for-byte compatible with the
@@ -437,7 +513,8 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
                                         (pendingSourceMask << 12u) |
                                         (confirmedSourceMask << 15u) |
                                         (diagnosticEvidenceClass << 18u) |
-                                        (diagnosticRoiZone << 20u);
+                                        (diagnosticRoiZone << 20u) |
+                                        (lifecycleRiskMask << 22u);
     InterlockedAdd(_Counters[6u + (pathClass == 0u ? 4u : pathClass - 1u)], 1u);
     InterlockedAdd(_Counters[11u + (confirmationClass == 0u ? 3u : confirmationClass - 1u)], 1u);
     // Read-only joint ledger: 5 admission classes x 4 confirmation classes.
@@ -540,7 +617,10 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     v.pos          = worldPos;
     v.norm         = norm;
     v.packedColor  = packed;
-    v.voxelFlatIdx = (uint)flatIdx;
+    // Keep the vertex identity in full-volume coordinates.  The coordinate
+    // map is regional, but all diagnostics, TSDF samples and face keys are
+    // deliberately global so a chunk can never drift into its own origin.
+    v.voxelFlatIdx = (uint)Flatten(coord);
 
     _Vertices[compactIdx]     = v;
     _CoordVertMap[flatIdx]    = (int)compactIdx;
@@ -597,9 +677,9 @@ void SmoothVertices(uint3 id : SV_DispatchThreadID)
         {
             int3 nc = coord;
             nc[axis] += dir;
-            if (nc[axis] < 0 || nc[axis] >= (int)_VoxCount[axis]) continue;
+            if (!InsideMap(nc)) continue;
 
-            int nbrVert = _CoordVertMap[Flatten(nc)];
+            int nbrVert = _CoordVertMap[MapFlatten(nc)];
             if (nbrVert < 0 || (uint)nbrVert >= vertCount) continue;
 
             float nw = max(0.0, dot(norm, _Vertices[nbrVert].norm));
@@ -650,12 +730,13 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     GPUVertex v = _Vertices[id.x];
     int3 coord  = Unflatten((int)v.voxelFlatIdx);
 
-    float4 prev    = _TemporalState[coord];
+    int3 localCoord = coord - _MapMin;
+    float4 prev    = _TemporalState[localCoord];
     float  prevAge = prev.w;
 
     if (prevAge < 0.0)
     {
-        _TemporalState[coord] = float4(v.pos, 0.0);
+        _TemporalState[localCoord] = float4(v.pos, 0.0);
         return;
     }
 
@@ -666,7 +747,7 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     {
         v.pos = prevPos;
         _Vertices[id.x]     = v;
-        _TemporalState[coord] = float4(prevPos, prevAge + 1.0);
+        _TemporalState[localCoord] = float4(prevPos, prevAge + 1.0);
         return;
     }
 
@@ -676,14 +757,13 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
 
     v.pos = lerp(prevPos, v.pos, alpha);
     _Vertices[id.x]     = v;
-    _TemporalState[coord] = float4(v.pos, age);
+    _TemporalState[localCoord] = float4(v.pos, age);
 }
 
 // ══════════════════════════════════════════════════════════════════
 //  Kernel 7 : GenerateIndices
 //  Per vertex: check 3 axes for quad emission
 // ══════════════════════════════════════════════════════════════════
-static const uint kCandidateHistoryMask = 524287u;
 static const uint kCandidateIndexMask = 0x3FFFFFFFu;
 
 uint CandidateHash(uint key)
@@ -693,7 +773,7 @@ uint CandidateHash(uint key)
     key ^= key >> 15u;
     key *= 0x846ca68bu;
     key ^= key >> 16u;
-    return key & kCandidateHistoryMask;
+    return key & _CandidateHistoryMask;
 }
 
 bool CandidateFindSlot(uint key, bool allowCreate, out uint slot, out uint state)
@@ -702,7 +782,7 @@ bool CandidateFindSlot(uint key, bool allowCreate, out uint slot, out uint state
     [unroll]
     for (uint probe = 0u; probe < 16u; probe++)
     {
-        slot = (start + probe) & kCandidateHistoryMask;
+        slot = (start + probe) & _CandidateHistoryMask;
         uint observedKey = _CandidateHistoryKeys[slot];
         if (observedKey == key)
         {
@@ -749,6 +829,14 @@ uint CandidateTriangleClass(uint stableKey, uint p0, uint p1, uint p2)
     uint previousMode = packedState & 15u;
     uint previousEpoch = packedState >> 4u;
     bool consecutive = found && previousEpoch != 0u && previousEpoch + 1u == _CandidateExtractionEpoch;
+    // Class 1 means that this extraction has no current observation for the
+    // vertex (typically because the mature surface is outside the current
+    // stereo frustum).  It is absence of evidence, not negative evidence.
+    // Class 3 remains insufficient/ambiguous evidence and may not preserve a
+    // triangle.  This distinction lets a verified surface survive a head turn
+    // without admitting any new geometry through the history-only path.
+    bool supportOrHistoryOnly = (e0 <= 1u) && (e1 <= 1u) && (e2 <= 1u);
+    bool matureHistoryHold = previousMode == 2u && !contradicted && supportOrHistoryOnly;
 
     uint candidateClass = 0u;
     uint nextMode = 0u;
@@ -756,8 +844,9 @@ uint CandidateTriangleClass(uint stableKey, uint p0, uint p1, uint p2)
     if (!updateEnabled)
     {
         // Save/export extraction is read-only.  It may show only a triangle
-        // that was already mature and still has full current support.
-        candidateClass = !contradicted && supportCount == 3u && previousMode == 2u
+        // that was already mature and is either supported now or simply not
+        // observed by the current stereo view.
+        candidateClass = matureHistoryHold
             ? 2u
             : 0u;
 
@@ -768,12 +857,20 @@ uint CandidateTriangleClass(uint stableKey, uint p0, uint p1, uint p2)
         else
             InterlockedAdd(_Counters[136], 1u);
     }
+    else if (matureHistoryHold && supportCount != 3u)
+    {
+        // A triangle that already passed the two-extraction, three-point gate
+        // remains mature while it is merely outside the current observation.
+        // Re-observation with class 2 (free-space contradiction) or class 3
+        // (edge/multi-hop ambiguity) still retires it below.
+        nextMode = 2u;
+        candidateClass = 2u;
+        InterlockedAdd(_Counters[133], 1u);
+    }
     else if (contradicted || supportCount != 3u)
     {
-        // No leniency in production: losing one support point, unstable
-        // support, or a free-space contradiction retires the whole triangle.
-        // Classes 1/3 remain reserved for ledger compatibility but are never
-        // emitted by this path.
+        // The history-only exception was handled above.  Current edge/multi-hop
+        // ambiguity or a free-space contradiction still retires the triangle.
         nextMode = 0u;
         candidateClass = 0u;
         InterlockedAdd(_Counters[136], 1u);
@@ -810,6 +907,85 @@ uint EncodeCandidateIndex(uint vertexIndex, uint candidateClass)
     return (vertexIndex & kCandidateIndexMask) | ((candidateClass & 3u) << 30u);
 }
 
+// A whole extraction chunk is deliberately fairly large.  Counting only its
+// total triangles lets geometry newly observed at one side hide geometry that
+// vanished at the other side.  Keep a coarse spatial ledger so the persistent
+// front buffer can distinguish growth from a local replacement.
+uint MatureSpatialBin(int3 coord)
+{
+    int3 extent = max(_CoreMax - _CoreMin, int3(1, 1, 1));
+    int3 rel = clamp(coord - _CoreMin, int3(0, 0, 0), extent - 1);
+    int3 bin = min((rel * 4) / extent, int3(3, 3, 3));
+    return (uint)(bin.x + 4 * bin.y + 16 * bin.z);
+}
+
+// Join the complete emitted triangle population to current geometric evidence,
+// red/green confirmation state, immutable admission source and the lifecycle
+// risks carried from TSDF integration.  Unlike counters 116..119 this covers
+// every emitted triangle, including fully-known self/direct/relay geometry.
+uint EmittedTriangleEvidence(uint p0, uint p1, uint p2)
+{
+    uint e0 = (p0 >> 18u) & 3u;
+    uint e1 = (p1 >> 18u) & 3u;
+    uint e2 = (p2 >> 18u) & 3u;
+    bool anySupport = e0 == 0u || e1 == 0u || e2 == 0u;
+    bool allSupport = e0 == 0u && e1 == 0u && e2 == 0u;
+    bool anyContradiction = e0 == 2u || e1 == 2u || e2 == 2u;
+    bool anyInsufficient = e0 == 3u || e1 == 3u || e2 == 3u;
+
+    if (allSupport) return 0u;
+    // A triangle straddling supported and contradicted samples is an edge or
+    // mixed-observation case, not a clean free-space conviction.
+    if (anySupport && anyContradiction) return 3u;
+    if (anyContradiction) return 2u;
+    if (anyInsufficient) return 3u;
+    return 1u;
+}
+
+void AuditEmittedTriangle(
+    uint p0, uint p1, uint p2,
+    uint pathClass, uint confirmationClass, uint spatialBin)
+{
+    uint evidence = EmittedTriangleEvidence(p0, p1, p2);
+    pathClass = min(pathClass, 4u);
+    confirmationClass = min(confirmationClass, 3u);
+    uint riskMask = ((p0 >> 22u) | (p1 >> 22u) | (p2 >> 22u)) & 31u;
+
+    InterlockedAdd(_Counters[330u + evidence], 1u);
+    InterlockedAdd(_Counters[334u + confirmationClass * 4u + evidence], 1u);
+    InterlockedAdd(_Counters[350u + pathClass * 4u + evidence], 1u);
+    [unroll]
+    for (uint risk = 0u; risk < 5u; risk++)
+    {
+        if ((riskMask & (1u << risk)) != 0u)
+        {
+            InterlockedAdd(_Counters[370u + risk * 4u + evidence], 1u);
+            InterlockedAdd(_Counters[390u + risk], 1u);
+        }
+    }
+    InterlockedAdd(_Counters[395u], 1u);
+    InterlockedAdd(
+        _Counters[396u + spatialBin * 16u + confirmationClass * 4u + evidence],
+        1u);
+}
+
+// A second, finer read-only fingerprint divides each coarse 4^3 ledger bin
+// into another 4^3 occupancy grid.  The resulting 16^3 cell identity lets the
+// CPU distinguish same-position survival from an equal-sized surface that
+// disappeared here and reappeared elsewhere.  It does not change topology.
+void MatureSpatialOccupancy(int3 coord, out uint spatialBin, out uint word, out uint bitMask)
+{
+    int3 extent = max(_CoreMax - _CoreMin, int3(1, 1, 1));
+    int3 rel = clamp(coord - _CoreMin, int3(0, 0, 0), extent - 1);
+    int3 fine = min((rel * 16) / extent, int3(15, 15, 15));
+    int3 coarse = fine / 4;
+    int3 local = fine - coarse * 4;
+    spatialBin = (uint)(coarse.x + 4 * coarse.y + 16 * coarse.z);
+    uint bit = (uint)(local.x + 4 * local.y + 16 * local.z);
+    word = bit >> 5u;
+    bitMask = 1u << (bit & 31u);
+}
+
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
     if (any(coord - d1 < 0))       return;
@@ -835,10 +1011,18 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     }
     if ((va < 0) == (vb < 0)) return;
 
-    int a = _CoordVertMap[Flatten(coord)];
-    int b = _CoordVertMap[Flatten(coord - d1)];
-    int c = _CoordVertMap[Flatten(coord - (d1 + d2))];
-    int d = _CoordVertMap[Flatten(coord - d2)];
+    // A chunk may inspect the halo but must never dereference a neighbour
+    // outside its regional coordinate map.
+    int3 cb = coord - d1;
+    int3 cc = coord - (d1 + d2);
+    int3 cd = coord - d2;
+    if (!InsideMap(coord) || !InsideMap(cb) || !InsideMap(cc) || !InsideMap(cd))
+        return;
+
+    int a = _CoordVertMap[MapFlatten(coord)];
+    int b = _CoordVertMap[MapFlatten(cb)];
+    int c = _CoordVertMap[MapFlatten(cc)];
+    int d = _CoordVertMap[MapFlatten(cd)];
     if (a < 0 || b < 0 || c < 0 || d < 0) return;
 
     uint pa = _VertexAdmissionClass[(uint)a];
@@ -963,6 +1147,25 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     uint candidateABC = CandidateTriangleClass(faceBaseKey, pa, pb, pc);
     uint candidateACD = CandidateTriangleClass(faceBaseKey + 1u, pa, pc, pd);
 
+    // Only triangles that passed the mature three-point gate enter the spatial
+    // persistence ledger. Pending/diagnostic geometry must not pin a region.
+    uint spatialBin = MatureSpatialBin(coord);
+    AuditEmittedTriangle(pa, pb, pc, pathTriABC, confirmTriABC, spatialBin);
+    AuditEmittedTriangle(pa, pc, pd, pathTriACD, confirmTriACD, spatialBin);
+    if (candidateABC == 2u)
+        InterlockedAdd(_Counters[138u + spatialBin], 1u);
+    if (candidateACD == 2u)
+        InterlockedAdd(_Counters[138u + spatialBin], 1u);
+
+    if (candidateABC == 2u || candidateACD == 2u)
+    {
+        uint occupancyBin;
+        uint occupancyWord;
+        uint occupancyMask;
+        MatureSpatialOccupancy(coord, occupancyBin, occupancyWord, occupancyMask);
+        InterlockedOr(_Counters[202u + occupancyBin * 2u + occupancyWord], occupancyMask);
+    }
+
     uint baseIdx;
     InterlockedAdd(_Counters[1], 6, baseIdx);
 
@@ -994,6 +1197,10 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
 
+    // The halo supplies shared corners only.  Exactly one core owns the
+    // emitted faces, preventing duplicate surfaces at chunk boundaries.
+    if (any(coord < _CoreMin) || any(coord >= _CoreMax)) return;
+
     TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0), 0u);
     TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1), 1u);
     TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0), 2u);
@@ -1013,6 +1220,335 @@ void BuildIndirectArgs(uint3 id : SV_DispatchThreadID)
     _DrawIndirectArgs[4] = 0;            // startInstance
 }
 
+// Copies only the committed payload into the immutable front-buffer.  The
+// extraction buffers are capacity-sized working storage and must not be kept
+// alive merely to render a much smaller accepted mesh.
+[numthreads(64, 1, 1)]
+void CopyMeshSnapshot(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _SnapshotVertexCount)
+    {
+        _SnapshotVertices[id.x] = _Vertices[id.x];
+        _SnapshotAdmissionClass[id.x] = _VertexAdmissionClass[id.x];
+    }
+    if (id.x < _SnapshotIndexCount)
+        _SnapshotIndices[id.x] = _Indices[id.x];
+}
+
+// Copies the immutable accepted mesh and the current candidate into disjoint
+// vertex ranges.  Candidate vertices are harmless until an admitted triangle
+// references them.
+[numthreads(64, 1, 1)]
+void CopyAdditiveMergePayload(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _PreviousVertexCount)
+    {
+        _MergeVertices[id.x] = _PreviousVertices[id.x];
+        _MergeAdmissionClass[id.x] = _PreviousAdmissionClass[id.x];
+    }
+    if (id.x < _CandidateVertexCount)
+    {
+        uint dst = _PreviousVertexCount + id.x;
+        _MergeVertices[dst] = _Vertices[id.x];
+        _MergeAdmissionClass[dst] = _VertexAdmissionClass[id.x];
+    }
+    if (id.x < _PreviousIndexCount)
+        _MergeIndices[id.x] = _PreviousIndices[id.x];
+}
+
+// Appends only three-point-mature candidate triangles in exact fine cells that
+// the accepted snapshot did not already own.  It cannot delete, move, or
+// overwrite an accepted triangle.
+[numthreads(64, 1, 1)]
+void AppendNovelMatureTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleBase = id.x * 3u;
+    if (triangleBase + 2u >= _CandidateIndexCount)
+        return;
+
+    uint encoded0 = _Indices[triangleBase];
+    uint encoded1 = _Indices[triangleBase + 1u];
+    uint encoded2 = _Indices[triangleBase + 2u];
+    uint candidateClass = encoded0 >> 30u;
+    if (candidateClass != 2u)
+    {
+        InterlockedAdd(_MergeCounters[4], 1u);
+        return;
+    }
+
+    uint raw0 = encoded0 & kCandidateIndexMask;
+    uint raw1 = encoded1 & kCandidateIndexMask;
+    uint raw2 = encoded2 & kCandidateIndexMask;
+    if (raw0 >= _CandidateVertexCount || raw1 >= _CandidateVertexCount ||
+        raw2 >= _CandidateVertexCount)
+        return;
+
+    int3 owner = max(Unflatten((int)_Vertices[raw0].voxelFlatIdx),
+                     max(Unflatten((int)_Vertices[raw1].voxelFlatIdx),
+                         Unflatten((int)_Vertices[raw2].voxelFlatIdx)));
+    uint spatialBin;
+    uint occupancyWord;
+    uint occupancyMask;
+    MatureSpatialOccupancy(owner, spatialBin, occupancyWord, occupancyMask);
+    uint occupancyIndex = spatialBin * 2u + occupancyWord;
+    if ((_AcceptedSpatialOccupancy[occupancyIndex] & occupancyMask) != 0u)
+    {
+        InterlockedAdd(_MergeCounters[3], 1u);
+        return;
+    }
+
+    uint dst;
+    InterlockedAdd(_MergeCounters[1], 3u, dst);
+    uint vertexOffset = _PreviousVertexCount;
+    _MergeIndices[dst] = EncodeCandidateIndex(raw0 + vertexOffset, candidateClass);
+    _MergeIndices[dst + 1u] = EncodeCandidateIndex(raw1 + vertexOffset, candidateClass);
+    _MergeIndices[dst + 2u] = EncodeCandidateIndex(raw2 + vertexOffset, candidateClass);
+    InterlockedAdd(_MergeCounters[2], 1u);
+}
+
+[numthreads(1, 1, 1)]
+void BuildAdditiveMergeArgs(uint3 id : SV_DispatchThreadID)
+{
+    _MergeDrawIndirectArgs[0] = _MergeCounters[1];
+    _MergeDrawIndirectArgs[1] = 1u;
+    _MergeDrawIndirectArgs[2] = 0u;
+    _MergeDrawIndirectArgs[3] = 0u;
+    _MergeDrawIndirectArgs[4] = 0u;
+}
+
+// HERA phase 1: copy the page vertex payload once.  The filtered index stream
+// can then be built without touching the authoritative TSDF or source page.
+[numthreads(64, 1, 1)]
+void CopyHeraVertexPayload(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _SnapshotVertexCount)
+        return;
+    _SnapshotVertices[id.x] = _Vertices[id.x];
+    _SnapshotAdmissionClass[id.x] = _VertexAdmissionClass[id.x];
+}
+
+// HERA phase 2: preserve the complete parent triangle stream.  The historical
+// A/B experiment proved that rejecting a whole 32^3 page because it contains a
+// small mixed subset discards mostly valid geometry.  A triangle that is mixed
+// in BOTH ledgers therefore requests 16^3 refinement in addition to retaining
+// its resident parent representation.
+[numthreads(64, 1, 1)]
+void FilterHeraCleanTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleBase = id.x * 3u;
+    if (triangleBase + 2u >= _HeraSourceIndexCount)
+        return;
+
+    uint encoded0 = _Indices[triangleBase];
+    uint encoded1 = _Indices[triangleBase + 1u];
+    uint encoded2 = _Indices[triangleBase + 2u];
+    uint raw0 = encoded0 & kCandidateIndexMask;
+    uint raw1 = encoded1 & kCandidateIndexMask;
+    uint raw2 = encoded2 & kCandidateIndexMask;
+    if (raw0 >= _SnapshotVertexCount || raw1 >= _SnapshotVertexCount || raw2 >= _SnapshotVertexCount)
+        return;
+
+    uint state0 = _VertexAdmissionClass[raw0];
+    uint state1 = _VertexAdmissionClass[raw1];
+    uint state2 = _VertexAdmissionClass[raw2];
+    uint path0 = min(state0 & 7u, 4u);
+    uint path1 = min(state1 & 7u, 4u);
+    uint path2 = min(state2 & 7u, 4u);
+    uint confirm0 = min((state0 >> 3u) & 3u, 3u);
+    uint confirm1 = min((state1 >> 3u) & 3u, 3u);
+    uint confirm2 = min((state2 >> 3u) & 3u, 3u);
+    uint pathTri = (path0 == path1 && path0 == path2) ? path0 : 4u;
+    uint confirmTri = (confirm0 == confirm1 && confirm0 == confirm2) ? confirm0 : 3u;
+    bool requestFineTierReview = pathTri == 4u && confirmTri == 3u;
+    // Display trust and 16-tier delegation are deliberately independent:
+    // source mixing is diagnostic provenance, not proof of bad geometry.
+    // A uniformly receiver-confirmed triangle is green even if its immutable
+    // birth sources differ. Unknown, pending or mixed confirmation stays red.
+    // Fine-tier review remains the narrower historic double-mixed request, so
+    // this semantic correction does not broaden child16 authority.
+    bool displayRed = confirmTri != 2u;
+    if (requestFineTierReview)
+        InterlockedAdd(_HeraFilterCounters[2], 1u);
+    if (displayRed)
+        InterlockedAdd(_HeraFilterCounters[21], 1u);
+    InterlockedAdd(_HeraFilterCounters[22u + confirmTri], 1u);
+
+    uint heraClass = displayRed ? 3u : 2u;
+    uint dst;
+    InterlockedAdd(_HeraFilterCounters[0], 3u, dst);
+    _SnapshotIndices[dst] = raw0 | (heraClass << 30u);
+    _SnapshotIndices[dst + 1u] = raw1 | (heraClass << 30u);
+    _SnapshotIndices[dst + 2u] = raw2 | (heraClass << 30u);
+    InterlockedAdd(_HeraFilterCounters[1], 1u);
+}
+
+
+// Read-only HERA rescue classification is isolated from the resident parent
+// index router above.  A missing TSDF binding or a diagnostic shader failure
+// must never zero the visible HERA draw stream on device.
+[numthreads(64, 1, 1)]
+void ClassifyHeraInternalMixed(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleBase = id.x * 3u;
+    if (triangleBase + 2u >= _HeraSourceIndexCount)
+        return;
+
+    uint raw0 = _Indices[triangleBase] & kCandidateIndexMask;
+    uint raw1 = _Indices[triangleBase + 1u] & kCandidateIndexMask;
+    uint raw2 = _Indices[triangleBase + 2u] & kCandidateIndexMask;
+    if (raw0 >= _SnapshotVertexCount || raw1 >= _SnapshotVertexCount || raw2 >= _SnapshotVertexCount)
+        return;
+
+    uint state0 = _VertexAdmissionClass[raw0];
+    uint state1 = _VertexAdmissionClass[raw1];
+    uint state2 = _VertexAdmissionClass[raw2];
+    uint path0 = min(state0 & 7u, 4u);
+    uint path1 = min(state1 & 7u, 4u);
+    uint path2 = min(state2 & 7u, 4u);
+    uint confirm0 = min((state0 >> 3u) & 3u, 3u);
+    uint confirm1 = min((state1 >> 3u) & 3u, 3u);
+    uint confirm2 = min((state2 >> 3u) & 3u, 3u);
+    uint pathTri = (path0 == path1 && path0 == path2) ? path0 : 4u;
+    uint confirmTri = (confirm0 == confirm1 && confirm0 == confirm2) ? confirm0 : 3u;
+    bool delegateToFineTier = pathTri == 4u && confirmTri == 3u;
+    bool hasInternalMixed = path0 == 4u || path1 == 4u || path2 == 4u ||
+                            confirm0 == 3u || confirm1 == 3u || confirm2 == 3u;
+
+    if (!hasInternalMixed)
+    {
+        if (delegateToFineTier)
+            InterlockedAdd(_HeraFilterCounters[9], 1u);
+        return;
+    }
+
+    float3 n0 = _Vertices[raw0].norm;
+    float3 n1 = _Vertices[raw1].norm;
+    float3 n2 = _Vertices[raw2].norm;
+    float l0 = dot(n0, n0);
+    float l1 = dot(n1, n1);
+    float l2 = dot(n2, n2);
+    bool normalsValid = l0 > 0.25 && l1 > 0.25 && l2 > 0.25;
+    float minNormalDot = -1.0;
+    if (normalsValid)
+    {
+        n0 *= rsqrt(l0);
+        n1 *= rsqrt(l1);
+        n2 *= rsqrt(l2);
+        minNormalDot = min(dot(n0, n1), min(dot(n1, n2), dot(n2, n0)));
+    }
+
+    int3 c0 = Unflatten((int)_Vertices[raw0].voxelFlatIdx);
+    int3 c1 = Unflatten((int)_Vertices[raw1].voxelFlatIdx);
+    int3 c2 = Unflatten((int)_Vertices[raw2].voxelFlatIdx);
+    float supportFloor = max(_MinWeight, 0.08);
+    bool fullyObserved = _TsdfVolume[c0].g >= supportFloor &&
+                         _TsdfVolume[c1].g >= supportFloor &&
+                         _TsdfVolume[c2].g >= supportFloor;
+    int3 safeMin = _CoreMin + int3(2, 2, 2);
+    int3 safeMax = _CoreMax - int3(2, 2, 2);
+    bool pageInterior = all(c0 >= safeMin) && all(c0 < safeMax) &&
+                        all(c1 >= safeMin) && all(c1 < safeMax) &&
+                        all(c2 >= safeMin) && all(c2 < safeMax);
+
+    uint splitClass = normalsValid && minNormalDot <= 0.82
+        ? 0u
+        : normalsValid && minNormalDot >= 0.94 && fullyObserved && pageInterior
+            ? 1u
+            : 2u;
+    InterlockedAdd(_HeraFilterCounters[10], 1u);
+    InterlockedAdd(_HeraFilterCounters[3u + splitClass], 1u);
+    if (delegateToFineTier)
+        InterlockedAdd(_HeraFilterCounters[6u + splitClass], 1u);
+
+    // A child16 rescue is a committed local addition, not a full-page
+    // delegated replacement. Route class 2 keeps it green and visible.
+    uint committedPatchBits = 2u << 30u;
+    uint encoded0 = raw0 | committedPatchBits;
+    uint encoded1 = raw1 | committedPatchBits;
+    uint encoded2 = raw2 | committedPatchBits;
+
+    // Counter 19 and this index stream are a strictly read-only replay of the
+    // fine-tier triangles that look like false centre conflicts.  Unlike the
+    // old count-only experiment, this preserves the exact triangle identity;
+    // it cannot accidentally resurrect the rest of the 16^3 page.
+    if (delegateToFineTier && splitClass == 1u)
+    {
+        uint shadowDst;
+        InterlockedAdd(_HeraFilterCounters[19], 3u, shadowDst);
+        _HeraInteriorShadowIndices[shadowDst] = encoded0;
+        _HeraInteriorShadowIndices[shadowDst + 1u] = encoded1;
+        _HeraInteriorShadowIndices[shadowDst + 2u] = encoded2;
+    }
+
+    // Exhaustive, mutually-exclusive split of the old "ambiguous" bucket.
+    // These counters are diagnostic only. They deliberately do not alter the
+    // HERA route or the immutable replay snapshot above.
+    if (splitClass == 2u)
+    {
+        bool normalFailure = !normalsValid || (minNormalDot > 0.82 && minNormalDot < 0.94);
+        bool weightFailure = !fullyObserved;
+        bool boundaryFailure = !pageInterior;
+        uint failureCount = (normalFailure ? 1u : 0u) +
+                            (weightFailure ? 1u : 0u) +
+                            (boundaryFailure ? 1u : 0u);
+        uint reason = failureCount > 1u
+            ? 3u // several independent gates failed
+            : normalFailure
+                ? 0u
+                : weightFailure
+                    ? 1u
+                    : boundaryFailure
+                        ? 2u
+                        : 3u; // defensive residual: never silently disappears
+        InterlockedAdd(_HeraFilterCounters[11u + reason], 1u);
+        if (delegateToFineTier)
+            InterlockedAdd(_HeraFilterCounters[15u + reason], 1u);
+
+        // Exact page-boundary stream. GenerateIndices already enforces the
+        // half-open core ownership rule, so this triangle has one canonical
+        // emitting page even when its vertices consume neighbour halo data.
+        // Copy the original indices verbatim: never re-triangulate a seam.
+        if (delegateToFineTier && failureCount == 1u && boundaryFailure)
+        {
+            uint boundaryDst;
+            InterlockedAdd(_HeraFilterCounters[20], 3u, boundaryDst);
+            _HeraBoundaryShadowIndices[boundaryDst] = encoded0;
+            _HeraBoundaryShadowIndices[boundaryDst + 1u] = encoded1;
+            _HeraBoundaryShadowIndices[boundaryDst + 2u] = encoded2;
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void BuildHeraFilteredArgs(uint3 id : SV_DispatchThreadID)
+{
+    _HeraDrawIndirectArgs[0] = _HeraFilterCounters[0];
+    _HeraDrawIndirectArgs[1] = 1u;
+    _HeraDrawIndirectArgs[2] = 0u;
+    _HeraDrawIndirectArgs[3] = 0u;
+    _HeraDrawIndirectArgs[4] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void BuildHeraInteriorShadowArgs(uint3 id : SV_DispatchThreadID)
+{
+    _HeraInteriorShadowDrawIndirectArgs[0] = _HeraFilterCounters[19];
+    _HeraInteriorShadowDrawIndirectArgs[1] = 1u;
+    _HeraInteriorShadowDrawIndirectArgs[2] = 0u;
+    _HeraInteriorShadowDrawIndirectArgs[3] = 0u;
+    _HeraInteriorShadowDrawIndirectArgs[4] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void BuildHeraBoundaryShadowArgs(uint3 id : SV_DispatchThreadID)
+{
+    _HeraBoundaryShadowDrawIndirectArgs[0] = _HeraFilterCounters[20];
+    _HeraBoundaryShadowDrawIndirectArgs[1] = 1u;
+    _HeraBoundaryShadowDrawIndirectArgs[2] = 0u;
+    _HeraBoundaryShadowDrawIndirectArgs[3] = 0u;
+    _HeraBoundaryShadowDrawIndirectArgs[4] = 0u;
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  Kernel 9 : InitTemporal
 //  Sets all voxels in _TemporalState to (0,0,0,-1) (uninitialized)
@@ -1020,6 +1556,6 @@ void BuildIndirectArgs(uint3 id : SV_DispatchThreadID)
 [numthreads(4, 4, 4)]
 void InitTemporal(uint3 id : SV_DispatchThreadID)
 {
-    if (any(id >= (uint3)_VoxCount)) return;
+    if (any(id >= (uint3)_MapCount)) return;
     _TemporalState[id] = float4(0, 0, 0, -1);
 }

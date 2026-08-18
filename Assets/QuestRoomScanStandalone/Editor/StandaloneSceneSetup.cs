@@ -288,6 +288,8 @@ namespace Genesis.RoomScan.Editor
             {
                 var so = new SerializedObject(me);
                 AssignCompute(so, "surfaceNetsCompute", SHADER_DIR + "SurfaceNetsExtract.compute");
+                var renderProp = so.FindProperty("renderProductionMesh");
+                if (renderProp != null) renderProp.boolValue = true;
                 var matProp = so.FindProperty("scanMeshMaterial");
                 if (matProp != null && matProp.objectReferenceValue == null)
                 {

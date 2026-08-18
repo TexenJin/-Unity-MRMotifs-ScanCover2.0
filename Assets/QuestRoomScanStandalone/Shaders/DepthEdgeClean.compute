@@ -9,7 +9,7 @@
 Texture2DArray<float>   _SrcDepth;
 RWTexture2DArray<float> _DstDepth;
 RWTexture2DArray<uint>  _EdgeReason;
-RWStructuredBuffer<uint> _EdgeStats; // [0] = 本统计周期边缘像素计数
+RWStructuredBuffer<uint> _EdgeStats; // 0=总击杀 1=掠射击杀 2=同平面支持 3=同平面救回
 
 uint  _DepthW, _DepthH;
 float4x4 _DepthProjInv[2];
@@ -31,12 +31,17 @@ int   _GrazingVetoEnabled;       // 1=启用掠射面片否决（③c，治连�
 float _GrazingMinFacingDot;      // 面片法线·视线 最小朝向（低于=沿视线拉出的帘子，杀）
 float _GrazingRangeBase;         // ③c 专属低跨度门槛基数（米）：缓坡帘绕过①号断崖门槛的入口
 float _GrazingRangeScale;        // ③c 低跨度门槛距离系数
+int   _GrazingPlaneExemptionEnabled; // 1=v2.1 同平面斜视证据可豁免纯朝向否决
+float _GrazingPlaneMaxResidual;  // 点到中心局部平面的最大残差（米）
+float _GrazingPlaneMinSupportRatio; // 局部探针同平面支持比例
+int   _GrazingPlaneMinSupportPoints; // 局部同平面最少支持点
 int   _CrossEyeEnabled;          // 1=启用双眼交叉证伪（③e，终极飞点签名）
 float _CrossEyeMarginBase;       // 交叉证伪深度差基数（米）
 float _CrossEyeMarginScale;      // 深度差距离系数
 float _CrossEyeMinOtherFacing;   // 面片朝向另一眼的最小 dot（背向=另一眼本来看不见，不杀）
 float4x4 _DepthProj[2];          // 正投影（跨眼投影用，逆矩阵已有 _DepthProjInv）
 float4x4 _DepthView[2];
+uint  _EyeOffset; // 逐眼交替：id.z 恒 0，真眼号 = _EyeOffset（08-18 帧率手术）
 
 #define MAX_PROBES 25
 
@@ -160,6 +165,28 @@ bool FitLocalPlaneNormal(float3 worlds[MAX_PROBES], int count, out float3 normal
     return SmallestEigenVector(xx, xy, xz, yy, yz, zz, normal);
 }
 
+// v2.1 的关键不是“斜视一律放行”，而是斜视样本必须先证明自己属于一个
+// 连续局部平面。以中心点为锚而不是以质心为锚，避免前后两层的中间帘面
+// 仅凭整体最小二乘拟合获得豁免；深度双簇和跨眼自由空间仍有最终否决权。
+bool HasCoherentGrazingPlaneSupport(
+    float3 worlds[MAX_PROBES], int count, float3 centerWorld, float3 normal)
+{
+    if (_GrazingPlaneExemptionEnabled == 0 || count < max(3, _GrazingPlaneMinSupportPoints))
+        return false;
+
+    float residualLimit = max(0.005, _GrazingPlaneMaxResidual);
+    int compatible = 0;
+    for (int i = 0; i < count; i++)
+    {
+        float residual = abs(dot(worlds[i] - centerWorld, normal));
+        if (residual <= residualLimit)
+            compatible++;
+    }
+
+    return compatible >= max(3, _GrazingPlaneMinSupportPoints) &&
+           (float)compatible / max((float)count, 1.0) >= saturate(_GrazingPlaneMinSupportRatio);
+}
+
 // ③c 共用：面片法线几乎侧对视线（|dot| 低于阈值）= 沿视线拉出的飞点帘签名。
 // 飞点帘上所有点被边缘附近的视线族扫在同一个"过视线的竖直扇面"里 → 拟合平面必含
 // 视线方向 → 法线 ⊥ 视线，与坡度无关（陡坡缓坡同签名）。真实面片二维铺开，法线必朝向视线一侧。
@@ -205,15 +232,16 @@ bool CrossEyeRefuted(float3 worldPos, float3 normal, uint eye)
 void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= _DepthW || id.y >= _DepthH) return;
-    uint eye = id.z;
+    uint eye = id.z + _EyeOffset;
     uint3 coord = uint3(id.xy, eye);
 
     float centerNdc = _SrcDepth[coord];
     float centerLin = ToLinear(centerNdc, eye);
 
-    // 探针采集（含中心，对齐 v0.2）
-    float linDepths[MAX_PROBES];
-    float3 worlds[MAX_PROBES];
+    // ── 第一层：纯寄存器普查，只采样+线性化+min/max，零数组 ──
+    // 实机定位（08-18 二轮）：早退逻辑对了但半档帧率没动——真凶是 25 格
+    // 本地内存数组（动态下标→编译器放 local memory≈显存，每像素白付
+    // 数百字节读写）。早退只需要 min/max，一个值都不用存；数组只喂第二层。
     int count = 0;
     float minD = centerLin;
     float maxD = centerLin;
@@ -227,15 +255,41 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
             if (nb.x < 0 || nb.y < 0 || nb.x >= (int)_DepthW || nb.y >= (int)_DepthH)
                 continue;
 
-            float ndc = _SrcDepth[uint3(nb, eye)];
-            float lin = ToLinear(ndc, eye);
-            float2 uv = float2((nb.x + 0.5) / (float)_DepthW,
-                               (nb.y + 0.5) / (float)_DepthH);
-            linDepths[count] = lin;
-            worlds[count] = NdcToWorld(float3(uv, ndc), eye);
+            float lin = ToLinear(_SrcDepth[uint3(nb, eye)], eye);
             count++;
             minD = min(minD, lin);
             maxD = max(maxD, lin);
+        }
+    }
+
+    float grazingRangeLimitEarly = max(_GrazingRangeBase, centerLin * _GrazingRangeScale);
+    if (count < 3 || maxD - minD <= grazingRangeLimitEarly)
+    {
+        _EdgeReason[coord] = 0u;
+        _DstDepth[coord] = centerNdc;
+        return;
+    }
+
+    // ── 第二层：仅断崖/掠射候选像素，补数组（线性深度+世界反投影）──
+    float linDepths[MAX_PROBES];
+    float3 worlds[MAX_PROBES];
+    {
+        int wi = 0;
+        for (int dy = -radius; dy <= radius; dy++)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                int2 nb = int2(id.xy) + int2(dx, dy);
+                if (nb.x < 0 || nb.y < 0 || nb.x >= (int)_DepthW || nb.y >= (int)_DepthH)
+                    continue;
+
+                float ndc = _SrcDepth[uint3(nb, eye)];
+                float2 uv = float2((nb.x + 0.5) / (float)_DepthW,
+                                   (nb.y + 0.5) / (float)_DepthH);
+                linDepths[wi] = ToLinear(ndc, eye);
+                worlds[wi] = NdcToWorld(float3(uv, ndc), eye);
+                wi++;
+            }
         }
     }
 
@@ -248,6 +302,8 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
     bool grazingSignature = false;
     bool dualClusterSignature = false;
     bool crossEyeSignature = false;
+    bool grazingPlaneSupportedSignature = false;
+    bool grazingPlaneRescuedSignature = false;
     bool grazingKill = false; // ③c 掠射否决击杀归因（HUD"掠:"读数）
     if (count >= 3)
     {
@@ -323,11 +379,11 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                     planeNormal = normal;
                     havePlaneNormal = true;
 
-                    if (_GrazingVetoEnabled != 0 &&
-                        IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
-                    { grazingSignature = true; isEdge = true; grazingKill = true; }
+                    grazingSignature = _GrazingVetoEnabled != 0 &&
+                        IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc);
 
-                    if (!isEdge && _UsePlaneReject != 0)
+                    if (!isEdge && (_UsePlaneReject != 0 ||
+                                    _GrazingPlaneExemptionEnabled != 0))
                     {
                         float3 probeCenter = 0;
                         for (int i = 0; i < count; i++) probeCenter += worlds[i];
@@ -349,6 +405,13 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                             planeTrusted = true;
                             planeTrustedSignature = true;
                         }
+
+                        float2 centerUv = float2((id.x + 0.5) / (float)_DepthW,
+                                                 (id.y + 0.5) / (float)_DepthH);
+                        float3 centerWorld = NdcToWorld(float3(centerUv, centerNdc), eye);
+                        grazingPlaneSupportedSignature = grazingSignature && !hasGap &&
+                            planeTrusted && HasCoherentGrazingPlaneSupport(
+                                worlds, count, centerWorld, normal);
                     }
                 }
             }
@@ -382,9 +445,14 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
             {
                 planeNormal = normal;
                 havePlaneNormal = true;
-                if (_GrazingVetoEnabled != 0 &&
-                    IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc))
-                { grazingSignature = true; isEdge = true; grazingKill = true; }
+                grazingSignature = _GrazingVetoEnabled != 0 &&
+                    IsGrazingCurtainDirection(normal, eye, id.xy, centerNdc);
+
+                float2 centerUv = float2((id.x + 0.5) / (float)_DepthW,
+                                         (id.y + 0.5) / (float)_DepthH);
+                float3 centerWorld = NdcToWorld(float3(centerUv, centerNdc), eye);
+                grazingPlaneSupportedSignature = grazingSignature &&
+                    HasCoherentGrazingPlaneSupport(worlds, count, centerWorld, normal);
             }
         }
 
@@ -405,6 +473,24 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
                 isEdge = true;
             }
         }
+
+        // 跨眼证伪、裙边和双深度层永远优先。只有未被这些硬证据否决、且局部
+        // 平面支持充足的掠射样本才获得 v2.1 式豁免；否则维持原掠射击杀。
+        if (grazingPlaneSupportedSignature)
+            InterlockedAdd(_EdgeStats[2], 1);
+        if (!isEdge && grazingSignature)
+        {
+            if (grazingPlaneSupportedSignature)
+            {
+                grazingPlaneRescuedSignature = true;
+                InterlockedAdd(_EdgeStats[3], 1);
+            }
+            else
+            {
+                isEdge = true;
+                grazingKill = true;
+            }
+        }
     }
 
     // Read-only per-pixel attribution. These bits never participate in the clean decision.
@@ -418,6 +504,8 @@ void DepthEdgeClean(uint3 id : SV_DispatchThreadID)
     if (crossEyeSignature)        reason |= 1u << 6;
     if (isEdge)                   reason |= 1u << 7;
     if (spanOverGrazingSignature) reason |= 1u << 8;
+    if (grazingPlaneSupportedSignature) reason |= 1u << 9;
+    if (grazingPlaneRescuedSignature)   reason |= 1u << 10;
     _EdgeReason[coord] = reason;
 
     if (isEdge)
