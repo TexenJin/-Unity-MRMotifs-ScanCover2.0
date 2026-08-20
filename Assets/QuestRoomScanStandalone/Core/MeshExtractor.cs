@@ -65,6 +65,14 @@ namespace Genesis.RoomScan
         [SerializeField, Min(0f), Tooltip("Maximum live counter readbacks per second. Save/export still captures a full paired snapshot.")]
         private float diagnosticReadbackHz = 2f;
 
+        [Header("第一阶段纯几何稳定诊断")]
+        [SerializeField, Tooltip("只读比较相邻 TSDF 快照，输出留存/扰动/P50/P95；不读颜色，不写融合体。")]
+        private bool enableGeometryStabilityDiagnostics = true;
+        [SerializeField, Range(0.2f, 2f), Tooltip("TSDF 纯几何诊断采样频率。1Hz 足以观察秒级稳定且不挤占融合节拍。")]
+        private float geometryDiagnosticHz = 1f;
+        [SerializeField, Range(0.05f, 1f), Tooltip("参与纯几何账的归一化 TSDF 近零带；0.3 与现有表面普查口径一致。")]
+        private float geometryDiagnosticSurfaceBand = 0.3f;
+
         [Header("Persistent Incremental Meshing")]
         [SerializeField, Tooltip("Keep completed mesh chunks and rebuild only TSDF chunks whose extractable surface changed.")]
         private bool enablePersistentDirtyChunks = true;
@@ -103,6 +111,7 @@ namespace Genesis.RoomScan
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;
         private CoarseSkinRenderer _coarseSkin;
+        private GeometryStabilityMonitor _geometryStability;
         private PersistentChunkMeshPipeline _persistentChunks;
         private PersistentChunkMeshPipeline _chunkAbReplay;
         private HeraHierarchicalReplay _heraReplay;
@@ -261,6 +270,8 @@ namespace Genesis.RoomScan
             public string CsvText;
             public string LocalReplacementPath;
             public string LocalReplacementText;
+            public string GeometryStabilityPath;
+            public string GeometryStabilityText;
             public string SummaryPath;
             public string SummaryText;
         }
@@ -378,6 +389,15 @@ namespace Genesis.RoomScan
 
             if (surfaceNetsCompute == null)
                 throw new Exception("[RoomScan] surfaceNetsCompute not assigned on MeshExtractor");
+
+            if (enableGeometryStabilityDiagnostics)
+            {
+                _geometryStability = gameObject.GetComponent<GeometryStabilityMonitor>();
+                if (_geometryStability == null)
+                    _geometryStability = gameObject.AddComponent<GeometryStabilityMonitor>();
+                _geometryStability.Initialize(
+                    _volume, geometryDiagnosticHz, geometryDiagnosticSurfaceBand);
+            }
 
             // GPU Surface Nets buffers (~480 MB at the default 256³ voxel grid)
             // are allocated lazily — first scan via RoomScanner.StartScanning,
@@ -666,6 +686,11 @@ namespace Genesis.RoomScan
         /// <summary>父页派发→回读回调往返 EMA（ms，HUD 计时账）。</summary>
         public float IncrementalHeraAvgDispatchToCallbackMs =>
             HasIncrementalHera ? _heraReplay.ParentAvgDispatchToCallbackMs : 0f;
+        public string IncrementalHeraSyncDebtCompact =>
+            HasIncrementalHera ? _heraReplay.ParentSyncDebtCompact : "块诊断无";
+        public string ProductionSyncDebtCompact => _persistentChunks != null
+            ? _persistentChunks.GetSyncDebtStatsCompact()
+            : "块诊断无";
         public bool IncrementalQueueParentBlock(int3 coordinate) =>
             HasIncrementalHera && _heraReplay.QueueParentBlock(coordinate);
         /// <summary>实时轨：未冻块即时出粗网格页（不建家族，tally 照记）。</summary>
@@ -1114,6 +1139,7 @@ namespace Genesis.RoomScan
             _ledgerOpen = true;
             ResetTemporalDiagnosticState();
             _persistentChunks?.ResetLocalReplacementLedger();
+            _geometryStability?.ResetSession();
             Logger.Info($"累计账开始: {_ledgerSessionId}");
         }
 
@@ -1133,6 +1159,56 @@ namespace Genesis.RoomScan
             return _persistentChunks != null
                 ? _persistentChunks.GetLocalReplacementStatsCompact()
                 : "持久块未接管";
+        }
+
+        /// <summary>颜色与网格块之前的 TSDF 几何真值账。</summary>
+        public string GetGeometryStabilityStatsCompact()
+        {
+            return _geometryStability != null
+                ? _geometryStability.GetCompactStats()
+                : "几何诊断关";
+        }
+
+        /// <summary>
+        /// A/B 模式不会走旧的 B 键累计账协程，因此在 A 冻结、增量 HERA
+        /// 被替换成冻结回放之前，单独落一次第一阶段只读快照。
+        /// </summary>
+        public string ExportFirstStageGeometrySnapshot(string reason)
+        {
+            if (_geometryStability == null || _geometryStability.SampleCount == 0)
+                return "";
+            try
+            {
+                string outputDir = Path.Combine(Application.persistentDataPath, "ScanCoverDiagnostics");
+                Directory.CreateDirectory(outputDir);
+                string session = string.IsNullOrEmpty(_ledgerSessionId) || _ledgerSessionId == "未开始"
+                    ? DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)
+                    : _ledgerSessionId;
+                string stem = "geometry_stage1_" + session;
+                var csv = new StringBuilder(4096);
+                _geometryStability.AppendCsv(csv, session);
+                var summary = new StringBuilder(4096);
+                summary.AppendLine("QRS 第一阶段纯几何快照");
+                summary.AppendLine($"会话: {session}");
+                summary.AppendLine($"导出原因: {reason}");
+                summary.AppendLine($"导出(UTC): {DateTime.UtcNow:O}");
+                _geometryStability.AppendSummary(summary);
+                _persistentChunks?.AppendSyncDebtSummary(summary, "生产64³提取块");
+                if (HasIncrementalHera)
+                    _heraReplay.AppendParentSyncDebtSummary(summary);
+
+                string csvPath = Path.Combine(outputDir, stem + ".csv");
+                string summaryPath = Path.Combine(outputDir, stem + "_summary.txt");
+                File.WriteAllText(csvPath, csv.ToString(), new UTF8Encoding(true));
+                File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(true));
+                Logger.Info($"第一阶段几何快照已保存: {summaryPath}");
+                return summaryPath;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"第一阶段几何快照保存失败: {ex.Message}");
+                return "";
+            }
         }
 
         /// <summary>
@@ -1190,6 +1266,8 @@ namespace Genesis.RoomScan
                 File.WriteAllText(payload.CsvPath, payload.CsvText, new UTF8Encoding(true));
                 if (!string.IsNullOrEmpty(payload.LocalReplacementText))
                     File.WriteAllText(payload.LocalReplacementPath, payload.LocalReplacementText, new UTF8Encoding(true));
+                if (!string.IsNullOrEmpty(payload.GeometryStabilityText))
+                    File.WriteAllText(payload.GeometryStabilityPath, payload.GeometryStabilityText, new UTF8Encoding(true));
                 stopwatch.Stop();
                 writeMs = stopwatch.Elapsed.TotalMilliseconds;
                 string timedSummary = payload.SummaryText +
@@ -1240,12 +1318,16 @@ namespace Genesis.RoomScan
 
             var localReplacementCsv = new StringBuilder(4096);
             _persistentChunks?.AppendLocalReplacementCsv(localReplacementCsv, _ledgerSessionId);
+            var geometryStabilityCsv = new StringBuilder(4096);
+            _geometryStability?.AppendCsv(geometryStabilityCsv, _ledgerSessionId);
             return new LedgerExportPayload
             {
                 CsvPath = Path.Combine(outputDir, stem + ".csv"),
                 CsvText = csv.ToString(),
                 LocalReplacementPath = Path.Combine(outputDir, stem + "_local_replacements.csv"),
                 LocalReplacementText = localReplacementCsv.ToString(),
+                GeometryStabilityPath = Path.Combine(outputDir, stem + "_geometry_stability.csv"),
+                GeometryStabilityText = geometryStabilityCsv.ToString(),
                 SummaryPath = Path.Combine(outputDir, stem + "_summary.txt"),
                 SummaryText = null
             };
@@ -1269,6 +1351,10 @@ namespace Genesis.RoomScan
             sb.AppendLine($"边缘只读验证: 三点获当前深度支持时画完整绿色三角；仅两点受支持时只画两点间绿色边线。中栏证据不足>={temporalDiagnosticInsufficientThreshold:P0}、当前深度支持<={temporalDiagnosticSupportCeiling:P0}，连续{Mathf.Max(1, temporalDiagnosticRequiredWindows)}个约{Mathf.Max(1f, temporalDiagnosticWindowSeconds):F1}秒窗口后形成的红色候选与其余未决状态均隐藏，但继续记账。它不参与生产准入、融合、删面或拓扑。");
             sb.AppendLine($"边缘终态: {(_temporalIllegalCandidateActive ? "隐藏红色候选激活" : "绿色观察")}，最近中栏支持{_lastTemporalSupportRatio:P1}，证据不足{_lastTemporalInsufficientRatio:P1}，连续坏窗{_temporalDiagnosticConsecutiveBadWindows}/{Mathf.Max(1, temporalDiagnosticRequiredWindows)}。");
             _persistentChunks?.AppendLocalReplacementSummary(sb);
+            _geometryStability?.AppendSummary(sb);
+            _persistentChunks?.AppendSyncDebtSummary(sb, "生产64³提取块");
+            if (HasIncrementalHera)
+                _heraReplay.AppendParentSyncDebtSummary(sb);
 
             if (_ledgerSamples.Count == 0)
                 return sb.ToString();

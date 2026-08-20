@@ -187,6 +187,7 @@ namespace Genesis.RoomScan
             public uint CandidateEpoch;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
+            public float CommittedAtRealtime;
             public bool Queued;
             /// <summary>入队时刻（Time.time）：计时账"排队→落地"起点。</summary>
             public float QueuedAt;
@@ -286,6 +287,10 @@ namespace Genesis.RoomScan
             new int3(-1, 0, 0), new int3(1, 0, 0),
             new int3(0, -1, 0), new int3(0, 1, 0),
             new int3(0, 0, -1), new int3(0, 0, 1)
+        };
+        private static readonly int3[] PositiveFaceNeighbours =
+        {
+            new int3(1, 0, 0), new int3(0, 1, 0), new int3(0, 0, 1)
         };
 
         private readonly VolumeIntegrator _volume;
@@ -1019,6 +1024,7 @@ namespace Genesis.RoomScan
                             MergeAcceptedSpatialEvidence(chunk, spatialMature, spatialOccupancy);
                             chunk.AdditiveMergePasses++;
                             chunk.BuiltEpoch = candidateEpoch;
+                            chunk.CommittedAtRealtime = Time.realtimeSinceStartup;
                             chunk.Built = true;
                             ResetDestructiveCandidate(chunk);
                             FinishCandidateCommit(chunk, candidateEpoch);
@@ -1148,6 +1154,7 @@ namespace Genesis.RoomScan
                     chunk.HeraBoundaryShadowIndices = boundaryShadowIndices;
                     chunk.AdditiveMergePasses = 0;
                     chunk.BuiltEpoch = candidateEpoch;
+                    chunk.CommittedAtRealtime = Time.realtimeSinceStartup;
                     chunk.Built = true;
                     chunk.ReplayTriangles = sourceTriangles;
                     chunk.ReplayCleanTriangles = keptTriangles;
@@ -1255,6 +1262,7 @@ namespace Genesis.RoomScan
             Array.Copy(spatialMature, chunk.AcceptedSpatialMature, SpatialLedgerBinCount);
             Array.Copy(spatialOccupancy, chunk.AcceptedSpatialOccupancy, SpatialOccupancyWordCount);
             chunk.BuiltEpoch = candidateEpoch;
+            chunk.CommittedAtRealtime = Time.realtimeSinceStartup;
             chunk.Built = true;
             if (_config.StaticReplay)
                 chunk.Renderer.SetReplayPageState(_diagnosticColoring ? chunk.ReplayPageClass : -1);
@@ -1967,6 +1975,81 @@ namespace Genesis.RoomScan
                    $"接{_localAcceptedCandidates}/拒{_localRejectedCandidates} " +
                    $"末{(last.Accepted ? "收" : "拒")} 同{last.SameCells} 消{last.LostCells} " +
                    $"新{last.AddedCells} 搬?{last.SuspectedMovedCells}";
+        }
+
+        /// <summary>
+        /// Read-only page publication debt. A mismatched face is a candidate,
+        /// not proof of a crack: adjacent visible pages came from different
+        /// fusion epochs and must be judged separately from TSDF instability.
+        /// </summary>
+        public string GetSyncDebtStatsCompact()
+        {
+            CalculateSyncDebt(out int stale, out int visiblePairs, out int mismatchedPairs,
+                out uint maxEpochGap, out _, out float oldestDebtSeconds);
+            return $"[债{stale} 队{PendingChunkCount}+{CommitPendingCount} " +
+                   $"缝候{mismatchedPairs}/{visiblePairs} 差{maxEpochGap} " +
+                   $"老{oldestDebtSeconds:0.0}s]";
+        }
+
+        public void AppendSyncDebtSummary(StringBuilder sb, string label)
+        {
+            if (sb == null) return;
+            CalculateSyncDebt(out int stale, out int visiblePairs, out int mismatchedPairs,
+                out uint maxEpochGap, out float maxCommitSkew, out float oldestDebtSeconds);
+            sb.AppendLine();
+            sb.AppendLine($"块同步债（{label}，只读）:");
+            sb.AppendLine($"待追平块={stale} 排队={PendingChunkCount} 提交在途={CommitPendingCount} " +
+                          $"可见相邻面={visiblePairs} 异版本候选面={mismatchedPairs} " +
+                          $"最大epoch差={maxEpochGap} 最大提交时差={maxCommitSkew:F3}s 最老债={oldestDebtSeconds:F3}s");
+            sb.AppendLine("口径: 异版本只表示相邻页发布时间不同；它与纯TSDF位移分账，不直接判为几何裂缝。");
+        }
+
+        private void CalculateSyncDebt(out int stale, out int visiblePairs,
+            out int mismatchedPairs, out uint maxEpochGap, out float maxCommitSkew,
+            out float oldestDebtSeconds)
+        {
+            stale = 0;
+            visiblePairs = 0;
+            mismatchedPairs = 0;
+            maxEpochGap = 0u;
+            maxCommitSkew = 0f;
+            oldestDebtSeconds = 0f;
+            float now = Time.time;
+
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (chunk.TargetEpoch > chunk.ProcessedEpoch || chunk.Queued || chunk.CommitPending)
+                {
+                    stale++;
+                    float started = chunk.QueuedAt > 0f ? chunk.QueuedAt : chunk.CommitPendingSince;
+                    if (started > 0f)
+                        oldestDebtSeconds = Mathf.Max(oldestDebtSeconds, now - started);
+                }
+
+                if (!IsVisibleSurfacePage(chunk)) continue;
+                for (int n = 0; n < PositiveFaceNeighbours.Length; n++)
+                {
+                    int3 neighbourCoordinate = chunk.Coordinate + PositiveFaceNeighbours[n];
+                    if (math.any(neighbourCoordinate >= _chunkCount)) continue;
+                    Chunk neighbour = _chunks[Flatten(neighbourCoordinate)];
+                    if (!IsVisibleSurfacePage(neighbour)) continue;
+                    visiblePairs++;
+                    uint gap = chunk.BuiltEpoch >= neighbour.BuiltEpoch
+                        ? chunk.BuiltEpoch - neighbour.BuiltEpoch
+                        : neighbour.BuiltEpoch - chunk.BuiltEpoch;
+                    if (gap == 0u) continue;
+                    mismatchedPairs++;
+                    maxEpochGap = math.max(maxEpochGap, gap);
+                    maxCommitSkew = Mathf.Max(maxCommitSkew,
+                        Mathf.Abs(chunk.CommittedAtRealtime - neighbour.CommittedAtRealtime));
+                }
+            }
+        }
+
+        private static bool IsVisibleSurfacePage(Chunk chunk)
+        {
+            return chunk.Built && chunk.RequestedVisible && chunk.AcceptedIndices > 0;
         }
 
         public void AppendLocalReplacementSummary(StringBuilder sb)

@@ -77,6 +77,7 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSWireThickness;
             float _RSMeshStride;
             float _RSGridSpacing;
+            float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
             float _RSSuppressPink;
@@ -385,9 +386,16 @@ Shader "Genesis/ScanMeshVertexColor"
                     : _RSJointDiagnostic > 0.5
                         ? IN.diagnosticColor
                         : _RSExtractionColor.rgb;
-                lineColor = ApplyConfidenceViz(lineColor, IN.positionWS);
+                // 第一阶段纯几何观察：统一白线，明确绕开置信色、冻结色和
+                // HERA 路由色。它只改变最终片元，不改变任何数据或提取决策。
+                lineColor = _RSGeometryTruthView > 0.5
+                    ? float3(0.95, 0.95, 0.95)
+                    : ApplyConfidenceViz(lineColor, IN.positionWS);
                 return half4(lineColor, _RSExtractionColor.a);
             }
+
+                if (_RSGeometryTruthView > 0.5)
+                    return half4(0.82, 0.82, 0.82, 1.0);
 
                 float3 normal = normalize(IN.normalWS);
 

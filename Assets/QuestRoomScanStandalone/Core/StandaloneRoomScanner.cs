@@ -37,6 +37,8 @@ namespace Genesis.RoomScan
         private float meshGridSpacing = 0.3f;
         [SerializeField, Tooltip("置信度通道 v1 可视化（诊断开关，默认关）：开=按体素分歧 EMA 给网格着色——高置信=原色 / 中=黄 / 低=蓝紫（几何在打架）/ 无数据=灰。只读着色，不碰任何生产逻辑")]
         private bool confidenceViz = false;
+        [SerializeField, Tooltip("第一阶段纯几何观察：开=所有生产/HERA网格统一白色，绕开置信、冻结和路由着色。仅显示层，不改变融合、提取或页面调度。")]
+        private bool geometryTruthView = true;
 
         [Header("覆盖范围")]
         [SerializeField, Tooltip("头部排除区（QRS 原版防自扫）：开=头周圆柱内永不生成网格（半径在 VolumeIntegrator.exclusionRadius 调）；关=周围近距也能覆盖网格")]
@@ -324,6 +326,15 @@ namespace Genesis.RoomScan
             wireframeMode = !wireframeMode;
             ApplyDisplayMode();
             NotifyInput(wireframeMode ? "切到线框" : "切到实体");
+        }
+
+        /// <summary>第一阶段白网 A/B：只切最终着色，所有后台数据与调度继续运行。</summary>
+        public void ToggleGeometryTruthView()
+        {
+            geometryTruthView = !geometryTruthView;
+            ApplyDisplayMode();
+            NotifyInput(geometryTruthView ? "纯白几何：开" : "纯白几何：关");
+            RefreshStatusBadge();
         }
 
         /// <summary>
@@ -744,11 +755,15 @@ namespace Genesis.RoomScan
                                    (_probeHud.Length > 0 ? $" {_probeHud}" : "");
                     if (_meshExtractor != null && _meshExtractor.HasIncrementalHera)
                     {
+                        string geometryLine = $"{_meshExtractor.GetGeometryStabilityStatsCompact()} · " +
+                                              $"64{_meshExtractor.ProductionSyncDebtCompact} " +
+                                              $"32{_meshExtractor.IncrementalHeraSyncDebtCompact} · " +
+                                              $"视{(geometryTruthView ? "白" : "色")}";
                         string timingLine = $"帧{1f / Mathf.Max(0.001f, Time.smoothDeltaTime):0} 拍{_heraTicksPerSec:0}/s 落{_meshExtractor.IncrementalHeraAvgQueueToCommitMs:0}ms " +
                                             $"回{_meshExtractor.IncrementalHeraAvgDispatchToCallbackMs:0}ms " +
                                             $"融{_emaIntegrateMs:0.0}提{_emaHeraTickMs:0.0}ms " +
                                             $"温{OVRPlugin.batteryTemperature:0}°";
-                        _statusBadgeText.text = $"● 采集中·炮0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{timingLine}\n{toggleLine}";
+                        _statusBadgeText.text = $"● 采集中·测0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{geometryLine}\n{timingLine}\n{toggleLine}";
                     }
                     else
                         _statusBadgeText.text = $"● 采集中·炮0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}";
@@ -2700,6 +2715,13 @@ namespace Genesis.RoomScan
 
             _coverageOverlay?.SetAcquiring(false);
             PauseScanning();
+            // 必须在 BeginFrozenHeraReplay 替换增量 32³ 管线之前落账，
+            // 否则扫描期的块同步债会被冻结回放状态覆盖。
+            string geometrySnapshot = _meshExtractor != null
+                ? _meshExtractor.ExportFirstStageGeometrySnapshot("A键冻结前")
+                : "";
+            if (!string.IsNullOrEmpty(geometrySnapshot))
+                Logger.Info($"A键已封存第一阶段诊断: {geometrySnapshot}");
             _chunkAbFrozen = true;
             if (enableHeraHierarchicalReplay)
             {
@@ -2926,6 +2948,7 @@ namespace Genesis.RoomScan
         private static readonly int MeshStrideID = Shader.PropertyToID("_RSMeshStride");
         private static readonly int GridSpacingID = Shader.PropertyToID("_RSGridSpacing");
         private static readonly int ConfidenceVizID = Shader.PropertyToID("_RSConfidenceViz");
+        private static readonly int GeometryTruthViewID = Shader.PropertyToID("_RSGeometryTruthView");
         private bool _confidenceVizApplied;
         private float _lastConfidenceStatsTime = -10f;
 
@@ -2945,6 +2968,7 @@ namespace Genesis.RoomScan
             Shader.SetGlobalFloat(MeshStrideID, meshDisplayStride);
             Shader.SetGlobalFloat(GridSpacingID, meshGridSpacing);
             Shader.SetGlobalFloat(ConfidenceVizID, confidenceViz ? 1f : 0f);
+            Shader.SetGlobalFloat(GeometryTruthViewID, geometryTruthView ? 1f : 0f);
         }
     }
 }

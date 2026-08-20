@@ -221,6 +221,7 @@ MonoBehaviour:
   meshDisplayStride: 1
   meshGridSpacing: 0.3
   confidenceViz: 1
+  geometryTruthView: 1
   enableHeadExclusion: 1
   enableFrozenChunkAbExperiment: 1
   enableHeraHierarchicalReplay: 1
@@ -290,6 +291,9 @@ MonoBehaviour:
   enableCoarseSkin: 0
   gpuVertexBudgetPercent: 0.08
   diagnosticReadbackHz: 2
+  enableGeometryStabilityDiagnostics: 1
+  geometryDiagnosticHz: 1
+  geometryDiagnosticSurfaceBand: 0.3
   enablePersistentDirtyChunks: 1
   maxDirtyChunksPerExtraction: 2
   extractionHaloVoxels: 2

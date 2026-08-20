@@ -390,6 +390,16 @@ namespace Genesis.RoomScan
         public float ParentAvgQueueToCommitMs => _disposed ? 0f : _parent32.AvgQueueToCommitMs;
         /// <summary>父页派发→回读回调往返 EMA（ms，HUD 计时账）。</summary>
         public float ParentAvgDispatchToCallbackMs => _disposed ? 0f : _parent32.AvgDispatchToCallbackMs;
+        /// <summary>32³父页的发布/相邻版本同步债，只读，不参与排队或提交。</summary>
+        public string ParentSyncDebtCompact => _disposed
+            ? "块诊断无"
+            : _parent32.GetSyncDebtStatsCompact();
+
+        public void AppendParentSyncDebtSummary(StringBuilder sb)
+        {
+            if (_disposed) return;
+            _parent32.AppendSyncDebtSummary(sb, "HERA 32³父页");
+        }
 
         /// <summary>
         /// 冻结成功的 32³ 块入场精修。父页网格与冻结网格同尺寸同原点（已核验同构：

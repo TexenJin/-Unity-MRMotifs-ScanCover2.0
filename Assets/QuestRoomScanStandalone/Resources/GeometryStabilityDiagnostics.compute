@@ -1,0 +1,60 @@
+#pragma kernel CompareVolumes
+#pragma kernel CopyCurrent
+
+// First-stage diagnostics only.  Neither kernel writes the production TSDF.
+Texture3D<float2> _CurrentVolume;
+Texture3D<float2> _PreviousVolume;
+RWTexture3D<float2> _PreviousVolumeRW;
+RWStructuredBuffer<uint> _GeometryStats;
+
+int3 _VoxelCount;
+float _MinMeshWeight;
+float _SurfaceBand;
+float _VoxelDistance;
+float _VoxelSize;
+
+// 0 old surface, 1 current surface, 2 retained, 3 lost, 4 added,
+// 5 retained cells moving >= 0.25 voxel, 6 maximum drift in 1/1024 voxel.
+// 8..71: 64-bin drift histogram, each bin = 1/16 voxel.
+#define HISTOGRAM_BASE 8
+#define HISTOGRAM_COUNT 64
+
+[numthreads(8, 8, 8)]
+void CompareVolumes(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+
+    float2 previous = _PreviousVolume[id];
+    float2 current = _CurrentVolume[id];
+    bool previousSurface = abs(previous.y) >= _MinMeshWeight && abs(previous.x) < _SurfaceBand;
+    bool currentSurface = abs(current.y) >= _MinMeshWeight && abs(current.x) < _SurfaceBand;
+
+    if (previousSurface) InterlockedAdd(_GeometryStats[0], 1u);
+    if (currentSurface) InterlockedAdd(_GeometryStats[1], 1u);
+
+    if (previousSurface && currentSurface)
+    {
+        InterlockedAdd(_GeometryStats[2], 1u);
+        float driftVoxels = abs(current.x - previous.x) * _VoxelDistance / max(_VoxelSize, 1e-6);
+        if (driftVoxels >= 0.25) InterlockedAdd(_GeometryStats[5], 1u);
+        uint driftFixed = (uint)min(driftVoxels * 1024.0 + 0.5, 4294967295.0);
+        InterlockedMax(_GeometryStats[6], driftFixed);
+        uint histogramBin = min((uint)(driftVoxels * 16.0), HISTOGRAM_COUNT - 1u);
+        InterlockedAdd(_GeometryStats[HISTOGRAM_BASE + histogramBin], 1u);
+    }
+    else if (previousSurface)
+    {
+        InterlockedAdd(_GeometryStats[3], 1u);
+    }
+    else if (currentSurface)
+    {
+        InterlockedAdd(_GeometryStats[4], 1u);
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CopyCurrent(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount)) return;
+    _PreviousVolumeRW[id] = _CurrentVolume[id];
+}

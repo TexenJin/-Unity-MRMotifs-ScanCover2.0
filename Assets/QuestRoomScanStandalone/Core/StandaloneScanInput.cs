@@ -14,6 +14,7 @@ namespace Genesis.RoomScan
     ///   右摇杆方向+按下 = 性能二分热键：上=实时轨 / 左=冻结调度器 / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
     ///   左摇杆按下 = 线框 / 实体切换（全局 shader 开关，帧率二分用）
     ///   左摇杆上+按下 = 源头时序滤波开关（盯墙养绿 A/B 热键，HUD 闸行 时开/时关 回显）
+    ///   左摇杆下+按下 = 第一阶段纯白几何 / 原状态色切换（仅显示层）
     /// 每次按键给一下短震动作为反馈。
     /// </summary>
     public class StandaloneScanInput : MonoBehaviour
@@ -146,6 +147,11 @@ namespace Genesis.RoomScan
                 {
                     scanner.NotifyInput("左摇杆上");
                     scanner.ToggleTemporalFilter();
+                }
+                else if (lstick.y < -0.5f)
+                {
+                    scanner.NotifyInput("左摇杆下");
+                    scanner.ToggleGeometryTruthView();
                 }
                 else
                 {
