@@ -1692,7 +1692,7 @@ MonoBehaviour:
   targetOpenXRApiVersion: 
   required: 0
   customRuntimeLoaderName: 
-  m_EnableHandRemoval: 0
+  m_EnableHandRemoval: 1
 --- !u!114 &3365326665437779180
 MonoBehaviour:
   m_ObjectHideFlags: 0

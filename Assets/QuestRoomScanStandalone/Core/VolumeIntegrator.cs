@@ -101,6 +101,32 @@ namespace Genesis.RoomScan
                  "与整帧闸分工：整帧闸 90 防涂抹，种子闸 60 保覆盖生产力（天棚慢扫帧多在 60 以下）。0 = 关闭。 (default 60)")]
         [SerializeField, Range(0f, 360f)] private float motionSeedBlockDegPerSec = 60f;
 
+        [Header("噪声模型加权（造炮）")]
+        [Tooltip("总开关：融合权重 w∝1/σ²(d,θ,ω)——距离/掠射角/运动状态三项降权。08-21 用户拍板，" +
+                 "定罪链：定点实验 O≈0（偏移脱罪）+ R 随距离掠射爆炸（方差定罪）+ 动态 O 一动掉负静止养回、平移也掉负（时延族实锤）。" +
+                 "纯数据层通用机制，符合阻尼封顶。 (default true)")]
+        [SerializeField] private bool noiseMotionWeightEnable = true;
+        [Tooltip("运动角速度参考值（°/s）：达到此速度时运动质量分折到地板。必须远低于整帧闸 90——90 以上停笔，参考值~90 之间是降权慢写带。 (default 30)")]
+        [SerializeField, Range(5f, 120f)] private float noiseMotionAngRefDegPerSec = 30f;
+        [Tooltip("运动线速度参考值（m/s）：平移也触发时延（实锤），与角速度各归一取大。正常扫房步速 ~0.3-0.5m/s。 (default 0.3)")]
+        [SerializeField, Range(0.05f, 2f)] private float noiseMotionLinRefMps = 0.3f;
+        [Tooltip("运动质量地板：再快也保留此比例权重，防断粮、防与整帧闸之间出死区。 (default 0.15)")]
+        [SerializeField, Range(0.01f, 1f)] private float noiseMotionFloor = 0.15f;
+        [Tooltip("距离噪声指数：>1 让远距观测降权更陡（深度 σ 随距离平方增长）。1=保持现有线性不动。 (default 1)")]
+        [SerializeField, Range(0.5f, 3f)] private float noiseDistExponent = 1f;
+        [Tooltip("掠射角噪声指数：>1 让掠射观测降权更陡。1=保持现有线性不动。 (default 1)")]
+        [SerializeField, Range(0.5f, 3f)] private float noiseAngleExponent = 1f;
+
+        [Header("M1 成熟面观测折让")]
+        [Tooltip("总开关：已长熟的面对小矛盾新观测打折接收——几何不跟、权重慢涨、分歧按一致记账。真变化全速放行。08-20 用户拍板停用（非撤回）：M1.1 实机信高+5 但颜色体系仍不符合直觉，回 pre-M1 基线对表业内路线后再定去向。代码保留，勾上即复活。 (default false)")]
+        [SerializeField] private bool enableMatureSurfaceObsDiscount = false;
+        [Tooltip("折让判据的成熟门槛：weight≥此值的面才享折让。拍板口径 0.5=长熟面——不复用 frozenMatureWeight（实为 0.15=刚转正，折让会把爬坡期增长拖慢 20 倍）。 (default 0.5)")]
+        [SerializeField, Range(0.1f, 1f)] private float matureSurfaceObsWeightMin = 0.5f;
+        [Tooltip("小矛盾带半宽（归一化 sd，0.15≈2.2cm）：|新观测-存量|≤此值才折让；超带=真变化全速放行。必须小于矛盾杆 0.2 才有意义。 (default 0.15)")]
+        [SerializeField, Range(0.05f, 0.4f)] private float matureSurfaceObsMargin = 0.15f;
+        [Tooltip("折让力度：带内观测的积分权重/扣减乘此系数。0.05=1/20 速度=真变化的申诉通道慢但不设硬顶。 (default 0.05)")]
+        [SerializeField, Range(0.01f, 0.5f)] private float matureSurfaceObsDiscount = 0.05f;
+
         [Header("逐块可逆冻结")]
         [Tooltip("逐块可逆冻结总开关：开=冻结体素记穿越票+成熟度普查可用；关=票/普查全停（掩码冻结/解冻 API 仍可用）。" +
                  "冻结=weight 翻符号不销毁 TSDF，提取层 abs 透明，解冻=翻回。 (default true)")]
@@ -133,6 +159,14 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("建立一份只读 KinectFusion 式 raw-projective TSDF 影子体。生产体仍使用现有 raw×法向余弦；影子体只用于对照统计和手动切换显示。")]
         private bool enableProjectiveShadow = false;
 
+        [Header("置信度通道 v1（只读影子）")]
+        [SerializeField, Tooltip("分歧 EMA 基准速率，再乘观测质量 q（低质观测少说话）。0=不更新，1=逐帧覆盖。")]
+        private float confidenceRate = 0.15f;
+        [SerializeField, Tooltip("高/中置信分界（归一化 sd 的逐帧分歧 EMA，0.1≈1.5cm 抖动）。")]
+        private float confidenceMidMax = 0.1f;
+        [SerializeField, Tooltip("中/低置信分界（0.25≈3.8cm，超过=几何在打架）。")]
+        private float confidenceLowMin = 0.25f;
+
         [Header("Camera Color")]
         [Tooltip("Exposure boost for camera texture. Quest 3 passthrough cameras produce dim images. (default 3.0)")]
         [SerializeField, Range(1f, 10f)] private float cameraExposure = 3f;
@@ -141,6 +175,8 @@ namespace Genesis.RoomScan
         private RenderTexture _colorVolume;
         private RenderTexture _projectiveShadowVolume;
         private RenderTexture _admissionTraceVolume;
+        private RenderTexture _confidenceVolume;
+        private RenderTexture _coherenceVolume;
 
         /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
@@ -151,6 +187,10 @@ namespace Genesis.RoomScan
         public RenderTexture ColorVolume => _colorVolume;
         /// <summary>Read-only provenance sidecar for dilation admission. Never changes TSDF production decisions.</summary>
         public RenderTexture AdmissionTraceVolume => _admissionTraceVolume;
+        /// <summary>置信度通道 v1：分歧 EMA 体（R8，0=逐帧观测一致 1=完全矛盾）。只读影子，生产路径一律不读。</summary>
+        public RenderTexture ConfidenceVolume => _confidenceVolume;
+        /// <summary>v2 相干通道：有符号分歧 EMA（0.5=中性）。噪声回中性，纠错/真变化偏两端。只读影子。</summary>
+        public RenderTexture CoherenceVolume => _coherenceVolume;
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
         public float VoxelDistance => voxelDistance;
@@ -181,6 +221,10 @@ namespace Genesis.RoomScan
         private static readonly int CarveBypassMarginID = Shader.PropertyToID("gsCarveBypassMargin");
         private static readonly int CarveBypassBoostID = Shader.PropertyToID("gsCarveBypassBoost");
         private static readonly int FreeSpaceCarveBoostID = Shader.PropertyToID("gsFreeSpaceCarveBoost");
+        private static readonly int MatureObsEnableID = Shader.PropertyToID("gsMatureObsEnable");
+        private static readonly int MatureObsWeightMinID = Shader.PropertyToID("gsMatureObsWeightMin");
+        private static readonly int MatureObsMarginID = Shader.PropertyToID("gsMatureObsMargin");
+        private static readonly int MatureObsDiscountID = Shader.PropertyToID("gsMatureObsDiscount");
         private static readonly int RescueSeedDistOnlyID = Shader.PropertyToID("gsRescueSeedDistOnly");
         private static readonly int MotionSeedBlockID = Shader.PropertyToID("gsMotionSeedBlock");
         private static readonly int AbstainSeedGuardID = Shader.PropertyToID("gsAbstainSeedGuard");
@@ -194,6 +238,9 @@ namespace Genesis.RoomScan
         private static readonly int ProvisionalSeedWeightID = Shader.PropertyToID("gsProvisionalSeedWeight");
         private static readonly int FormalSurfaceWeightID = Shader.PropertyToID("gsFormalSurfaceWeight");
         private static readonly int DiagnosticAngularSpeedID = Shader.PropertyToID("gsDiagnosticAngularSpeed");
+        private static readonly int NoiseMotionQualityID = Shader.PropertyToID("gsNoiseMotionQuality");
+        private static readonly int NoiseDistExpID = Shader.PropertyToID("gsNoiseDistExp");
+        private static readonly int NoiseAngExpID = Shader.PropertyToID("gsNoiseAngExp");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
         private static readonly int CamAvailableID = Shader.PropertyToID("gsCamAvailable");
         private static readonly int CamPosID = Shader.PropertyToID("gsCamPos");
@@ -207,6 +254,14 @@ namespace Genesis.RoomScan
         private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
         private static readonly int WriteAdmissionTraceID = Shader.PropertyToID("gsWriteAdmissionTrace");
+        private static readonly int ConfidenceRWID = Shader.PropertyToID("gsConfidenceRW");
+        private static readonly int CoherenceRWID = Shader.PropertyToID("gsCoherenceRW");
+        private static readonly int ConfidenceWriteID = Shader.PropertyToID("gsConfidenceWrite");
+        private static readonly int ConfidenceRateID = Shader.PropertyToID("gsConfidenceRate");
+        private static readonly int ConfidenceMidMaxID = Shader.PropertyToID("gsConfidenceMidMax");
+        private static readonly int ConfidenceLowMinID = Shader.PropertyToID("gsConfidenceLowMin");
+        private static readonly int ConfidenceStatsID = Shader.PropertyToID("_ConfidenceStats");
+        private static readonly int ConfidenceGlobalTexID = Shader.PropertyToID("gsConfidence");
         private static readonly int BakeSrcAdmissionTraceID = Shader.PropertyToID("gsBakeSrcAdmissionTrace");
         private static readonly int PruneZOffsetID = Shader.PropertyToID("gsPruneZOffset");
         private static readonly int PruneZCountID = Shader.PropertyToID("gsPruneZCount");
@@ -223,6 +278,7 @@ namespace Genesis.RoomScan
         private static readonly int ChunkFreezeSetMaskID = Shader.PropertyToID("_ChunkFreezeSetMask");
         private static readonly int ChunkFreezeClearMaskID = Shader.PropertyToID("_ChunkFreezeClearMask");
         private static readonly int FrozenChunkVotesID = Shader.PropertyToID("_FrozenChunkVotes");
+        private static readonly int FrozenChunkBitsID = Shader.PropertyToID("_FrozenChunkBits");
         private static readonly int ChunkMaturityID = Shader.PropertyToID("_ChunkMaturity");
         private static readonly int FrozenBlockEnableID = Shader.PropertyToID("gsFrozenBlockEnable");
         private static readonly int FrozenVoteQualityMinID = Shader.PropertyToID("gsFrozenVoteQualityMin");
@@ -257,6 +313,7 @@ namespace Genesis.RoomScan
         private ComputeBuffer _chunkFreezeSetMask;
         private ComputeBuffer _chunkFreezeClearMask;
         private ComputeBuffer _frozenChunkVotes;
+        private ComputeBuffer _frozenChunkBits; // T2：当前已冻块位图（1 位/块），补洞票的块冻结态判据
         private ComputeBuffer _chunkMaturity;
         private uint[] _voteZeros;
         private uint[] _maturityZeros;
@@ -277,6 +334,23 @@ namespace Genesis.RoomScan
         private static readonly int CoverageCountersID = Shader.PropertyToID("_CoverageCounters");
         private static readonly int ColorVolumeReadID = Shader.PropertyToID("gsColorVolumeRead");
 
+        // 置信度通道 v1 统计（分歧 EMA 三档普查）
+        private ComputeKernelHelper _confidenceKernel;
+        private ComputeBuffer _confidenceStats;
+        private bool _confidenceReadbackPending;
+        /// <summary>最近一轮置信度普查：有数据体素数（abs(weight)≥出网门槛，冻结 abs 后参与）。</summary>
+        public int ConfidenceVoxelCount { get; private set; }
+        /// <summary>高置信（分歧 EMA &lt; confidenceMidMax）。</summary>
+        public int ConfidenceHighCount { get; private set; }
+        /// <summary>中置信。</summary>
+        public int ConfidenceMidCount { get; private set; }
+        /// <summary>低置信（≥ confidenceLowMin，几何在打架）。</summary>
+        public int ConfidenceLowCount { get; private set; }
+        /// <summary>低置信中相干者（签名一致=真错/真变化嫌疑，相干闸该放行）。</summary>
+        public int ConfidenceLowCoherentCount { get; private set; }
+        /// <summary>低置信中纯噪声（方向横跳，相干闸拦得住的那类）。</summary>
+        public int ConfidenceLowNoiseCount { get; private set; }
+
         // 矛盾票普查：诊断"幽灵抹不掉"——反对票到底投没投出、被哪道门禁拦住
         private ComputeBuffer _carveStats;
         private bool _carveStatsReadbackPending;
@@ -291,7 +365,7 @@ namespace Genesis.RoomScan
         // 68..70: provisional seeds, promotions and formal-surface demotions.
         // 71..89: read-only lifecycle forensics: seed source/risk, promotion
         // mechanism, promotion-time risk and immutable birth source.
-        private const int CarveStatsCount = 91;
+        private const int CarveStatsCount = 93; // 91=相干闸拦下的噪声票（v2，只读账）；92=M1 成熟面观测折让命中
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
@@ -377,6 +451,9 @@ namespace Genesis.RoomScan
         private int _lastMotionGatedCount;
         /// <summary>平滑后的深度位姿角速度（°/s），调试用。</summary>
         public float SmoothedAngularSpeed => _smoothedAngSpeed;
+        /// <summary>当前运动质量分（1=静止满权，地板=运动降权到底），HUD 回显用。</summary>
+        public float MotionQuality => _motionQuality;
+        private float _motionQuality = 1f;
 
         private void Awake()
         {
@@ -444,14 +521,31 @@ namespace Genesis.RoomScan
             _maturityKernel = new ComputeKernelHelper(compute, "CountChunkMaturity");
             _maturityKernel.Set(VolumeRWID, _volume);
             _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+            _maturityKernel.Set(ConfidenceRWID, _confidenceVolume); // 资格门：普查同拍低置信账（w 槽）
 
             _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+            _integrateKernel.Set(FrozenChunkBitsID, _frozenChunkBits);
 
             _coverageKernel = new ComputeKernelHelper(compute, "CountSurfaceCoverage");
             _coverageKernel.Set(VolumeRWID, _volume);
             _coverageCounters = new ComputeBuffer(3, sizeof(uint));
             _coverageKernel.Set(CoverageCountersID, _coverageCounters);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
+
+            // 置信度通道 v1：分歧 EMA 体绑进 Integrate（写）与 Clear（清零），
+            // CountConfidence 内核只读它做三档普查。缓冲建后先清零——新缓冲首帧
+            // 按垃圾计数写会 GPU 挂死（粗皮缓冲同款老陷阱）。
+            _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
+            _clearKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _clearKernel.Set(CoherenceRWID, _coherenceVolume);
+            _confidenceKernel = new ComputeKernelHelper(compute, "CountConfidence");
+            _confidenceKernel.Set(VolumeRWID, _volume);
+            _confidenceKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _confidenceKernel.Set(CoherenceRWID, _coherenceVolume);
+            _confidenceStats = new ComputeBuffer(6, sizeof(uint));
+            _confidenceStats.SetData(new uint[6]);
+            _confidenceKernel.Set(ConfidenceStatsID, _confidenceStats);
 
             _carveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
             _carveStats.SetData(ZeroCarveStats);
@@ -477,6 +571,8 @@ namespace Genesis.RoomScan
             _carveStats = null;
             _projectiveShadowCarveStats?.Release();
             _projectiveShadowCarveStats = null;
+            _confidenceStats?.Release();
+            _confidenceStats = null;
             ReleaseFrozenBlockBuffers();
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
@@ -501,6 +597,8 @@ namespace Genesis.RoomScan
             if (_colorVolume) { Destroy(_colorVolume); _colorVolume = null; }
             if (_projectiveShadowVolume) { Destroy(_projectiveShadowVolume); _projectiveShadowVolume = null; }
             if (_admissionTraceVolume) { Destroy(_admissionTraceVolume); _admissionTraceVolume = null; }
+            if (_confidenceVolume) { Destroy(_confidenceVolume); _confidenceVolume = null; }
+            if (_coherenceVolume) { Destroy(_coherenceVolume); _coherenceVolume = null; }
             IntegrationCount = 0;
             Logger.Info("VolumeIntegrator: GPU volumes released");
         }
@@ -559,6 +657,7 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _pruneKernel.Set(VolumeRWID, _volume);
@@ -575,9 +674,17 @@ namespace Genesis.RoomScan
             _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
             _maturityKernel.Set(VolumeRWID, _volume);
             _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+            _maturityKernel.Set(ConfidenceRWID, _confidenceVolume); // 资格门：普查同拍低置信账（w 槽）
             _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+            _integrateKernel.Set(FrozenChunkBitsID, _frozenChunkBits);
             _coverageKernel.Set(VolumeRWID, _volume);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
+            _clearKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _clearKernel.Set(CoherenceRWID, _coherenceVolume);
+            _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
+            _confidenceKernel.Set(VolumeRWID, _volume);
+            _confidenceKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _confidenceKernel.Set(CoherenceRWID, _coherenceVolume);
         }
 
         private void EnsureDirtyChunkBuffer()
@@ -618,14 +725,16 @@ namespace Genesis.RoomScan
             int maskWords = Mathf.Max(1, (frozenRequiredCount + 31) / 32);
             _chunkFreezeSetMask = new ComputeBuffer(maskWords, sizeof(uint));
             _chunkFreezeClearMask = new ComputeBuffer(maskWords, sizeof(uint));
-            _frozenChunkVotes = new ComputeBuffer(frozenCount, sizeof(uint) * 2);
+            _frozenChunkVotes = new ComputeBuffer(frozenCount, sizeof(uint) * 4); // T2：uint2→uint4（z=补洞票）
             _chunkMaturity = new ComputeBuffer(frozenCount, sizeof(uint) * 4);
-            _voteZeros = new uint[frozenCount * 2];
+            _frozenChunkBits = new ComputeBuffer(maskWords, sizeof(uint));
+            _voteZeros = new uint[frozenCount * 4];
             _maturityZeros = new uint[frozenCount * 4];
             _chunkFreezeSetMask.SetData(new uint[maskWords]);
             _chunkFreezeClearMask.SetData(new uint[maskWords]);
             _frozenChunkVotes.SetData(_voteZeros);
             _chunkMaturity.SetData(_maturityZeros);
+            _frozenChunkBits.SetData(new uint[maskWords]);
         }
 
         private void ReleaseFrozenBlockBuffers()
@@ -636,6 +745,8 @@ namespace Genesis.RoomScan
             _chunkFreezeClearMask = null;
             _frozenChunkVotes?.Release();
             _frozenChunkVotes = null;
+            _frozenChunkBits?.Release();
+            _frozenChunkBits = null;
             _chunkMaturity?.Release();
             _chunkMaturity = null;
             _voteZeros = null;
@@ -716,6 +827,34 @@ namespace Genesis.RoomScan
             ColoredSurfaceCount = (int)data[2];
         }
 
+        /// <summary>
+        /// 清零置信度统计缓冲并重新普查一遍（分歧 EMA 三档：高/中/低），
+        /// 异步回读到 ConfidenceVoxelCount/High/Mid/Low。HUD 定期调用。
+        /// </summary>
+        public void RefreshConfidenceStats()
+        {
+            if (_volume == null || _confidenceStats == null) return;
+            if (_confidenceReadbackPending) return;
+            _confidenceReadbackPending = true;
+            _confidenceStats.SetData(new uint[6]);
+            _confidenceKernel.DispatchFit(_volume);
+            AsyncGPUReadback.Request(_confidenceStats, OnConfidenceReadback);
+        }
+
+        private void OnConfidenceReadback(AsyncGPUReadbackRequest request)
+        {
+            _confidenceReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 6) return;
+            ConfidenceVoxelCount = (int)data[0];
+            ConfidenceHighCount = (int)data[1];
+            ConfidenceMidCount = (int)data[2];
+            ConfidenceLowCount = (int)data[3];
+            ConfidenceLowCoherentCount = (int)data[4];
+            ConfidenceLowNoiseCount = (int)data[5];
+        }
+
         private void RequestCarveStatsReadback()
         {
             if (_carveStats == null || _carveStatsReadbackPending) return;
@@ -772,6 +911,8 @@ namespace Genesis.RoomScan
                    $"排拦{FormatCarveCount(LastCarveStats[1])} 法拦{FormatCarveCount(LastCarveStats[2])} " +
                    $"遮拦{FormatCarveCount(LastCarveStats[3])} 带拦{FormatCarveCount(LastCarveStats[4])} " +
                    $"前延{FormatCarveCount(LastCarveStats[8])} 后延{FormatCarveCount(LastCarveStats[9])}" +
+                   (LastCarveStats[91] > 0 ? $" 噪拦{FormatCarveCount(LastCarveStats[91])}" : "") +
+                   (LastCarveStats[92] > 0 ? $" 折{FormatCarveCount(LastCarveStats[92])}" : "") +
                    (_lastMotionGatedCount > 0 ? $" 动闸{_lastMotionGatedCount}" : "");
         }
 
@@ -1007,6 +1148,31 @@ namespace Genesis.RoomScan
             long traceBytesPerVoxel = traceFormat == GraphicsFormat.R8_UNorm ? 1L : 2L;
             Logger.Info($"Dilation admission trace: {voxelCount} {traceFormat} = " +
                         $"{(traceBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+
+            // 置信度通道 v1：与 admission trace 同格式（R8 归一化存分歧 EMA，
+            // 不支持时退 R16_SFloat）。只读影子，生产路径一律不读它。
+            _confidenceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "ConfidenceDivergence"
+            };
+            _confidenceVolume.Create();
+
+            // v2 相干通道：同格式第二张 R8（0.5 偏置有符号分歧 EMA）。
+            _coherenceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "ConfidenceCoherence"
+            };
+            _coherenceVolume.Create();
         }
 
         private void SetShaderConstants()
@@ -1049,16 +1215,30 @@ namespace Genesis.RoomScan
             compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
             compute.SetFloat(DiagnosticAngularSpeedID, 0f);
+            compute.SetFloat(NoiseMotionQualityID, 1f);
+            compute.SetFloat(NoiseDistExpID, noiseDistExponent);
+            compute.SetFloat(NoiseAngExpID, noiseAngleExponent);
+            compute.SetFloat(MatureObsEnableID, enableMatureSurfaceObsDiscount ? 1f : 0f);
+            compute.SetFloat(MatureObsWeightMinID, matureSurfaceObsWeightMin);
+            compute.SetFloat(MatureObsMarginID, matureSurfaceObsMargin);
+            compute.SetFloat(MatureObsDiscountID, matureSurfaceObsDiscount);
             compute.SetFloat(FrozenBlockEnableID, frozenBlockEnable ? 1f : 0f);
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(ConfidenceWriteID, 1f);
+            compute.SetFloat(ConfidenceRateID, confidenceRate);
+            compute.SetFloat(ConfidenceMidMaxID, confidenceMidMax);
+            compute.SetFloat(ConfidenceLowMinID, confidenceLowMin);
             ConfigureDirtyTracking(false);
 
             Shader.SetGlobalTexture(VolumeID, _volume);
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
+            Shader.SetGlobalTexture(ConfidenceGlobalTexID, _confidenceVolume);
+            Shader.SetGlobalFloat(ConfidenceMidMaxID, confidenceMidMax);
+            Shader.SetGlobalFloat(ConfidenceLowMinID, confidenceLowMin);
         }
 
         /// <summary>
@@ -1076,6 +1256,7 @@ namespace Genesis.RoomScan
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(ConfidenceWriteID, 1f);
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -1086,6 +1267,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.SetFloat(ConfidenceWriteID, 0f);
                 _clearKernel.Set(VolumeRWID, _projectiveShadowVolume);
                 _clearKernel.Set(ColorVolumeRWID, _colorVolume); // bound but guarded from writes
                 _clearKernel.DispatchFit(_projectiveShadowVolume);
@@ -1095,6 +1277,7 @@ namespace Genesis.RoomScan
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(ConfidenceWriteID, 1f);
             _clearKernel.Set(VolumeRWID, _volume);
             _carveStats?.SetData(ZeroCarveStats);
             _projectiveShadowCarveStats?.SetData(ZeroCarveStats);
@@ -1289,8 +1472,20 @@ namespace Genesis.RoomScan
         }
 
         // ── 逐块可逆冻结公共 API ─────────────────────────────────────
-        /// <summary>冻结票箱（每块 uint2：x=自由空间票 y=遮挡票），调度器周期回读。</summary>
+        /// <summary>冻结票箱（每块 uint4：x=自由空间票 y=遮挡票 z=补洞票 w=保留），调度器周期回读。</summary>
         public ComputeBuffer FrozenChunkVotes => _frozenChunkVotes;
+
+        /// <summary>
+        /// T2：下发当前已冻块全量位图（1 位/块，调度器在每次冻结/解冻裁决后调用）。
+        /// 补洞票的块冻结态判据——冻块内空体素继续积分，种子出生只在该位图置位的
+        /// 块里记票。与 set/clear 一次性掩码不同，本位图是持续状态、全量覆盖。
+        /// </summary>
+        public void SetFrozenChunkBits(uint[] bits)
+        {
+            if (!FrozenBlockReady || bits == null || _frozenChunkBits == null) return;
+            if (bits.Length != _frozenChunkBits.count) return;
+            _frozenChunkBits.SetData(bits);
+        }
         /// <summary>成熟度账（每块 uint4：x=surface体素数 y=其中已冻结），调度器周期回读。</summary>
         public ComputeBuffer ChunkMaturity => _chunkMaturity;
         /// <summary>冻结 API 是否可用（GPU 资源已惰性分配）。</summary>
@@ -1482,6 +1677,21 @@ namespace Genesis.RoomScan
                     _pendingCamFrame = null; // 丢弃过期颜色帧，防与下一帧位姿错配
                     return;
                 }
+
+                // 噪声模型加权（08-21 造炮）：整帧闸 90°/s 之下不再二值放行，而是按运动状态
+                // 连续降权——角速度/线速度各对参考值归一取大，1(静止)→地板线性折让。
+                // 位姿-深度时延族在低速带照样放错位置（实锤：平移不转头 O 也掉负），
+                // 二值闸管不了的段由权重连续谱接管；地板防断粮。
+                _motionQuality = 1f;
+                if (noiseMotionWeightEnable)
+                {
+                    float a = noiseMotionAngRefDegPerSec > 0f
+                        ? _smoothedAngSpeed / noiseMotionAngRefDegPerSec : 0f;
+                    float l = noiseMotionLinRefMps > 0f
+                        ? dc.SmoothedDepthLinearSpeed / noiseMotionLinRefMps : 0f;
+                    _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
+                        Mathf.Clamp01(Mathf.Max(a, l)));
+                }
             }
 
             dc.UpdateDilationIfNeeded();
@@ -1513,6 +1723,10 @@ namespace Genesis.RoomScan
             compute.SetFloat(CarveBypassMarginID, carveBypassMargin);
             compute.SetFloat(CarveBypassBoostID, carveBypassBoost);
             compute.SetFloat(FreeSpaceCarveBoostID, freeSpaceCarveBoost);
+            compute.SetFloat(MatureObsEnableID, enableMatureSurfaceObsDiscount ? 1f : 0f);
+            compute.SetFloat(MatureObsWeightMinID, matureSurfaceObsWeightMin);
+            compute.SetFloat(MatureObsMarginID, matureSurfaceObsMargin);
+            compute.SetFloat(MatureObsDiscountID, matureSurfaceObsDiscount);
             compute.SetFloat(RescueSeedDistOnlyID, rescueSeedDistOnly ? 1f : 0f);
             compute.SetFloat(MotionSeedBlockID, motionSeedBlockDegPerSec);
             compute.SetFloat(AbstainSeedGuardID, abstainSeedGuard ? 1f : 0f);
@@ -1526,6 +1740,9 @@ namespace Genesis.RoomScan
             compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
             compute.SetFloat(DiagnosticAngularSpeedID, _smoothedAngSpeed);
+            compute.SetFloat(NoiseMotionQualityID, noiseMotionWeightEnable ? _motionQuality : 1f);
+            compute.SetFloat(NoiseDistExpID, noiseDistExponent);
+            compute.SetFloat(NoiseAngExpID, noiseAngleExponent);
             compute.SetFloat(FrozenBlockEnableID, frozenBlockEnable ? 1f : 0f);
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
@@ -1560,6 +1777,7 @@ namespace Genesis.RoomScan
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(ConfidenceWriteID, 1f); // 主卷记置信度账
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(CarveStatsID, _carveStats);
@@ -1573,6 +1791,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.SetFloat(ConfidenceWriteID, 0f); // 影子卷不记置信度账（防 A/B 双跑污染）
                 ConfigureDirtyTracking(false);
                 compute.SetInt(CamAvailableID, 0);
                 _integrateKernel.Set(VolumeRWID, _projectiveShadowVolume);
@@ -1584,6 +1803,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(UseRawProjectiveSdfID, 0f);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
+                compute.SetFloat(ConfidenceWriteID, 1f);
                 ConfigureDirtyTracking(true);
                 compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
                 _integrateKernel.Set(VolumeRWID, _volume);

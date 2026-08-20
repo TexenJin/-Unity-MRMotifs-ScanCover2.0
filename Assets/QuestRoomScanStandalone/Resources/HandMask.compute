@@ -1,0 +1,50 @@
+// 手部语义剔除（公共配方 E，08-20 用户拍板"手部压根就不该能参与到影响当中"）：
+// 深度源头打码——手关节/控制器球罩住的像素写 0=弃权（复用缘洗弃权语义：不种不长不抹），
+// 整合/穿越票/拍平/B1 对被打码像素全自动免疫，一处打码全链免疫（避免消费端各自补丁=打地鼠）。
+// 必须打在双边滤波之前（否则滤波邻域把弃权值洇回有效像素、把有效值洇进弃权区）。
+// 与"弃权像素不投穿越票"通用闸（VolumeIntegration 冻票路径）同车：
+// 0=近端时 sDist 算出深负 frozenDelta，不拦会给球后方冻块灌遮挡票=误解冻。
+//
+// 世界坐标重建与 DepthKit gsDepthNDCtoWorld 同式；矩阵逐内核下发而非读全局量——
+// 本 pass 跑在 SetGlobalShaderProperties 之前，全局矩阵是上一拍的陈旧值。
+// 双眼同拍处理（id.z=眼片）：深度图低分辨率，双眼全掩成本可忽略，省掉逐眼交替的
+// 邻眼陈旧/首帧垃圾边角问题。
+#pragma kernel HandMask
+
+Texture2DArray<float> _RawDepth;
+RWTexture2DArray<float> _MaskedDepth;
+RWStructuredBuffer<uint> _HandMaskStats; // [0]=本统计周期罩住像素数（HUD"罩"）
+
+float4 _HandSpheres[48]; // xyz=世界坐标球心，w=半径（米）（08-20 指链球扩容 16→48）
+int _HandSphereCount;
+int _DepthW;
+int _DepthH;
+float4x4 _MaskProjInv[2]; // 逐眼深度投影逆
+float4x4 _MaskViewInv[2]; // 逐眼深度视逆（深度相机→世界，含 world-lock）
+
+[numthreads(8,8,1)]
+void HandMask(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DepthW || id.y >= (uint)_DepthH) return;
+    uint3 coord = uint3(id.xy, id.z);
+    float d = _RawDepth[coord];
+    if (d <= 0.0) { _MaskedDepth[coord] = 0.0; return; } // 已是弃权，穿透
+
+    float2 ndcXY = (id.xy + 0.5) / float2(_DepthW, _DepthH);
+    float4 hcs = float4(float3(ndcXY, d) * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_MaskViewInv[id.z], mul(_MaskProjInv[id.z], hcs));
+    float3 wp = worldH.xyz / worldH.w;
+
+    [loop] for (int i = 0; i < _HandSphereCount; i++)
+    {
+        float4 s = _HandSpheres[i];
+        float3 diff = wp - s.xyz;
+        if (dot(diff, diff) < s.w * s.w)
+        {
+            _MaskedDepth[coord] = 0.0;
+            InterlockedAdd(_HandMaskStats[0], 1u);
+            return;
+        }
+    }
+    _MaskedDepth[coord] = d;
+}

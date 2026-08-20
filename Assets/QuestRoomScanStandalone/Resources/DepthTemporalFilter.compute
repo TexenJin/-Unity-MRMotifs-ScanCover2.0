@@ -1,0 +1,124 @@
+// 源头时序滤波（08-20，公共配方 A 的第一刀：深度先稳定再融合）
+// 当前帧像素重建世界点，重投影到上一拍同眼历史；世界位移带内=同一表面的噪声，做 EMA；
+// 带外=真变化/遮挡/边缘 bleed 候选，当前帧全速放行并刷新历史。手罩 0=弃权：
+// 输出穿透 0，但历史保留（手移开后原表面立刻回到滤波轨，不把弃权洇进历史）。
+// 本 pass 跑在 SetGlobalShaderProperties 之前，矩阵必须逐内核下发（HandMask 同款教训）。
+
+#pragma kernel TemporalFilter
+
+Texture2DArray<float>   _SrcDepth;
+Texture2DArray<float>   _HistDepth;
+RWTexture2DArray<float> _DstDepth;
+RWTexture2DArray<float> _NextHistDepth;
+RWStructuredBuffer<uint> _TemporalStats; // 0=稳定混合 1=真变化放行
+
+int _DepthW;
+int _DepthH;
+int _HasPrev;
+float _TemporalAlpha;
+float _TemporalChangeBase;
+float _TemporalChangeScale;
+
+float4x4 _CurProj[2];
+float4x4 _CurProjInv[2];
+float4x4 _CurView[2];
+float4x4 _CurViewInv[2];
+float4x4 _PrevProj[2];
+float4x4 _PrevProjInv[2];
+float4x4 _PrevView[2];
+float4x4 _PrevViewInv[2];
+
+float3 CurNdcToWorld(float3 ndc, uint eye)
+{
+    float4 hcs = float4(ndc * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_CurViewInv[eye], mul(_CurProjInv[eye], hcs));
+    return worldH.xyz / worldH.w;
+}
+
+float3 PrevNdcToWorld(float3 ndc, uint eye)
+{
+    float4 hcs = float4(ndc * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_PrevViewInv[eye], mul(_PrevProjInv[eye], hcs));
+    return worldH.xyz / worldH.w;
+}
+
+bool WorldToPrevNdc(float3 world, uint eye, out float3 ndc)
+{
+    float4 clip = mul(_PrevProj[eye], mul(_PrevView[eye], float4(world, 1.0)));
+    ndc = float3(0.0, 0.0, 0.0);
+    if (clip.w <= 1e-6) return false;
+    ndc = clip.xyz / clip.w * 0.5 + 0.5;
+    return all(ndc.xy >= 0.001) && all(ndc.xy <= 0.999);
+}
+
+float3 WorldToCurNdc(float3 world, uint eye)
+{
+    float4 clip = mul(_CurProj[eye], mul(_CurView[eye], float4(world, 1.0)));
+    return clip.xyz / max(clip.w, 1e-6) * 0.5 + 0.5;
+}
+
+[numthreads(8, 8, 1)]
+void TemporalFilter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DepthW || id.y >= (uint)_DepthH || id.z >= 2) return;
+    uint3 coord = id;
+    uint eye = id.z;
+
+    float cur = _SrcDepth[coord];
+    if (cur <= 0.0)
+    {
+        _DstDepth[coord] = 0.0;
+        _NextHistDepth[coord] = _HasPrev != 0 ? _HistDepth[coord] : 0.0;
+        return;
+    }
+
+    float2 uv = (id.xy + 0.5) / float2(_DepthW, _DepthH);
+    float3 curWorld = CurNdcToWorld(float3(uv, cur), eye);
+
+    if (_HasPrev == 0)
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    float3 prevNdc;
+    if (!WorldToPrevNdc(curWorld, eye, prevNdc))
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        InterlockedAdd(_TemporalStats[1], 1u);
+        return;
+    }
+
+    uint2 prevPixel = clamp((uint2)(prevNdc.xy * float2(_DepthW, _DepthH)),
+                            uint2(0, 0), uint2(_DepthW - 1, _DepthH - 1));
+    float hist = _HistDepth[uint3(prevPixel, eye)];
+    if (hist <= 0.0)
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    float3 histWorld = PrevNdcToWorld(float3(prevNdc.xy, hist), eye);
+    float curDist = length(curWorld - _CurViewInv[eye]._m03_m13_m23);
+    float changeLimit = max(_TemporalChangeBase, curDist * _TemporalChangeScale);
+    float worldDelta = length(curWorld - histWorld);
+
+    if (worldDelta > changeLimit)
+    {
+        // 真变化直通：手、家具、新遮挡不吃滤波残影；历史同步换轨。
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        InterlockedAdd(_TemporalStats[1], 1u);
+        return;
+    }
+
+    float3 filteredWorld = lerp(histWorld, curWorld, saturate(_TemporalAlpha));
+    float filteredNdc = WorldToCurNdc(filteredWorld, eye).z;
+    filteredNdc = saturate(filteredNdc);
+    _DstDepth[coord] = filteredNdc;
+    _NextHistDepth[coord] = filteredNdc;
+    InterlockedAdd(_TemporalStats[0], 1u);
+}

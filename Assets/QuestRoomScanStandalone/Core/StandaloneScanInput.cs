@@ -13,6 +13,7 @@ namespace Genesis.RoomScan
     ///                注意 A/B 实验旗下满屏网=增量 HERA 所画，开关切的就是它）
     ///   右摇杆方向+按下 = 性能二分热键：上=实时轨 / 左=冻结调度器 / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
     ///   左摇杆按下 = 线框 / 实体切换（全局 shader 开关，帧率二分用）
+    ///   左摇杆上+按下 = 源头时序滤波开关（盯墙养绿 A/B 热键，HUD 闸行 时开/时关 回显）
     /// 每次按键给一下短震动作为反馈。
     /// </summary>
     public class StandaloneScanInput : MonoBehaviour
@@ -136,10 +137,21 @@ namespace Genesis.RoomScan
             // 左摇杆按下：线框/实体切换。走全局 shader 开关（ApplyDisplayMode
             // SetGlobalFloat），对增量 HERA 页同样生效——帧率二分实验专用：
             // 切实体后帧率跳升=线框边缘检测的填充开销是主猪。
+            // 左摇杆推上再按下=源头时序滤波开关（盯墙养绿 A/B：同墙同段实时切换，
+            // 关闭侧=pre-时序滤波基线；与右摇杆方向热键同款手势）。
             if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.LTouch))
             {
-                scanner.NotifyInput("左摇杆");
-                scanner.ToggleWireframe();
+                Vector2 lstick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.LTouch);
+                if (lstick.y > 0.5f)
+                {
+                    scanner.NotifyInput("左摇杆上");
+                    scanner.ToggleTemporalFilter();
+                }
+                else
+                {
+                    scanner.NotifyInput("左摇杆");
+                    scanner.ToggleWireframe();
+                }
                 Pulse();
             }
         }

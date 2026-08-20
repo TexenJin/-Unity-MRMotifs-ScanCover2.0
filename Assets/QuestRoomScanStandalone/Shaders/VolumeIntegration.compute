@@ -28,8 +28,9 @@ float gsDirtyMinWeight;
 // weight 翻符号即冻结，提取层 abs(weight) 对符号透明 → 冻结/解冻都不标脏、不重提网格。
 RWStructuredBuffer<uint> _ChunkFreezeSetMask;   // 位图：本批待冻结块（1 位/块）
 RWStructuredBuffer<uint> _ChunkFreezeClearMask; // 位图：本批待解冻块（同批票箱清零）
-RWStructuredBuffer<uint2> _FrozenChunkVotes;    // 每块穿越票：x=自由空间票 y=遮挡票
-RWStructuredBuffer<uint4> _ChunkMaturity;       // 每块成熟度：x=surface体素数 y=其中已冻结
+RWStructuredBuffer<uint4> _FrozenChunkVotes;    // 每块票箱：x=自由空间票 y=遮挡票 z=补洞票（T2）w=保留
+RWStructuredBuffer<uint> _FrozenChunkBits;      // 位图：当前已冻块（1 位/块，CPU 随冻结裁决下发）
+RWStructuredBuffer<uint4> _ChunkMaturity;       // 每块成熟度：x=surface体素数 y=其中已冻结 z=可出网 w=低置信（资格门账）
 float gsFrozenBlockEnable;     // 总开关：0=穿越票/成熟度普查停（掩码冻结仍可用）
 float gsFrozenVoteQualityMin;  // 穿越票最低质量（防低质掠射噪声买票解冻）
 float gsFrozenVoteMargin;      // 穿越票矛盾杆（归一化单位，1=截断距离），随距离自适应放大
@@ -39,6 +40,18 @@ float gsFrozenMatureWeight;    // 长熟体素权重门槛：成熟度普查只�
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
 RWStructuredBuffer<uint> _CarveStats; // 0..9=矛盾/延拦；10..27=现有只读账；28..44=膨胀供体出生证明（只读）
+// ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
+// 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
+// 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
+// 平均一账两收。生产路径（准出/提取/冻结/解冻）一律不读它；消费端（着色/统计）
+// 自带容忍杆。归一化 sd 单位（1=截断距离 0.15m，0.1≈1.5cm）。
+RWTexture3D<float> gsConfidenceRW;
+RWTexture3D<float> gsCoherenceRW; // v2 相干通道：有符号分歧 EMA，0.5 偏置=中性。
+                                  // 噪声方向逐帧翻→收敛回 0.5；纠错/真变化签名一致→偏两端。
+float gsConfidenceWrite;   // 主卷=1 影子卷=0（A/B 双跑同一内核，防影子卷污染主账）
+float gsConfidenceRate;    // EMA 基准速率，再乘观测质量 q（低质观测少说话）
+float gsConfidenceMidMax;  // 高/中置信分界（分歧 EMA，归一化 sd：0.1≈1.5cm 逐帧抖动）
+float gsConfidenceLowMin;  // 中/低分界（0.25≈3.8cm，超过=几何在打架）
 // Projective TSDF A/B controls. The production pass keeps both at 0/1;
 // the read-only KinectFusion-style shadow pass sets raw=1, writeColor=0.
 float gsUseRawProjectiveSdf;
@@ -65,9 +78,17 @@ float gsDilationBlockSparse;    // 1=路径探针间距过大的长距供料不�
 float gsProvisionalSeedWeight;  // 新表面暂存权重，必须低于正式出网阈值
 float gsFormalSurfaceWeight;    // 与 Surface Nets _MinWeight 对齐的正式表面阈值
 float gsDiagnosticAngularSpeed; // 只读：当前深度位姿的平滑头部角速度（deg/s）
+// 噪声模型加权（08-21 造炮，w∝1/σ²(d,θ,ω)）：运动质量分由 C# 按角速度+线速度合成
+// （1=静止满权→地板），距离/掠射角指数默认 1=保持原线性。定罪链见 VolumeIntegrator 注释。
+float gsNoiseMotionQuality;
+float gsNoiseDistExp;
+float gsNoiseAngExp;
 
 #define EXCLUSION_TOP 0.25
-#define EXCLUSION_BOTTOM 1.7
+// 08-19 实机定罪：BOTTOM 1.7 时站立头高 1.6m→圆柱下沿 −0.1m，脚下整片地板
+// 永被罩住="近处地面完全无网"实锤。改 0.6=圆柱只罩头/躯干（头高 1.6→下沿 1.0m），
+// 近处地板解放；半径同车 0.6→0.35（场景 YAML 曾压脚本默认=prefab 覆盖陷阱又一例）。
+#define EXCLUSION_BOTTOM 0.6
 #define MIN_DOT 0.3
 
 float gsExclusionRadius; // 排除区半径（原写死 0.6，现由 VolumeIntegrator.exclusionRadius 下发）
@@ -144,6 +165,28 @@ void WriteTrackedTsdf(uint3 coord, float2 value)
     float2 before = gsVolumeRW[coord];
     gsVolumeRW[coord] = value;
     MarkDirtyChunk(coord, before, value);
+}
+
+// 置信度通道更新（只读影子，不影响任何生产决策）：
+// 观测分歧进 EMA；速率乘质量 q——低质掠射/远距观测少说话，防噪声把账刷花。
+void ConfidenceObserve(uint3 coord, float oldSd, float newSd, float q)
+{
+    if (gsConfidenceWrite < 0.5) return;
+    float r = saturate(gsConfidenceRate * q);
+    float d = gsConfidenceRW[coord];
+    gsConfidenceRW[coord] = lerp(d, saturate(abs(newSd - oldSd)), r);
+    // v2 相干通道（同速率有符号 EMA，与无符号账可比）：噪声方向逐帧翻→
+    // 收敛回中性 0.5；纠错/真变化签名一致→偏两端。0.5 偏置，±0.5 截断。
+    float s = gsCoherenceRW[coord] - 0.5;
+    gsCoherenceRW[coord] = saturate(lerp(s, newSd - oldSd, r) + 0.5);
+}
+
+// 首次观测无分歧史记 0；"未知/未长成"由消费端用 weight 另行判定，不在本通道编码。
+void ConfidenceSeed(uint3 coord)
+{
+    if (gsConfidenceWrite < 0.5) return;
+    gsConfidenceRW[coord] = 0.0;
+    gsCoherenceRW[coord] = 0.5; // 出生=无分歧史，相干回中性
 }
 
 // Persistent, diagnostic-only packed provenance. One compact R8 sidecar holds
@@ -241,6 +284,18 @@ float gsCarveGain;
 // （weight≈0.087）在典型质量下 2~3 票扣死；成熟面权重基数大，同等倍率只擦皮。
 // 不动 carveGain 本体、不动胀绕/法绕/弃权旁路（它们自带 gsCarveBypassBoost）。
 float gsFreeSpaceCarveBoost;
+// M1 成熟面观测折让（08-20 用户拍板，绿网留存战役第一刀）：已长熟的面
+// （weight≥gsMatureObsWeightMin）对"小矛盾"新观测（|Δsd|≤gsMatureObsMargin）
+// 打折接收——几何不跟（blend/权重增长/扣减 ×gsMatureObsDiscount）、不记分歧账
+// （ConfidenceObserve 跳过=绿网不再被视角偏差喂黄的直接机关）。真变化（|Δsd|
+// 超带）全速放行；带内持续矛盾按 1/20 速度累积=申诉通道不设硬顶。
+// 背景：R1 实验定罪视角偏差族（动了才掉色、静止养回绿、转角/远处出生即黄紫）。
+// 注意判据门槛独立成字段：拍板口径 0.5=长熟面，而 gsFrozenMatureWeight 实为
+// 0.15（刚转正的年轻面）——若复用它，爬坡期 weight 增长被 ×0.05 拖慢 20 倍。
+float gsMatureObsEnable;
+float gsMatureObsWeightMin;
+float gsMatureObsMargin;
+float gsMatureObsDiscount;
 // 救援样本播种资格审查改用距离分（默认 1）：边缘清洗的同平面背书已替代本地法线
 // 可信度，掠射角不再重复计罚。0 = 关回（救援样本按真实 quality 过 0.25 播种线）。
 float gsRescueSeedDistOnly;
@@ -287,6 +342,11 @@ void Clear(uint3 id : SV_DispatchThreadID)
         gsColorVolumeRW[id] = float4(0, 0, 0, 0);
     if (gsWriteAdmissionTrace > 0.5)
         gsAdmissionTraceRW[id] = 0.0;
+    if (gsConfidenceWrite > 0.5)
+    {
+        gsConfidenceRW[id] = 0.0; // 清卷=清账：旧分歧 EMA 不得跨会话残留
+        gsCoherenceRW[id] = 0.5;  // 相干回中性
+    }
 }
 
 #pragma kernel Prune
@@ -494,13 +554,17 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
 
     if (!valid) return;
 
-    float distFactor = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+    float distFactor = pow(saturate(1.0 - voxEyeDist / gsMaxUpdateDist), gsNoiseDistExp);
     // 救援降级③：救援样本不再享受 0.5 角度地板。混合斜坡是多帧一致的系统性伪造品，
     // 给它角度地板等于让最不可信的掠射观测以正视待遇播种/增长。救援只豁免法线闸
     // 准入（上方 validSurfaceNormal），质量分必须按真实入射角诚实计算——掠射就是
     // 低质量，低质量就是慢生慢长，靠后续正视观测自然转正。
-    float angleFactor = saturate(normDot);
-    float quality = distFactor * angleFactor;
+    float angleFactor = pow(saturate(normDot), gsNoiseAngExp);
+    // 噪声模型加权（08-21 造炮，已拍板）：w∝1/σ²(d,θ,ω)。运动项 gsNoiseMotionQuality
+    // 由 C# 按角速度+线速度合成标量传入（整帧闸 90°/s 之下的连续降权谱，地板防断粮）；
+    // 距离/角度项指数默认 1=不动现有行为，调参即生效。定罪链：定点实验 O≈0（偏移脱罪）、
+    // R 8→49-72 随距离掠射爆炸（方差定罪）、动态 O 一动掉负静止养回+平移也掉负（时延族实锤）。
+    float quality = distFactor * angleFactor * gsNoiseMotionQuality;
     float q2 = quality * quality;
     // 救援样本的播种资格审查用距离分而非角度质量分：救援标记本身意味着上游
     // 边缘清洗已用同平面连贯性+双眼支持给该像素背书，本地法线在掠射时测不准
@@ -717,18 +781,40 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         // 踩破它——纯噪声把票箱刷热、冻-解振荡（实机：解=冻的 2~3 倍）。与法绕
         // nrMargin 同款教训：裕量必须随距离放大。家具级真矛盾 ≥30cm，杆抬到
         // 5m≈10cm 也不误伤解冻修复。
+        // 弃权像素不投票（08-20 通用闸，与手部打码同车）：raw==0=传感器/预处理明说
+        // "我不知道"（缘洗弃权带、手部球打码），此时 depthEyeDist≈近端，sDistNorm 深负
+        // →frozenDelta 恒负=白灌遮挡票。边缘弃权带太细历史没炸过，手部大圆盘会给球后方
+        // 冻块灌到误解冻。语义正义："我不知道"的像素本不该有票权；near<minUpdateDist
+        // 早退的设备上此闸字节级无操作，纯双保险。
         if (gsFrozenBlockEnable > 0.5 && gsFrozenChunkSize != 0 &&
-            quality >= gsFrozenVoteQualityMin)
+            quality >= gsFrozenVoteQualityMin && receiverOwnsRawDepth)
         {
             float frozenDelta = sDistNorm - old.x;
+            // v2 账必须每帧记（同意帧拉低分歧）。只在矛盾帧记账=分歧 EMA 单调上飘
+            // =冻块置信度被人为刷低（实机：信低 11→25 统计污染，非几何恶化）。
+            ConfidenceObserve(coord, old.x, sDistNorm, quality);
             float voteMargin = gsFrozenVoteMargin * max(depthEyeDist / 1.5, 1.0);
             if (abs(frozenDelta) > voteMargin)
             {
-                uint frozenChunk = FrozenChunkIndexFromCoord(coord);
-                if (frozenDelta > 0.0)
-                    InterlockedAdd(_FrozenChunkVotes[frozenChunk].x, 1u); // 自由空间票
+                // v2 相干闸（08-19，用户约束：按住"整体换掉"不能按死纠错）：
+                // 纯噪声=高分歧但方向逐帧翻（相干 |s|/d < 0.5）→拦票记只读账；
+                // 签名一致的矛盾=纠错/真变化（手伸进来、幻影该抹）→照常放行。
+                // 已知盲区：折角飞像素若是系统性偏差（前沿膨胀，方向固定）则
+                // 相干度同样高=闸拦不住——CountConfidence 相干拆分专门鉴别此情形。
+                float dConf = gsConfidenceRW[coord];
+                float coherence = abs(gsCoherenceRW[coord] - 0.5) / max(dConf, 0.02);
+                if (dConf < gsConfidenceMidMax || coherence >= 0.5)
+                {
+                    uint frozenChunk = FrozenChunkIndexFromCoord(coord);
+                    if (frozenDelta > 0.0)
+                        InterlockedAdd(_FrozenChunkVotes[frozenChunk].x, 1u); // 自由空间票
+                    else
+                        InterlockedAdd(_FrozenChunkVotes[frozenChunk].y, 1u); // 遮挡票
+                }
                 else
-                    InterlockedAdd(_FrozenChunkVotes[frozenChunk].y, 1u); // 遮挡票
+                {
+                    InterlockedAdd(_CarveStats[91], 1); // 相干闸拦下的噪声票（只读账）
+                }
             }
         }
         return; // frozen voxel — skip integration
@@ -745,6 +831,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         {
             float abstainWeight = max(weight - max(q2 * gsCarveGain, 1.0 / 127.0), 0.0);
             WriteTrackedTsdf(coord, float2(oldVal, abstainWeight));
+            ConfidenceObserve(coord, oldVal, sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
             {
                 uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
@@ -778,8 +865,24 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 max(PRUNE_WEIGHT + 1.0 / 127.0,
                     gsFormalSurfaceWeight - 1.0 / 127.0));
             WriteTrackedTsdf(coord, float2(sDistNorm, provisionalWeight));
+            ConfidenceSeed(coord); // 置信度通道：出生记无分歧
             InterlockedAdd(_CarveStats[68], 1);
             InterlockedAdd(_CarveStats[70u + admissionSource], 1u); // 71..73 seed source
+            // T2 补洞票：冻块只冻结"已有数据"体素，块内空体素继续积分——所以
+            // 冻块里的洞（早冻时没长完的区）后来数据长满，全靠种子出生证明。
+            // 实时轨第一闸硬跳冻块，这些数据永远等不到重提 → 在这里记票，
+            // CPU 过阈后把父块重排进提取队列（重排不解冻）。
+            // 判据：本块已冻（_FrozenChunkBits）+ 本帧确有种子在此出生（能走到
+            // 这里=已过种子闸/运动闸/膨胀拦截）+ 质量门槛与穿越票同款。
+            if (gsFrozenBlockEnable > 0.5 && gsFrozenChunkSize != 0 &&
+                quality >= gsFrozenVoteQualityMin)
+            {
+                uint holeChunk = FrozenChunkIndexFromCoord(coord);
+                uint holeWord = holeChunk >> 5;
+                uint holeBit = 1u << (holeChunk & 31u);
+                if ((_FrozenChunkBits[holeWord] & holeBit) != 0u)
+                    InterlockedAdd(_FrozenChunkVotes[holeChunk].z, 1u); // 补洞票
+            }
             if (grazingPlaneRescued) InterlockedAdd(_CarveStats[74], 1u);
             if (nearAbstainNeighbour) InterlockedAdd(_CarveStats[75], 1u);
             if (gsDiagnosticAngularSpeed > 60.0) InterlockedAdd(_CarveStats[76], 1u);
@@ -825,12 +928,25 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     //  ① 矛盾帧不再加赞成增长（否则 -0.075q2 被同帧 +0.025q2 稀释）；
     //  ② carveStep 保底 1 个量化步长——体积是 R8G8_SNorm，weight 步长 1/127≈0.0079，
     //     Δw 小于半步(≈0.004)会被四舍五入归零，反对票投了但写盘无效（实机：普查"投"涨而幽灵不动）。
+    // M1 折让判据（必须在 contradicted 之前算）：存量面已长熟且新观测落在小矛盾
+    // 带内 → 本帧按折让接收。默认 margin 0.15 < 矛盾杆 0.2，故带内观测本就构不成
+    // 反对票——折让治的不是扣减，而是"分歧账照记、blend 照跟"这两件啃绿网的事。
+    // 副作用是甜的：拍平压痕 vs 每帧原始观测的分歧也落带内 → 拍平自伤与年审
+    // 冤案（冻块压痕撞降级线）被同一刀顺手同治。折让命中只记只读账 92。
+    bool matureSurfaceObs = weight >= gsMatureObsWeightMin;
+    float obsDelta = abs(sDistNorm - oldVal);
+    bool obsDiscount = gsMatureObsEnable > 0.5 && matureSurfaceObs &&
+                       obsDelta <= gsMatureObsMargin;
+    float q2obs = obsDiscount ? q2 * gsMatureObsDiscount : q2;
+    if (obsDiscount) InterlockedAdd(_CarveStats[92], 1); // 折让命中（HUD 折N）
+
     bool contradicted = sDistNorm > oldVal + 0.2;
     // 自由空间对称扣减：主矛盾通道乘 gsFreeSpaceCarveBoost（默认 2，可关回 1）。
     // 新鲜正式面（刚转正 weight≈0.087）在 q≈0.5 时 2~3 票扣死——混合斜坡伪造品
     // 的多帧一致性反而加速它的死亡；成熟面权重基数大（≤0.5），同等倍率只擦皮，
     // 且成熟面有持续正视赞成票补给，天然免疫。
-    float carveStep = max(q2 * gsCarveGain * gsFreeSpaceCarveBoost, 1.0 / 127.0);
+    // M1：扣减同步吃折让（margin 被调到 0.2 之上时带内也会出现反对票）。
+    float carveStep = max(q2obs * gsCarveGain * gsFreeSpaceCarveBoost, 1.0 / 127.0);
     float carvedWeight = contradicted ? max(weight - carveStep, 0.0) : weight;
 
     // 外推闸只阻止假近表面的增长。若当前射线明确反证已有存量，照常扣权，
@@ -844,6 +960,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (contradicted)
         {
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
+            // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
+            ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
             {
                 uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
@@ -855,7 +973,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         return;
     }
 
-    float blend = q2 * gsBlendRate / (1.0 + weight * gsStability);
+    float blend = q2obs * gsBlendRate / (1.0 + weight * gsStability); // M1：折让带内几何不跟
     blend = clamp(blend, 0.0, 0.7);
     if (blend < 0.005)
     {
@@ -863,6 +981,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (contradicted)
         {
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
+            // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
+            ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
             {
                 uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
@@ -876,7 +996,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
 
     float newTsdf = lerp(oldVal, sDistNorm, blend);
     // 矛盾帧只扣不增：反对票与赞成票同帧抵消是设计缺陷（v2 修复①）
-    float newWeight = contradicted ? carvedWeight : min(weight + q2 * gsWeightGrowth, gsMaxWeight);
+    float newWeight = contradicted ? carvedWeight : min(weight + q2obs * gsWeightGrowth, gsMaxWeight); // M1：折让带内权重慢涨
     // 救援降级①：救援样本不享快速转正——混合斜坡伪造品恰恰能产出"第二次一致原始
     // 观测"，快速转正对它不是防线而是加速器。救援面只能走自然增长慢慢爬到正式阈值。
     bool consistentRawRepeat = !contradicted && !grazingPlaneRescued &&
@@ -919,6 +1039,12 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     if (weight >= gsFormalSurfaceWeight && newWeight < gsFormalSurfaceWeight)
         InterlockedAdd(_CarveStats[70], 1); // formal -> below mesh threshold
     WriteTrackedTsdf(coord, float2(newTsdf, newWeight));
+    // 赞成帧也记账：一致→EMA 收敛向 0。M1.1 折让带内按"一致"记账（Δ=0）——
+    // 不喂分歧（视角偏差不啃绿）且保留养绿通道（盯着看 EMA 向 0 收敛=有迹可循）。
+    // M1 初版"跳过记账"被实机判死：带内=全部小分歧观测=唯一恢复通道，跳过=熟面
+    // EMA 只进不出=绿→黄单行线（用户实锤"颜色不像修改之前有迹可循"）。
+    // 相干通道顺带回中性：带内宽恕的观测不配参与方向签名。
+    ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality);
     if (gsWriteAdmissionTrace > 0.5)
     {
         uint oldTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
@@ -1036,7 +1162,7 @@ void ClearFrozenChunkVotes(uint3 id : SV_DispatchThreadID)
     uint word = id.x >> 5;
     uint bit = 1u << (id.x & 31u);
     if ((_ChunkFreezeClearMask[word] & bit) != 0u)
-        _FrozenChunkVotes[id.x] = uint2(0u, 0u);
+        _FrozenChunkVotes[id.x] = uint4(0u, 0u, 0u, 0u);
 }
 
 // 逐块成熟度普查：只数"长熟体素"（abs(weight)≥gsFrozenMatureWeight 且 |sd|<0.3）。
@@ -1057,7 +1183,15 @@ void CountChunkMaturity(uint3 id : SV_DispatchThreadID)
     if (abs(vol.x) >= 0.3) return;
     uint chunkIndex = FrozenChunkIndexFromCoord(id);
     if (absWeight >= gsDirtyMinWeight)
+    {
         InterlockedAdd(_ChunkMaturity[chunkIndex].z, 1u); // 可出网体素数
+        // 冻结资格门账本（w 槽，置信度消费 v2 第一刀）：可出网族群里低置信
+        // （分歧 EMA≥gsConfidenceLowMin=几何在打架）体素数。CPU 冻结裁决时
+        // w/z 超阈=块没资格稳定，拒冻保持活代谢。与 z 同族群同拍，免新普查。
+        // 置信体未写过时读 0=高置信，门天然失效放行（fail-open）。
+        if (gsConfidenceRW[id] >= gsConfidenceLowMin)
+            InterlockedAdd(_ChunkMaturity[chunkIndex].w, 1u);
+    }
     if (absWeight < gsFrozenMatureWeight) return;
     InterlockedAdd(_ChunkMaturity[chunkIndex].x, 1u); // 长熟体素数
     if (vol.y < 0.0)
@@ -1070,6 +1204,7 @@ void CountChunkMaturity(uint3 id : SV_DispatchThreadID)
 // ──────────────────────────────────────────────────────────────────
 
 #pragma kernel CountSurfaceCoverage
+#pragma kernel CountConfidence
 
 RWStructuredBuffer<uint> _CoverageCounters; // [0]=surface, [1]=frozen, [2]=colored
 
@@ -1093,6 +1228,34 @@ void CountSurfaceCoverage(uint3 id : SV_DispatchThreadID)
         float4 color = gsColorVolumeRead[id];
         if (color.a > 0.1)
             InterlockedAdd(_CoverageCounters[2], 1);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+//  CountConfidence（置信度通道 v1 统计）：按分歧 EMA 三档计数。
+//  只数"有数据"体素（abs(weight)≥gsDirtyMinWeight，冻结的 abs 后照常参与——
+//  冻块的置信度照样要可见）。CPU 定期清零后 dispatch、回读，HUD 回显占比。
+// ──────────────────────────────────────────────────────────────────
+
+RWStructuredBuffer<uint> _ConfidenceStats; // [0]=有数据 [1]=高 [2]=中 [3]=低 [4]=低且相干(纠错嫌疑) [5]=低且纯噪声
+
+[numthreads(4, 4, 4)]
+void CountConfidence(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= gsVoxCount)) return;
+    float2 vol = gsVolumeRW[id];
+    if (abs(vol.y) < gsDirtyMinWeight) return;
+    InterlockedAdd(_ConfidenceStats[0], 1u);
+    float d = gsConfidenceRW[id];
+    if (d < gsConfidenceMidMax)      InterlockedAdd(_ConfidenceStats[1], 1u);
+    else if (d < gsConfidenceLowMin) InterlockedAdd(_ConfidenceStats[2], 1u);
+    else
+    {
+        InterlockedAdd(_ConfidenceStats[3], 1u);
+        // 低置信再按相干拆分：相干=签名一致（真错/真变化嫌疑，闸该放行）；
+        // 纯噪声=方向横跳（折角飞像素若是此类，相干闸拦得住）。
+        float coh = abs(gsCoherenceRW[id] - 0.5) / max(d, 0.02);
+        InterlockedAdd(_ConfidenceStats[coh >= 0.5 ? 4u : 5u], 1u);
     }
 }
 

@@ -63,6 +63,13 @@ Shader "Genesis/ScanMeshVertexColor"
             float4 gsVoxCount;
             float gsVoxSize;
 
+            // ── 置信度通道 v1（只读诊断可视化，全局量由 VolumeIntegrator 下发）──
+            TEXTURE3D(gsConfidence);
+            SAMPLER(sampler_gsConfidence);
+            float _RSConfidenceViz;
+            float gsConfidenceMidMax;
+            float gsConfidenceLowMin;
+
             // ── Globals set by RoomScanner ──
             float _RSNoFreezeTint;
             float _RSNormalFallback;
@@ -129,6 +136,21 @@ Shader "Genesis/ScanMeshVertexColor"
                 if (_RSNoFreezeTint < 0.5 && IsVoxelFrozen(worldPos))
                     color = lerp(color, half3(0.3, 0.5, 0.9), 0.25);
                 return color;
+            }
+
+            // 置信度通道 v1 可视化（_RSConfidenceViz 诊断开关，默认关）：
+            // 高置信=原色（分歧 EMA 小，逐帧观测一致）；中=黄（1.5~3.8cm 抖动）；
+            // 低=蓝紫（几何在打架）；体素已无数据=灰。只读着色，不碰生产逻辑。
+            half3 ApplyConfidenceViz(half3 color, float3 worldPos)
+            {
+                if (_RSConfidenceViz < 0.5) return color;
+                float3 uvw = WorldToVoxelUVW(worldPos);
+                float w = SAMPLE_TEXTURE3D_LOD(gsVolume, sampler_gsVolume, uvw, 0).g;
+                if (abs(w) < 0.01) return half3(0.5, 0.5, 0.5);
+                float d = SAMPLE_TEXTURE3D_LOD(gsConfidence, sampler_gsConfidence, uvw, 0).r;
+                if (d < gsConfidenceMidMax) return color;
+                if (d < gsConfidenceLowMin) return half3(1.0, 0.85, 0.1);
+                return half3(0.45, 0.3, 1.0);
             }
 
             struct Varyings
@@ -337,18 +359,22 @@ Shader "Genesis/ScanMeshVertexColor"
                 }
                 else
                 {
-                    // 08-19 碎网修复：世界空间格线画法替代条带抽稀（观感对标
-                    // Meta 系统网格）。根因：Meta 的网眼是几何上就粗的大三角形
-                    // 经纬网；顶点侧按体素格挑条带只能得到 5cm 微三角形锯齿条带，
-                    // 先天做不出干净经纬线。这里片元级直接画：像素世界坐标距最近
-                    // 格平面（x/y/z = k×spacing）小于约 1 像素宽即判在线上，
-                    // fwidth 抗锯齿、屏宽恒定；任意朝向墙面都得笔直经纬网。
-                    // 线连续无缺口，顶点抽稀因此同步回 1（关）。
-                    float spacing = max(_RSGridSpacing, 0.05);
-                    float3 gridDist = abs(frac(IN.positionWS / spacing + 0.5) - 0.5) * spacing;
-                    float3 pxWidth = fwidth(IN.positionWS) * thickness;
-                    float3 lineI = 1.0 - smoothstep(float3(0.0, 0.0, 0.0), pxWidth, gridDist);
-                    if (max(lineI.x, max(lineI.y, lineI.z)) < 0.5)
+                    // 08-19 回退：恢复重心坐标密集真边线框（08-18 晚版式）。
+                    // 碎网观感战役两连败记录：①顶点侧条带抽稀=5cm 微三角形锯齿
+                    // 条带，先天做不出 Meta 几何级粗网；②片元级世界格线画法=
+                    // 实机判定观感不佳，且大网眼不利于观察底层细节。结论：Meta
+                    // 的粗网必须几何级生成（路线A粗皮已落地备用，默认关），
+                    // 诊断期主显示就用密集真边。
+                    float3 bary = IN.barycentric;
+                    float3 dx = ddx(bary);
+                    float3 dy = ddy(bary);
+                    float3 edgeWidth = sqrt(dx * dx + dy * dy);
+                    float3 edge = smoothstep(0.0, edgeWidth * thickness, bary);
+                    float minEdge = min(edge.x, min(edge.y, edge.z));
+
+                    // Discard interior — threshold scales inversely with thickness
+                    float discardThreshold = saturate(1.0 - thickness * 0.15);
+                    if (minEdge > discardThreshold)
                         discard;
                 }
 
@@ -359,6 +385,7 @@ Shader "Genesis/ScanMeshVertexColor"
                     : _RSJointDiagnostic > 0.5
                         ? IN.diagnosticColor
                         : _RSExtractionColor.rgb;
+                lineColor = ApplyConfidenceViz(lineColor, IN.positionWS);
                 return half4(lineColor, _RSExtractionColor.a);
             }
 
@@ -382,6 +409,7 @@ Shader "Genesis/ScanMeshVertexColor"
 
                 // 2. Apply freeze tint
                 baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
+                baseColor = ApplyConfidenceViz(baseColor, IN.positionWS);
 
                 return _RSHeraReplayActive > 0.5
                     ? half4(HeraRouteColor(heraDelegated), 1)

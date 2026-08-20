@@ -26,6 +26,32 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader depthDilationCompute;
         [SerializeField] private ComputeShader bilateralFilterCompute;
         [SerializeField] private ComputeShader depthEdgeCleanCompute;
+        [Tooltip("手部打码 compute；留空则 Resources/HandMask 兜底装载（免场景 YAML 接线）。")]
+        [SerializeField] private ComputeShader handMaskCompute;
+        [Tooltip("源头时序滤波 compute；留空则 Resources/DepthTemporalFilter 兜底装载（免场景 YAML 接线）。")]
+        [SerializeField] private ComputeShader temporalFilterCompute;
+
+        [Header("源头时序滤波（08-20，数据层第一刀）")]
+        [Tooltip("深度先跨帧稳定再进双边/缘洗/TSDF：当前像素重建世界点，重投影到上一拍历史；" +
+                 "世界位移超阈=真变化立即放行，带内才做 EMA。手罩 0=弃权只穿透不清历史。 (default true)")]
+        [SerializeField] private bool enableTemporalFilter = true;
+        [SerializeField, Range(0.05f, 1f), Tooltip("静态/慢动时当前帧权重。0.35≈3 拍收敛到 95%；快速转视会按角速度自动放大到 1。")]
+        private float temporalFilterAlpha = 0.35f;
+        [SerializeField, Min(0.005f), Tooltip("真变化判据基数（米）：重投影历史点与当前世界点距离超此直接放行，不吃滤波延迟。")]
+        private float temporalChangeBaseMeters = 0.04f;
+        [SerializeField, Min(0f), Tooltip("真变化判据距离系数：远处允许更大绝对位移，防边缘 bleed 被平均。")]
+        private float temporalChangeDistanceScale = 0.02f;
+
+        [Header("手部语义剔除（08-20，公共配方 E）")]
+        [Tooltip("第一层=平台原生手部剔除（XR_META_environment_depth_hand_removal）：手追在跑时手像素被" +
+                 "背景估计替换——不烙手也不留洞。持握控制器时手追暂停=自动失效，由第二层球打码补位。 (default true)")]
+        [SerializeField] private bool enableNativeHandRemoval = true;
+        [Tooltip("第二层=控制器/手关节球深度打码：球罩住的像素写 0=弃权（复用缘洗语义：不种不长不抹不投票），" +
+                 "整合/穿越票/拍平/B1 全自动免疫。原生剔除生效时只打控制器球（避免把原生填的背景打回弃权）。 (default true)")]
+        [SerializeField] private bool enableHandMask = true;
+        [SerializeField, Range(0.05f, 0.2f)] private float handPalmRadius = 0.11f;
+        [SerializeField, Range(0.03f, 0.12f)] private float handTipRadius = 0.07f;
+        [SerializeField, Range(0.06f, 0.25f)] private float controllerSphereRadius = 0.13f;
 
         [Header("Bilateral Depth Filter")]
         [Tooltip("Edge-preserving depth denoising guided by passthrough RGB. Smooths flat surfaces while keeping object boundaries sharp.")]
@@ -105,13 +131,19 @@ namespace Genesis.RoomScan
         // 四元数提取存在分支不连续风险（曾致诊断运动位 100% 饱和失效）。
         private bool _hasLastDepthRot;
         private Quaternion _lastDepthRot;
+        private Vector3 _lastDepthPos;
         private float _lastDepthRotTime;
         private float _smoothedDepthAngSpeed;
+        private float _smoothedDepthLinSpeed;
 
         /// <summary>平滑后的深度位姿角速度（°/s），随深度帧到达更新。</summary>
         public float SmoothedDepthAngularSpeed => _smoothedDepthAngSpeed;
 
-        private void TrackDepthAngularSpeed(Quaternion rot)
+        /// <summary>平滑后的深度位姿线速度（m/s），与角速度同源同时刻。
+        /// 08-21 造炮新增：定点实验实锤平移不转头也触发时延族掉负，噪声模型必须含平移项。</summary>
+        public float SmoothedDepthLinearSpeed => _smoothedDepthLinSpeed;
+
+        private void TrackDepthAngularSpeed(Quaternion rot, Vector3 pos)
         {
             float now = Time.unscaledTime;
             if (_hasLastDepthRot)
@@ -123,9 +155,14 @@ namespace Genesis.RoomScan
                     // 帧时间戳毛刺会产生上万度的假尖峰，截断保护 EMA
                     _smoothedDepthAngSpeed = Mathf.Lerp(
                         _smoothedDepthAngSpeed, Mathf.Min(inst, 2000f), 0.35f);
+                    float instLin = Vector3.Distance(_lastDepthPos, pos) / dt;
+                    // 同理截断（追踪丢失重定位会产生瞬移假尖峰）
+                    _smoothedDepthLinSpeed = Mathf.Lerp(
+                        _smoothedDepthLinSpeed, Mathf.Min(instLin, 20f), 0.35f);
                 }
             }
             _lastDepthRot = rot;
+            _lastDepthPos = pos;
             _lastDepthRotTime = now;
             _hasLastDepthRot = true;
         }
@@ -195,6 +232,32 @@ namespace Genesis.RoomScan
         // 双边/缘洗共用同名 uniform，同 ID 复用（逐眼交替的眼偏移）
         private static readonly int EyeOffsetID = Shader.PropertyToID("_EyeOffset");
 
+        // 手部打码 property IDs（_DepthW/_DepthH 与双边同名同 ID，复用 BilDepthWID/BilDepthHID）
+        private static readonly int RawDepthID = Shader.PropertyToID("_RawDepth");
+        private static readonly int MaskedDepthID = Shader.PropertyToID("_MaskedDepth");
+        private static readonly int HandMaskStatsID = Shader.PropertyToID("_HandMaskStats");
+        private static readonly int HandSpheresID = Shader.PropertyToID("_HandSpheres");
+        private static readonly int HandSphereCountID = Shader.PropertyToID("_HandSphereCount");
+        private static readonly int MaskProjInvID = Shader.PropertyToID("_MaskProjInv");
+        private static readonly int MaskViewInvID = Shader.PropertyToID("_MaskViewInv");
+
+        // 源头时序滤波 property IDs（_SrcDepth/_DstDepth/_DepthW/_DepthH 与双边同名同 ID，复用）
+        private static readonly int TemporalHistDepthID = Shader.PropertyToID("_HistDepth");
+        private static readonly int TemporalNextHistDepthID = Shader.PropertyToID("_NextHistDepth");
+        private static readonly int TemporalStatsID = Shader.PropertyToID("_TemporalStats");
+        private static readonly int TemporalCurProjID = Shader.PropertyToID("_CurProj");
+        private static readonly int TemporalCurProjInvID = Shader.PropertyToID("_CurProjInv");
+        private static readonly int TemporalCurViewID = Shader.PropertyToID("_CurView");
+        private static readonly int TemporalCurViewInvID = Shader.PropertyToID("_CurViewInv");
+        private static readonly int TemporalPrevProjID = Shader.PropertyToID("_PrevProj");
+        private static readonly int TemporalPrevProjInvID = Shader.PropertyToID("_PrevProjInv");
+        private static readonly int TemporalPrevViewID = Shader.PropertyToID("_PrevView");
+        private static readonly int TemporalPrevViewInvID = Shader.PropertyToID("_PrevViewInv");
+        private static readonly int TemporalHasPrevID = Shader.PropertyToID("_HasPrev");
+        private static readonly int TemporalAlphaID = Shader.PropertyToID("_TemporalAlpha");
+        private static readonly int TemporalChangeBaseID = Shader.PropertyToID("_TemporalChangeBase");
+        private static readonly int TemporalChangeScaleID = Shader.PropertyToID("_TemporalChangeScale");
+
         /// <summary>逐眼交替节拍：每次融合前预处理只洗一只眼，0/1 翻转。</summary>
         private int _preprocessEye;
 
@@ -212,6 +275,10 @@ namespace Genesis.RoomScan
 
         /// <summary>最近一次中心深度中位数（米，左眼线性化）；&lt;0 = 尚无有效样本。</summary>
         public float LastCenterDepthMeters { get; private set; } = -1f;
+
+        /// <summary>深度帧尺寸（B1 平面拟合影子内核 dispatch 用）；无深度帧时为 0。</summary>
+        public int DepthWidth => _depthTex != null ? _depthTex.width : 0;
+        public int DepthHeight => _depthTex != null ? _depthTex.height : 0;
 
         /// <summary>发起一次中心 8×8 深度采样（异步回读，结果落 LastCenterDepthMeters）。</summary>
         public void RequestCenterDepthSample()
@@ -268,6 +335,10 @@ namespace Genesis.RoomScan
         private bool _hasBilateralKernel;
         private ComputeKernelHelper _edgeCleanKernel;
         private bool _hasEdgeCleanKernel;
+        private ComputeKernelHelper _handMaskKernel;
+        private bool _hasHandMaskKernel;
+        private ComputeKernelHelper _temporalKernel;
+        private bool _hasTemporalKernel;
 
         private Texture _depthTex;
         /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
@@ -290,6 +361,28 @@ namespace Genesis.RoomScan
         private ComputeBuffer _edgeStats;
         private bool _edgeStatsReadbackPending;
         private int _edgeCleansSinceStats;
+        // 手部语义剔除状态（球打码层）
+        private RenderTexture _handMaskedDepthTex;
+        private ComputeBuffer _handMaskStats;
+        private bool _handMaskStatsReadbackPending;
+        private int _handMasksSinceStats;
+        private readonly HandSphereCollector _handSphereCollector = new HandSphereCollector();
+        private static readonly uint[] ZeroHandMaskStats = new uint[1];
+        // 源头时序滤波状态：输出 + 历史读/写双缓冲（重投影读邻域，读写必须分卷防竞态）。
+        private RenderTexture _temporalDepthTex;
+        private RenderTexture _temporalHistReadTex;
+        private RenderTexture _temporalHistWriteTex;
+        private ComputeBuffer _temporalStats;
+        private bool _temporalStatsReadbackPending;
+        private int _temporalSinceStats;
+        private bool _hasTemporalHistory;
+        private readonly Matrix4x4[] _prevTemporalProj = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalProjInv = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalView = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalViewInv = new Matrix4x4[2];
+        private static readonly uint[] ZeroTemporalStats = new uint[2];
+        private bool _handRemovalTried;
+        private bool _handRemovalActive;
         private readonly Vector4[] _linearizeAB = new Vector4[2];
         private static readonly uint[] ZeroEdgeStats = new uint[4];
         private int _dilationMaxStep;
@@ -304,6 +397,25 @@ namespace Genesis.RoomScan
         public uint LastGrazingPlaneRescuedCount { get; private set; }
         /// <summary>边缘清洗统计是否已有首批读数。</summary>
         public bool HasEdgeCleanStats { get; private set; }
+
+        /// <summary>平台原生手部剔除是否已生效（HUD"剔"）。</summary>
+        public bool NativeHandRemovalActive => _handRemovalActive;
+        /// <summary>本拍参与打码的球数（HUD"手"）；0=无手无柄在追或打码关。</summary>
+        public int HandSphereCount => _handSphereCollector.Count;
+        /// <summary>手部追踪子系统是否在跑（HUD 诊断）。</summary>
+        public bool HandTrackingRunning => _handSphereCollector.HandTrackingRunning;
+        /// <summary>上一统计周期被球打码罩住的像素数（HUD"罩"）。</summary>
+        public uint LastHandMaskedPixels { get; private set; }
+        /// <summary>球打码 pass 是否可用（开关+内核齐备）。</summary>
+        public bool HandMaskEnabled => enableHandMask && _hasHandMaskKernel;
+        /// <summary>源头时序滤波 pass 是否可用（开关+内核齐备）。</summary>
+        public bool TemporalFilterEnabled => enableTemporalFilter && _hasTemporalKernel;
+        /// <summary>上一统计周期带内稳定混合的像素数（HUD"时稳"）。</summary>
+        public uint LastTemporalStablePixels { get; private set; }
+        /// <summary>上一统计周期判为真变化并全速放行的像素数（HUD"时变"）。</summary>
+        public uint LastTemporalChangedPixels { get; private set; }
+        /// <summary>时序滤波统计是否已有首批读数。</summary>
+        public bool HasTemporalStats { get; private set; }
 
         private Texture _rgbGuide;
 
@@ -380,6 +492,46 @@ namespace Genesis.RoomScan
             {
                 _edgeCleanKernel = new ComputeKernelHelper(depthEdgeCleanCompute, "DepthEdgeClean");
                 _hasEdgeCleanKernel = true;
+            }
+            // 手部打码内核（PlaneFitShadow 案教训 checklist）：HasKernel 前置闸 + try/catch 保险丝，
+            // 内核缺失/编译失败只停打码，不得截断 Start 后半截饿死融合。
+            if (handMaskCompute == null)
+                handMaskCompute = Resources.Load<ComputeShader>("HandMask");
+            if (handMaskCompute != null && handMaskCompute.HasKernel("HandMask"))
+            {
+                try
+                {
+                    _handMaskKernel = new ComputeKernelHelper(handMaskCompute, "HandMask");
+                    _hasHandMaskKernel = true;
+                }
+                catch (Exception e)
+                {
+                    Logger.Warning("DepthCapture: HandMask 内核初始化失败，球打码停用：" + e.Message);
+                }
+            }
+            else if (handMaskCompute != null)
+            {
+                Logger.Warning("DepthCapture: HandMask.compute 无 HandMask 内核（导入失败？查 Editor.log），球打码停用");
+            }
+
+            // 源头时序滤波内核（与 HandMask 同 checklist）：内核缺失只停滤波，不得截断 Start 后半截。
+            if (temporalFilterCompute == null)
+                temporalFilterCompute = Resources.Load<ComputeShader>("DepthTemporalFilter");
+            if (temporalFilterCompute != null && temporalFilterCompute.HasKernel("TemporalFilter"))
+            {
+                try
+                {
+                    _temporalKernel = new ComputeKernelHelper(temporalFilterCompute, "TemporalFilter");
+                    _hasTemporalKernel = true;
+                }
+                catch (Exception e)
+                {
+                    Logger.Warning("DepthCapture: TemporalFilter 内核初始化失败，源头时序滤波停用：" + e.Message);
+                }
+            }
+            else if (temporalFilterCompute != null)
+            {
+                Logger.Warning("DepthCapture: DepthTemporalFilter.compute 无 TemporalFilter 内核（导入失败？查 Editor.log），源头时序滤波停用");
             }
 
             _dilationMaxStep = 1;
@@ -529,6 +681,7 @@ namespace Genesis.RoomScan
                 _arOcclusionManager.enabled = false;
             }
             DepthAvailable = false;
+            _hasTemporalHistory = false; // 停扫后再开必须重新种历史，防隔夜残影
         }
 
         private void OnApplicationPause(bool paused)
@@ -544,6 +697,7 @@ namespace Genesis.RoomScan
                     _subscribed = false;
                 }
                 DepthAvailable = false;
+                _hasTemporalHistory = false; // 应用暂停期间位姿/世界锁可能重建
             }
             else if (_captureActive)
             {
@@ -582,6 +736,21 @@ namespace Genesis.RoomScan
             _edgeStats = null;
             _edgeStatsReadbackPending = false;
             HasEdgeCleanStats = false;
+            if (_handMaskedDepthTex) { Destroy(_handMaskedDepthTex); _handMaskedDepthTex = null; }
+            _handMaskStats?.Release();
+            _handMaskStats = null;
+            _handMaskStatsReadbackPending = false;
+            LastHandMaskedPixels = 0;
+            if (_temporalDepthTex) { Destroy(_temporalDepthTex); _temporalDepthTex = null; }
+            if (_temporalHistReadTex) { Destroy(_temporalHistReadTex); _temporalHistReadTex = null; }
+            if (_temporalHistWriteTex) { Destroy(_temporalHistWriteTex); _temporalHistWriteTex = null; }
+            _temporalStats?.Release();
+            _temporalStats = null;
+            _temporalStatsReadbackPending = false;
+            HasTemporalStats = false;
+            LastTemporalStablePixels = 0;
+            LastTemporalChangedPixels = 0;
+            _hasTemporalHistory = false;
             _dilatedDepth = null;
             Logger.Info("DepthCapture: GPU resources released");
         }
@@ -624,7 +793,7 @@ namespace Genesis.RoomScan
         private bool _preprocessDirty;
 
         /// <summary>
-        /// 融合前预处理：双边滤波 → 边缘清洗 → 全局属性 → 法线 → 标膨胀脏。
+        /// 融合前预处理：手罩 → 源头时序滤波 → 双边滤波 → 边缘清洗 → 全局属性 → 法线 → 标膨胀脏。
         /// 只在 scanner 即将 Integrate 时调用；无新深度帧则空转早退。
         /// </summary>
         public void PreprocessLatestFrame()
@@ -638,6 +807,8 @@ namespace Genesis.RoomScan
             // 注意：HUD"缘:"统计随之减半（每次只数一只眼），属预期。
             _preprocessEye = 1 - _preprocessEye;
 
+            ApplyHandMask(); // 手部打码必须在时序/双边之前：滤波邻域会把弃权值洇回有效像素
+            ApplyTemporalFilter(); // 数据层第一刀：深度先跨帧稳定再进空间滤波/TSDF
             ApplyBilateralFilter();
             ApplyDepthEdgeClean();
             SetGlobalShaderProperties();
@@ -684,7 +855,7 @@ namespace Genesis.RoomScan
             if (!_mainCam) _mainCam = Camera.main;
             if (!_mainCam) return;
 
-            TrackDepthAngularSpeed(_mainCam.transform.rotation);
+            TrackDepthAngularSpeed(_mainCam.transform.rotation, _mainCam.transform.position);
 
             Matrix4x4 p = _mainCam.projectionMatrix;
             Matrix4x4 pi = p.inverse;
@@ -718,7 +889,37 @@ namespace Genesis.RoomScan
 
             if (!DepthAvailable) return;
 
-            TrackDepthAngularSpeed(poses[0].rotation);
+            // 第一层手部语义剔除=平台原生（XR_META_environment_depth_hand_removal）：
+            // 手追在跑时手像素被背景估计替换（不烙手也不留洞）。裸手主防线；
+            // 持握控制器时手追暂停自动失效，由 ApplyHandMask 控制器球补位。
+            // 此处子系统已 running；设置失败/不支持不影响扫描，只记日志。
+            if (!_handRemovalTried)
+            {
+                _handRemovalTried = true;
+                if (enableNativeHandRemoval &&
+                    _arOcclusionManager.subsystem is UnityEngine.XR.OpenXR.Features.Meta.MetaOpenXROcclusionSubsystem metaOcc)
+                {
+                    try
+                    {
+                        if (metaOcc.isHandRemovalSupported == Supported.Supported)
+                        {
+                            var res = metaOcc.TrySetHandRemovalEnabled(true);
+                            _handRemovalActive = res == UnityEngine.XR.OpenXR.NativeTypes.XrResult.Success;
+                            Logger.Info($"DepthCapture: 原生手部剔除 TrySet → {res}（active={_handRemovalActive}）");
+                        }
+                        else
+                        {
+                            Logger.Info($"DepthCapture: 原生手部剔除不受支持（{metaOcc.isHandRemovalSupported}），纯球打码兜底");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Warning("DepthCapture: 原生手部剔除设置失败（不影响扫描）：" + e.Message);
+                    }
+                }
+            }
+
+            TrackDepthAngularSpeed(poses[0].rotation, poses[0].position);
 
             for (int i = 0; i < 2; i++)
             {
@@ -768,7 +969,197 @@ namespace Genesis.RoomScan
             return 0;
         }
 
+        /// <summary>
+        /// 性能二分热键（scanner 转发，左摇杆上）：源头时序滤波开关。
+        /// 盯墙养绿 A/B 用：同墙同段实时切换，比打两个包干净。关闭即
+        /// ApplyTemporalFilter 早退（其内部自门控已清 _hasTemporalHistory，
+        /// 重开不吃隔夜残影），管线零改线。返回新状态。
+        /// </summary>
+        public bool ToggleTemporalFilter()
+        {
+            enableTemporalFilter = !enableTemporalFilter;
+            _hasTemporalHistory = false;
+            return enableTemporalFilter;
+        }
+
         private bool _loggedBilateralSkip;
+
+        /// <summary>
+        /// 手部语义剔除第二层（球打码）：控制器/手关节球罩住的深度像素写 0=弃权，
+        /// 复用缘洗弃权语义（不种不长不抹），整合/穿越票/拍平/B1 全自动免疫。
+        /// 与"弃权像素不投穿越票"通用闸（VolumeIntegration 冻票路径）同车——
+        /// 不拦的话 0=近端算出深负 frozenDelta 会给球后方冻块灌遮挡票=误解冻。
+        /// 原生剔除生效时采集器只回控制器球（避免把原生填的背景估计打回弃权）。
+        /// 无球=不 dispatch 不换纹理=零成本透传。双眼同拍（深度图低清，成本可忽略）。
+        /// </summary>
+        private void ApplyHandMask()
+        {
+            if (!enableHandMask || !_hasHandMaskKernel || _depthTex == null) return;
+
+            _handSphereCollector.Refresh(_trackingSpaceTransform, _handRemovalActive,
+                handPalmRadius, handTipRadius, controllerSphereRadius);
+            if (_handSphereCollector.Count <= 0) return;
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+
+            if (_handMaskedDepthTex == null || _handMaskedDepthTex.width != w || _handMaskedDepthTex.height != h)
+            {
+                if (_handMaskedDepthTex) Destroy(_handMaskedDepthTex);
+                _handMaskedDepthTex = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _handMaskedDepthTex.Create();
+            }
+
+            if (_handMaskStats == null)
+            {
+                _handMaskStats = new ComputeBuffer(1, sizeof(uint));
+                _handMaskStats.SetData(ZeroHandMaskStats);
+            }
+
+            var cs = handMaskCompute;
+            _handMaskKernel.Set(RawDepthID, _depthTex);
+            _handMaskKernel.Set(MaskedDepthID, _handMaskedDepthTex);
+            _handMaskKernel.Set(HandMaskStatsID, _handMaskStats);
+            cs.SetVectorArray(HandSpheresID, _handSphereCollector.Spheres);
+            cs.SetInt(HandSphereCountID, _handSphereCollector.Count);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetMatrixArray(MaskProjInvID, _projInv);
+            cs.SetMatrixArray(MaskViewInvID, _viewInv);
+
+            _handMaskKernel.DispatchFit(w, h, 2);
+
+            _depthTex = _handMaskedDepthTex;
+
+            // 罩像素读数（HUD"罩"）：每 15 次打码结算一次，读回即清零开新周期
+            _handMasksSinceStats++;
+            if (_handMasksSinceStats >= 15 && !_handMaskStatsReadbackPending)
+            {
+                _handMasksSinceStats = 0;
+                _handMaskStatsReadbackPending = true;
+                AsyncGPUReadback.Request(_handMaskStats, OnHandMaskStatsReadback);
+            }
+        }
+
+        private void OnHandMaskStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _handMaskStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 1) return;
+            LastHandMaskedPixels = data[0];
+            _handMaskStats?.SetData(ZeroHandMaskStats);
+        }
+
+        /// <summary>
+        /// 源头时序滤波：当前深度先经世界点重投影与上一拍对齐；带内噪声做 EMA，
+        /// 带外真变化直接全速放行。放在手罩之后、双边之前——弃权 0 穿透且不清洗历史，
+        /// 双边邻域也就不会把旧表面/弃权值互相洇染。输出原位替换 _depthTex，下游零改线。
+        /// </summary>
+        private void ApplyTemporalFilter()
+        {
+            if (!enableTemporalFilter || !_hasTemporalKernel || _depthTex == null)
+            {
+                _hasTemporalHistory = false; // 停用后再开不得吃隔夜历史
+                return;
+            }
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+            bool recreate = _temporalDepthTex == null || _temporalDepthTex.width != w || _temporalDepthTex.height != h;
+            if (recreate)
+            {
+                if (_temporalDepthTex) Destroy(_temporalDepthTex);
+                if (_temporalHistReadTex) Destroy(_temporalHistReadTex);
+                if (_temporalHistWriteTex) Destroy(_temporalHistWriteTex);
+                _temporalDepthTex = CreateTemporalDepthTexture(w, h, "DepthTemporalOut");
+                _temporalHistReadTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistRead");
+                _temporalHistWriteTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistWrite");
+                _hasTemporalHistory = false;
+            }
+
+            if (_temporalStats == null)
+            {
+                _temporalStats = new ComputeBuffer(2, sizeof(uint));
+                _temporalStats.SetData(ZeroTemporalStats);
+            }
+
+            var cs = temporalFilterCompute;
+            _temporalKernel.Set(BilSrcDepthID, _depthTex);
+            _temporalKernel.Set(TemporalHistDepthID, _temporalHistReadTex);
+            _temporalKernel.Set(BilDstDepthID, _temporalDepthTex);
+            _temporalKernel.Set(TemporalNextHistDepthID, _temporalHistWriteTex);
+            _temporalKernel.Set(TemporalStatsID, _temporalStats);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetMatrixArray(TemporalCurProjID, _proj);
+            cs.SetMatrixArray(TemporalCurProjInvID, _projInv);
+            cs.SetMatrixArray(TemporalCurViewID, _view);
+            cs.SetMatrixArray(TemporalCurViewInvID, _viewInv);
+            cs.SetMatrixArray(TemporalPrevProjID, _prevTemporalProj);
+            cs.SetMatrixArray(TemporalPrevProjInvID, _prevTemporalProjInv);
+            cs.SetMatrixArray(TemporalPrevViewID, _prevTemporalView);
+            cs.SetMatrixArray(TemporalPrevViewInvID, _prevTemporalViewInv);
+            cs.SetInt(TemporalHasPrevID, _hasTemporalHistory ? 1 : 0);
+            // 转头越快，当前帧权重越大；到融合运动闸同杆（90°/s）时基本直通。
+            float motionAlpha = Mathf.Clamp01(_smoothedDepthAngSpeed / 90f);
+            cs.SetFloat(TemporalAlphaID, Mathf.Max(temporalFilterAlpha, motionAlpha));
+            cs.SetFloat(TemporalChangeBaseID, temporalChangeBaseMeters);
+            cs.SetFloat(TemporalChangeScaleID, temporalChangeDistanceScale);
+
+            _temporalKernel.DispatchFit(w, h, 2);
+
+            _depthTex = _temporalDepthTex;
+            (_temporalHistReadTex, _temporalHistWriteTex) = (_temporalHistWriteTex, _temporalHistReadTex);
+            Array.Copy(_proj, _prevTemporalProj, 2);
+            Array.Copy(_projInv, _prevTemporalProjInv, 2);
+            Array.Copy(_view, _prevTemporalView, 2);
+            Array.Copy(_viewInv, _prevTemporalViewInv, 2);
+            _hasTemporalHistory = true;
+
+            _temporalSinceStats++;
+            if (_temporalSinceStats >= 15 && !_temporalStatsReadbackPending)
+            {
+                _temporalSinceStats = 0;
+                _temporalStatsReadbackPending = true;
+                AsyncGPUReadback.Request(_temporalStats, OnTemporalStatsReadback);
+            }
+        }
+
+        private static RenderTexture CreateTemporalDepthTexture(int w, int h, string name)
+        {
+            var rt = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+            {
+                name = name,
+                dimension = TextureDimension.Tex2DArray,
+                volumeDepth = 2,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            rt.Create();
+            return rt;
+        }
+
+        private void OnTemporalStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _temporalStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 2) return;
+            LastTemporalStablePixels = data[0];
+            LastTemporalChangedPixels = data[1];
+            HasTemporalStats = true;
+            _temporalStats?.SetData(ZeroTemporalStats);
+        }
+
         private void ApplyBilateralFilter()
         {
             if (!enableBilateralFilter || !_hasBilateralKernel || _rgbGuide == null || _depthTex == null)

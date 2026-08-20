@@ -56,6 +56,8 @@ namespace Genesis.RoomScan
         private float coarseSkinMinWeight = 0.04f;
         [SerializeField, Range(1f, 12f), Tooltip("粗皮提取频率（Hz）：皮不需要跟随细网 12Hz，4Hz 足够")]
         private float coarseSkinHz = 4f;
+        [SerializeField, Tooltip("粗皮总开关（默认关）：08-19 用户拍板——皮属最后装修，诊断期主显示=密集重心线框，粗皮留待装修期启用")]
+        private bool enableCoarseSkin = false;
         [SerializeField, Tooltip("Max vertex fraction of total voxels (0.01-0.10).")]
         [Range(0.01f, 0.10f)] private float gpuVertexBudgetPercent = 0.08f;
 
@@ -414,6 +416,7 @@ namespace Genesis.RoomScan
         private void EnsureCoarseSkin()
         {
             if (_coarseSkin != null) return;
+            if (!enableCoarseSkin) return;
             if (coarseSkinCompute == null) return;
             if (_volume == null) _volume = VolumeIntegrator.Instance;
             if (_volume == null) return;

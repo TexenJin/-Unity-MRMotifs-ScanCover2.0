@@ -35,6 +35,8 @@ namespace Genesis.RoomScan
         private int meshDisplayStride = 1;
         [SerializeField, Range(0.1f, 1.0f), Tooltip("世界格线网眼间距（米）：片元级在网格表面直接画经纬线，间距=网眼，观感对标 Meta 系统网格。0.3=30cm 网眼（推荐）；嫌密调大，嫌疏调小")]
         private float meshGridSpacing = 0.3f;
+        [SerializeField, Tooltip("置信度通道 v1 可视化（诊断开关，默认关）：开=按体素分歧 EMA 给网格着色——高置信=原色 / 中=黄 / 低=蓝紫（几何在打架）/ 无数据=灰。只读着色，不碰任何生产逻辑")]
+        private bool confidenceViz = false;
 
         [Header("覆盖范围")]
         [SerializeField, Tooltip("头部排除区（QRS 原版防自扫）：开=头周圆柱内永不生成网格（半径在 VolumeIntegrator.exclusionRadius 调）；关=周围近距也能覆盖网格")]
@@ -61,10 +63,25 @@ namespace Genesis.RoomScan
         private int frozenBlockStabilityTolerance = 24;
         [SerializeField, Min(1), Tooltip("解冻门槛：冻结块单窗穿越票（自由空间+遮挡）达到此数记一个热窗，连续两窗达标才解冻（防抖动）。32³ 块比 64³ 小，阈值同比例降。 (default 200)")]
         private int frozenBlockVoteThreshold = 200;
-        [SerializeField, Range(1f, 4f), Tooltip("棘轮解冻：每解冻过一次的块，票阈×倍率^次数（首解保持灵敏，振荡成本指数升，真变化永留申诉通道）。1=固定阈（退回旧行为）。 (default 2)")]
-        private float frozenBlockVoteRatchet = 2f;
+        [SerializeField, Range(1f, 8f), Tooltip("棘轮解冻：每解冻过一次的块，票阈×倍率^次数（首解保持灵敏，振荡成本指数升，真变化永留申诉通道）。1=固定阈（退回旧行为）。 (default 3，08-19 深夜校准：×8 止血档曾致纠错名义化（手难纠错），×2 复活纠错成功但放出噪声荒漠区”解-活-噪-杀“循环（实机：解23/帧32，自愈靠棘轮升档但路太长）；×3=首解 200 不变保灵敏度，惯犯升档陡一档 200/600/1800/5400/16200 让脏区更快锁死。振荡区票荒双保险（拍平截票+噪拦）不变，复发再回调)")]
+        private float frozenBlockVoteRatchet = 3f;
+        [SerializeField, Min(1), Tooltip("T2 补洞门槛：冻结块单窗补洞票（冻块内空体素种子出生数）达到此数记一个热窗，连续两窗达标→重排该块页面重提（不解冻）。种子每体素一生只出生一次，票天然有界，阈值可与解冻阈同档。 (default 200)")]
+        private int frozenBlockHoleVoteThreshold = 200;
         [SerializeField, Tooltip("冻结需相邻两窗稳定（旧行为：冻结延迟 4-8s）。关=一窗达标即冻（速冻，2-4s），配合实时轨先看后冻。 (default false)")]
         private bool frozenBlockRequireStability = false;
+        [SerializeField, Tooltip("冻结资格门（置信度消费 v2 第一刀，08-20 用户拍板主刀）：开=冻结裁决时查块内低置信体素占比，" +
+                 "超阈拒冻——噪声荒漠/几何打架的块没资格稳定，永不冻结保持 v2.2 式活代谢（幻影随生随杀）；" +
+                 "拍平压稳折角→观测一致→置信升→自然获得冻结资格，振荡断根不依赖棘轮高度。" +
+                 "只闸普查冻结路径，不碰复冻兜底（振荡最后防线，防止闸门误伤重开振荡战）。 (default true)")]
+        private bool enableFreezeConfidenceGate = true;
+        [SerializeField, Range(0.02f, 0.5f), Tooltip("资格门低置信占比上限：块内可出网体素中分歧 EMA 低置信（几何在打架）占比超过此值则拒冻。0.2=五分之一体素在打架就不配冻。 (default 0.2)")]
+        private float freezeGateLowConfMaxFrac = 0.2f;
+        [SerializeField, Range(0.5f, 4f), Tooltip("冻结热身期（秒）：块首次报满成熟下限后须等满此时间才许冻——给分歧 EMA 留积累窗，" +
+                 "堵冷启动 fail-open 洞（录屏 025342 判决：冻4 在 7.8s 已发生，EMA 全 0=高置信期谁申请都批，赃物由此进琥珀）。 (default 2，08-20 从 1 上调)")]
+        private float frozenBlockMatureWarmupSeconds = 2f;
+        [SerializeField, Range(0.1f, 0.8f), Tooltip("资格年审降级阈：已冻块低置信占比超过此值→主动降级解冻（赃出琥珀恢复活代谢）。" +
+                 "必须高于拒冻阈=滞回防翻烙饼（冻<0.2 才批、审>0.35 才降，中间带=既往不咎）。降级不记 thawCounts=不吃棘轮误罚。 (default 0.35)")]
+        private float freezeGateDemoteLowConfFrac = 0.35f;
         [SerializeField, Tooltip("自适应普查：连续安静窗（无冻/解/生长/穿越票）后普查窗按 1→2→4s 阶梯放慢，任一活动立即打回快窗。静止场景省掉空转普查的全体积 dispatch+双回读。 (default true，08-18 晚帧率预算手术)")]
         private bool enableAdaptiveCensus = true;
 
@@ -90,6 +107,55 @@ namespace Genesis.RoomScan
         [SerializeField, Min(0f), Tooltip("复冻重提冷却（秒）：振荡块在冷却内复冻不立刻重提，到点由维护时钟补提（最终一致）。" +
                  "首冻/被撤页过的块不受限。防冻-解振荡的重提洪流灌满提取队列、饿死新块出网（实机：后期解升温+新页不再出现）。 (default 15)")]
         private float frozenPageRequeueCooldownSeconds = 15f;
+        [SerializeField, Min(1), Tooltip("复冻兜底：宽限超期时解冻次数≥此值的振荡惯犯块不撤页、强制冻回静态几何求安分；" +
+                 "真变化由穿越票走解冻棘轮硬闯（按不死，只慢一两窗）。初犯块照走撤页快路径（家具真搬走不受拖累）。" +
+                 "阻尼封顶原则：这是调度层最后一个阻尼器，之后的'不安分'只准去数据层治。 (default 2)")]
+        private int frozenRefreezeMinThaws = 2;
+
+        [Header("平面拍平（B1 影子，只读验证）")]
+        [SerializeField, Tooltip("B1 影子平面拟合：对视线落点块的当帧高质量观测做 PCA 平面拟合（只读不写 TSDF），" +
+                 "HUD 拍行输出残差（拟合优度）/存量偏移（拍平幅度预估）/点数/主轴。验证'观测共识面干净+存量偏离'假设，成立才开 B2 写入。 (default true)")]
+        private bool enablePlaneFitShadow = true;
+        [SerializeField] private ComputeShader planeFitShadowCompute;
+
+        [Header("平面拍平（B2 写入，振荡断根）")]
+        [SerializeField, Tooltip("B2 逐像素泼溅拍平：观测面附近'持续矛盾'的体素 sd 直接改写为观测值" +
+                 "——只写 sd 不动 weight（冻块负 weight 保留=不解冻修冻块几何），穿越票失根=振荡断根。" +
+                 "持久闸=置信度分歧 EMA：瞬态手/行人进冻块不会被烙进几何；压完观测一致 EMA 衰减自然停手。 (default true)")]
+        private bool enablePlaneFlatten = true;
+        [SerializeField, Range(0.1f, 0.6f), Tooltip("显著区阈值（sd 归一，1=截断带 15cm）：|观测-存量| 超此才压。0.3≈4.5cm；平墙实测 O-12mm 天然免疫")]
+        private float planeFlattenMinDelta = 0.3f;
+        [SerializeField, Range(0.05f, 0.6f), Tooltip("持久矛盾门槛（分歧 EMA，0-1）：EMA 超此才认定持续矛盾。0.25≈3.75cm；折角实测 ~0.67")]
+        private float planeFlattenMinConf = 0.25f;
+        [SerializeField, Range(0.2f, 2f), Tooltip("拍平节拍（秒）。冻块不自愈全靠本通道，0.5s 足够")]
+        private float planeFlattenIntervalSec = 0.5f;
+        [SerializeField, Range(0.2f, 0.9f), Tooltip("相干门槛（08-19 三面角伺服实锤）：|相干-0.5|/分歧 超此才压。" +
+                 "观测方向逐帧翻=抖动观测（相干回中性）不配写几何；方向固定=系统偏差/真变化照压。与冻票噪拦同杆")]
+        private float planeFlattenMinCoherence = 0.5f;
+        [SerializeField, Range(1, 32), Tooltip("每拍最多重提几页（冻块拍平后的显示刷新，重排不解冻）。防一拍灌爆提取队列")]
+        private int planeFlattenRepageMaxPerTick = 8;
+
+        [Header("M3/B3 平面先验普查（只读影子）")]
+        [SerializeField, Tooltip("M3/B3 第一刀：对冻结块做平面资格普查（只读 TSDF/置信度，不写任何生产状态）。" +
+                 "HUD 报 合格平面块数/面旁无数据候选面积/拒因分布——先量出值不值得，再决定接不接显示层补全皮。 (default true)")]
+        private bool enablePlanePriorCensus = true;
+        [SerializeField, Range(0.5f, 10f), Tooltip("普查节拍（秒）。冻结块集合低频变化，2s 足够；一块一线程，开销可忽略")]
+        private float planePriorCensusIntervalSec = 2f;
+        [SerializeField, Range(0.03f, 0.2f), Tooltip("正式面 weight 门槛（与出网门槛同杆 0.08）：低于此不算面证据")]
+        private float planePriorMinWeight = 0.08f;
+        [SerializeField, Range(0.1f, 0.6f), Tooltip("低置信判线（分歧 EMA）：超过此值记为脏体素（与拒冻门 0.2 同杆）")]
+        private float planePriorLowConfMin = 0.2f;
+        [SerializeField, Range(0.05f, 0.6f), Tooltip("低置信占比上限：块内脏体素比例超此拒认平面（与拒冻门 w/z>0.2 同杆）")]
+        private float planePriorLowConfMaxFrac = 0.2f;
+        [SerializeField, Range(0.005f, 0.08f), Tooltip("平面残差上限（米 RMS）：块内 TSDF 面点 sd 子体素拟合残差超此=非平面。" +
+                 "校准锚（08-20 205043 实机）：好墙 B1 真值带 23-29mm、干净冻墙 EMA 后应 10-15mm、垃圾搅局块 ~110mm；30mm 干净分离。 (default 0.03)")]
+        private float planePriorMaxResidualMeters = 0.03f;
+        [SerializeField, Range(0.03f, 0.3f), Tooltip("补全带半宽（米）：合格平面两侧此距离内的无数据体素记为 B3 候选面积")]
+        private float planePriorFillBandMeters = 0.12f;
+        [SerializeField, Min(50), Tooltip("面体素数下限：块内正式面体素少于此=证据不足拒认（300≈32³块的 1%）")]
+        private int planePriorMinSurfaceVoxels = 300;
+        [SerializeField, Range(1, 256), Tooltip("每拍最多普查几个冻结块（一块一线程；超出下拍再轮，低频普查不追一拍全量）")]
+        private int planePriorMaxBlocksPerTick = 64;
 
         // ── 逐块可逆冻结调度器状态 ──
         private readonly HashSet<int> _frozenBlocks = new HashSet<int>();
@@ -109,6 +175,93 @@ namespace Genesis.RoomScan
         private float _censusCurrentWindow = 1f;
         private int _lastVotesHotCount;
         private int _frozenBlockUnfreezeEvents;
+        // 复冻兜底账：宽限超期被强制冻回的振荡惯犯块次数（HUD"回N"）。
+        private int _forceRefreezeEvents;
+        // 资格门账：因低置信占比超阈被拒冻的块次（累计，HUD"资N"）。
+        private int _freezeGateRejected;
+        // 资格年审账：已冻块低置信超降级阈被收回资格的块次（累计，HUD"审N"）+
+        // 本批降级名单（解冻记账环节对它跳过 thawCounts++，降级不吃棘轮）。
+        private int _freezeGateDemoted;
+        private readonly HashSet<int> _demotedThisBatch = new HashSet<int>();
+        // 解冻诊断账（HUD"诊"，代替 logcat——实机看不了日志）：热窗总数 /
+        // 解冻时的最大累计解冻序号（同块反复解则爬升，多块轮流则停在 1-2）/
+        // 最近一次解冻的本窗票数与当时阈值（票随阈涨=棘轮被票量追平）。
+        private int _diagHotWindows;
+        private int _diagUnfreezeMaxThaws;
+        private uint _diagLastVotes;
+        private uint _diagLastThreshold;
+        private int _diagLastThaws;
+        // 票峰：历次解冻中的最高票数及当时解冻序号——校准棘轮倍率用
+        // （峰远高于当前档阈=倍率还不够；峰贴着阈=振荡已到天花板附近）。
+        private uint _diagPeakVotes;
+        private int _diagPeakThaws;
+        // ── B1 影子平面拟合状态（只读）──
+        private ComputeKernelHelper _planeFitAccumKernel;
+        private ComputeKernelHelper _planeOffsetKernel;
+        private ComputeBuffer _planeFitStats;      // 16 int，与 shader 槽位约定一致
+        private static readonly int[] PlaneFitZero = new int[16];
+        private float _planeFitLastTick = -10f;
+        private bool _planeFitPending;
+        private bool _planeOffsetPending;
+        private float _planePendingSince;
+        private Unity.Mathematics.int3 _planeBlockMinVox;
+        private bool _planeInit;                   // 平面 EMA 是否已初始化
+        private Vector3 _planePointLocal;          // 平面 EMA（体积局部，米）
+        private Vector3 _planeNormalLocal;
+        // HUD 读数
+        private bool _planeHudValid;
+        private string _planeHudNote = "";
+        // 空括号悬案探针：T=tick 入口计数（不涨=tick 根本没被执行/上游异常截断
+        // Update）；F=拟合回读回调计数（T 涨 F 不涨=dispatch 后回读丢失）。
+        private int _planeTicks;
+        private int _planeFitCb;
+        // ── B2 拍平写入状态（生产：写 TSDF sd，不动 weight）──
+        private ComputeKernelHelper _planeFlattenKernel;
+        private ComputeBuffer _planeFlatStats;       // 16 int（复用槽位约定：13=压下总数 14=其中冻块）
+        private float _planeFlattenLastTick = -10f;
+        private bool _planeFlatPending;
+        private float _planeFlatPendingSince;
+        private string _flatHudNote = "";
+        private int _flatSnapTotal;                  // HUD 累计：压下体素总数
+        private int _flatSnapFrozen;                 // HUD 累计：其中冻块体素
+        private int _flatSnapCohBlocked;             // HUD 累计：相干闸拦下（抖动观测不配写几何）
+        private int _flatSnapRepage;                 // HUD 累计：拍平后重提页数（显示刷新）
+        private int _flatSnapRepageDeferred;         // HUD 累计：冷却内转延迟补提（稳态下重排全走这条路，只数排=读数误导）
+        private ComputeBuffer _planeFlatBlocks;      // 64 int，本拍压到的冻块线性索引（刀3）
+        private int _planeFlatBlocksExpected;        // 链式回读条数（stats[12]，钳 64）
+        private readonly HashSet<int> _flatUniqueBlocks = new HashSet<int>();
+        // ── M3/B3 平面先验普查状态（只读影子：只读 TSDF/置信度，不写生产状态）──
+        private ComputeKernelHelper _planeCensusKernel;
+        private ComputeBuffer _planeCensusBlocks;    // planePriorMaxBlocksPerTick int，本拍冻结块清单
+        private ComputeBuffer _planeCensusStats;     // 16 int（槽位约定见 PlaneFitShadow.compute）
+        private float _planeCensusLastTick = -10f;
+        private bool _planeCensusPending;
+        private float _planeCensusPendingSince;
+        private readonly List<int> _planeCensusBlockList = new List<int>(64);
+        // 冻前探头（引导值）：同 kernel 同闸，单块视线落点块，独立 stats buffer
+        private ComputeKernelHelper _planeProbeKernel;
+        private ComputeBuffer _planeProbeBlocks;    // 1 int
+        private ComputeBuffer _planeProbeStats;     // 16 int，同槽位约定
+        private bool _planeProbePending;
+        private float _planeProbePendingSince;
+        private bool _probeGazeFrozen;      // 本拍探头块是否已冻（回读切 冻/预 前缀）
+        private readonly int[] _probeBlockArr = new int[1];
+        private string _probeHud = "";
+        // HUD 读数：查=扫描块数 合=平面资格合格 缺=面旁无数据候选体素
+        // 残=算出残差块（合格+残差拒）的均残差 mm（诊断"差多少被拒"）
+        // 拒因：残（残差/特征分解）浊（低置信占比）少（面体素不足）。
+        private string _censusHudNote = "";
+        private int _censusHudScanned;
+        private int _censusHudQualified;
+        private int _censusHudFill;
+        private int _censusHudAvgResidualMm;
+        private int _censusHudRejEigen;
+        private int _censusHudRejLowConf;
+        private int _censusHudRejFew;
+        private float _planeResidualMm;
+        private float _planeOffsetMm;
+        private int _planePointCount;
+        private char _planeAxis = '?';
         private int _supervisorWatchdogResets;
         // 解冻块的宽限撤页表：块号 → 到期时刻（Time.time）。复冻即取消。
         private readonly Dictionary<int, float> _pendingPageInvalidate = new Dictionary<int, float>();
@@ -117,6 +270,13 @@ namespace Genesis.RoomScan
         private readonly Dictionary<int, float> _deferredPageRequeue = new Dictionary<int, float>();
         // 棘轮解冻账：块号 → 累计解冻次数（票阈=基数×倍率^次数）。
         private readonly Dictionary<int, int> _thawCounts = new Dictionary<int, int>();
+        // ── T2 补洞票状态 ──
+        // 补洞热窗账（双门槛用）/ 补洞棘轮账（块号→累计重排次数，与解冻棘轮互相独立：
+        // 重排不动积分权，不该抬高解冻申诉成本，反之亦然）/ 全量冻结位图（随裁决下发 GPU）。
+        private readonly HashSet<int> _hotHoleBlocksPrevWindow = new HashSet<int>();
+        private readonly Dictionary<int, int> _holeRequeueCounts = new Dictionary<int, int>();
+        private uint[] _frozenChunkBitsArr;
+        private int _holeRequeueEvents;
         // 实时轨状态：巡视时钟 / 块级节流账 / 全局速率窗。
         private float _liveTrackLastSweep = -1f;
         private readonly Dictionary<int, float> _livePageQueueTime = new Dictionary<int, float>();
@@ -237,6 +397,18 @@ namespace Genesis.RoomScan
             if (_depthCapture == null) return;
             int mode = _depthCapture.CycleDepthPreprocessingMode();
             NotifyInput(mode == 0 ? "深滤:全开" : mode == 1 ? "深滤:半(只缘洗)" : "深滤:全关");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// 性能二分热键（左摇杆上）：源头时序滤波开关。盯墙养绿 A/B 用——
+        /// 同墙同段实时切换（关闭侧=pre-时序滤波基线），滤波内部自门控清历史，
+        /// 重开不吃隔夜残影。HUD 闸行 时开/时关 回显当前档位。
+        /// </summary>
+        public void ToggleTemporalFilter()
+        {
+            if (_depthCapture == null) return;
+            NotifyInput(_depthCapture.ToggleTemporalFilter() ? "时滤:开" : "时滤:关");
             RefreshStatusBadge();
         }
 
@@ -429,6 +601,12 @@ namespace Genesis.RoomScan
 
                 if (IsScanning)
                 {
+                    // HUD 防抖（08-21 拍板"让它们老实点"）：扫描中遥测 0.4s 节流——
+                    // 原随提取节拍 ~18/s 重排文本，数字全在蹦迪根本没法盯。暂停/回放等
+                    // 事件分支不节流（状态切换要即时）。行为层读数（角/质/探头）钉行首
+                    // 固定位，热账尾巴随便跳不影响盯读。
+                    if (Time.unscaledTime < _badgeNextRefresh) return;
+                    _badgeNextRefresh = Time.unscaledTime + 0.4f;
                     float coverage = _coverageOverlay != null ? _coverageOverlay.CoveragePercent : 0f;
                     _statusBadgeText.color = new Color(0.25f, 1f, 0.45f, 1f);
                     string frozenTail = _frozenBlockUnfreezeEvents > 0
@@ -436,6 +614,58 @@ namespace Genesis.RoomScan
                         : (_frozenBlocks.Count > 0 ? $" · 冻{_frozenBlocks.Count}" : "");
                     if (_liveTrackQueuedTotal > 0)
                         frozenTail += $"实{_liveTrackQueuedTotal}";
+                    if (_holeRequeueEvents > 0)
+                        frozenTail += $"补{_holeRequeueEvents}";
+                    // 复冻兜底活度：回N=振荡惯犯块被强制冻回次数。回N 涨+解/冻比降=兜底在灭火；
+                    // 回N 涨但折角仍闪=该块的穿越票在棘轮下仍能硬闯，说明是真变化信号而非振荡。
+                    if (_forceRefreezeEvents > 0)
+                        frozenTail += $"回{_forceRefreezeEvents}";
+                    // 资格门活度：资N=因低置信占比超阈被拒冻的块次（累计）。资涨+冻涨慢=
+                    // 噪声荒漠/打架块被挡在冻结门外保持活代谢（v2.2 优势回归）；折角拍稳后
+                    // 置信升→资停涨+该块入冻=资格门按设计闭环。资0=没有块撞门（或门被关）。
+                    if (_freezeGateRejected > 0)
+                        frozenTail += $"资{_freezeGateRejected}";
+                    // 年审活度：审N=已冻块被收回资格的累计块次（解N 含审N）。
+                    // 审后该块紫区回落+重新入冻=降级-修复-回冻闭环成立；
+                    // 审反复涨同一块=降级阈/拒冻阈滞回带太窄或该区置信永久低（=本来就不该冻）。
+                    if (_freezeGateDemoted > 0)
+                        frozenTail += $"审{_freezeGateDemoted}";
+                    // 解冻诊断（代替 logcat）：热=热窗总数；解K=解冻时的最大累计解冻序号
+                    // （同块反复解则爬升，多块轮流则停在 1-2）；票V/T=最近一次解冻的
+                    // 本窗票数/当时阈值（票随阈一起涨=棘轮被票量追平→调棘轮倍率）。
+                    if (_diagHotWindows > 0)
+                        frozenTail += $"诊热{_diagHotWindows}解{_diagUnfreezeMaxThaws}票{_diagLastVotes}/{_diagLastThreshold}峰{_diagPeakVotes}@{_diagPeakThaws}";
+                    // B1 影子平面拟合读数（ASCII 输出：动态字体图集+置顶材质有缺字前科）：
+                    // R=残差 RMS mm（小=共识面干净） O=存量偏移 mm（拍平幅度预估）
+                    // N=观测点数 AX=平面主轴。"拍4"=版本戳：无 4=构建缓存旧包。
+                    // 探针：T=tick 入口计数 F=回读回调计数（T0=tick 未执行；T涨F0=回读丢失）。
+                    if (enablePlaneFitShadow)
+                        frozenTail += _planeHudValid
+                            ? $"拍4[R{_planeResidualMm:0} O{_planeOffsetMm:+0;-#;0} N{_planePointCount / 1000f:0.0}k AX{_planeAxis}]"
+                            : $"拍4[T{_planeTicks}F{_planeFitCb}{_planeHudNote}]";
+                    // B2 拍平写入活度：压=累计压下体素 冻=其中冻块体素 拦=相干闸拦下
+                    // （三面角抖动观测，拦涨压缩=刀2 生效）排=立即重提 延=冷却内转
+                    // 延迟补提（稳态下排≈0 是常态，延才是刀3 真活度）。
+                    // 压涨+解/冻比降=振荡断根生效；压0=无持续矛盾（或闸太严）。!备注=分闸/异常。
+                    if (enablePlaneFlatten)
+                        frozenTail += _flatHudNote.Length > 0
+                            ? $"压[!{_flatHudNote}]"
+                            : $"压{_flatSnapTotal}冻{_flatSnapFrozen}拦{_flatSnapCohBlocked}排{_flatSnapRepage}延{_flatSnapRepageDeferred}";
+                    // M3/B3 平面先验普查读数（只读影子）：查=本拍扫描冻结块 合=平面资格合格
+                    // 缺=合格面旁无数据候选体素（未来 B3 补全面积，k=千）
+                    // 残=算出残差块（合格+残差拒）的均残差 mm（sd 子体素改尺后=几何真值，
+                    // 真平墙应远小于门槛 20；贴近/超过=折角或真不平；全拒时也可读=诊断盲区已补）
+                    // 拒=残差/浊(低置信)/少(面不足) 三拒因。判读：合多缺多=B3 值得上生产；
+                    // 拒残高+残大=折角块占比大（正常）；拒残高+残小=门槛还卡着尺子噪声（再查）。
+                    if (enablePlanePriorCensus)
+                        frozenTail += _censusHudNote.Length > 0
+                            ? $"普[!{_censusHudNote}]"
+                            : $"普查{_censusHudScanned}合{_censusHudQualified}缺{_censusHudFill / 1000f:0.0}k残{_censusHudAvgResidualMm}拒{_censusHudRejEigen}/{_censusHudRejLowConf}/{_censusHudRejFew}";
+                    // 冻前探头+冻块就地判决（08-20/08-21 拍板"纯引导值"）：视线落点块单块过
+                    // 普查闸。预=未冻块预言"冻了合不合"（预可→冻→合涨=链路通；预可合不涨=锅在
+                    // 冻结通道；预从不可=锅在数据层）；冻=已冻块就地报成色（冻合R/冻残/冻低/
+                    // 冻少）=质量地图，与普查行聚合值互相印证。
+                    // 08-21 防抖：探头读数挪到行首固定位（watch 串），不再挂 frozenTail 随波逐流。
                     // 父页队列拥塞读数：队=排队待提取，途=已派发待回读。
                     // 队高途高=回读延迟瓶颈；队高途低=派发被预算/节拍限流。
                     if (_meshExtractor != null && _meshExtractor.HasIncrementalHera)
@@ -459,8 +689,23 @@ namespace Genesis.RoomScan
                     string liveGate = enableLiveTrack
                         ? $" · 活[排{_liveGateQueued}冻{_liveGateFrozen}空{_liveGateEmpty}冷{_liveGateCool}内{_liveGateContent}途{_liveGateFlight}速{_liveGateRate}]"
                         : "";
+                    // 置信度通道普查回读（分歧 EMA 三档+低置信相干拆分）：
+                    // 高=逐帧观测一致；低=几何在打架，拆 干=签名一致(纠错嫌疑/闸放行)
+                    // 噪=方向横跳(纯噪声/闸拦得住)。噪拦=v2 相干闸拦下的冻票数。
+                    string confTail = "";
+                    if (_volumeIntegrator != null && _volumeIntegrator.ConfidenceVoxelCount > 0)
+                    {
+                        float ct = _volumeIntegrator.ConfidenceVoxelCount;
+                        confTail = $" · 信[高{100f * _volumeIntegrator.ConfidenceHighCount / ct:0} 中{100f * _volumeIntegrator.ConfidenceMidCount / ct:0} 低{100f * _volumeIntegrator.ConfidenceLowCount / ct:0}" +
+                                   $"(干{100f * _volumeIntegrator.ConfidenceLowCoherentCount / ct:0} 噪{100f * _volumeIntegrator.ConfidenceLowNoiseCount / ct:0})]";
+                        if (_volumeIntegrator.HasCarveStats && _volumeIntegrator.LastCarveStats[91] > 0)
+                            confTail += $"噪拦{_volumeIntegrator.LastCarveStats[91]}";
+                        // M1 折让命中读数（92 槽）：>0=折让在跑；盯熟墙时持续增长=预期。
+                        if (_volumeIntegrator.HasCarveStats && _volumeIntegrator.LastCarveStats[92] > 0)
+                            confTail += $"折{_volumeIntegrator.LastCarveStats[92]}";
+                    }
                     string secondLine = _meshExtractor != null && _meshExtractor.HasIncrementalHera
-                        ? $"精修 {_meshExtractor.IncrementalHeraPagesCommitted} 页 · 视线:{GazeBlockStatus()} · X 点阵 · A 冻结{liveGate}"
+                        ? $"精修 {_meshExtractor.IncrementalHeraPagesCommitted} 页 · 视线:{GazeBlockStatus()} · X 点阵 · A 冻结{liveGate}{confTail}"
                         : "黄=待成网 绿=已可出网 · A 冻结";
                     // 计时账第三行：拍=提取实际节拍(/s) 落=入队→落地 回=派发→回读
                     // 融/提=各自 CPU 耗时(ms)。判读：拍远低于16=被融合帧挤占；
@@ -473,21 +718,40 @@ namespace Genesis.RoomScan
                     string frozenLabel = !enableFrozenBlockSupervisor ? "关"
                         : enableAdaptiveCensus ? $"开{_censusCurrentWindow:0}s"  // 自适应普查窗回显：1s=有活动 2/4s=安静期
                         : "开";
+                    // 手部语义剔除读数（08-20）：剔=平台原生手部剔除（开=生效，关=未支持/未开）；
+                    // 手=本拍打码球数（裸手 5/手，持柄时手追暂停只剩柄球）；
+                    // 罩=上统计周期被球罩住的深度像素数（手入镜应显著>0，空手≈0）。
+                    string handLabel = _depthCapture == null || !_depthCapture.HandMaskEnabled
+                        ? ""
+                        : $" 剔{(_depthCapture.NativeHandRemovalActive ? "开" : "关")}" +
+                          $"手{_depthCapture.HandSphereCount}罩{_depthCapture.LastHandMaskedPixels}";
+                    // 源头时序滤波读数：稳=重投影带内做 EMA；变=真变化/换轨全速放行。
+                    // 静止盯墙稳应占主导；挥手/搬物变应立刻冲高（不吃残影）。
+                    // 时关/时开 档位回显（左摇杆上 A/B 热键，录屏判读要知道当前在哪组）。
+                    string temporalLabel = _depthCapture == null ? ""
+                        : !_depthCapture.TemporalFilterEnabled ? " 时关"
+                        : !_depthCapture.HasTemporalStats ? " 时开"
+                        : $" 时稳{_depthCapture.LastTemporalStablePixels}变{_depthCapture.LastTemporalChangedPixels}";
                     string toggleLine = $"闸[实{(enableLiveTrack ? "开" : "关")} 冻{frozenLabel} " +
                                         $"融{integrationHz:0} 滤{filterLabel} " +
                                         $"显{(_meshExtractor != null && _meshExtractor.IsAnyMeshVisible ? "开" : "关")}" +
                                         $"皮{(_meshExtractor == null || !_meshExtractor.HasCoarseSkin ? "无" : (_meshExtractor.IsCoarseSkinVisible ? "开" : "关"))}" +
-                                        $"{(meshDisplayStride > 1 ? $" 网{meshDisplayStride}" : $" 格{Mathf.RoundToInt(meshGridSpacing * 100f)}")}]";
+                                        $"{(meshDisplayStride > 1 ? $" 网{meshDisplayStride}" : "")}]{handLabel}{temporalLabel}";
+                    // 行为层读数钉行首固定位（防抖）：角/质定宽 + 探头判决紧随其后，
+                    // 前缀长度恒定（覆盖%定宽 3 位），热账 frozenTail 怎么跳都不动这里。
+                    string watch = $" 角{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f),3:F0}°/s" +
+                                   $" 质{(_volumeIntegrator != null ? _volumeIntegrator.MotionQuality : 1f):F2}" +
+                                   (_probeHud.Length > 0 ? $" {_probeHud}" : "");
                     if (_meshExtractor != null && _meshExtractor.HasIncrementalHera)
                     {
                         string timingLine = $"帧{1f / Mathf.Max(0.001f, Time.smoothDeltaTime):0} 拍{_heraTicksPerSec:0}/s 落{_meshExtractor.IncrementalHeraAvgQueueToCommitMs:0}ms " +
                                             $"回{_meshExtractor.IncrementalHeraAvgDispatchToCallbackMs:0}ms " +
                                             $"融{_emaIntegrateMs:0.0}提{_emaHeraTickMs:0.0}ms " +
                                             $"温{OVRPlugin.batteryTemperature:0}°";
-                        _statusBadgeText.text = $"● 采集中 · 视角覆盖 {coverage:0}%{frozenTail}\n{secondLine}\n{timingLine}\n{toggleLine}";
+                        _statusBadgeText.text = $"● 采集中·炮0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{timingLine}\n{toggleLine}";
                     }
                     else
-                        _statusBadgeText.text = $"● 采集中 · 视角覆盖 {coverage:0}%{frozenTail}\n{secondLine}\n{toggleLine}";
+                        _statusBadgeText.text = $"● 采集中·炮0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}";
                     return;
                 }
 
@@ -631,6 +895,7 @@ namespace Genesis.RoomScan
         private string _hudLastError = "";
         private string _hudLastInput = "无";
         private float _hudRefreshTimer;
+        private float _badgeNextRefresh; // 徽标 HUD 防抖节流（扫描中 0.4s），08-21 拍板"让它们老实点"
 
         /// <summary>输入处理器回显：最近一次识别到的按键（用于区分"输入没到达"与"启动失败"）。</summary>
         public void NotifyInput(string what)
@@ -870,11 +1135,12 @@ namespace Genesis.RoomScan
             }
 
             _hudText.text =
-                $"【QRS独立链】{_hudStatus}\n" +
-                $"深度:{(DepthCapture.DepthAvailable ? "可用" : "无")}#{(_depthCapture != null ? _depthCapture.FrameCount : 0)}  相机:{(camPlaying ? "运行" : "未运行")}  融合:{integrated}帧\n" +
+                $"【QRS独立链·炮0821】{_hudStatus}\n" +
+                $"深度:{(DepthCapture.DepthAvailable ? "可用" : "无")}#{(_depthCapture != null ? _depthCapture.FrameCount : 0)}  相机:{(camPlaying ? "运行" : "未运行")}  融合:{integrated}帧" +
+                $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s" +
+                $" 动质:{(_volumeIntegrator != null ? _volumeIntegrator.MotionQuality : 1f):F2}\n" +
                 $"顶点:{verts}  三角:{tris}\n" +
                 $"矛盾票:{(_volumeIntegrator != null ? _volumeIntegrator.GetCarveStatsCompact() : "无")}" +
-                $" 角速:{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f):F0}°/s" +
                 $" 缘:{edgeStat}\n" +
                 $"供料账:{(_volumeIntegrator != null ? _volumeIntegrator.GetSupplyLedgerCompact() : "无")}\n" +
                 $"断层影:{(_volumeIntegrator != null ? _volumeIntegrator.GetAdaptiveGapShadowCompact() : "无")}\n" +
@@ -926,6 +1192,20 @@ namespace Genesis.RoomScan
                 _volumeIntegrator.Cleared -= ResetFrozenBlockSupervisor;
             if (_diagnosticRoiFrame != null)
                 Destroy(_diagnosticRoiFrame);
+            _planeFitStats?.Release();
+            _planeFitStats = null;
+            _planeFlatStats?.Release();
+            _planeFlatStats = null;
+            _planeFlatBlocks?.Release();
+            _planeFlatBlocks = null;
+            _planeCensusStats?.Release();
+            _planeCensusStats = null;
+            _planeCensusBlocks?.Release();
+            _planeCensusBlocks = null;
+            _planeProbeStats?.Release();
+            _planeProbeStats = null;
+            _planeProbeBlocks?.Release();
+            _planeProbeBlocks = null;
         }
 
         private void OnDisable()
@@ -937,6 +1217,13 @@ namespace Genesis.RoomScan
         private void Update()
         {
             UpdateHud();
+
+            // 置信度可视化开关支持运行时改值（编辑器内拖勾即生效，重发全局量）。
+            if (confidenceViz != _confidenceVizApplied)
+            {
+                _confidenceVizApplied = confidenceViz;
+                ApplyDisplayMode();
+            }
 
             if (enableFrozenChunkAbExperiment && _chunkAbFrozen)
             {
@@ -961,6 +1248,16 @@ namespace Genesis.RoomScan
             TickPendingPageInvalidates(t);
             TickDeferredPageRequeues(t);
             TickLiveTrack(t);
+            TickPlaneFitShadow(t);
+            TickPlaneFlatten(t);
+            TickPlanePriorCensus(t);
+
+            // 置信度通道 v1 普查：2s 节流，异步回读后 HUD 回显高/中/低占比。
+            if (t - _lastConfidenceStatsTime >= 2f)
+            {
+                _lastConfidenceStatsTime = t;
+                _volumeIntegrator.RefreshConfidenceStats();
+            }
 
             bool integrationDue = t - _lastIntegrationTime >= IntegrationInterval;
             bool meshDue = t - _lastMeshTime >= MeshInterval;
@@ -1100,6 +1397,7 @@ namespace Genesis.RoomScan
                 EnsureFreezeMaskArrays();
                 Array.Clear(_freezeClearMask, 0, _freezeClearMask.Length);
                 var hotNow = new HashSet<int>();
+                var hotHoleNow = new HashSet<int>();
                 for (int b = 0; b < blockCount; b++)
                 {
                     if (!_frozenBlocks.Contains(b)) continue;
@@ -1107,20 +1405,62 @@ namespace Genesis.RoomScan
                     // 遮挡票（y）=更近的新表面——新家具落在从未冻结的空体素上、自己
                     // 就能积分成网，不需要解冻背后的墙；其大头是身体路过（30cm+ 矛盾，
                     // 任何距离杆都拦不住），计入只会制造冻-解振荡（实机：解=冻的 2 倍）。
-                    uint total = votes[b * 2];
+                    uint total = votes[b * 4];
                     // 棘轮：解冻过 n 次的块票阈=基数×倍率^n——首解灵敏，
                     // 振荡块申诉成本指数升，真搬走迟早跨过（不设硬顶）。
                     int thaws = _thawCounts.TryGetValue(b, out int tc) ? tc : 0;
                     uint threshold = (uint)Mathf.Max(1f,
                         frozenBlockVoteThreshold * Mathf.Pow(frozenBlockVoteRatchet, thaws));
-                    if (total < threshold) continue;
-                    hotNow.Add(b);
-                    // 双门槛：上窗也热才解冻（先查旧窗，循环后再换窗）。
-                    if (_hotBlocksPrevWindow.Contains(b))
-                        _freezeClearMask[b >> 5] |= 1u << (b & 31);
+                    if (total >= threshold)
+                    {
+                        hotNow.Add(b);
+                        // 双门槛：上窗也热才解冻（先查旧窗，循环后再换窗）。
+                        bool unfreezing = _hotBlocksPrevWindow.Contains(b);
+                        if (unfreezing)
+                            _freezeClearMask[b >> 5] |= 1u << (b & 31);
+                        // 解冻诊断记账（HUD 版，实机看不了 logcat）：判读——
+                        // 同块反复热且"解K"爬升、票随阈涨=棘轮被票量追上（调倍率）；
+                        // 多块轮流热=解K 停在 1-2，振荡摊在区块群上，性质不同另议。
+                        _diagHotWindows++;
+                        if (unfreezing)
+                        {
+                            _diagLastVotes = total;
+                            _diagLastThreshold = threshold;
+                            _diagLastThaws = thaws + 1;
+                            if (_diagLastThaws > _diagUnfreezeMaxThaws)
+                                _diagUnfreezeMaxThaws = _diagLastThaws;
+                            if (total > _diagPeakVotes)
+                            {
+                                _diagPeakVotes = total;
+                                _diagPeakThaws = _diagLastThaws;
+                            }
+                        }
+                        Logger.Info($"解冻诊断：块 {FormatBlockCoords(new List<int> { b })} 热窗 票{total}≥阈{threshold}（已解{thaws}次{(unfreezing ? "，双窗达标→解冻" : "，首窗")}）");
+                    }
+
+                    // ── T2 补洞票（z）：冻块内空体素种子出生=早冻留下的洞在长数据。
+                    // 实时轨第一闸硬跳冻块，这些数据永远等不到重提 → 过阈后把块重排
+                    // 进定稿轨重提（页原子顶替），不解冻、不动积分权。独立阈值+独立
+                    // 双窗+独立棘轮：重排与解冻是两种后果，账分开记。
+                    uint holeVotes = votes[b * 4 + 2];
+                    int requeues = _holeRequeueCounts.TryGetValue(b, out int rc) ? rc : 0;
+                    uint holeThreshold = (uint)Mathf.Max(1f,
+                        frozenBlockHoleVoteThreshold * Mathf.Pow(frozenBlockVoteRatchet, requeues));
+                    if (holeVotes < holeThreshold) continue;
+                    hotHoleNow.Add(b);
+                    if (_hotHoleBlocksPrevWindow.Contains(b) &&
+                        _meshExtractor != null && _meshExtractor.HasIncrementalHera)
+                    {
+                        QueueIncrementalPage(b);
+                        _holeRequeueCounts[b] = requeues + 1;
+                        _holeRequeueEvents++;
+                        Logger.Info($"T2 补洞：块重排重提（补洞票 {holeVotes}≥{holeThreshold} 双窗达标，第 {requeues + 1} 次）：{FormatBlockCoords(new List<int> { b })}");
+                    }
                 }
                 _hotBlocksPrevWindow.Clear();
                 _hotBlocksPrevWindow.UnionWith(hotNow);
+                _hotHoleBlocksPrevWindow.Clear();
+                _hotHoleBlocksPrevWindow.UnionWith(hotHoleNow);
                 _lastVotesHotCount = hotNow.Count; // 自适应普查活动账（本窗有无解冻需求）
                 _volumeIntegrator.ClearAllFrozenVotes();
                 _volumeIntegrator.RefreshChunkMaturity();
@@ -1160,18 +1500,56 @@ namespace Genesis.RoomScan
                         int prev = _maturityPrevSurface[b];
                         if (surface < frozenBlockMinSurfaceVoxels) continue;
                         // T1b 守卫：普查窗 2s→1s 后冻结不得随之提前——首次报满
-                        // 下限只记账，满 1s 才许冻（冻结时机与原 2s 窗一致，
-                        // 防"普查加速=带洞早冻"加剧 Tier2 死局）。
+                        // 下限只记账，满热身期才许冻。08-20 起热身 1s→2s（可配）：
+                        // 兼给分歧 EMA 留积累窗，堵冷启动 fail-open 洞（EMA 全 0=
+                        // 高置信期资格门必然放行，赃物由此进琥珀）。
                         if (!_firstMatureTime.ContainsKey(b))
                         {
                             _firstMatureTime[b] = Time.time;
                             continue;
                         }
-                        if (Time.time - _firstMatureTime[b] < 1f) continue;
+                        if (Time.time - _firstMatureTime[b] < frozenBlockMatureWarmupSeconds) continue;
+                        // 冻结资格门（置信度消费 v2 第一刀）：低置信占比超阈=块内几何
+                        // 在打架，没资格稳定 → 拒冻保持活代谢（v2.2 优势：幻影随生随杀）。
+                        // 分母=z 可出网体素数，与 w 低置信账同族群同拍。置信体未写过时
+                        // w=0 天然放行（fail-open）。折角被拍平压稳后置信升→自动过门，
+                        // 振荡断根不依赖棘轮高度。
+                        if (enableFreezeConfidenceGate)
+                        {
+                            int meshable = (int)maturity[b * 4 + 2];
+                            int lowConf = (int)maturity[b * 4 + 3];
+                            if (meshable > 0 && lowConf > freezeGateLowConfMaxFrac * meshable)
+                            {
+                                _freezeGateRejected++;
+                                continue;
+                            }
+                        }
                         if (!frozenBlockRequireStability ||
                             (prev >= frozenBlockMinSurfaceVoxels &&
                              Math.Abs(surface - prev) <= frozenBlockStabilityTolerance))
                             _freezeSetMask[b >> 5] |= 1u << (b & 31);
+                    }
+                    // 资格年审（置信度消费 v2 第二刀，08-20 录屏 025342 拍板）：已冻块
+                    // 低置信占比超降级阈→主动降级解冻。赃在琥珀里拒冻门管不到（实锤：
+                    // 压冻占 91%=冻块内几何持续打架），年审放它出来恢复活代谢。
+                    // 滞回防翻烙饼：降级阈 0.35 > 拒冻阈 0.2，中间带既往不咎。
+                    // 降级记 _demotedThisBatch——记账环节对它跳过 thawCounts++
+                    // （年审不是票解，吃棘轮误罚会把被动降级块推向复冻兜底惯犯池）。
+                    if (enableFreezeConfidenceGate)
+                    {
+                        _demotedThisBatch.Clear();
+                        for (int b = 0; b < blockCount; b++)
+                        {
+                            if (!_frozenBlocks.Contains(b)) continue;
+                            int meshable = (int)maturity[b * 4 + 2];
+                            int lowConf = (int)maturity[b * 4 + 3];
+                            if (meshable > 0 && lowConf > freezeGateDemoteLowConfFrac * meshable)
+                            {
+                                _freezeClearMask[b >> 5] |= 1u << (b & 31);
+                                _demotedThisBatch.Add(b);
+                                _freezeGateDemoted++;
+                            }
+                        }
                     }
                 }
                 int changedBlocks = 0;
@@ -1203,18 +1581,25 @@ namespace Genesis.RoomScan
 
                 _volumeIntegrator.ApplyChunkFreezeMasks(_freezeSetMask, _freezeClearMask);
                 foreach (int b in setBlocks) _frozenBlocks.Add(b);
+                int demotedCount = 0;
                 foreach (int b in clearBlocks)
                 {
                     _frozenBlocks.Remove(b);
+                    // 年审降级不吃棘轮（不是票解，是资格门收回冻结资格）。
+                    if (_demotedThisBatch.Remove(b)) { demotedCount++; continue; }
                     // 棘轮记账：本块解冻次数+1，下窗起票阈×倍率。
                     _thawCounts[b] = (_thawCounts.TryGetValue(b, out int tc) ? tc : 0) + 1;
                 }
+                // T2：全量冻结位图同步本批裁决并下发 GPU（补洞票的块冻结态判据）。
+                foreach (int b in setBlocks) _frozenChunkBitsArr[b >> 5] |= 1u << (b & 31);
+                foreach (int b in clearBlocks) _frozenChunkBitsArr[b >> 5] &= ~(1u << (b & 31));
+                _volumeIntegrator.SetFrozenChunkBits(_frozenChunkBitsArr);
                 // 增量精修挂接：新冻块排队精修上屏；解冻块撤页（重冻后自动重建）。
                 SyncIncrementalHeraBlocks(setBlocks, clearBlocks);
                 if (clearBlocks.Count > 0)
                 {
                     _frozenBlockUnfreezeEvents += clearBlocks.Count;
-                    Logger.Info($"逐块冻结：解冻 {clearBlocks.Count} 块修复（穿越票双门槛）：{FormatBlockCoords(clearBlocks)}");
+                    Logger.Info($"逐块冻结：解冻 {clearBlocks.Count} 块（票解 {clearBlocks.Count - demotedCount} + 年审降级 {demotedCount}）：{FormatBlockCoords(clearBlocks)}");
                 }
                 if (setBlocks.Count > 0)
                     Logger.Info($"逐块冻结：新冻 {setBlocks.Count} 块（累计 {_frozenBlocks.Count}）：{FormatBlockCoords(setBlocks)}");
@@ -1257,6 +1642,8 @@ namespace Genesis.RoomScan
             {
                 _freezeSetMask = new uint[words];
                 _freezeClearMask = new uint[words];
+                // T2 全量冻结位图随掩码同尺寸重建（重建=网格维度变了，冻结态本应已重置）
+                _frozenChunkBitsArr = new uint[words];
             }
         }
 
@@ -1264,11 +1651,56 @@ namespace Genesis.RoomScan
         {
             _frozenBlocks.Clear();
             _hotBlocksPrevWindow.Clear();
+            // T2 补洞账与位图随扫描重置清零
+            _hotHoleBlocksPrevWindow.Clear();
+            _holeRequeueCounts.Clear();
+            _holeRequeueEvents = 0;
+            if (_frozenChunkBitsArr != null)
+            {
+                Array.Clear(_frozenChunkBitsArr, 0, _frozenChunkBitsArr.Length);
+                if (_volumeIntegrator != null && _volumeIntegrator.FrozenBlockReady)
+                    _volumeIntegrator.SetFrozenChunkBits(_frozenChunkBitsArr);
+            }
             _maturityPrevSurface = null;
             _frozenBlockWindowStart = -1f;
             _frozenBlockReadbackPending = false;
             _frozenBlockReadbackPendingSince = 0f;
             _frozenBlockUnfreezeEvents = 0;
+            _forceRefreezeEvents = 0;
+            _diagHotWindows = 0;
+            _diagUnfreezeMaxThaws = 0;
+            _diagLastVotes = 0;
+            _diagLastThreshold = 0;
+            _diagLastThaws = 0;
+            _diagPeakVotes = 0;
+            _diagPeakThaws = 0;
+            _planeInit = false;
+            _planeHudValid = false;
+            _planeHudNote = "";
+            _planeTicks = 0;
+            _planeFitCb = 0;
+            _flatSnapTotal = 0;
+            _flatSnapFrozen = 0;
+            _flatSnapCohBlocked = 0;
+            _flatSnapRepage = 0;
+            _flatSnapRepageDeferred = 0;
+            _flatHudNote = "";
+            _planeFlatPending = false;
+            _planeCensusPending = false;
+            _planeCensusLastTick = -10f;
+            _censusHudNote = "";
+            _censusHudScanned = 0;
+            _censusHudQualified = 0;
+            _censusHudFill = 0;
+            _censusHudAvgResidualMm = 0;
+            _censusHudRejEigen = 0;
+            _censusHudRejLowConf = 0;
+            _censusHudRejFew = 0;
+            _planeProbePending = false;
+            _probeHud = "";
+            _planeResidualMm = 0f;
+            _planeOffsetMm = 0f;
+            _planePointCount = 0;
             _supervisorWatchdogResets = 0;
             _censusQuietStreak = 0;
             _censusCurrentWindow = frozenBlockWindowSeconds;
@@ -1364,19 +1796,581 @@ namespace Genesis.RoomScan
                 if (now >= kv.Value) (expired ??= new List<int>()).Add(kv.Key);
             }
             if (expired == null) return;
+            List<int> refrozen = null;
+            List<int> invalidated = null;
             foreach (int b in expired)
             {
                 _pendingPageInvalidate.Remove(b);
+                // 复冻兜底（阻尼封顶，调度层最后一道阻尼器）：振荡惯犯块（累计解冻≥阈值次）
+                // 超期未复冻 = 冻-解振荡不收敛（系统性偏差纠不完，折角案例实锤）。
+                // 撤页只会让它悬在未冻态被实时轨反复重提（"整体换掉"观感引擎），此路
+                // 无自限。改为强制冻回静态几何求安分；真变化由穿越票走解冻棘轮硬闯
+                // （按不死，只慢一两窗）。初犯块照走下方撤页快路径——家具真搬走
+                // 不该被兜底拖累。
+                bool habitual = _thawCounts.TryGetValue(b, out int thaws) && thaws >= frozenRefreezeMinThaws;
+                if (habitual && !_frozenBlocks.Contains(b) &&
+                    _volumeIntegrator != null && _volumeIntegrator.FrozenBlockReady)
+                {
+                    EnsureFreezeMaskArrays();
+                    Array.Clear(_freezeSetMask, 0, _freezeSetMask.Length);
+                    Array.Clear(_freezeClearMask, 0, _freezeClearMask.Length);
+                    _freezeSetMask[b >> 5] |= 1u << (b & 31);
+                    _volumeIntegrator.ApplyChunkFreezeMasks(_freezeSetMask, _freezeClearMask);
+                    _frozenBlocks.Add(b);
+                    _frozenChunkBitsArr[b >> 5] |= 1u << (b & 31);
+                    _volumeIntegrator.SetFrozenChunkBits(_frozenChunkBitsArr);
+                    _forceRefreezeEvents++;
+                    (refrozen ??= new List<int>()).Add(b);
+                    continue;
+                }
                 // 撤页过的块视为"无页"：清掉冷却账，下次复冻必立刻重提（不吃冷却）。
                 _lastPageQueueTime.Remove(b);
                 _deferredPageRequeue.Remove(b);
                 _meshExtractor.IncrementalInvalidateParentBlock(FrozenBlockCoord3(b));
+                (invalidated ??= new List<int>()).Add(b);
             }
-            Logger.Info($"增量精修：{expired.Count} 块解冻超 {frozenPageInvalidateGraceSeconds:0}s 未复冻，撤下旧页：{FormatBlockCoords(expired)}");
+            if (invalidated != null)
+                Logger.Info($"增量精修：{invalidated.Count} 块解冻超 {frozenPageInvalidateGraceSeconds:0}s 未复冻，撤下旧页：{FormatBlockCoords(invalidated)}");
+            if (refrozen != null)
+            {
+                // 强制复冻后走正常复冻挂接：旧页继续显示，按冷却节流原子换新。
+                SyncIncrementalHeraBlocks(refrozen, new List<int>(0));
+                Logger.Info($"复冻兜底：{refrozen.Count} 个振荡惯犯块（解冻≥{frozenRefreezeMinThaws}次）超期未复冻，强制冻回求安分（真变化走解冻棘轮硬闯）：{FormatBlockCoords(refrozen)}");
+                RefreshStatusBadge();
+            }
         }
 
         // ─────────────────────────────────────────────────────────────
-        //  实时轨调度器（看哪出哪）：视线落点周边 slab 内未冻块即时出粗
+        //  B1 影子平面拟合（只读不写 TSDF）：视线落点块的观测共识面拟合。
+        //  两拍流水线：①FitAccum 全帧深度归约→回读→CPU Jacobi 特征分解得
+        //  平面（λ_min=拟合优度）→EMA 多帧共识；②OffsetAccum 扫块内正式面
+        //  体素到平面距离→存量偏移（拍平幅度预估）。HUD"拍"行三指标。
+        //  验证假设：折角/天棚观测共识面干净（残差小）+存量面偏离（偏移大）
+        //  →成立才开 B2 拍平写入；若残差大=观测面本身不干净，拍平无的放矢。
+        // ─────────────────────────────────────────────────────────────
+
+        private static readonly int PlaneFitStatsID = Shader.PropertyToID("_PlaneFitStats");
+        private static readonly int FitWorldToLocalID = Shader.PropertyToID("_FitWorldToLocal");
+        private static readonly int FitBlockCenterVoxID = Shader.PropertyToID("_FitBlockCenterVox");
+        private static readonly int FitHalfSizeVoxID = Shader.PropertyToID("_FitHalfSizeVox");
+        private static readonly int FitVoxelSizeID = Shader.PropertyToID("_FitVoxelSize");
+        private static readonly int FitVoxCountXID = Shader.PropertyToID("_FitVoxCountX");
+        private static readonly int FitVoxCountYID = Shader.PropertyToID("_FitVoxCountY");
+        private static readonly int FitVoxCountZID = Shader.PropertyToID("_FitVoxCountZ");
+        private static readonly int FitEyeID = Shader.PropertyToID("_FitEye");
+        private static readonly int FitTsdfVolumeID = Shader.PropertyToID("_FitTsdfVolume");
+        private static readonly int FitPlanePointLocalID = Shader.PropertyToID("_FitPlanePointLocal");
+        private static readonly int FitPlaneNormalLocalID = Shader.PropertyToID("_FitPlaneNormalLocal");
+        private static readonly int FitBlockMinVoxIID = Shader.PropertyToID("_FitBlockMinVoxI");
+        private static readonly int FlatVolumeRWID = Shader.PropertyToID("gsVolumeRW");
+        private static readonly int FlatConfidenceRWID = Shader.PropertyToID("gsConfidenceRW");
+        private static readonly int FlatMinDeltaID = Shader.PropertyToID("_FlatMinDelta");
+        private static readonly int FlatMinConfID = Shader.PropertyToID("_FlatMinConf");
+        private static readonly int FlatCoherenceRWID = Shader.PropertyToID("gsCoherenceRW");
+        private static readonly int FlatBlocksRWID = Shader.PropertyToID("_FlatBlocksRW");
+        private static readonly int FlatMinCohID = Shader.PropertyToID("_FlatMinCoh");
+        private static readonly int FlatChunkSizeID = Shader.PropertyToID("_FlatChunkSize");
+        private static readonly int FlatChunkCountID = Shader.PropertyToID("_FlatChunkCount");
+        private static readonly int PlaneCensusBlocksID = Shader.PropertyToID("_PlaneCensusBlocks");
+        private static readonly int PlaneCensusStatsID = Shader.PropertyToID("_PlaneCensusStats");
+        private static readonly int PlaneConfidenceID = Shader.PropertyToID("_PlaneConfidence");
+        private static readonly int PlaneBlockCountID = Shader.PropertyToID("_PlaneBlockCount");
+        private static readonly int PlaneChunkCountID = Shader.PropertyToID("_PlaneChunkCount");
+        private static readonly int PlaneChunkSizeID = Shader.PropertyToID("_PlaneChunkSize");
+        private static readonly int PlaneMinWeightID = Shader.PropertyToID("_PlaneMinWeight");
+        private static readonly int PlaneLowConfMinID = Shader.PropertyToID("_PlaneLowConfMin");
+        private static readonly int PlaneLowConfMaxFracID = Shader.PropertyToID("_PlaneLowConfMaxFrac");
+        private static readonly int PlaneMaxResidualID = Shader.PropertyToID("_PlaneMaxResidualMeters");
+        private static readonly int PlaneFillBandID = Shader.PropertyToID("_PlaneFillBandMeters");
+        private static readonly int PlaneMinSurfaceID = Shader.PropertyToID("_PlaneMinSurfaceVoxels");
+
+        // ── M3/B3 平面先验普查（只读影子）────────────────────────────────────
+        // 保险丝与 B1/B2 同款：tick 体内任何异常会截断 Update 后半截=饿死融合，
+        // 吞掉留名 EXC<类型>。看门狗 3s 未归=GPU 回读丢失，复位重试。
+        private void TickPlanePriorCensus(float now)
+        {
+            if (!enablePlanePriorCensus) return;
+            try { TickPlanePriorCensusInner(now); }
+            catch (System.Exception ex)
+            {
+                string nm = "EXC" + ex.GetType().Name;
+                _censusHudNote = nm.Length > 16 ? nm.Substring(0, 16) : nm;
+            }
+        }
+
+        private void TickPlanePriorCensusInner(float now)
+        {
+            if (planeFitShadowCompute == null) { _censusHudNote = "NOPARAM"; return; }
+            if (_planeCensusPending || _planeProbePending)
+            {
+                // 看门狗必须各自闸自己的 pending（08-21 预STUCK 冤案实锤）：
+                // 探头未 dispatch 的拍（预已冻/预界外）pendingSince 是陈旧值，
+                // 无闸判超时会每拍覆盖合法读数。
+                if (_planeCensusPending && now - _planeCensusPendingSince > 3f)
+                { _planeCensusPending = false; _censusHudNote = "STUCK"; }
+                if (_planeProbePending && now - _planeProbePendingSince > 3f)
+                { _planeProbePending = false; _probeHud = "预STUCK"; }
+                return;
+            }
+            if (now - _planeCensusLastTick < planePriorCensusIntervalSec) return;
+            _planeCensusLastTick = now;
+            if (_volumeIntegrator == null || _volumeIntegrator.Volume == null)
+            { _censusHudNote = "NORDY"; return; }
+            if (_volumeIntegrator.ConfidenceVolume == null) { _censusHudNote = "NOCONF"; return; }
+            if (_planeCensusStats == null)
+            {
+                // 内核存在闸（08-19 漏 #pragma kernel 实锤的疫苗）：空资产时
+                // FindKernel 抛 NRE——先探明，留名 NOKRN 而不是炸异常。
+                if (!planeFitShadowCompute.HasKernel("PlaneCensus"))
+                { _censusHudNote = "NOKRN"; return; }
+                _planeCensusStats = new ComputeBuffer(16, sizeof(int));
+                _planeCensusBlocks = new ComputeBuffer(planePriorMaxBlocksPerTick, sizeof(int));
+                _planeCensusKernel = new ComputeKernelHelper(planeFitShadowCompute, "PlaneCensus");
+                _planeProbeStats = new ComputeBuffer(16, sizeof(int));
+                _planeProbeBlocks = new ComputeBuffer(1, sizeof(int));
+                _planeProbeKernel = new ComputeKernelHelper(planeFitShadowCompute, "PlaneCensus");
+            }
+            var fgrid = _volumeIntegrator.FrozenChunkCount;
+            if (fgrid.x <= 0) { _censusHudNote = "NOGRID"; return; }
+            var vox = _volumeIntegrator.VoxelCount;
+            var cs = planeFitShadowCompute;
+            cs.SetInt(FitVoxCountXID, vox.x);
+            cs.SetInt(FitVoxCountYID, vox.y);
+            cs.SetInt(FitVoxCountZID, vox.z);
+            cs.SetFloat(FitVoxelSizeID, _volumeIntegrator.VoxelSize);
+            cs.SetInts(PlaneChunkCountID, fgrid.x, fgrid.y, fgrid.z);
+            cs.SetInt(PlaneChunkSizeID, Mathf.Max(1, vox.x / fgrid.x));
+            cs.SetFloat(PlaneMinWeightID, planePriorMinWeight);
+            cs.SetFloat(PlaneLowConfMinID, planePriorLowConfMin);
+            cs.SetFloat(PlaneLowConfMaxFracID, planePriorLowConfMaxFrac);
+            cs.SetFloat(PlaneMaxResidualID, planePriorMaxResidualMeters);
+            cs.SetFloat(PlaneFillBandID, planePriorFillBandMeters);
+            cs.SetInt(PlaneMinSurfaceID, planePriorMinSurfaceVoxels);
+            // ① 冻前探头先行（哪怕冻结集还空着也要跑——引导值在首冻之前就该在线）：
+            // 单块 dispatch，用的是与普查完全相同的闸/尺子，预言"此块此刻冻了合不合"。
+            TickGazeProbeInner(now);
+            // ② 冻结块普查：清单（线性索引），封顶 planePriorMaxBlocksPerTick——
+            // 先来的先查，多出的下拍再轮（低频普查不追一拍全量）。
+            if (_frozenBlocks.Count == 0) { _censusHudNote = "NOFRZ"; return; }
+            _planeCensusBlockList.Clear();
+            foreach (int b in _frozenBlocks)
+            {
+                if (_planeCensusBlockList.Count >= planePriorMaxBlocksPerTick) break;
+                _planeCensusBlockList.Add(b);
+            }
+            cs.SetInt(PlaneBlockCountID, _planeCensusBlockList.Count);
+            _planeCensusBlocks.SetData(_planeCensusBlockList);
+            _planeCensusStats.SetData(PlaneFitZero);
+            // 同 kernel 共享绑定：探头刚把 stats/blocks 绑到自己 buffer 上，
+            // 普查 dispatch 前必须重绑回自己的（两 Set 一拍一次，代价可忽略）。
+            _planeCensusKernel.Set(PlaneCensusStatsID, _planeCensusStats);
+            _planeCensusKernel.Set(PlaneCensusBlocksID, _planeCensusBlocks);
+            _planeCensusKernel.Set(FitTsdfVolumeID, _volumeIntegrator.Volume);
+            _planeCensusKernel.Set(PlaneConfidenceID, _volumeIntegrator.ConfidenceVolume);
+            _planeCensusKernel.DispatchFit(_planeCensusBlockList.Count, 1, 1);
+            _planeCensusPending = true;
+            _planeCensusPendingSince = now;
+            _censusHudNote = "";
+            AsyncGPUReadback.Request(_planeCensusStats, OnPlaneCensusReadback);
+        }
+
+        private void OnPlaneCensusReadback(AsyncGPUReadbackRequest request)
+        {
+            _planeCensusPending = false;
+            if (request.hasError || _planeCensusStats == null)
+            { _censusHudNote = "RBERR"; return; }
+            var d = request.GetData<int>();
+            if (d.Length < 16) { _censusHudNote = "LEN"; return; }
+            _censusHudScanned = d[0];
+            _censusHudQualified = d[1];
+            _censusHudFill = d[4];
+            // 残=所有算出残差的块（合格+残差拒）的均残差 mm——诊断"门槛 vs 实测差多少"。
+            // 全拒时也能读出"差多少被拒"（08-20 量化地板案的诊断盲区补洞）。
+            int evaluated = d[1] + d[6];
+            _censusHudAvgResidualMm = evaluated > 0 ? d[9] / evaluated : 0;
+            _censusHudRejEigen = d[6] + d[10]; // 残差拒+特征分解失败合并显示（后者罕见）
+            _censusHudRejLowConf = d[7];
+            _censusHudRejFew = d[8];
+        }
+
+        // ── 冻前探头 + 冻块就地判决（引导值）─────────────────────────
+        // 视线落点块单块过普查闸：同 kernel 同尺子。未冻=预言"此块此刻冻了合不合"（预）；
+        // 已冻=就地报该块成色与拒因（冻，08-21 拍板：死显示变质量地图）。
+        // 只读 TSDF/置信度，不写任何生产状态（与普查同款只读影子纪律）。
+        private void TickGazeProbeInner(float now)
+        {
+            if (_meshExtractor == null || !TryGetGazeBlockIndex(out int gb))
+            { _probeHud = "预界外"; return; }
+            _probeGazeFrozen = _frozenBlocks.Contains(gb);
+            var cs = planeFitShadowCompute;
+            cs.SetInt(PlaneBlockCountID, 1);
+            _probeBlockArr[0] = gb;
+            _planeProbeBlocks.SetData(_probeBlockArr);
+            _planeProbeStats.SetData(PlaneFitZero);
+            _planeProbeKernel.Set(PlaneCensusStatsID, _planeProbeStats);
+            _planeProbeKernel.Set(PlaneCensusBlocksID, _planeProbeBlocks);
+            _planeProbeKernel.Set(FitTsdfVolumeID, _volumeIntegrator.Volume);
+            _planeProbeKernel.Set(PlaneConfidenceID, _volumeIntegrator.ConfidenceVolume);
+            _planeProbeKernel.DispatchFit(1, 1, 1);
+            _planeProbePending = true;
+            _planeProbePendingSince = now;
+            AsyncGPUReadback.Request(_planeProbeStats, OnPlaneProbeReadback);
+        }
+
+        private void OnPlaneProbeReadback(AsyncGPUReadbackRequest request)
+        {
+            _planeProbePending = false;
+            if (request.hasError || _planeProbeStats == null) { _probeHud = "预RBERR"; return; }
+            var d = request.GetData<int>();
+            if (d.Length < 16) { _probeHud = "预LEN"; return; }
+            if (d[0] <= 0) { _probeHud = "预空"; return; }
+            // 槽位：[1]合格 [5]合格残差mm [6]残差拒 [9]算出残差块残差mm和
+            //       [7]低置信拒 [8]面不足拒 [10]特征分解失败 [2]面体素 [3]低置信体素
+            string p = _probeGazeFrozen ? "冻" : "预";
+            int lowPct = d[2] > 0 ? (int)(100L * d[3] / d[2]) : 0;
+            if (d[1] > 0)
+            {
+                // [4]=该块合格面旁补全带无数据体素（未来 B3 候选面积）——合格同时报缺，
+                // 引导值一鱼两吃：R/低 管"能不能合"，缺管"值不值得补"。
+                string verdict = _probeGazeFrozen ? "冻合" : "预可";
+                _probeHud = d[4] > 0
+                    ? $"{verdict}R{d[5]}低{lowPct}缺{d[4] / 1000f:0.0}k"
+                    : $"{verdict}R{d[5]}低{lowPct}";
+                return;
+            }
+            if (d[6] > 0) { _probeHud = $"{p}残{d[9]}"; return; }
+            if (d[7] > 0) { _probeHud = $"{p}低{lowPct}"; return; }
+            if (d[8] > 0) { _probeHud = $"{p}少"; return; }
+            if (d[10] > 0) { _probeHud = $"{p}分"; return; }
+            _probeHud = $"{p}?";
+        }
+
+        private void TickPlaneFitShadow(float now)
+        {
+            if (!enablePlaneFitShadow) return;
+            _planeTicks++;
+            // 空括号悬案保险丝：tick 体内任何异常都会截断 Update 后半截（融合饿死）
+            // 且不留备注——吞掉并留名 EX<类型>。若实机出现 EX=悬案告破且融合回血。
+            try { TickPlaneFitShadowInner(now); }
+            catch (System.Exception ex)
+            {
+                _planeHudValid = false;
+                string nm = "EX" + ex.GetType().Name;
+                _planeHudNote = nm.Length > 16 ? nm.Substring(0, 16) : nm;
+            }
+        }
+
+        private void TickPlaneFitShadowInner(float now)
+        {
+            if (!enablePlaneFitShadow) return;
+            // 分闸备注：拍行空括号无法定位，每个早退点都留名（实机无 logcat）。
+            if (planeFitShadowCompute == null) { _planeHudValid = false; _planeHudNote = "NOPARAM"; return; }
+            // 看门狗：回读 pending 超 3s 未归=回调丢失（GPU 挂死/请求丢失），
+            // 复位重试。备注全 ASCII：动态字体图集+置顶材质有缺字前科（豆腐块实锤），
+            // 诊断备注不赌字体覆盖。
+            if (_planeFitPending || _planeOffsetPending)
+            {
+                if (now - _planePendingSince > 3f)
+                {
+                    _planeFitPending = false;
+                    _planeOffsetPending = false;
+                    _planeHudValid = false; _planeHudNote = "STUCK";
+                }
+                return;
+            }
+            if (now - _planeFitLastTick < 1f) return;
+            _planeFitLastTick = now;
+            var cam = Camera.main;
+            if (cam == null) { _planeHudValid = false; _planeHudNote = "NOCAM"; return; }
+            if (_volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady)
+            { _planeHudValid = false; _planeHudNote = "NORDY"; return; }
+            if (_depthCapture == null || _depthCapture.DepthWidth <= 0)
+            { _planeHudValid = false; _planeHudNote = "NODEPTH"; return; }
+            Vector3 gaze = cam.transform.position + cam.transform.forward * GetGazeDistance();
+            if (!TryWorldToFrozenBlock(gaze, out _, out Unity.Mathematics.int3 bc))
+            {
+                _planeHudValid = false; _planeHudNote = "OUT";
+                return;
+            }
+            if (_planeFitStats == null)
+            {
+                // 内核存在闸：shader 资产导入失败（空资产）时 FindKernel 抛 NRE
+                // （08-19 导入中毒实锤）——先探明，留名 NOKRN 而不是炸异常。
+                if (!planeFitShadowCompute.HasKernel("FitAccum") ||
+                    !planeFitShadowCompute.HasKernel("OffsetAccum"))
+                { _planeHudValid = false; _planeHudNote = "NOKRN"; return; }
+                _planeFitStats = new ComputeBuffer(16, sizeof(int));
+                _planeFitAccumKernel = new ComputeKernelHelper(planeFitShadowCompute, "FitAccum");
+                _planeOffsetKernel = new ComputeKernelHelper(planeFitShadowCompute, "OffsetAccum");
+                _planeFitAccumKernel.Set(PlaneFitStatsID, _planeFitStats);
+                _planeOffsetKernel.Set(PlaneFitStatsID, _planeFitStats);
+            }
+            var vox = _volumeIntegrator.VoxelCount;
+            float vs = _volumeIntegrator.VoxelSize;
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            int blockSize = Mathf.Max(1, vox.x / grid.x);
+            _planeBlockMinVox = bc * blockSize;
+            var cs = planeFitShadowCompute;
+            cs.SetMatrix(FitWorldToLocalID, _meshExtractor.transform.worldToLocalMatrix);
+            cs.SetVector(FitBlockCenterVoxID, new Vector3(
+                _planeBlockMinVox.x + blockSize * 0.5f,
+                _planeBlockMinVox.y + blockSize * 0.5f,
+                _planeBlockMinVox.z + blockSize * 0.5f));
+            cs.SetFloat(FitHalfSizeVoxID, blockSize * 0.5f);
+            cs.SetFloat(FitVoxelSizeID, vs);
+            cs.SetInt(FitVoxCountXID, vox.x);
+            cs.SetInt(FitVoxCountYID, vox.y);
+            cs.SetInt(FitVoxCountZID, vox.z);
+            cs.SetInt(FitEyeID, 0); // 左眼片：逐眼交替清洗，旧一拍无妨（影子实验）
+            _planeFitStats.SetData(PlaneFitZero);
+            _planeFitAccumKernel.DispatchFit(_depthCapture.DepthWidth, _depthCapture.DepthHeight, 1);
+            _planeFitPending = true;
+            _planePendingSince = now;
+            AsyncGPUReadback.Request(_planeFitStats, OnPlaneFitReadback);
+        }
+
+        private void OnPlaneFitReadback(AsyncGPUReadbackRequest request)
+        {
+            _planeFitPending = false;
+            _planeFitCb++;
+            if (request.hasError || _planeFitStats == null)
+            { _planeHudValid = false; _planeHudNote = "RBERR"; return; }
+            var d = request.GetData<int>();
+            if (d.Length < 16) { _planeHudValid = false; _planeHudNote = "LEN"; return; }
+            int n = d[0];
+            if (n < 800)
+            {
+                _planeHudValid = false; _planeHudNote = $"FEW{n}";
+                return;
+            }
+            // 质心（体素单位，块中心为原点；量化 ×4 还原）
+            double cx = d[1] / (4.0 * n), cy = d[2] / (4.0 * n), cz = d[3] / (4.0 * n);
+            // 协方差 = Σpp/(n×16) − ccᵀ（体素²）
+            double xx = d[4] / (16.0 * n) - cx * cx, xy = d[5] / (16.0 * n) - cx * cy, xz = d[6] / (16.0 * n) - cx * cz;
+            double yy = d[7] / (16.0 * n) - cy * cy, yz = d[8] / (16.0 * n) - cy * cz, zz = d[9] / (16.0 * n) - cz * cz;
+            Vector3 normal = SmallestEigenVector3x3(xx, xy, xz, yy, yz, zz, out double lambdaMin);
+            float vs = _volumeIntegrator.VoxelSize;
+            var vox = _volumeIntegrator.VoxelCount;
+            // 平面点（体积局部，米）：块中心体素 + 质心偏移 → 体素坐标 → 局部米
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            int blockSize = Mathf.Max(1, vox.x / grid.x);
+            Vector3 planeVox = new Vector3(
+                _planeBlockMinVox.x + blockSize * 0.5f + (float)cx,
+                _planeBlockMinVox.y + blockSize * 0.5f + (float)cy,
+                _planeBlockMinVox.z + blockSize * 0.5f + (float)cz);
+            Vector3 planeLocal = new Vector3(
+                (planeVox.x - vox.x * 0.5f) * vs,
+                (planeVox.y - vox.y * 0.5f) * vs,
+                (planeVox.z - vox.z * 0.5f) * vs);
+            // 法向半球归一（朝相机），防 EMA 符号翻跳。体素空间方向=局部空间方向（均匀缩放）。
+            var cam = Camera.main;
+            Vector3 camLocal = _meshExtractor.transform.InverseTransformPoint(cam.transform.position);
+            if (Vector3.Dot(normal, camLocal - planeLocal) < 0f) normal = -normal;
+            if (!_planeInit)
+            {
+                _planeInit = true;
+                _planePointLocal = planeLocal;
+                _planeNormalLocal = normal;
+            }
+            else
+            {
+                _planePointLocal = Vector3.Lerp(_planePointLocal, planeLocal, 0.35f);
+                _planeNormalLocal = Vector3.Lerp(_planeNormalLocal, normal, 0.35f).normalized;
+            }
+            _planeResidualMm = (float)Math.Sqrt(Math.Max(lambdaMin, 0.0)) * vs * 1000f;
+            _planePointCount = n;
+            Vector3 an = new Vector3(Math.Abs(_planeNormalLocal.x), Math.Abs(_planeNormalLocal.y), Math.Abs(_planeNormalLocal.z));
+            _planeAxis = an.x >= an.y && an.x >= an.z ? 'X' : (an.y >= an.z ? 'Y' : 'Z');
+            _planeHudValid = true;
+            // 第二拍：存量偏移归约
+            _planeFitStats.SetData(PlaneFitZero);
+            var cs = planeFitShadowCompute;
+            cs.SetVector(FitPlanePointLocalID, _planePointLocal);
+            cs.SetVector(FitPlaneNormalLocalID, _planeNormalLocal);
+            cs.SetVector(FitBlockMinVoxIID, new Vector3(_planeBlockMinVox.x, _planeBlockMinVox.y, _planeBlockMinVox.z));
+            _planeOffsetKernel.Set(FitTsdfVolumeID, _volumeIntegrator.Volume);
+            _planeOffsetKernel.DispatchFit(blockSize, blockSize, blockSize);
+            _planeOffsetPending = true;
+            _planePendingSince = Time.time;
+            AsyncGPUReadback.Request(_planeFitStats, OnPlaneOffsetReadback);
+        }
+
+        private void OnPlaneOffsetReadback(AsyncGPUReadbackRequest request)
+        {
+            _planeOffsetPending = false;
+            if (request.hasError || _planeFitStats == null) return;
+            var d = request.GetData<int>();
+            if (d.Length < 13) return;
+            int cnt = d[11];
+            _planeOffsetMm = cnt > 0 ? (float)d[10] / cnt : 0f;
+        }
+
+        // ── B2 拍平写入（生产路径：写 TSDF sd，不动 weight）────────────────
+        // 保险丝与 B1 同款：异常截断 Update 后半截=饿死融合（08-19 实锤），吞掉留名。
+        private void TickPlaneFlatten(float now)
+        {
+            if (!enablePlaneFlatten) return;
+            try { TickPlaneFlattenInner(now); }
+            catch (System.Exception ex)
+            {
+                string nm = "EXF" + ex.GetType().Name;
+                _flatHudNote = nm.Length > 16 ? nm.Substring(0, 16) : nm;
+            }
+        }
+
+        private void TickPlaneFlattenInner(float now)
+        {
+            if (planeFitShadowCompute == null) { _flatHudNote = "NOPARAM"; return; }
+            // 看门狗：回读 3s 未归=请求丢失，复位重试
+            if (_planeFlatPending)
+            {
+                if (now - _planeFlatPendingSince > 3f)
+                { _planeFlatPending = false; _flatHudNote = "STUCK"; }
+                return;
+            }
+            if (now - _planeFlattenLastTick < planeFlattenIntervalSec) return;
+            _planeFlattenLastTick = now;
+            if (_volumeIntegrator == null || _volumeIntegrator.Volume == null)
+            { _flatHudNote = "NORDY"; return; }
+            if (_volumeIntegrator.ConfidenceVolume == null ||
+                _volumeIntegrator.CoherenceVolume == null) { _flatHudNote = "NOCONF"; return; }
+            if (_depthCapture == null || _depthCapture.DepthWidth <= 0)
+            { _flatHudNote = "NODEPTH"; return; }
+            if (_planeFlatStats == null)
+            {
+                // 内核存在闸（08-19 漏 #pragma kernel 实锤的疫苗）
+                if (!planeFitShadowCompute.HasKernel("FlattenSplat"))
+                { _flatHudNote = "NOKRN"; return; }
+                _planeFlatStats = new ComputeBuffer(16, sizeof(int));
+                _planeFlatBlocks = new ComputeBuffer(64, sizeof(int));
+                _planeFlattenKernel = new ComputeKernelHelper(planeFitShadowCompute, "FlattenSplat");
+                _planeFlattenKernel.Set(PlaneFitStatsID, _planeFlatStats);
+                _planeFlattenKernel.Set(FlatBlocksRWID, _planeFlatBlocks);
+            }
+            var vox = _volumeIntegrator.VoxelCount;
+            var cs = planeFitShadowCompute;
+            cs.SetMatrix(FitWorldToLocalID, _meshExtractor.transform.worldToLocalMatrix);
+            cs.SetFloat(FitVoxelSizeID, _volumeIntegrator.VoxelSize);
+            cs.SetInt(FitVoxCountXID, vox.x);
+            cs.SetInt(FitVoxCountYID, vox.y);
+            cs.SetInt(FitVoxCountZID, vox.z);
+            cs.SetInt(FitEyeID, 0); // 左眼片（与 B1 同：旧一拍无妨）
+            cs.SetFloat(FlatMinDeltaID, planeFlattenMinDelta);
+            cs.SetFloat(FlatMinConfID, planeFlattenMinConf);
+            cs.SetFloat(FlatMinCohID, planeFlattenMinCoherence);
+            // 冻结块网格逐内核下发（gsFrozenChunkSize/Count 在 VolumeIntegration 是
+            // 按 compute SetInt 的非全局量，本 shader 读不到）：0=冻结关=不上报块。
+            var fgrid = _volumeIntegrator.FrozenChunkCount;
+            cs.SetInt(FlatChunkSizeID, fgrid.x > 0 ? Mathf.Max(1, vox.x / fgrid.x) : 0);
+            cs.SetInts(FlatChunkCountID, fgrid.x, fgrid.y, fgrid.z);
+            _planeFlattenKernel.Set(FlatVolumeRWID, _volumeIntegrator.Volume);
+            _planeFlattenKernel.Set(FlatConfidenceRWID, _volumeIntegrator.ConfidenceVolume);
+            _planeFlattenKernel.Set(FlatCoherenceRWID, _volumeIntegrator.CoherenceVolume);
+            _planeFlatStats.SetData(PlaneFitZero);
+            _planeFlattenKernel.DispatchFit(_depthCapture.DepthWidth, _depthCapture.DepthHeight, 1);
+            _planeFlatPending = true;
+            _planeFlatPendingSince = now;
+            _flatHudNote = "";
+            AsyncGPUReadback.Request(_planeFlatStats, OnPlaneFlatReadback);
+        }
+
+        private void OnPlaneFlatReadback(AsyncGPUReadbackRequest request)
+        {
+            if (request.hasError || _planeFlatStats == null)
+            { _planeFlatPending = false; _flatHudNote = "RBERR"; return; }
+            var d = request.GetData<int>();
+            if (d.Length < 16) { _planeFlatPending = false; _flatHudNote = "LEN"; return; }
+            _flatSnapTotal += d[13];
+            _flatSnapFrozen += d[14];
+            _flatSnapCohBlocked += d[15];
+            // 刀3 链式回读：本拍压到冻块→再取块索引清单。挂起保持到清单归还
+            // （看门狗重新计 3s）；清单回调里做重排队。
+            _planeFlatBlocksExpected = Mathf.Min(d[12], 64);
+            if (_planeFlatBlocksExpected > 0 && _planeFlatBlocks != null)
+            {
+                _planeFlatPendingSince = Time.time;
+                AsyncGPUReadback.Request(_planeFlatBlocks, OnPlaneFlatBlocksReadback);
+                return; // _planeFlatPending 保持 true
+            }
+            _planeFlatPending = false;
+        }
+
+        // 刀3 重排钩：拍平改了冻块 TSDF 但直写不标脏不重排，不补这一钩页面永远
+        // 显示旧几何（A 类显示陈旧=纠了看不见）。重排不解冻（补洞票同款），
+        // 冷却/延迟补提与复冻共用一套账，每拍上限防灌爆提取队列。
+        private void OnPlaneFlatBlocksReadback(AsyncGPUReadbackRequest request)
+        {
+            _planeFlatPending = false;
+            if (request.hasError || _planeFlatBlocks == null) { _flatHudNote = "RBERR"; return; }
+            var d = request.GetData<int>();
+            int n = Mathf.Min(_planeFlatBlocksExpected, d.Length);
+            _flatUniqueBlocks.Clear();
+            for (int i = 0; i < n; i++) _flatUniqueBlocks.Add(d[i]);
+            int repaged = 0;
+            foreach (int b in _flatUniqueBlocks)
+            {
+                if (repaged >= planeFlattenRepageMaxPerTick) break;
+                if (!_frozenBlocks.Contains(b)) continue; // 压后已解冻=正常流程接管
+                if (_lastPageQueueTime.TryGetValue(b, out float last))
+                {
+                    if (Time.time - last >= frozenPageRequeueCooldownSeconds)
+                    { QueueIncrementalPage(b); repaged++; }
+                    else if (!_deferredPageRequeue.ContainsKey(b))
+                    {
+                        _deferredPageRequeue[b] = last + frozenPageRequeueCooldownSeconds;
+                        _flatSnapRepageDeferred++; // 延迟补提也计数：稳态下排≈0 是常态，延才是真活度
+                    }
+                }
+                else { QueueIncrementalPage(b); repaged++; }
+            }
+            _flatSnapRepage += repaged;
+        }
+
+        /// <summary>对称 3×3 最小特征向量（Jacobi 旋转，~12 扫收敛）。λ_min=沿法向方差=拟合优度。</summary>
+        private static Vector3 SmallestEigenVector3x3(
+            double xx, double xy, double xz, double yy, double yz, double zz, out double lambdaMin)
+        {
+            double[,] a = { { xx, xy, xz }, { xy, yy, yz }, { xz, yz, zz } };
+            double[,] v = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+            for (int sweep = 0; sweep < 16; sweep++)
+            {
+                double off = Math.Abs(a[0, 1]) + Math.Abs(a[0, 2]) + Math.Abs(a[1, 2]);
+                if (off < 1e-12) break;
+                for (int p = 0; p < 3; p++)
+                    for (int q = p + 1; q < 3; q++)
+                    {
+                        double apq = a[p, q];
+                        if (Math.Abs(apq) < 1e-15) continue;
+                        double theta = 0.5 * Math.Atan2(2.0 * apq, a[q, q] - a[p, p]);
+                        double c = Math.Cos(theta), s = Math.Sin(theta);
+                        for (int k = 0; k < 3; k++)
+                        {
+                            double akp = a[k, p], akq = a[k, q];
+                            a[k, p] = c * akp - s * akq;
+                            a[k, q] = s * akp + c * akq;
+                        }
+                        for (int k = 0; k < 3; k++)
+                        {
+                            double apk = a[p, k], aqk = a[q, k];
+                            a[p, k] = c * apk - s * aqk;
+                            a[q, k] = s * apk + c * aqk;
+                        }
+                        for (int k = 0; k < 3; k++)
+                        {
+                            double vkp = v[k, p], vkq = v[k, q];
+                            v[k, p] = c * vkp - s * vkq;
+                            v[k, q] = s * vkp + c * vkq;
+                        }
+                    }
+            }
+            int minIdx = 0;
+            if (a[1, 1] < a[minIdx, minIdx]) minIdx = 1;
+            if (a[2, 2] < a[minIdx, minIdx]) minIdx = 2;
+            lambdaMin = a[minIdx, minIdx];
+            return new Vector3((float)v[0, minIdx], (float)v[1, minIdx], (float)v[2, minIdx]).normalized;
+        }
+
+
         //  网格页（不建家族省 8 倍子页负载，边界三角定稿才补）。四道闸：
         //  冻结跳过（定稿轨接管）/ 在途跳过 / 块级 1s 节流（缺肉长肉节奏）
         //  / 全局 5 页/s 硬顶（帧率保护）。解冻块也会被实时轨拾起=修复
@@ -1535,6 +2529,36 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>HUD 视线块状态：头显正前方深度锚定落点所在冻结块的定稿阶段+红占比。</summary>
+        /// <summary>
+        /// 视线落点块线性索引（GazeBlockStatus 同源数学，冻前探头用）：
+        /// 无相机/未就绪/界外=false。调用方需保证 _meshExtractor 非空。
+        /// </summary>
+        private bool TryGetGazeBlockIndex(out int blockIndex)
+        {
+            blockIndex = -1;
+            var cam = Camera.main;
+            if (cam == null || _volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady)
+                return false;
+            float gazeDist = GetGazeDistance();
+            Vector3 point = cam.transform.position + cam.transform.forward * gazeDist;
+            // 体积以自身变换原点为中心：local = (voxel + 0.5 - count/2) * voxSize。
+            Vector3 local = _meshExtractor.transform.InverseTransformPoint(point);
+            var vox = _volumeIntegrator.VoxelCount;
+            float vs = _volumeIntegrator.VoxelSize;
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            int blockSize = Mathf.Max(1, vox.x / grid.x);
+            int vx = Mathf.FloorToInt(local.x / vs + vox.x * 0.5f);
+            int vy = Mathf.FloorToInt(local.y / vs + vox.y * 0.5f);
+            int vz = Mathf.FloorToInt(local.z / vs + vox.z * 0.5f);
+            if (vx < 0 || vy < 0 || vz < 0 || vx >= vox.x || vy >= vox.y || vz >= vox.z)
+                return false;
+            int bx = Mathf.Min(vx / blockSize, grid.x - 1);
+            int by = Mathf.Min(vy / blockSize, grid.y - 1);
+            int bz = Mathf.Min(vz / blockSize, grid.z - 1);
+            blockIndex = bx + grid.x * (by + grid.y * bz);
+            return true;
+        }
+
         private string GazeBlockStatus()
         {
             var cam = Camera.main;
@@ -1901,6 +2925,9 @@ namespace Genesis.RoomScan
         private static readonly int WireThicknessID = Shader.PropertyToID("_RSWireThickness");
         private static readonly int MeshStrideID = Shader.PropertyToID("_RSMeshStride");
         private static readonly int GridSpacingID = Shader.PropertyToID("_RSGridSpacing");
+        private static readonly int ConfidenceVizID = Shader.PropertyToID("_RSConfidenceViz");
+        private bool _confidenceVizApplied;
+        private float _lastConfidenceStatsTime = -10f;
 
         private void SetSafeShaderDefaults()
         {
@@ -1917,6 +2944,7 @@ namespace Genesis.RoomScan
             Shader.SetGlobalFloat(WireThicknessID, wireThickness);
             Shader.SetGlobalFloat(MeshStrideID, meshDisplayStride);
             Shader.SetGlobalFloat(GridSpacingID, meshGridSpacing);
+            Shader.SetGlobalFloat(ConfidenceVizID, confidenceViz ? 1f : 0f);
         }
     }
 }

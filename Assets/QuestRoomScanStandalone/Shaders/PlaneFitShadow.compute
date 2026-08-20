@@ -1,0 +1,413 @@
+// 平面拍平战役 B1 影子内核（只读：不写 TSDF、不改任何生产状态）
+// 导入失败事件存档（08-19）：初版漏写 #pragma kernel →导入器枚举 0 内核=
+// "was not imported correctly"/"is empty"空资产进包（0.0kb）→设备 FindKernel
+// 抛 NRE 且实机无 logcat 全隐形。症状签名与解法见同目录教训注释。
+// 目的：验证"折角/天棚的观测共识面是干净平面 + 存量面系统性偏离"假设。
+// 内核一 FitAccum：当帧深度像素（半采样）中落入视线块者，做块局部坐标的
+//   一阶/二阶矩原子累加（int 定点防溢出，量化 1/4 体素=1.25cm，统计无感）；
+//   C# 侧回读后 3×3 协方差 Jacobi 特征分解 → 平面法向 + λ_min=拟合优度。
+// 内核二 OffsetAccum：扫块内正式面体素（|w|≥0.08 且 |sd|<0.6，冻块负 weight
+//   取 abs 兼容），算到 C# 拟合平面的有符号距离累加 → 存量偏移（拍平幅度预估）。
+
+#include "DepthKit.hlsl"
+
+// 内核登记（漏写=导入器枚举 0 内核=空资产→设备 FindKernel 抛 NRE，08-19 实锤）
+#pragma kernel FitAccum
+#pragma kernel OffsetAccum
+#pragma kernel FlattenSplat
+#pragma kernel PlaneCensus
+
+// 槽位约定按内核各自绑定独立缓冲（C# 侧 B1=_planeFitStats / B2=_planeFlatStats）：
+// B1：[0]点数 [1-3]Σp [4-9]Σpp [10]偏移和mm [11]偏移数 [12]|偏移|和mm
+// B2：[12]冻块索引追加计数 [13]压下体素总数 [14]其中冻块 [15]相干闸拦下
+RWStructuredBuffer<int> _PlaneFitStats;
+
+float4x4 _FitWorldToLocal;   // 体积 worldToLocal（meshExtractor.transform）
+float3 _FitBlockCenterVox;   // 块中心（体素单位，体积局部体素坐标系）
+float _FitHalfSizeVox;       // 16（32³ 块半径）
+float _FitVoxelSize;         // 米/体素
+int _FitVoxCountX;           // 体积体素总数（局部→体素坐标换算用）
+int _FitVoxCountY;
+int _FitVoxCountZ;
+int _FitEye;                 // 用哪只眼的深度（0/1）
+
+// OffsetAccum 专用
+Texture3D<float2> _FitTsdfVolume;
+float3 _FitPlanePointLocal;  // 拟合平面点（体积局部，米）
+float3 _FitPlaneNormalLocal; // 拟合平面法向（体积局部，单位向量）
+float3 _FitBlockMinVoxI;      // 块最小角（体素整数坐标；float3 下发避免 SetVector→int 位重解释，值均为小整数精确可转）
+
+[numthreads(8,8,1)]
+void FitAccum(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= gsDepthTexSize.x || id.y >= gsDepthTexSize.y) return;
+    // 半采样（棋盘格）：点数减半换定点累加安全裕量，统计无损。
+    if (((id.x + id.y) & 1u) != 0u) return;
+
+    float depthNDC = gsDepthTex[uint3(id.xy, (uint)_FitEye)];
+    if (depthNDC <= 0.0) return; // 弃权/无效像素
+
+    float2 uv = (id.xy + 0.5) / float2(gsDepthTexSize);
+    float3 world = gsDepthNDCtoWorld(float3(uv, depthNDC), _FitEye);
+
+    // 掠射观测剔除：只要正视/近正视样本（共识面的高质量证据）；
+    // 掠射样本=偏差制造者本人，混进来会污染拟合目标。
+    float3 nrm = gsDepthNormalSample(uv, _FitEye).xyz;
+    float3 eyePos = gsDepthEyePos(_FitEye);
+    float3 toPix = world - eyePos;
+    float facing = -dot(normalize(toPix), nrm);
+    if (facing < 0.5) return;
+
+    float3 local = mul(_FitWorldToLocal, float4(world, 1)).xyz;
+    // 体积局部（米，原点居中）→ 体素坐标（与 C# GazeBlockStatus 同换算）
+    float3 vox = local / _FitVoxelSize +
+                 float3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ) * 0.5;
+    float3 rel = vox - _FitBlockCenterVox;
+    if (abs(rel.x) > _FitHalfSizeVox || abs(rel.y) > _FitHalfSizeVox || abs(rel.z) > _FitHalfSizeVox)
+        return;
+
+    // 定点量化 ×4（1.25cm）：Σpp 上界 64²×153600≈6.3e8 < int32 上限。
+    int3 q = (int3)round(rel * 4.0);
+    InterlockedAdd(_PlaneFitStats[0], 1);
+    InterlockedAdd(_PlaneFitStats[1], q.x);
+    InterlockedAdd(_PlaneFitStats[2], q.y);
+    InterlockedAdd(_PlaneFitStats[3], q.z);
+    InterlockedAdd(_PlaneFitStats[4], q.x * q.x);
+    InterlockedAdd(_PlaneFitStats[5], q.x * q.y);
+    InterlockedAdd(_PlaneFitStats[6], q.x * q.z);
+    InterlockedAdd(_PlaneFitStats[7], q.y * q.y);
+    InterlockedAdd(_PlaneFitStats[8], q.y * q.z);
+    InterlockedAdd(_PlaneFitStats[9], q.z * q.z);
+}
+
+[numthreads(8,8,8)]
+void OffsetAccum(uint3 id : SV_DispatchThreadID)
+{
+    int3 coord = (int3)_FitBlockMinVoxI + (int3)id;
+    float2 s = _FitTsdfVolume[coord];
+    float w = abs(s.y); // 冻块负 weight 取 abs：拍平评估不问冻结态
+    if (w < 0.08 || abs(s.x) > 0.6) return; // 只要正式面近零交叉体素
+
+    float3 posLocal = ((float3)coord + 0.5 -
+                       float3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ) * 0.5) * _FitVoxelSize;
+    float d = dot(posLocal - _FitPlanePointLocal, _FitPlaneNormalLocal);
+    int mm = (int)round(d * 1000.0);
+    InterlockedAdd(_PlaneFitStats[10], mm);
+    InterlockedAdd(_PlaneFitStats[11], 1);
+    InterlockedAdd(_PlaneFitStats[12], abs(mm));
+}
+
+// ── 内核三 FlattenSplat（B2 拍平写入，08-19）─────────────────────────────
+// 每像素自带局部平面（观测点+世界法向）→折角两块面各压各的，无块级角平分面
+// 倒角破坏（B1 实测块 1.6m，块级单平面在折角必然误伤好墙沿=方案否决原因）。
+// 三原则：只写 sd、weight 原样（负 weight=冻结编码保留=不解冻修冻块几何）；
+// 只压显著区（|观测-存量|≥_FlatMinDelta）；持久闸（置信度 EMA≥_FlatMinConf
+// =持续矛盾才压，瞬态手/行人进冻块不被烙进几何——EMA 自限：压完观测一致、
+// EMA 衰减、自然停手）。穿越票失根（frozenDelta≈0）=振荡断根。
+// 相干闸（08-19 三面角伺服实锤，刀2）：持久闸只量"观测 vs 存量"分歧，量不了
+// 观测自身稳不稳——三面角多径区观测逐帧跳，拍平变追踪抖动观测的伺服器
+// （压向 A→观测跳 B→再压）。相干=有符号分歧 EMA 的方向一致性：方向逐帧翻
+// →回中性 0.5→拦；方向固定（系统偏差/真搬家具）→偏两端→放行。
+// 与冻票噪拦同一判据，通用机制无角区特化。
+RWTexture3D<float2> gsVolumeRW;   // 生产主卷 TSDF（R8G8_SNorm）
+Texture3D<float> gsConfidenceRW;  // 分歧 EMA 影子卷（只读：0-1，sd 归一单位）
+Texture3D<float> gsCoherenceRW;   // 相干 EMA 影子卷（只读：0.5 偏置有符号分歧）
+RWStructuredBuffer<int> _FlatBlocksRW; // 本拍压到的冻块线性索引（64 槽，刀3 重排队用）
+float gsVoxDist;                  // 全局量（VolumeIntegrator SetGlobalFloat）
+float _FlatMinDelta;              // 显著区阈值（sd 归一，0.3≈4.5cm）
+float _FlatMinConf;               // 持久矛盾门槛（分歧 EMA，0.25≈3.75cm）
+float _FlatMinCoh;                // 相干门槛（|coh-0.5|/dConf，0.5=与冻票噪拦同杆）
+int _FlatChunkSize;               // 冻结块边长（体素，0=冻结系统关；逐内核下发非全局）
+int3 _FlatChunkCount;             // 冻结块网格维度（线性化与 C# FrozenBlockCoord3 互逆）
+
+// ── M3/B3 平面先验普查（只读影子，08-20）────────────────────────────
+// 目的：先量出"多少冻结块真的有资格给平面先验供面、这些面旁边有多少无数据带"，
+// 再决定是否接显示层补全皮。只读 TSDF/置信度，绝不写生产状态。
+StructuredBuffer<int> _PlaneCensusBlocks; // 本拍冻结块线性索引清单
+RWStructuredBuffer<int> _PlaneCensusStats;
+Texture3D<float> _PlaneConfidence;
+int _PlaneBlockCount;
+int3 _PlaneChunkCount;
+int _PlaneChunkSize;
+float _PlaneMinWeight;
+float _PlaneLowConfMin;
+float _PlaneLowConfMaxFrac;
+float _PlaneMaxResidualMeters;
+float _PlaneFillBandMeters;
+int _PlaneMinSurfaceVoxels;
+
+[numthreads(8,8,1)]
+void FlattenSplat(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= gsDepthTexSize.x || id.y >= gsDepthTexSize.y) return;
+    if (((id.x + id.y) & 1u) != 0u) return; // 半采样（相邻像素泼溅重叠，无损）
+    float depthNDC = gsDepthTex[uint3(id.xy, (uint)_FitEye)];
+    if (depthNDC <= 0.0) return;
+
+    float2 uv = (id.xy + 0.5) / float2(gsDepthTexSize);
+    float3 world = gsDepthNDCtoWorld(float3(uv, depthNDC), _FitEye);
+    float3 nrm = gsDepthNormalSample(uv, _FitEye).xyz;
+    float facing = -dot(normalize(world - gsDepthEyePos(_FitEye)), nrm);
+    if (facing < 0.5) return; // 掠射剔除（与 FitAccum 同杆：掠射=偏差制造者）
+
+    float3 local = mul(_FitWorldToLocal, float4(world, 1)).xyz;
+    float3 voxF = local / _FitVoxelSize +
+                  float3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ) * 0.5;
+    // 法向随世界→局部同旋转（均匀缩放，方向不变）；局部空间点积=世界空间点积
+    float3 nrmLocal = normalize(mul((float3x3)_FitWorldToLocal, nrm));
+    [unroll]
+    for (int k = -2; k <= 2; k++) // 沿法向 ±2 体素泼溅：零交叉两侧同改，不留旧梯度尾巴
+    {
+        int3 v = (int3)floor(voxF + nrmLocal * (float)k);
+        if (any(v < 0) || any(v >= int3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ))) continue;
+        float2 s = gsVolumeRW[v];
+        if (abs(s.y) < 0.08) continue;             // 只修正式面（冻块负 weight 取 abs）
+        float dConf = gsConfidenceRW[v];
+        if (dConf < _FlatMinConf) continue;        // 持久闸：瞬态矛盾不烙
+        // 相干闸（刀2）：方向翻的抖动观测不配改写几何；首压可能因账未偏向被拦
+        // 一拍，0.5s 后账偏向即放行（折角回归验收点：好墙拍平不得被掐死）。
+        float coh = abs(gsCoherenceRW[v] - 0.5) / max(dConf, 0.02);
+        if (coh < _FlatMinCoh) { InterlockedAdd(_PlaneFitStats[15], 1); continue; }
+        float3 centerLocal = ((float3)v + 0.5 -
+            float3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ) * 0.5) * _FitVoxelSize;
+        float sdObs = clamp(dot(centerLocal - local, nrmLocal) / gsVoxDist, -1.0, 1.0);
+        if (abs(sdObs - s.x) < _FlatMinDelta) continue;  // 只压显著区（平墙 O 小=免疫）
+        gsVolumeRW[v] = float2(sdObs, s.y); // 只写 sd，weight 原样（冻结态保留）
+        InterlockedAdd(_PlaneFitStats[13], 1);              // 本拍压下体素总数
+        if (s.y < 0.0)
+        {
+            InterlockedAdd(_PlaneFitStats[14], 1); // 其中冻块体素
+            // 刀3：冻块页面上报——拍平改了冻块 TSDF 但直写不标脏不重排，
+            // 不上报则页面永远显示旧几何（A 类显示陈旧=纠了看不见）。
+            // C# 凭索引 QueueIncrementalPage（重排不解冻，补洞票同款）。
+            if (_FlatChunkSize > 0)
+            {
+                int slot; // 与 int 缓冲匹配的 InterlockedAdd 重载（防 Vulkan 编译挑错）
+                InterlockedAdd(_PlaneFitStats[12], 1, slot);
+                if (slot < 64)
+                {
+                    int3 bc = min(v / _FlatChunkSize, _FlatChunkCount - 1);
+                    _FlatBlocksRW[slot] = bc.x + _FlatChunkCount.x * (bc.y + _FlatChunkCount.y * bc.z);
+                }
+            }
+        }
+    }
+}
+
+// PlaneCensus 专用 Jacobi 最小特征向量（输入为块局部体素单位协方差）。
+bool PlaneCensusEigen(float xx, float xy, float xz, float yy, float yz, float zz,
+                      out float3 normal, out float lambdaMin)
+{
+    normal = float3(0, 1, 0);
+    float a[9];
+    a[0] = xx; a[1] = xy; a[2] = xz;
+    a[3] = xy; a[4] = yy; a[5] = yz;
+    a[6] = xz; a[7] = yz; a[8] = zz;
+    float v[9];
+    v[0] = 1; v[1] = 0; v[2] = 0;
+    v[3] = 0; v[4] = 1; v[5] = 0;
+    v[6] = 0; v[7] = 0; v[8] = 1;
+
+    for (int iter = 0; iter < 24; iter++)
+    {
+        int p = 0;
+        int q = 1;
+        float maxOff = abs(a[1]);
+        if (abs(a[2]) > maxOff) { maxOff = abs(a[2]); p = 0; q = 2; }
+        if (abs(a[5]) > maxOff) { maxOff = abs(a[5]); p = 1; q = 2; }
+        if (maxOff < 1e-8) break;
+
+        float app = a[p * 3 + p];
+        float aqq = a[q * 3 + q];
+        float apq = a[p * 3 + q];
+        float phi = 0.5 * atan2(2.0 * apq, aqq - app);
+        float c = cos(phi);
+        float s = sin(phi);
+
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float akp = a[k * 3 + p];
+            float akq = a[k * 3 + q];
+            a[k * 3 + p] = c * akp - s * akq;
+            a[k * 3 + q] = s * akp + c * akq;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float apk = a[p * 3 + k];
+            float aqk = a[q * 3 + k];
+            a[p * 3 + k] = c * apk - s * aqk;
+            a[q * 3 + k] = s * apk + c * aqk;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float vkp = v[k * 3 + p];
+            float vkq = v[k * 3 + q];
+            v[k * 3 + p] = c * vkp - s * vkq;
+            v[k * 3 + q] = s * vkp + c * vkq;
+        }
+    }
+
+    int smallest = 0;
+    if (a[4] < a[0]) smallest = 1;
+    if (a[8] < a[smallest * 3 + smallest]) smallest = 2;
+    normal = float3(v[smallest], v[3 + smallest], v[6 + smallest]);
+    lambdaMin = a[smallest * 3 + smallest];
+    if (any(isnan(normal)) || any(isinf(normal)) || dot(normal, normal) < 1e-8)
+        return false;
+    normal = normalize(normal);
+    return true;
+}
+
+// 全场冻结块平面资格普查：一块一线程，低频跑（默认 2s）。
+// 折角块会被残差闸自然淘汰——这是通用几何判据，不是角区特化。
+// 08-20 改尺（实机全员拒绝的量化地板实锤后）：面点不再直接用整数体素中心
+// （5cm 量化→完美墙零交叉层 1-3 体素厚→RMS 地板 15-45mm，20mm 门槛在地板下
+// =平面永不合格）。改用 sd 子体素修正：t=s.x（归一 sd）含"体素中心离零交叉
+// 多远"的连续信息，沿初拟合平面法向把面点拉回零交叉（p'=p-k·t·n，
+// k=截断带/体素边长），修正后协方差闭式可得，无需二扫：
+//   Cov(p') = C - k(covPT·nᵀ + n·covPTᵀ) + k²·varT·n·nᵀ
+// 法向符号由 covPT 定向自校正（covPT 与 sd 增长方向共线），与积分/拍平的
+// sd 符号约定全局翻转无关。折角块=两张面，修正后残差仍大→照样淘汰。
+// 统计槽：[0]扫描块 [1]合格 [2]面体素和 [3]低置信和 [4]B3候选体素
+//         [5]合格块残差mm和 [6]残差拒 [7]浊拒 [8]少拒
+//         [9]算出残差块的残差mm和（合格+残差拒，诊断用均残差） [10]特征分解失败
+[numthreads(1, 1, 1)]
+void PlaneCensus(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_PlaneBlockCount) return;
+    int blockIndex = _PlaneCensusBlocks[id.x];
+    int3 bc;
+    bc.x = blockIndex % _PlaneChunkCount.x;
+    bc.y = (blockIndex / _PlaneChunkCount.x) % _PlaneChunkCount.y;
+    bc.z = blockIndex / (_PlaneChunkCount.x * _PlaneChunkCount.y);
+    int3 blockMin = bc * _PlaneChunkSize;
+    int3 blockMax = min(blockMin + _PlaneChunkSize, int3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ));
+    float3 halfSize = float3(_PlaneChunkSize, _PlaneChunkSize, _PlaneChunkSize) * 0.5;
+
+    int surfaceCount = 0;
+    int lowConfCount = 0;
+    float3 sum = 0.0;
+    float3 sumSq = 0.0;
+    float3 sumCross = 0.0;
+    float sumT = 0.0;    // Σt，t=s.x（归一 sd，截断带为单位）
+    float sumT2 = 0.0;   // Σt²
+    float3 sumTP = 0.0;  // Σt·p
+
+    [loop]
+    for (int z = blockMin.z; z < blockMax.z; z++)
+    {
+        [loop]
+        for (int y = blockMin.y; y < blockMax.y; y++)
+        {
+            [loop]
+            for (int x = blockMin.x; x < blockMax.x; x++)
+            {
+                float2 s = _FitTsdfVolume[int3(x, y, z)];
+                float w = abs(s.y);
+                if (w < _PlaneMinWeight || abs(s.x) > 0.6) continue;
+                float3 rel = float3(x, y, z) - (float3)blockMin - halfSize;
+                sum += rel;
+                sumSq += rel * rel;
+                sumCross += float3(rel.x * rel.y, rel.x * rel.z, rel.y * rel.z);
+                sumT += s.x;
+                sumT2 += s.x * s.x;
+                sumTP += s.x * rel;
+                surfaceCount++;
+                if (_PlaneConfidence[int3(x, y, z)] > _PlaneLowConfMin) lowConfCount++;
+            }
+        }
+    }
+
+    InterlockedAdd(_PlaneCensusStats[0], 1);
+    InterlockedAdd(_PlaneCensusStats[2], surfaceCount);
+    InterlockedAdd(_PlaneCensusStats[3], lowConfCount);
+    if (surfaceCount < _PlaneMinSurfaceVoxels)
+    {
+        InterlockedAdd(_PlaneCensusStats[8], 1);
+        return;
+    }
+    if (lowConfCount > _PlaneLowConfMaxFrac * surfaceCount)
+    {
+        InterlockedAdd(_PlaneCensusStats[7], 1);
+        return;
+    }
+
+    float invN = 1.0 / (float)surfaceCount;
+    // 注意：centroid 是 HLSL 保留字（插值修饰符），变量名必须绕开（08-20 编译实锤）。
+    float3 center = sum * invN;
+    float meanT = sumT * invN;
+    float xx = sumSq.x * invN - center.x * center.x;
+    float yy = sumSq.y * invN - center.y * center.y;
+    float zz = sumSq.z * invN - center.z * center.z;
+    float xy = sumCross.x * invN - center.x * center.y;
+    float xz = sumCross.y * invN - center.x * center.z;
+    float yz = sumCross.z * invN - center.y * center.z;
+    float3 covPT = sumTP * invN - center * meanT;        // Cov(p,t)
+    float varT = max(sumT2 * invN - meanT * meanT, 0.0); // Var(t)
+
+    // 初拟合：整数面点的最小特征向量=初始法向（符号任意，下一步自校正）
+    float3 normal;
+    float lambdaMin;
+    if (!PlaneCensusEigen(xx, xy, xz, yy, yz, zz, normal, lambdaMin))
+    {
+        InterlockedAdd(_PlaneCensusStats[10], 1);
+        return;
+    }
+    if (dot(normal, covPT) < 0.0) normal = -normal;
+
+    // sd 子体素修正协方差（闭式）：吃掉 5cm 量化地板，残差反映几何真值
+    float k = gsVoxDist / _FitVoxelSize; // 归一 sd → 体素
+    float k2vt = k * k * varT;
+    float cxx = xx - 2.0 * k * covPT.x * normal.x + k2vt * normal.x * normal.x;
+    float cyy = yy - 2.0 * k * covPT.y * normal.y + k2vt * normal.y * normal.y;
+    float czz = zz - 2.0 * k * covPT.z * normal.z + k2vt * normal.z * normal.z;
+    float cxy = xy - k * (covPT.x * normal.y + covPT.y * normal.x) + k2vt * normal.x * normal.y;
+    float cxz = xz - k * (covPT.x * normal.z + covPT.z * normal.x) + k2vt * normal.x * normal.z;
+    float cyz = yz - k * (covPT.y * normal.z + covPT.z * normal.y) + k2vt * normal.y * normal.z;
+
+    float3 normal2;
+    float lambdaMin2;
+    if (!PlaneCensusEigen(cxx, cxy, cxz, cyy, cyz, czz, normal2, lambdaMin2))
+    {
+        InterlockedAdd(_PlaneCensusStats[10], 1);
+        return;
+    }
+    float residual = sqrt(max(lambdaMin2, 0.0)) * _FitVoxelSize;
+    // 算出残差的块全记账（合格与否都记）——诊断读数：门槛 vs 实测差多少一眼可读
+    InterlockedAdd(_PlaneCensusStats[9], (int)round(residual * 1000.0));
+    if (residual > _PlaneMaxResidualMeters)
+    {
+        InterlockedAdd(_PlaneCensusStats[6], 1);
+        return;
+    }
+    if (dot(normal2, normal) < 0.0) normal2 = -normal2; // 与修正方向同向
+    // 修正后平面点（体素单位，块中心相对）：c'=c-k·meanT·n
+    float3 centerCorr = center - k * meanT * normal;
+
+    // 合格平面旁的无数据带=未来 B3 补全皮候选面积。只计数，不写 TSDF/显示缓冲。
+    int fillCandidates = 0;
+    [loop]
+    for (int z = blockMin.z; z < blockMax.z; z++)
+    {
+        [loop]
+        for (int y = blockMin.y; y < blockMax.y; y++)
+        {
+            [loop]
+            for (int x = blockMin.x; x < blockMax.x; x++)
+            {
+                float2 s = _FitTsdfVolume[int3(x, y, z)];
+                if (abs(s.y) >= _PlaneMinWeight) continue;
+                float3 rel = float3(x, y, z) - (float3)blockMin - halfSize;
+                float d = dot((rel - centerCorr) * _FitVoxelSize, normal2);
+                if (abs(d) <= _PlaneFillBandMeters) fillCandidates++;
+            }
+        }
+    }
+
+    InterlockedAdd(_PlaneCensusStats[1], 1);
+    InterlockedAdd(_PlaneCensusStats[4], fillCandidates);
+    InterlockedAdd(_PlaneCensusStats[5], (int)round(residual * 1000.0));
+}

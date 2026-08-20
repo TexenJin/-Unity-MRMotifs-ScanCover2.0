@@ -217,12 +217,49 @@ MonoBehaviour:
   integrationHz: 20
   meshExtractionHz: 12
   wireframeMode: 1
-  wireThickness: 2
+  wireThickness: 1
+  meshDisplayStride: 1
+  meshGridSpacing: 0.3
+  confidenceViz: 1
   enableHeadExclusion: 1
+  enableFrozenChunkAbExperiment: 1
+  enableHeraHierarchicalReplay: 1
+  abMaxChunksPerTick: 3
+  keepFrozenReplayAfterExport: 1
+  enableFrozenBlockSupervisor: 1
+  frozenBlockWindowSeconds: 1
+  frozenBlockMinSurfaceVoxels: 600
+  frozenBlockStabilityTolerance: 24
+  frozenBlockVoteThreshold: 200
+  frozenBlockVoteRatchet: 3
+  frozenBlockHoleVoteThreshold: 200
+  frozenBlockRequireStability: 0
+  enableFreezeConfidenceGate: 1
+  freezeGateLowConfMaxFrac: 0.2
+  enableAdaptiveCensus: 1
+  enableLiveTrack: 1
+  liveTrackSweepSeconds: 0.15
+  liveTrackBlockCooldownSeconds: 0.5
+  liveTrackMaxPagesPerSecond: 10
+  liveTrackMinSurfaceVoxels: 16
+  enableIncrementalHeraRefine: 1
+  frozenPageInvalidateGraceSeconds: 8
+  frozenPageRequeueCooldownSeconds: 15
+  frozenRefreezeMinThaws: 2
+  enablePlaneFitShadow: 1
+  planeFitShadowCompute: {fileID: 7200000, guid: cf3a91b27e4d4f58a6c0d9e1b2a34f56, type: 3}
+  enablePlaneFlatten: 1
+  planeFlattenMinDelta: 0.3
+  planeFlattenMinConf: 0.25
+  planeFlattenIntervalSec: 0.5
+  planeFlattenMinCoherence: 0.5
+  planeFlattenRepageMaxPerTick: 8
   logLevel: 1
+  showStatusBadge: 1
   showDebugHud: 1
   showDepthPreview: 0
   showDepthPointCloud: 0
+  showDiagnosticRoiFrame: 0
 --- !u!114 &170429782
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -247,8 +284,24 @@ MonoBehaviour:
   renderProductionMesh: 1
   surfaceNetsCompute: {fileID: 7200000, guid: 642ed88bf212b4bc38e224b13f42362e, type: 3}
   coarseSkinCompute: {fileID: 7200000, guid: b63ebfaab5fc49b7b8f3ca0d93f4110a, type: 3}
+  coarseSkinStride: 4
+  coarseSkinMinWeight: 0.04
+  coarseSkinHz: 4
+  enableCoarseSkin: 0
   gpuVertexBudgetPercent: 0.08
   diagnosticReadbackHz: 2
+  enablePersistentDirtyChunks: 1
+  maxDirtyChunksPerExtraction: 2
+  extractionHaloVoxels: 2
+  dirtyLedgerReadbackHz: 5
+  enableDiagnosticRoi: 1
+  diagnosticRoiRect: {x: 0.2, y: 0.25, z: 0.8, w: 0.75}
+  diagnosticRoiSplitX: {x: 0.44, y: 0.56}
+  temporalDiagnosticWindowSeconds: 5
+  temporalDiagnosticInsufficientThreshold: 0.4
+  temporalDiagnosticSupportCeiling: 0.6
+  temporalDiagnosticRequiredWindows: 2
+  temporalDiagnosticWarmupSeconds: 5
 --- !u!114 &170429783
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -271,8 +324,8 @@ MonoBehaviour:
   voxelMin: 0.1
   depthDisparityThreshold: 0.5
   maxUpdateDist: 5
-  minUpdateDist: 0.5
-  exclusionRadius: 0.6
+  minUpdateDist: 0.15
+  exclusionRadius: 0.35
   maxFrustumPositions: 1000000
   blendRate: 0.8
   stability: 2.5
@@ -285,6 +338,8 @@ MonoBehaviour:
   carveBypassNormal: 1
   carveBypassMargin: 0.5
   carveBypassBoost: 2
+  freeSpaceCarveBoost: 2
+  rescueSeedDistOnly: 1
   abstainSeedGuard: 1
   rawSeedGate: 1
   rawSeedBand: 1
@@ -295,13 +350,25 @@ MonoBehaviour:
   dilationBlockSparseWrites: 1
   provisionalSeedWeight: 0.06
   motionGateDegPerSec: 90
+  motionSeedBlockDegPerSec: 60
+  frozenBlockEnable: 1
+  frozenVoteQualityMin: 0.25
+  frozenVoteMargin: 0.2
+  frozenChunkSize: 32
+  frozenMatureWeight: 0.15
   minMeshWeight: 0.08
+  extractionChunkSize: 64
+  dirtyTsdfThreshold: 0.02
+  dirtySurfaceBand: 1
+  enableProjectiveShadow: 0
+  confidenceRate: 0.15
+  confidenceMidMax: 0.1
+  confidenceLowMin: 0.25
   cameraExposure: 3
   warmupIntegrations: 3
   pruneIntervalSeconds: 3
   pruneSlicesPerIntegration: 8
   coverageUpdateInterval: 120
-  enableProjectiveShadow: 0
 --- !u!114 &170429784
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -318,6 +385,12 @@ MonoBehaviour:
   depthDilationCompute: {fileID: 7200000, guid: 0d6a7d2279e7547dd9ab3b58d73f99e8, type: 3}
   bilateralFilterCompute: {fileID: 7200000, guid: bde882d2fb87a4de7ae342e8acf27418, type: 3}
   depthEdgeCleanCompute: {fileID: 7200000, guid: b4f6bc291209432ca9515fbaa165c03e, type: 3}
+  handMaskCompute: {fileID: 0}
+  enableNativeHandRemoval: 0
+  enableHandMask: 1
+  handPalmRadius: 0.11
+  handTipRadius: 0.07
+  controllerSphereRadius: 0.13
   enableBilateralFilter: 1
   sigmaSpatial: 3
   sigmaColor: 0.1
