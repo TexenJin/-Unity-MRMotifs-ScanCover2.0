@@ -8,6 +8,9 @@ RWTexture3D<float2> _PreviousVolumeRW;
 RWStructuredBuffer<uint> _GeometryStats;
 
 int3 _VoxelCount;
+int3 _SpatialChunkCount;
+int _SpatialChunkSize;
+int _SpatialBase;
 float _MinMeshWeight;
 float _SurfaceBand;
 float _VoxelDistance;
@@ -18,6 +21,7 @@ float _VoxelSize;
 // 8..71: 64-bin drift histogram, each bin = 1/16 voxel.
 #define HISTOGRAM_BASE 8
 #define HISTOGRAM_COUNT 64
+#define SPATIAL_STRIDE 8
 
 [numthreads(8, 8, 8)]
 void CompareVolumes(uint3 id : SV_DispatchThreadID)
@@ -29,26 +33,54 @@ void CompareVolumes(uint3 id : SV_DispatchThreadID)
     bool previousSurface = abs(previous.y) >= _MinMeshWeight && abs(previous.x) < _SurfaceBand;
     bool currentSurface = abs(current.y) >= _MinMeshWeight && abs(current.x) < _SurfaceBand;
 
-    if (previousSurface) InterlockedAdd(_GeometryStats[0], 1u);
-    if (currentSurface) InterlockedAdd(_GeometryStats[1], 1u);
+    int3 pageCoord = min((int3)id / max(_SpatialChunkSize, 1), _SpatialChunkCount - 1);
+    uint pageIndex = (uint)(pageCoord.x + _SpatialChunkCount.x *
+        (pageCoord.y + _SpatialChunkCount.y * pageCoord.z));
+    uint pageBase = (uint)_SpatialBase + pageIndex * SPATIAL_STRIDE;
+
+    if (previousSurface)
+    {
+        InterlockedAdd(_GeometryStats[0], 1u);
+        InterlockedAdd(_GeometryStats[pageBase], 1u);
+    }
+    if (currentSurface)
+    {
+        InterlockedAdd(_GeometryStats[1], 1u);
+        InterlockedAdd(_GeometryStats[pageBase + 1u], 1u);
+    }
 
     if (previousSurface && currentSurface)
     {
         InterlockedAdd(_GeometryStats[2], 1u);
+        InterlockedAdd(_GeometryStats[pageBase + 2u], 1u);
         float driftVoxels = abs(current.x - previous.x) * _VoxelDistance / max(_VoxelSize, 1e-6);
-        if (driftVoxels >= 0.25) InterlockedAdd(_GeometryStats[5], 1u);
+        if (driftVoxels >= 0.25)
+        {
+            InterlockedAdd(_GeometryStats[5], 1u);
+            InterlockedAdd(_GeometryStats[pageBase + 5u], 1u);
+        }
+        if (driftVoxels >= 0.5)
+            InterlockedAdd(_GeometryStats[pageBase + 6u], 1u);
         uint driftFixed = (uint)min(driftVoxels * 1024.0 + 0.5, 4294967295.0);
         InterlockedMax(_GeometryStats[6], driftFixed);
+        int3 localCoord = (int3)id - pageCoord * _SpatialChunkSize;
+        uint localFlat = (uint)(localCoord.x + _SpatialChunkSize *
+            (localCoord.y + _SpatialChunkSize * localCoord.z));
+        uint packedDriftLocation = (min(driftFixed, 0x1FFFFu) << 15u) |
+            (localFlat & 0x7FFFu);
+        InterlockedMax(_GeometryStats[pageBase + 7u], packedDriftLocation);
         uint histogramBin = min((uint)(driftVoxels * 16.0), HISTOGRAM_COUNT - 1u);
         InterlockedAdd(_GeometryStats[HISTOGRAM_BASE + histogramBin], 1u);
     }
     else if (previousSurface)
     {
         InterlockedAdd(_GeometryStats[3], 1u);
+        InterlockedAdd(_GeometryStats[pageBase + 3u], 1u);
     }
     else if (currentSurface)
     {
         InterlockedAdd(_GeometryStats[4], 1u);
+        InterlockedAdd(_GeometryStats[pageBase + 4u], 1u);
     }
 }
 

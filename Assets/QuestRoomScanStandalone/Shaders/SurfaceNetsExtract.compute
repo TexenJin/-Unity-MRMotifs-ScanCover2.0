@@ -8,8 +8,9 @@
 //   3. BuildVertexDispatchArgs  (1 thread)
 //   4. [optional] InitSmooth -> N x SmoothVertices -> ApplySmooth
 //   5. [optional] TemporalBlend
-//   6. GenerateIndices  (indirect 1D over vertices)
-//   7. BuildIndirectArgs  (1 thread)
+//   6. AccumulateVisualQualityVertices -> FitVisualQualityPlanes (read-only)
+//   7. GenerateIndices  (indirect 1D over vertices)
+//   8. BuildIndirectArgs  (1 thread)
 
 #pragma kernel ClearCounters
 #pragma kernel ClassifyAndEmit
@@ -18,6 +19,8 @@
 #pragma kernel SmoothVertices
 #pragma kernel ApplySmooth
 #pragma kernel TemporalBlend
+#pragma kernel AccumulateVisualQualityVertices
+#pragma kernel FitVisualQualityPlanes
 #pragma kernel GenerateIndices
 #pragma kernel BuildIndirectArgs
 #pragma kernel InitTemporal
@@ -74,6 +77,7 @@ uint   _CandidateExtractionEpoch;
 uint   _CandidateHistoryUpdateEnabled;
 uint   _CandidateHistoryCapacity;
 uint   _CandidateHistoryMask;
+uint   _VisualQualityEnabled;
 
 // ──────────────────────────────────────────────────────────────────
 //  GPU Vertex (32 bytes, matches StructuredBuffer in render shader)
@@ -149,6 +153,27 @@ RWStructuredBuffer<uint>      _CandidateHistoryKeys;
 RWStructuredBuffer<uint>      _CandidateHistoryStates;
 
 RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, w = age (-1 = uninit)
+
+// Read-only visual-quality ledger.  It classifies the final, smoothed/blended
+// mesh but never writes vertices, indices, TSDF, admission or renderer state.
+#define VISUAL_BIN_COUNT 64u
+#define VISUAL_PRIMARY_COUNT 8u
+#define VISUAL_FLAG_COUNT 11u
+#define VISUAL_PRIMARY_BASE 1420u
+#define VISUAL_FLAGS_BASE 1428u
+#define VISUAL_RESIDUAL_HIST_BASE 1439u
+#define VISUAL_NORMAL_HIST_BASE 1445u
+#define VISUAL_TOTAL_INDEX 1450u
+#define VISUAL_SPATIAL_PRIMARY_BASE 1451u
+#define VISUAL_SPATIAL_FLAGS_BASE 1963u
+#define VISUAL_PLANE_ACCUM_BASE 2667u
+#define VISUAL_PLANE_ACCUM_STRIDE 10u
+#define VISUAL_PLANE_MODEL_BASE 3307u
+#define VISUAL_PLANE_MODEL_STRIDE 6u
+#define VISUAL_BOUNDARY_BASE 3691u
+#define VISUAL_BOUNDARY_FACE_RESOLUTION 33u
+#define VISUAL_BOUNDARY_FACE_CELLS 1089u
+#define COUNTER_COUNT 10225u
 
 // ──────────────────────────────────────────────────────────────────
 //  Corner / edge tables  (Surface Nets cell topology)
@@ -323,7 +348,7 @@ uint ClassifyCurrentGeometryEvidence(float3 worldPos, uint knownSourceMask, out 
 void ClearCounters(uint3 id : SV_DispatchThreadID)
 {
     [loop]
-    for (uint i = 0; i < 1420; i++)
+    for (uint i = 0; i < (_VisualQualityEnabled != 0u ? COUNTER_COUNT : 1420u); i++)
         _Counters[i] = 0;
 }
 
@@ -761,6 +786,216 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  Read-only visual-quality prepass
+//  Final vertex positions are fitted in 4^3 page-local bins.  The fit is only
+//  a diagnostic reference plane; it never feeds smoothing or extraction.
+// ══════════════════════════════════════════════════════════════════
+uint VisualSpatialBin(int3 coord)
+{
+    int3 extent = max(_CoreMax - _CoreMin, int3(1, 1, 1));
+    int3 rel = clamp(coord - _CoreMin, int3(0, 0, 0), extent - 1);
+    int3 bin = min((rel * 4) / extent, int3(3, 3, 3));
+    return (uint)(bin.x + 4 * bin.y + 16 * bin.z);
+}
+
+void VisualBinBounds(uint binIndex, out int3 voxelMin, out int3 voxelMax)
+{
+    int3 bin = int3((int)(binIndex & 3u),
+                    (int)((binIndex >> 2u) & 3u),
+                    (int)((binIndex >> 4u) & 3u));
+    int3 extent = max(_CoreMax - _CoreMin, int3(1, 1, 1));
+    voxelMin = _CoreMin + (extent * bin) / 4;
+    voxelMax = _CoreMin + (extent * (bin + 1)) / 4;
+}
+
+void VisualAccumulatePlaneVertex(uint binIndex, float3 posVox)
+{
+    int3 binMin;
+    int3 binMax;
+    VisualBinBounds(binIndex, binMin, binMax);
+    float3 binCenter = 0.5 * ((float3)binMin + (float3)binMax);
+    int3 q = (int3)round(clamp((posVox - binCenter) * 4.0, -127.0, 127.0));
+    uint baseIndex = VISUAL_PLANE_ACCUM_BASE + binIndex * VISUAL_PLANE_ACCUM_STRIDE;
+    InterlockedAdd(_Counters[baseIndex], 1u);
+    InterlockedAdd(_Counters[baseIndex + 1u], (uint)q.x);
+    InterlockedAdd(_Counters[baseIndex + 2u], (uint)q.y);
+    InterlockedAdd(_Counters[baseIndex + 3u], (uint)q.z);
+    InterlockedAdd(_Counters[baseIndex + 4u], (uint)(q.x * q.x));
+    InterlockedAdd(_Counters[baseIndex + 5u], (uint)(q.x * q.y));
+    InterlockedAdd(_Counters[baseIndex + 6u], (uint)(q.x * q.z));
+    InterlockedAdd(_Counters[baseIndex + 7u], (uint)(q.y * q.y));
+    InterlockedAdd(_Counters[baseIndex + 8u], (uint)(q.y * q.z));
+    InterlockedAdd(_Counters[baseIndex + 9u], (uint)(q.z * q.z));
+}
+
+uint VisualPackBoundaryVertex(float3 posVox, int3 coord)
+{
+    // The normal Surface Nets offset lies inside [0,1]^3.  Leave one voxel of
+    // headroom on either side for smoothing/temporal motion and quantize at
+    // 1/256 voxel (about 0.2 mm at the default 5 cm voxel).
+    uint3 q = (uint3)round(clamp((posVox - (float3)coord + 1.0) * 256.0, 0.0, 1023.0));
+    return 0x80000000u | q.x | (q.y << 10u) | (q.z << 20u);
+}
+
+void VisualWriteBoundaryVertex(uint face, uint u, uint v, uint packed)
+{
+    if (u >= VISUAL_BOUNDARY_FACE_RESOLUTION || v >= VISUAL_BOUNDARY_FACE_RESOLUTION)
+        return;
+    uint address = VISUAL_BOUNDARY_BASE +
+        face * VISUAL_BOUNDARY_FACE_CELLS + u + VISUAL_BOUNDARY_FACE_RESOLUTION * v;
+    _Counters[address] = packed;
+}
+
+[numthreads(64, 1, 1)]
+void AccumulateVisualQualityVertices(uint3 id : SV_DispatchThreadID)
+{
+    if (_VisualQualityEnabled == 0u) return;
+    uint vertCount = min(_Counters[0], _MaxVertices);
+    if (id.x >= vertCount) return;
+
+    GPUVertex vertex = _Vertices[id.x];
+    int3 coord = Unflatten((int)vertex.voxelFlatIdx);
+    float3 posVox = vertex.pos / max(_VoxSize, 1e-6) + (float3)_VoxCount * 0.5;
+
+    if (all(coord >= _CoreMin) && all(coord < _CoreMax))
+        VisualAccumulatePlaneVertex(VisualSpatialBin(coord), posVox);
+
+    uint packed = VisualPackBoundaryVertex(posVox, coord);
+    int3 rel = coord - _CoreMin;
+    int3 extent = _CoreMax - _CoreMin;
+    // Exact 33x33 face identities are reserved for the 32^3 management pages.
+    // Larger legacy extraction chunks keep the shape ledger but skip this seam
+    // fingerprint rather than collapsing multiple coordinates into one slot.
+    if (all(extent <= 32))
+    {
+        if (coord.x == _CoreMin.x)
+            VisualWriteBoundaryVertex(0u, (uint)rel.y, (uint)rel.z, packed);
+        if (coord.x == _CoreMax.x)
+            VisualWriteBoundaryVertex(1u, (uint)rel.y, (uint)rel.z, packed);
+        if (coord.y == _CoreMin.y)
+            VisualWriteBoundaryVertex(2u, (uint)rel.x, (uint)rel.z, packed);
+        if (coord.y == _CoreMax.y)
+            VisualWriteBoundaryVertex(3u, (uint)rel.x, (uint)rel.z, packed);
+        if (coord.z == _CoreMin.z)
+            VisualWriteBoundaryVertex(4u, (uint)rel.x, (uint)rel.y, packed);
+        if (coord.z == _CoreMax.z)
+            VisualWriteBoundaryVertex(5u, (uint)rel.x, (uint)rel.y, packed);
+    }
+}
+
+bool VisualPlaneEigen(float xx, float xy, float xz, float yy, float yz, float zz,
+                      out float3 normal, out float lambdaMin, out float lambdaSecond)
+{
+    normal = float3(0, 1, 0);
+    lambdaMin = 0.0;
+    lambdaSecond = 0.0;
+    float a[9];
+    a[0] = xx; a[1] = xy; a[2] = xz;
+    a[3] = xy; a[4] = yy; a[5] = yz;
+    a[6] = xz; a[7] = yz; a[8] = zz;
+    float basis[9];
+    basis[0] = 1; basis[1] = 0; basis[2] = 0;
+    basis[3] = 0; basis[4] = 1; basis[5] = 0;
+    basis[6] = 0; basis[7] = 0; basis[8] = 1;
+
+    [loop]
+    for (int iter = 0; iter < 16; iter++)
+    {
+        int p = 0;
+        int q = 1;
+        float maxOff = abs(a[1]);
+        if (abs(a[2]) > maxOff) { maxOff = abs(a[2]); p = 0; q = 2; }
+        if (abs(a[5]) > maxOff) { maxOff = abs(a[5]); p = 1; q = 2; }
+        if (maxOff < 1e-7) break;
+        float app = a[p * 3 + p];
+        float aqq = a[q * 3 + q];
+        float apq = a[p * 3 + q];
+        float phi = 0.5 * atan2(2.0 * apq, aqq - app);
+        float c = cos(phi);
+        float s = sin(phi);
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float akp = a[k * 3 + p];
+            float akq = a[k * 3 + q];
+            a[k * 3 + p] = c * akp - s * akq;
+            a[k * 3 + q] = s * akp + c * akq;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float apk = a[p * 3 + k];
+            float aqk = a[q * 3 + k];
+            a[p * 3 + k] = c * apk - s * aqk;
+            a[q * 3 + k] = s * apk + c * aqk;
+        }
+        [loop]
+        for (int k = 0; k < 3; k++)
+        {
+            float bkp = basis[k * 3 + p];
+            float bkq = basis[k * 3 + q];
+            basis[k * 3 + p] = c * bkp - s * bkq;
+            basis[k * 3 + q] = s * bkp + c * bkq;
+        }
+    }
+
+    int smallest = 0;
+    if (a[4] < a[0]) smallest = 1;
+    if (a[8] < a[smallest * 3 + smallest]) smallest = 2;
+    int largest = 0;
+    if (a[4] > a[0]) largest = 1;
+    if (a[8] > a[largest * 3 + largest]) largest = 2;
+    lambdaMin = max(a[smallest * 3 + smallest], 0.0);
+    lambdaSecond = max(a[0] + a[4] + a[8] - lambdaMin -
+        a[largest * 3 + largest], 0.0);
+    normal = float3(basis[smallest], basis[3 + smallest], basis[6 + smallest]);
+    if (any(isnan(normal)) || any(isinf(normal)) || dot(normal, normal) < 1e-8)
+        return false;
+    normal = normalize(normal);
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void FitVisualQualityPlanes(uint3 id : SV_DispatchThreadID)
+{
+    if (_VisualQualityEnabled == 0u) return;
+    if (id.x >= VISUAL_BIN_COUNT) return;
+    uint accum = VISUAL_PLANE_ACCUM_BASE + id.x * VISUAL_PLANE_ACCUM_STRIDE;
+    uint model = VISUAL_PLANE_MODEL_BASE + id.x * VISUAL_PLANE_MODEL_STRIDE;
+    uint count = _Counters[accum];
+    if (count < 8u) return;
+
+    float invN = 1.0 / (float)count;
+    float3 centerQ = float3((float)asint(_Counters[accum + 1u]),
+                            (float)asint(_Counters[accum + 2u]),
+                            (float)asint(_Counters[accum + 3u])) * invN;
+    float xx = (float)_Counters[accum + 4u] * invN - centerQ.x * centerQ.x;
+    float xy = (float)asint(_Counters[accum + 5u]) * invN - centerQ.x * centerQ.y;
+    float xz = (float)asint(_Counters[accum + 6u]) * invN - centerQ.x * centerQ.z;
+    float yy = (float)_Counters[accum + 7u] * invN - centerQ.y * centerQ.y;
+    float yz = (float)asint(_Counters[accum + 8u]) * invN - centerQ.y * centerQ.z;
+    float zz = (float)_Counters[accum + 9u] * invN - centerQ.z * centerQ.z;
+    float3 normal;
+    float lambdaMin;
+    float lambdaSecond;
+    if (!VisualPlaneEigen(xx, xy, xz, yy, yz, zz, normal, lambdaMin, lambdaSecond))
+        return;
+    float trace = max(xx + yy + zz, 1e-6);
+    float thinRatio = lambdaMin / trace;
+    float spanRatio = lambdaSecond / trace;
+    // A plane may be visibly rough and must stay eligible for diagnosis.  The
+    // loose thinness gate rejects volumetric/corner mixtures, while the second
+    // eigenvalue rejects line-like fragments.
+    bool planeCandidate = thinRatio <= 0.08 && spanRatio >= 0.02;
+    _Counters[model] = planeCandidate ? 1u : 0u;
+    _Counters[model + 1u] = (uint)(int)round(normal.x * 32767.0);
+    _Counters[model + 2u] = (uint)(int)round(normal.y * 32767.0);
+    _Counters[model + 3u] = (uint)(int)round(normal.z * 32767.0);
+    _Counters[model + 4u] = (uint)round(sqrt(max(lambdaMin, 0.0)) * 256.0);
+    _Counters[model + 5u] = (uint)round(saturate(thinRatio) * 1000000.0);
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  Kernel 7 : GenerateIndices
 //  Per vertex: check 3 axes for quad emission
 // ══════════════════════════════════════════════════════════════════
@@ -986,6 +1221,131 @@ void MatureSpatialOccupancy(int3 coord, out uint spatialBin, out uint word, out 
     bitMask = 1u << (bit & 31u);
 }
 
+void AuditVisualTriangle(uint index0, uint index1, uint index2, int3 ownerCoord, uint spatialBin)
+{
+    if (_VisualQualityEnabled == 0u) return;
+    GPUVertex v0 = _Vertices[index0];
+    GPUVertex v1 = _Vertices[index1];
+    GPUVertex v2 = _Vertices[index2];
+    float invVoxel = 1.0 / max(_VoxSize, 1e-6);
+    float3 p0 = v0.pos * invVoxel;
+    float3 p1 = v1.pos * invVoxel;
+    float3 p2 = v2.pos * invVoxel;
+    float3 edge01 = p1 - p0;
+    float3 edge02 = p2 - p0;
+    float3 edge12 = p2 - p1;
+    float edge01Sq = dot(edge01, edge01);
+    float edge02Sq = dot(edge02, edge02);
+    float edge12Sq = dot(edge12, edge12);
+    float maxEdgeSq = max(edge01Sq, max(edge02Sq, edge12Sq));
+    float3 faceCross = cross(edge01, edge02);
+    float area2 = length(faceCross);
+    bool degenerate = area2 < 0.02;
+    bool elongated = maxEdgeSq > 9.0 || maxEdgeSq / max(area2, 1e-5) > 12.0;
+    float3 faceNormal = degenerate ? float3(0, 1, 0) : faceCross / area2;
+
+    float l0 = dot(v0.norm, v0.norm);
+    float l1 = dot(v1.norm, v1.norm);
+    float l2 = dot(v2.norm, v2.norm);
+    bool normalsValid = l0 > 0.25 && l1 > 0.25 && l2 > 0.25;
+    float3 n0 = normalsValid ? normalize(v0.norm) : float3(0, 1, 0);
+    float3 n1 = normalsValid ? normalize(v1.norm) : float3(0, 1, 0);
+    float3 n2 = normalsValid ? normalize(v2.norm) : float3(0, 1, 0);
+    float minNormalDot = normalsValid
+        ? min(dot(n0, n1), min(dot(n0, n2), dot(n1, n2)))
+        : -1.0;
+    float3 normalSum = n0 + n1 + n2;
+    bool averageNormalValid = normalsValid && dot(normalSum, normalSum) > 1e-6;
+    float3 averageNormal = averageNormalValid ? normalize(normalSum) : float3(0, 1, 0);
+    float orientationDot = (!degenerate && averageNormalValid)
+        ? dot(faceNormal, averageNormal)
+        : 1.0;
+    bool orientationOpposed = orientationDot < -0.2;
+    bool vertexNormalDispersion = !normalsValid || minNormalDot < 0.94;
+    bool edgeOrCorner = normalsValid && minNormalDot <= 0.82;
+
+    int3 boundaryDistanceMin = ownerCoord - _CoreMin;
+    int3 boundaryDistanceMax = (_CoreMax - 1) - ownerCoord;
+    bool boundaryNear = any(boundaryDistanceMin <= 1) || any(boundaryDistanceMax <= 1);
+
+    uint model = VISUAL_PLANE_MODEL_BASE + spatialBin * VISUAL_PLANE_MODEL_STRIDE;
+    bool planeCandidate = _Counters[model] != 0u;
+    float signedResidual = 0.0;
+    float planeFaceDot = 1.0;
+    bool normalDeviation = false;
+    if (planeCandidate)
+    {
+        float3 planeNormal = float3((float)asint(_Counters[model + 1u]),
+                                    (float)asint(_Counters[model + 2u]),
+                                    (float)asint(_Counters[model + 3u])) / 32767.0;
+        planeNormal = normalize(planeNormal);
+        if (averageNormalValid && dot(planeNormal, averageNormal) < 0.0)
+            planeNormal = -planeNormal;
+        int3 binMin;
+        int3 binMax;
+        VisualBinBounds(spatialBin, binMin, binMax);
+        float3 binCenter = 0.5 * ((float3)binMin + (float3)binMax) - (float3)_VoxCount * 0.5;
+        uint accum = VISUAL_PLANE_ACCUM_BASE + spatialBin * VISUAL_PLANE_ACCUM_STRIDE;
+        float count = max((float)_Counters[accum], 1.0);
+        float3 meanQ = float3((float)asint(_Counters[accum + 1u]),
+                              (float)asint(_Counters[accum + 2u]),
+                              (float)asint(_Counters[accum + 3u])) / count;
+        float3 planePoint = binCenter + meanQ * 0.25;
+        float3 triangleCenter = (p0 + p1 + p2) / 3.0;
+        signedResidual = dot(triangleCenter - planePoint, planeNormal);
+        planeFaceDot = degenerate ? 0.0 : abs(dot(faceNormal, planeNormal));
+        normalDeviation = planeFaceDot < 0.9659258; // >15 degrees
+
+        float absResidual = abs(signedResidual);
+        uint residualBin = absResidual < 0.05 ? 0u :
+                           (absResidual < 0.10 ? 1u :
+                           (absResidual < 0.20 ? 2u :
+                           (absResidual < 0.40 ? 3u :
+                           (absResidual < 0.80 ? 4u : 5u))));
+        InterlockedAdd(_Counters[VISUAL_RESIDUAL_HIST_BASE + residualBin], 1u);
+        uint normalBin = planeFaceDot >= 0.9986295 ? 0u :
+                         (planeFaceDot >= 0.9925462 ? 1u :
+                         (planeFaceDot >= 0.9659258 ? 2u :
+                         (planeFaceDot >= 0.8660254 ? 3u : 4u)));
+        InterlockedAdd(_Counters[VISUAL_NORMAL_HIST_BASE + normalBin], 1u);
+    }
+
+    bool flags[11];
+    flags[0] = planeCandidate && abs(signedResidual) >= 0.10;
+    flags[1] = planeCandidate && abs(signedResidual) >= 0.20;
+    flags[2] = planeCandidate && signedResidual >= 0.20;
+    flags[3] = planeCandidate && signedResidual <= -0.20;
+    flags[4] = planeCandidate && normalDeviation;
+    flags[5] = vertexNormalDispersion;
+    flags[6] = orientationOpposed;
+    flags[7] = degenerate;
+    flags[8] = elongated;
+    flags[9] = boundaryNear;
+    flags[10] = !planeCandidate;
+
+    uint primaryClass;
+    if (degenerate || elongated) primaryClass = 3u;             // spike/degenerate
+    else if (orientationOpposed) primaryClass = 5u;             // winding/normal opposed
+    else if (edgeOrCorner) primaryClass = 4u;                   // legitimate edge candidate
+    else if (!planeCandidate) primaryClass = boundaryNear ? 6u : 7u;
+    else if (normalDeviation || vertexNormalDispersion) primaryClass = 2u;
+    else if (abs(signedResidual) >= 0.20) primaryClass = 1u;
+    else primaryClass = 0u;
+
+    InterlockedAdd(_Counters[VISUAL_PRIMARY_BASE + primaryClass], 1u);
+    InterlockedAdd(_Counters[VISUAL_SPATIAL_PRIMARY_BASE +
+        spatialBin * VISUAL_PRIMARY_COUNT + primaryClass], 1u);
+    [unroll]
+    for (uint flag = 0u; flag < VISUAL_FLAG_COUNT; flag++)
+    {
+        if (!flags[flag]) continue;
+        InterlockedAdd(_Counters[VISUAL_FLAGS_BASE + flag], 1u);
+        InterlockedAdd(_Counters[VISUAL_SPATIAL_FLAGS_BASE +
+            spatialBin * VISUAL_FLAG_COUNT + flag], 1u);
+    }
+    InterlockedAdd(_Counters[VISUAL_TOTAL_INDEX], 1u);
+}
+
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
     if (any(coord - d1 < 0))       return;
@@ -1171,6 +1531,8 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 
     if (va < 0)
     {
+        AuditVisualTriangle((uint)c, (uint)b, (uint)a, coord, spatialBin);
+        AuditVisualTriangle((uint)d, (uint)c, (uint)a, coord, spatialBin);
         _Indices[baseIdx    ] = EncodeCandidateIndex((uint)c, candidateABC);
         _Indices[baseIdx + 1] = EncodeCandidateIndex((uint)b, candidateABC);
         _Indices[baseIdx + 2] = EncodeCandidateIndex((uint)a, candidateABC);
@@ -1180,6 +1542,8 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     }
     else
     {
+        AuditVisualTriangle((uint)a, (uint)c, (uint)d, coord, spatialBin);
+        AuditVisualTriangle((uint)a, (uint)b, (uint)c, coord, spatialBin);
         _Indices[baseIdx    ] = EncodeCandidateIndex((uint)a, candidateACD);
         _Indices[baseIdx + 1] = EncodeCandidateIndex((uint)c, candidateACD);
         _Indices[baseIdx + 2] = EncodeCandidateIndex((uint)d, candidateACD);

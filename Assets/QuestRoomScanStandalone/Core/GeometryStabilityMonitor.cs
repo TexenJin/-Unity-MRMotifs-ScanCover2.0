@@ -18,6 +18,46 @@ namespace Genesis.RoomScan
         private const int StatsCount = 72;
         private const int HistogramBase = 8;
         private const int HistogramCount = 64;
+        private const int SpatialChunkSize = 32;
+        private const int SpatialStride = 8;
+
+        internal readonly struct SpatialSample
+        {
+            public readonly float Elapsed;
+            public readonly Vector3Int Page;
+            public readonly uint PreviousSurface;
+            public readonly uint CurrentSurface;
+            public readonly uint Retained;
+            public readonly uint Lost;
+            public readonly uint Added;
+            public readonly uint Moving;
+            public readonly uint SevereMoving;
+            public readonly float MaxMillimeters;
+            public readonly Vector3Int MaxVoxel;
+            public readonly Vector3 MaxLocalMeters;
+
+            public SpatialSample(float elapsed, Vector3Int page, uint previousSurface,
+                uint currentSurface, uint retained, uint lost, uint added, uint moving,
+                uint severeMoving, float maxMillimeters, Vector3Int maxVoxel,
+                Vector3 maxLocalMeters)
+            {
+                Elapsed = elapsed;
+                Page = page;
+                PreviousSurface = previousSurface;
+                CurrentSurface = currentSurface;
+                Retained = retained;
+                Lost = lost;
+                Added = added;
+                Moving = moving;
+                SevereMoving = severeMoving;
+                MaxMillimeters = maxMillimeters;
+                MaxVoxel = maxVoxel;
+                MaxLocalMeters = maxLocalMeters;
+            }
+
+            public ulong ActivityScore => (ulong)SevereMoving * 16ul +
+                (ulong)(Lost + Added) * 4ul + Moving;
+        }
 
         internal readonly struct Sample
         {
@@ -63,9 +103,14 @@ namespace Genesis.RoomScan
         private static readonly int SurfaceBandId = Shader.PropertyToID("_SurfaceBand");
         private static readonly int VoxelDistanceId = Shader.PropertyToID("_VoxelDistance");
         private static readonly int VoxelSizeId = Shader.PropertyToID("_VoxelSize");
+        private static readonly int SpatialChunkCountId = Shader.PropertyToID("_SpatialChunkCount");
+        private static readonly int SpatialChunkSizeId = Shader.PropertyToID("_SpatialChunkSize");
+        private static readonly int SpatialBaseId = Shader.PropertyToID("_SpatialBase");
 
         private readonly List<Sample> _samples = new List<Sample>(1024);
-        private readonly uint[] _zeros = new uint[StatsCount];
+        private readonly List<SpatialSample> _spatialSamples = new List<SpatialSample>(8192);
+        private readonly List<SpatialSample> _lastSpatialSamples = new List<SpatialSample>(256);
+        private uint[] _zeros;
         private VolumeIntegrator _volume;
         private ComputeShader _compute;
         private ComputeBuffer _stats;
@@ -82,6 +127,8 @@ namespace Genesis.RoomScan
         private float _nextSampleTime;
         private float _sessionStarted;
         private Sample? _last;
+        private Vector3Int _spatialChunkCount;
+        private int _totalStatsCount;
 
         public bool IsReady => _initialized && _previous != null && _stats != null;
         public int SampleCount => _samples.Count;
@@ -100,7 +147,15 @@ namespace Genesis.RoomScan
 
             _compareKernel = _compute.FindKernel("CompareVolumes");
             _copyKernel = _compute.FindKernel("CopyCurrent");
-            _stats = new ComputeBuffer(StatsCount, sizeof(uint));
+            var voxels = _volume != null ? _volume.VoxelCount : default;
+            _spatialChunkCount = new Vector3Int(
+                Mathf.Max(1, Mathf.CeilToInt(voxels.x / (float)SpatialChunkSize)),
+                Mathf.Max(1, Mathf.CeilToInt(voxels.y / (float)SpatialChunkSize)),
+                Mathf.Max(1, Mathf.CeilToInt(voxels.z / (float)SpatialChunkSize)));
+            int spatialPages = _spatialChunkCount.x * _spatialChunkCount.y * _spatialChunkCount.z;
+            _totalStatsCount = StatsCount + spatialPages * SpatialStride;
+            _zeros = new uint[_totalStatsCount];
+            _stats = new ComputeBuffer(_totalStatsCount, sizeof(uint));
             _stats.SetData(_zeros);
             if (_volume != null)
             {
@@ -114,6 +169,8 @@ namespace Genesis.RoomScan
         public void ResetSession()
         {
             _samples.Clear();
+            _spatialSamples.Clear();
+            _lastSpatialSamples.Clear();
             _last = null;
             _sessionStarted = Time.realtimeSinceStartup;
             ResetBaseline();
@@ -160,7 +217,7 @@ namespace Genesis.RoomScan
                 if (!_initialized || requestGeneration != _generation || request.hasError)
                     return;
                 var data = request.GetData<uint>();
-                if (data.Length < StatsCount) return;
+                if (data.Length < _totalStatsCount) return;
                 ApplySample(data);
             });
         }
@@ -181,12 +238,57 @@ namespace Genesis.RoomScan
             float p50 = HistogramPercentileMillimeters(data, histogramTotal, 0.50f);
             float p95 = HistogramPercentileMillimeters(data, histogramTotal, 0.95f);
             float maxMm = data[6] / 1024f * _volume.VoxelSize * 1000f;
+            float elapsed = Time.realtimeSinceStartup - _sessionStarted;
             var sample = new Sample(
-                Time.realtimeSinceStartup - _sessionStarted,
+                elapsed,
                 previousSurface, currentSurface, retained, lost, added, moving,
                 survival, churn, p50, p95, maxMm);
             _last = sample;
             _samples.Add(sample);
+            ApplySpatialSample(data, elapsed);
+        }
+
+        private void ApplySpatialSample(Unity.Collections.NativeArray<uint> data, float elapsed)
+        {
+            _lastSpatialSamples.Clear();
+            int pageCount = _spatialChunkCount.x * _spatialChunkCount.y * _spatialChunkCount.z;
+            var volumeCount = _volume.VoxelCount;
+            float voxelSize = _volume.VoxelSize;
+            for (int pageIndex = 0; pageIndex < pageCount; pageIndex++)
+            {
+                int baseIndex = StatsCount + pageIndex * SpatialStride;
+                uint lost = data[baseIndex + 3];
+                uint added = data[baseIndex + 4];
+                uint moving = data[baseIndex + 5];
+                uint severe = data[baseIndex + 6];
+                if (lost == 0u && added == 0u && moving == 0u && severe == 0u)
+                    continue;
+
+                int pageX = pageIndex % _spatialChunkCount.x;
+                int pageY = (pageIndex / _spatialChunkCount.x) % _spatialChunkCount.y;
+                int pageZ = pageIndex / (_spatialChunkCount.x * _spatialChunkCount.y);
+                uint packed = data[baseIndex + 7];
+                uint driftFixed = packed >> 15;
+                int localFlat = (int)(packed & 0x7FFFu);
+                int localX = localFlat % SpatialChunkSize;
+                int localY = (localFlat / SpatialChunkSize) % SpatialChunkSize;
+                int localZ = localFlat / (SpatialChunkSize * SpatialChunkSize);
+                var maxVoxel = new Vector3Int(
+                    Mathf.Min(pageX * SpatialChunkSize + localX, volumeCount.x - 1),
+                    Mathf.Min(pageY * SpatialChunkSize + localY, volumeCount.y - 1),
+                    Mathf.Min(pageZ * SpatialChunkSize + localZ, volumeCount.z - 1));
+                var maxLocal = new Vector3(
+                    (maxVoxel.x + 0.5f - volumeCount.x * 0.5f) * voxelSize,
+                    (maxVoxel.y + 0.5f - volumeCount.y * 0.5f) * voxelSize,
+                    (maxVoxel.z + 0.5f - volumeCount.z * 0.5f) * voxelSize);
+                var row = new SpatialSample(
+                    elapsed, new Vector3Int(pageX, pageY, pageZ),
+                    data[baseIndex], data[baseIndex + 1], data[baseIndex + 2],
+                    lost, added, moving, severe,
+                    driftFixed / 1024f * voxelSize * 1000f, maxVoxel, maxLocal);
+                _lastSpatialSamples.Add(row);
+                _spatialSamples.Add(row);
+            }
         }
 
         private float HistogramPercentileMillimeters(
@@ -225,6 +327,22 @@ namespace Genesis.RoomScan
                           $"P50={s.P50Millimeters:F2}mm P95={s.P95Millimeters:F2}mm 最大={s.MaxMillimeters:F2}mm " +
                           $"旧/现/同/失/新={s.PreviousSurface}/{s.CurrentSurface}/{s.Retained}/{s.Lost}/{s.Added}");
             sb.AppendLine("位移口径: 同一体素的 TSDF sd 变化×截断距离，属于表面法向位移代理；块缝与出网延迟另账统计。");
+            sb.AppendLine($"空间定位: 32³页={_spatialChunkCount.x}×{_spatialChunkCount.y}×{_spatialChunkCount.z} " +
+                          $"末次活跃页={_lastSpatialSamples.Count} 累计空间行={_spatialSamples.Count}；每页保留最强位移体素，不保留逐体素总档案。");
+            if (_lastSpatialSamples.Count > 0)
+            {
+                var hottest = new List<SpatialSample>(_lastSpatialSamples);
+                hottest.Sort((a, b) => b.ActivityScore.CompareTo(a.ActivityScore));
+                int count = Mathf.Min(8, hottest.Count);
+                sb.AppendLine("末次热点32³页:");
+                for (int i = 0; i < count; i++)
+                {
+                    SpatialSample p = hottest[i];
+                    sb.AppendLine($"  页={p.Page.x}/{p.Page.y}/{p.Page.z} 失/新/动/剧={p.Lost}/{p.Added}/{p.Moving}/{p.SevereMoving} " +
+                                  $"最大={p.MaxMillimeters:F2}mm 体素={p.MaxVoxel.x}/{p.MaxVoxel.y}/{p.MaxVoxel.z} " +
+                                  $"局部米={p.MaxLocalMeters.x:F3}/{p.MaxLocalMeters.y:F3}/{p.MaxLocalMeters.z:F3}");
+                }
+            }
         }
 
         public void AppendCsv(StringBuilder sb, string sessionId)
@@ -244,6 +362,27 @@ namespace Genesis.RoomScan
                   .Append(s.P50Millimeters.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
                   .Append(s.P95Millimeters.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
                   .Append(s.MaxMillimeters.ToString("F3", CultureInfo.InvariantCulture)).AppendLine();
+            }
+        }
+
+        public void AppendSpatialCsv(StringBuilder sb, string sessionId)
+        {
+            if (sb == null) return;
+            sb.AppendLine("session_id,elapsed_s,page_x,page_y,page_z,previous_surface,current_surface,retained,lost,added,moving_ge_quarter_voxel,moving_ge_half_voxel,max_mm,max_voxel_x,max_voxel_y,max_voxel_z,max_local_x_m,max_local_y_m,max_local_z_m");
+            for (int i = 0; i < _spatialSamples.Count; i++)
+            {
+                SpatialSample s = _spatialSamples[i];
+                sb.Append(sessionId).Append(',')
+                  .Append(s.Elapsed.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(s.Page.x).Append(',').Append(s.Page.y).Append(',').Append(s.Page.z).Append(',')
+                  .Append(s.PreviousSurface).Append(',').Append(s.CurrentSurface).Append(',')
+                  .Append(s.Retained).Append(',').Append(s.Lost).Append(',').Append(s.Added).Append(',')
+                  .Append(s.Moving).Append(',').Append(s.SevereMoving).Append(',')
+                  .Append(s.MaxMillimeters.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(s.MaxVoxel.x).Append(',').Append(s.MaxVoxel.y).Append(',').Append(s.MaxVoxel.z).Append(',')
+                  .Append(s.MaxLocalMeters.x.ToString("F4", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(s.MaxLocalMeters.y.ToString("F4", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(s.MaxLocalMeters.z.ToString("F4", CultureInfo.InvariantCulture)).AppendLine();
             }
         }
 
@@ -281,6 +420,10 @@ namespace Genesis.RoomScan
             _compute.SetFloat(SurfaceBandId, _surfaceBand);
             _compute.SetFloat(VoxelDistanceId, _volume.VoxelDistance);
             _compute.SetFloat(VoxelSizeId, _volume.VoxelSize);
+            _compute.SetInts(SpatialChunkCountId,
+                _spatialChunkCount.x, _spatialChunkCount.y, _spatialChunkCount.z);
+            _compute.SetInt(SpatialChunkSizeId, SpatialChunkSize);
+            _compute.SetInt(SpatialBaseId, StatsCount);
             _compute.SetTexture(kernel, CurrentVolumeId, _volume.Volume);
         }
 

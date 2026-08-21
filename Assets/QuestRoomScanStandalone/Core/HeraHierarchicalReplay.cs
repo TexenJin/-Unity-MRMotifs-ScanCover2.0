@@ -401,6 +401,12 @@ namespace Genesis.RoomScan
             _parent32.AppendSyncDebtSummary(sb, "HERA 32³父页");
         }
 
+        public void AppendParentVisualQualityReport(StringBuilder sb)
+        {
+            if (_disposed) return;
+            _parent32.AppendVisualQualityReport(sb, "HERA 32³父页");
+        }
+
         /// <summary>
         /// 冻结成功的 32³ 块入场精修。父页网格与冻结网格同尺寸同原点（已核验同构：
         /// 体积 192×128×192 下双方都是 6×4×6，线性化公式一致），坐标直译。

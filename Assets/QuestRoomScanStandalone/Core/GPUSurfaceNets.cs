@@ -18,6 +18,8 @@ namespace Genesis.RoomScan
         private readonly int _kSmoothVertices;
         private readonly int _kApplySmooth;
         private readonly int _kTemporalBlend;
+        private readonly int _kAccumulateVisualQualityVertices;
+        private readonly int _kFitVisualQualityPlanes;
         private readonly int _kGenerateIndices;
         private readonly int _kBuildIndirectArgs;
         private readonly int _kInitTemporal;
@@ -77,6 +79,7 @@ namespace Genesis.RoomScan
         public float TemporalDeadzone { get; set; } = 0.001f;
         public bool StrictObservedEdges { get; set; }
         public bool CandidateHistoryUpdateEnabled { get; set; } = true;
+        public bool VisualQualityDiagnosticsEnabled { get; set; }
         public bool DiagnosticRoiEnabled { get; set; } = true;
         public Vector4 DiagnosticRoiRect { get; set; } = new Vector4(0.2f, 0.25f, 0.8f, 0.75f);
         public Vector2 DiagnosticRoiSplitX { get; set; } = new Vector2(0.44f, 0.56f);
@@ -130,6 +133,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_CandidateHistoryUpdateEnabled = Shader.PropertyToID("_CandidateHistoryUpdateEnabled");
         private static readonly int ID_CandidateHistoryCapacity = Shader.PropertyToID("_CandidateHistoryCapacity");
         private static readonly int ID_CandidateHistoryMask = Shader.PropertyToID("_CandidateHistoryMask");
+        private static readonly int ID_VisualQualityEnabled = Shader.PropertyToID("_VisualQualityEnabled");
         private static readonly int ID_SnapshotVertices = Shader.PropertyToID("_SnapshotVertices");
         private static readonly int ID_SnapshotIndices = Shader.PropertyToID("_SnapshotIndices");
         private static readonly int ID_SnapshotAdmissionClass = Shader.PropertyToID("_SnapshotAdmissionClass");
@@ -190,7 +194,11 @@ namespace Genesis.RoomScan
         // 396..1419: 4^3 spatial bins x 4 confirmation states x 4 current-depth
         // evidence states.  This is the page-local join used to locate flying
         // red geometry; it is read-only and adds only a few KB of counters.
-        private const int CounterCount = 1420;
+        // 1420..3690: final-mesh visual-quality primary classes, independent
+        // flags, histograms, 4^3 spatial joins and page-local plane-fit scratch.
+        // 3691..10224: six 33x33 exact shared-boundary vertex fingerprints used
+        // to distinguish a real seam candidate from a mere epoch mismatch.
+        private const int CounterCount = 10225;
         private const int CandidateHistoryCapacity = 1 << 19;
 
         public GPUSurfaceNets(ComputeShader compute)
@@ -204,6 +212,8 @@ namespace Genesis.RoomScan
             _kSmoothVertices = compute.FindKernel("SmoothVertices");
             _kApplySmooth = compute.FindKernel("ApplySmooth");
             _kTemporalBlend = compute.FindKernel("TemporalBlend");
+            _kAccumulateVisualQualityVertices = compute.FindKernel("AccumulateVisualQualityVertices");
+            _kFitVisualQualityPlanes = compute.FindKernel("FitVisualQualityPlanes");
             _kGenerateIndices = compute.FindKernel("GenerateIndices");
             _kBuildIndirectArgs = compute.FindKernel("BuildIndirectArgs");
             _kInitTemporal = compute.FindKernel("InitTemporal");
@@ -656,6 +666,7 @@ namespace Genesis.RoomScan
             }
             _compute.SetInt(ID_CandidateExtractionEpoch, unchecked((int)_candidateExtractionEpoch));
             _compute.SetInt(ID_CandidateHistoryUpdateEnabled, CandidateHistoryUpdateEnabled ? 1 : 0);
+            _compute.SetInt(ID_VisualQualityEnabled, VisualQualityDiagnosticsEnabled ? 1 : 0);
 
             _compute.SetTexture(_kClassifyAndEmit, ID_TsdfVolume, tsdfVolume);
             _compute.SetTexture(_kClassifyAndEmit, ID_ColorVolume, colorVolume);
@@ -716,10 +727,14 @@ namespace Genesis.RoomScan
                 _compute.DispatchIndirect(_kTemporalBlend, _dispatchArgs);
             }
 
-            // 6. Generate indices
+            // 6. Read-only visual-quality prepass over the final vertex positions.
+            _compute.DispatchIndirect(_kAccumulateVisualQualityVertices, _dispatchArgs);
+            _compute.Dispatch(_kFitVisualQualityPlanes, 1, 1, 1);
+
+            // 7. Generate indices
             _compute.DispatchIndirect(_kGenerateIndices, _dispatchArgs);
 
-            // 7. Build draw indirect args
+            // 8. Build draw indirect args
             _compute.Dispatch(_kBuildIndirectArgs, 1, 1, 1);
         }
 
@@ -799,6 +814,10 @@ namespace Genesis.RoomScan
 
             BindBuffer(_kTemporalBlend, ID_Vertices, _vertices);
             BindBuffer(_kTemporalBlend, ID_Counters, _counters);
+
+            BindBuffer(_kAccumulateVisualQualityVertices, ID_Vertices, _vertices);
+            BindBuffer(_kAccumulateVisualQualityVertices, ID_Counters, _counters);
+            BindBuffer(_kFitVisualQualityPlanes, ID_Counters, _counters);
 
             BindBuffer(_kGenerateIndices, ID_Vertices, _vertices);
             BindBuffer(_kGenerateIndices, ID_CoordVertMap, _coordVertMap);

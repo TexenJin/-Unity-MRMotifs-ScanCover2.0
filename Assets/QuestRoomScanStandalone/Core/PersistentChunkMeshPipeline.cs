@@ -238,6 +238,16 @@ namespace Genesis.RoomScan
             public readonly uint[] ReplayForensicRiskTotals = new uint[5];
             public readonly uint[] ReplayForensicSpatialConfirmationEvidence = new uint[64 * 16];
             public uint ReplayForensicTotal;
+            public readonly uint[] VisualPrimary = new uint[VisualPrimaryCount];
+            public readonly uint[] VisualFlags = new uint[VisualFlagCount];
+            public readonly uint[] VisualResidualHistogram = new uint[VisualResidualHistogramCount];
+            public readonly uint[] VisualNormalHistogram = new uint[VisualNormalHistogramCount];
+            public readonly uint[] VisualSpatialPrimary = new uint[SpatialLedgerBinCount * VisualPrimaryCount];
+            public readonly uint[] VisualSpatialFlags = new uint[SpatialLedgerBinCount * VisualFlagCount];
+            public readonly uint[] VisualPlaneAccum = new uint[SpatialLedgerBinCount * VisualPlaneAccumStride];
+            public readonly uint[] VisualPlaneModel = new uint[SpatialLedgerBinCount * VisualPlaneModelStride];
+            public readonly uint[] BoundaryFingerprint = new uint[VisualBoundaryFingerprintCount];
+            public uint VisualTotal;
             public readonly uint[] AcceptedSpatialMature = new uint[SpatialLedgerBinCount];
             public readonly uint[] AcceptedSpatialOccupancy = new uint[SpatialOccupancyWordCount];
             public readonly byte[] SpatialStablePasses = new byte[SpatialLedgerBinCount];
@@ -291,6 +301,20 @@ namespace Genesis.RoomScan
         private static readonly int3[] PositiveFaceNeighbours =
         {
             new int3(1, 0, 0), new int3(0, 1, 0), new int3(0, 0, 1)
+        };
+        private static readonly string[] VisualPrimaryNames =
+        {
+            "planar_coherent", "bulge_or_dent", "ripple_or_faceting",
+            "spike_or_degenerate", "edge_or_corner_candidate",
+            "orientation_mismatch", "boundary_or_insufficient", "nonplanar_context"
+        };
+        private static readonly string[] VisualFlagNames =
+        {
+            "plane_residual_ge_0_1_voxel", "plane_residual_ge_0_2_voxel",
+            "positive_depth_ge_0_2_voxel", "negative_depth_le_minus_0_2_voxel",
+            "normal_deviation_ge_15deg", "vertex_normal_dispersion",
+            "face_normal_opposes_tsdf_gradient", "degenerate_area",
+            "elongated_or_long_edge", "near_page_boundary", "plane_fit_unavailable"
         };
 
         private readonly VolumeIntegrator _volume;
@@ -388,6 +412,25 @@ namespace Genesis.RoomScan
         private const int ForensicRiskCount = 5;
         private const int ForensicSpatialStride = ForensicConfirmationCount * ForensicEvidenceCount;
         private const int ForensicSpatialCount = SpatialLedgerBinCount * ForensicSpatialStride;
+        private const int VisualPrimaryBase = 1420;
+        private const int VisualPrimaryCount = 8;
+        private const int VisualFlagsBase = 1428;
+        private const int VisualFlagCount = 11;
+        private const int VisualResidualHistogramBase = 1439;
+        private const int VisualResidualHistogramCount = 6;
+        private const int VisualNormalHistogramBase = 1445;
+        private const int VisualNormalHistogramCount = 5;
+        private const int VisualTotalIndex = 1450;
+        private const int VisualSpatialPrimaryBase = 1451;
+        private const int VisualSpatialFlagsBase = 1963;
+        private const int VisualPlaneAccumBase = 2667;
+        private const int VisualPlaneAccumStride = 10;
+        private const int VisualPlaneModelBase = 3307;
+        private const int VisualPlaneModelStride = 6;
+        private const int VisualBoundaryBase = 3691;
+        private const int VisualBoundaryFaceResolution = 33;
+        private const int VisualBoundaryFaceCells = VisualBoundaryFaceResolution * VisualBoundaryFaceResolution;
+        private const int VisualBoundaryFingerprintCount = 6 * VisualBoundaryFaceCells;
         // A few early triangles are usually a fragment, not an established
         // surface.  Protection starts only after a dense bin and one of its
         // face-neighbours have remained coherent for several accepted passes.
@@ -802,6 +845,10 @@ namespace Genesis.RoomScan
                 TemporalDeadzone = _config.TemporalDeadzone,
                 StrictObservedEdges = false,
                 CandidateHistoryUpdateEnabled = true,
+                // Full triangle-shape atomics run only in frozen/static replay.
+                // Live production keeps only the lightweight TSDF spatial monitor,
+                // so observing quality cannot itself increase page publication debt.
+                VisualQualityDiagnosticsEnabled = _config.StaticReplay,
                 DiagnosticRoiEnabled = _config.DiagnosticRoiEnabled,
                 DiagnosticRoiRect = _config.DiagnosticRoiRect,
                 DiagnosticRoiSplitX = _config.DiagnosticRoiSplitX
@@ -909,6 +956,8 @@ namespace Genesis.RoomScan
                               (!destructive || DestructiveCandidateConfirmed(chunk));
                 if (accept)
                 {
+                    if (_config.StaticReplay)
+                        CaptureVisualQualityPage(chunk, counters);
                     RecordLocalReplacement(
                         chunk, candidateEpoch, vertices, indices, spatialOccupancy,
                         true, "accepted");
@@ -1302,6 +1351,39 @@ namespace Genesis.RoomScan
             chunk.ReplayForensicTotal = counters.Length > ForensicTotalIndex
                 ? counters[ForensicTotalIndex]
                 : 0u;
+            CaptureVisualQualityPage(chunk, counters);
+        }
+
+        private static void CaptureVisualQualityPage(
+            Chunk chunk,
+            Unity.Collections.NativeArray<uint> counters)
+        {
+            CopyCounterRange(counters, VisualPrimaryBase, chunk.VisualPrimary);
+            CopyCounterRange(counters, VisualFlagsBase, chunk.VisualFlags);
+            CopyCounterRange(counters, VisualResidualHistogramBase, chunk.VisualResidualHistogram);
+            CopyCounterRange(counters, VisualNormalHistogramBase, chunk.VisualNormalHistogram);
+            CopyCounterRange(counters, VisualSpatialPrimaryBase, chunk.VisualSpatialPrimary);
+            CopyCounterRange(counters, VisualSpatialFlagsBase, chunk.VisualSpatialFlags);
+            CopyCounterRange(counters, VisualPlaneAccumBase, chunk.VisualPlaneAccum);
+            CopyCounterRange(counters, VisualPlaneModelBase, chunk.VisualPlaneModel);
+            CopyCounterRange(counters, VisualBoundaryBase, chunk.BoundaryFingerprint);
+            chunk.VisualTotal = counters.Length > VisualTotalIndex
+                ? counters[VisualTotalIndex]
+                : 0u;
+        }
+
+        private static void ClearVisualQualityPage(Chunk chunk)
+        {
+            Array.Clear(chunk.VisualPrimary, 0, chunk.VisualPrimary.Length);
+            Array.Clear(chunk.VisualFlags, 0, chunk.VisualFlags.Length);
+            Array.Clear(chunk.VisualResidualHistogram, 0, chunk.VisualResidualHistogram.Length);
+            Array.Clear(chunk.VisualNormalHistogram, 0, chunk.VisualNormalHistogram.Length);
+            Array.Clear(chunk.VisualSpatialPrimary, 0, chunk.VisualSpatialPrimary.Length);
+            Array.Clear(chunk.VisualSpatialFlags, 0, chunk.VisualSpatialFlags.Length);
+            Array.Clear(chunk.VisualPlaneAccum, 0, chunk.VisualPlaneAccum.Length);
+            Array.Clear(chunk.VisualPlaneModel, 0, chunk.VisualPlaneModel.Length);
+            Array.Clear(chunk.BoundaryFingerprint, 0, chunk.BoundaryFingerprint.Length);
+            chunk.VisualTotal = 0u;
         }
 
         private static void CopyCounterRange(
@@ -1473,6 +1555,7 @@ namespace Genesis.RoomScan
             sb.AppendLine("child_inherits_parent_decision_state=false");
             sb.AppendLine("child_reuses_parent_classification_semantics=true");
             AppendForensicReplayReport(sb);
+            AppendVisualQualityReport(sb, $"冻结回放{_config.ChunkSize}³页");
             sb.AppendLine("page_ab_csv:");
             sb.AppendLine("chunk_x,chunk_y,chunk_z,core_min_x,core_min_y,core_min_z,core_max_x,core_max_y,core_max_z,build_frame,build_order,page_class,vertices,triangles,clean_triangles,questionable_triangles,transition_triangles,pending_triangles,legacy_internal_mixed_counter,contact_triangles,contact_real_edge,contact_suspected_center_false,contact_ambiguous,contact_ambiguous_normal,contact_ambiguous_weight,contact_ambiguous_boundary,contact_ambiguous_multi,delegated_real_edge,delegated_suspected_center_false,delegated_ambiguous,delegated_ambiguous_normal,delegated_ambiguous_weight,delegated_ambiguous_boundary,delegated_ambiguous_multi,delegated_without_internal_mixed,atomic_clean_collateral_loss");
             for (int i = 0; i < _chunks.Count; i++)
@@ -2004,6 +2087,221 @@ namespace Genesis.RoomScan
             sb.AppendLine("口径: 异版本只表示相邻页发布时间不同；它与纯TSDF位移分账，不直接判为几何裂缝。");
         }
 
+        /// <summary>
+        /// Read-only ledger over final smoothed/blended triangles.  Primary
+        /// classes are mutually exclusive; flags deliberately overlap.
+        /// </summary>
+        public void AppendVisualQualityReport(StringBuilder sb, string label)
+        {
+            if (sb == null) return;
+            var primary = new long[VisualPrimaryCount];
+            var flags = new long[VisualFlagCount];
+            var residualHistogram = new long[VisualResidualHistogramCount];
+            var normalHistogram = new long[VisualNormalHistogramCount];
+            long total = 0;
+            int pages = 0;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (!chunk.Built || chunk.VisualTotal == 0u) continue;
+                pages++;
+                total += chunk.VisualTotal;
+                for (int n = 0; n < VisualPrimaryCount; n++) primary[n] += chunk.VisualPrimary[n];
+                for (int n = 0; n < VisualFlagCount; n++) flags[n] += chunk.VisualFlags[n];
+                for (int n = 0; n < VisualResidualHistogramCount; n++)
+                    residualHistogram[n] += chunk.VisualResidualHistogram[n];
+                for (int n = 0; n < VisualNormalHistogramCount; n++)
+                    normalHistogram[n] += chunk.VisualNormalHistogram[n];
+            }
+
+            long primarySum = 0;
+            for (int i = 0; i < primary.Length; i++) primarySum += primary[i];
+            sb.AppendLine();
+            sb.AppendLine($"网格直观质量分类账（{label}，只读）:");
+            sb.AppendLine($"chunk_size={_config.ChunkSize};pages={pages};triangle_total={total};primary_reconcile_delta={total - primarySum}");
+            sb.AppendLine("scope=final_smoothed_temporally_blended_triangle_geometry;primary_classes_mutually_exclusive=true;flags_overlap=true;production_gating=false");
+            sb.AppendLine("plane_reference=page_local_4x4x4_robust_candidate_bins;residual_unit=voxel;default_voxel_size_m=" +
+                          _volume.VoxelSize.ToString("R", CultureInfo.InvariantCulture));
+            sb.AppendLine("plane_model_semantics=normal+point+offset permit adjacent-bin depth/orientation comparison for low-frequency bows;positive/negative triangle depth remains relative to the TSDF-gradient-aligned local plane");
+            for (int i = 0; i < VisualPrimaryCount; i++)
+                sb.AppendLine($"primary_{VisualPrimaryNames[i]}={primary[i]}");
+            for (int i = 0; i < VisualFlagCount; i++)
+                sb.AppendLine($"flag_{VisualFlagNames[i]}={flags[i]}");
+            sb.AppendLine("residual_abs_histogram_voxels=<0.05,<0.10,<0.20,<0.40,<0.80,>=0.80");
+            sb.AppendLine("residual_abs_histogram_counts=" + string.Join(",", residualHistogram));
+            sb.AppendLine("normal_deviation_histogram_degrees=<3,<7,<15,<30,>=30");
+            sb.AppendLine("normal_deviation_histogram_counts=" + string.Join(",", normalHistogram));
+
+            sb.AppendLine("visual_quality_page_csv:");
+            sb.Append("chunk_x,chunk_y,chunk_z,built_epoch,triangles");
+            for (int i = 0; i < VisualPrimaryCount; i++) sb.Append(',').Append(VisualPrimaryNames[i]);
+            for (int i = 0; i < VisualFlagCount; i++) sb.Append(',').Append(VisualFlagNames[i]);
+            sb.AppendLine();
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (!chunk.Built || chunk.VisualTotal == 0u) continue;
+                sb.Append(chunk.Coordinate.x).Append(',').Append(chunk.Coordinate.y).Append(',')
+                  .Append(chunk.Coordinate.z).Append(',').Append(chunk.BuiltEpoch).Append(',')
+                  .Append(chunk.VisualTotal);
+                for (int n = 0; n < VisualPrimaryCount; n++) sb.Append(',').Append(chunk.VisualPrimary[n]);
+                for (int n = 0; n < VisualFlagCount; n++) sb.Append(',').Append(chunk.VisualFlags[n]);
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("visual_quality_spatial_csv:");
+            sb.Append("chunk_x,chunk_y,chunk_z,bin_x,bin_y,bin_z,voxel_min_x,voxel_min_y,voxel_min_z,voxel_max_x,voxel_max_y,voxel_max_z,local_min_x_m,local_min_y_m,local_min_z_m,local_max_x_m,local_max_y_m,local_max_z_m,triangles,plane_candidate,plane_rms_vox,plane_thin_ratio,plane_nx,plane_ny,plane_nz,plane_point_x_m,plane_point_y_m,plane_point_z_m,plane_offset_m");
+            for (int i = 0; i < VisualPrimaryCount; i++) sb.Append(',').Append(VisualPrimaryNames[i]);
+            for (int i = 0; i < VisualFlagCount; i++) sb.Append(',').Append(VisualFlagNames[i]);
+            sb.AppendLine();
+            int3 volumeCount = _volume.VoxelCount;
+            float voxelSize = _volume.VoxelSize;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (!chunk.Built || chunk.VisualTotal == 0u) continue;
+                int3 extent = math.max(chunk.CoreMax - chunk.CoreMin, new int3(1));
+                for (int bin = 0; bin < SpatialLedgerBinCount; bin++)
+                {
+                    int primaryBase = bin * VisualPrimaryCount;
+                    long binTotal = 0;
+                    for (int n = 0; n < VisualPrimaryCount; n++)
+                        binTotal += chunk.VisualSpatialPrimary[primaryBase + n];
+                    if (binTotal == 0) continue;
+                    int3 binCoord = new int3(bin & 3, (bin >> 2) & 3, (bin >> 4) & 3);
+                    int3 voxelMin = chunk.CoreMin + (extent * binCoord) / 4;
+                    int3 voxelMax = chunk.CoreMin + (extent * (binCoord + 1)) / 4;
+                    float3 localMin = ((float3)voxelMin - (float3)volumeCount * 0.5f) * voxelSize;
+                    float3 localMax = ((float3)voxelMax - (float3)volumeCount * 0.5f) * voxelSize;
+                    int modelBase = bin * VisualPlaneModelStride;
+                    uint planeCandidate = chunk.VisualPlaneModel[modelBase];
+                    float planeRmsVox = chunk.VisualPlaneModel[modelBase + 4] / 1024f;
+                    float thinRatio = chunk.VisualPlaneModel[modelBase + 5] / 1000000f;
+                    float3 planeNormal = new float3(
+                        unchecked((int)chunk.VisualPlaneModel[modelBase + 1]) / 32767f,
+                        unchecked((int)chunk.VisualPlaneModel[modelBase + 2]) / 32767f,
+                        unchecked((int)chunk.VisualPlaneModel[modelBase + 3]) / 32767f);
+                    int accumBase = bin * VisualPlaneAccumStride;
+                    float vertexCount = Mathf.Max(1f, chunk.VisualPlaneAccum[accumBase]);
+                    float3 meanQ = new float3(
+                        unchecked((int)chunk.VisualPlaneAccum[accumBase + 1]),
+                        unchecked((int)chunk.VisualPlaneAccum[accumBase + 2]),
+                        unchecked((int)chunk.VisualPlaneAccum[accumBase + 3])) / vertexCount;
+                    float3 planePoint = (((float3)voxelMin + (float3)voxelMax) * 0.5f -
+                                         (float3)volumeCount * 0.5f + meanQ * 0.25f) * voxelSize;
+                    float planeOffset = math.dot(planeNormal, planePoint);
+                    sb.Append(chunk.Coordinate.x).Append(',').Append(chunk.Coordinate.y).Append(',').Append(chunk.Coordinate.z).Append(',')
+                      .Append(binCoord.x).Append(',').Append(binCoord.y).Append(',').Append(binCoord.z).Append(',')
+                      .Append(voxelMin.x).Append(',').Append(voxelMin.y).Append(',').Append(voxelMin.z).Append(',')
+                      .Append(voxelMax.x).Append(',').Append(voxelMax.y).Append(',').Append(voxelMax.z).Append(',')
+                      .Append(localMin.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMin.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMin.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(binTotal).Append(',').Append(planeCandidate).Append(',')
+                      .Append(planeRmsVox.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(thinRatio.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planeNormal.x.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planeNormal.y.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planeNormal.z.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planePoint.x.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planePoint.y.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planePoint.z.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(planeOffset.ToString("F5", CultureInfo.InvariantCulture));
+                    for (int n = 0; n < VisualPrimaryCount; n++)
+                        sb.Append(',').Append(chunk.VisualSpatialPrimary[primaryBase + n]);
+                    int flagBase = bin * VisualFlagCount;
+                    for (int n = 0; n < VisualFlagCount; n++)
+                        sb.Append(',').Append(chunk.VisualSpatialFlags[flagBase + n]);
+                    sb.AppendLine();
+                }
+            }
+
+            AppendBoundarySeamReport(sb);
+        }
+
+        private void AppendBoundarySeamReport(StringBuilder sb)
+        {
+            sb.AppendLine("boundary_seam_csv:");
+            sb.AppendLine("chunk_a_x,chunk_a_y,chunk_a_z,chunk_b_x,chunk_b_y,chunk_b_z,axis,epoch_a,epoch_b,shared_vertices,only_a,only_b,delta_gt_2mm,delta_gt_5mm,delta_gt_10mm,p95_delta_mm,max_delta_mm,status");
+            if (_config.ChunkSize != 32)
+            {
+                sb.AppendLine("boundary_fingerprint_status=skipped_non_32_page");
+                return;
+            }
+
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk a = _chunks[i];
+                if (!IsVisibleSurfacePage(a)) continue;
+                for (int axis = 0; axis < PositiveFaceNeighbours.Length; axis++)
+                {
+                    int3 neighbourCoordinate = a.Coordinate + PositiveFaceNeighbours[axis];
+                    if (math.any(neighbourCoordinate >= _chunkCount)) continue;
+                    Chunk b = _chunks[Flatten(neighbourCoordinate)];
+                    if (!IsVisibleSurfacePage(b)) continue;
+                    int faceA = axis * 2 + 1;
+                    int faceB = axis * 2;
+                    int shared = 0;
+                    int onlyA = 0;
+                    int onlyB = 0;
+                    int gt2 = 0;
+                    int gt5 = 0;
+                    int gt10 = 0;
+                    float maxMm = 0f;
+                    var deltas = new List<float>(256);
+                    for (int cell = 0; cell < VisualBoundaryFaceCells; cell++)
+                    {
+                        uint packedA = a.BoundaryFingerprint[faceA * VisualBoundaryFaceCells + cell];
+                        uint packedB = b.BoundaryFingerprint[faceB * VisualBoundaryFaceCells + cell];
+                        bool presentA = (packedA & 0x80000000u) != 0u;
+                        bool presentB = (packedB & 0x80000000u) != 0u;
+                        if (presentA && presentB)
+                        {
+                            shared++;
+                            float mm = math.length(DecodeBoundaryOffset(packedA) - DecodeBoundaryOffset(packedB)) *
+                                       _volume.VoxelSize * 1000f;
+                            deltas.Add(mm);
+                            maxMm = Mathf.Max(maxMm, mm);
+                            if (mm > 2f) gt2++;
+                            if (mm > 5f) gt5++;
+                            if (mm > 10f) gt10++;
+                        }
+                        else if (presentA) onlyA++;
+                        else if (presentB) onlyB++;
+                    }
+                    if (shared == 0 && onlyA == 0 && onlyB == 0) continue;
+                    deltas.Sort();
+                    float p95 = deltas.Count > 0
+                        ? deltas[Mathf.Clamp(Mathf.CeilToInt(deltas.Count * 0.95f) - 1, 0, deltas.Count - 1)]
+                        : 0f;
+                    string status = onlyA + onlyB > 0 ? "presence_mismatch_candidate" :
+                                    gt5 > 0 ? "position_mismatch_candidate" :
+                                    shared > 0 ? "aligned" : "no_shared_surface";
+                    sb.Append(a.Coordinate.x).Append(',').Append(a.Coordinate.y).Append(',').Append(a.Coordinate.z).Append(',')
+                      .Append(b.Coordinate.x).Append(',').Append(b.Coordinate.y).Append(',').Append(b.Coordinate.z).Append(',')
+                      .Append(axis == 0 ? "x" : axis == 1 ? "y" : "z").Append(',')
+                      .Append(a.BuiltEpoch).Append(',').Append(b.BuiltEpoch).Append(',')
+                      .Append(shared).Append(',').Append(onlyA).Append(',').Append(onlyB).Append(',')
+                      .Append(gt2).Append(',').Append(gt5).Append(',').Append(gt10).Append(',')
+                      .Append(p95.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(maxMm.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(status).AppendLine();
+                }
+            }
+            sb.AppendLine("boundary_semantics=exact same-global-voxel final vertex fingerprints across adjacent 32^3 pages;presence or position mismatch is a seam candidate, not automatic proof of a visible crack");
+        }
+
+        private static float3 DecodeBoundaryOffset(uint packed)
+        {
+            float x = (packed & 0x3FFu) / 256f - 1f;
+            float y = ((packed >> 10) & 0x3FFu) / 256f - 1f;
+            float z = ((packed >> 20) & 0x3FFu) / 256f - 1f;
+            return new float3(x, y, z);
+        }
+
         private void CalculateSyncDebt(out int stale, out int visiblePairs,
             out int mismatchedPairs, out uint maxEpochGap, out float maxCommitSkew,
             out float oldestDebtSeconds)
@@ -2306,6 +2604,7 @@ namespace Genesis.RoomScan
                 chunk.AdditiveMergePasses = 0;
                 Array.Clear(chunk.AcceptedSpatialMature, 0, chunk.AcceptedSpatialMature.Length);
                 Array.Clear(chunk.AcceptedSpatialOccupancy, 0, chunk.AcceptedSpatialOccupancy.Length);
+                ClearVisualQualityPage(chunk);
                 Array.Clear(chunk.SpatialStablePasses, 0, chunk.SpatialStablePasses.Length);
                 Array.Clear(chunk.SpatialProtected, 0, chunk.SpatialProtected.Length);
                 chunk.DestructiveCandidateCount = 0;
@@ -2351,6 +2650,7 @@ namespace Genesis.RoomScan
                 chunk.AdditiveMergePasses = 0;
                 Array.Clear(chunk.AcceptedSpatialMature, 0, chunk.AcceptedSpatialMature.Length);
                 Array.Clear(chunk.AcceptedSpatialOccupancy, 0, chunk.AcceptedSpatialOccupancy.Length);
+                ClearVisualQualityPage(chunk);
                 Array.Clear(chunk.SpatialStablePasses, 0, chunk.SpatialStablePasses.Length);
                 Array.Clear(chunk.SpatialProtected, 0, chunk.SpatialProtected.Length);
                 chunk.DestructiveCandidateCount = 0;

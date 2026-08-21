@@ -272,6 +272,8 @@ namespace Genesis.RoomScan
             public string LocalReplacementText;
             public string GeometryStabilityPath;
             public string GeometryStabilityText;
+            public string GeometrySpatialPath;
+            public string GeometrySpatialText;
             public string SummaryPath;
             public string SummaryText;
         }
@@ -1194,12 +1196,20 @@ namespace Genesis.RoomScan
                 summary.AppendLine($"导出(UTC): {DateTime.UtcNow:O}");
                 _geometryStability.AppendSummary(summary);
                 _persistentChunks?.AppendSyncDebtSummary(summary, "生产64³提取块");
+                _persistentChunks?.AppendVisualQualityReport(summary, "生产提取块");
                 if (HasIncrementalHera)
+                {
                     _heraReplay.AppendParentSyncDebtSummary(summary);
+                    _heraReplay.AppendParentVisualQualityReport(summary);
+                }
 
                 string csvPath = Path.Combine(outputDir, stem + ".csv");
+                var spatialCsv = new StringBuilder(4096);
+                _geometryStability.AppendSpatialCsv(spatialCsv, session);
+                string spatialPath = Path.Combine(outputDir, stem + "_spatial.csv");
                 string summaryPath = Path.Combine(outputDir, stem + "_summary.txt");
                 File.WriteAllText(csvPath, csv.ToString(), new UTF8Encoding(true));
+                File.WriteAllText(spatialPath, spatialCsv.ToString(), new UTF8Encoding(true));
                 File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(true));
                 Logger.Info($"第一阶段几何快照已保存: {summaryPath}");
                 return summaryPath;
@@ -1268,6 +1278,8 @@ namespace Genesis.RoomScan
                     File.WriteAllText(payload.LocalReplacementPath, payload.LocalReplacementText, new UTF8Encoding(true));
                 if (!string.IsNullOrEmpty(payload.GeometryStabilityText))
                     File.WriteAllText(payload.GeometryStabilityPath, payload.GeometryStabilityText, new UTF8Encoding(true));
+                if (!string.IsNullOrEmpty(payload.GeometrySpatialText))
+                    File.WriteAllText(payload.GeometrySpatialPath, payload.GeometrySpatialText, new UTF8Encoding(true));
                 stopwatch.Stop();
                 writeMs = stopwatch.Elapsed.TotalMilliseconds;
                 string timedSummary = payload.SummaryText +
@@ -1320,6 +1332,8 @@ namespace Genesis.RoomScan
             _persistentChunks?.AppendLocalReplacementCsv(localReplacementCsv, _ledgerSessionId);
             var geometryStabilityCsv = new StringBuilder(4096);
             _geometryStability?.AppendCsv(geometryStabilityCsv, _ledgerSessionId);
+            var geometrySpatialCsv = new StringBuilder(4096);
+            _geometryStability?.AppendSpatialCsv(geometrySpatialCsv, _ledgerSessionId);
             return new LedgerExportPayload
             {
                 CsvPath = Path.Combine(outputDir, stem + ".csv"),
@@ -1328,6 +1342,8 @@ namespace Genesis.RoomScan
                 LocalReplacementText = localReplacementCsv.ToString(),
                 GeometryStabilityPath = Path.Combine(outputDir, stem + "_geometry_stability.csv"),
                 GeometryStabilityText = geometryStabilityCsv.ToString(),
+                GeometrySpatialPath = Path.Combine(outputDir, stem + "_geometry_spatial.csv"),
+                GeometrySpatialText = geometrySpatialCsv.ToString(),
                 SummaryPath = Path.Combine(outputDir, stem + "_summary.txt"),
                 SummaryText = null
             };
@@ -1353,8 +1369,12 @@ namespace Genesis.RoomScan
             _persistentChunks?.AppendLocalReplacementSummary(sb);
             _geometryStability?.AppendSummary(sb);
             _persistentChunks?.AppendSyncDebtSummary(sb, "生产64³提取块");
+            _persistentChunks?.AppendVisualQualityReport(sb, "生产提取块");
             if (HasIncrementalHera)
+            {
                 _heraReplay.AppendParentSyncDebtSummary(sb);
+                _heraReplay.AppendParentVisualQualityReport(sb);
+            }
 
             if (_ledgerSamples.Count == 0)
                 return sb.ToString();
