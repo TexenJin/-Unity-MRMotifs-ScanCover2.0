@@ -818,11 +818,27 @@ namespace Genesis.RoomScan
                 throw new InvalidOperationException("HERA 缺少体积、计算着色器或网格材质");
 
             DisposeFrozenChunkReplay();
-            DisposeFrozenHeraReplay();
             _chunkAbDiagnosticColoring = true;
             // Close the last partial GPU accounting period while the frozen
             // replay is being built. This is asynchronous and diagnostic-only.
             _volume.FlushForensicLedger();
+
+            // The incremental hierarchy already owns the visible, device-proven
+            // 32^3 pages and their temporal candidate history.  Finalize that
+            // same hierarchy instead of disposing it and creating 144 cold
+            // workers: the latter made every frozen page report zero geometry
+            // and blanked the display at the A-key hand-off.
+            if (_heraReplay != null && _heraReplay.IsIncremental)
+            {
+                if (!_heraReplay.BeginFrozenFinalization())
+                    throw new InvalidOperationException("HERA 增量层无法转入全场收尾");
+                _heraReplay.SetDiagnosticColoring(true);
+                _heraReplay.SetVisible(true);
+                Logger.Info("HERA：沿用已上屏增量父页开始冻结收尾，交接期不撤网格");
+                return;
+            }
+
+            DisposeFrozenHeraReplay();
 
             var parent32 = CreateHeraReplayConfig(32, maxChunksPerTick, true);
             var child16 = CreateHeraReplayConfig(16, maxChunksPerTick, false);

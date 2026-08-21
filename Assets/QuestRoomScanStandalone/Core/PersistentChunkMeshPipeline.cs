@@ -730,6 +730,32 @@ namespace Genesis.RoomScan
             return true;
         }
 
+        /// <summary>
+        /// Finish a static replay without rebuilding pages that already own a
+        /// committed front buffer.  Frozen HERA uses this when its live
+        /// incremental pipeline becomes the final full-volume replay: keeping
+        /// the existing workers also keeps their candidate history and avoids
+        /// an all-empty hand-off caused by starting every page from scratch.
+        /// </summary>
+        public int QueueUnbuiltStaticReplayChunks()
+        {
+            if (_disposed || !_config.StaticReplay)
+                return 0;
+
+            int queued = 0;
+            uint epoch = math.max(1u, _volume.DirtyEpoch);
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (chunk.Built || chunk.Queued || chunk.CommitPending)
+                    continue;
+                QueueChunk(i, epoch);
+                if (chunk.Queued)
+                    queued++;
+            }
+            return queued;
+        }
+
         /// <summary>页是否已建（含空页）。增量精修 HUD 与邻页判定用。</summary>
         public bool IsChunkBuilt(int3 coordinate)
         {

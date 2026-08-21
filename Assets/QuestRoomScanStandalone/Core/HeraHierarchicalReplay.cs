@@ -195,7 +195,7 @@ namespace Genesis.RoomScan
         // 建完"的时刻，子页救回的全局绘制验证改为构造即解锁（逐页可见性仍由
         // FinalizeFamily 把关）；同一页可重提交（解冻重修），总账用逐页 tally
         // 先扣旧值防膨胀。
-        private readonly bool _incrementalMode;
+        private bool _incrementalMode;
         private sealed class ParentTally
         {
             public long Kept, Delegated, DisplayRed;
@@ -377,6 +377,30 @@ namespace Genesis.RoomScan
         // ── 增量精修公开 API（两段合一）──
 
         public bool IsIncremental => _incrementalMode;
+
+        /// <summary>
+        /// Promote the live incremental hierarchy into the frozen full-volume
+        /// replay in place.  Existing parent snapshots and per-page candidate
+        /// history remain authoritative; only pages that have never committed
+        /// are queued.  This is the production hand-off, not a diagnostic copy.
+        /// </summary>
+        public bool BeginFrozenFinalization()
+        {
+            if (_disposed || !_incrementalMode)
+                return false;
+
+            _incrementalMode = false;
+            // No more live/frozen routing exists after A.  An in-flight parent
+            // callback now belongs to the final track and may create its normal
+            // rescue family.
+            _liveParentKeys.Clear();
+            int queued = _parent32.QueueUnbuiltStaticReplayChunks();
+            Logger.Info(
+                $"HERA：增量层原地转全场收尾；保留已建父页={ParentBuilt}，" +
+                $"补排未建父页={queued}");
+            return true;
+        }
+
         /// <summary>已提交的父页数（HUD"精修上屏 n 页"；重提交不重复计数）。</summary>
         public int IncrementalPagesCommitted => _parentResults;
         /// <summary>父+子管线提交看门狗复位总数（HUD 回读丢弃活度）。</summary>
