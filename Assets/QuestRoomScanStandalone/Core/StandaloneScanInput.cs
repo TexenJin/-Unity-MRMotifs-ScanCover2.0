@@ -8,13 +8,15 @@ namespace Genesis.RoomScan
     ///   A          = 冻结共享 TSDF（先隐藏采集覆盖片）
     ///   Y          = 在 64³ / 32³ / 16³ 只读回放档之间循环
     ///   B          = 只导出并清空当前档，不清共享 TSDF
-    ///   右摇杆按下 = 冻结回放后：单色线框/好坏空状态着色；扫描中：网格显示开/关（只藏绘制，
-    ///                融合/提取/精修后台照跑——满屏网视角的帧率二分闸，判光栅化压力用。
-    ///                注意 A/B 实验旗下满屏网=增量 HERA 所画，开关切的就是它）
-    ///   右摇杆方向+按下 = 性能二分热键：上=实时轨 / 左=冻结调度器 / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
-    ///   左摇杆按下 = 线框 / 实体切换（全局 shader 开关，帧率二分用）
+    ///   右摇杆按下 = 路线验证期间：纸网合流→支撑真值→三角粗皮→HERA→纸网合流；
+    ///                否则冻结回放后切状态着色。两个直接视图保留融合但暂停 HERA。
+    ///   右摇杆方向+按下 = 追责/性能热键：上=实时轨 / 左=胶冻↔原冻（仅空卷） / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
+    ///   左摇杆按下 = 支撑真值档切拓扑审计/外皮片实体；纸网合流档切纸主网格/旧真边对照
     ///   左摇杆上+按下 = 源头时序滤波开关（盯墙养绿 A/B 热键，HUD 闸行 时开/时关 回显）
     ///   左摇杆下+按下 = 第一阶段纯白几何 / 原状态色切换（仅显示层）
+    ///   左摇杆右+按下 = 32³融合管理块线框开关（青稳/黄热/红双热/洋红已解冻）
+    ///   左摇杆左+按下 = 空卷时切换胶冻 / 原冻（与右摇杆左同义，便于实机操作）
+    ///   左握把+X = 平台前处理 / QRS 后处理双路逐帧采集开关（普通 X 仍是 BB 反投影显示）
     /// 每次按键给一下短震动作为反馈。
     /// </summary>
     public class StandaloneScanInput : MonoBehaviour
@@ -82,7 +84,7 @@ namespace Genesis.RoomScan
             // 右摇杆：按下=单色/状态着色；**推方向再按下**=性能二分热键（实机：
             // 采集 15-24fps GPU U 91%，冻结满显示 73fps——猪在采集链路 GPU 侧）：
             //   上=实时轨开关（提取+过滤+回读churn）
-            //   左=冻结调度器开关（2s 全体积普查+票箱回读）
+            //   左=胶冻/原冻 A/B（只允许尚未开扫的空卷切换）
             //   下=融合 20↔10Hz（TSDF 积分量减半）
             if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick, controller))
             {
@@ -95,7 +97,7 @@ namespace Genesis.RoomScan
                 else if (stick.x < -0.5f)
                 {
                     scanner.NotifyInput("摇杆左");
-                    scanner.ToggleFrozenBlockSupervisor();
+                    scanner.ToggleGunGelGuardedFusionExperiment();
                 }
                 else if (stick.x > 0.5f)
                 {
@@ -110,7 +112,8 @@ namespace Genesis.RoomScan
                 else
                 {
                     // 着色切换只在冻结回放后有意义（ToggleChunkAbDisplayMode 未冻结
-                    // 直接早退=空转）；扫描中这颗键让给帧率二分总闸"显开/显关"。
+                    // 直接早退=空转）；扫描中路线验证时切纸网合流/支撑真值/三角粗皮/HERA，
+                    // 否则沿用网格显示总闸。
                     if (scanner.IsChunkAbFrozen)
                         scanner.ToggleChunkAbDisplayMode();
                     else
@@ -127,11 +130,31 @@ namespace Genesis.RoomScan
                 Pulse();
             }
 
-            // 左手 X：呼出/收起采集点阵（单帧真值判官对照层）。
+            // 左手 X：呼出/收起融合前 BB 反投影留痕；开启时只显示反投影点。
+            // 左握把+X：最小双路逐帧采集（平台前处理 + 同帧 QRS 后处理），不改显示。
             if (OVRInput.GetDown(OVRInput.RawButton.X))
             {
-                scanner.NotifyInput("X键");
-                scanner.ToggleCoverageMarkers();
+                // 不走 PrimaryHandTrigger 虚拟重映射：Quest/OpenXR 实机曾出现
+                // 握把已按住但读数仍为 0，导致组合键误落到普通 X 点阵分支。
+                // 直接读左握把物理 RawButton，并用 RawAxis 0.35 作双保险。
+                float leftGrip = OVRInput.Get(
+                    OVRInput.RawAxis1D.LHandTrigger,
+                    OVRInput.Controller.LTouch);
+                bool leftGripHeld =
+                    OVRInput.Get(OVRInput.RawButton.LHandTrigger, OVRInput.Controller.LTouch) ||
+                    leftGrip > 0.35f;
+                if (leftGripHeld)
+                {
+                    scanner.NotifyInput($"左握把+X 握{leftGrip:0.00}");
+                    scanner.TogglePairedDepthFrameCapture();
+                }
+                else
+                {
+                    scanner.ToggleCoverageMarkers();
+                    // ToggleCoverageMarkers 内部会写一次提示，因此诊断握值必须放在
+                    // 它之后，确保实机截图能看见而不是被“BB反投影”提示覆盖。
+                    scanner.NotifyInput($"X点阵 握{leftGrip:0.00}");
+                }
                 Pulse();
             }
 
@@ -152,6 +175,16 @@ namespace Genesis.RoomScan
                 {
                     scanner.NotifyInput("左摇杆下");
                     scanner.ToggleGeometryTruthView();
+                }
+                else if (lstick.x > 0.5f)
+                {
+                    scanner.NotifyInput("左摇杆右");
+                    scanner.ToggleManagementBlockWireOverlay();
+                }
+                else if (lstick.x < -0.5f)
+                {
+                    scanner.NotifyInput("左摇杆左");
+                    scanner.ToggleGunGelGuardedFusionExperiment();
                 }
                 else
                 {

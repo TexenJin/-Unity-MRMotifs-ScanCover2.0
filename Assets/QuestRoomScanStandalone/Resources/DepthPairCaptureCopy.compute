@@ -1,0 +1,15 @@
+#pragma kernel CopyDepth
+
+Texture2DArray<float> _SourceDepth;
+RWTexture2DArray<float> _DestDepth;
+int2 _CaptureSize;
+
+[numthreads(8, 8, 1)]
+void CopyDepth(uint3 id : SV_DispatchThreadID)
+{
+    // 采集文件只保存融合实际读取的 texture-array slice 0。
+    if (id.x >= (uint)_CaptureSize.x || id.y >= (uint)_CaptureSize.y || id.z >= 1)
+        return;
+
+    _DestDepth[id] = _SourceDepth.Load(int4(id.xy, id.z, 0));
+}

@@ -15,6 +15,17 @@ RWTexture3D<float> gsAdmissionTraceRW;
 Texture2DArray<uint> gsEdgeReasonTex;
 RWStructuredBuffer<uint> _DirtyChunkEpochs;
 RWStructuredBuffer<uint> _DirtyBoundaryEpochs;
+// 32^3 HERA parent-page liveness ledger.  This is deliberately separate from
+// the coarser persistent-extraction ledger above: page production must react to
+// the page that actually changed, not make every child of one 64^3 owner wait
+// on the same scheduling decision.
+RWStructuredBuffer<uint> _ActivePageEpochs;
+// Advances whenever an integration write still observes an extractable
+// surface in the page, even if the zero crossing itself did not move enough to
+// advance the geometry epoch.  It wakes missing-product pages without waiting
+// for the freeze supervisor's 1/2/4-second maturity census.
+RWStructuredBuffer<uint> _ActivePageObservedEpochs;
+RWStructuredBuffer<uint> _ActivePageBoundaryEpochs;
 uint3 gsDirtyChunkCount;
 uint gsDirtyChunkSize;
 uint gsTrackDirtyChunks;
@@ -78,6 +89,7 @@ float gsDilationBlockSparse;    // 1=路径探针间距过大的长距供料不�
 float gsProvisionalSeedWeight;  // 新表面暂存权重，必须低于正式出网阈值
 float gsFormalSurfaceWeight;    // 与 Surface Nets _MinWeight 对齐的正式表面阈值
 float gsDiagnosticAngularSpeed; // 只读：当前深度位姿的平滑头部角速度（deg/s）
+float4x4 gsFusionCorrection;    // 枪胶受保护融合：同帧世界法线随位姿小修正一起旋转；基线=单位阵
 // 噪声模型加权（08-21 造炮，w∝1/σ²(d,θ,ω)）：运动质量分由 C# 按角速度+线速度合成
 // （1=静止满权→地板），距离/掠射角指数默认 1=保持原线性。定罪链见 VolumeIntegrator 注释。
 float gsNoiseMotionQuality;
@@ -100,7 +112,7 @@ float gsExclusionRadius; // 排除区半径（原写死 0.6，现由 VolumeInteg
 #define COLOR_SURFACE_BAND 0.5
 #define DILATION_PATH_PROBES 12
 
-// 块线性索引：脏账本/冻结位图/穿越票/成熟度共用同一套块网格（gsDirtyChunkSize）。
+// 持久提取块线性索引（通常 64^3）。
 uint ChunkIndexFromCoord(uint3 coord)
 {
     uint3 chunk = min(coord / gsDirtyChunkSize, gsDirtyChunkCount - 1u);
@@ -131,11 +143,21 @@ void MarkDirtyChunk(uint3 coord, float2 before, float2 after)
     bool distanceChanged = beforeSurface && afterSurface &&
                            abs(after.x - before.x) >= gsDirtyTsdfThreshold;
 
+    uint3 page = min(coord / gsFrozenChunkSize, gsFrozenChunkCount - 1u);
+    uint pageIndex = FrozenChunkIndexFromCoord(coord);
+    if (afterSurface)
+        InterlockedMax(_ActivePageObservedEpochs[pageIndex], gsDirtyChunkEpoch);
+
     if (beforeSurface == afterSurface && !signChanged && !distanceChanged) return;
 
     uint3 chunk = min(coord / gsDirtyChunkSize, gsDirtyChunkCount - 1u);
     uint chunkIndex = ChunkIndexFromCoord(coord);
     InterlockedMax(_DirtyChunkEpochs[chunkIndex], gsDirtyChunkEpoch);
+
+    // 32^3 active-page owner ledger. gsFrozenChunk* is retained as the spatial
+    // address system, but its freeze state is intentionally not consulted:
+    // stable/frozen pages and live pages have the same right to be produced.
+    InterlockedMax(_ActivePageEpochs[pageIndex], gsDirtyChunkEpoch);
 
     // A changed voxel only invalidates a neighbouring extraction chunk when
     // it lies in that exact shared-face halo. This replaces the old CPU rule
@@ -158,6 +180,27 @@ void MarkDirtyChunk(uint3 coord, float2 before, float2 after)
         InterlockedMax(_DirtyBoundaryEpochs[faceBase + 4u], gsDirtyChunkEpoch);
     if (chunk.z + 1u < gsDirtyChunkCount.z && upper.z < halo)
         InterlockedMax(_DirtyBoundaryEpochs[faceBase + 5u], gsDirtyChunkEpoch);
+
+    // Exact 32^3 shared-face debt.  The CPU scheduler queues both sides of a
+    // changed face; each old front remains resident until its own replacement
+    // commits, bounding the lifetime of a one-new/one-old boundary.
+    uint3 pageStart = page * gsFrozenChunkSize;
+    uint3 pageEnd = min(pageStart + gsFrozenChunkSize, gsVoxCount);
+    uint3 pageLocal = coord - pageStart;
+    uint3 pageUpper = (pageEnd - 1u) - coord;
+    uint pageFaceBase = pageIndex * 6u;
+    if (page.x > 0u && pageLocal.x < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 0u], gsDirtyChunkEpoch);
+    if (page.x + 1u < gsFrozenChunkCount.x && pageUpper.x < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 1u], gsDirtyChunkEpoch);
+    if (page.y > 0u && pageLocal.y < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 2u], gsDirtyChunkEpoch);
+    if (page.y + 1u < gsFrozenChunkCount.y && pageUpper.y < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 3u], gsDirtyChunkEpoch);
+    if (page.z > 0u && pageLocal.z < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 4u], gsDirtyChunkEpoch);
+    if (page.z + 1u < gsFrozenChunkCount.z && pageUpper.z < halo)
+        InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 5u], gsDirtyChunkEpoch);
 }
 
 void WriteTrackedTsdf(uint3 coord, float2 value)
@@ -391,7 +434,8 @@ void Integrate(uint id : SV_DispatchThreadID)
         return;
 
     float depthNDC = gsDepthSample(voxNDC.xy);
-    float3 depthNorm = gsDepthNormalSample(voxNDC.xy).xyz;
+    float3 depthNorm = normalize(mul((float3x3)gsFusionCorrection,
+                                     gsDepthNormalSample(voxNDC.xy).xyz));
     float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC));
 
     float3 eyeToDepth = depthPos - eyePos;
@@ -786,8 +830,24 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         // →frozenDelta 恒负=白灌遮挡票。边缘弃权带太细历史没炸过，手部大圆盘会给球后方
         // 冻块灌到误解冻。语义正义："我不知道"的像素本不该有票权；near<minUpdateDist
         // 早退的设备上此闸字节级无操作，纯双保险。
+        // A direct raw sample is not automatically a trustworthy free-space
+        // witness. At a depth discontinuity the near surface can temporarily
+        // drop out and expose a perfectly valid background depth; letting that
+        // background ray vote through the frozen foreground is the observed
+        // corner "lose -> thaw -> fuse back" loop. Require the receiver to be
+        // outside every discontinuity/grazing signature and outside the 3x3
+        // abstention halo. A genuinely removed surface still has a correction
+        // path once the newly exposed background is a clean, locally supported
+        // observation rather than an edge sample.
+        const uint frozenVoteUnsafeReasonMask =
+            (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) |
+            (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) |
+            (1u << 10);
+        bool stableFrozenVoteSource = receiverOwnsRawDepth &&
+                                      !nearAbstainNeighbour &&
+                                      (receiverEdgeReason & frozenVoteUnsafeReasonMask) == 0u;
         if (gsFrozenBlockEnable > 0.5 && gsFrozenChunkSize != 0 &&
-            quality >= gsFrozenVoteQualityMin && receiverOwnsRawDepth)
+            quality >= gsFrozenVoteQualityMin && stableFrozenVoteSource)
         {
             float frozenDelta = sDistNorm - old.x;
             // v2 账必须每帧记（同意帧拉低分歧）。只在矛盾帧记账=分歧 EMA 单调上飘
@@ -994,8 +1054,15 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         return;
     }
 
-    float newTsdf = lerp(oldVal, sDistNorm, blend);
-    // 矛盾帧只扣不增：反对票与赞成票同帧抵消是设计缺陷（v2 修复①）
+    // A free-space contradiction is evidence against the old surface, not a
+    // replacement surface measurement. Moving sd while carving its weight
+    // morphs the retained zero crossing toward background depth and bakes a
+    // bow/ripple into every lose/reacquire cycle. Keep the old geometry fixed
+    // while its support is being challenged; persistent contradiction can
+    // still carve it to zero, after which clean observations seed the real
+    // replacement surface through the normal provisional path.
+    float newTsdf = contradicted ? oldVal : lerp(oldVal, sDistNorm, blend);
+    // 矛盾帧只扣不增、不挪面：反对票与赞成票同帧抵消或同时拉动几何都是设计缺陷。
     float newWeight = contradicted ? carvedWeight : min(weight + q2obs * gsWeightGrowth, gsMaxWeight); // M1：折让带内权重慢涨
     // 救援降级①：救援样本不享快速转正——混合斜坡伪造品恰恰能产出"第二次一致原始
     // 观测"，快速转正对它不是防线而是加速器。救援面只能走自然增长慢慢爬到正式阈值。

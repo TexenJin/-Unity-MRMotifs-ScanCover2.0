@@ -1,0 +1,1208 @@
+// Surfel truth and paper topology over the shared TSDF. One sample-lattice edge
+// may emit one independent zero crossing. The audit view draws those crossings;
+// the paper view connects them through per-face contour decisions and closed
+// cell rings. Everything remains read-only: no fusion/freeze/TSDF write-back.
+#pragma kernel SupportClear
+#pragma kernel SupportClearCells
+#pragma kernel SupportEmitCrossings
+#pragma kernel SupportRetainPrevious
+#pragma kernel SupportClassifyTopology
+#pragma kernel SupportBuildTopology
+#pragma kernel SupportBuildArgs
+
+Texture3D<float2> _TsdfVolume;
+
+int3  _VoxCount;
+float _VoxSize;
+int   _SupportStride;
+float _SupportMinWeight;
+int3  _SupportSampleCount;
+uint  _SupportMaxPoints;
+uint  _SupportMaxTopologyIndices;
+uint  _SupportMaxTopologyVertices;
+float _SupportSurfelRadius;
+uint  _SupportHoldFrames;
+int3  _SupportTopologyCellCount;
+
+RWStructuredBuffer<float4> _SupportPoints;       // xyz=world position, w=min endpoint weight
+RWStructuredBuffer<float4> _SupportNormals;      // xyz=TSDF normal, w=topology class 0..3
+// x=node*3+axis. y packs persistent paper evidence:
+// bits 0..7 confirmations, 8..15 missing-without-evidence, 16..23 conflicts.
+RWStructuredBuffer<uint2>  _SupportPointCells;
+RWStructuredBuffer<int>    _SupportCellPointMap; // node*3+axis -> point (-1 = no crossing)
+// 0=points 1=point overflow 2=topology indices 3=index overflow
+// 4=cell-local topology vertices 5=topology vertex overflow
+RWStructuredBuffer<uint>   _SupportCounters;
+RWStructuredBuffer<float4> _SupportTopologyPoints;
+RWStructuredBuffer<float4> _SupportTopologyNormals;
+RWStructuredBuffer<uint>   _SupportTopologyIndices;
+// x: edge mask 0..11, face-pair choices 12..17, owned bit 24,
+// cluster-fallback bit 25.
+// y: consecutive fully-observed cell-level revocation evidence.
+RWStructuredBuffer<uint2>  _SupportTopologyCellStates;
+// xyz: twelve 8-bit edge parameters (four per uint). w: two-bit sheet
+// labels for the guarded multi-sheet fallback.  Published topology therefore
+// owns geometry as well as connectivity.
+RWStructuredBuffer<uint4>  _SupportTopologyCellGeometry;
+RWStructuredBuffer<uint>   _SupportDrawArgs;     // independent-Surfel indirect args
+RWStructuredBuffer<uint>   _SupportTopologyDrawArgs;
+
+StructuredBuffer<float4> _SupportPreviousPoints;
+StructuredBuffer<float4> _SupportPreviousNormals;
+StructuredBuffer<uint2>  _SupportPreviousPointCells;
+StructuredBuffer<uint>   _SupportPreviousCounters;
+
+static const uint kPaperStateMask = 255u;
+static const uint kPaperOwnedConfirmations = 3u;
+static const uint kPaperReplaceConflicts = 3u;
+static const uint kTopologyEdgeMask = 0x0FFFu;
+static const uint kTopologyFaceShift = 12u;
+static const uint kTopologyOwnedBit = 1u << 24u;
+static const uint kTopologyClusterFallbackBit = 1u << 25u;
+
+uint PaperConfirmationCount(uint state)
+{
+    return state & kPaperStateMask;
+}
+
+uint PaperMissingCount(uint state)
+{
+    return (state >> 8u) & kPaperStateMask;
+}
+
+uint PaperConflictCount(uint state)
+{
+    return (state >> 16u) & kPaperStateMask;
+}
+
+uint PackPaperState(uint confirmations, uint missing, uint conflicts)
+{
+    return min(confirmations, kPaperStateMask) |
+        (min(missing, kPaperStateMask) << 8u) |
+        (min(conflicts, kPaperStateMask) << 16u);
+}
+
+int FlattenSampleCell(int3 c)
+{
+    return c.x + c.y * _SupportSampleCount.x +
+        c.z * _SupportSampleCount.x * _SupportSampleCount.y;
+}
+
+int FlattenTopologyCell(int3 c)
+{
+    return c.x + c.y * _SupportTopologyCellCount.x +
+        c.z * _SupportTopologyCellCount.x * _SupportTopologyCellCount.y;
+}
+
+int3 UnflattenSampleCell(uint flat)
+{
+    uint sliceXY = (uint)(_SupportSampleCount.x * _SupportSampleCount.y);
+    uint z = flat / sliceXY;
+    uint rem = flat - z * sliceXY;
+    uint y = rem / (uint)_SupportSampleCount.x;
+    uint x = rem - y * (uint)_SupportSampleCount.x;
+    return int3((int)x, (int)y, (int)z);
+}
+
+float3 FineCoordToWorld(float3 fineCoord)
+{
+    return (fineCoord + 0.5 - (float3)_VoxCount * 0.5) * _VoxSize;
+}
+
+bool FindCrossing(int3 a, int3 b, float2 sampleA,
+    out float3 finePosition, out float supportWeight)
+{
+    float2 sampleB = _TsdfVolume[b];
+    float weightA = abs(sampleA.y);
+    float weightB = abs(sampleB.y);
+    finePosition = 0.0;
+    supportWeight = 0.0;
+    if (weightA < _SupportMinWeight || weightB < _SupportMinWeight)
+        return false;
+
+    float sdA = sampleA.x;
+    float sdB = sampleB.x;
+    bool crosses = (sdA <= 0.0 && sdB >= 0.0) ||
+                   (sdB <= 0.0 && sdA >= 0.0);
+    float denom = sdA - sdB;
+    if (!crosses || abs(denom) < 1e-6)
+        return false;
+
+    finePosition = lerp((float3)a, (float3)b, saturate(sdA / denom));
+    supportWeight = min(weightA, weightB);
+    return true;
+}
+
+float3 EstimateNormal(float3 finePosition, int3 fallbackAxis)
+{
+    int3 c = clamp((int3)round(finePosition), int3(1,1,1), _VoxCount - 2);
+    float2 xp = _TsdfVolume[c + int3(1,0,0)];
+    float2 xm = _TsdfVolume[c - int3(1,0,0)];
+    float2 yp = _TsdfVolume[c + int3(0,1,0)];
+    float2 ym = _TsdfVolume[c - int3(0,1,0)];
+    float2 zp = _TsdfVolume[c + int3(0,0,1)];
+    float2 zm = _TsdfVolume[c - int3(0,0,1)];
+    float3 gradient = float3(
+        abs(xp.y) >= _SupportMinWeight && abs(xm.y) >= _SupportMinWeight ? xp.x - xm.x : 0.0,
+        abs(yp.y) >= _SupportMinWeight && abs(ym.y) >= _SupportMinWeight ? yp.x - ym.x : 0.0,
+        abs(zp.y) >= _SupportMinWeight && abs(zm.y) >= _SupportMinWeight ? zp.x - zm.x : 0.0);
+    float lengthSq = dot(gradient, gradient);
+    return lengthSq > 1e-8 ? gradient * rsqrt(lengthSq) : normalize((float3)fallbackAxis);
+}
+
+[numthreads(1, 1, 1)]
+void SupportClear(uint3 id : SV_DispatchThreadID)
+{
+    _SupportCounters[0] = 0u;
+    _SupportCounters[1] = 0u;
+    _SupportCounters[2] = 0u;
+    _SupportCounters[3] = 0u;
+    _SupportCounters[4] = 0u;
+    _SupportCounters[5] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void SupportClearCells(uint3 id : SV_DispatchThreadID)
+{
+    uint total = (uint)(_SupportSampleCount.x *
+        _SupportSampleCount.y * _SupportSampleCount.z * 3);
+    if (id.x < total)
+        _SupportCellPointMap[id.x] = -1;
+}
+
+[numthreads(4, 4, 4)]
+void SupportEmitCrossings(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_SupportSampleCount))
+        return;
+
+    int3 cell = (int3)id;
+    int flat = FlattenSampleCell(cell);
+    int3 a = cell * _SupportStride;
+    float2 sampleA = _TsdfVolume[a];
+    [unroll]
+    for (int axis = 0; axis < 3; axis++)
+    {
+        int3 step = axis == 0 ? int3(_SupportStride, 0, 0) :
+                    axis == 1 ? int3(0, _SupportStride, 0) :
+                                int3(0, 0, _SupportStride);
+        float3 crossingPosition;
+        float crossingWeight;
+        if (!FindCrossing(a, a + step, sampleA,
+                crossingPosition, crossingWeight))
+            continue;
+
+        uint pointIndex;
+        InterlockedAdd(_SupportCounters[0], 1u, pointIndex);
+        if (pointIndex >= _SupportMaxPoints)
+        {
+            InterlockedAdd(_SupportCounters[1], 1u);
+            continue;
+        }
+
+        _SupportPoints[pointIndex] = float4(
+            FineCoordToWorld(crossingPosition), crossingWeight);
+        _SupportNormals[pointIndex] = float4(
+            EstimateNormal(crossingPosition, step), 0.0);
+        uint mapIndex = (uint)(flat * 3 + axis);
+        _SupportPointCells[pointIndex] = uint2(
+            mapIndex, PackPaperState(1u, 0u, 0u));
+        _SupportCellPointMap[mapIndex] = (int)pointIndex;
+    }
+}
+
+// Evidence-driven paper ownership.  Candidate edges may collect confirmations
+// across short gaps.  Once owned, missing input is not negative evidence and
+// therefore does not erase the paper.  A valid same-sign TSDF edge is explicit
+// contrary evidence; three such conflicts revoke/replace the old edge.  Fresh
+// compatible observations gently refine position instead of making it jitter.
+[numthreads(64, 1, 1)]
+void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
+{
+    uint previousCount = min(_SupportPreviousCounters[0], _SupportMaxPoints);
+    if (id.x >= previousCount)
+        return;
+
+    uint2 previousCell = _SupportPreviousPointCells[id.x];
+    uint mapIndex = previousCell.x;
+    uint previousState = previousCell.y;
+    uint totalMapEntries = (uint)(_SupportSampleCount.x *
+        _SupportSampleCount.y * _SupportSampleCount.z * 3);
+    if (mapIndex >= totalMapEntries)
+        return;
+
+    uint confirmations = max(PaperConfirmationCount(previousState), 1u);
+    uint missing = PaperMissingCount(previousState);
+    uint conflicts = PaperConflictCount(previousState);
+    int currentIndex = _SupportCellPointMap[mapIndex];
+
+    // Fresh and previous observations refer to the exact same sample edge.
+    // Preserve an already-owned position through isolated depth jumps; accept a
+    // genuinely moved surface only after repeated contrary observations.
+    if (currentIndex >= 0)
+    {
+        float4 previousPoint = _SupportPreviousPoints[id.x];
+        float4 currentPoint = _SupportPoints[currentIndex];
+        float positionGap = length(currentPoint.xyz - previousPoint.xyz);
+        float compatibleGap = max(_VoxSize * 1.25,
+            _SupportSurfelRadius * 0.9);
+        if (positionGap <= compatibleGap)
+        {
+            uint refinedConfirmations = min(confirmations + 1u, 255u);
+            float refinement = 1.0 / (float)min(refinedConfirmations, 8u);
+            currentPoint.xyz = lerp(previousPoint.xyz, currentPoint.xyz, refinement);
+            currentPoint.w = max(previousPoint.w, currentPoint.w);
+            float3 blendedNormal = lerp(
+                _SupportPreviousNormals[id.x].xyz,
+                _SupportNormals[currentIndex].xyz, refinement);
+            float normalLengthSq = dot(blendedNormal, blendedNormal);
+            if (normalLengthSq > 1e-8)
+                _SupportNormals[currentIndex] = float4(
+                    blendedNormal * rsqrt(normalLengthSq), 0.0);
+            _SupportPoints[currentIndex] = currentPoint;
+            _SupportPointCells[currentIndex] = uint2(mapIndex,
+                PackPaperState(refinedConfirmations, 0u, 0u));
+        }
+        else
+        {
+            uint nextConflicts = min(conflicts + 1u, 255u);
+            if (confirmations >= kPaperOwnedConfirmations &&
+                nextConflicts < kPaperReplaceConflicts)
+            {
+                _SupportPoints[currentIndex] = previousPoint;
+                _SupportNormals[currentIndex] = float4(
+                    _SupportPreviousNormals[id.x].xyz, 0.0);
+                _SupportPointCells[currentIndex] = uint2(mapIndex,
+                    PackPaperState(confirmations, 0u, nextConflicts));
+            }
+            // At the third conflict the fresh point already in currentIndex is
+            // accepted as a new candidate; its state from Emit remains 1/0/0.
+        }
+        return;
+    }
+
+    // No fresh crossing. Distinguish lack of observation from an actual
+    // same-sign TSDF statement on this edge.
+    uint flat = mapIndex / 3u;
+    uint axis = mapIndex - flat * 3u;
+    int3 sampleNode = UnflattenSampleCell(flat);
+    int3 a = sampleNode * _SupportStride;
+    int3 step = axis == 0u ? int3(_SupportStride, 0, 0) :
+                axis == 1u ? int3(0, _SupportStride, 0) :
+                             int3(0, 0, _SupportStride);
+    float2 sampleA = _TsdfVolume[a];
+    float2 sampleB = _TsdfVolume[a + step];
+    bool endpointsObserved = abs(sampleA.y) >= _SupportMinWeight &&
+                             abs(sampleB.y) >= _SupportMinWeight;
+    bool stillCrosses = (sampleA.x <= 0.0 && sampleB.x >= 0.0) ||
+                        (sampleB.x <= 0.0 && sampleA.x >= 0.0);
+    bool explicitConflict = endpointsObserved && !stillCrosses;
+
+    uint nextMissing = missing;
+    uint nextConflicts = conflicts;
+    if (explicitConflict)
+    {
+        nextConflicts = min(conflicts + 1u, 255u);
+        nextMissing = 0u;
+        // An owned edge remains available to the last published cell topology.
+        // The cell-level two-phase commit below decides when a complete
+        // replacement (or confirmed empty state) may retire it.
+        if (nextConflicts >= kPaperReplaceConflicts &&
+            confirmations < kPaperOwnedConfirmations)
+            return;
+    }
+    else
+    {
+        nextMissing = min(missing + 1u, 255u);
+        // Unowned candidates get a short grace window so separate edge samples
+        // can meet. Owned paper persists through indefinite no-data periods;
+        // only explicit evidence above is allowed to revoke it.
+        if (confirmations < kPaperOwnedConfirmations &&
+            nextMissing > max(_SupportHoldFrames, 1u))
+            return;
+    }
+
+    uint pointIndex;
+    InterlockedAdd(_SupportCounters[0], 1u, pointIndex);
+    if (pointIndex >= _SupportMaxPoints)
+    {
+        InterlockedAdd(_SupportCounters[1], 1u);
+        return;
+    }
+
+    _SupportPoints[pointIndex] = _SupportPreviousPoints[id.x];
+    _SupportNormals[pointIndex] = float4(_SupportPreviousNormals[id.x].xyz, 0.0);
+    _SupportPointCells[pointIndex] = uint2(mapIndex,
+        PackPaperState(confirmations, nextMissing, nextConflicts));
+    _SupportCellPointMap[mapIndex] = (int)pointIndex;
+}
+
+// Topology class: 0 exposed/red, 1 fragile/yellow, 2 connected/green,
+// 3 parallel incompatible layer/magenta. This is an audit overlay only.
+[numthreads(64, 1, 1)]
+void SupportClassifyTopology(uint3 id : SV_DispatchThreadID)
+{
+    uint pointCount = min(_SupportCounters[0], _SupportMaxPoints);
+    if (id.x >= pointCount)
+        return;
+
+    float3 p = _SupportPoints[id.x].xyz;
+    float3 n = normalize(_SupportNormals[id.x].xyz);
+    uint mapIndex = _SupportPointCells[id.x].x;
+    int3 cell = UnflattenSampleCell(mapIndex / 3u);
+    uint compatibleCount = 0u;
+    bool stackedLayer = false;
+    float maxLinkDistance = _SupportSurfelRadius * 2.15;
+
+    [loop]
+    for (int dz = -1; dz <= 1; dz++)
+    [loop]
+    for (int dy = -1; dy <= 1; dy++)
+    [loop]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        if (dx == 0 && dy == 0 && dz == 0)
+            continue;
+        int3 neighbourCell = cell + int3(dx, dy, dz);
+        if (any(neighbourCell < 0) || any(neighbourCell >= _SupportSampleCount))
+            continue;
+        int neighbourFlat = FlattenSampleCell(neighbourCell);
+        [unroll]
+        for (int axis = 0; axis < 3; axis++)
+        {
+            int neighbourIndex = _SupportCellPointMap[neighbourFlat * 3 + axis];
+            if (neighbourIndex < 0 || neighbourIndex == (int)id.x)
+                continue;
+
+            float3 q = _SupportPoints[neighbourIndex].xyz;
+            float3 nq = normalize(_SupportNormals[neighbourIndex].xyz);
+            float3 delta = q - p;
+            float distance = length(delta);
+            if (distance > maxLinkDistance)
+                continue;
+
+            float normalAgreement = abs(dot(n, nq));
+            float planeGap = max(abs(dot(delta, n)), abs(dot(delta, nq)));
+            float tangentDistance = sqrt(max(0.0, distance * distance - planeGap * planeGap));
+            if (normalAgreement >= 0.75 &&
+                planeGap <= max(_VoxSize * 0.8, _SupportSurfelRadius * 0.55) &&
+                tangentDistance <= maxLinkDistance)
+            {
+                compatibleCount++;
+            }
+            else if (normalAgreement >= 0.82 &&
+                     planeGap > max(_VoxSize, _SupportSurfelRadius * 0.75))
+            {
+                stackedLayer = true;
+            }
+        }
+    }
+
+    float topologyClass = stackedLayer ? 3.0 :
+        compatibleCount >= 3u ? 2.0 :
+        compatibleCount >= 1u ? 1.0 : 0.0;
+    float4 normalAndClass = _SupportNormals[id.x];
+    normalAndClass.w = topologyClass;
+    _SupportNormals[id.x] = normalAndClass;
+}
+
+// A paper-topology cell is the cube between eight neighbouring support sample
+// nodes. Its twelve edge slots already contain the exact zero-crossing points
+// emitted above. Each cube face first joins its own contour crossings; the six
+// face decisions then form one or more closed rings inside the cell. Adjacent
+// cubes reuse both the edge-point indices and the shared-face decision, so the
+// visible paper is connected instead of being a pile of overlapping discs.
+// Normals only choose triangle winding. They never admit or reject geometry.
+// Failed contour graphs are split into locally coherent surface sheets. Each
+// sheet is cell-local; unrelated normals/depth layers are never bridged.
+static const int3 kTopologyEdgeNode[12] = {
+    int3(0,0,0), int3(0,1,0), int3(0,0,1), int3(0,1,1),
+    int3(0,0,0), int3(1,0,0), int3(0,0,1), int3(1,0,1),
+    int3(0,0,0), int3(1,0,0), int3(0,1,0), int3(1,1,0)
+};
+static const uint kTopologyEdgeAxis[12] = {
+    0u, 0u, 0u, 0u,
+    1u, 1u, 1u, 1u,
+    2u, 2u, 2u, 2u
+};
+
+uint ReadPackedEdgeParameter(uint4 packedGeometry, uint edge)
+{
+    uint lane = edge >> 2u;
+    uint shift = (edge & 3u) * 8u;
+    uint packed = lane == 0u ? packedGeometry.x :
+                  lane == 1u ? packedGeometry.y : packedGeometry.z;
+    return (packed >> shift) & 0xFFu;
+}
+
+void WritePackedEdgeParameter(inout uint4 packedGeometry, uint edge, uint value)
+{
+    uint lane = edge >> 2u;
+    uint shift = (edge & 3u) * 8u;
+    uint mask = 0xFFu << shift;
+    if (lane == 0u)
+        packedGeometry.x = (packedGeometry.x & ~mask) | ((value & 0xFFu) << shift);
+    else if (lane == 1u)
+        packedGeometry.y = (packedGeometry.y & ~mask) | ((value & 0xFFu) << shift);
+    else
+        packedGeometry.z = (packedGeometry.z & ~mask) | ((value & 0xFFu) << shift);
+}
+
+uint QuantizeEdgeParameter(int3 cell, uint edge, float3 worldPosition)
+{
+    float3 finePosition = worldPosition / _VoxSize - 0.5 +
+        (float3)_VoxCount * 0.5;
+    int3 edgeNode = cell + kTopologyEdgeNode[edge];
+    uint axis = kTopologyEdgeAxis[edge];
+    float start = axis == 0u ? (float)(edgeNode.x * _SupportStride) :
+                  axis == 1u ? (float)(edgeNode.y * _SupportStride) :
+                               (float)(edgeNode.z * _SupportStride);
+    float coordinate = axis == 0u ? finePosition.x :
+                       axis == 1u ? finePosition.y : finePosition.z;
+    float edgeT = saturate((coordinate - start) / (float)_SupportStride);
+    return (uint)round(edgeT * 255.0);
+}
+
+float3 DecodeEdgePosition(int3 cell, uint edge, uint quantizedT)
+{
+    int3 edgeNode = cell + kTopologyEdgeNode[edge];
+    float3 finePosition = (float3)(edgeNode * _SupportStride);
+    float edgeT = (float)quantizedT / 255.0;
+    uint axis = kTopologyEdgeAxis[edge];
+    if (axis == 0u) finePosition.x += edgeT * _SupportStride;
+    else if (axis == 1u) finePosition.y += edgeT * _SupportStride;
+    else finePosition.z += edgeT * _SupportStride;
+    return FineCoordToWorld(finePosition);
+}
+
+int AppendTopologyVertex(float3 position, float3 normal, float topologyClass)
+{
+    // Vulkan's definite-assignment pass does not infer that InterlockedAdd
+    // always writes its out value, so seed it explicitly.
+    uint vertexIndex = 0u;
+    InterlockedAdd(_SupportCounters[4], 1u, vertexIndex);
+    if (vertexIndex >= _SupportMaxTopologyVertices)
+    {
+        InterlockedAdd(_SupportCounters[5], 1u);
+        return -1;
+    }
+    float normalLengthSq = dot(normal, normal);
+    normal = normalLengthSq > 1e-8
+        ? normal * rsqrt(normalLengthSq) : float3(0.0, 1.0, 0.0);
+    _SupportTopologyPoints[vertexIndex] = float4(position, 1.0);
+    _SupportTopologyNormals[vertexIndex] = float4(normal, topologyClass);
+    return (int)vertexIndex;
+}
+
+void EmitTopologyTriangle(uint a, uint b, uint c, float3 referenceNormal)
+{
+    float3 pa = _SupportTopologyPoints[a].xyz;
+    float3 pb = _SupportTopologyPoints[b].xyz;
+    float3 pc = _SupportTopologyPoints[c].xyz;
+    float3 faceNormal = cross(pb - pa, pc - pa);
+    if (dot(faceNormal, faceNormal) < 1e-10)
+        return;
+
+    if (dot(faceNormal, referenceNormal) < 0.0)
+    {
+        uint swapIndex = b;
+        b = c;
+        c = swapIndex;
+    }
+
+    // Reservations are always exactly three indices and the C# capacity is a
+    // multiple of three. Therefore the first overflow reservation starts at
+    // the capacity boundary and cannot leave an unwritten gap in the draw span.
+    uint baseIndex;
+    InterlockedAdd(_SupportCounters[2], 3u, baseIndex);
+    if (baseIndex + 3u > _SupportMaxTopologyIndices)
+    {
+        InterlockedAdd(_SupportCounters[3], 1u);
+        return;
+    }
+    _SupportTopologyIndices[baseIndex] = a;
+    _SupportTopologyIndices[baseIndex + 1u] = b;
+    _SupportTopologyIndices[baseIndex + 2u] = c;
+}
+
+static const int3 kTopologyCornerNode[8] = {
+    int3(0,0,0), int3(1,0,0), int3(1,1,0), int3(0,1,0),
+    int3(0,0,1), int3(1,0,1), int3(1,1,1), int3(0,1,1)
+};
+
+// Each face lists its four boundary edges and four scalar corners in the same
+// cyclic order. Two crossings make one contour segment. Four crossings use an
+// asymptotic decider instead of deleting the whole cell or choosing a fixed
+// diagonal, which is the mature marching-squares treatment of saddle cases.
+static const uint4 kTopologyFaceEdges[6] = {
+    uint4(0,5,1,4),   // z0: 0-1-2-3
+    uint4(2,7,3,6),   // z1: 4-5-6-7
+    uint4(0,9,2,8),   // y0: 0-1-5-4
+    uint4(1,11,3,10), // y1: 3-2-6-7
+    uint4(4,10,6,8),  // x0: 0-3-7-4
+    uint4(5,11,7,9)   // x1: 1-2-6-5
+};
+static const uint4 kTopologyFaceCorners[6] = {
+    uint4(0,1,2,3),
+    uint4(4,5,6,7),
+    uint4(0,1,5,4),
+    uint4(3,2,6,7),
+    uint4(0,3,7,4),
+    uint4(1,2,6,5)
+};
+
+[numthreads(4, 4, 4)]
+void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_SupportTopologyCellCount))
+        return;
+
+    int3 cell = (int3)id;
+    int edgePointIndices[12];
+    int evidencePointIndices[12];
+    uint rawEdgeMask = 0u;
+    uint candidateEdgeMask = 0u;
+
+    [unroll]
+    for (uint gatherEdge = 0u; gatherEdge < 12u; gatherEdge++)
+    {
+        edgePointIndices[gatherEdge] = -1;
+        evidencePointIndices[gatherEdge] = -1;
+        int3 node = cell + kTopologyEdgeNode[gatherEdge];
+        uint mapIndex = (uint)(FlattenSampleCell(node) * 3) + kTopologyEdgeAxis[gatherEdge];
+        int pointIndex = _SupportCellPointMap[mapIndex];
+        if (pointIndex < 0 || pointIndex >= (int)_SupportMaxPoints)
+            continue;
+
+        edgePointIndices[gatherEdge] = pointIndex;
+        evidencePointIndices[gatherEdge] = pointIndex;
+        rawEdgeMask |= 1u << gatherEdge;
+        uint pointState = _SupportPointCells[pointIndex].y;
+        if (PaperConfirmationCount(pointState) >= kPaperOwnedConfirmations &&
+            PaperConflictCount(pointState) < kPaperReplaceConflicts)
+            candidateEdgeMask |= 1u << gatherEdge;
+    }
+
+    float2 cornerSamples[8];
+    bool allCornersObserved = true;
+    [unroll]
+    for (uint cornerIndex = 0u; cornerIndex < 8u; cornerIndex++)
+    {
+        int3 node = cell + kTopologyCornerNode[cornerIndex];
+        cornerSamples[cornerIndex] = _TsdfVolume[node * _SupportStride];
+        if (abs(cornerSamples[cornerIndex].y) < _SupportMinWeight)
+            allCornersObserved = false;
+    }
+
+    int topologyFlat = FlattenTopologyCell(cell);
+    uint2 publishedState = _SupportTopologyCellStates[topologyFlat];
+    uint publishedEdgeMask = publishedState.x & kTopologyEdgeMask;
+    uint publishedFaceChoices =
+        (publishedState.x >> kTopologyFaceShift) & 0x3Fu;
+    bool hasPublishedTopology =
+        (publishedState.x & kTopologyOwnedBit) != 0u;
+    bool publishedUsesClusterFallback =
+        (publishedState.x & kTopologyClusterFallbackBit) != 0u;
+    uint4 publishedGeometry = _SupportTopologyCellGeometry[topologyFlat];
+
+    // A replacement is eligible only when every selected face has 0, 2 or 4
+    // crossings. That guarantees a closed face-contour graph before the old
+    // topology is touched; 1/3-edge partial candidates wait in shadow.
+    bool candidateClosed = countbits(candidateEdgeMask) >= 3u;
+    [unroll]
+    for (uint candidateFaceIndex = 0u; candidateFaceIndex < 6u; candidateFaceIndex++)
+    {
+        uint4 faceEdges = kTopologyFaceEdges[candidateFaceIndex];
+        uint faceCount =
+            ((candidateEdgeMask >> faceEdges.x) & 1u) +
+            ((candidateEdgeMask >> faceEdges.y) & 1u) +
+            ((candidateEdgeMask >> faceEdges.z) & 1u) +
+            ((candidateEdgeMask >> faceEdges.w) & 1u);
+        if (faceCount == 1u || faceCount == 3u)
+            candidateClosed = false;
+    }
+
+    // Published geometry is a cell-local snapshot and no longer depends on the
+    // current shared point map.  Current points are consulted only as explicit
+    // revocation evidence.
+    bool publishedPointsAvailable = hasPublishedTopology;
+    bool publishedFullyContradicted = hasPublishedTopology &&
+        allCornersObserved &&
+        (publishedEdgeMask & rawEdgeMask) == publishedEdgeMask;
+    if (publishedFullyContradicted)
+    {
+        [unroll]
+        for (uint publishedEdge = 0u; publishedEdge < 12u; publishedEdge++)
+        {
+            if (((publishedEdgeMask >> publishedEdge) & 1u) == 0u)
+                continue;
+            uint pointState = _SupportPointCells[evidencePointIndices[publishedEdge]].y;
+            if (PaperConflictCount(pointState) < kPaperReplaceConflicts)
+                publishedFullyContradicted = false;
+        }
+    }
+
+    uint cellRevocationEvidence = publishedState.y;
+    if (hasPublishedTopology && !candidateClosed &&
+        publishedFullyContradicted)
+        cellRevocationEvidence = min(cellRevocationEvidence + 1u, 255u);
+    else
+        cellRevocationEvidence = 0u;
+
+    if (cellRevocationEvidence >= kPaperReplaceConflicts)
+    {
+        _SupportTopologyCellStates[topologyFlat] = uint2(0u, 0u);
+        hasPublishedTopology = false;
+        publishedPointsAvailable = false;
+    }
+
+    // A never-published cell may use a guarded multi-sheet fallback even when
+    // face parity is incomplete.  This fills complex desk/edge cells only when
+    // their points can be separated into coherent surface sheets.
+    bool candidateFallbackEligible = countbits(candidateEdgeMask) >= 3u;
+    bool committingCandidate = candidateClosed ||
+        (!hasPublishedTopology && candidateFallbackEligible);
+    bool forceClusterFallback =
+        (committingCandidate && !candidateClosed) ||
+        (!committingCandidate && publishedUsesClusterFallback);
+    uint selectedEdgeMask = committingCandidate
+        ? candidateEdgeMask
+        : publishedPointsAvailable ? publishedEdgeMask : 0u;
+    uint crossingCount = countbits(selectedEdgeMask);
+    if (crossingCount < 3u)
+    {
+        if (hasPublishedTopology)
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                publishedState.x, cellRevocationEvidence);
+        return;
+    }
+
+    // Ignore stale/replacement edges that do not belong to the topology chosen
+    // for this dispatch. Published topology and a complete candidate can coexist
+    // in the point map, but only one is ever emitted.
+    [unroll]
+    for (uint selectedEdge = 0u; selectedEdge < 12u; selectedEdge++)
+    {
+        if (((selectedEdgeMask >> selectedEdge) & 1u) == 0u)
+            edgePointIndices[selectedEdge] = -1;
+    }
+
+    // Materialize cell-local topology vertices from one coherent geometry
+    // version. A candidate uses this frame's mature support points and prepares
+    // a packed snapshot; an old publication uses only its packed snapshot, so
+    // later shared-edge depth jumps cannot pull an old triangle into a flap.
+    uint4 candidateGeometry = uint4(0u, 0u, 0u, 0u);
+    bool topologyVertexOverflow = false;
+    [unroll]
+    for (uint materializeEdge = 0u; materializeEdge < 12u; materializeEdge++)
+    {
+        if (edgePointIndices[materializeEdge] < 0)
+            continue;
+
+        float3 topologyPosition;
+        float3 topologyNormal;
+        float topologyClass;
+        if (committingCandidate)
+        {
+            int sourcePointIndex = evidencePointIndices[materializeEdge];
+            topologyPosition = _SupportPoints[sourcePointIndex].xyz;
+            topologyNormal = _SupportNormals[sourcePointIndex].xyz;
+            topologyClass = _SupportNormals[sourcePointIndex].w;
+            WritePackedEdgeParameter(candidateGeometry, materializeEdge,
+                QuantizeEdgeParameter(cell, materializeEdge, topologyPosition));
+        }
+        else
+        {
+            uint quantizedT = ReadPackedEdgeParameter(
+                publishedGeometry, materializeEdge);
+            topologyPosition = DecodeEdgePosition(
+                cell, materializeEdge, quantizedT);
+            float3 finePosition = topologyPosition / _VoxSize - 0.5 +
+                (float3)_VoxCount * 0.5;
+            int3 axisStep = kTopologyEdgeAxis[materializeEdge] == 0u
+                ? int3(_SupportStride, 0, 0)
+                : kTopologyEdgeAxis[materializeEdge] == 1u
+                    ? int3(0, _SupportStride, 0)
+                    : int3(0, 0, _SupportStride);
+            topologyNormal = EstimateNormal(finePosition, axisStep);
+            topologyClass = 2.0;
+        }
+
+        int topologyPointIndex = AppendTopologyVertex(
+            topologyPosition, topologyNormal, topologyClass);
+        edgePointIndices[materializeEdge] = topologyPointIndex;
+        if (topologyPointIndex < 0)
+            topologyVertexOverflow = true;
+    }
+    if (topologyVertexOverflow)
+        return;
+
+    uint resolvedFaceChoices = committingCandidate ? 0u : publishedFaceChoices;
+
+    int2 adjacency[12];
+    [unroll]
+    for (uint adjacencyEdge = 0u; adjacencyEdge < 12u; adjacencyEdge++)
+        adjacency[adjacencyEdge] = int2(-1, -1);
+    bool graphInvalid = forceClusterFallback;
+
+    #define ADD_TOPOLOGY_CONNECTION(EDGE_A, EDGE_B) \
+    { \
+        int _edgeA = (int)(EDGE_A); \
+        int _edgeB = (int)(EDGE_B); \
+        if (_edgeA != _edgeB) \
+        { \
+            if (adjacency[_edgeA].x < 0) adjacency[_edgeA].x = _edgeB; \
+            else if (adjacency[_edgeA].x != _edgeB && adjacency[_edgeA].y < 0) adjacency[_edgeA].y = _edgeB; \
+            else if (adjacency[_edgeA].x != _edgeB && adjacency[_edgeA].y != _edgeB) graphInvalid = true; \
+            if (adjacency[_edgeB].x < 0) adjacency[_edgeB].x = _edgeA; \
+            else if (adjacency[_edgeB].x != _edgeA && adjacency[_edgeB].y < 0) adjacency[_edgeB].y = _edgeA; \
+            else if (adjacency[_edgeB].x != _edgeA && adjacency[_edgeB].y != _edgeA) graphInvalid = true; \
+        } \
+    }
+
+    [unroll]
+    for (uint topologyFaceIndex = 0u; topologyFaceIndex < 6u; topologyFaceIndex++)
+    {
+        uint4 faceEdges = kTopologyFaceEdges[topologyFaceIndex];
+        uint activeEdges[4];
+        uint activeCount = 0u;
+        [unroll]
+        for (uint slot = 0u; slot < 4u; slot++)
+        {
+            uint faceEdge = faceEdges[slot];
+            if (edgePointIndices[faceEdge] >= 0)
+            {
+                activeEdges[activeCount] = faceEdge;
+                activeCount++;
+            }
+        }
+
+        if (activeCount == 2u)
+        {
+            ADD_TOPOLOGY_CONNECTION(activeEdges[0], activeEdges[1]);
+        }
+        else if (activeCount == 3u)
+        {
+            // A retained crossing can briefly coexist with two current ones.
+            // Missing/conflict evidence, not confirmation age, decides which
+            // edge is stale. Stable owned edges therefore are not punished just
+            // for being old.
+            uint stalestSlot = 0u;
+            uint stalestRank = 0u;
+            uint secondRank = 0u;
+            [unroll]
+            for (uint slot = 0u; slot < 3u; slot++)
+            {
+                uint rankedEdge = activeEdges[slot];
+                uint state = _SupportPointCells[evidencePointIndices[rankedEdge]].y;
+                uint staleRank = PaperConflictCount(state) * 256u +
+                                 PaperMissingCount(state);
+                if (staleRank > stalestRank)
+                {
+                    secondRank = stalestRank;
+                    stalestRank = staleRank;
+                    stalestSlot = slot;
+                }
+                else if (staleRank > secondRank)
+                {
+                    secondRank = staleRank;
+                }
+            }
+            if (stalestRank > secondRank)
+            {
+                uint keptA = activeEdges[(stalestSlot + 1u) % 3u];
+                uint keptB = activeEdges[(stalestSlot + 2u) % 3u];
+                ADD_TOPOLOGY_CONNECTION(keptA, keptB);
+            }
+        }
+        else if (activeCount == 4u)
+        {
+            uint4 faceCorners = kTopologyFaceCorners[topologyFaceIndex];
+            float s0 = cornerSamples[faceCorners.x].x;
+            float s1 = cornerSamples[faceCorners.y].x;
+            float s2 = cornerSamples[faceCorners.z].x;
+            float s3 = cornerSamples[faceCorners.w].x;
+            float faceDecision = s0 * s2 - s1 * s3;
+            bool diagonal02Dominates;
+
+            if (!committingCandidate)
+            {
+                // Re-emitting an owned cell must reproduce the exact published
+                // face pairing.  Re-running the scalar decider here made a
+                // saddle face toggle while its edge mask was otherwise stable.
+                diagonal02Dominates =
+                    ((publishedFaceChoices >> topologyFaceIndex) & 1u) != 0u;
+            }
+            else
+            {
+                bool dataChoice = faceDecision > 0.0;
+                diagonal02Dominates = dataChoice;
+
+                uint publishedFaceEdgeCount =
+                    ((publishedEdgeMask >> faceEdges.x) & 1u) +
+                    ((publishedEdgeMask >> faceEdges.y) & 1u) +
+                    ((publishedEdgeMask >> faceEdges.z) & 1u) +
+                    ((publishedEdgeMask >> faceEdges.w) & 1u);
+                bool publishedFaceWasAmbiguous =
+                    hasPublishedTopology && publishedFaceEdgeCount == 4u;
+
+                // A replacement inherits the old saddle decision inside a
+                // relative dead band.  It may flip only when the new scalar
+                // field supplies a clear decision, rather than because the
+                // determinant crossed zero by one noisy sample.
+                float decisionScale =
+                    abs(s0 * s2) + abs(s1 * s3) + 1e-6;
+                if (publishedFaceWasAmbiguous)
+                {
+                    bool publishedChoice =
+                        ((publishedFaceChoices >> topologyFaceIndex) & 1u) != 0u;
+                    if (dataChoice != publishedChoice &&
+                        abs(faceDecision) < decisionScale * 0.20)
+                        diagonal02Dominates = publishedChoice;
+                }
+                else if (abs(faceDecision) < decisionScale * 0.20)
+                {
+                    // There is no previous decision to inherit.  Resolve only
+                    // this first publication geometrically and then persist it.
+                    float3 p0 = _SupportTopologyPoints[edgePointIndices[faceEdges.x]].xyz;
+                    float3 p1 = _SupportTopologyPoints[edgePointIndices[faceEdges.y]].xyz;
+                    float3 p2 = _SupportTopologyPoints[edgePointIndices[faceEdges.z]].xyz;
+                    float3 p3 = _SupportTopologyPoints[edgePointIndices[faceEdges.w]].xyz;
+                    float pairingA = length(p0 - p1) + length(p2 - p3);
+                    float pairingB = length(p3 - p0) + length(p1 - p2);
+                    diagonal02Dominates = pairingA <= pairingB;
+                }
+            }
+
+            if (diagonal02Dominates)
+                resolvedFaceChoices |= 1u << topologyFaceIndex;
+            else
+                resolvedFaceChoices &= ~(1u << topologyFaceIndex);
+
+            if (diagonal02Dominates)
+            {
+                ADD_TOPOLOGY_CONNECTION(faceEdges.x, faceEdges.y);
+                ADD_TOPOLOGY_CONNECTION(faceEdges.z, faceEdges.w);
+            }
+            else
+            {
+                ADD_TOPOLOGY_CONNECTION(faceEdges.w, faceEdges.x);
+                ADD_TOPOLOGY_CONNECTION(faceEdges.y, faceEdges.z);
+            }
+        }
+    }
+    #undef ADD_TOPOLOGY_CONNECTION
+
+    uint visitedMask = 0u;
+    bool emittedAny = false;
+    [loop]
+    for (uint startEdge = 0u; startEdge < 12u; startEdge++)
+    {
+        if (graphInvalid)
+            break;
+        if (edgePointIndices[startEdge] < 0 ||
+            adjacency[startEdge].x < 0 || adjacency[startEdge].y < 0 ||
+            ((visitedMask >> startEdge) & 1u) != 0u)
+            continue;
+
+        uint ringEdges[12];
+        uint ringCount = 0u;
+        int previousEdge = -1;
+        int currentEdge = (int)startEdge;
+        bool closedRing = false;
+
+        [loop]
+        for (uint stepIndex = 0u; stepIndex < 12u; stepIndex++)
+        {
+            if (currentEdge < 0)
+                break;
+            if (currentEdge == (int)startEdge && ringCount > 0u)
+            {
+                closedRing = true;
+                break;
+            }
+            if (((visitedMask >> (uint)currentEdge) & 1u) != 0u)
+                break;
+
+            ringEdges[ringCount] = (uint)currentEdge;
+            ringCount++;
+            visitedMask |= 1u << (uint)currentEdge;
+            int2 links = adjacency[currentEdge];
+            int nextEdge = links.x != previousEdge ? links.x : links.y;
+            previousEdge = currentEdge;
+            currentEdge = nextEdge;
+        }
+        if (!closedRing && currentEdge == (int)startEdge && ringCount >= 3u)
+            closedRing = true;
+        if (!closedRing || ringCount < 3u)
+            continue;
+
+        float3 referenceNormal = 0.0;
+        [loop]
+        for (uint ringIndex = 0u; ringIndex < ringCount; ringIndex++)
+        {
+            uint pointIndex = (uint)edgePointIndices[ringEdges[ringIndex]];
+            referenceNormal += normalize(_SupportTopologyNormals[pointIndex].xyz);
+        }
+        float referenceLengthSq = dot(referenceNormal, referenceNormal);
+        if (referenceLengthSq < 1e-8)
+        {
+            float3 pa = _SupportTopologyPoints[edgePointIndices[ringEdges[0]]].xyz;
+            float3 pb = _SupportTopologyPoints[edgePointIndices[ringEdges[1]]].xyz;
+            float3 pc = _SupportTopologyPoints[edgePointIndices[ringEdges[2]]].xyz;
+            referenceNormal = cross(pb - pa, pc - pa);
+            referenceLengthSq = dot(referenceNormal, referenceNormal);
+        }
+        if (referenceLengthSq < 1e-10)
+            continue;
+        referenceNormal *= rsqrt(referenceLengthSq);
+
+        uint anchorPoint = (uint)edgePointIndices[ringEdges[0]];
+        [loop]
+        for (uint fanStep = 1u; fanStep + 1u < ringCount; fanStep++)
+        {
+            uint pointB = (uint)edgePointIndices[ringEdges[fanStep]];
+            uint pointC = (uint)edgePointIndices[ringEdges[fanStep + 1u]];
+            EmitTopologyTriangle(anchorPoint, pointB, pointC, referenceNormal);
+            emittedAny = true;
+        }
+    }
+
+    if (emittedAny)
+    {
+        if (committingCandidate)
+        {
+            uint committedState =
+                (selectedEdgeMask & kTopologyEdgeMask) |
+                ((resolvedFaceChoices & 0x3Fu) << kTopologyFaceShift) |
+                kTopologyOwnedBit;
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                committedState, 0u);
+            _SupportTopologyCellGeometry[topologyFlat] = candidateGeometry;
+        }
+        else
+        {
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                publishedState.x, cellRevocationEvidence);
+        }
+        return;
+    }
+
+    // The old fallback forced every 3..6 point failure into one angular fan.
+    // At a desk side that joined wall, tabletop and vertical side into a flap.
+    // Instead, separate up to three locally coherent sheets by normal and
+    // plane distance, then triangulate each sheet independently.  A group with
+    // fewer than three points remains an honest hole rather than a guessed
+    // bridge. Published fallback cells replay their stored labels verbatim.
+    uint edgeClusterLabels = committingCandidate ? 0u : publishedGeometry.w;
+    float3 clusterSeedPositions[3];
+    float3 clusterSeedNormals[3];
+    // Spell out all slots: the Vulkan compiler's definite-assignment analysis
+    // does not accept a dynamically indexed array as initialized by a loop,
+    // even when that loop is explicitly unrolled.
+    clusterSeedPositions[0] = 0.0;
+    clusterSeedPositions[1] = 0.0;
+    clusterSeedPositions[2] = 0.0;
+    clusterSeedNormals[0] = float3(0.0, 1.0, 0.0);
+    clusterSeedNormals[1] = float3(0.0, 1.0, 0.0);
+    clusterSeedNormals[2] = float3(0.0, 1.0, 0.0);
+    uint clusterCount = 0u;
+    float planeTolerance = max(_VoxSize * 0.55,
+        _VoxSize * (float)_SupportStride * 0.18);
+
+    if (committingCandidate)
+    {
+        [unroll]
+        for (uint clusterEdge = 0u; clusterEdge < 12u; clusterEdge++)
+        {
+            if (edgePointIndices[clusterEdge] < 0)
+                continue;
+            uint topologyPoint = (uint)edgePointIndices[clusterEdge];
+            float3 pointPosition = _SupportTopologyPoints[topologyPoint].xyz;
+            float3 pointNormal = normalize(_SupportTopologyNormals[topologyPoint].xyz);
+            int selectedCluster = -1;
+            [unroll]
+            for (uint testCluster = 0u; testCluster < 3u; testCluster++)
+            {
+                if (testCluster >= clusterCount)
+                    continue;
+                float3 seedNormal = clusterSeedNormals[testCluster];
+                float normalAgreement = abs(dot(pointNormal, seedNormal));
+                float3 delta = pointPosition - clusterSeedPositions[testCluster];
+                float planeGap = max(abs(dot(delta, pointNormal)),
+                    abs(dot(delta, seedNormal)));
+                if (normalAgreement >= 0.78 && planeGap <= planeTolerance)
+                {
+                    selectedCluster = (int)testCluster;
+                    break;
+                }
+            }
+            if (selectedCluster < 0 && clusterCount < 3u)
+            {
+                selectedCluster = (int)clusterCount;
+                clusterSeedPositions[clusterCount] = pointPosition;
+                clusterSeedNormals[clusterCount] = pointNormal;
+                clusterCount++;
+            }
+            if (selectedCluster >= 0)
+            {
+                uint clusterIndex = (uint)selectedCluster;
+                uint shift = clusterEdge * 2u;
+                edgeClusterLabels |= (clusterIndex + 1u) << shift;
+            }
+        }
+        candidateGeometry.w = edgeClusterLabels;
+    }
+
+    [loop]
+    for (uint emitCluster = 1u; emitCluster <= 3u; emitCluster++)
+    {
+        uint sheetEdges[12];
+        uint sheetCount = 0u;
+        float3 sheetCenter = 0.0;
+        float3 sheetNormal = 0.0;
+        float3 firstNormal = 0.0;
+        [unroll]
+        for (uint sheetEdge = 0u; sheetEdge < 12u; sheetEdge++)
+        {
+            if (edgePointIndices[sheetEdge] < 0)
+                continue;
+            uint label = (edgeClusterLabels >> (sheetEdge * 2u)) & 3u;
+            if (label != emitCluster)
+                continue;
+            uint topologyPoint = (uint)edgePointIndices[sheetEdge];
+            float3 pointNormal = normalize(_SupportTopologyNormals[topologyPoint].xyz);
+            if (sheetCount == 0u)
+                firstNormal = pointNormal;
+            if (dot(pointNormal, firstNormal) < 0.0)
+                pointNormal = -pointNormal;
+            sheetEdges[sheetCount] = sheetEdge;
+            sheetCenter += _SupportTopologyPoints[topologyPoint].xyz;
+            sheetNormal += pointNormal;
+            sheetCount++;
+        }
+        if (sheetCount < 3u)
+            continue;
+
+        sheetCenter /= (float)sheetCount;
+        float normalLengthSq = dot(sheetNormal, sheetNormal);
+        if (normalLengthSq < 1e-8)
+        {
+            float3 pa = _SupportTopologyPoints[edgePointIndices[sheetEdges[0]]].xyz;
+            float3 pb = _SupportTopologyPoints[edgePointIndices[sheetEdges[1]]].xyz;
+            float3 pc = _SupportTopologyPoints[edgePointIndices[sheetEdges[2]]].xyz;
+            sheetNormal = cross(pb - pa, pc - pa);
+            normalLengthSq = dot(sheetNormal, sheetNormal);
+        }
+        if (normalLengthSq < 1e-10)
+            continue;
+        sheetNormal *= rsqrt(normalLengthSq);
+
+        bool coherentSheet = true;
+        if (committingCandidate)
+        {
+            [loop]
+            for (uint validateSlot = 0u; validateSlot < sheetCount; validateSlot++)
+            {
+                uint topologyPoint =
+                    (uint)edgePointIndices[sheetEdges[validateSlot]];
+                float3 pointPosition = _SupportTopologyPoints[topologyPoint].xyz;
+                float3 pointNormal = normalize(_SupportTopologyNormals[topologyPoint].xyz);
+                if (abs(dot(pointNormal, sheetNormal)) < 0.78 ||
+                    abs(dot(pointPosition - sheetCenter, sheetNormal)) > planeTolerance)
+                    coherentSheet = false;
+            }
+        }
+        if (!coherentSheet)
+            continue;
+
+        float3 referenceAxis = abs(sheetNormal.y) < 0.9
+            ? float3(0.0, 1.0, 0.0)
+            : float3(1.0, 0.0, 0.0);
+        float3 sheetTangent = normalize(cross(referenceAxis, sheetNormal));
+        float3 sheetBitangent = cross(sheetNormal, sheetTangent);
+        float sheetAngles[12];
+        [loop]
+        for (uint pointSlot = 0u; pointSlot < sheetCount; pointSlot++)
+        {
+            float3 pointPosition = _SupportTopologyPoints[
+                edgePointIndices[sheetEdges[pointSlot]]].xyz;
+            float3 relativePosition = pointPosition - sheetCenter;
+            sheetAngles[pointSlot] = atan2(
+                dot(relativePosition, sheetBitangent),
+                dot(relativePosition, sheetTangent));
+        }
+        [loop]
+        for (uint sortStart = 0u; sortStart + 1u < sheetCount; sortStart++)
+        {
+            uint smallestSlot = sortStart;
+            [loop]
+            for (uint candidateSlot = sortStart + 1u;
+                 candidateSlot < sheetCount; candidateSlot++)
+            {
+                if (sheetAngles[candidateSlot] < sheetAngles[smallestSlot])
+                    smallestSlot = candidateSlot;
+            }
+            if (smallestSlot != sortStart)
+            {
+                float swapAngle = sheetAngles[sortStart];
+                sheetAngles[sortStart] = sheetAngles[smallestSlot];
+                sheetAngles[smallestSlot] = swapAngle;
+                uint swapEdge = sheetEdges[sortStart];
+                sheetEdges[sortStart] = sheetEdges[smallestSlot];
+                sheetEdges[smallestSlot] = swapEdge;
+            }
+        }
+
+        uint sheetAnchor = (uint)edgePointIndices[sheetEdges[0]];
+        [loop]
+        for (uint fanStep = 1u; fanStep + 1u < sheetCount; fanStep++)
+        {
+            uint pointB = (uint)edgePointIndices[sheetEdges[fanStep]];
+            uint pointC = (uint)edgePointIndices[sheetEdges[fanStep + 1u]];
+            EmitTopologyTriangle(sheetAnchor, pointB, pointC, sheetNormal);
+            emittedAny = true;
+        }
+    }
+
+    if (emittedAny)
+    {
+        if (committingCandidate)
+        {
+            uint committedState =
+                (selectedEdgeMask & kTopologyEdgeMask) |
+                ((resolvedFaceChoices & 0x3Fu) << kTopologyFaceShift) |
+                kTopologyOwnedBit | kTopologyClusterFallbackBit;
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                committedState, 0u);
+            _SupportTopologyCellGeometry[topologyFlat] = candidateGeometry;
+        }
+        else
+        {
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                publishedState.x, cellRevocationEvidence);
+        }
+    }
+    else if (!committingCandidate && hasPublishedTopology)
+    {
+        _SupportTopologyCellStates[topologyFlat] = uint2(
+            publishedState.x, cellRevocationEvidence);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void SupportBuildArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint pointCount = min(_SupportCounters[0], _SupportMaxPoints);
+    _SupportDrawArgs[0] = pointCount * 6u;
+    _SupportDrawArgs[1] = 1u;
+    _SupportDrawArgs[2] = 0u;
+    _SupportDrawArgs[3] = 0u;
+    _SupportDrawArgs[4] = 0u;
+
+    _SupportTopologyDrawArgs[0] = min(_SupportCounters[2], _SupportMaxTopologyIndices);
+    _SupportTopologyDrawArgs[1] = 1u;
+    _SupportTopologyDrawArgs[2] = 0u;
+    _SupportTopologyDrawArgs[3] = 0u;
+    _SupportTopologyDrawArgs[4] = 0u;
+}

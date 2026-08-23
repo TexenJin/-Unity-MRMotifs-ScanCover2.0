@@ -271,7 +271,11 @@ namespace Genesis.RoomScan
         // 08-18 实机视频定案：实时轨落点写死 1.5m，站 2.5m 外看墙时落点飘在半空，
         // slab 七块全是空块 → "空块不排" → 正眼盯着的墙永远不长网。改为每次巡视
         // 从深度图中心 8×8（左眼片）取中位数距离，落点钉在实际表面略后方。
+        private bool _centerDepthRequested;
         private bool _centerDepthPending;
+        private ComputeKernelHelper _centerDepthKernel;
+        private ComputeBuffer _centerDepthSamplesBuffer;
+        private static readonly int CenterDepthSamplesID = Shader.PropertyToID("gsCenterDepthSamples");
 
         /// <summary>最近一次中心深度中位数（米，左眼线性化）；&lt;0 = 尚无有效样本。</summary>
         public float LastCenterDepthMeters { get; private set; } = -1f;
@@ -280,15 +284,29 @@ namespace Genesis.RoomScan
         public int DepthWidth => _depthTex != null ? _depthTex.width : 0;
         public int DepthHeight => _depthTex != null ? _depthTex.height : 0;
 
-        /// <summary>发起一次中心 8×8 深度采样（异步回读，结果落 LastCenterDepthMeters）。</summary>
+        /// <summary>
+        /// 请求下一张被融合消费的预处理深度帧做中心 8×8 采样。
+        /// 请求只记账；真正的 GPU 拷贝在 PreprocessLatestFrame 末尾执行，避免直接
+        /// 回读 Meta GraphicsFormat.None 的平台外部纹理。
+        /// </summary>
         public void RequestCenterDepthSample()
         {
-            if (_centerDepthPending || _depthTex == null || !DepthAvailable) return;
-            int w = _depthTex.width, h = _depthTex.height;
-            if (w < 16 || h < 16) return;
+            if (!DepthAvailable) return;
+            _centerDepthRequested = true;
+        }
+
+        private void DispatchCenterDepthSample()
+        {
+            if (!_centerDepthRequested || _centerDepthPending || _depthTex == null) return;
+            if (_depthTex.width < 16 || _depthTex.height < 16) return;
+            _centerDepthRequested = false;
+            _centerDepthSamplesBuffer ??= new ComputeBuffer(64, sizeof(float));
+            _centerDepthKernel.Set(DepthTexID, _depthTex);
+            _centerDepthKernel.Set(CenterDepthSamplesID, _centerDepthSamplesBuffer);
+            _centerDepthKernel.Shader.SetInts(TexSizeID, _depthTex.width, _depthTex.height);
+            _centerDepthKernel.DispatchFit(8, 8, 1);
             _centerDepthPending = true;
-            AsyncGPUReadback.Request(_depthTex, 0, w / 2 - 4, h / 2 - 4, 8, 8, 0, 1,
-                TextureFormat.RFloat, OnCenterDepthReadback);
+            AsyncGPUReadback.Request(_centerDepthSamplesBuffer, OnCenterDepthReadback);
         }
 
         private void OnCenterDepthReadback(AsyncGPUReadbackRequest request)
@@ -427,11 +445,47 @@ namespace Genesis.RoomScan
         private bool _dilationDirty;
         private int _frameCount;
         private float _lastLogTime;
+        private PairedDepthFrameRecorder _pairedFrameRecorder;
 
         private const string ScenePermission = "com.oculus.permission.USE_SCENE";
 
         /// <summary>Raised after each depth frame is processed (filtering, normals computed, globals set).</summary>
         public event Action Updated;
+        /// <summary>
+        /// 当前深度、配套位姿矩阵与世界法线已完成同帧预处理。
+        /// 只读诊断应从这里取样，避免新位姿配旧纹理制造假错层。
+        /// </summary>
+        public event Action Preprocessed;
+
+        /// <summary>平台前处理/本工程后处理双路逐帧采集是否正在接收新帧。</summary>
+        public bool PairedFrameCaptureActive => _pairedFrameRecorder != null && _pairedFrameRecorder.IsCapturing;
+        /// <summary>双路采集当前会话目录；设备端位于 ScanCoverDiagnostics/depth_pair_capture 下。</summary>
+        public string PairedFrameCaptureDirectory => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.SessionDirectory
+            : string.Empty;
+        /// <summary>尚在 GPU 回读或后台写盘的帧对数量。</summary>
+        public int PairedFrameCapturePending => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.OutstandingPairCount
+            : 0;
+        /// <summary>因回读/写盘队列满而明确丢弃的帧对数量。</summary>
+        public int PairedFrameCaptureDropped => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.DroppedPairCount
+            : 0;
+
+        public bool TogglePairedFrameCapture()
+        {
+            if (_pairedFrameRecorder == null)
+                _pairedFrameRecorder = GetComponent<PairedDepthFrameRecorder>() ??
+                                       gameObject.AddComponent<PairedDepthFrameRecorder>();
+
+            if (_pairedFrameRecorder.IsCapturing)
+            {
+                _pairedFrameRecorder.StopCapture();
+                return false;
+            }
+
+            return _pairedFrameRecorder.StartCapture();
+        }
 
         /// <summary>
         /// Provide an RGB texture as edge guide for bilateral depth filtering.
@@ -456,6 +510,8 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            _pairedFrameRecorder = GetComponent<PairedDepthFrameRecorder>() ??
+                                   gameObject.AddComponent<PairedDepthFrameRecorder>();
         }
 
         private void Start()
@@ -480,6 +536,7 @@ namespace Genesis.RoomScan
             CacheTrackingSpaceTransform();
 
             _normKernel = new ComputeKernelHelper(depthNormalCompute, "DepthNorm");
+            _centerDepthKernel = new ComputeKernelHelper(depthNormalCompute, "CenterDepthSample");
             _monoConvertKernel = new ComputeKernelHelper(depthNormalCompute, "MonoRawDepthToStereo");
             _initDilateKernel = new ComputeKernelHelper(depthDilationCompute, "InitDepthDilation");
             _dilateStepKernel = new ComputeKernelHelper(depthDilationCompute, "DilateDepthStep");
@@ -751,6 +808,10 @@ namespace Genesis.RoomScan
             LastTemporalStablePixels = 0;
             LastTemporalChangedPixels = 0;
             _hasTemporalHistory = false;
+            _centerDepthSamplesBuffer?.Release();
+            _centerDepthSamplesBuffer = null;
+            _centerDepthRequested = false;
+            _centerDepthPending = false;
             _dilatedDepth = null;
             Logger.Info("DepthCapture: GPU resources released");
         }
@@ -781,6 +842,35 @@ namespace Genesis.RoomScan
 
             if (!DepthAvailable) return;
 
+            // 外部 swapchain 纹理只保证当前帧有效。诊断采集必须在回调内立刻复制，
+            // 不能只保存 Texture 引用等到融合节拍再读，否则拿到的可能已经是下一拍。
+            if (_pairedFrameRecorder != null && _pairedFrameRecorder.IsCapturing)
+            {
+                bool hasTimestamp = args.TryGetTimestamp(out long timestampNs);
+                ReadOnlyList<XRFov> captureFovs = default;
+                ReadOnlyList<Pose> capturePoses = default;
+                bool hasFrameGeometry = args.TryGetFovs(out captureFovs) &&
+                                        args.TryGetPoses(out capturePoses) &&
+                                        captureFovs.Count >= 2 && capturePoses.Count >= 2;
+                if (hasFrameGeometry)
+                {
+                    _pairedFrameRecorder.StagePlatformFrame(
+                        _depthTex,
+                        _frameCount,
+                        hasTimestamp,
+                        timestampNs,
+                        capturePoses[0],
+                        capturePoses[1],
+                        captureFovs[0],
+                        captureFovs[1],
+                        _planes,
+                        _proj,
+                        _projInv,
+                        _view,
+                        _viewInv);
+                }
+            }
+
             // JIT 化（08-18 实机：预处理链 30Hz 全速跑吃掉 24→72 帧的差价）：
             // 深度帧到达只记账不加工；双边/缘洗/法线挪到 PreprocessLatestFrame
             // 由 scanner 在每次融合前调用——加工节拍=融合节拍（20Hz），
@@ -801,11 +891,10 @@ namespace Genesis.RoomScan
             if (!_preprocessDirty || !DepthAvailable) return;
             _preprocessDirty = false;
 
-            // 逐眼交替（08-18 帧率手术第三刀）：每次只洗一只眼，左右轮换。
-            // 每眼有效清洗率=融合频率/2（10Hz@20Hz 融合），陈旧度仅一拍（50ms）；
-            // 快转时运动闸本就拦融合，静态/慢动场景 50ms 陈旧无感。开销直接腰斩。
-            // 注意：HUD"缘:"统计随之减半（每次只数一只眼），属预期。
-            _preprocessEye = 1 - _preprocessEye;
+            // VolumeIntegration.compute 的融合采样固定读取 texture-array slice 0。
+            // 因此每次只清洗融合真正消费的第 0 眼：保持单眼 GPU 成本不变，
+            // 避免“第 1 眼刚更新、陈旧第 0 眼却配当前位姿进入 TSDF”的错层融合。
+            _preprocessEye = 0;
 
             ApplyHandMask(); // 手部打码必须在时序/双边之前：滤波邻域会把弃权值洇回有效像素
             ApplyTemporalFilter(); // 数据层第一刀：深度先跨帧稳定再进空间滤波/TSDF
@@ -814,6 +903,9 @@ namespace Genesis.RoomScan
             SetGlobalShaderProperties();
             ComputeNormals();
             _dilationDirty = true;
+            _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
+            DispatchCenterDepthSample();
+            Preprocessed?.Invoke();
         }
 
         /// <summary>

@@ -1,0 +1,428 @@
+// 枪胶路线第一版 GPU 影子层。
+// 同吃生产预处理深度/法线/姿态，只维护稀疏 K<=3 局部候选与只读统计；
+// 绝不写 TSDF、冻结票箱、脏页或显示缓冲。
+
+#pragma kernel ClearCells
+#pragma kernel ClearStats
+#pragma kernel BuildObservations
+#pragma kernel BuildCorrespondences
+#pragma kernel UpdateCandidates
+#pragma kernel CountCensus
+
+struct Observation
+{
+    float4 positionSigma; // xyz=世界点，w=观测 sigma（0=无效）
+    float4 normalQuality; // xyz=世界法线，w=质量
+};
+
+struct Correspondence
+{
+    float4 sourceValid; // xyz=观测点，w=1 有效
+    float4 targetSigma; // xyz=候选中心，w=合并 sigma
+    float4 normalAngle; // xyz=候选法线，w=法线夹角
+};
+
+Texture2DArray<float>  _DepthTex;
+Texture2DArray<float4> _NormalTex;
+float4x4 _DepthProjInv[2];
+float4x4 _DepthViewInv[2];
+float4x4 _Correction;
+int2 _DepthSize;
+int2 _ObservationGrid;
+int _PixelStride;
+int _ObservationCount;
+int _TableCapacity;
+int _TableMask;
+int _ProbeCount;
+int _CandidateCapacity;
+int _FrameIndex;
+float _CellSize;
+float _MotionQuality;
+float _MaxDepth;
+
+RWStructuredBuffer<Observation> _Observations;
+RWStructuredBuffer<Correspondence> _Correspondences;
+RWStructuredBuffer<int4> _CellKeys;
+RWStructuredBuffer<uint> _CellState; // 0 空，1 初始化中，2 就绪
+RWStructuredBuffer<uint> _CellLock;
+RWStructuredBuffer<float4> _CandidateCenterSigma;
+RWStructuredBuffer<float4> _CandidateNormalSupport;
+RWStructuredBuffer<float4> _CandidateFirstViewAngle;
+RWStructuredBuffer<uint4> _CandidateMeta; // x=观测数 y=0胚/1稳 z=末帧 w=保留
+RWStructuredBuffer<uint> _Stats;
+
+static const float SIGMA_FLOOR = 0.004;
+static const float SIGMA_CEILING = 0.030;
+static const float SPAWN_Z = 3.0;
+static const float STABLE_SUPPORT = 4.0;
+static const float STABLE_SIGMA = 0.020;
+static const float STABLE_VIEW_DEG = 3.0;
+
+uint HashCell(int3 key)
+{
+    uint3 value = asuint(key);
+    uint hash = value.x * 73856093u;
+    hash ^= value.y * 19349663u;
+    hash ^= value.z * 83492791u;
+    hash ^= hash >> 16;
+    return hash & (uint)_TableMask;
+}
+
+bool SameKey(int4 stored, int3 key)
+{
+    return all(stored.xyz == key);
+}
+
+int FindCell(int3 key)
+{
+    uint start = HashCell(key);
+    [loop]
+    for (int probe = 0; probe < _ProbeCount; probe++)
+    {
+        uint slot = (start + (uint)probe) & (uint)_TableMask;
+        uint state = _CellState[slot];
+        if (state == 2u && SameKey(_CellKeys[slot], key)) return (int)slot;
+        if (state == 0u) return -1;
+    }
+    return -1;
+}
+
+int FindOrClaimCell(int3 key)
+{
+    uint start = HashCell(key);
+    [loop]
+    for (int probe = 0; probe < _ProbeCount; probe++)
+    {
+        uint slot = (start + (uint)probe) & (uint)_TableMask;
+        uint state = _CellState[slot];
+        if (state == 2u && SameKey(_CellKeys[slot], key)) return (int)slot;
+        if (state == 0u)
+        {
+            uint original;
+            InterlockedCompareExchange(_CellState[slot], 0u, 1u, original);
+            if (original == 0u)
+            {
+                _CellKeys[slot] = int4(key, 0);
+                DeviceMemoryBarrier();
+                _CellState[slot] = 2u;
+                return (int)slot;
+            }
+        }
+    }
+    return -1;
+}
+
+float CandidateScore(uint candidateIndex, float3 samplePosition, float3 sampleNormal, float observationSigma,
+                     out float residual, out float angleDeg)
+{
+    float4 centerSigma = _CandidateCenterSigma[candidateIndex];
+    float4 normalSupport = _CandidateNormalSupport[candidateIndex];
+    float3 candidateNormal = normalize(normalSupport.xyz);
+    float normalDot = clamp(abs(dot(candidateNormal, sampleNormal)), 0.0, 1.0);
+    angleDeg = degrees(acos(normalDot));
+    residual = abs(dot(samplePosition - centerSigma.xyz, candidateNormal));
+    float combinedSigma = sqrt(max(centerSigma.w, SIGMA_FLOOR * SIGMA_FLOOR) +
+                               observationSigma * observationSigma);
+    float depthZ = residual / max(combinedSigma, 1e-6);
+    float normalZ = angleDeg / 25.0;
+    return sqrt(depthZ * depthZ + normalZ * normalZ);
+}
+
+bool FindBestStable(float3 samplePosition, float3 sampleNormal, float sigma,
+                    out uint bestIndex, out float bestScore,
+                    out float bestResidual, out float bestAngle)
+{
+    int3 home = (int3)floor(samplePosition / _CellSize);
+    bool found = false;
+    bestIndex = 0u;
+    bestScore = 1e20;
+    bestResidual = 0.0;
+    bestAngle = 0.0;
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++)
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    [unroll]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int slot = FindCell(home + int3(dx, dy, dz));
+        if (slot < 0) continue;
+        [loop]
+        for (int c = 0; c < _CandidateCapacity; c++)
+        {
+            uint index = (uint)(slot * _CandidateCapacity + c);
+            uint4 meta = _CandidateMeta[index];
+            if (meta.x == 0u || meta.y == 0u) continue;
+            float residual, angle;
+            float score = CandidateScore(index, samplePosition, sampleNormal, sigma, residual, angle);
+            if (score < bestScore)
+            {
+                found = true;
+                bestIndex = index;
+                bestScore = score;
+                bestResidual = residual;
+                bestAngle = angle;
+            }
+        }
+    }
+    return found;
+}
+
+bool FindBestAny(float3 samplePosition, float3 sampleNormal, float sigma,
+                 out uint bestIndex, out float bestScore)
+{
+    int3 home = (int3)floor(samplePosition / _CellSize);
+    bool found = false;
+    bestIndex = 0u;
+    bestScore = 1e20;
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++)
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    [unroll]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int slot = FindCell(home + int3(dx, dy, dz));
+        if (slot < 0) continue;
+        [loop]
+        for (int c = 0; c < _CandidateCapacity; c++)
+        {
+            uint index = (uint)(slot * _CandidateCapacity + c);
+            if (_CandidateMeta[index].x == 0u) continue;
+            float residual, angle;
+            float score = CandidateScore(index, samplePosition, sampleNormal, sigma, residual, angle);
+            if (score < bestScore)
+            {
+                found = true;
+                bestIndex = index;
+                bestScore = score;
+            }
+        }
+    }
+    return found;
+}
+
+[numthreads(256, 1, 1)]
+void ClearCells(uint id : SV_DispatchThreadID)
+{
+    if (id < (uint)_TableCapacity)
+    {
+        _CellKeys[id] = int4(0, 0, 0, 0);
+        _CellState[id] = 0u;
+        _CellLock[id] = 0u;
+    }
+    uint candidateCount = (uint)(_TableCapacity * _CandidateCapacity);
+    if (id < candidateCount)
+    {
+        _CandidateCenterSigma[id] = 0;
+        _CandidateNormalSupport[id] = 0;
+        _CandidateFirstViewAngle[id] = 0;
+        _CandidateMeta[id] = 0;
+    }
+}
+
+[numthreads(32, 1, 1)]
+void ClearStats(uint id : SV_DispatchThreadID)
+{
+    if (id < 16u) _Stats[id] = 0u;
+}
+
+[numthreads(8, 8, 1)]
+void BuildObservations(uint2 grid : SV_DispatchThreadID)
+{
+    if (any(grid >= (uint2)_ObservationGrid)) return;
+    uint index = grid.y * (uint)_ObservationGrid.x + grid.x;
+    uint2 pixel = min(grid * (uint)_PixelStride, (uint2)_DepthSize - 1u);
+    float depth = _DepthTex[uint3(pixel, 0)];
+    float3 normal = _NormalTex[uint3(pixel, 0)].xyz;
+    float normalLength = length(normal);
+    Observation output;
+    output.positionSigma = 0;
+    output.normalQuality = 0;
+    if (depth > 0.0 && depth < 1.0 && normalLength > 0.25)
+    {
+        // 与生产 DepthNormals/DepthKit 保持同一像素到 NDC 口径。
+        float2 uv = (float2)pixel / (float2)_DepthSize;
+        float4 hcs = float4(float3(uv, depth) * 2.0 - 1.0, 1.0);
+        float4 worldH = mul(_DepthViewInv[0], mul(_DepthProjInv[0], hcs));
+        float3 world = worldH.xyz / worldH.w;
+        float3 cameraWorld = mul(_DepthViewInv[0], float4(0, 0, 0, 1)).xyz;
+        float range = distance(world, cameraWorld);
+        if (range >= 0.15 && range <= _MaxDepth)
+        {
+            normal = normalize(normal);
+            float3 view = normalize(cameraWorld - world);
+            float incidence = abs(dot(normal, view));
+            float distanceQuality = saturate(1.0 - range / _MaxDepth);
+            float quality = clamp(distanceQuality * incidence * _MotionQuality, 0.05, 1.0);
+            float sigma = clamp(SIGMA_FLOOR / sqrt(quality), SIGMA_FLOOR, 0.025);
+            output.positionSigma = float4(world, sigma);
+            output.normalQuality = float4(normal, quality);
+            InterlockedAdd(_Stats[0], 1u);
+        }
+    }
+    _Observations[index] = output;
+}
+
+[numthreads(128, 1, 1)]
+void BuildCorrespondences(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ObservationCount) return;
+    Observation observation = _Observations[id];
+    Correspondence output;
+    output.sourceValid = 0;
+    output.targetSigma = 0;
+    output.normalAngle = 0;
+    if (observation.positionSigma.w > 0.0)
+    {
+        uint candidateIndex;
+        float score, residual, angle;
+        if (FindBestStable(observation.positionSigma.xyz, observation.normalQuality.xyz,
+                           observation.positionSigma.w, candidateIndex, score, residual, angle) &&
+            angle <= 45.0)
+        {
+            float4 candidate = _CandidateCenterSigma[candidateIndex];
+            float combinedSigma = sqrt(max(candidate.w, SIGMA_FLOOR * SIGMA_FLOOR) +
+                                       observation.positionSigma.w * observation.positionSigma.w);
+            if (residual <= 5.0 * combinedSigma)
+            {
+                output.sourceValid = float4(observation.positionSigma.xyz, 1.0);
+                output.targetSigma = float4(candidate.xyz, combinedSigma);
+                output.normalAngle = float4(normalize(_CandidateNormalSupport[candidateIndex].xyz), angle);
+                InterlockedAdd(_Stats[1], 1u);
+            }
+        }
+    }
+    _Correspondences[id] = output;
+}
+
+[numthreads(128, 1, 1)]
+void UpdateCandidates(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_ObservationCount) return;
+    Observation observation = _Observations[id];
+    if (observation.positionSigma.w <= 0.0) return;
+    float3 samplePosition = mul(_Correction, float4(observation.positionSigma.xyz, 1.0)).xyz;
+    float3 sampleNormal = normalize(mul((float3x3)_Correction, observation.normalQuality.xyz));
+    float sigma = observation.positionSigma.w;
+    float quality = observation.normalQuality.w;
+    float3 cameraWorld = mul(_Correction, mul(_DepthViewInv[0], float4(0, 0, 0, 1))).xyz;
+    float3 view = normalize(cameraWorld - samplePosition);
+
+    uint bestIndex;
+    float bestScore;
+    bool hasBest = FindBestAny(samplePosition, sampleNormal, sigma, bestIndex, bestScore);
+    int3 homeKey = (int3)floor(samplePosition / _CellSize);
+    int localSlot = FindOrClaimCell(homeKey);
+    if (localSlot < 0)
+    {
+        InterlockedAdd(_Stats[12], 1u);
+        return;
+    }
+
+    if (!hasBest || bestScore > SPAWN_Z)
+    {
+        uint originalLock;
+        InterlockedCompareExchange(_CellLock[localSlot], 0u, 1u, originalLock);
+        if (originalLock != 0u)
+        {
+            InterlockedAdd(_Stats[6], 1u);
+            return;
+        }
+        int empty = -1;
+        [loop]
+        for (int c = 0; c < _CandidateCapacity; c++)
+        {
+            uint index = (uint)(localSlot * _CandidateCapacity + c);
+            if (_CandidateMeta[index].x == 0u) { empty = (int)index; break; }
+        }
+        if (empty >= 0)
+        {
+            uint index = (uint)empty;
+            _CandidateCenterSigma[index] = float4(samplePosition, max(sigma * sigma, SIGMA_FLOOR * SIGMA_FLOOR));
+            _CandidateNormalSupport[index] = float4(sampleNormal, quality);
+            _CandidateFirstViewAngle[index] = float4(view, 0.0);
+            _CandidateMeta[index] = uint4(1u, 0u, (uint)_FrameIndex, 0u);
+            InterlockedAdd(_Stats[2], 1u);
+        }
+        else
+        {
+            InterlockedAdd(_Stats[5], 1u);
+        }
+        DeviceMemoryBarrier();
+        _CellLock[localSlot] = 0u;
+        return;
+    }
+
+    uint bestSlot = bestIndex / (uint)_CandidateCapacity;
+    uint updateLock;
+    InterlockedCompareExchange(_CellLock[bestSlot], 0u, 1u, updateLock);
+    if (updateLock != 0u)
+    {
+        InterlockedAdd(_Stats[6], 1u);
+        return;
+    }
+    uint4 meta = _CandidateMeta[bestIndex];
+    if (meta.x == 0u)
+    {
+        _CellLock[bestSlot] = 0u;
+        return;
+    }
+    float residual, angle;
+    float score = CandidateScore(bestIndex, samplePosition, sampleNormal, sigma, residual, angle);
+    float robustWeight = 1.0 / (1.0 + (score / SPAWN_Z) * (score / SPAWN_Z));
+    float effective = max(quality * robustWeight, 1e-4);
+    float4 centerSigma = _CandidateCenterSigma[bestIndex];
+    float4 normalSupport = _CandidateNormalSupport[bestIndex];
+    float alpha = min(0.20, effective / max(normalSupport.w + effective, 1e-5));
+    float3 alignedNormal = dot(normalSupport.xyz, sampleNormal) >= 0.0 ? sampleNormal : -sampleNormal;
+    centerSigma.xyz = lerp(centerSigma.xyz, samplePosition, alpha);
+    centerSigma.w = clamp(lerp(centerSigma.w, residual * residual, alpha),
+                          SIGMA_FLOOR * SIGMA_FLOOR, SIGMA_CEILING * SIGMA_CEILING);
+    normalSupport.xyz = normalize(lerp(normalize(normalSupport.xyz), alignedNormal, alpha));
+    normalSupport.w += effective;
+    float4 firstViewAngle = _CandidateFirstViewAngle[bestIndex];
+    firstViewAngle.w = max(firstViewAngle.w,
+                           degrees(acos(clamp(dot(normalize(firstViewAngle.xyz), view), -1.0, 1.0))));
+    uint wasStable = meta.y;
+    meta.x = min(meta.x + 1u, 65535u);
+    meta.z = (uint)_FrameIndex;
+    bool stable = normalSupport.w >= STABLE_SUPPORT &&
+                  sqrt(centerSigma.w) <= STABLE_SIGMA &&
+                  firstViewAngle.w >= STABLE_VIEW_DEG;
+    meta.y = stable ? 1u : 0u;
+    _CandidateCenterSigma[bestIndex] = centerSigma;
+    _CandidateNormalSupport[bestIndex] = normalSupport;
+    _CandidateFirstViewAngle[bestIndex] = firstViewAngle;
+    _CandidateMeta[bestIndex] = meta;
+    InterlockedAdd(_Stats[3], 1u);
+    if (wasStable == 0u && meta.y == 1u) InterlockedAdd(_Stats[4], 1u);
+    DeviceMemoryBarrier();
+    _CellLock[bestSlot] = 0u;
+}
+
+[numthreads(128, 1, 1)]
+void CountCensus(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint)_TableCapacity || _CellState[id] != 2u) return;
+    uint active = 0u;
+    uint stable = 0u;
+    uint stale = 0u;
+    [loop]
+    for (int c = 0; c < _CandidateCapacity; c++)
+    {
+        uint index = id * (uint)_CandidateCapacity + (uint)c;
+        uint4 meta = _CandidateMeta[index];
+        if (meta.x == 0u) continue;
+        active++;
+        if (meta.y != 0u)
+        {
+            stable++;
+            if ((uint)_FrameIndex > meta.z + 60u) stale++;
+        }
+    }
+    if (active > 0u) InterlockedAdd(_Stats[8], active);
+    if (stable > 0u) InterlockedAdd(_Stats[9], stable);
+    if (stable >= 2u) InterlockedAdd(_Stats[10], 1u);
+    if (stale > 0u) InterlockedAdd(_Stats[11], stale);
+}

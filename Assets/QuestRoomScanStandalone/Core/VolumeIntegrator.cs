@@ -35,6 +35,31 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.1f, 1f)] private float exclusionRadius = 0.35f;
         [SerializeField] private int maxFrustumPositions = 1000000;
 
+        [Header("校枪—分层凝胶（GPU 证据层）")]
+        [Tooltip("同吃生产预处理深度/法线/姿态，估计融合专用小修正并维护 K<=3 局部候选。本层自身不写 TSDF；下方受保护实验可选择消费结果。")]
+        [SerializeField] private bool enableGunGelEvidenceShadow = true;
+        [Tooltip("影子层采样步长。8 与离线验证口径一致，优先控制 Quest GPU/回读负担。")]
+        [SerializeField, Range(2, 16)] private int gunGelPixelStride = 8;
+        [Tooltip("候选空间哈希格尺寸（米）。它只是索引邻域，不是把房间切成冻结管理块。")]
+        [SerializeField, Range(0.05f, 0.25f)] private float gunGelCellSize = 0.10f;
+        [Tooltip("候选分类账刷新间隔（融合帧）。校枪仍逐帧异步计算。")]
+        [SerializeField, Range(10, 120)] private int gunGelReportInterval = 30;
+
+        [Header("枪胶受保护融合实验")]
+        [Tooltip("开=同帧预处理深度先留在三槽流水线，校枪完成后仅把秩/匹配/运动/幅度全部合格的帧校正后送入生产 TSDF；" +
+                 "快转、快移、撞30mm上限或解算不足的帧整帧弃权。关=原始生产融合。新实验默认开，必须从空 TSDF 开始对比。")]
+        [SerializeField] private bool enableGunGelGuardedFusionExperiment = true;
+        [Tooltip("校枪参与生产融合所需的最少点面对应数。实机健康帧约1500；低于此值说明可见稳定凝胶不足。")]
+        [SerializeField, Range(128, 4096)] private int gunGelFusionMinCorrespondences = 800;
+        [Tooltip("允许写入 TSDF 的最大校枪平移（毫米）。撞30mm求解上限的帧永远拒绝。")]
+        [SerializeField, Range(1f, 30f)] private float gunGelFusionMaxTranslationMm = 20f;
+        [Tooltip("允许写入 TSDF 的最大校枪转角（度）。")]
+        [SerializeField, Range(0.1f, 1.5f)] private float gunGelFusionMaxRotationDeg = 1f;
+        [Tooltip("枪胶实验的角速度硬闸（°/s）。203438实机在48°/s撞30mm上限，默认35提前停笔。")]
+        [SerializeField, Range(5f, 120f)] private float gunGelFusionMaxAngularSpeed = 35f;
+        [Tooltip("枪胶实验的线速度硬闸（m/s）。平移同样会触发深度/姿态时延错位。")]
+        [SerializeField, Range(0.05f, 1f)] private float gunGelFusionMaxLinearSpeed = 0.35f;
+
         [Header("Convergence")]
         [Tooltip("Blend strength. Higher = faster convergence and correction. (default 0.8)")]
         [SerializeField, Range(0.1f, 2f)] private float blendRate = 0.8f;
@@ -250,6 +275,7 @@ namespace Genesis.RoomScan
         private static readonly int CamSensorResID = Shader.PropertyToID("gsCamSensorRes");
         private static readonly int CamCurrentResID = Shader.PropertyToID("gsCamCurrentRes");
         private static readonly int CamExposureID = Shader.PropertyToID("gsCamExposure");
+        private static readonly int FusionCorrectionID = Shader.PropertyToID("gsFusionCorrection");
         private static readonly int UseRawProjectiveSdfID = Shader.PropertyToID("gsUseRawProjectiveSdf");
         private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
@@ -267,6 +293,9 @@ namespace Genesis.RoomScan
         private static readonly int PruneZCountID = Shader.PropertyToID("gsPruneZCount");
         private static readonly int DirtyChunkEpochsID = Shader.PropertyToID("_DirtyChunkEpochs");
         private static readonly int DirtyBoundaryEpochsID = Shader.PropertyToID("_DirtyBoundaryEpochs");
+        private static readonly int ActivePageEpochsID = Shader.PropertyToID("_ActivePageEpochs");
+        private static readonly int ActivePageObservedEpochsID = Shader.PropertyToID("_ActivePageObservedEpochs");
+        private static readonly int ActivePageBoundaryEpochsID = Shader.PropertyToID("_ActivePageBoundaryEpochs");
         private static readonly int DirtyChunkCountID = Shader.PropertyToID("gsDirtyChunkCount");
         private static readonly int DirtyChunkSizeID = Shader.PropertyToID("gsDirtyChunkSize");
         private static readonly int TrackDirtyChunksID = Shader.PropertyToID("gsTrackDirtyChunks");
@@ -310,6 +339,9 @@ namespace Genesis.RoomScan
         private ComputeBuffer _frustumVolume;
         private ComputeBuffer _dirtyChunkEpochs;
         private ComputeBuffer _dirtyBoundaryEpochs;
+        private ComputeBuffer _activePageEpochs;
+        private ComputeBuffer _activePageObservedEpochs;
+        private ComputeBuffer _activePageBoundaryEpochs;
         private ComputeBuffer _chunkFreezeSetMask;
         private ComputeBuffer _chunkFreezeClearMask;
         private ComputeBuffer _frozenChunkVotes;
@@ -434,6 +466,62 @@ namespace Genesis.RoomScan
         public int ExtractionChunkSize => Mathf.Max(8, extractionChunkSize);
         public uint DirtyEpoch => _dirtyEpoch;
 
+        /// <summary>Latest exact 32^3 HERA page owner/boundary epochs.</summary>
+        public uint[] LatestActivePageEpochs { get; private set; }
+        public uint[] LatestActivePageObservedEpochs { get; private set; }
+        public uint[] LatestActivePageBoundaryEpochs { get; private set; }
+        private bool _activePageEpochReadbackPending;
+        private bool _activePageObservedEpochReadbackPending;
+        private bool _activePageBoundaryReadbackPending;
+
+        /// <summary>
+        /// Refresh the small 32^3 active-page liveness ledgers.  These buffers
+        /// drive mesh scheduling only; they never participate in TSDF admission,
+        /// freezing or surface classification.
+        /// </summary>
+        public void RequestActivePageEpochs()
+        {
+            if (!_activePageEpochReadbackPending && _activePageEpochs != null)
+            {
+                _activePageEpochReadbackPending = true;
+                AsyncGPUReadback.Request(_activePageEpochs, req =>
+                {
+                    _activePageEpochReadbackPending = false;
+                    if (req.hasError) return;
+                    var data = req.GetData<uint>();
+                    if (LatestActivePageEpochs == null || LatestActivePageEpochs.Length != data.Length)
+                        LatestActivePageEpochs = new uint[data.Length];
+                    data.CopyTo(LatestActivePageEpochs);
+                });
+            }
+            if (!_activePageObservedEpochReadbackPending && _activePageObservedEpochs != null)
+            {
+                _activePageObservedEpochReadbackPending = true;
+                AsyncGPUReadback.Request(_activePageObservedEpochs, req =>
+                {
+                    _activePageObservedEpochReadbackPending = false;
+                    if (req.hasError) return;
+                    var data = req.GetData<uint>();
+                    if (LatestActivePageObservedEpochs == null || LatestActivePageObservedEpochs.Length != data.Length)
+                        LatestActivePageObservedEpochs = new uint[data.Length];
+                    data.CopyTo(LatestActivePageObservedEpochs);
+                });
+            }
+            if (!_activePageBoundaryReadbackPending && _activePageBoundaryEpochs != null)
+            {
+                _activePageBoundaryReadbackPending = true;
+                AsyncGPUReadback.Request(_activePageBoundaryEpochs, req =>
+                {
+                    _activePageBoundaryReadbackPending = false;
+                    if (req.hasError) return;
+                    var data = req.GetData<uint>();
+                    if (LatestActivePageBoundaryEpochs == null || LatestActivePageBoundaryEpochs.Length != data.Length)
+                        LatestActivePageBoundaryEpochs = new uint[data.Length];
+                    data.CopyTo(LatestActivePageBoundaryEpochs);
+                });
+            }
+        }
+
         private Texture _pendingCamFrame;
         private Vector3 _pendingCamPos;
         private Quaternion _pendingCamRot;
@@ -443,6 +531,30 @@ namespace Genesis.RoomScan
         private Vector2 _pendingCurrentRes;
         private RenderTexture _camFrameCopy;
         private Texture2D _dummyCamTex;
+
+        private const int GunGelDeferredSlotCount = 3;
+
+        private sealed class GunGelDeferredFrame
+        {
+            public RenderTexture Depth;
+            public RenderTexture Normal;
+            public RenderTexture DilatedDepth;
+            public RenderTexture EdgeReason;
+            public Matrix4x4[] View;
+            public Matrix4x4[] Projection;
+            public Matrix4x4[] ViewInverse;
+            public Matrix4x4[] ProjectionInverse;
+            public readonly Vector4[] ExclusionPositions = new Vector4[64];
+            public int ExclusionCount;
+            public int FrameIndex;
+            public int Generation;
+            public float AngularSpeed;
+            public float LinearSpeed;
+            public float MotionQuality;
+            public bool Pending;
+            public bool Ready;
+            public GunGelEvidenceShadow.FrameDecision Decision;
+        }
 
         // 运动闸：角速度镜像自 DepthCapture.SmoothedDepthAngularSpeed（深度帧事件内、
         // 原始 Pose 四元数、真实帧间隔计算），供 HUD 读数与运动闸共用。
@@ -454,10 +566,60 @@ namespace Genesis.RoomScan
         /// <summary>当前运动质量分（1=静止满权，地板=运动降权到底），HUD 回显用。</summary>
         public float MotionQuality => _motionQuality;
         private float _motionQuality = 1f;
+        private GunGelEvidenceShadow _gunGelEvidenceShadow;
+        private bool _gunGelRuntimeFailureReported;
+        private readonly GunGelDeferredFrame[] _gunGelDeferredFrames =
+            new GunGelDeferredFrame[GunGelDeferredSlotCount];
+        private int _gunGelDeferredGeneration;
+        private int _gunGelCaptureFrameIndex;
+        private int _gunGelFusionAccepted;
+        private int _gunGelFusionRejected;
+        private int _gunGelFusionQueueAbstained;
+        private float _gunGelLastAppliedMm;
+        private string _gunGelLastFusionDecision = "预热";
+        private bool _gunGelGuardedFusionRuntimeHalted;
+
+        /// <summary>
+        /// 当前空卷选择是否为枪胶受保护融合。只读暴露给扫描器，用于把
+        /// “胶冻/原冻”身份钉进 HUD 与导出；不参与融合判决。
+        /// </summary>
+        public bool GunGelGuardedFusionExperimentEnabled =>
+            enableGunGelGuardedFusionExperiment;
+
+        public string GetGunGelEvidenceShadowCompact()
+        {
+            if (!enableGunGelEvidenceShadow) return "关";
+            if (_gunGelRuntimeFailureReported) return "已熔断（生产融合正常）";
+            string fusion;
+            if (!enableGunGelGuardedFusionExperiment)
+                fusion = "融基线";
+            else if (_gunGelGuardedFusionRuntimeHalted)
+                fusion = "融试熔断→基线";
+            else
+                fusion = $"融试用{_gunGelFusionAccepted}弃{_gunGelFusionRejected}" +
+                         $"队{CountGunGelDeferredFrames()}失{_gunGelFusionQueueAbstained}" +
+                         $"末{_gunGelLastFusionDecision}{_gunGelLastAppliedMm:F1}mm";
+            string shadow = _gunGelEvidenceShadow != null
+                ? _gunGelEvidenceShadow.GetCompact()
+                : "未就绪";
+            return fusion + " · " + shadow;
+        }
+
+        public string ToggleGunGelGuardedFusionExperiment()
+        {
+            if (IntegrationCount > 0 || CountGunGelDeferredFrames() > 0)
+                return "枪胶融:需空卷/重启后切";
+            enableGunGelGuardedFusionExperiment = !enableGunGelGuardedFusionExperiment;
+            _gunGelGuardedFusionRuntimeHalted = false;
+            _gunGelLastFusionDecision = "预热";
+            return enableGunGelGuardedFusionExperiment ? "枪胶融:实验" : "枪胶融:基线";
+        }
 
         private void Awake()
         {
             Instance = this;
+            for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
+                _gunGelDeferredFrames[i] = new GunGelDeferredFrame();
             // GPU resources allocate lazily on the first scan / save / full-load
             // path via ReallocateVolumes(). The lightweight LoadRefinedOnlyAsync
             // path (returning-player and editor-sim) never touches them, so a
@@ -495,6 +657,9 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _integrateKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _integrateKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
 
             _pruneKernel = new ComputeKernelHelper(compute, "Prune");
             _pruneKernel.Set(VolumeRWID, _volume);
@@ -502,6 +667,9 @@ namespace Genesis.RoomScan
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _pruneKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _pruneKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
 
             _freezeKernel = new ComputeKernelHelper(compute, "FreezeInFrustum");
             _freezeKernel.Set(VolumeRWID, _volume);
@@ -585,6 +753,9 @@ namespace Genesis.RoomScan
         /// </summary>
         public void ReleaseVolumes()
         {
+            ResetGunGelDeferredFrames(true);
+            _gunGelEvidenceShadow?.Dispose();
+            _gunGelEvidenceShadow = null;
             _frustumVolume?.Release();
             _frustumVolume = null;
             _frustumReady = false;
@@ -592,6 +763,15 @@ namespace Genesis.RoomScan
             _dirtyChunkEpochs = null;
             _dirtyBoundaryEpochs?.Release();
             _dirtyBoundaryEpochs = null;
+            _activePageEpochs?.Release();
+            _activePageEpochs = null;
+            _activePageObservedEpochs?.Release();
+            _activePageObservedEpochs = null;
+            _activePageBoundaryEpochs?.Release();
+            _activePageBoundaryEpochs = null;
+            LatestActivePageEpochs = null;
+            LatestActivePageObservedEpochs = null;
+            LatestActivePageBoundaryEpochs = null;
             _dirtyChunkCount = int3.zero;
             if (_volume) { Destroy(_volume); _volume = null; }
             if (_colorVolume) { Destroy(_colorVolume); _colorVolume = null; }
@@ -638,6 +818,7 @@ namespace Genesis.RoomScan
             else            RebindKernelTextures();
 
             SetShaderConstants();
+            EnsureGunGelEvidenceShadow();
             Clear();
 
             if (DepthCapture.Instance != null)
@@ -646,6 +827,256 @@ namespace Genesis.RoomScan
             Logger.Info(firstAlloc
                 ? "VolumeIntegrator: GPU resources allocated lazily on first scan/save/full-load."
                 : "VolumeIntegrator: GPU volumes re-allocated after release.");
+        }
+
+        private void EnsureGunGelEvidenceShadow()
+        {
+            if (!enableGunGelEvidenceShadow || _gunGelEvidenceShadow != null) return;
+            try
+            {
+                _gunGelRuntimeFailureReported = false;
+                _gunGelEvidenceShadow = new GunGelEvidenceShadow(
+                    gunGelPixelStride, gunGelCellSize, gunGelReportInterval);
+                Logger.Info($"枪胶 GPU 层已启用：stride={gunGelPixelStride}, " +
+                            $"cell={gunGelCellSize:F2}m, K<=3, report={gunGelReportInterval}帧；" +
+                            $"受保护融合={(enableGunGelGuardedFusionExperiment ? "实验" : "基线")}。");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"枪胶 GPU 影子初始化失败，生产融合继续：{ex.Message}");
+                _gunGelEvidenceShadow?.Dispose();
+                _gunGelEvidenceShadow = null;
+            }
+        }
+
+        private void DispatchGunGelEvidenceShadow(DepthCapture depth)
+        {
+            if (_gunGelEvidenceShadow == null) return;
+            try
+            {
+                _gunGelEvidenceShadow.Dispatch(depth, _motionQuality, _gunGelCaptureFrameIndex++);
+            }
+            catch (Exception ex)
+            {
+                // 影子必须可整段拔除：任何平台/驱动/缓冲异常只熔断影子，正式融合继续。
+                if (!_gunGelRuntimeFailureReported)
+                {
+                    Logger.Warning($"枪胶 GPU 影子运行失败，已熔断但生产融合继续：{ex.Message}");
+                    _gunGelRuntimeFailureReported = true;
+                }
+                _gunGelEvidenceShadow.Dispose();
+                _gunGelEvidenceShadow = null;
+                _gunGelGuardedFusionRuntimeHalted = true;
+            }
+        }
+
+        private int CountGunGelDeferredFrames()
+        {
+            int count = 0;
+            for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
+            {
+                GunGelDeferredFrame frame = _gunGelDeferredFrames[i];
+                if (frame != null && (frame.Pending || frame.Ready)) count++;
+            }
+            return count;
+        }
+
+        private void ResetGunGelDeferredFrames(bool releaseTextures)
+        {
+            _gunGelDeferredGeneration++;
+            for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
+            {
+                GunGelDeferredFrame frame = _gunGelDeferredFrames[i];
+                if (frame == null) continue;
+                frame.Pending = false;
+                frame.Ready = false;
+                frame.Generation = _gunGelDeferredGeneration;
+                if (!releaseTextures) continue;
+                if (frame.Depth) Destroy(frame.Depth);
+                if (frame.Normal) Destroy(frame.Normal);
+                if (frame.DilatedDepth) Destroy(frame.DilatedDepth);
+                if (frame.EdgeReason) Destroy(frame.EdgeReason);
+                frame.Depth = null;
+                frame.Normal = null;
+                frame.DilatedDepth = null;
+                frame.EdgeReason = null;
+            }
+        }
+
+        private static RenderTexture EnsureGunGelFrameCopy(RenderTexture target,
+            Texture source, string name)
+        {
+            if (source == null) return null;
+            int volumeDepth = 1;
+            if (source is RenderTexture sourceRt) volumeDepth = sourceRt.volumeDepth;
+            else if (source is Texture2DArray sourceArray) volumeDepth = sourceArray.depth;
+            bool recreate = target == null || target.width != source.width ||
+                            target.height != source.height ||
+                            target.graphicsFormat != source.graphicsFormat ||
+                            target.dimension != source.dimension ||
+                            target.volumeDepth != volumeDepth;
+            if (recreate)
+            {
+                if (target) Destroy(target);
+                var descriptor = new RenderTextureDescriptor(source.width, source.height)
+                {
+                    graphicsFormat = source.graphicsFormat,
+                    depthBufferBits = 0,
+                    msaaSamples = 1,
+                    mipCount = 1,
+                    dimension = source.dimension,
+                    volumeDepth = volumeDepth,
+                    enableRandomWrite = false,
+                    useMipMap = false,
+                    autoGenerateMips = false
+                };
+                target = new RenderTexture(descriptor)
+                {
+                    name = name,
+                    filterMode = source.filterMode,
+                    wrapMode = source.wrapMode
+                };
+                target.Create();
+            }
+            Graphics.CopyTexture(source, target);
+            return target;
+        }
+
+        private bool QueueGunGelGuardedFrame(DepthCapture depth,
+            float angularSpeed, float linearSpeed, float motionQuality)
+        {
+            if (_gunGelEvidenceShadow == null || depth == null ||
+                depth.DepthTex == null || depth.NormTex == null ||
+                depth.DilatedDepthTex == null || depth.EdgeReasonTex == null)
+            {
+                _gunGelFusionQueueAbstained++;
+                _gunGelLastFusionDecision = "缺纹";
+                return false;
+            }
+
+            GunGelDeferredFrame frame = null;
+            for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
+            {
+                if (!_gunGelDeferredFrames[i].Pending && !_gunGelDeferredFrames[i].Ready)
+                {
+                    frame = _gunGelDeferredFrames[i];
+                    break;
+                }
+            }
+            if (frame == null)
+            {
+                _gunGelFusionQueueAbstained++;
+                _gunGelLastFusionDecision = "队满";
+                return false;
+            }
+
+            int frameIndex = _gunGelCaptureFrameIndex++;
+            int generation = _gunGelDeferredGeneration;
+            try
+            {
+                frame.Depth = EnsureGunGelFrameCopy(frame.Depth, depth.DepthTex,
+                    $"GunGelDepth_{frameIndex}");
+                frame.Normal = EnsureGunGelFrameCopy(frame.Normal, depth.NormTex,
+                    $"GunGelNormal_{frameIndex}");
+                frame.DilatedDepth = EnsureGunGelFrameCopy(frame.DilatedDepth,
+                    depth.DilatedDepthTex, $"GunGelDilated_{frameIndex}");
+                frame.EdgeReason = EnsureGunGelFrameCopy(frame.EdgeReason,
+                    depth.EdgeReasonTex, $"GunGelEdge_{frameIndex}");
+                frame.View = (Matrix4x4[])depth.View.Clone();
+                frame.Projection = (Matrix4x4[])depth.Proj.Clone();
+                frame.ViewInverse = (Matrix4x4[])depth.ViewInv.Clone();
+                frame.ProjectionInverse = (Matrix4x4[])depth.ProjInv.Clone();
+                frame.ExclusionCount = Mathf.Min(ExclusionZones.Count, 64);
+                Array.Clear(frame.ExclusionPositions, 0, frame.ExclusionPositions.Length);
+                for (int i = 0; i < frame.ExclusionCount; i++)
+                    if (ExclusionZones[i] != null)
+                        frame.ExclusionPositions[i] = ExclusionZones[i].position;
+                frame.FrameIndex = frameIndex;
+                frame.Generation = generation;
+                frame.AngularSpeed = angularSpeed;
+                frame.LinearSpeed = linearSpeed;
+                frame.MotionQuality = motionQuality;
+                frame.Pending = true;
+                frame.Ready = false;
+
+                bool dispatched = _gunGelEvidenceShadow.Dispatch(
+                    frame.Depth, frame.Normal, depth.DepthWidth, depth.DepthHeight,
+                    frame.ProjectionInverse, frame.ViewInverse,
+                    motionQuality, frameIndex,
+                    decision =>
+                    {
+                        if (frame.Generation != _gunGelDeferredGeneration ||
+                            decision.FrameIndex != frame.FrameIndex) return;
+                        frame.Decision = decision;
+                        frame.Pending = false;
+                        frame.Ready = true;
+                    });
+                if (dispatched) return true;
+                frame.Pending = false;
+                _gunGelFusionQueueAbstained++;
+                _gunGelLastFusionDecision = "影忙";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                frame.Pending = false;
+                frame.Ready = false;
+                _gunGelGuardedFusionRuntimeHalted = true;
+                _gunGelLastFusionDecision = "熔断";
+                if (!_gunGelRuntimeFailureReported)
+                {
+                    Logger.Warning($"枪胶受保护融合留帧失败，回到基线融合：{ex.Message}");
+                    _gunGelRuntimeFailureReported = true;
+                }
+                return false;
+            }
+        }
+
+        private bool TryGetOldestResolvedGunGelFrame(out GunGelDeferredFrame result)
+        {
+            result = null;
+            GunGelDeferredFrame oldest = null;
+            for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
+            {
+                GunGelDeferredFrame frame = _gunGelDeferredFrames[i];
+                if (!frame.Pending && !frame.Ready) continue;
+                if (oldest == null || frame.FrameIndex < oldest.FrameIndex) oldest = frame;
+            }
+            if (oldest == null || oldest.Pending) return false;
+            result = oldest;
+            return true;
+        }
+
+        private bool AcceptGunGelFrame(GunGelDeferredFrame frame, out string reason)
+        {
+            GunGelEvidenceShadow.FrameDecision decision = frame.Decision;
+            if (!decision.ReadbackSucceeded) { reason = "回读"; return false; }
+            if (frame.AngularSpeed > gunGelFusionMaxAngularSpeed) { reason = "快角"; return false; }
+            if (frame.LinearSpeed > gunGelFusionMaxLinearSpeed) { reason = "快移"; return false; }
+            if (decision.EffectiveRank < 6) { reason = "欠秩"; return false; }
+            if (decision.CorrespondenceCount < gunGelFusionMinCorrespondences) { reason = "少配"; return false; }
+            if (decision.TranslationClamped || decision.RotationClamped) { reason = "撞顶"; return false; }
+            if (decision.TranslationMm > gunGelFusionMaxTranslationMm) { reason = "位大"; return false; }
+            if (decision.RotationDeg > gunGelFusionMaxRotationDeg) { reason = "转大"; return false; }
+            reason = "校";
+            return true;
+        }
+
+        private static void ApplyGunGelCorrection(GunGelDeferredFrame frame)
+        {
+            Matrix4x4 correction = frame.Decision.Correction;
+            for (int i = 0; i < frame.ViewInverse.Length; i++)
+            {
+                frame.ViewInverse[i] = correction * frame.ViewInverse[i];
+                frame.View[i] = frame.ViewInverse[i].inverse;
+            }
+        }
+
+        private static void ReleaseGunGelDeferredFrame(GunGelDeferredFrame frame)
+        {
+            if (frame == null) return;
+            frame.Pending = false;
+            frame.Ready = false;
         }
 
         private void RebindKernelTextures()
@@ -660,11 +1091,17 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _integrateKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _integrateKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _pruneKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _pruneKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
             _freezeKernel.Set(VolumeRWID, _volume);
             _unfreezeKernel.Set(VolumeRWID, _volume);
             _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
@@ -702,8 +1139,12 @@ namespace Genesis.RoomScan
                 Mathf.CeilToInt(voxelCount.y / (float)fChunkSize),
                 Mathf.CeilToInt(voxelCount.z / (float)fChunkSize));
             int frozenRequiredCount = frozenRequired.x * frozenRequired.y * frozenRequired.z;
+            int activeBoundaryCount = Mathf.Max(1, frozenRequiredCount * 6);
             if (_dirtyChunkEpochs != null && _dirtyChunkEpochs.count == requiredCount &&
                 _dirtyBoundaryEpochs != null && _dirtyBoundaryEpochs.count == boundaryCount &&
+                _activePageEpochs != null && _activePageEpochs.count == Mathf.Max(1, frozenRequiredCount) &&
+                _activePageObservedEpochs != null && _activePageObservedEpochs.count == Mathf.Max(1, frozenRequiredCount) &&
+                _activePageBoundaryEpochs != null && _activePageBoundaryEpochs.count == activeBoundaryCount &&
                 _frozenChunkVotes != null && _frozenChunkVotes.count == Mathf.Max(1, frozenRequiredCount))
             {
                 _dirtyChunkCount = required;
@@ -713,11 +1154,20 @@ namespace Genesis.RoomScan
 
             _dirtyChunkEpochs?.Release();
             _dirtyBoundaryEpochs?.Release();
+            _activePageEpochs?.Release();
+            _activePageObservedEpochs?.Release();
+            _activePageBoundaryEpochs?.Release();
             _dirtyChunkEpochs = new ComputeBuffer(Mathf.Max(1, requiredCount), sizeof(uint));
             _dirtyBoundaryEpochs = new ComputeBuffer(boundaryCount, sizeof(uint));
+            _activePageEpochs = new ComputeBuffer(Mathf.Max(1, frozenRequiredCount), sizeof(uint));
+            _activePageObservedEpochs = new ComputeBuffer(Mathf.Max(1, frozenRequiredCount), sizeof(uint));
+            _activePageBoundaryEpochs = new ComputeBuffer(activeBoundaryCount, sizeof(uint));
             _dirtyChunkCount = required;
             _dirtyChunkEpochs.SetData(new uint[Mathf.Max(1, requiredCount)]);
             _dirtyBoundaryEpochs.SetData(new uint[boundaryCount]);
+            _activePageEpochs.SetData(new uint[Mathf.Max(1, frozenRequiredCount)]);
+            _activePageObservedEpochs.SetData(new uint[Mathf.Max(1, frozenRequiredCount)]);
+            _activePageBoundaryEpochs.SetData(new uint[activeBoundaryCount]);
 
             ReleaseFrozenBlockBuffers();
             _frozenChunkCount = frozenRequired;
@@ -785,6 +1235,12 @@ namespace Genesis.RoomScan
                     _dirtyChunkEpochs.SetData(new uint[_dirtyChunkEpochs.count]);
                 if (_dirtyBoundaryEpochs != null)
                     _dirtyBoundaryEpochs.SetData(new uint[_dirtyBoundaryEpochs.count]);
+                if (_activePageEpochs != null)
+                    _activePageEpochs.SetData(new uint[_activePageEpochs.count]);
+                if (_activePageObservedEpochs != null)
+                    _activePageObservedEpochs.SetData(new uint[_activePageObservedEpochs.count]);
+                if (_activePageBoundaryEpochs != null)
+                    _activePageBoundaryEpochs.SetData(new uint[_activePageBoundaryEpochs.count]);
             }
             ConfigureDirtyTracking(true);
         }
@@ -802,6 +1258,17 @@ namespace Genesis.RoomScan
             // work in the following scan session.
             if (_dirtyBoundaryEpochs != null)
                 _dirtyBoundaryEpochs.SetData(new uint[_dirtyBoundaryEpochs.count]);
+            // Active-page epochs are event ledgers, not a full-replay invalidation
+            // mask. Marking every 32^3 page here would make a fresh scan enqueue
+            // all empty room pages before any surface exists. Existing loaded
+            // surfaces are discovered by the low-rate census fallback; new live
+            // surfaces advance this ledger directly in MarkDirtyChunk.
+            if (_activePageEpochs != null)
+                _activePageEpochs.SetData(new uint[_activePageEpochs.count]);
+            if (_activePageObservedEpochs != null)
+                _activePageObservedEpochs.SetData(new uint[_activePageObservedEpochs.count]);
+            if (_activePageBoundaryEpochs != null)
+                _activePageBoundaryEpochs.SetData(new uint[_activePageBoundaryEpochs.count]);
         }
 
         private void DispatchCoverageCount()
@@ -1287,6 +1754,8 @@ namespace Genesis.RoomScan
             Array.Clear(CumulativeCarveStats, 0, CumulativeCarveStats.Length);
             HasCarveStats = false;
             HasProjectiveShadowCarveStats = false;
+            _gunGelEvidenceShadow?.Clear();
+            ResetGunGelDeferredFrames(false);
             MarkAllChunksDirty();
             Cleared?.Invoke();
         }
@@ -1300,6 +1769,14 @@ namespace Genesis.RoomScan
         {
             IntegrationCount = 0;
             _integrationsSinceCoverage = 0;
+            _gunGelCaptureFrameIndex = 0;
+            _gunGelFusionAccepted = 0;
+            _gunGelFusionRejected = 0;
+            _gunGelFusionQueueAbstained = 0;
+            _gunGelLastAppliedMm = 0f;
+            _gunGelLastFusionDecision = "预热";
+            _gunGelGuardedFusionRuntimeHalted = false;
+            ResetGunGelDeferredFrames(false);
         }
 
         /// <summary>
@@ -1408,6 +1885,8 @@ namespace Genesis.RoomScan
 
             // Rebind per-kernel UAV references so subsequent integrations/clears use new textures
             RebindVolumeTextures();
+            // 枪胶候选使用世界坐标稀疏哈希；重定位后旧键不可复用，宁可重新预热也不混坐标系。
+            _gunGelEvidenceShadow?.Clear();
             MarkAllChunksDirty();
             TopologyInvalidated?.Invoke();
 
@@ -1661,6 +2140,17 @@ namespace Genesis.RoomScan
             if (!_frustumReady) SetupFrustumVolume();
             if (!_frustumReady) return;
 
+            Texture fusionDepth = dc.DepthTex;
+            Texture fusionNormal = dc.NormTex;
+            Texture fusionDilatedDepth = dc.DilatedDepthTex;
+            Texture fusionEdgeReason = dc.EdgeReasonTex;
+            Matrix4x4[] fusionView = dc.View;
+            Matrix4x4[] fusionProjection = dc.Proj;
+            Matrix4x4[] fusionViewInverse = dc.ViewInv;
+            Matrix4x4[] fusionProjectionInverse = dc.ProjInv;
+            GunGelDeferredFrame deferredFrame = null;
+            bool usingGuardedFrame = false;
+
             // 运动闸：转头时积分位姿与深度帧存在帧差，写入会切向涂抹成搓衣板褶皱、
             // 矛盾票也会按错位投影啃到真表面。超阈值整帧停笔（不集成、不扣减），
             // 停下来正对目标时票照投——消幽灵的姿势是"停住看"，不是"转着磨"。
@@ -1668,44 +2158,103 @@ namespace Genesis.RoomScan
             // （dt=真实深度帧间隔），这里只消费。旧实现用积分间隔 ÷ 矩阵.rotation
             // 增量：深度帧率低于积分率时系统性放大，且 ScaleFlipZ 负行列式矩阵的
             // 四元数提取有分支不连续风险——曾致诊断运动位 100% 饱和失效。
-            if (dc.ViewInv != null && dc.ViewInv.Length > 0)
+            float currentAngularSpeed = dc.SmoothedDepthAngularSpeed;
+            float currentLinearSpeed = dc.SmoothedDepthLinearSpeed;
+            _smoothedAngSpeed = currentAngularSpeed;
+            _motionQuality = 1f;
+            if (noiseMotionWeightEnable)
             {
-                _smoothedAngSpeed = dc.SmoothedDepthAngularSpeed;
-                if (motionGateDegPerSec > 0f && _smoothedAngSpeed > motionGateDegPerSec)
+                float a = noiseMotionAngRefDegPerSec > 0f
+                    ? currentAngularSpeed / noiseMotionAngRefDegPerSec : 0f;
+                float l = noiseMotionLinRefMps > 0f
+                    ? currentLinearSpeed / noiseMotionLinRefMps : 0f;
+                _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
+                    Mathf.Clamp01(Mathf.Max(a, l)));
+            }
+
+            bool currentHardGated = motionGateDegPerSec > 0f &&
+                                    currentAngularSpeed > motionGateDegPerSec;
+            bool guardedExperimentActive = enableGunGelGuardedFusionExperiment &&
+                                           !_gunGelGuardedFusionRuntimeHalted &&
+                                           _gunGelEvidenceShadow != null;
+
+            if (!currentHardGated)
+            {
+                dc.UpdateDilationIfNeeded();
+                if (guardedExperimentActive)
                 {
-                    _motionGatedSinceStats++;
-                    _pendingCamFrame = null; // 丢弃过期颜色帧，防与下一帧位姿错配
+                    QueueGunGelGuardedFrame(dc, currentAngularSpeed,
+                        currentLinearSpeed, _motionQuality);
+                    _pendingCamFrame = null; // 实验暂不延迟相机色帧，防跨帧贴错色。
+                }
+                else
+                {
+                    DispatchGunGelEvidenceShadow(dc);
+                }
+            }
+            else
+            {
+                _motionGatedSinceStats++;
+                _pendingCamFrame = null;
+            }
+
+            // 受保护实验必须消费“同一帧”的深度、法线、姿态和解算结果。
+            // 最老帧尚在回读时宁可短暂停笔，绝不用上一帧校正硬套当前帧。
+            if (guardedExperimentActive && !_gunGelGuardedFusionRuntimeHalted)
+            {
+                if (!TryGetOldestResolvedGunGelFrame(out deferredFrame)) return;
+                if (!AcceptGunGelFrame(deferredFrame, out string rejectReason))
+                {
+                    _gunGelFusionRejected++;
+                    _gunGelLastFusionDecision = rejectReason;
+                    _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
+                    ReleaseGunGelDeferredFrame(deferredFrame);
                     return;
                 }
 
-                // 噪声模型加权（08-21 造炮）：整帧闸 90°/s 之下不再二值放行，而是按运动状态
-                // 连续降权——角速度/线速度各对参考值归一取大，1(静止)→地板线性折让。
-                // 位姿-深度时延族在低速带照样放错位置（实锤：平移不转头 O 也掉负），
-                // 二值闸管不了的段由权重连续谱接管；地板防断粮。
-                _motionQuality = 1f;
-                if (noiseMotionWeightEnable)
-                {
-                    float a = noiseMotionAngRefDegPerSec > 0f
-                        ? _smoothedAngSpeed / noiseMotionAngRefDegPerSec : 0f;
-                    float l = noiseMotionLinRefMps > 0f
-                        ? dc.SmoothedDepthLinearSpeed / noiseMotionLinRefMps : 0f;
-                    _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
-                        Mathf.Clamp01(Mathf.Max(a, l)));
-                }
+                ApplyGunGelCorrection(deferredFrame);
+                usingGuardedFrame = true;
+                fusionDepth = deferredFrame.Depth;
+                fusionNormal = deferredFrame.Normal;
+                fusionDilatedDepth = deferredFrame.DilatedDepth;
+                fusionEdgeReason = deferredFrame.EdgeReason;
+                fusionView = deferredFrame.View;
+                fusionProjection = deferredFrame.Projection;
+                fusionViewInverse = deferredFrame.ViewInverse;
+                fusionProjectionInverse = deferredFrame.ProjectionInverse;
+                _smoothedAngSpeed = deferredFrame.AngularSpeed;
+                _motionQuality = deferredFrame.MotionQuality;
+                _gunGelFusionAccepted++;
+                _gunGelLastFusionDecision = "校";
+                _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
+            }
+            else if (currentHardGated)
+            {
+                return;
             }
 
-            dc.UpdateDilationIfNeeded();
+            compute.SetMatrixArray(DepthCapture.ViewID, fusionView);
+            compute.SetMatrixArray(DepthCapture.ProjID, fusionProjection);
+            compute.SetMatrixArray(DepthCapture.ViewInvID, fusionViewInverse);
+            compute.SetMatrixArray(DepthCapture.ProjInvID, fusionProjectionInverse);
+            compute.SetMatrix(FusionCorrectionID,
+                usingGuardedFrame ? deferredFrame.Decision.Correction : Matrix4x4.identity);
 
-            compute.SetMatrixArray(DepthCapture.ViewID, dc.View);
-            compute.SetMatrixArray(DepthCapture.ProjID, dc.Proj);
-            compute.SetMatrixArray(DepthCapture.ViewInvID, dc.ViewInv);
-            compute.SetMatrixArray(DepthCapture.ProjInvID, dc.ProjInv);
-
-            int numExclusions = Mathf.Min(ExclusionZones.Count, 64);
-            for (int i = 0; i < numExclusions; i++)
+            int numExclusions;
+            if (usingGuardedFrame)
             {
-                if (ExclusionZones[i] != null)
-                    _exclusionPositions[i] = ExclusionZones[i].position;
+                numExclusions = deferredFrame.ExclusionCount;
+                Array.Copy(deferredFrame.ExclusionPositions, _exclusionPositions,
+                    _exclusionPositions.Length);
+            }
+            else
+            {
+                numExclusions = Mathf.Min(ExclusionZones.Count, 64);
+                for (int i = 0; i < numExclusions; i++)
+                {
+                    if (ExclusionZones[i] != null)
+                        _exclusionPositions[i] = ExclusionZones[i].position;
+                }
             }
             compute.SetInt(NumExclusionsID, numExclusions);
             compute.SetVectorArray(ExclusionHeadsID, _exclusionPositions);
@@ -1747,8 +2296,9 @@ namespace Genesis.RoomScan
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
 
-            EnsureCamFrameCopy();
-            bool productionCamAvailable = _pendingCamFrame != null && _camFrameCopy != null;
+            if (!usingGuardedFrame) EnsureCamFrameCopy();
+            bool productionCamAvailable = !usingGuardedFrame &&
+                                          _pendingCamFrame != null && _camFrameCopy != null;
             if (productionCamAvailable)
             {
                 compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID, _camFrameCopy);
@@ -1767,10 +2317,10 @@ namespace Genesis.RoomScan
                 compute.SetInt(CamAvailableID, 0);
             }
 
-            _integrateKernel.Set(DepthCapture.DepthTexID, dc.DepthTex);
-            _integrateKernel.Set(DepthCapture.NormTexID, dc.NormTex);
-            _integrateKernel.Set(DepthCapture.DilatedDepthTexID, dc.DilatedDepthTex);
-            _integrateKernel.Set(DepthCapture.EdgeReasonTexID, dc.EdgeReasonTex);
+            _integrateKernel.Set(DepthCapture.DepthTexID, fusionDepth);
+            _integrateKernel.Set(DepthCapture.NormTexID, fusionNormal);
+            _integrateKernel.Set(DepthCapture.DilatedDepthTexID, fusionDilatedDepth);
+            _integrateKernel.Set(DepthCapture.EdgeReasonTexID, fusionEdgeReason);
 
             // A: unchanged production path (projective difference scaled by normal cosine).
             BeginDirtyEpoch();
@@ -1812,6 +2362,7 @@ namespace Genesis.RoomScan
 
             IntegrationCount++;
             _pendingCamFrame = null;
+            ReleaseGunGelDeferredFrame(deferredFrame);
 
             if (warmupIntegrations > 0 && IntegrationCount == warmupIntegrations)
             {

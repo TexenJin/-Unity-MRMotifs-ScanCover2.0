@@ -205,10 +205,31 @@ namespace Genesis.RoomScan
         }
         private readonly Dictionary<int, ParentTally> _parentTally =
             new Dictionary<int, ParentTally>();
+        private static readonly int3[] ParentFaceNeighbours =
+        {
+            new int3(-1, 0, 0), new int3(1, 0, 0),
+            new int3(0, -1, 0), new int3(0, 1, 0),
+            new int3(0, 0, -1), new int3(0, 0, 1)
+        };
         // 实时轨父页集合：这些页只出粗网格（tally 照记），提交时不建家族、
         // 不派生 16³ 子页——边界三角留给定稿轨（冻结后 QueueParentBlock 重
         // 提交时移出本集合，家族照常创建）补，省 8 倍子页负载。
         private readonly HashSet<int> _liveParentKeys = new HashSet<int>();
+        // Exact shared faces converge only after both pages are frozen. The
+        // queued pair rebuild is bounded by the 32^3 adjacency graph and keeps
+        // the old front buffers visible; it never fans out through live pages.
+        private readonly HashSet<int> _frozenParentKeys = new HashSet<int>();
+        private readonly HashSet<ulong> _pendingBoundaryPairs = new HashSet<ulong>();
+        private bool _frozenFinalizationActive;
+        private int _frozenFinalizationRequested;
+        private int _frozenFinalizationCompleted;
+        private int _frozenFinalizationSealedParentPages;
+        private int _frozenFinalizationSealedChildPages;
+        private int _frozenFinalizationUnbuiltQueued;
+        // A 键后所有扫描期实时页必须在静止 TSDF 上重提交一次，不能把粗页直接
+        // 当最终页封印。已有在途任务先落地，再由 Tick 排最终一遍；旧前台始终驻留。
+        private readonly HashSet<int> _frozenFinalizationNeedsQueue = new HashSet<int>();
+        private readonly HashSet<int> _frozenFinalizationResubmitPending = new HashSet<int>();
 
         public HeraHierarchicalReplay(
             VolumeIntegrator volume,
@@ -268,11 +289,21 @@ namespace Genesis.RoomScan
         public int FamiliesFinalized => _familiesSwapped + _familiesBlocked;
         public int FamiliesPending => Math.Max(0, _familiesQueued - FamiliesFinalized);
         public int ChildrenPending => Math.Max(0, ChildQueued - ChildBuilt);
+        public int ParentFinalizationPending =>
+            Math.Max(0, ParentTotal - ParentBuilt) +
+            _frozenFinalizationNeedsQueue.Count +
+            _frozenFinalizationResubmitPending.Count;
         public bool IsComplete =>
             !Failed &&
             ParentBuilt >= ParentTotal &&
             ChildBuilt >= ChildQueued &&
-            FamiliesFinalized >= FamiliesQueued;
+            FamiliesFinalized >= FamiliesQueued &&
+            ParentFinalizationPending == 0 &&
+            _pendingBoundaryPairs.Count == 0 &&
+            _parent32.PendingChunkCount == 0 &&
+            _parent32.CommitPendingCount == 0 &&
+            _child16.PendingChunkCount == 0 &&
+            _child16.CommitPendingCount == 0;
         // Vertex buffers contain an intentionally shared/copy-through payload,
         // so their count is storage, not a reliable draw statistic.
         public long StoredVertexPayload =>
@@ -303,8 +334,9 @@ namespace Genesis.RoomScan
         public long VisibleVertices => StoredVertexPayload;
 
         public string CompactStats =>
-            $"32:{ParentBuilt}/{ParentTotal} 16:{ChildBuilt}/{ChildQueued} " +
-            $"换:{FamiliesSwapped} 保:{FamiliesBlocked} 64账:{Ledger64Count}/{Ledger64Total}";
+            $"32:{ParentBuilt}/{ParentTotal} 终:{_frozenFinalizationCompleted}/{_frozenFinalizationRequested} " +
+            $"16:{ChildBuilt}/{ChildQueued} 换:{FamiliesSwapped} 保:{FamiliesBlocked} " +
+            $"64账:{Ledger64Count}/{Ledger64Total}";
 
         // 双色画面保持不变；红色现在只表达确认尚未闭环。出生来源混合仍可
         // 请求 16 级复核，但不再单独把已经真实确认的三角染红。
@@ -318,6 +350,29 @@ namespace Genesis.RoomScan
             if (_disposed) return;
             _parent32.Tick();
             _child16.Tick();
+            QueueReadyBoundaryPairs();
+            if (_frozenFinalizationActive)
+            {
+                QueueFrozenFinalizationResubmits();
+                _frozenFinalizationCompleted = Math.Max(
+                    0, _frozenFinalizationRequested - ParentFinalizationPending);
+                if (ParentFinalizationPending == 0 &&
+                    _parent32.PendingChunkCount == 0 &&
+                    _parent32.CommitPendingCount == 0 &&
+                    _child16.PendingChunkCount == 0 &&
+                    _child16.CommitPendingCount == 0 &&
+                    FamiliesPending == 0)
+                {
+                    _frozenFinalizationSealedParentPages =
+                        _parent32.SealCommittedStaticReplayPages();
+                    _frozenFinalizationSealedChildPages =
+                        _child16.SealCommittedStaticReplayPages();
+                    _frozenFinalizationActive = false;
+                    Logger.Info(
+                        $"HERA：A键前台快照封存完成 " +
+                        $"{_frozenFinalizationCompleted}/{_frozenFinalizationRequested}");
+                }
+            }
             // 全场绘制验证以 ParentBuilt>=ParentTotal 为前提，增量模式永远不满足，
             // 且其呈现锁已在构造时解开——增量模式跳过该验证。
             if (!_incrementalMode)
@@ -379,26 +434,61 @@ namespace Genesis.RoomScan
         public bool IsIncremental => _incrementalMode;
 
         /// <summary>
-        /// Promote the live incremental hierarchy into the frozen full-volume
-        /// replay in place.  Existing parent snapshots and per-page candidate
-        /// history remain authoritative; only pages that have never committed
-        /// are queued.  This is the production hand-off, not a diagnostic copy.
+        /// Finalize the live hierarchy in place. Every scan-time live parent is
+        /// resubmitted against the still TSDF after A; never-built pages are also
+        /// completed. Existing fronts stay visible until each replacement commits,
+        /// and only then are parent/rescue pages sealed as the frozen product.
         /// </summary>
         public bool BeginFrozenFinalization()
         {
             if (_disposed || !_incrementalMode)
                 return false;
 
-            _incrementalMode = false;
-            // No more live/frozen routing exists after A.  An in-flight parent
-            // callback now belongs to the final track and may create its normal
-            // rescue family.
+            int livePages = _liveParentKeys.Count;
+            _frozenFinalizationNeedsQueue.Clear();
+            _frozenFinalizationResubmitPending.Clear();
+            foreach (int parentKey in _liveParentKeys)
+                _frozenFinalizationNeedsQueue.Add(parentKey);
+
+            // The adjacency queue belongs to the moving scan-time generation.
+            // No old pair debt may cross A and mutate the sealed front.
+            _pendingBoundaryPairs.Clear();
+            _frozenParentKeys.Clear();
             _liveParentKeys.Clear();
-            int queued = _parent32.QueueUnbuiltStaticReplayChunks();
+            _incrementalMode = false;
+            _frozenFinalizationActive = true;
+            _frozenFinalizationSealedParentPages = 0;
+            _frozenFinalizationSealedChildPages = 0;
+            _frozenFinalizationRequested = ParentTotal + livePages;
+            _frozenFinalizationCompleted = Math.Max(
+                0, _frozenFinalizationRequested - ParentFinalizationPending);
+            _frozenFinalizationUnbuiltQueued =
+                _parent32.QueueUnbuiltStaticReplayChunks();
             Logger.Info(
-                $"HERA：增量层原地转全场收尾；保留已建父页={ParentBuilt}，" +
-                $"补排未建父页={queued}");
+                $"HERA：A键进入静止提交屏障；实时页统一重提={livePages}，" +
+                $"补未建父页={_frozenFinalizationUnbuiltQueued}，旧前台保持到新页落地");
             return true;
+        }
+
+        private void QueueFrozenFinalizationResubmits()
+        {
+            if (_frozenFinalizationNeedsQueue.Count == 0) return;
+            List<int> ready = null;
+            foreach (int parentKey in _frozenFinalizationNeedsQueue)
+            {
+                int3 coordinate = Unflatten(parentKey, _parentGrid);
+                if (_parent32.IsChunkInFlight(coordinate)) continue;
+                (ready ??= new List<int>()).Add(parentKey);
+            }
+            if (ready == null) return;
+            for (int i = 0; i < ready.Count; i++)
+            {
+                int parentKey = ready[i];
+                int3 coordinate = Unflatten(parentKey, _parentGrid);
+                if (!_parent32.RebuildStaticReplayChunk(coordinate)) continue;
+                _frozenFinalizationNeedsQueue.Remove(parentKey);
+                _frozenFinalizationResubmitPending.Add(parentKey);
+            }
         }
 
         /// <summary>已提交的父页数（HUD"精修上屏 n 页"；重提交不重复计数）。</summary>
@@ -414,6 +504,25 @@ namespace Genesis.RoomScan
         public float ParentAvgQueueToCommitMs => _disposed ? 0f : _parent32.AvgQueueToCommitMs;
         /// <summary>父页派发→回读回调往返 EMA（ms，HUD 计时账）。</summary>
         public float ParentAvgDispatchToCallbackMs => _disposed ? 0f : _parent32.AvgDispatchToCallbackMs;
+        /// <summary>
+        /// A page product exists only after a non-empty parent front snapshot or
+        /// a finalized child16 rescue patch is published.  Queue attempts,
+        /// empty Built pages and aggregate ParentBuilt counts are not products.
+        /// </summary>
+        public bool HasPublishedPageProduct(int3 coordinate)
+        {
+            if (_disposed || math.any(coordinate < 0) || math.any(coordinate >= _parentGrid))
+                return false;
+            if (_parent32.HasCommittedSurface(coordinate))
+                return true;
+
+            int parentKey = Flatten(coordinate, _parentGrid);
+            if (!_families.TryGetValue(parentKey, out Family family) || !family.Finalized)
+                return false;
+            if (family.Swapped)
+                return family.ChildKept + family.TriangleBoundaryCommitted > 0;
+            return family.MixedCommitted && family.MixedCommittedTriangles > 0;
+        }
         /// <summary>32³父页的发布/相邻版本同步债，只读，不参与排队或提交。</summary>
         public string ParentSyncDebtCompact => _disposed
             ? "块诊断无"
@@ -434,15 +543,17 @@ namespace Genesis.RoomScan
         /// <summary>
         /// 冻结成功的 32³ 块入场精修。父页网格与冻结网格同尺寸同原点（已核验同构：
         /// 体积 192×128×192 下双方都是 6×4×6，线性化公式一致），坐标直译。
-        /// 邻页不主动刷新：冻结只翻 weight 符号不改 abs 几何，共享面体素的证据
-        /// 在邻块冻结前本就未定格，刷了也是旧值——等邻块自己冻结时重排即可。
+        /// 邻页在仍活动时不刷新：共享面证据尚未定格。等相邻两页都冻结后，才把
+        /// 这一对加入边界收敛队列；旧前台快照一直保留到成对重提分别提交完成。
         /// </summary>
-        public bool QueueParentBlock(int3 coordinate)
+        public bool QueueParentBlock(int3 coordinate, bool urgent = false)
         {
             if (_disposed || !_incrementalMode) return false;
             // 定稿轨接管：移出实时集合，本次提交若有问题三角则照常建家族。
             _liveParentKeys.Remove(Flatten(coordinate, _parentGrid));
-            if (!_parent32.QueueStaticReplayChunk(coordinate)) return false;
+            if (!_parent32.QueueStaticReplayChunk(
+                    coordinate, liveProgressive: false, urgent: urgent)) return false;
+            MarkParentFrozen(coordinate);
             // 解冻期被隐藏的页在重冻重建后要恢复可见（非家族页没人替它开）。
             _parent32.SetChunkVisible(coordinate, true);
             return true;
@@ -453,13 +564,30 @@ namespace Genesis.RoomScan
         /// 不建家族（16³ 救回/边界补丁留给冻结后的定稿轨），tally/红占比照常记账，
         /// HUD 视线块状态不受影响。页随块级节流周期性重提交=缺肉长肉直播。
         /// </summary>
-        public bool QueueLiveParentBlock(int3 coordinate)
+        public bool QueueLiveParentBlock(int3 coordinate, bool urgent = false)
         {
             if (_disposed || !_incrementalMode) return false;
-            if (!_parent32.QueueStaticReplayChunk(coordinate)) return false;
-            _liveParentKeys.Add(Flatten(coordinate, _parentGrid));
-            _parent32.SetChunkVisible(coordinate, true);
+            if (!_parent32.QueueStaticReplayChunk(
+                    coordinate, liveProgressive: true, urgent: urgent)) return false;
+            KeepParentBlockLive(coordinate);
             return true;
+        }
+
+        /// <summary>
+        /// Transition one parent from final/refined identity back to live identity without
+        /// withdrawing its resident parent snapshot.  16^3 remains rescue-only and is
+        /// retracted here because its evidence belonged to the previous frozen generation.
+        /// </summary>
+        public void KeepParentBlockLive(int3 coordinate)
+        {
+            if (_disposed || !_incrementalMode) return;
+            int parentKey = Flatten(coordinate, _parentGrid);
+            _frozenParentKeys.Remove(parentKey);
+            RemovePendingBoundaryPairs(parentKey);
+            _liveParentKeys.Add(parentKey);
+            if (_families.TryGetValue(parentKey, out Family family))
+                RemoveFamilyIncremental(parentKey, family);
+            _parent32.SetChunkVisible(coordinate, true);
         }
 
         /// <summary>
@@ -470,9 +598,11 @@ namespace Genesis.RoomScan
         public void InvalidateParentBlock(int3 coordinate)
         {
             if (_disposed || !_incrementalMode) return;
-            _liveParentKeys.Remove(Flatten(coordinate, _parentGrid));
-            _parent32.SetChunkVisible(coordinate, false);
             int parentKey = Flatten(coordinate, _parentGrid);
+            _liveParentKeys.Remove(parentKey);
+            _frozenParentKeys.Remove(parentKey);
+            RemovePendingBoundaryPairs(parentKey);
+            _parent32.SetChunkVisible(coordinate, false);
             if (_parentTally.TryGetValue(parentKey, out ParentTally tally))
             {
                 _parentResults--;
@@ -505,6 +635,79 @@ namespace Genesis.RoomScan
             if (_families.TryGetValue(parentKey, out Family family))
                 RemoveFamilyIncremental(parentKey, family);
         }
+
+        private void MarkParentFrozen(int3 coordinate)
+        {
+            if (math.any(coordinate < 0) || math.any(coordinate >= _parentGrid))
+                return;
+
+            int parentKey = Flatten(coordinate, _parentGrid);
+            if (!_frozenParentKeys.Add(parentKey))
+                return;
+            for (int i = 0; i < ParentFaceNeighbours.Length; i++)
+            {
+                int3 neighbour = coordinate + ParentFaceNeighbours[i];
+                if (math.any(neighbour < 0) || math.any(neighbour >= _parentGrid))
+                    continue;
+                int neighbourKey = Flatten(neighbour, _parentGrid);
+                if (_frozenParentKeys.Contains(neighbourKey))
+                    _pendingBoundaryPairs.Add(PackParentPair(parentKey, neighbourKey));
+            }
+        }
+
+        private void RemovePendingBoundaryPairs(int parentKey)
+        {
+            _pendingBoundaryPairs.RemoveWhere(pair =>
+                ParentPairA(pair) == parentKey || ParentPairB(pair) == parentKey);
+        }
+
+        private void QueueReadyBoundaryPairs()
+        {
+            if (_pendingBoundaryPairs.Count == 0 ||
+                _parent32.PendingChunkCount > 0 ||
+                _parent32.CommitPendingCount > 0)
+                return;
+
+            ulong readyPair = 0;
+            bool found = false;
+            foreach (ulong pair in _pendingBoundaryPairs)
+            {
+                int3 a = Unflatten(ParentPairA(pair), _parentGrid);
+                int3 b = Unflatten(ParentPairB(pair), _parentGrid);
+                if (_parent32.IsChunkInFlight(a) || _parent32.IsChunkInFlight(b))
+                    continue;
+                readyPair = pair;
+                found = true;
+                break;
+            }
+            if (!found)
+                return;
+
+            int3 pageA = Unflatten(ParentPairA(readyPair), _parentGrid);
+            int3 pageB = Unflatten(ParentPairB(readyPair), _parentGrid);
+            // RebuildStaticReplayChunk keeps each immutable front snapshot on
+            // screen until its replacement is complete. Queue only one pair at
+            // a time so the convergence pass cannot recreate the former
+            // all-pages-at-once worker/memory spike.
+            if (!_parent32.RebuildStaticReplayChunk(pageA) ||
+                !_parent32.RebuildStaticReplayChunk(pageB))
+                return;
+
+            _pendingBoundaryPairs.Remove(readyPair);
+            Logger.Info(
+                $"HERA 32³边界收敛：成对重提 {pageA.x}/{pageA.y}/{pageA.z} <-> " +
+                $"{pageB.x}/{pageB.y}/{pageB.z}，旧前台保留到提交完成");
+        }
+
+        private static ulong PackParentPair(int a, int b)
+        {
+            uint lo = (uint)Math.Min(a, b);
+            uint hi = (uint)Math.Max(a, b);
+            return ((ulong)lo << 32) | hi;
+        }
+
+        private static int ParentPairA(ulong pair) => (int)(pair >> 32);
+        private static int ParentPairB(ulong pair) => (int)(pair & 0xFFFFFFFFUL);
 
         private void RemoveFamilyIncremental(int parentKey, Family family)
         {
@@ -557,6 +760,16 @@ namespace Genesis.RoomScan
             _ledger64.Clear();
             _parentTally.Clear();
             _liveParentKeys.Clear();
+            _frozenParentKeys.Clear();
+            _pendingBoundaryPairs.Clear();
+            _frozenFinalizationActive = false;
+            _frozenFinalizationRequested = 0;
+            _frozenFinalizationCompleted = 0;
+            _frozenFinalizationSealedParentPages = 0;
+            _frozenFinalizationSealedChildPages = 0;
+            _frozenFinalizationUnbuiltQueued = 0;
+            _frozenFinalizationNeedsQueue.Clear();
+            _frozenFinalizationResubmitPending.Clear();
             _parentResults = 0;
             _childResults = 0;
             _familiesQueued = 0;
@@ -614,6 +827,8 @@ namespace Genesis.RoomScan
         {
             if (_disposed) return;
             int parentKey = Flatten(result.Coordinate, _parentGrid);
+            bool frozenFinalResubmit = _frozenFinalizationActive &&
+                                       _frozenFinalizationResubmitPending.Remove(parentKey);
             // 增量模式下同一页可能重提交（解冻重修）：先扣该页旧账再入新账，
             // 全局总账不随重建次数膨胀。全场回放每页只提交一次，tally 恒为空，
             // 行为与原路径逐字节一致。
@@ -672,6 +887,12 @@ namespace Genesis.RoomScan
             else if (oldDelegated > 0)
                 ledger.ProblemParentPages--;
 
+            // A may have caught this page while a scan-time candidate was already
+            // queued/in flight.  Account that callback, but do not derive final
+            // 16^3 rescue from it: Tick will submit the mandatory still-TSDF pass.
+            if (_frozenFinalizationActive && !frozenFinalResubmit &&
+                _frozenFinalizationNeedsQueue.Contains(parentKey))
+                return;
             if (result.DelegatedTriangles <= 0)
                 return;
             // 实时轨页只出粗网格：不建家族不派生子页，tally 已在上面记完。
@@ -961,13 +1182,23 @@ namespace Genesis.RoomScan
 
         public void AppendReport(StringBuilder sb)
         {
-            sb.AppendLine("ScanCover HERA frozen TSDF replay");
+            sb.AppendLine("ScanCover HERA sealed-front finalization");
             sb.AppendLine($"utc={DateTime.UtcNow:O}");
             sb.AppendLine($"ledger_complete={IsComplete.ToString().ToLowerInvariant()}");
             sb.AppendLine($"replay_failed={Failed.ToString().ToLowerInvariant()}");
             sb.AppendLine($"families_finalized={FamiliesFinalized}/{FamiliesQueued}");
             sb.AppendLine($"families_pending={FamiliesPending}");
             sb.AppendLine($"children_pending={ChildrenPending}");
+            sb.AppendLine($"parent32_finalization_requested={_frozenFinalizationRequested}");
+            sb.AppendLine($"parent32_finalization_completed={_frozenFinalizationCompleted}");
+            sb.AppendLine($"parent32_finalization_pending={ParentFinalizationPending}");
+            sb.AppendLine("parent32_finalization_source=sealed_incremental_front_snapshots");
+            sb.AppendLine($"parent32_finalization_sealed_at_a={_frozenFinalizationSealedParentPages}");
+            sb.AppendLine($"child16_finalization_sealed_at_a={_frozenFinalizationSealedChildPages}");
+            sb.AppendLine($"parent32_finalization_unbuilt_queued={_frozenFinalizationUnbuiltQueued}");
+            sb.AppendLine("parent32_finalization_reextract_committed_pages=false");
+            sb.AppendLine("parent32_finalization_existing_front_immutable=true");
+            sb.AppendLine("parent32_scan_boundary_debt_carried_into_finalization=false");
             sb.AppendLine("roles=64_lifetime_ledger,32_evidence_router,16_on_demand_refinement");
             sb.AppendLine("replacement=parent32_resident_plus_child16_exact_rescue_only");
             sb.AppendLine("child16_full_page_replacement_enabled=false");
@@ -1205,6 +1436,16 @@ namespace Genesis.RoomScan
             return coordinate.x + grid.x * (coordinate.y + grid.y * coordinate.z);
         }
 
+        private static int3 Unflatten(int key, int3 grid)
+        {
+            int plane = grid.x * grid.y;
+            int z = key / plane;
+            int remainder = key - z * plane;
+            int y = remainder / grid.x;
+            int x = remainder - y * grid.x;
+            return new int3(x, y, z);
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -1216,6 +1457,9 @@ namespace Genesis.RoomScan
             _families.Clear();
             _childToParent.Clear();
             _ledger64.Clear();
+            _liveParentKeys.Clear();
+            _frozenParentKeys.Clear();
+            _pendingBoundaryPairs.Clear();
         }
     }
 }

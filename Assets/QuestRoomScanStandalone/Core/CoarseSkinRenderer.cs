@@ -45,7 +45,7 @@ namespace Genesis.RoomScan
         private bool _visible = true;
         private static bool _shaderMissingLogged;
 
-        private static readonly Color SkinColor = new Color(0.55f, 0.75f, 0.95f, 0.85f);
+        private static readonly Color SkinColor = new Color(0.42f, 0.72f, 1.0f, 0.42f);
 
         private static readonly int ID_TsdfVolume = Shader.PropertyToID("_TsdfVolume");
         private static readonly int ID_VoxCount = Shader.PropertyToID("_VoxCount");
@@ -72,12 +72,16 @@ namespace Genesis.RoomScan
         public bool IsReady => _ready;
 
         /// <summary>幂等。compute 或 shader 缺失时返回 false，皮整体缺席但不影响任何既有路径。</summary>
-        public bool Initialize(ComputeShader compute, int3 voxCount, float voxSize,
+        public bool Initialize(ComputeShader compute, Shader skinShader, int3 voxCount, float voxSize,
             int stride, float minWeight, float extractHz)
         {
             if (_ready) return true;
 
-            var shader = Shader.Find("Genesis/ScanCoarseSkin");
+            // Keep a serialized shader reference in the scene. Shader.Find-only
+            // materials can be stripped from Android players even though they
+            // work in the Editor, which would make the validation route appear
+            // to have no surface at all.
+            var shader = skinShader != null ? skinShader : Shader.Find("Genesis/ScanCoarseSkin");
             if (compute == null || shader == null)
             {
                 if (!_shaderMissingLogged)

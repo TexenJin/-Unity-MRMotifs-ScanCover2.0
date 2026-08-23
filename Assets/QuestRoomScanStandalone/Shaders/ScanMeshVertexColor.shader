@@ -77,6 +77,7 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSWireThickness;
             float _RSMeshStride;
             float _RSGridSpacing;
+            float _RSPaperGridMode;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
@@ -85,6 +86,28 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSHeraReplayActive;
 
             #define DEPTH_TOLERANCE 0.015
+
+            float2 PaperGridUV(float3 positionWS, float3 normalWS)
+            {
+                float3 a = abs(normalize(normalWS));
+                if (a.x >= a.y && a.x >= a.z) return positionWS.zy;
+                if (a.y >= a.z) return positionWS.xz;
+                return positionWS.xy;
+            }
+
+            float PaperTriangleGrid(float3 positionWS, float3 normalWS)
+            {
+                float spacing = max(_RSGridSpacing, 0.04);
+                float2 p = PaperGridUV(positionWS, normalWS) / spacing;
+                float3 family = float3(
+                    p.x,
+                    0.5 * p.x + 0.8660254 * p.y,
+                   -0.5 * p.x + 0.8660254 * p.y);
+                float3 distanceToLine = abs(frac(family + 0.5) - 0.5);
+                float3 aa = max(fwidth(family) * max(_RSWireThickness, 0.55), 0.0008);
+                float3 lineCoverage = 1.0 - smoothstep(aa, aa * 1.8, distanceToLine);
+                return max(lineCoverage.x, max(lineCoverage.y, lineCoverage.z));
+            }
 
             float3 WorldToVoxelUVW(float3 worldPos)
             {
@@ -333,6 +356,17 @@ Shader "Genesis/ScanMeshVertexColor"
             // emits it; retaining this guard keeps old GPU buffers harmless.
             bool diagnosticBoundaryOnly = _RSJointDiagnostic > 0.5 &&
                                           IN.diagnosticClass == 1u;
+            if (_RSPaperGridMode > 0.5)
+            {
+                // In the hybrid route HERA contributes only the more precise
+                // surface position/normal. Coverage and the visible line
+                // pattern come from the same world-anchored paper grid used by
+                // SupportTruth, so page boundaries cannot define visual holes.
+                float grid = PaperTriangleGrid(IN.positionWS, IN.normalWS);
+                half3 paper = half3(0.11, 0.15, 0.18);
+                return half4(lerp(paper, half3(0.96, 0.98, 1.0), saturate(grid)), 1.0);
+            }
+
             if (_RSWireframe > 0.5 || diagnosticBoundaryOnly)
             {
                 float thickness = max(_RSWireThickness, 0.2);
@@ -365,7 +399,8 @@ Shader "Genesis/ScanMeshVertexColor"
                     // 条带，先天做不出 Meta 几何级粗网；②片元级世界格线画法=
                     // 实机判定观感不佳，且大网眼不利于观察底层细节。结论：Meta
                     // 的粗网必须几何级生成（路线A粗皮已落地备用，默认关），
-                    // 诊断期主显示就用密集真边。
+                    // 诊断期主显示就用密集真边。注意：纸主网格的新世界格线
+                    // 由稳定支撑层兜底覆盖，已不再受这里所述的 HERA 页面缺页约束。
                     float3 bary = IN.barycentric;
                     float3 dx = ddx(bary);
                     float3 dy = ddy(bary);

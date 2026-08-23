@@ -33,12 +33,14 @@ namespace Genesis.RoomScan
         private float wireThickness = 1.0f;
         [SerializeField, Range(1, 6), Tooltip("条带抽稀（顶点侧按体素格丢三角形，任一轴对齐即保留）。08-19 实机判定观感碎、做不出 Meta 粗网，已让世界格线画法取代，默认 1=关闭，仅留作帧率应急杠杆")]
         private int meshDisplayStride = 1;
-        [SerializeField, Range(0.1f, 1.0f), Tooltip("世界格线网眼间距（米）：片元级在网格表面直接画经纬线，间距=网眼，观感对标 Meta 系统网格。0.3=30cm 网眼（推荐）；嫌密调大，嫌疏调小")]
-        private float meshGridSpacing = 0.3f;
+        [SerializeField, Range(0.1f, 1.0f), Tooltip("纸主三角网的世界空间间距（米）。0.12m 保留旧细网对局部结构的可读性；后续视觉定稿可再放大。")]
+        private float meshGridSpacing = 0.12f;
         [SerializeField, Tooltip("置信度通道 v1 可视化（诊断开关，默认关）：开=按体素分歧 EMA 给网格着色——高置信=原色 / 中=黄 / 低=蓝紫（几何在打架）/ 无数据=灰。只读着色，不碰任何生产逻辑")]
         private bool confidenceViz = false;
         [SerializeField, Tooltip("第一阶段纯几何观察：开=所有生产/HERA网格统一白色，绕开置信、冻结和路由着色。仅显示层，不改变融合、提取或页面调度。")]
         private bool geometryTruthView = true;
+        [SerializeField, Tooltip("32³融合/冻结管理块运行时线框：淡青=稳定冻结，黄=本窗自由空间票热，红=连续两窗热，洋红=已解冻待复冻。只读显示层。")]
+        private bool showManagementBlockWireOverlay = true;
 
         [Header("覆盖范围")]
         [SerializeField, Tooltip("头部排除区（QRS 原版防自扫）：开=头周圆柱内永不生成网格（半径在 VolumeIntegrator.exclusionRadius 调）；关=周围近距也能覆盖网格")]
@@ -57,6 +59,9 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("成熟 64³ 块自动冻结（weight 翻符号不销毁 TSDF），扫描不停；穿越票双门槛解冻修复再冻。" +
                  "冻结块停止积分写入=停止重提抖动+锁住已收敛几何；解冻=翻回符号，修复由正常积分驱动。 (default true)")]
         private bool enableFrozenBlockSupervisor = true;
+        [SerializeField, Tooltip("枪胶净室追责：保留枪胶受保护融合和实时页面生产，但整卷停用逐块冻结/解冻监督。" +
+                 "用于隔离 32³ 整块速冻是否导致转角留不住、孔洞和旧页台阶；仅允许空卷切换。主对照默认关闭。 (default false)")]
+        private bool enableGunGelCleanRoomExperiment = false;
         [SerializeField, Min(0.5f), Tooltip("穿越票/成熟度统计窗（秒）：每窗回读票箱+普查成熟度。1s=新区首现/启动空窗减半（T1b；冻结时机由首达标满 1s 守卫兜底不提前）。开自适应普查后此值=快窗基准，安静期自动放慢到 2/4s。 (default 1，08-18 从 2 收紧；退回值 2)")]
         private float frozenBlockWindowSeconds = 1f;
         [SerializeField, Min(100), Tooltip("成熟判定：块内长熟体素（权重≥frozenMatureWeight）数下限（32³ 块含一面墙约 1~3k；空块/毛坯块永不冻结）。 (default 600)")]
@@ -87,8 +92,9 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("自适应普查：连续安静窗（无冻/解/生长/穿越票）后普查窗按 1→2→4s 阶梯放慢，任一活动立即打回快窗。静止场景省掉空转普查的全体积 dispatch+双回读。 (default true，08-18 晚帧率预算手术)")]
         private bool enableAdaptiveCensus = true;
 
-        [Header("实时轨（看哪出哪）")]
-        [SerializeField, Tooltip("实时轨：视线落点周边未冻块即时出网（红绿粗页，不定稿不建家族省 8 倍子页负载），冻结后由定稿轨原子接管。关=纯定稿轨（旧行为）。 (default true)")]
+        [Header("活跃页调度（看哪出哪）")]
+        [SerializeField, Tooltip("32³只保留空间容器身份。任何产生有效几何变化的页面均可出网；" +
+                 "当前视野优先，首次变脏时刻提供防饿死期限，冻结状态不再拥有出网否决权。 (default true)")]
         private bool enableLiveTrack = true;
         [SerializeField, Min(0.1f), Tooltip("实时轨巡视间隔（秒）。 (default 0.15，帧率手术后 08-18 从 0.25 放松)")]
         private float liveTrackSweepSeconds = 0.15f;
@@ -98,21 +104,22 @@ namespace Genesis.RoomScan
         private int liveTrackMaxPagesPerSecond = 10;
         [SerializeField, Min(0), Tooltip("实时轨块内容下限：普查可出网体素（≥minMeshWeight 0.08，T3 从长熟 0.15 降档——0.08~0.15 带可出网不该被当空块）低于此数的块不排。普查按 1s 窗更新，全新区域首次出网最多延迟一个窗。 (default 16)")]
         private int liveTrackMinSurfaceVoxels = 16;
+        [SerializeField, Range(0f, 0.5f), Tooltip("视锥预热外扩：0.18 表示屏幕四周再扩 18%，转头前相邻页先排队。")]
+        private float liveTrackViewportMargin = 0.18f;
+        [SerializeField, Min(0.1f), Tooltip("当前视野脏页最长等待（秒）。持续变化不得重置这个期限。")]
+        private float liveTrackVisibleDeadlineSeconds = 0.35f;
+        [SerializeField, Min(0.5f), Tooltip("视野外脏页最长等待（秒）。用于后台最终一致，防止必须转头才刷新。")]
+        private float liveTrackBackgroundDeadlineSeconds = 2f;
+        [SerializeField, Range(1, 8), Tooltip("一次巡视最多提交的32³页面数；全局页/秒硬顶仍负责GPU保护。")]
+        private int liveTrackMaxPagesPerSweep = 5;
 
         [Header("增量精修（两段合一）")]
         [SerializeField, Tooltip("成熟冻结块就地精修上屏：采集段不出粗网，冻哪块出哪块的 HERA 红绿网格；点阵默认隐藏（X 呼出当判官）。" +
                  "关=旧两段式（采集只点阵，A 冻结才出网格）。需同时开启 HERA 分层回放。 (default true)")]
         private bool enableIncrementalHeraRefine = true;
-        [SerializeField, Min(1f), Tooltip("解冻后旧网格页保留宽限（秒）：宽限内复冻则原子换新、画面不闪空；超期未复冻（家具真搬走等）才撤页露洞。" +
-                 "解冻源多为手/身体短暂遮挡的穿越票，没有宽限会冻-解-冻振荡=整块闪烁。 (default 8)")]
-        private float frozenPageInvalidateGraceSeconds = 8f;
         [SerializeField, Min(0f), Tooltip("复冻重提冷却（秒）：振荡块在冷却内复冻不立刻重提，到点由维护时钟补提（最终一致）。" +
-                 "首冻/被撤页过的块不受限。防冻-解振荡的重提洪流灌满提取队列、饿死新块出网（实机：后期解升温+新页不再出现）。 (default 15)")]
+                 "首冻不受限。旧父页始终驻留，冷却只合并重复任务，不再撤页或强制复冻。 (default 15)")]
         private float frozenPageRequeueCooldownSeconds = 15f;
-        [SerializeField, Min(1), Tooltip("复冻兜底：宽限超期时解冻次数≥此值的振荡惯犯块不撤页、强制冻回静态几何求安分；" +
-                 "真变化由穿越票走解冻棘轮硬闯（按不死，只慢一两窗）。初犯块照走撤页快路径（家具真搬走不受拖累）。" +
-                 "阻尼封顶原则：这是调度层最后一个阻尼器，之后的'不安分'只准去数据层治。 (default 2)")]
-        private int frozenRefreezeMinThaws = 2;
 
         [Header("平面拍平（B1 影子，只读验证）")]
         [SerializeField, Tooltip("B1 影子平面拟合：对视线落点块的当帧高质量观测做 PCA 平面拟合（只读不写 TSDF），" +
@@ -162,6 +169,10 @@ namespace Genesis.RoomScan
         // ── 逐块可逆冻结调度器状态 ──
         private readonly HashSet<int> _frozenBlocks = new HashSet<int>();
         private readonly HashSet<int> _hotBlocksPrevWindow = new HashSet<int>();
+        private readonly HashSet<int> _managementHotBlocks = new HashSet<int>();
+        private readonly HashSet<int> _managementConfirmedHotBlocks = new HashSet<int>();
+        private readonly HashSet<int> _managementThawedBlocks = new HashSet<int>();
+        private FrozenBlockWireOverlay _managementBlockWireOverlay;
         private int[] _maturityPrevSurface;
         private uint[] _freezeSetMask;
         private uint[] _freezeClearMask;
@@ -177,8 +188,6 @@ namespace Genesis.RoomScan
         private float _censusCurrentWindow = 1f;
         private int _lastVotesHotCount;
         private int _frozenBlockUnfreezeEvents;
-        // 复冻兜底账：宽限超期被强制冻回的振荡惯犯块次数（HUD"回N"）。
-        private int _forceRefreezeEvents;
         // 资格门账：因低置信占比超阈被拒冻的块次（累计，HUD"资N"）。
         private int _freezeGateRejected;
         // 资格年审账：已冻块低置信超降级阈被收回资格的块次（累计，HUD"审N"）+
@@ -265,8 +274,6 @@ namespace Genesis.RoomScan
         private int _planePointCount;
         private char _planeAxis = '?';
         private int _supervisorWatchdogResets;
-        // 解冻块的宽限撤页表：块号 → 到期时刻（Time.time）。复冻即取消。
-        private readonly Dictionary<int, float> _pendingPageInvalidate = new Dictionary<int, float>();
         // 重提冷却账：块号 → 上次实际排队时刻 / 冷却内复冻的延迟补提时刻。
         private readonly Dictionary<int, float> _lastPageQueueTime = new Dictionary<int, float>();
         private readonly Dictionary<int, float> _deferredPageRequeue = new Dictionary<int, float>();
@@ -282,10 +289,17 @@ namespace Genesis.RoomScan
         // 实时轨状态：巡视时钟 / 块级节流账 / 全局速率窗。
         private float _liveTrackLastSweep = -1f;
         private readonly Dictionary<int, float> _livePageQueueTime = new Dictionary<int, float>();
-        // 内容闸账（T1a）：块号 → 上次排队时的全局融合 epoch。脏块 epoch（64³，
-        // MarkDirtyChunk 只在几何级变化时记账）超过它=该块真变过才重提——帧级新鲜，
-        // 取代旧"普查长熟数没变"判据（2s 相位=出网脉冲与"看着不涨"的主谋）。
+        // 尝试账（T1a）：块号 → 上次排队尝试时的页面 epoch。它只证明请求发出过，
+        // 不证明页面 Built，更不证明已有非空前台；覆盖债必须由 HERA 的逐页发布产物
+        // 查询单独结清。脏块 epoch 超过它仍表示已有页发生了新几何变化。
         private readonly Dictionary<int, uint> _liveQueuedEpoch = new Dictionary<int, uint>();
+        // 缺产品页专用观察账：记录上次排队时已消费到哪一次“融合仍看到表面”。
+        // 它不替代几何 epoch，只让空产品重试脱离冻结成熟度普查的慢时钟。
+        private readonly Dictionary<int, uint> _liveQueuedObservedEpoch = new Dictionary<int, uint>();
+        // 首次脏时刻只记一次，后续变化不能重置，避免繁忙转角永久饿死。
+        private readonly Dictionary<int, float> _liveDirtySince = new Dictionary<int, float>();
+        // 每个32³页面六个面的边界债已观察 epoch；债务同时唤醒共享面的两页。
+        private uint[] _liveBoundaryEpochConsumed;
         // 网格资格账（普查 z 槽）：块号 → 可出网（≥minMeshWeight）体素数。空闸判据（T3）。
         private int[] _meshablePrevSurface;
         // 首达标时刻账：块号 → 普查首次报满成熟下限的时刻（T1b 防冻结随普查窗缩短提前）。
@@ -297,6 +311,7 @@ namespace Genesis.RoomScan
         // 排=成功排队 / 冻=定稿轨地盘 / 空=长熟数不足 / 冷=块级节流 / 内=内容闸 / 途=在途 / 速=速率硬顶。
         private int _liveGateQueued, _liveGateFrozen, _liveGateEmpty, _liveGateCool,
                     _liveGateContent, _liveGateFlight, _liveGateRate;
+        private int _liveDirtyCount, _liveVisibleDirtyCount, _liveOverdueCount, _liveBoundaryDebtCount;
         // 计时账（EMA α=0.25）：融合/提取 CPU 耗时 + 提取实际节拍（拍/s）。
         private float _emaIntegrateMs = -1f;
         private float _emaHeraTickMs = -1f;
@@ -309,23 +324,65 @@ namespace Genesis.RoomScan
         private bool _chunkAbFrozen;
         private bool _chunkAbDiagnosticColoring = true;
         private ObservationCoverageOverlay _coverageOverlay;
+        private DepthPointCloudOverlay _depthPointCloudOverlay;
+        private bool _bbPresentationCaptured;
+        private bool _bbRestoreMeshVisible;
+        private bool _bbRestoreCoarseSkinVisible;
+        private bool _bbRestoreManagementBlocks;
         private float _heraFreezeStartedAt = -1f;
         private float _heraLastProgressAt = -1f;
         private string _heraLastProgressSignature = "";
 
         public bool IsChunkAbExperimentEnabled => enableFrozenChunkAbExperiment;
         public bool IsChunkAbFrozen => _chunkAbFrozen;
+        public bool IsGunGelCleanRoomEnabled => enableGunGelCleanRoomExperiment;
         public int ActiveChunkAbSize => ChunkAbSizes[Mathf.Clamp(_chunkAbGearIndex, 0, ChunkAbSizes.Length - 1)];
 
         /// <summary>当前是否线框显示。</summary>
         public bool IsWireframe => wireframeMode;
+        private bool FrozenBlockSupervisorEffective =>
+            enableFrozenBlockSupervisor && !enableGunGelCleanRoomExperiment;
+
+        private bool GunGelGuardedFusionEnabled =>
+            _volumeIntegrator != null && _volumeIntegrator.GunGelGuardedFusionExperimentEnabled;
+
+        /// <summary>
+        /// 主对照身份。胶冻/原冻的冻结监督完全相同；胶活/原活仅保留给
+        /// 净室追责，不作为本轮生产 A/B 入口。
+        /// </summary>
+        private string CaptureModeLabel => enableGunGelCleanRoomExperiment
+            ? (GunGelGuardedFusionEnabled ? "胶活" : "原活")
+            : (GunGelGuardedFusionEnabled ? "胶冻" : "原冻");
+
+        private string CaptureModeToken => enableGunGelCleanRoomExperiment
+            ? (GunGelGuardedFusionEnabled ? "gel_live" : "base_live")
+            : (GunGelGuardedFusionEnabled ? "gel_freeze" : "base_freeze");
+
+        private void SyncCaptureModeIdentity()
+        {
+            _meshExtractor?.SetCaptureModeIdentity(CaptureModeLabel, CaptureModeToken);
+        }
 
         /// <summary>在线框 / 顶点色实体之间切换（QRS SetRenderMode 的二态精简版）。</summary>
         public void ToggleWireframe()
         {
+            if (_meshExtractor != null && _meshExtractor.IsPaperFineHybridVisible)
+            {
+                bool paperGrid = _meshExtractor.TogglePaperOwnedGrid();
+                NotifyInput(paperGrid ? "纸网：纸拓扑纯显" : "纸网：HERA旧网格");
+                RefreshStatusBadge();
+                return;
+            }
+
             wireframeMode = !wireframeMode;
             ApplyDisplayMode();
-            NotifyInput(wireframeMode ? "切到线框" : "切到实体");
+            bool supportTruthOnly = _meshExtractor != null &&
+                                    _meshExtractor.IsSupportTruthOnlyVisible;
+            _meshExtractor?.SetSupportTruthAudit(wireframeMode);
+            if (supportTruthOnly)
+                NotifyInput(wireframeMode ? "支撑：圆点原料" : "支撑：纸拓扑独显");
+            else
+                NotifyInput(wireframeMode ? "切到线框" : "切到实体");
         }
 
         /// <summary>第一阶段白网 A/B：只切最终着色，所有后台数据与调度继续运行。</summary>
@@ -350,14 +407,21 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// 帧率二分总闸（右摇杆直接按下）：切"当前真正在画网格的那条路径"。
+        /// 路线验证总闸（右摇杆直接按下）：切"当前真正在画网格的那条路径"。
         /// A/B 实验旗下开机即 PrepareForChunkAbAcquisition，renderProductionMesh 恒
         /// false、满屏网全来自增量 HERA——所以扫描中必须切增量 HERA，切旧字段是空转。
-        /// 只藏绘制；融合/提取/精修/记账后台照跑。
+        /// 支撑真值/三角粗皮下暂停 HERA；纸网合流同时保留稳定底纸和增量 HERA。
         /// </summary>
         public void ToggleMeshDisplay()
         {
             if (_meshExtractor == null) return;
+            if (_meshExtractor.IsRouteValidationActive)
+            {
+                string route = _meshExtractor.CycleRouteValidationView();
+                NotifyInput($"显示：{route}");
+                RefreshStatusBadge();
+                return;
+            }
             bool visible = _meshExtractor.HasIncrementalHera
                 ? _meshExtractor.ToggleIncrementalHeraVisible()
                 : _meshExtractor.ToggleProductionMeshVisible();
@@ -385,6 +449,29 @@ namespace Genesis.RoomScan
         {
             enableFrozenBlockSupervisor = !enableFrozenBlockSupervisor;
             NotifyInput(enableFrozenBlockSupervisor ? "冻结调度:开" : "冻结调度:关");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// 第一轮旧机制追责：在同一 APK 中切换“枪胶净室”与“旧冻结监督”。
+        /// 必须在空卷、尚未开始扫描时切换，避免两套规则污染同一份 TSDF。
+        /// 净室只隔离逐块冻结/解冻；枪胶守门、实时页生产和扣减规则保持不变。
+        /// </summary>
+        public void ToggleGunGelCleanRoomExperiment()
+        {
+            bool volumeHasData = _volumeIntegrator != null && _volumeIntegrator.IntegrationCount > 0;
+            if (IsScanning || HasStarted || _chunkAbFrozen || volumeHasData || _frozenBlocks.Count > 0)
+            {
+                NotifyInput("净室切换:需重启空卷");
+                RefreshStatusBadge();
+                return;
+            }
+
+            enableGunGelCleanRoomExperiment = !enableGunGelCleanRoomExperiment;
+            ResetFrozenBlockSupervisor();
+            NotifyInput(enableGunGelCleanRoomExperiment
+                ? "追责:净室(逐块冻停)"
+                : "追责:旧冻机制");
             RefreshStatusBadge();
         }
 
@@ -423,6 +510,46 @@ namespace Genesis.RoomScan
             RefreshStatusBadge();
         }
 
+        /// <summary>左摇杆右+按：32³融合管理块线框只读层。</summary>
+        public void ToggleManagementBlockWireOverlay()
+        {
+            showManagementBlockWireOverlay = !showManagementBlockWireOverlay;
+            EnsureManagementBlockWireOverlay();
+            _managementBlockWireOverlay?.SetVisible(showManagementBlockWireOverlay);
+            NotifyInput(showManagementBlockWireOverlay ? "32块框:开" : "32块框:关");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// 空卷时切换胶冻/原冻。两边强制共用同一套旧冻结监督，只改变
+        /// 融合前是否启用枪胶受保护准入；开扫后锁死，必须重启新卷再换。
+        /// </summary>
+        public void ToggleGunGelGuardedFusionExperiment()
+        {
+            if (_volumeIntegrator == null)
+            {
+                NotifyInput("枪胶融:未就绪");
+                return;
+            }
+
+            bool volumeHasData = _volumeIntegrator.IntegrationCount > 0;
+            if (IsScanning || HasStarted || _chunkAbFrozen || volumeHasData || _frozenBlocks.Count > 0)
+            {
+                NotifyInput($"{CaptureModeLabel}已锁定:需重启空卷");
+                RefreshStatusBadge();
+                return;
+            }
+
+            // 成对实验必须只剩枪胶一个变量：两组都恢复相同的旧冻结监督。
+            enableGunGelCleanRoomExperiment = false;
+            enableFrozenBlockSupervisor = true;
+            ResetFrozenBlockSupervisor();
+            _volumeIntegrator.ToggleGunGelGuardedFusionExperiment();
+            SyncCaptureModeIdentity();
+            NotifyInput($"对照模式:{CaptureModeLabel}");
+            RefreshStatusBadge();
+        }
+
         [Header("日志")]
         [SerializeField] private LogLevel logLevel = LogLevel.Info;
 
@@ -433,6 +560,8 @@ namespace Genesis.RoomScan
 
         [Header("Minimal Status Badge")]
         [SerializeField] private bool showStatusBadge = true;
+        [SerializeField, Tooltip("开启后恢复冻结票、置信度、页面债、计时账等完整诊断 HUD；默认隐藏，后台统计不受影响。")]
+        private bool showDetailedRuntimeStatus = false;
         private UnityEngine.UI.Text _statusBadgeText;
 
         /// <summary>正在融合（未暂停）。</summary>
@@ -468,15 +597,17 @@ namespace Genesis.RoomScan
         {
             Instance = this;
             // Runtime lock: serialized scene values cannot accidentally revive
-            // the in-headset HUD, diagnostic ROI frame, or depth point cloud.
+            // the in-headset HUD or diagnostic ROI frame.  The BB depth probe is
+            // always present but starts hidden and is explicitly toggled by X.
             showDebugHud = false;
             showDiagnosticRoiFrame = false;
-            showDepthPointCloud = false;
             Logger.Level = logLevel;
             _depthCapture = GetComponent<DepthCapture>();
             _volumeIntegrator = GetComponent<VolumeIntegrator>();
             _meshExtractor = GetComponent<MeshExtractor>();
             _cameraProvider = GetComponent<PassthroughCameraProvider>();
+            SyncCaptureModeIdentity();
+            EnsureManagementBlockWireOverlay();
             _volumeIntegrator.Cleared += ResetFrozenBlockSupervisor;
             SetSafeShaderDefaults();
         }
@@ -498,7 +629,10 @@ namespace Genesis.RoomScan
                     _coverageOverlay = gameObject.AddComponent<ObservationCoverageOverlay>();
                 _meshExtractor.PrepareForChunkAbAcquisition();
             }
-            if (showDepthPointCloud) gameObject.AddComponent<DepthPointCloudOverlay>();
+            _depthPointCloudOverlay = GetComponent<DepthPointCloudOverlay>();
+            if (_depthPointCloudOverlay == null)
+                _depthPointCloudOverlay = gameObject.AddComponent<DepthPointCloudOverlay>();
+            _depthPointCloudOverlay.SetVisible(false);
             StartCoroutine(ConfigureCameraForPassthrough());
             if (showStatusBadge)
                 StartCoroutine(CreateStatusBadgeWhenCameraReady());
@@ -508,7 +642,7 @@ namespace Genesis.RoomScan
             Logger.Info(enableFrozenChunkAbExperiment
                 ? (enableHeraHierarchicalReplay
                     ? (enableIncrementalHeraRefine
-                        ? "增量精修就绪 — 扳机采集，成熟块自动定稿上屏，X 点阵判官，A 冻结全场回放"
+                        ? "增量精修就绪 — 扳机采集，成熟块自动定稿上屏，X BB反投影，A 冻结全场回放"
                         : "HERA 就绪 — 扳机采集，A 冻结并自动 32→16，B 导出并清派生网格")
                     : "切块 A/B 就绪 — 扳机采集，A 冻结，Y 换 64/32/16，B 导出并清当前档")
                 : "QRS 独立链就绪 — 右手柄扳机开始扫描，A 暂停，B 停止清空");
@@ -620,6 +754,28 @@ namespace Genesis.RoomScan
                     _badgeNextRefresh = Time.unscaledTime + 0.4f;
                     float coverage = _coverageOverlay != null ? _coverageOverlay.CoveragePercent : 0f;
                     _statusBadgeText.color = new Color(0.25f, 1f, 0.45f, 1f);
+                    if (!showDetailedRuntimeStatus)
+                    {
+                        string compactMode = CaptureModeLabel;
+                        string compactFreeze = !FrozenBlockSupervisorEffective ? "停" : "开";
+                        int compactPages = _meshExtractor != null
+                            ? _meshExtractor.IncrementalHeraPagesCommitted
+                            : 0;
+                        float compactFps = 1f / Mathf.Max(0.001f, Time.smoothDeltaTime);
+                        float compactQuality = _volumeIntegrator != null
+                            ? _volumeIntegrator.MotionQuality
+                            : 1f;
+                        string compactGunGel = _volumeIntegrator != null
+                            ? _volumeIntegrator.GetGunGelEvidenceShadowCompact()
+                            : "无";
+                        _statusBadgeText.text =
+                            $"● 采集·{compactMode}  覆{coverage,3:0}%  质{compactQuality:F2}  帧{compactFps:0}\n" +
+                            $"枪胶:{compactGunGel}\n" +
+                            $"{(_meshExtractor != null ? _meshExtractor.RouteValidationLabel : "无显示")} " +
+                            $"{(_meshExtractor != null ? _meshExtractor.SupportTruthStatsCompact : "纸无")} · " +
+                            $"冻{compactFreeze}  实{(enableLiveTrack ? "开" : "停")}  页{compactPages}  融{integrationHz:0}Hz · A冻结";
+                        return;
+                    }
                     string frozenTail = _frozenBlockUnfreezeEvents > 0
                         ? $" · 冻{_frozenBlocks.Count}解{_frozenBlockUnfreezeEvents}"
                         : (_frozenBlocks.Count > 0 ? $" · 冻{_frozenBlocks.Count}" : "");
@@ -627,10 +783,6 @@ namespace Genesis.RoomScan
                         frozenTail += $"实{_liveTrackQueuedTotal}";
                     if (_holeRequeueEvents > 0)
                         frozenTail += $"补{_holeRequeueEvents}";
-                    // 复冻兜底活度：回N=振荡惯犯块被强制冻回次数。回N 涨+解/冻比降=兜底在灭火；
-                    // 回N 涨但折角仍闪=该块的穿越票在棘轮下仍能硬闯，说明是真变化信号而非振荡。
-                    if (_forceRefreezeEvents > 0)
-                        frozenTail += $"回{_forceRefreezeEvents}";
                     // 资格门活度：资N=因低置信占比超阈被拒冻的块次（累计）。资涨+冻涨慢=
                     // 噪声荒漠/打架块被挡在冻结门外保持活代谢（v2.2 优势回归）；折角拍稳后
                     // 置信升→资停涨+该块入冻=资格门按设计闭环。资0=没有块撞门（或门被关）。
@@ -686,8 +838,6 @@ namespace Genesis.RoomScan
                         if (qd > 0 || inf > 0)
                             frozenTail += $"队{qd}途{inf}";
                     }
-                    if (_pendingPageInvalidate.Count > 0)
-                        frozenTail += $"缓{_pendingPageInvalidate.Count}";
                     // 看门狗活度：调度（6s 窗回读丢失）+ 提交（10s 页回读丢失）。
                     // 频繁增长=Quest 在静默丢 GPU 回读，是"出网不灵敏"的负载信号。
                     int commitWatchdogs = _meshExtractor != null ? _meshExtractor.IncrementalHeraWatchdogResets : 0;
@@ -698,7 +848,7 @@ namespace Genesis.RoomScan
                     // 视线路径可出网体素不足（深色面稀疏/真没扫到）；内多=完工墙静止（正常）；
                     // 冷/速多=节流过狠；途多=回读跟不上。
                     string liveGate = enableLiveTrack
-                        ? $" · 活[排{_liveGateQueued}冻{_liveGateFrozen}空{_liveGateEmpty}冷{_liveGateCool}内{_liveGateContent}途{_liveGateFlight}速{_liveGateRate}]"
+                        ? $" · 出[排{_liveGateQueued}待{_liveDirtyCount}视{_liveVisibleDirtyCount}期{_liveOverdueCount}缝{_liveBoundaryDebtCount}途{_liveGateFlight}]"
                         : "";
                     // 置信度通道普查回读（分歧 EMA 三档+低置信相干拆分）：
                     // 高=逐帧观测一致；低=几何在打架，拆 干=签名一致(纠错嫌疑/闸放行)
@@ -726,7 +876,8 @@ namespace Genesis.RoomScan
                     string filterLabel = _depthCapture == null ? "—"
                         : (_depthCapture.BilateralEnabled ? (_depthCapture.EdgeCleanEnabled ? "开" : "双")
                         : (_depthCapture.EdgeCleanEnabled ? "半" : "关"));
-                    string frozenLabel = !enableFrozenBlockSupervisor ? "关"
+                    string accountabilityLabel = CaptureModeLabel;
+                    string frozenLabel = !FrozenBlockSupervisorEffective ? "停"
                         : enableAdaptiveCensus ? $"开{_censusCurrentWindow:0}s"  // 自适应普查窗回显：1s=有活动 2/4s=安静期
                         : "开";
                     // 手部语义剔除读数（08-20）：剔=平台原生手部剔除（开=生效，关=未支持/未开）；
@@ -743,16 +894,26 @@ namespace Genesis.RoomScan
                         : !_depthCapture.TemporalFilterEnabled ? " 时关"
                         : !_depthCapture.HasTemporalStats ? " 时开"
                         : $" 时稳{_depthCapture.LastTemporalStablePixels}变{_depthCapture.LastTemporalChangedPixels}";
-                    string toggleLine = $"闸[实{(enableLiveTrack ? "开" : "关")} 冻{frozenLabel} " +
+                    string pairedCaptureLabel = _depthCapture == null ? ""
+                        : _depthCapture.PairedFrameCaptureActive
+                            ? $" 双采开(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped})"
+                            : _depthCapture.PairedFrameCapturePending > 0
+                                ? $" 双采写(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped})"
+                                : "";
+                    string toggleLine = $"闸[责{accountabilityLabel} 实{(enableLiveTrack ? "开" : "关")} 冻{frozenLabel} " +
                                         $"融{integrationHz:0} 滤{filterLabel} " +
                                         $"显{(_meshExtractor != null && _meshExtractor.IsAnyMeshVisible ? "开" : "关")}" +
                                         $"皮{(_meshExtractor == null || !_meshExtractor.HasCoarseSkin ? "无" : (_meshExtractor.IsCoarseSkinVisible ? "开" : "关"))}" +
-                                        $"{(meshDisplayStride > 1 ? $" 网{meshDisplayStride}" : "")}]{handLabel}{temporalLabel}";
+                                        $" 框{(showManagementBlockWireOverlay ? "开" : "关")}" +
+                                        $"{(meshDisplayStride > 1 ? $" 网{meshDisplayStride}" : "")}]{handLabel}{temporalLabel}{pairedCaptureLabel}";
                     // 行为层读数钉行首固定位（防抖）：角/质定宽 + 探头判决紧随其后，
                     // 前缀长度恒定（覆盖%定宽 3 位），热账 frozenTail 怎么跳都不动这里。
                     string watch = $" 角{(_volumeIntegrator != null ? _volumeIntegrator.SmoothedAngularSpeed : 0f),3:F0}°/s" +
                                    $" 质{(_volumeIntegrator != null ? _volumeIntegrator.MotionQuality : 1f):F2}" +
                                    (_probeHud.Length > 0 ? $" {_probeHud}" : "");
+                    // 枪胶影必须钉在采集态精简 HUD：详细 HUD 在增量 HERA 采集时不会显示，
+                    // 只接 UpdateHud 会导致实机无论截图或录像都看不到校枪/K3 读数。
+                    string gunGelLine = $"枪胶影:{(_volumeIntegrator != null ? _volumeIntegrator.GetGunGelEvidenceShadowCompact() : "无")}";
                     if (_meshExtractor != null && _meshExtractor.HasIncrementalHera)
                     {
                         string geometryLine = $"{_meshExtractor.GetGeometryStabilityStatsCompact()} · " +
@@ -763,17 +924,17 @@ namespace Genesis.RoomScan
                                             $"回{_meshExtractor.IncrementalHeraAvgDispatchToCallbackMs:0}ms " +
                                             $"融{_emaIntegrateMs:0.0}提{_emaHeraTickMs:0.0}ms " +
                                             $"温{OVRPlugin.batteryTemperature:0}°";
-                        _statusBadgeText.text = $"● 采集中·测0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{geometryLine}\n{timingLine}\n{toggleLine}";
+                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{geometryLine}\n{timingLine}\n{toggleLine}\n{gunGelLine}";
                     }
                     else
-                        _statusBadgeText.text = $"● 采集中·炮0821 · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}";
+                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}\n{gunGelLine}";
                     return;
                 }
 
                 _statusBadgeText.color = new Color(0.75f, 0.8f, 0.85f, 1f);
                 _statusBadgeText.text = HasStarted
-                    ? "Ⅱ 采集已暂停 · A 冻结 / 扳机继续"
-                    : "○ 待采集 · 扳机开始";
+                    ? $"Ⅱ 采集已暂停·{CaptureModeLabel} · A冻结 / 扳机继续"
+                    : $"○ 待采集·{CaptureModeLabel} · 扳机开始\n摇杆左推+按：切换胶冻/原冻";
                 return;
             }
 
@@ -861,6 +1022,14 @@ namespace Genesis.RoomScan
             string failureLine = failed
                 ? $"\n失败原因：{_meshExtractor.FrozenHeraReplayFailureReason}"
                 : "";
+            if (!showDetailedRuntimeStatus)
+            {
+                _statusBadgeText.text =
+                    $"{CaptureModeLabel} · {headline}\n" +
+                    $"页 父{parentBuilt}/{parentTotal} 子{childBuilt}/{childQueued} 裁{familyFinalized}/{familyQueued}\n" +
+                    $"耗时{elapsed:0.0}s · {(complete ? "B可导出" : "等待完成")}" + failureLine;
+                return;
+            }
             _statusBadgeText.text =
                 $"{headline}\n" +
                 $"32³ 父页　{parentBuilt}/{parentTotal}\n" +
@@ -897,9 +1066,6 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("在面板右上角开一个当前深度实时预览小窗（青=近 绿=中 红=远 暗=无效）。" +
             "用途：盯着幽灵网格时看深度画面里那个斑块还在不在——在=深度自洽幻觉（Meta侧时序锁定）；转头后斑块从预览消失=深度刷新")]
         private bool showDepthPreview = true;
-        [SerializeField, Tooltip("世界空间实时深度点云叠加层：当前深度以 3D 点云叠在网格上同屏对照。" +
-            "幽灵位置有点云覆盖=深度自洽幻觉；空空如也却有网格=矛盾在我们侧")]
-        private bool showDepthPointCloud = true;
         [SerializeField, Tooltip("显示只读断崖样本框：左侧近面、中间边缘、右侧远景。只影响诊断计数与导出。")]
         private bool showDiagnosticRoiFrame = false;
 
@@ -1159,6 +1325,7 @@ namespace Genesis.RoomScan
                 $" 缘:{edgeStat}\n" +
                 $"供料账:{(_volumeIntegrator != null ? _volumeIntegrator.GetSupplyLedgerCompact() : "无")}\n" +
                 $"断层影:{(_volumeIntegrator != null ? _volumeIntegrator.GetAdaptiveGapShadowCompact() : "无")}\n" +
+                $"枪胶影:{(_volumeIntegrator != null ? _volumeIntegrator.GetGunGelEvidenceShadowCompact() : "无")}\n" +
                 $"边缘源:{(_volumeIntegrator != null ? _volumeIntegrator.GetEdgeSourceLedgerCompact() : "无")}\n" +
                 $"供体证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationDonorLedgerCompact() : "无")}\n" +
                 $"路径证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationPathLedgerCompact() : "无")}\n" +
@@ -1175,7 +1342,7 @@ namespace Genesis.RoomScan
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续  A=暂停  B=保存并清空\n" +
-                $"摇杆按=线框  Y=生产A/候选B" +
+                $"摇杆按=线框 左摇杆左=胶冻/原冻  Y=生产A/候选B" +
                 (_hudLastError.Length > 0 ? $"\n<color=#FF6060>错误:{_hudLastError}</color>" : "");
         }
 
@@ -1226,12 +1393,27 @@ namespace Genesis.RoomScan
         private void OnDisable()
         {
             _coverageOverlay?.SetAcquiring(false);
+            _depthPointCloudOverlay?.SetAcquiring(false);
             if (IsScanning) PauseScanning();
         }
 
         private void Update()
         {
             UpdateHud();
+
+            // BB 验证态只允许反投影点上屏。异步新建的 HERA/粗皮页也会被
+            // 下一帧重新压回隐藏，但其后台融合、提取和提交继续运行。
+            if (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible)
+            {
+                _coverageOverlay?.SetMarkersVisible(false);
+                if (_meshExtractor != null && _meshExtractor.IsAnyMeshVisible)
+                    _meshExtractor.SetCurrentMeshDisplayVisible(false);
+                if (_meshExtractor != null && _meshExtractor.IsCoarseSkinVisible)
+                    _meshExtractor.SetCoarseSkinVisible(false);
+                if (showManagementBlockWireOverlay)
+                    showManagementBlockWireOverlay = false;
+                _managementBlockWireOverlay?.SetVisible(false);
+            }
 
             // 置信度可视化开关支持运行时改值（编辑器内拖勾即生效，重发全局量）。
             if (confidenceViz != _confidenceVizApplied)
@@ -1260,9 +1442,13 @@ namespace Genesis.RoomScan
 
             float t = Time.time;
             TickFrozenBlockSupervisor(t);
-            TickPendingPageInvalidates(t);
-            TickDeferredPageRequeues(t);
-            TickLiveTrack(t);
+            bool directTruthRoute = _meshExtractor != null &&
+                                    _meshExtractor.RouteValidationPausesHera;
+            if (!directTruthRoute)
+            {
+                TickDeferredPageRequeues(t);
+                TickLiveTrack(t);
+            }
             TickPlaneFitShadow(t);
             TickPlaneFlatten(t);
             TickPlanePriorCensus(t);
@@ -1288,7 +1474,7 @@ namespace Genesis.RoomScan
                 // 队10途0、落 20s）——提取超时 3 个节拍即让融合让路一帧，
                 // 扫描降频保命、网格出网不断流。刀A（同帧叠加）已炸毁退役。
                 float heraInterval = enableLiveTrack ? MeshInterval * 0.5f : MeshInterval;
-                bool heraDue = t - _lastMeshTime >= heraInterval;
+                bool heraDue = !directTruthRoute && t - _lastMeshTime >= heraInterval;
                 bool tickStarved = heraDue && t - _lastMeshTime >= heraInterval * 3f &&
                                    _meshExtractor.HasIncrementalHera;
                 bool integrateNow = integrationDue && !tickStarved;
@@ -1373,7 +1559,15 @@ namespace Genesis.RoomScan
 
         private void TickFrozenBlockSupervisor(float now)
         {
-            if (!enableFrozenBlockSupervisor) return;
+            if (!FrozenBlockSupervisorEffective)
+            {
+                // 净室只停冻结裁决，不能停实时轨的内容普查。实时轨用
+                // _meshablePrevSurface 判断 32³ 块是否已有可出网表面；旧实现把这份
+                // 只读账寄生在冻结监督回读链上，净室早退后会永久断供，只剩 HUD。
+                if (enableGunGelCleanRoomExperiment)
+                    TickCleanRoomLiveCensus(now);
+                return;
+            }
             // 看门狗：Quest 上 GPU 回读会静默丢弃（回调永不到达），没有超时复位的
             // pending 标志会把冻结调度器永久锁死——实机症状=几个块区后不再冻新块、
             // 不再出新网格页。超时强解：迟到的回调至多重复一次无害的窗口处理。
@@ -1395,6 +1589,78 @@ namespace Genesis.RoomScan
             _frozenBlockReadbackPending = true;
             _frozenBlockReadbackPendingSince = now;
             AsyncGPUReadback.Request(_volumeIntegrator.FrozenChunkVotes, OnFrozenVotesReadback);
+        }
+
+        /// <summary>
+        /// 净室专用只读普查：只更新实时轨的块内容账，不读取票箱、不生成冻结掩码，
+        /// 也不触发冻结、解冻、补洞重排或复冻。这样净室与旧冻只差冻结监督一个变量。
+        /// </summary>
+        private void TickCleanRoomLiveCensus(float now)
+        {
+            if (!enableLiveTrack) return;
+            if (_volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady) return;
+
+            if (_frozenBlockReadbackPending)
+            {
+                if (now - _frozenBlockReadbackPendingSince > 6f)
+                {
+                    _frozenBlockReadbackPending = false;
+                    Logger.Warning("枪胶净室：只读内容普查回读超时（>6s），已复位");
+                }
+                else return;
+            }
+
+            if (_frozenBlockWindowStart < 0f)
+            {
+                _frozenBlockWindowStart = now;
+                return;
+            }
+            // 内容账只决定实时页能否首发；固定 1s 上限，不能继承旧冻安静期 2/4s
+            // 自适应慢窗，否则净室转头看新区时仍会出现数秒空白。
+            float censusWindow = Mathf.Clamp(frozenBlockWindowSeconds, 0.25f, 1f);
+            if (now - _frozenBlockWindowStart < censusWindow) return;
+
+            _frozenBlockWindowStart = now;
+            _frozenBlockReadbackPending = true;
+            _frozenBlockReadbackPendingSince = now;
+            _volumeIntegrator.RefreshChunkMaturity();
+            AsyncGPUReadback.Request(
+                _volumeIntegrator.ChunkMaturity,
+                OnCleanRoomLiveCensusReadback);
+        }
+
+        private void OnCleanRoomLiveCensusReadback(AsyncGPUReadbackRequest request)
+        {
+            _frozenBlockReadbackPending = false;
+            if (request.hasError || !IsScanning || _chunkAbFrozen ||
+                !enableGunGelCleanRoomExperiment)
+                return;
+
+            try
+            {
+                var maturity = request.GetData<uint>();
+                int blockCount = _volumeIntegrator.FrozenBlockCount;
+                bool firstCensus = _maturityPrevSurface == null ||
+                                   _maturityPrevSurface.Length != blockCount;
+                if (firstCensus)
+                {
+                    _maturityPrevSurface = new int[blockCount];
+                    _meshablePrevSurface = new int[blockCount];
+                }
+
+                for (int b = 0; b < blockCount; b++)
+                {
+                    _maturityPrevSurface[b] = (int)maturity[b * 4];
+                    _meshablePrevSurface[b] = (int)maturity[b * 4 + 2];
+                }
+
+                if (firstCensus)
+                    Logger.Info("枪胶净室：实时轨只读内容普查已建档（冻结位保持全空）");
+            }
+            catch (Exception e)
+            {
+                Logger.Warning($"枪胶净室：只读内容普查异常，本窗跳过（{e.Message}）");
+            }
         }
 
         private void OnFrozenVotesReadback(AsyncGPUReadbackRequest request)
@@ -1472,10 +1738,16 @@ namespace Genesis.RoomScan
                         Logger.Info($"T2 补洞：块重排重提（补洞票 {holeVotes}≥{holeThreshold} 双窗达标，第 {requeues + 1} 次）：{FormatBlockCoords(new List<int> { b })}");
                     }
                 }
+                _managementHotBlocks.Clear();
+                _managementHotBlocks.UnionWith(hotNow);
+                _managementConfirmedHotBlocks.Clear();
+                foreach (int b in hotNow)
+                    if (_hotBlocksPrevWindow.Contains(b)) _managementConfirmedHotBlocks.Add(b);
                 _hotBlocksPrevWindow.Clear();
                 _hotBlocksPrevWindow.UnionWith(hotNow);
                 _hotHoleBlocksPrevWindow.Clear();
                 _hotHoleBlocksPrevWindow.UnionWith(hotHoleNow);
+                RefreshManagementBlockWireOverlay();
                 _lastVotesHotCount = hotNow.Count; // 自适应普查活动账（本窗有无解冻需求）
                 _volumeIntegrator.ClearAllFrozenVotes();
                 _volumeIntegrator.RefreshChunkMaturity();
@@ -1600,6 +1872,7 @@ namespace Genesis.RoomScan
                 foreach (int b in clearBlocks)
                 {
                     _frozenBlocks.Remove(b);
+                    _managementThawedBlocks.Add(b);
                     // 年审降级不吃棘轮（不是票解，是资格门收回冻结资格）。
                     if (_demotedThisBatch.Remove(b)) { demotedCount++; continue; }
                     // 棘轮记账：本块解冻次数+1，下窗起票阈×倍率。
@@ -1608,9 +1881,11 @@ namespace Genesis.RoomScan
                 // T2：全量冻结位图同步本批裁决并下发 GPU（补洞票的块冻结态判据）。
                 foreach (int b in setBlocks) _frozenChunkBitsArr[b >> 5] |= 1u << (b & 31);
                 foreach (int b in clearBlocks) _frozenChunkBitsArr[b >> 5] &= ~(1u << (b & 31));
+                foreach (int b in setBlocks) _managementThawedBlocks.Remove(b);
                 _volumeIntegrator.SetFrozenChunkBits(_frozenChunkBitsArr);
                 // 增量精修挂接：新冻块排队精修上屏；解冻块撤页（重冻后自动重建）。
                 SyncIncrementalHeraBlocks(setBlocks, clearBlocks);
+                RefreshManagementBlockWireOverlay();
                 if (clearBlocks.Count > 0)
                 {
                     _frozenBlockUnfreezeEvents += clearBlocks.Count;
@@ -1666,6 +1941,10 @@ namespace Genesis.RoomScan
         {
             _frozenBlocks.Clear();
             _hotBlocksPrevWindow.Clear();
+            _managementHotBlocks.Clear();
+            _managementConfirmedHotBlocks.Clear();
+            _managementThawedBlocks.Clear();
+            _managementBlockWireOverlay?.Clear();
             // T2 补洞账与位图随扫描重置清零
             _hotHoleBlocksPrevWindow.Clear();
             _holeRequeueCounts.Clear();
@@ -1681,7 +1960,6 @@ namespace Genesis.RoomScan
             _frozenBlockReadbackPending = false;
             _frozenBlockReadbackPendingSince = 0f;
             _frozenBlockUnfreezeEvents = 0;
-            _forceRefreezeEvents = 0;
             _diagHotWindows = 0;
             _diagUnfreezeMaxThaws = 0;
             _diagLastVotes = 0;
@@ -1720,13 +1998,15 @@ namespace Genesis.RoomScan
             _censusQuietStreak = 0;
             _censusCurrentWindow = frozenBlockWindowSeconds;
             _lastVotesHotCount = 0;
-            _pendingPageInvalidate.Clear();
             _lastPageQueueTime.Clear();
             _deferredPageRequeue.Clear();
             _thawCounts.Clear();
             _liveTrackLastSweep = -1f;
             _livePageQueueTime.Clear();
             _liveQueuedEpoch.Clear();
+            _liveQueuedObservedEpoch.Clear();
+            _liveDirtySince.Clear();
+            _liveBoundaryEpochConsumed = null;
             _meshablePrevSurface = null;
             _firstMatureTime.Clear();
             _liveRateWindowStart = -1f;
@@ -1734,6 +2014,7 @@ namespace Genesis.RoomScan
             _liveTrackQueuedTotal = 0;
             _liveGateQueued = _liveGateFrozen = _liveGateEmpty = _liveGateCool = 0;
             _liveGateContent = _liveGateFlight = _liveGateRate = 0;
+            _liveDirtyCount = _liveVisibleDirtyCount = _liveOverdueCount = _liveBoundaryDebtCount = 0;
             _meshExtractor?.ResetIncrementalHeraState();
         }
 
@@ -1744,10 +2025,8 @@ namespace Genesis.RoomScan
             if (_meshExtractor == null || !_meshExtractor.HasIncrementalHera) return;
             foreach (int b in setBlocks)
             {
-                // 复冻：取消宽限撤页。首冻/被撤页过的块（无排队记录）立刻排队；
-                // 其余按冷却节流——振荡块几何几乎没变，旧页继续显示即可，
-                // 立刻重提只会灌满队列饿死新块；冷却到点由维护时钟补提。
-                _pendingPageInvalidate.Remove(b);
+                // 冻结只把该页升级为“可派生16³救援”的定稿候选。首次冻结立刻
+                // 排队；重复冻结按冷却合并，旧父页在此期间始终保持可见。
                 if (_lastPageQueueTime.TryGetValue(b, out float last))
                 {
                     if (Time.time - last >= frozenPageRequeueCooldownSeconds)
@@ -1759,18 +2038,47 @@ namespace Genesis.RoomScan
             }
             foreach (int b in clearBlocks)
             {
-                // 解冻不立刻撤页：旧页=上一版定稿，继续显示；宽限内复冻→原子替换。
-                // 只有超期未复冻（家具真搬走等真变化）才由 TickPendingPageInvalidates 撤页露洞。
-                _pendingPageInvalidate[b] = Time.time + frozenPageInvalidateGraceSeconds;
+                // 管理块削权：解冻只改变数据层保护，不再撤页。父页保持最后一次
+                // 成功快照；16³救援影子收起，后续有效变化由活跃页调度重提交。
+                _meshExtractor.IncrementalKeepParentBlockLive(FrozenBlockCoord3(b));
             }
         }
 
         /// <summary>实际排队提取一页，并记账（冷却/补提两表）。</summary>
         private void QueueIncrementalPage(int b)
         {
+            // 路线验证必须是真隔离：支撑真值/三角粗皮直接消费 TSDF 时，HERA 不在
+            // 后台积攒页任务。切回 HERA 后由活跃页 epoch 按原调度重新唤醒。
+            if (_meshExtractor != null && _meshExtractor.RouteValidationPausesHera)
+                return;
+
             _lastPageQueueTime[b] = Time.time;
             _deferredPageRequeue.Remove(b);
-            _meshExtractor.IncrementalQueueParentBlock(FrozenBlockCoord3(b));
+            var coordinate = FrozenBlockCoord3(b);
+            if (_meshExtractor.IncrementalQueueParentBlock(coordinate))
+            {
+                _livePageQueueTime[b] = Time.time;
+                uint[] epochs = _volumeIntegrator != null ? _volumeIntegrator.LatestActivePageEpochs : null;
+                if (epochs != null && b >= 0 && b < epochs.Length)
+                    _liveQueuedEpoch[b] = epochs[b];
+                else if (!_liveQueuedEpoch.ContainsKey(b))
+                    _liveQueuedEpoch[b] = 0u;
+                uint[] observed = _volumeIntegrator != null
+                    ? _volumeIntegrator.LatestActivePageObservedEpochs
+                    : null;
+                _liveQueuedObservedEpoch[b] = observed != null && b >= 0 && b < observed.Length
+                    ? observed[b]
+                    : 0u;
+
+                // A queue request is not a page product.  Keep first-coverage
+                // debt alive across empty commits and deduplicated/no-op queue
+                // requests; the live scheduler will retry under its normal
+                // cooldown until a parent or child-rescue front is published.
+                if (_meshExtractor.IncrementalParentPageHasPublishedProduct(coordinate))
+                    _liveDirtySince.Remove(b);
+                else
+                    MarkActivePageDirty(b, Time.time);
+            }
         }
 
         /// <summary>冷却补提：延迟队列到点且块仍在冻结态的，补一次重提（最终一致）。</summary>
@@ -1796,63 +2104,30 @@ namespace Genesis.RoomScan
             }
         }
 
-        /// <summary>宽限撤页到期处理：解冻块超过宽限仍未复冻，旧页内容已不可信，撤下露真洞。</summary>
-        private void TickPendingPageInvalidates(float now)
+        private void EnsureManagementBlockWireOverlay()
         {
-            if (_pendingPageInvalidate.Count == 0) return;
-            if (_meshExtractor == null || !_meshExtractor.HasIncrementalHera)
+            if (_managementBlockWireOverlay == null)
+                _managementBlockWireOverlay = GetComponent<FrozenBlockWireOverlay>() ??
+                                              gameObject.AddComponent<FrozenBlockWireOverlay>();
+            _managementBlockWireOverlay.SetVisible(showManagementBlockWireOverlay);
+        }
+
+        private void RefreshManagementBlockWireOverlay()
+        {
+            EnsureManagementBlockWireOverlay();
+            if (_volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady)
             {
-                _pendingPageInvalidate.Clear();
+                _managementBlockWireOverlay.Clear();
                 return;
             }
-            List<int> expired = null;
-            foreach (KeyValuePair<int, float> kv in _pendingPageInvalidate)
-            {
-                if (now >= kv.Value) (expired ??= new List<int>()).Add(kv.Key);
-            }
-            if (expired == null) return;
-            List<int> refrozen = null;
-            List<int> invalidated = null;
-            foreach (int b in expired)
-            {
-                _pendingPageInvalidate.Remove(b);
-                // 复冻兜底（阻尼封顶，调度层最后一道阻尼器）：振荡惯犯块（累计解冻≥阈值次）
-                // 超期未复冻 = 冻-解振荡不收敛（系统性偏差纠不完，折角案例实锤）。
-                // 撤页只会让它悬在未冻态被实时轨反复重提（"整体换掉"观感引擎），此路
-                // 无自限。改为强制冻回静态几何求安分；真变化由穿越票走解冻棘轮硬闯
-                // （按不死，只慢一两窗）。初犯块照走下方撤页快路径——家具真搬走
-                // 不该被兜底拖累。
-                bool habitual = _thawCounts.TryGetValue(b, out int thaws) && thaws >= frozenRefreezeMinThaws;
-                if (habitual && !_frozenBlocks.Contains(b) &&
-                    _volumeIntegrator != null && _volumeIntegrator.FrozenBlockReady)
-                {
-                    EnsureFreezeMaskArrays();
-                    Array.Clear(_freezeSetMask, 0, _freezeSetMask.Length);
-                    Array.Clear(_freezeClearMask, 0, _freezeClearMask.Length);
-                    _freezeSetMask[b >> 5] |= 1u << (b & 31);
-                    _volumeIntegrator.ApplyChunkFreezeMasks(_freezeSetMask, _freezeClearMask);
-                    _frozenBlocks.Add(b);
-                    _frozenChunkBitsArr[b >> 5] |= 1u << (b & 31);
-                    _volumeIntegrator.SetFrozenChunkBits(_frozenChunkBitsArr);
-                    _forceRefreezeEvents++;
-                    (refrozen ??= new List<int>()).Add(b);
-                    continue;
-                }
-                // 撤页过的块视为"无页"：清掉冷却账，下次复冻必立刻重提（不吃冷却）。
-                _lastPageQueueTime.Remove(b);
-                _deferredPageRequeue.Remove(b);
-                _meshExtractor.IncrementalInvalidateParentBlock(FrozenBlockCoord3(b));
-                (invalidated ??= new List<int>()).Add(b);
-            }
-            if (invalidated != null)
-                Logger.Info($"增量精修：{invalidated.Count} 块解冻超 {frozenPageInvalidateGraceSeconds:0}s 未复冻，撤下旧页：{FormatBlockCoords(invalidated)}");
-            if (refrozen != null)
-            {
-                // 强制复冻后走正常复冻挂接：旧页继续显示，按冷却节流原子换新。
-                SyncIncrementalHeraBlocks(refrozen, new List<int>(0));
-                Logger.Info($"复冻兜底：{refrozen.Count} 个振荡惯犯块（解冻≥{frozenRefreezeMinThaws}次）超期未复冻，强制冻回求安分（真变化走解冻棘轮硬闯）：{FormatBlockCoords(refrozen)}");
-                RefreshStatusBadge();
-            }
+            _managementBlockWireOverlay.Rebuild(
+                _volumeIntegrator.VoxelCount,
+                _volumeIntegrator.VoxelSize,
+                _volumeIntegrator.FrozenChunkCount,
+                _frozenBlocks,
+                _managementHotBlocks,
+                _managementConfirmedHotBlocks,
+                _managementThawedBlocks);
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -2386,10 +2661,9 @@ namespace Genesis.RoomScan
         }
 
 
-        //  网格页（不建家族省 8 倍子页负载，边界三角定稿才补）。四道闸：
-        //  冻结跳过（定稿轨接管）/ 在途跳过 / 块级 1s 节流（缺肉长肉节奏）
-        //  / 全局 5 页/s 硬顶（帧率保护）。解冻块也会被实时轨拾起=修复
-        //  过程直播（拾起即取消宽限撤页：旧页被实况页原子顶替）。
+        // 32³ 活跃页调度。页面的空间地址仍沿用冻结管理网格，但出网权只看：
+        // 精确页脏 epoch / 共享面债务 / 首次脏时间 / 视锥优先级。冻结仅决定本次
+        // 提交是否带 16³ 定稿救援，不再决定页面能否生产或旧页是否被撤下。
         // ─────────────────────────────────────────────────────────────
 
         private void TickLiveTrack(float now)
@@ -2397,8 +2671,6 @@ namespace Genesis.RoomScan
             if (!enableLiveTrack) return;
             if (_meshExtractor == null || !_meshExtractor.HasIncrementalHera) return;
             if (_volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady) return;
-            // 内容下限依赖普查账（2s 窗更新）；首轮普查未建档前不排实时页。
-            if (_maturityPrevSurface == null) return;
             var cam = Camera.main;
             if (cam == null) return;
             if (_liveTrackLastSweep >= 0f && now - _liveTrackLastSweep < liveTrackSweepSeconds) return;
@@ -2410,92 +2682,312 @@ namespace Genesis.RoomScan
                 _liveRateWindowStart = now;
                 _liveRateWindowCount = 0;
             }
-            if (_liveRateWindowCount >= liveTrackMaxPagesPerSecond) return;
-
-            // 落点锚定采样：每次巡视发一次中心深度回读（结果下次巡视生效，一拍延迟无感）。
-            // 锚定值仅供 HUD @距离 回显，不再决定供给——供给改为下方的视线射线撒点。
+            // 中心深度只负责把精确 gaze 页钉到真实表面；全部候选仍按页体积扫描视锥，
+            // 不再让单条射线拥有其它可见页的生杀权。
             _depthCapture?.RequestCenterDepthSample();
-            var grid = _volumeIntegrator.FrozenChunkCount;
-            float blockWorld = _volumeIntegrator.VoxelSize *
-                               Mathf.Max(1, _volumeIntegrator.VoxelCount.x / grid.x);
+            _volumeIntegrator.RequestActivePageEpochs();
+            uint[] pageEpochs = _volumeIntegrator.LatestActivePageEpochs;
+            uint[] observedEpochs = _volumeIntegrator.LatestActivePageObservedEpochs;
+            uint[] boundaryEpochs = _volumeIntegrator.LatestActivePageBoundaryEpochs;
+            int pageCount = _volumeIntegrator.FrozenBlockCount;
 
-            // 视线射线撒候选（08-18 用户拍板：取消距离限制，"看到哪哪出网格"）。
-            // 单落点制的死穴：锚定失败/出体积时整轨断供——深色床=深度稀疏无样本→
-            // 退 1.5m 落在床上方空气；远处=钳 6m 出体积→同样落空。改为沿视线从
-            // 0.5m 走到 6m（出体积即收工），步长 0.75 块，途经块去重、近者优先。
-            // "空块不排"闸天然拦掉空气段，无需知道真实墙距；所有闸门不变。
-            _liveCandidates.Clear();
-            Vector3 rayOrigin = cam.transform.position;
-            Vector3 rayDir = cam.transform.forward;
-            float step = Mathf.Max(0.1f, blockWorld * 0.75f);
-            bool enteredVolume = false;
-            for (float t = 0.5f; t <= 6f && _liveCandidates.Count < 32; t += step)
+            // 边界债不等冻结：某页共享面附近发生有效几何变化，双方都进入脏账。
+            RefreshActiveBoundaryDebt(now, pageCount, boundaryEpochs);
+
+            // 精确32³ owner epoch 建立首次脏时刻。后续 epoch 推进只累计，不重置。
+            for (int b = 0; b < pageCount; b++)
             {
-                if (!TryWorldToFrozenBlock(rayOrigin + rayDir * t, out int b, out _))
-                {
-                    if (enteredVolume) break; // 已进过体积再出界=射线穿出，收工
-                    continue; // 还没进体积（贴边界站位），继续往前探
-                }
-                enteredVolume = true;
-                if (_liveCandidates.Count > 0 && _liveCandidates[_liveCandidates.Count - 1].Block == b)
-                    continue; // 连续采样打在同一块
-                bool dup = false;
-                for (int k = 0; k < _liveCandidates.Count; k++)
-                    if (_liveCandidates[k].Block == b) { dup = true; break; }
-                if (dup) continue;
-                _liveCandidates.Add(new LiveCandidate { Block = b, Dist = t });
+                var coordinate = FrozenBlockCoord3(b);
+                uint pageEpoch = pageEpochs != null && b < pageEpochs.Length ? pageEpochs[b] : 0u;
+                bool hasPublishedProduct =
+                    _meshExtractor.IncrementalParentPageHasPublishedProduct(coordinate);
+                bool hasSurface = _meshablePrevSurface != null && b < _meshablePrevSurface.Length &&
+                                  _meshablePrevSurface[b] >= liveTrackMinSurfaceVoxels;
+                uint queuedEpoch = _liveQueuedEpoch.TryGetValue(b, out uint qe) ? qe : 0u;
+                uint observedEpoch = observedEpochs != null && b < observedEpochs.Length ? observedEpochs[b] : 0u;
+                uint queuedObservedEpoch = _liveQueuedObservedEpoch.TryGetValue(b, out uint qoe) ? qoe : 0u;
+                bool changed = pageEpoch > queuedEpoch;
+                // GPU epoch 本身只在“可提取表面出生/消失/穿越/显著位移”时推进，
+                // 因此它就是首次出网许可，不再等 1~4s 普查。普查只负责页账建立前
+                // 已经存在的表面兜底；已建页变为空也会由 changed 触发清空旧前台。
+                bool observedSinceAttempt = observedEpoch > queuedObservedEpoch;
+                if (changed || (!hasPublishedProduct && (observedSinceAttempt || hasSurface)))
+                    MarkActivePageDirty(b, now);
             }
-            if (_liveCandidates.Count == 0) return; // 整条射线都在体积外
 
-            // 活闸普查重计（只统计本轮走完 slab 循环的闸门分布；早退轮保留上轮读数）。
+            // 构造全部脏页候选：视锥中心优先，视野外仍由首次脏期限兜底。
+            _liveCandidates.Clear();
+            _liveVisibleDirtyCount = 0;
+            _liveOverdueCount = 0;
+            GeometryUtility.CalculateFrustumPlanes(cam, _liveFrustumPlanes);
+            bool hasGazePage = TryGetGazeBlockIndex(out int gazePage);
+            foreach (KeyValuePair<int, float> kv in _liveDirtySince)
+            {
+                int b = kv.Key;
+                var coordinate = FrozenBlockCoord3(b);
+                bool hasPublishedProduct =
+                    _meshExtractor.IncrementalParentPageHasPublishedProduct(coordinate);
+                bool hasSurface = _meshablePrevSurface != null && b < _meshablePrevSurface.Length &&
+                                  _meshablePrevSurface[b] >= liveTrackMinSurfaceVoxels;
+                uint pageEpoch = pageEpochs != null && b < pageEpochs.Length ? pageEpochs[b] : 0u;
+                uint queuedEpoch = _liveQueuedEpoch.TryGetValue(b, out uint qe) ? qe : 0u;
+                uint observedEpoch = observedEpochs != null && b < observedEpochs.Length ? observedEpochs[b] : 0u;
+                uint queuedObservedEpoch = _liveQueuedObservedEpoch.TryGetValue(b, out uint qoe) ? qoe : 0u;
+                // A fresh geometry event gets one early attempt before the
+                // asynchronous surface census catches up.  After that attempt,
+                // a still-empty page retries only while current meshable
+                // surface evidence exists; a historical sticky epoch cannot
+                // create permanent work for a surface that has disappeared.
+                if (!hasSurface && !hasPublishedProduct && pageEpoch <= queuedEpoch &&
+                    observedEpoch <= queuedObservedEpoch)
+                    continue;
+
+                Bounds pageBounds = FrozenBlockWorldBounds(b);
+                GetPageScreenPriority(cam, pageBounds, liveTrackViewportMargin,
+                    out float centerDistanceSq, out float cameraDepth, out bool overlapsPreheatViewport);
+                bool visible = GeometryUtility.TestPlanesAABB(_liveFrustumPlanes, pageBounds) ||
+                               overlapsPreheatViewport;
+                float age = Mathf.Max(0f, now - kv.Value);
+                float deadline = visible ? liveTrackVisibleDeadlineSeconds : liveTrackBackgroundDeadlineSeconds;
+                bool overdue = age >= Mathf.Max(0.05f, deadline);
+                _liveCandidates.Add(new LiveCandidate
+                {
+                    Block = b,
+                    Visible = visible,
+                    // The exact depth-anchored gaze page and the small central
+                    // viewport neighbourhood pre-empt FIFO background debt.
+                    // This is visual scheduling only; it changes no TSDF or
+                    // admission decision.
+                    Urgent = (hasGazePage && b == gazePage) ||
+                             (visible && centerDistanceSq <= 0.04f),
+                    Overdue = overdue,
+                    Age = age,
+                    CenterDistanceSq = centerDistanceSq,
+                    CameraDepth = cameraDepth
+                });
+                if (visible) _liveVisibleDirtyCount++;
+                if (overdue) _liveOverdueCount++;
+            }
+            _liveDirtyCount = _liveCandidates.Count;
+            _liveCandidates.Sort(CompareLiveCandidates);
+
             _liveGateQueued = _liveGateFrozen = _liveGateEmpty = _liveGateCool = 0;
             _liveGateContent = _liveGateFlight = _liveGateRate = 0;
 
-            // 内容闸信号源回读（T1a）：每巡视发一次脏块 epoch 回读（72B），
-            // 结果下轮巡视生效——帧级新鲜，取代 2s 普查相位。
-            _volumeIntegrator.RequestDirtyChunkEpochs();
-
             int queued = 0;
-            for (int i = 0; i < _liveCandidates.Count && queued < 5; i++)
+            for (int i = 0; i < _liveCandidates.Count && queued < liveTrackMaxPagesPerSweep; i++)
             {
-                int b = _liveCandidates[i].Block;
-                if (_frozenBlocks.Contains(b)) { _liveGateFrozen++; continue; } // 定稿轨的地盘
-                if (_meshablePrevSurface[b] < liveTrackMinSurfaceVoxels) { _liveGateEmpty++; continue; } // 空块不排（T3：可出网档）
+                LiveCandidate candidate = _liveCandidates[i];
+                int b = candidate.Block;
                 if (_livePageQueueTime.TryGetValue(b, out float last) &&
-                    now - last < liveTrackBlockCooldownSeconds) { _liveGateCool++; continue; } // 块级节流
+                    now - last < liveTrackBlockCooldownSeconds)
+                { _liveGateCool++; continue; }
                 var coord = FrozenBlockCoord3(b);
-                // 内容闸（T1a）：块所属 64³ 脏块 epoch 没超过上次排队时的全局 epoch
-                // =几何级零变化（MarkDirtyChunk 只记新生/穿越/位移，权重纯积累不记账），
-                // 重提纯属烧队列。快照未建档前放行（每块至少排一次）。
-                var epochs = _volumeIntegrator.LatestDirtyChunkEpochs;
-                var dc = _volumeIntegrator.DirtyChunkCount;
-                if (epochs != null && epochs.Length == dc.x * dc.y * dc.z &&
-                    _liveQueuedEpoch.TryGetValue(b, out uint qe))
-                {
-                    int di = coord.x / 2 + dc.x * (coord.y / 2 + dc.y * (coord.z / 2));
-                    if (epochs[di] <= qe) { _liveGateContent++; continue; }
-                }
-                if (_meshExtractor.IncrementalParentBlockInFlight(coord)) { _liveGateFlight++; continue; } // 在途
-                if (_liveRateWindowCount >= liveTrackMaxPagesPerSecond) { _liveGateRate++; break; } // 速率硬顶
-                if (!_meshExtractor.IncrementalQueueLiveParentBlock(coord)) continue;
+                // 在途时不丢脏时刻；回调完成后本页仍在字典中，下一巡视自动补跑。
+                if (_meshExtractor.IncrementalParentBlockInFlight(coord))
+                { _liveGateFlight++; continue; }
+                if (_liveRateWindowCount >= liveTrackMaxPagesPerSecond)
+                { _liveGateRate++; break; }
+
+                // 冻结只选择“定稿+16救援”或“实时粗页”，不再拥有出网否决权。
+                bool queuedOk = _frozenBlocks.Contains(b)
+                    ? _meshExtractor.IncrementalQueueParentBlock(coord, candidate.Urgent)
+                    : _meshExtractor.IncrementalQueueLiveParentBlock(coord, candidate.Urgent);
+                if (!queuedOk) continue;
                 _livePageQueueTime[b] = now;
-                _liveQueuedEpoch[b] = _volumeIntegrator.DirtyEpoch;
+                _liveQueuedEpoch[b] = pageEpochs != null && b < pageEpochs.Length
+                    ? pageEpochs[b]
+                    : 0u;
+                _liveQueuedObservedEpoch[b] = observedEpochs != null && b < observedEpochs.Length
+                    ? observedEpochs[b]
+                    : 0u;
+
+                bool hasPublishedProduct =
+                    _meshExtractor.IncrementalParentPageHasPublishedProduct(coord);
+                bool workInFlight = _meshExtractor.IncrementalParentBlockInFlight(coord);
+                if (hasPublishedProduct)
+                    _liveDirtySince.Remove(b);
+                else
+                    MarkActivePageDirty(b, now);
+
+                // QueueStaticReplayChunk accepts identity/dedup requests too.
+                // Only an actual queued/in-flight job consumes the production
+                // rate budget.  A no-op without a product remains coverage debt
+                // and is retried after the same block cooldown.
+                if (!workInFlight)
+                {
+                    if (!hasPublishedProduct) _liveGateContent++;
+                    continue;
+                }
+
                 _liveRateWindowCount++;
                 _liveTrackQueuedTotal++;
                 _liveGateQueued++;
                 queued++;
-                // 解冻块被实时轨拾起=修复直播：旧页将被实况页原子顶替，
-                // 宽限撤页失去意义（撤了反而闪空）。
-                _pendingPageInvalidate.Remove(b);
             }
         }
+
+        private void MarkActivePageDirty(int block, float now)
+        {
+            if (!_liveDirtySince.ContainsKey(block))
+                _liveDirtySince.Add(block, now);
+        }
+
+        private void RefreshActiveBoundaryDebt(float now, int pageCount, uint[] boundaryEpochs)
+        {
+            _liveBoundaryDebtCount = 0;
+            if (boundaryEpochs == null || boundaryEpochs.Length != pageCount * 6)
+                return;
+            if (_liveBoundaryEpochConsumed == null ||
+                _liveBoundaryEpochConsumed.Length != boundaryEpochs.Length)
+                _liveBoundaryEpochConsumed = new uint[boundaryEpochs.Length];
+
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            for (int b = 0; b < pageCount; b++)
+            {
+                var c = FrozenBlockCoord3(b);
+                for (int face = 0; face < 6; face++)
+                {
+                    int slot = b * 6 + face;
+                    uint epoch = boundaryEpochs[slot];
+                    if (epoch == 0u || epoch <= _liveBoundaryEpochConsumed[slot]) continue;
+                    _liveBoundaryEpochConsumed[slot] = epoch;
+                    _liveBoundaryDebtCount++;
+                    MarkActivePageDirty(b, now);
+                    var n = c + ActivePageFaceNeighbours[face];
+                    if (n.x < 0 || n.y < 0 || n.z < 0 ||
+                        n.x >= grid.x || n.y >= grid.y || n.z >= grid.z)
+                        continue;
+                    int neighbour = n.x + grid.x * (n.y + grid.y * n.z);
+                    MarkActivePageDirty(neighbour, now);
+                }
+            }
+        }
+
+        private Vector3 FrozenBlockWorldCenter(int block)
+        {
+            var coord = FrozenBlockCoord3(block);
+            var vox = _volumeIntegrator.VoxelCount;
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            int blockSize = Mathf.Max(1, vox.x / grid.x);
+            Vector3 local = new Vector3(
+                (coord.x * blockSize + blockSize * 0.5f - vox.x * 0.5f) * _volumeIntegrator.VoxelSize,
+                (coord.y * blockSize + blockSize * 0.5f - vox.y * 0.5f) * _volumeIntegrator.VoxelSize,
+                (coord.z * blockSize + blockSize * 0.5f - vox.z * 0.5f) * _volumeIntegrator.VoxelSize);
+            return _meshExtractor.transform.TransformPoint(local);
+        }
+
+        private readonly Plane[] _liveFrustumPlanes = new Plane[6];
+        private readonly Vector3[] _livePageCorners = new Vector3[8];
+
+        private Bounds FrozenBlockWorldBounds(int block)
+        {
+            var coord = FrozenBlockCoord3(block);
+            var vox = _volumeIntegrator.VoxelCount;
+            var grid = _volumeIntegrator.FrozenChunkCount;
+            int blockSize = Mathf.Max(1, vox.x / grid.x);
+            float vs = _volumeIntegrator.VoxelSize;
+            Vector3 localMin = new Vector3(
+                (coord.x * blockSize - vox.x * 0.5f) * vs,
+                (coord.y * blockSize - vox.y * 0.5f) * vs,
+                (coord.z * blockSize - vox.z * 0.5f) * vs);
+            Vector3 localMax = new Vector3(
+                (Mathf.Min((coord.x + 1) * blockSize, vox.x) - vox.x * 0.5f) * vs,
+                (Mathf.Min((coord.y + 1) * blockSize, vox.y) - vox.y * 0.5f) * vs,
+                (Mathf.Min((coord.z + 1) * blockSize, vox.z) - vox.z * 0.5f) * vs);
+            Transform root = _meshExtractor.transform;
+            Bounds bounds = new Bounds(root.TransformPoint(localMin), Vector3.zero);
+            for (int i = 0; i < 8; i++)
+            {
+                Vector3 local = new Vector3(
+                    (i & 1) == 0 ? localMin.x : localMax.x,
+                    (i & 2) == 0 ? localMin.y : localMax.y,
+                    (i & 4) == 0 ? localMin.z : localMax.z);
+                Vector3 world = root.TransformPoint(local);
+                _livePageCorners[i] = world;
+                bounds.Encapsulate(world);
+            }
+            return bounds;
+        }
+
+        private void GetPageScreenPriority(Camera cam, Bounds bounds, float viewportMargin,
+            out float centerDistanceSq, out float cameraDepth, out bool overlapsViewport)
+        {
+            if (bounds.Contains(cam.transform.position))
+            {
+                centerDistanceSq = 0f;
+                cameraDepth = 0f;
+                overlapsViewport = true;
+                return;
+            }
+
+            float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
+            float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity;
+            cameraDepth = float.PositiveInfinity;
+            bool anyInFront = false;
+            for (int i = 0; i < 8; i++)
+            {
+                Vector3 viewport = cam.WorldToViewportPoint(_livePageCorners[i]);
+                if (viewport.z <= 0f) continue;
+                anyInFront = true;
+                minX = Mathf.Min(minX, viewport.x);
+                maxX = Mathf.Max(maxX, viewport.x);
+                minY = Mathf.Min(minY, viewport.y);
+                maxY = Mathf.Max(maxY, viewport.y);
+                cameraDepth = Mathf.Min(cameraDepth, viewport.z);
+            }
+            if (!anyInFront)
+            {
+                Vector3 center = cam.WorldToViewportPoint(bounds.center);
+                float dx = center.x - 0.5f;
+                float dy = center.y - 0.5f;
+                centerDistanceSq = dx * dx + dy * dy;
+                cameraDepth = Mathf.Abs(center.z);
+                overlapsViewport = false;
+                return;
+            }
+            float margin = Mathf.Max(0f, viewportMargin);
+            overlapsViewport = maxX >= -margin && minX <= 1f + margin &&
+                               maxY >= -margin && minY <= 1f + margin;
+            float nearestX = Mathf.Clamp(0.5f, minX, maxX);
+            float nearestY = Mathf.Clamp(0.5f, minY, maxY);
+            float screenDx = nearestX - 0.5f;
+            float screenDy = nearestY - 0.5f;
+            centerDistanceSq = screenDx * screenDx + screenDy * screenDy;
+        }
+
+        private static int CompareLiveCandidates(LiveCandidate a, LiveCandidate b)
+        {
+            int urgent = b.Urgent.CompareTo(a.Urgent);
+            if (urgent != 0) return urgent;
+            int aBand = (a.Overdue ? 2 : 0) + (a.Visible ? 1 : 0);
+            int bBand = (b.Overdue ? 2 : 0) + (b.Visible ? 1 : 0);
+            int band = bBand.CompareTo(aBand);
+            if (band != 0) return band;
+            int age = b.Age.CompareTo(a.Age);
+            if (age != 0) return age;
+            int center = a.CenterDistanceSq.CompareTo(b.CenterDistanceSq);
+            return center != 0 ? center : a.CameraDepth.CompareTo(b.CameraDepth);
+        }
+
+        private static readonly Unity.Mathematics.int3[] ActivePageFaceNeighbours =
+        {
+            new Unity.Mathematics.int3(-1, 0, 0), new Unity.Mathematics.int3(1, 0, 0),
+            new Unity.Mathematics.int3(0, -1, 0), new Unity.Mathematics.int3(0, 1, 0),
+            new Unity.Mathematics.int3(0, 0, -1), new Unity.Mathematics.int3(0, 0, 1)
+        };
 
         private struct LiveCandidate
         {
             public int Block;
-            public float Dist;
+            public bool Visible;
+            public bool Urgent;
+            public bool Overdue;
+            public float Age;
+            public float CenterDistanceSq;
+            public float CameraDepth;
         }
-        private readonly List<LiveCandidate> _liveCandidates = new List<LiveCandidate>(32);
+        private readonly List<LiveCandidate> _liveCandidates = new List<LiveCandidate>(144);
 
         /// <summary>
         /// 实时轨视线落点距离（米）：深度锚定优先——中心 8×8 深度中位数 +0.15m
@@ -2631,6 +3123,8 @@ namespace Genesis.RoomScan
             IsScanning = true;
             try
             {
+                // 开扫前最后一次固化身份；后续空卷开关由 HasStarted 锁死。
+                SyncCaptureModeIdentity();
                 // 阶段 1：GPU 体积 bring-up
                 _volumeIntegrator.ReallocateVolumes();
                 await Task.Yield();
@@ -2666,6 +3160,7 @@ namespace Genesis.RoomScan
                     if (incremental)
                         _meshExtractor.BeginIncrementalHera(abMaxChunksPerTick);
                 }
+                _depthPointCloudOverlay?.SetAcquiring(true);
                 HasStarted = true;
                 _hudStatus = resuming ? "扫描中(继续)" : "扫描中";
                 _hudLastError = "";
@@ -2690,6 +3185,8 @@ namespace Genesis.RoomScan
             if (!IsScanning) return;
             IsScanning = false;
 
+            _depthPointCloudOverlay?.SetAcquiring(false);
+
             _cameraProvider?.StopCapture();
             _depthCapture.StopDepthCapture();
 
@@ -2700,9 +3197,9 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Freeze the shared TSDF and begin a read-only replay of the selected
-        /// admission granularity.  Coverage tiles are hidden first, before a
-        /// replay renderer is allowed to appear, so the two cannot overlap.
+        /// Freeze the shared TSDF and seal the visible incremental HERA front.
+        /// Coverage tiles are hidden first; already-published HERA snapshots
+        /// stay resident while never-built pages finish their bookkeeping.
         /// </summary>
         public void FreezeChunkAbTsdf()
         {
@@ -2735,7 +3232,7 @@ namespace Genesis.RoomScan
             _chunkAbDiagnosticColoring = true;
             RefreshStatusBadge();
             Logger.Info(enableHeraHierarchicalReplay
-                ? "共享 TSDF 已冻结；开始 HERA 只读分层回放"
+                ? "共享 TSDF 已冻结；当前 HERA 前台已封存，仅补未建页"
                 : $"共享 TSDF 已冻结；开始 {ActiveChunkAbSize}³ 只读切块回放");
         }
 
@@ -2767,7 +3264,8 @@ namespace Genesis.RoomScan
             {
                 string message = _meshExtractor.FrozenHeraReplayFailed
                     ? $"HERA 回放失败，禁止导出：{_meshExtractor.FrozenHeraReplayFailureReason}"
-                    : $"账簿未闭环：还差 {_meshExtractor.FrozenHeraChildrenPending} 个子页、" +
+                    : $"账簿未闭环：还差 {_meshExtractor.FrozenHeraParentFinalizationPending} 个父页、" +
+                      $"{_meshExtractor.FrozenHeraChildrenPending} 个子页、" +
                       $"{_meshExtractor.FrozenHeraFamiliesPending} 个家族裁决";
                 NotifyInput(message);
                 RefreshStatusBadge();
@@ -2850,13 +3348,66 @@ namespace Genesis.RoomScan
             RefreshStatusBadge();
         }
 
-        /// <summary>X：呼出/收起采集点阵（单帧真值判官对照层；数据账不受显示影响）。</summary>
+        /// <summary>X：呼出/收起融合前 BB 反投影留痕；不写 TSDF，数据账不受显示影响。</summary>
         public void ToggleCoverageMarkers()
         {
-            if (_coverageOverlay == null) return;
-            bool visible = !_coverageOverlay.MarkersVisible;
-            _coverageOverlay.SetMarkersVisible(visible);
-            NotifyInput(visible ? "点阵判官：开" : "点阵判官：关");
+            if (_depthPointCloudOverlay == null) return;
+            bool visible = !_depthPointCloudOverlay.Visible;
+            // 旧黄/绿 TSDF 就绪片会污染“深度先验”观察，BB 验证期间保持隐藏；
+            // 视角覆盖账本仍在后台统计。
+            _coverageOverlay?.SetMarkersVisible(false);
+            if (visible)
+            {
+                _bbPresentationCaptured = true;
+                _bbRestoreMeshVisible = _meshExtractor != null && _meshExtractor.IsAnyMeshVisible;
+                _bbRestoreCoarseSkinVisible = _meshExtractor != null && _meshExtractor.IsCoarseSkinVisible;
+                _bbRestoreManagementBlocks = showManagementBlockWireOverlay;
+                _meshExtractor?.SetCurrentMeshDisplayVisible(false);
+                _meshExtractor?.SetCoarseSkinVisible(false);
+                showManagementBlockWireOverlay = false;
+                _managementBlockWireOverlay?.SetVisible(false);
+            }
+            _depthPointCloudOverlay.SetVisible(visible);
+            _depthPointCloudOverlay.SetAcquiring(IsScanning);
+            if (!visible && _bbPresentationCaptured)
+            {
+                _meshExtractor?.SetCurrentMeshDisplayVisible(_bbRestoreMeshVisible);
+                _meshExtractor?.SetCoarseSkinVisible(_bbRestoreCoarseSkinVisible);
+                showManagementBlockWireOverlay = _bbRestoreManagementBlocks;
+                _managementBlockWireOverlay?.SetVisible(_bbRestoreManagementBlocks);
+                _bbPresentationCaptured = false;
+            }
+            NotifyInput(visible ? "BB反投影：开(白正视/洋红掠射)" : "BB反投影：关");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// 左握把+X：切换平台前处理/本工程后处理双路逐帧采集。
+        /// 只增加诊断副本，不改变深度预处理、融合或显示。
+        /// </summary>
+        public void TogglePairedDepthFrameCapture()
+        {
+            if (_depthCapture == null)
+            {
+                NotifyInput("双深采集：DepthCapture 不可用");
+                return;
+            }
+
+            bool wasActive = _depthCapture.PairedFrameCaptureActive;
+            bool active = _depthCapture.TogglePairedFrameCapture();
+            if (active)
+            {
+                NotifyInput("双深采集：开始（左握把+X停止）");
+            }
+            else if (wasActive)
+            {
+                NotifyInput($"双深采集：停止，待写{_depthCapture.PairedFrameCapturePending} " +
+                            $"丢{_depthCapture.PairedFrameCaptureDropped}");
+            }
+            else
+            {
+                NotifyInput("双深采集：启动失败（查设备日志）");
+            }
             RefreshStatusBadge();
         }
 
@@ -2947,6 +3498,7 @@ namespace Genesis.RoomScan
         private static readonly int WireThicknessID = Shader.PropertyToID("_RSWireThickness");
         private static readonly int MeshStrideID = Shader.PropertyToID("_RSMeshStride");
         private static readonly int GridSpacingID = Shader.PropertyToID("_RSGridSpacing");
+        private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
         private static readonly int ConfidenceVizID = Shader.PropertyToID("_RSConfidenceViz");
         private static readonly int GeometryTruthViewID = Shader.PropertyToID("_RSGeometryTruthView");
         private bool _confidenceVizApplied;
@@ -2956,6 +3508,7 @@ namespace Genesis.RoomScan
         {
             Shader.SetGlobalFloat(TriAvailableID, 0f);
             Shader.SetGlobalFloat(NormalFallbackID, 0f);
+            Shader.SetGlobalFloat(PaperGridModeID, 0f);
             ApplyDisplayMode();
             Shader.SetGlobalFloat(NoFreezeTintID, 0f);
         }

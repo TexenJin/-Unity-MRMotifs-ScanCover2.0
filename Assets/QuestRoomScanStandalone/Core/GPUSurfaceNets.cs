@@ -155,6 +155,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_HeraFilterCounters = Shader.PropertyToID("_HeraFilterCounters");
         private static readonly int ID_HeraDrawIndirectArgs = Shader.PropertyToID("_HeraDrawIndirectArgs");
         private static readonly int ID_HeraSourceIndexCount = Shader.PropertyToID("_HeraSourceIndexCount");
+        private static readonly int ID_HeraMatureOnly = Shader.PropertyToID("_HeraMatureOnly");
         private static readonly int ID_HeraInteriorShadowIndices = Shader.PropertyToID("_HeraInteriorShadowIndices");
         private static readonly int ID_HeraInteriorShadowDrawIndirectArgs = Shader.PropertyToID("_HeraInteriorShadowDrawIndirectArgs");
         private static readonly int ID_HeraBoundaryShadowIndices = Shader.PropertyToID("_HeraBoundaryShadowIndices");
@@ -343,7 +344,10 @@ namespace Genesis.RoomScan
                 _compute.Dispatch(_kCopyMeshSnapshot, CeilDiv(count, 64), 1, 1);
         }
 
-        public HeraFilterOperation BeginHeraCleanFilter(int vertexCount, int indexCount)
+        public HeraFilterOperation BeginHeraCleanFilter(
+            int vertexCount,
+            int indexCount,
+            bool matureOnly = false)
         {
             vertexCount = Mathf.Clamp(vertexCount, 0, _maxVertices);
             indexCount = Mathf.Clamp(indexCount, 0, _maxIndices);
@@ -371,6 +375,7 @@ namespace Genesis.RoomScan
 
                 _compute.SetInt(ID_SnapshotVertexCount, vertexCount);
                 _compute.SetInt(ID_HeraSourceIndexCount, indexCount);
+                _compute.SetInt(ID_HeraMatureOnly, matureOnly ? 1 : 0);
                 _compute.SetBuffer(_kCopyHeraVertexPayload, ID_Vertices, _vertices);
                 _compute.SetBuffer(_kCopyHeraVertexPayload, ID_VertexAdmissionClass, _vertexAdmissionClass);
                 _compute.SetBuffer(_kCopyHeraVertexPayload, ID_SnapshotVertices, snapshot.VertexBuffer);

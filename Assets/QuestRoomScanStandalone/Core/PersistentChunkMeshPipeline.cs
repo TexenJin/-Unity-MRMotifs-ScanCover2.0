@@ -189,11 +189,29 @@ namespace Genesis.RoomScan
             public readonly uint[] LastBoundaryEpoch = new uint[6];
             public float CommittedAtRealtime;
             public bool Queued;
+            public bool QueuedUrgent;
+            public int QueueSerial;
             /// <summary>入队时刻（Time.time）：计时账"排队→落地"起点。</summary>
             public float QueuedAt;
             public bool Built;
             public bool CommitPending;
             public float CommitPendingSince;
+            public bool FrozenSnapshotSealed;
+            // Live 32^3 pages are repeatable producers.  Keep their temporal
+            // extraction worker and spatial front across commits; only the
+            // A-sealed/frozen replay is a one-shot job.
+            public bool LiveProgressive;
+            // The mutable page role may change while a GPU extraction/readback
+            // is in flight.  Candidate identity is latched at dispatch so a
+            // stale callback cannot be reinterpreted as the new role.
+            public bool CandidateLiveProgressive;
+            public bool ForceQueueAfterCommit;
+            // CandidateTriangleClass promotes a supported triangle only after
+            // two consecutive extraction epochs.  A geometry dirty event owns
+            // this bounded evaluation debt even when later TSDF writes change
+            // only weight and therefore do not advance the dirty ledger.
+            public int LiveEvaluationPassesRemaining;
+            public bool LiveEvaluationUrgent;
             public bool RequestedVisible = true;
             public int AcceptedVertices;
             public int AcceptedIndices;
@@ -324,10 +342,24 @@ namespace Genesis.RoomScan
         private readonly int _layer;
         private readonly Config _config;
         private readonly Action<GPUSurfaceNets> _extract;
-        private readonly Queue<int> _dirtyQueue = new Queue<int>();
+        private readonly struct QueueEntry
+        {
+            public readonly int Index;
+            public readonly int Serial;
+
+            public QueueEntry(int index, int serial)
+            {
+                Index = index;
+                Serial = serial;
+            }
+        }
+
+        private readonly Queue<QueueEntry> _dirtyQueue = new Queue<QueueEntry>();
+        private readonly Queue<QueueEntry> _urgentQueue = new Queue<QueueEntry>();
         private readonly List<Chunk> _chunks = new List<Chunk>();
         private int3 _chunkCount;
         private int _generation;
+        private int _queueSerial;
         private int _readbackFailures;
         private bool _readbackPending;
         private bool _ownerLedgerReady;
@@ -338,6 +370,7 @@ namespace Genesis.RoomScan
         private bool _disposed;
         private bool _visible;
         private bool _diagnosticColoring = true;
+        private bool _sealCommittedStaticReplayPages;
         private int _replayBuildSequence;
         private float _nextReadbackTime;
 
@@ -443,9 +476,13 @@ namespace Genesis.RoomScan
         // Partial additive recovery is deliberately bounded.  A later clean,
         // non-regressive replacement compacts the snapshot back to one exact
         // extraction payload.
-        private const int MaxAdditiveMergePasses = 6;
+        // A 32^3 live page owns one renderer but may receive many 4x4x4-bin
+        // installments.  The vertex/index hard caps remain the real memory
+        // guard; this pass cap only prevents an indefinitely retained worker.
+        private const int MaxAdditiveMergePasses = 24;
         private const int MaxAdditiveSnapshotVertices = 131072;
         private const int MaxAdditiveSnapshotIndices = 786432;
+        private const int LiveMaturityEvaluationPasses = 2;
         // Disabled for production: a monotonic triangle union cannot both keep
         // stale geometry and correct a surface that moves into a neighbouring
         // voxel.  It also has no shared-boundary transaction, so it can create
@@ -506,7 +543,7 @@ namespace Genesis.RoomScan
         public bool InitialBuildComplete { get; private set; }
         public bool Failed { get; private set; }
         public string FailureReason { get; private set; }
-        public int PendingChunkCount => _dirtyQueue.Count;
+        public int PendingChunkCount => _urgentQueue.Count + _dirtyQueue.Count;
         // ── 计时账（EMA 平滑，α=0.25）──
         private float _emaQueueToCommitMs = -1f;
         private float _emaDispatchToCallbackMs = -1f;
@@ -612,17 +649,36 @@ namespace Genesis.RoomScan
                 RequestDirtyLedgerIfDue();
 
             int budget = _config.MaxChunksPerTick;
-            while (budget-- > 0 && _dirtyQueue.Count > 0)
+            while (budget-- > 0 && (_urgentQueue.Count > 0 || _dirtyQueue.Count > 0))
             {
-                int index = _dirtyQueue.Dequeue();
-                Chunk chunk = _chunks[index];
+                QueueEntry entry = _urgentQueue.Count > 0
+                    ? _urgentQueue.Dequeue()
+                    : _dirtyQueue.Dequeue();
+                Chunk chunk = _chunks[entry.Index];
+                // Promotion and later requeues leave stale queue tokens behind.
+                // A serial makes them harmless without an O(n) queue removal.
+                if (!chunk.Queued || entry.Serial != chunk.QueueSerial)
+                {
+                    budget++;
+                    continue;
+                }
                 chunk.Queued = false;
+                chunk.QueuedUrgent = false;
+                if (_sealCommittedStaticReplayPages && chunk.FrozenSnapshotSealed &&
+                    chunk.Built && !chunk.CommitPending)
+                {
+                    chunk.ProcessedEpoch = math.max(chunk.ProcessedEpoch, chunk.TargetEpoch);
+                    chunk.Surface?.Dispose();
+                    chunk.Surface = null;
+                    continue;
+                }
                 try
                 {
                     EnsureChunkResources(chunk);
                     if (chunk.CommitPending)
                         continue;
                     uint candidateEpoch = chunk.TargetEpoch;
+                    chunk.CandidateLiveProgressive = chunk.LiveProgressive;
                     _extract(chunk.Surface);
                     chunk.Renderer.UpdateBounds(GetPaddedCoreBounds(chunk));
                     chunk.CandidateEpoch = candidateEpoch;
@@ -646,6 +702,7 @@ namespace Genesis.RoomScan
                 if (chunk.CommitPending && Time.time - chunk.CommitPendingSince > 10f)
                 {
                     chunk.CommitPending = false;
+                    chunk.ForceQueueAfterCommit = false;
                     CommitWatchdogResets++;
                     Logger.Warning($"页 {chunk.Coordinate} 提交回读超时（>10s），看门狗复位重排");
                     QueueChunk(chunk.Index, chunk.TargetEpoch);
@@ -721,12 +778,33 @@ namespace Genesis.RoomScan
                 chunk.HeraBoundaryShadowSnapshot != null && chunk.HeraBoundaryShadowIndices > 0;
         }
 
-        public bool QueueStaticReplayChunk(int3 coordinate)
+        public bool QueueStaticReplayChunk(
+            int3 coordinate,
+            bool liveProgressive = false,
+            bool urgent = false)
         {
             if (_disposed || !_config.StaticReplay ||
                 math.any(coordinate < 0) || math.any(coordinate >= _chunkCount))
                 return false;
-            QueueChunk(Flatten(coordinate), math.max(1u, _volume.DirtyEpoch));
+            Chunk chunk = _chunks[Flatten(coordinate)];
+            if (chunk.CommitPending)
+                chunk.ForceQueueAfterCommit =
+                    chunk.CandidateLiveProgressive != liveProgressive;
+            chunk.LiveProgressive = liveProgressive;
+            if (liveProgressive)
+            {
+                chunk.LiveEvaluationUrgent =
+                    chunk.LiveEvaluationPassesRemaining > 0
+                        ? chunk.LiveEvaluationUrgent || urgent
+                        : urgent;
+                chunk.LiveEvaluationPassesRemaining = LiveMaturityEvaluationPasses;
+            }
+            else
+            {
+                chunk.LiveEvaluationPassesRemaining = 0;
+                chunk.LiveEvaluationUrgent = false;
+            }
+            QueueChunk(chunk.Index, math.max(1u, _volume.DirtyEpoch), urgent);
             return true;
         }
 
@@ -749,11 +827,36 @@ namespace Genesis.RoomScan
                 Chunk chunk = _chunks[i];
                 if (chunk.Built || chunk.Queued || chunk.CommitPending)
                     continue;
+                chunk.LiveProgressive = false;
                 QueueChunk(i, epoch);
                 if (chunk.Queued)
                     queued++;
             }
             return queued;
+        }
+
+        /// <summary>
+        /// Seal every already-published static page as the A-key product.
+        /// Queued or in-flight rebuilds may finish their GPU work, but cannot
+        /// replace these immutable front snapshots. Pages that never published
+        /// remain unsealed and may still be completed as empty bookkeeping.
+        /// </summary>
+        public int SealCommittedStaticReplayPages()
+        {
+            if (_disposed || !_config.StaticReplay)
+                return 0;
+
+            _sealCommittedStaticReplayPages = true;
+            int sealedCount = 0;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (!chunk.Built)
+                    continue;
+                chunk.FrozenSnapshotSealed = true;
+                sealedCount++;
+            }
+            return sealedCount;
         }
 
         /// <summary>页是否已建（含空页）。增量精修 HUD 与邻页判定用。</summary>
@@ -762,6 +865,20 @@ namespace Genesis.RoomScan
             if (_disposed || math.any(coordinate < 0) || math.any(coordinate >= _chunkCount))
                 return false;
             return _chunks[Flatten(coordinate)].Built;
+        }
+
+        /// <summary>
+        /// Whether this page owns a non-empty committed front snapshot.  This is
+        /// deliberately stricter than IsChunkBuilt: an empty bookkeeping page is
+        /// built, but it is not a surface product and must not settle live
+        /// coverage debt.
+        /// </summary>
+        public bool HasCommittedSurface(int3 coordinate)
+        {
+            if (_disposed || math.any(coordinate < 0) || math.any(coordinate >= _chunkCount))
+                return false;
+            Chunk chunk = _chunks[Flatten(coordinate)];
+            return chunk.Built && chunk.Snapshot != null && chunk.AcceptedIndices > 0;
         }
 
         /// <summary>页是否在队或提交在途（增量精修 HUD："精修中"判定）。</summary>
@@ -785,6 +902,11 @@ namespace Genesis.RoomScan
                 math.any(coordinate < 0) || math.any(coordinate >= _chunkCount))
                 return false;
             Chunk chunk = _chunks[Flatten(coordinate)];
+            if (chunk.CommitPending)
+                chunk.ForceQueueAfterCommit = true;
+            chunk.LiveProgressive = false;
+            chunk.LiveEvaluationPassesRemaining = 0;
+            chunk.LiveEvaluationUrgent = false;
             chunk.ProcessedEpoch = 0;
             chunk.TargetEpoch = 0;
             QueueChunk(chunk.Index, math.max(1u, _volume.DirtyEpoch));
@@ -945,6 +1067,7 @@ namespace Genesis.RoomScan
                 {
                     // Keep the previous front-buffer and retry the same epoch.
                     chunk.CommitPending = false;
+                    chunk.ForceQueueAfterCommit = false;
                     QueueChunk(chunk.Index, candidateEpoch);
                     return;
                 }
@@ -954,11 +1077,6 @@ namespace Genesis.RoomScan
                 int indices = counters.Length > 1 ? (int)counters[1] : 0;
                 if (_config.StaticReplay)
                     CaptureStaticReplayPage(chunk, counters, indices);
-                if (_config.StaticReplay && _config.HeraFilterCleanTriangles)
-                {
-                    RequestHeraFilteredCommit(chunk, candidateEpoch, vertices, indices, requestGeneration);
-                    return;
-                }
                 var spatialMature = new uint[SpatialLedgerBinCount];
                 for (int i = 0; i < SpatialLedgerBinCount; i++)
                 {
@@ -970,6 +1088,13 @@ namespace Genesis.RoomScan
                 {
                     int counterIndex = SpatialOccupancyBase + i;
                     spatialOccupancy[i] = counterIndex < counters.Length ? counters[counterIndex] : 0u;
+                }
+                if (_config.StaticReplay && _config.HeraFilterCleanTriangles)
+                {
+                    RequestHeraFilteredCommit(
+                        chunk, candidateEpoch, vertices, indices, requestGeneration,
+                        spatialMature, spatialOccupancy);
+                    return;
                 }
                 bool spatialDestructive = IsSpatialRegression(chunk, spatialMature);
                 bool destructive = IsDestructiveRegression(chunk, vertices, indices);
@@ -1137,17 +1262,26 @@ namespace Genesis.RoomScan
             uint candidateEpoch,
             int vertices,
             int sourceIndices,
-            int requestGeneration)
+            int requestGeneration,
+            uint[] spatialMature,
+            uint[] spatialOccupancy)
         {
             GPUSurfaceNets.HeraFilterOperation operation;
+            // QueueParentBlock may switch the page to final identity while an
+            // older live GPU job is still in flight.  The result must be judged
+            // by the identity with which it was dispatched; the finalizer will
+            // then enqueue its mandatory clean whole-page pass.
+            bool liveProgressiveCandidate = chunk.CandidateLiveProgressive;
             try
             {
-                operation = chunk.Surface.BeginHeraCleanFilter(vertices, sourceIndices);
+                operation = chunk.Surface.BeginHeraCleanFilter(
+                    vertices, sourceIndices, matureOnly: liveProgressiveCandidate);
             }
             catch (Exception ex)
             {
                 Logger.Warning($"HERA filter could not start for page {chunk.Coordinate}: {ex.Message}");
                 chunk.CommitPending = false;
+                chunk.ForceQueueAfterCommit = false;
                 QueueChunk(chunk.Index, candidateEpoch);
                 return;
             }
@@ -1161,7 +1295,22 @@ namespace Genesis.RoomScan
                     if (filterRequest.hasError)
                     {
                         chunk.CommitPending = false;
+                        chunk.ForceQueueAfterCommit = false;
                         QueueChunk(chunk.Index, candidateEpoch);
+                        return;
+                    }
+
+                    // A may seal a resident front snapshot while an older
+                    // scan-time rebuild is already in flight. Discard that
+                    // candidate before TakeSnapshot/SetMeshSource so an empty
+                    // cold result cannot overwrite the visible product.
+                    if (_sealCommittedStaticReplayPages &&
+                        chunk.FrozenSnapshotSealed && chunk.Built)
+                    {
+                        chunk.CommitPending = false;
+                        chunk.ProcessedEpoch = math.max(chunk.ProcessedEpoch, chunk.TargetEpoch);
+                        chunk.Surface?.Dispose();
+                        chunk.Surface = null;
                         return;
                     }
 
@@ -1196,7 +1345,52 @@ namespace Genesis.RoomScan
                     int confirmationPendingTriangles = filtered.Length > 23 ? (int)filtered[23] : 0;
                     int confirmationConfirmedTriangles = filtered.Length > 24 ? (int)filtered[24] : 0;
                     int confirmationMixedTriangles = filtered.Length > 25 ? (int)filtered[25] : 0;
-                    int sourceTriangles = Mathf.Max(0, sourceIndices / 3);
+                    int sourceTriangles = liveProgressiveCandidate
+                        ? keptTriangles
+                        : Mathf.Max(0, sourceIndices / 3);
+
+                    // Role changed after this task was dispatched.  Publishing
+                    // it would either turn a mature-only live candidate into a
+                    // false final page, or let an old final candidate replace a
+                    // newly-live append-only front.  Keep the resident front,
+                    // settle this task and let ForceQueueAfterCommit run the
+                    // current role once.
+                    if (liveProgressiveCandidate != chunk.LiveProgressive)
+                    {
+                        RecordLocalReplacement(
+                            chunk, candidateEpoch, vertices, sourceIndices,
+                            spatialOccupancy, false, "hera_candidate_role_superseded");
+                        if (liveProgressiveCandidate)
+                            FinishLiveCandidateCommit(chunk, candidateEpoch);
+                        else
+                            FinishCandidateCommit(chunk, candidateEpoch);
+                        return;
+                    }
+
+                    // Once a live sheet has a front-buffer it is never replaced
+                    // during scan-time.  Later candidates may only write mature
+                    // triangles into fine cells that the sheet did not already
+                    // own.  A-finalized pages bypass this branch and still get
+                    // their mandatory whole-page still-TSDF resubmission.
+                    if (liveProgressiveCandidate && chunk.Built)
+                    {
+                        BeginHeraLiveSpatialAppend(
+                            chunk, candidateEpoch, vertices, sourceIndices,
+                            requestGeneration, spatialMature, spatialOccupancy);
+                        return;
+                    }
+
+                    // Do not create an empty live page merely because its worker
+                    // completed.  A later dirty epoch can retry, and the first
+                    // visible commit will already contain useful writing.
+                    if (liveProgressiveCandidate && storedIndices <= 0)
+                    {
+                        RecordLocalReplacement(
+                            chunk, candidateEpoch, vertices, sourceIndices,
+                            spatialOccupancy, false, "hera_live_no_mature_triangles");
+                        FinishLiveCandidateCommit(chunk, candidateEpoch);
+                        return;
+                    }
 
                     GPUChunkMeshSnapshot nextSnapshot = operation.TakeSnapshot();
                     GPUChunkMeshSnapshot nextInteriorShadowSnapshot = operation.TakeInteriorShadowSnapshot();
@@ -1228,6 +1422,9 @@ namespace Genesis.RoomScan
                     chunk.HeraInteriorShadowIndices = interiorShadowIndices;
                     chunk.HeraBoundaryShadowIndices = boundaryShadowIndices;
                     chunk.AdditiveMergePasses = 0;
+                    UpdateSpatialProtection(chunk, spatialMature);
+                    Array.Copy(spatialMature, chunk.AcceptedSpatialMature, SpatialLedgerBinCount);
+                    Array.Copy(spatialOccupancy, chunk.AcceptedSpatialOccupancy, SpatialOccupancyWordCount);
                     chunk.BuiltEpoch = candidateEpoch;
                     chunk.CommittedAtRealtime = Time.realtimeSinceStartup;
                     chunk.Built = true;
@@ -1253,11 +1450,16 @@ namespace Genesis.RoomScan
                     chunk.ReplayPageClass = sourceTriangles == 0 ? 0 : delegatedTriangles > 0 ? 2 : 1;
                     chunk.Renderer.SetHeraReplayDisplay(_diagnosticColoring);
                     ResetDestructiveCandidate(chunk);
+                    if (_sealCommittedStaticReplayPages)
+                        chunk.FrozenSnapshotSealed = true;
 
                     // Complete the page commit before notifying HERA.  The
                     // family callback is the final authority over parent/child
                     // visibility and must not be overwritten by commit cleanup.
-                    FinishCandidateCommit(chunk, candidateEpoch);
+                    if (liveProgressiveCandidate)
+                        FinishLiveCandidateCommit(chunk, candidateEpoch);
+                    else
+                        FinishCandidateCommit(chunk, candidateEpoch);
 
                     StaticReplayPageCommitted?.Invoke(new StaticReplayPageResult(
                         chunk.Coordinate,
@@ -1299,7 +1501,7 @@ namespace Genesis.RoomScan
                     // GPU memory to grow throughout HERA and made the headset
                     // spend long periods showing only the first sparse rescue
                     // pages.  Keep the snapshots; retire only the worker.
-                    if (_config.StaticReplay)
+                    if (_config.StaticReplay && !liveProgressiveCandidate)
                     {
                         chunk.Surface?.Dispose();
                         chunk.Surface = null;
@@ -1308,6 +1510,149 @@ namespace Genesis.RoomScan
                 finally
                 {
                     operation.Dispose();
+                }
+            });
+        }
+
+        /// <summary>
+        /// Writes new mature fine cells into an already-visible HERA parent page.
+        /// The old front-buffer is copied byte-for-byte and remains resident until
+        /// the complete successor snapshot is ready, so this phase cannot delete,
+        /// move, or punch a hole in previously visible geometry.
+        /// </summary>
+        private void BeginHeraLiveSpatialAppend(
+            Chunk chunk,
+            uint candidateEpoch,
+            int vertices,
+            int sourceIndices,
+            int requestGeneration,
+            uint[] spatialMature,
+            uint[] spatialOccupancy)
+        {
+            uint addedCells = CountAddedSpatialCells(
+                chunk.AcceptedSpatialOccupancy, spatialOccupancy);
+            if (addedCells == 0u)
+            {
+                RecordLocalReplacement(
+                    chunk, candidateEpoch, vertices, sourceIndices,
+                    spatialOccupancy, false, "hera_live_no_new_mature_cells");
+                ResetDestructiveCandidate(chunk);
+                FinishLiveCandidateCommit(chunk, candidateEpoch);
+                return;
+            }
+
+            bool capacityAvailable =
+                chunk.Snapshot != null &&
+                chunk.AdditiveMergePasses < MaxAdditiveMergePasses &&
+                chunk.SnapshotVertexCount + vertices <= MaxAdditiveSnapshotVertices &&
+                chunk.SnapshotIndexCount + sourceIndices <= MaxAdditiveSnapshotIndices;
+            if (!capacityAvailable)
+            {
+                _localPartialCapRejectedCandidates++;
+                string decision = chunk.AdditiveMergePasses >= MaxAdditiveMergePasses
+                    ? "hera_live_bin_pass_cap"
+                    : "hera_live_bin_capacity_cap";
+                RecordLocalReplacement(
+                    chunk, candidateEpoch, vertices, sourceIndices,
+                    spatialOccupancy, false, decision);
+                ResetDestructiveCandidate(chunk);
+                FinishLiveCandidateCommit(chunk, candidateEpoch);
+                return;
+            }
+
+            GPUSurfaceNets.AdditiveMergeOperation merge;
+            try
+            {
+                merge = chunk.Surface.BeginAdditiveMerge(
+                    chunk.Snapshot,
+                    chunk.SnapshotVertexCount,
+                    chunk.SnapshotIndexCount,
+                    vertices,
+                    sourceIndices,
+                    chunk.AcceptedSpatialOccupancy);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"HERA live bin append could not start for page " +
+                               $"{chunk.Coordinate}: {ex.Message}");
+                RecordLocalReplacement(
+                    chunk, candidateEpoch, vertices, sourceIndices,
+                    spatialOccupancy, false, "hera_live_bin_start_failed");
+                ResetDestructiveCandidate(chunk);
+                FinishLiveCandidateCommit(chunk, candidateEpoch);
+                return;
+            }
+
+            AsyncGPUReadback.Request(merge.Counters, mergeRequest =>
+            {
+                try
+                {
+                    if (_disposed || requestGeneration != _generation)
+                        return;
+
+                    if (mergeRequest.hasError)
+                    {
+                        RecordLocalReplacement(
+                            chunk, candidateEpoch, vertices, sourceIndices,
+                            spatialOccupancy, false, "hera_live_bin_readback_failed");
+                        ResetDestructiveCandidate(chunk);
+                        FinishLiveCandidateCommit(chunk, candidateEpoch);
+                        return;
+                    }
+
+                    var counters = mergeRequest.GetData<uint>();
+                    uint novelTriangles = counters.Length > 2 ? counters[2] : 0u;
+                    uint skippedOccupied = counters.Length > 3 ? counters[3] : 0u;
+                    uint skippedImmature = counters.Length > 4 ? counters[4] : 0u;
+                    int mergedIndices = counters.Length > 1
+                        ? (int)counters[1]
+                        : chunk.SnapshotIndexCount;
+
+                    if (novelTriangles == 0u ||
+                        mergedIndices <= chunk.SnapshotIndexCount ||
+                        mergedIndices > MaxAdditiveSnapshotIndices)
+                    {
+                        RecordLocalReplacement(
+                            chunk, candidateEpoch, vertices, sourceIndices,
+                            spatialOccupancy, false, "hera_live_bin_no_novel_triangles",
+                            novelTriangles, skippedOccupied, skippedImmature,
+                            merge.OutputVertexCount, mergedIndices,
+                            chunk.AdditiveMergePasses);
+                        ResetDestructiveCandidate(chunk);
+                        FinishLiveCandidateCommit(chunk, candidateEpoch);
+                        return;
+                    }
+
+                    RecordLocalReplacement(
+                        chunk, candidateEpoch, vertices, sourceIndices,
+                        spatialOccupancy, true, "hera_live_bin_append",
+                        novelTriangles, skippedOccupied, skippedImmature,
+                        merge.OutputVertexCount, mergedIndices,
+                        chunk.AdditiveMergePasses + 1);
+
+                    GPUChunkMeshSnapshot nextSnapshot = merge.TakeSnapshot();
+                    nextSnapshot?.SetDrawIndexCount(mergedIndices);
+                    GPUChunkMeshSnapshot previousSnapshot = chunk.Snapshot;
+                    chunk.Snapshot = nextSnapshot;
+                    chunk.Renderer.SetMeshSource(nextSnapshot);
+                    previousSnapshot?.Dispose();
+
+                    chunk.SnapshotVertexCount = merge.OutputVertexCount;
+                    chunk.SnapshotIndexCount = mergedIndices;
+                    chunk.AcceptedVertices = merge.OutputVertexCount;
+                    chunk.AcceptedIndices = mergedIndices;
+                    MergeAcceptedSpatialEvidence(chunk, spatialMature, spatialOccupancy);
+                    chunk.AdditiveMergePasses++;
+                    chunk.BuiltEpoch = candidateEpoch;
+                    chunk.CommittedAtRealtime = Time.realtimeSinceStartup;
+                    chunk.Built = true;
+                    chunk.Renderer.SetHeraReplayDisplay(_diagnosticColoring);
+                    ResetDestructiveCandidate(chunk);
+                    FinishLiveCandidateCommit(chunk, candidateEpoch);
+                }
+                finally
+                {
+                    merge.Dispose();
                 }
             });
         }
@@ -1840,8 +2185,45 @@ namespace Genesis.RoomScan
                     chunk.Snapshot != null && chunk.AcceptedIndices > 0;
             }
 
-            if (chunk.TargetEpoch > chunk.ProcessedEpoch)
+            if (chunk.ForceQueueAfterCommit &&
+                !(_sealCommittedStaticReplayPages && chunk.FrozenSnapshotSealed))
+            {
+                chunk.ForceQueueAfterCommit = false;
+                QueueChunk(
+                    chunk.Index,
+                    math.max(1u, _volume.DirtyEpoch),
+                    urgent: chunk.LiveEvaluationUrgent,
+                    force: true);
+            }
+            else if (chunk.TargetEpoch > chunk.ProcessedEpoch)
                 QueueChunk(chunk.Index, chunk.TargetEpoch);
+        }
+
+        private void FinishLiveCandidateCommit(Chunk chunk, uint candidateEpoch)
+        {
+            if (chunk.LiveEvaluationPassesRemaining > 0)
+                chunk.LiveEvaluationPassesRemaining--;
+
+            FinishCandidateCommit(chunk, candidateEpoch);
+
+            // One real geometry event buys exactly the two evaluations required
+            // by CandidateTriangleClass.  This is version debt, not a timer: it
+            // ends deterministically and cannot turn into another wake-up rule
+            // tuned per room, distance, angle, or material.
+            if (chunk.LiveProgressive &&
+                chunk.LiveEvaluationPassesRemaining > 0 &&
+                !(_sealCommittedStaticReplayPages && chunk.FrozenSnapshotSealed))
+            {
+                QueueChunk(
+                    chunk.Index,
+                    math.max(1u, _volume.DirtyEpoch),
+                    urgent: chunk.LiveEvaluationUrgent,
+                    force: true);
+            }
+            else if (chunk.LiveEvaluationPassesRemaining <= 0)
+            {
+                chunk.LiveEvaluationUrgent = false;
+            }
         }
 
         private static bool IsDestructiveRegression(Chunk chunk, int vertices, int indices)
@@ -2560,16 +2942,40 @@ namespace Genesis.RoomScan
             }
         }
 
-        private void QueueChunk(int index, uint epoch)
+        private void QueueChunk(
+            int index,
+            uint epoch,
+            bool urgent = false,
+            bool force = false)
         {
             Chunk chunk = _chunks[index];
+            if (_sealCommittedStaticReplayPages && chunk.FrozenSnapshotSealed && chunk.Built)
+                return;
             if (epoch > chunk.TargetEpoch)
                 chunk.TargetEpoch = epoch;
-            if (chunk.Queued || chunk.CommitPending || chunk.ProcessedEpoch >= chunk.TargetEpoch)
+            if (chunk.CommitPending ||
+                (!force && chunk.ProcessedEpoch >= chunk.TargetEpoch))
                 return;
+            if (chunk.Queued)
+            {
+                if (!urgent || chunk.QueuedUrgent)
+                    return;
+                // Promote an already queued centre-page job.  Its old FIFO
+                // token becomes stale through QueueSerial.
+                chunk.QueuedUrgent = true;
+                chunk.QueueSerial = ++_queueSerial;
+                _urgentQueue.Enqueue(new QueueEntry(index, chunk.QueueSerial));
+                return;
+            }
             chunk.Queued = true;
+            chunk.QueuedUrgent = urgent;
+            chunk.QueueSerial = ++_queueSerial;
             chunk.QueuedAt = Time.time;
-            _dirtyQueue.Enqueue(index);
+            QueueEntry entry = new QueueEntry(index, chunk.QueueSerial);
+            if (urgent)
+                _urgentQueue.Enqueue(entry);
+            else
+                _dirtyQueue.Enqueue(entry);
         }
 
         private void QueueAll(uint epoch)
@@ -2606,6 +3012,7 @@ namespace Genesis.RoomScan
         private void ResetToKnownEmptyVolume()
         {
             _generation++;
+            _sealCommittedStaticReplayPages = false;
             _readbackPending = false;
             _ownerLedgerReady = false;
             _boundaryLedgerReady = false;
@@ -2613,6 +3020,7 @@ namespace Genesis.RoomScan
             _ownerEpochSnapshot = null;
             _boundaryEpochSnapshot = null;
             _dirtyQueue.Clear();
+            _urgentQueue.Clear();
             uint clearEpoch = _volume.DirtyEpoch;
             for (int i = 0; i < _chunks.Count; i++)
             {
@@ -2622,7 +3030,14 @@ namespace Genesis.RoomScan
                 chunk.ProcessedEpoch = clearEpoch;
                 chunk.TargetEpoch = clearEpoch;
                 chunk.Queued = false;
+                chunk.QueuedUrgent = false;
                 chunk.CommitPending = false;
+                chunk.FrozenSnapshotSealed = false;
+                chunk.LiveProgressive = false;
+                chunk.CandidateLiveProgressive = false;
+                chunk.ForceQueueAfterCommit = false;
+                chunk.LiveEvaluationPassesRemaining = 0;
+                chunk.LiveEvaluationUrgent = false;
                 chunk.AcceptedVertices = 0;
                 chunk.AcceptedIndices = 0;
                 chunk.SnapshotVertexCount = 0;
@@ -2652,6 +3067,7 @@ namespace Genesis.RoomScan
         private void ResetForGlobalInvalidation()
         {
             _generation++;
+            _sealCommittedStaticReplayPages = false;
             _readbackPending = false;
             _ownerLedgerReady = false;
             _boundaryLedgerReady = false;
@@ -2659,6 +3075,7 @@ namespace Genesis.RoomScan
             _ownerEpochSnapshot = null;
             _boundaryEpochSnapshot = null;
             _dirtyQueue.Clear();
+            _urgentQueue.Clear();
             InitialBuildComplete = false;
             for (int i = 0; i < _chunks.Count; i++)
             {
@@ -2668,7 +3085,14 @@ namespace Genesis.RoomScan
                 chunk.ProcessedEpoch = 0;
                 chunk.TargetEpoch = 0;
                 chunk.Queued = false;
+                chunk.QueuedUrgent = false;
                 chunk.CommitPending = false;
+                chunk.FrozenSnapshotSealed = false;
+                chunk.LiveProgressive = false;
+                chunk.CandidateLiveProgressive = false;
+                chunk.ForceQueueAfterCommit = false;
+                chunk.LiveEvaluationPassesRemaining = 0;
+                chunk.LiveEvaluationUrgent = false;
                 chunk.AcceptedVertices = 0;
                 chunk.AcceptedIndices = 0;
                 chunk.SnapshotVertexCount = 0;
@@ -2710,6 +3134,7 @@ namespace Genesis.RoomScan
                 _chunks[i].Dispose();
             _chunks.Clear();
             _dirtyQueue.Clear();
+            _urgentQueue.Clear();
         }
     }
 }

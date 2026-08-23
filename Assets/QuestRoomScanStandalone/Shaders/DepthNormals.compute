@@ -4,6 +4,9 @@
 RWTexture2DArray<float4> gsDepthNormalTexRW;
 
 #pragma kernel DepthNorm
+#pragma kernel CenterDepthSample
+
+RWStructuredBuffer<float> gsCenterDepthSamples;
 
 [numthreads(8, 8, 1)]
 void DepthNorm(uint3 id : SV_DispatchThreadID)
@@ -29,6 +32,20 @@ void DepthNorm(uint3 id : SV_DispatchThreadID)
     float3 worldNorm = -normalize(cross(hDeriv, vDeriv));
 
     gsDepthNormalTexRW[id] = float4(worldNorm, 1.0);
+}
+
+// Copy a tiny centre tile from the already preprocessed depth texture into a
+// buffer that Vulkan can read back reliably.  Meta's platform-owned external
+// depth texture reports GraphicsFormat.None and cannot be used as the source
+// of AsyncGPUReadback directly; this kernel is dispatched only after the
+// temporal/bilateral/edge-clean chain has produced a regular UAV texture.
+[numthreads(8, 8, 1)]
+void CenterDepthSample(uint3 id : SV_DispatchThreadID)
+{
+    int2 offset = int2(id.xy) - int2(4, 4);
+    int2 pixel = int2(gsDepthTexSize / 2) + offset;
+    pixel = clamp(pixel, int2(0, 0), int2(gsDepthTexSize) - 1);
+    gsCenterDepthSamples[id.y * 8u + id.x] = gsDepthTex[uint3(pixel, 0)];
 }
 
 // Editor simulation: convert mono linear depth to stereo NDC depth

@@ -50,14 +50,32 @@ namespace Genesis.RoomScan
         [SerializeField] public ComputeShader surfaceNetsCompute;
         [SerializeField, Tooltip("粗皮提取内核（08-19 路线A）：同一份 TSDF 按粗晶格二次提取出 Meta 观感大三角网。空=粗皮缺席不影响任何既有路径。")]
         public ComputeShader coarseSkinCompute;
+        [SerializeField, Tooltip("粗皮显示 shader 的强引用，防止 Android 构建裁剪 Shader.Find 才会用到的资源。")]
+        private Shader coarseSkinShader;
         [SerializeField, Range(2, 8), Tooltip("粗皮晶格步长（细体素数）：4=20cm 网眼（对标 Meta）；嫌密调大，嫌疏调小")]
         private int coarseSkinStride = 4;
         [SerializeField, Range(0.02f, 0.08f), Tooltip("粗皮数据有效性门槛：比出网门槛低=皮要覆盖面不要精度")]
         private float coarseSkinMinWeight = 0.04f;
         [SerializeField, Range(1f, 12f), Tooltip("粗皮提取频率（Hz）：皮不需要跟随细网 12Hz，4Hz 足够")]
         private float coarseSkinHz = 4f;
-        [SerializeField, Tooltip("粗皮总开关（默认关）：08-19 用户拍板——皮属最后装修，诊断期主显示=密集重心线框，粗皮留待装修期启用")]
-        private bool enableCoarseSkin = false;
+        [SerializeField, Tooltip("粗皮总开关：直接消费 TSDF 的 GPU 快速显示层，不等待 HERA 页或 CPU 回读。")]
+        private bool enableCoarseSkin = true;
+        [SerializeField, Tooltip("路线验证：默认纸网合流；右摇杆按下循环支撑真值、三角粗皮、HERA对照。仅两个直接视图暂停 HERA 排页。")]
+        private bool coarseSkinRouteValidation = true;
+        [SerializeField, Tooltip("支撑真值提取：审计态画独立 TSDF 零交叉；纸面态把同一采样立方体内的共享交叉点即时连成拓扑三角。")]
+        private ComputeShader supportTruthCompute;
+        [SerializeField, Tooltip("支撑真值显示 shader 强引用，防止 Android 构建裁剪。")]
+        private Shader supportTruthShader;
+        [SerializeField, Range(1, 4), Tooltip("支撑采样步长：2=10cm 格点边；纸面三角共享这些边上的零交叉顶点。")]
+        private int supportTruthStride = 2;
+        [SerializeField, Range(0.01f, 0.08f), Tooltip("局部零交叉两端的最低 TSDF 权重。")]
+        private float supportTruthMinWeight = 0.04f;
+        [SerializeField, Range(1f, 12f), Tooltip("支撑真值刷新频率。")]
+        private float supportTruthHz = 4f;
+        [SerializeField, Range(0.04f, 0.12f), Tooltip("拓扑审计 Surfel 的世界空间半径；10cm采样默认7cm，产生少量重叠。")]
+        private float supportTruthSurfelRadius = 0.07f;
+        [SerializeField, Range(0f, 2f), Tooltip("未成纸边的跨批次会合窗口；取得纸张所有权后不再按时间删除，只由连续TSDF反证撤销。")]
+        private float supportTruthHoldSeconds = 0.75f;
         [SerializeField, Tooltip("Max vertex fraction of total voxels (0.01-0.10).")]
         [Range(0.01f, 0.10f)] private float gpuVertexBudgetPercent = 0.08f;
 
@@ -111,6 +129,18 @@ namespace Genesis.RoomScan
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;
         private CoarseSkinRenderer _coarseSkin;
+        private SupportTruthRenderer _supportTruth;
+        private enum RouteValidationView
+        {
+            PaperFineHybrid,
+            SupportTruth,
+            CoarseSkin,
+            Hera
+        }
+        private RouteValidationView _routeValidationView = RouteValidationView.PaperFineHybrid;
+        private bool _supportTruthAuditMode = true;
+        private bool _paperOwnedGrid = true;
+        private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
         private GeometryStabilityMonitor _geometryStability;
         private PersistentChunkMeshPipeline _persistentChunks;
         private PersistentChunkMeshPipeline _chunkAbReplay;
@@ -263,6 +293,8 @@ namespace Genesis.RoomScan
         private float _lastExportStrictReadbackMs;
         private float _lastExportRestoreSubmitMs;
         private float _lastExportPayloadBuildMs;
+        private string _captureModeLabel = "未标记";
+        private string _captureModeToken = "unlabeled";
 
         private sealed class LedgerExportPayload
         {
@@ -278,6 +310,16 @@ namespace Genesis.RoomScan
             public string SummaryText;
         }
 
+        /// <summary>
+        /// 由扫描器在空卷选择或正式开扫时写入。只影响文件名和报告元数据，
+        /// 不参与融合、冻结、提取或 HERA 裁决。
+        /// </summary>
+        public void SetCaptureModeIdentity(string label, string token)
+        {
+            _captureModeLabel = string.IsNullOrWhiteSpace(label) ? "未标记" : label;
+            _captureModeToken = string.IsNullOrWhiteSpace(token) ? "unlabeled" : token;
+        }
+
         internal GPUSurfaceNets GpuSurfaceNets => _gpuSurfaceNets;
         public bool IsInitialized => _gpuSurfaceNets != null || _persistentChunks != null ||
                                      _chunkAbReplay != null || _heraReplay != null;
@@ -291,6 +333,8 @@ namespace Genesis.RoomScan
         public int FrozenHeraChildBuilt => _heraReplay?.ChildBuilt ?? 0;
         public int FrozenHeraChildQueued => _heraReplay?.ChildQueued ?? 0;
         public int FrozenHeraChildrenPending => _heraReplay?.ChildrenPending ?? 0;
+        public int FrozenHeraParentFinalizationPending =>
+            _heraReplay?.ParentFinalizationPending ?? 0;
         public int FrozenHeraFamiliesQueued => _heraReplay?.FamiliesQueued ?? 0;
         public int FrozenHeraFamiliesFinalized => _heraReplay?.FamiliesFinalized ?? 0;
         public int FrozenHeraFamiliesPending => _heraReplay?.FamiliesPending ?? 0;
@@ -425,9 +469,28 @@ namespace Genesis.RoomScan
         /// </summary>
         public void EnsureInitialized()
         {
+            EnsureSupportTruth();
             EnsureCoarseSkin();
             if (_gpuSurfaceNets != null || _persistentChunks != null) return;
             Init();
+        }
+
+        private void EnsureSupportTruth()
+        {
+            if (_supportTruth != null) return;
+            if (!coarseSkinRouteValidation || supportTruthCompute == null) return;
+            if (_volume == null) _volume = VolumeIntegrator.Instance;
+            if (_volume == null) return;
+
+            _supportTruth = gameObject.AddComponent<SupportTruthRenderer>();
+            if (!_supportTruth.Initialize(supportTruthCompute, supportTruthShader,
+                    _volume.VoxelCount, _volume.VoxelSize, supportTruthStride,
+                    supportTruthMinWeight, supportTruthHz, supportTruthSurfelRadius,
+                    supportTruthHoldSeconds))
+            {
+                Destroy(_supportTruth);
+                _supportTruth = null;
+            }
         }
 
         /// <summary>
@@ -444,7 +507,7 @@ namespace Genesis.RoomScan
             if (_volume == null) return;
 
             _coarseSkin = gameObject.AddComponent<CoarseSkinRenderer>();
-            if (!_coarseSkin.Initialize(coarseSkinCompute, _volume.VoxelCount,
+            if (!_coarseSkin.Initialize(coarseSkinCompute, coarseSkinShader, _volume.VoxelCount,
                     _volume.VoxelSize, coarseSkinStride, coarseSkinMinWeight, coarseSkinHz))
             {
                 Destroy(_coarseSkin);
@@ -616,13 +679,140 @@ namespace Genesis.RoomScan
 
         /// <summary>HUD"显"读数：当前真正在画网格的那条路径是否可见。</summary>
         public bool IsAnyMeshVisible =>
-            HasIncrementalHera ? IsIncrementalHeraVisible : IsProductionMeshVisible;
+            IsSupportTruthVisible ||
+            IsCoarseSkinVisible ||
+            (HasIncrementalHera ? IsIncrementalHeraVisible : IsProductionMeshVisible);
+
+        /// <summary>
+        /// 诊断呈现总闸的显式 setter。只改变当前拥有前景的生产/HERA绘制路径，
+        /// 不暂停融合、提取、页面提交或记账。
+        /// </summary>
+        public void SetCurrentMeshDisplayVisible(bool visible)
+        {
+            if (IsRouteValidationActive)
+                ApplyRouteValidationVisibility(visible);
+            else if (HasIncrementalHera)
+                _heraReplay.SetVisible(visible);
+            else
+                SetProductionMeshVisible(visible);
+        }
+
+        public bool IsSupportTruthVisible =>
+            _supportTruth != null && _supportTruth.Visible;
+
+        public string SupportTruthStatsCompact =>
+            _supportTruth != null ? _supportTruth.StatsCompact : "纸无";
+
+        public bool IsSupportTruthOnlyVisible =>
+            IsRouteValidationActive &&
+            _routeValidationView == RouteValidationView.SupportTruth;
+
+        public bool IsPaperFineHybridVisible =>
+            IsRouteValidationActive &&
+            _routeValidationView == RouteValidationView.PaperFineHybrid;
 
         /// <summary>HUD"皮"读数：粗皮组件是否已建（无=compute 未接线或体积未起）。</summary>
         public bool HasCoarseSkin => _coarseSkin != null;
 
         /// <summary>HUD"皮"读数：粗皮当前是否可见。</summary>
         public bool IsCoarseSkinVisible => _coarseSkin != null && _coarseSkin.Visible;
+
+        public void SetCoarseSkinVisible(bool visible)
+        {
+            if (_coarseSkin != null) _coarseSkin.Visible = visible;
+        }
+
+        /// <summary>
+        /// All four views read the same TSDF. Paper topology is now a true
+        /// isolated producer/view: HERA neither draws nor accumulates page work
+        /// while paper owns the foreground. The left-stick comparison resumes
+        /// HERA and shows the old page mesh by itself.
+        /// </summary>
+        public bool IsRouteValidationActive =>
+            coarseSkinRouteValidation && _supportTruth != null &&
+            _coarseSkin != null && HasIncrementalHera;
+
+        public bool RouteValidationPausesHera =>
+            IsRouteValidationActive &&
+            (_routeValidationView == RouteValidationView.SupportTruth ||
+             _routeValidationView == RouteValidationView.CoarseSkin ||
+             (_routeValidationView == RouteValidationView.PaperFineHybrid &&
+              _paperOwnedGrid));
+
+        public string RouteValidationLabel => !IsRouteValidationActive
+            ? "常规网格"
+            : _routeValidationView == RouteValidationView.PaperFineHybrid
+                ? (_paperOwnedGrid ? "纸拓扑网格" : "HERA旧网格")
+                : _routeValidationView == RouteValidationView.SupportTruth
+                ? (_supportTruthAuditMode ? "支撑圆点" : "纸拓扑独显")
+                : _routeValidationView == RouteValidationView.CoarseSkin
+                    ? "三角粗皮"
+                    : "HERA对照";
+
+        public string CycleRouteValidationView()
+        {
+            if (!IsRouteValidationActive) return "常规网格";
+            _routeValidationView = _routeValidationView == RouteValidationView.PaperFineHybrid
+                ? RouteValidationView.SupportTruth
+                : _routeValidationView == RouteValidationView.SupportTruth
+                    ? RouteValidationView.CoarseSkin
+                    : _routeValidationView == RouteValidationView.CoarseSkin
+                        ? RouteValidationView.Hera
+                        : RouteValidationView.PaperFineHybrid;
+            if (_routeValidationView == RouteValidationView.SupportTruth)
+                _supportTruthAuditMode = Shader.GetGlobalFloat("_RSWireframe") > 0.5f;
+            ApplyRouteValidationVisibility(true);
+            Logger.Info($"支架路线验证：{RouteValidationLabel}");
+            return RouteValidationLabel;
+        }
+
+        private void ApplyRouteValidationVisibility(bool visible)
+        {
+            bool hybridVisible = visible &&
+                _routeValidationView == RouteValidationView.PaperFineHybrid;
+            bool paperTopologyVisible = hybridVisible && _paperOwnedGrid;
+            bool oldHeraVisible = hybridVisible && !_paperOwnedGrid;
+            SetPaperGridMode(paperTopologyVisible);
+            if (_supportTruth != null)
+            {
+                bool supportVisible = visible &&
+                    (_routeValidationView == RouteValidationView.SupportTruth ||
+                     paperTopologyVisible);
+                _supportTruth.AuditMode = _routeValidationView == RouteValidationView.SupportTruth &&
+                                          _supportTruthAuditMode;
+                _supportTruth.Visible = supportVisible;
+            }
+            if (_coarseSkin != null)
+                _coarseSkin.Visible = visible &&
+                    _routeValidationView == RouteValidationView.CoarseSkin;
+            if (_heraReplay != null)
+                _heraReplay.SetVisible(visible &&
+                    (_routeValidationView == RouteValidationView.Hera ||
+                     oldHeraVisible));
+        }
+
+        public void SetSupportTruthAudit(bool audit)
+        {
+            _supportTruthAuditMode = audit;
+            if (_supportTruth != null &&
+                _routeValidationView == RouteValidationView.SupportTruth)
+                _supportTruth.AuditMode = audit;
+        }
+
+        public bool TogglePaperOwnedGrid()
+        {
+            _paperOwnedGrid = !_paperOwnedGrid;
+            if (IsPaperFineHybridVisible)
+                ApplyRouteValidationVisibility(true);
+            return _paperOwnedGrid;
+        }
+
+        private void SetPaperGridMode(bool enabled)
+        {
+            Shader.SetGlobalFloat(PaperGridModeID, enabled ? 1f : 0f);
+            if (_supportTruth != null)
+                _supportTruth.PaperGridEnabled = enabled;
+        }
 
         /// <summary>
         /// Enter the isolated chunk-granularity experiment.  The live production
@@ -653,6 +843,7 @@ namespace Genesis.RoomScan
             if (_volume == null || surfaceNetsCompute == null || scanMeshMaterial == null)
                 throw new InvalidOperationException("增量 HERA 缺少体积、计算着色器或网格材质");
 
+            EnsureSupportTruth();
             EnsureCoarseSkin();
             if (_heraReplay != null)
             {
@@ -667,8 +858,18 @@ namespace Genesis.RoomScan
                 transform, gameObject.layer, parent32, child16, ExtractCurrentVolume,
                 incrementalMode: true);
             _heraReplay.SetDiagnosticColoring(true);
-            _heraReplay.SetVisible(true);
-            Logger.Info("增量 HERA：成熟冻结块将逐块精修上屏（32³父页常驻，16³仅救回）");
+            if (coarseSkinRouteValidation && _supportTruth != null && _coarseSkin != null)
+            {
+                _routeValidationView = RouteValidationView.PaperFineHybrid;
+                _paperOwnedGrid = true;
+                ApplyRouteValidationVisibility(true);
+                Logger.Info("支架路线验证：默认纸拓扑网格纯隔离（HERA不上屏且暂停排页）；左摇杆切HERA旧网格，右摇杆循环支撑圆点/三角粗皮/HERA对照/纸拓扑网格");
+            }
+            else
+            {
+                _heraReplay.SetVisible(true);
+                Logger.Info("增量 HERA：成熟冻结块将逐块精修上屏（32³父页常驻，16³仅救回）");
+            }
         }
 
         public bool HasIncrementalHera => _heraReplay != null && _heraReplay.IsIncremental;
@@ -693,17 +894,32 @@ namespace Genesis.RoomScan
         public string ProductionSyncDebtCompact => _persistentChunks != null
             ? _persistentChunks.GetSyncDebtStatsCompact()
             : "块诊断无";
-        public bool IncrementalQueueParentBlock(int3 coordinate) =>
-            HasIncrementalHera && _heraReplay.QueueParentBlock(coordinate);
+        public bool IncrementalQueueParentBlock(int3 coordinate, bool urgent = false) =>
+            HasIncrementalHera && _heraReplay.QueueParentBlock(coordinate, urgent);
         /// <summary>实时轨：未冻块即时出粗网格页（不建家族，tally 照记）。</summary>
-        public bool IncrementalQueueLiveParentBlock(int3 coordinate) =>
-            HasIncrementalHera && _heraReplay.QueueLiveParentBlock(coordinate);
+        public bool IncrementalQueueLiveParentBlock(int3 coordinate, bool urgent = false) =>
+            HasIncrementalHera && _heraReplay.QueueLiveParentBlock(coordinate, urgent);
+        /// <summary>
+        /// 管理块解冻只切回实时身份：父页最后一次成功快照继续驻留，16³救援影子收起。
+        /// 不撤页、不触发空窗；后续有效变化由活跃页调度重提交。
+        /// </summary>
+        public void IncrementalKeepParentBlockLive(int3 coordinate)
+        {
+            if (HasIncrementalHera) _heraReplay.KeepParentBlockLive(coordinate);
+        }
         public void IncrementalInvalidateParentBlock(int3 coordinate)
         {
             if (HasIncrementalHera) _heraReplay.InvalidateParentBlock(coordinate);
         }
         public bool IncrementalParentBlockInFlight(int3 coordinate) =>
             HasIncrementalHera && _heraReplay.IsParentBlockInFlight(coordinate);
+        /// <summary>
+        /// True only after this 32³ page has published non-empty parent geometry
+        /// or finalized visible child16 rescue geometry.  It is not an alias for
+        /// "queued", "built" or the aggregate page counter.
+        /// </summary>
+        public bool IncrementalParentPageHasPublishedProduct(int3 coordinate) =>
+            HasIncrementalHera && _heraReplay.HasPublishedPageProduct(coordinate);
         public bool TryGetIncrementalPageTally(int3 coordinate, out long redTriangles, out long totalTriangles)
         {
             redTriangles = 0;
@@ -813,6 +1029,7 @@ namespace Genesis.RoomScan
         /// </summary>
         public void BeginFrozenHeraReplay(int maxChunksPerTick)
         {
+            SetPaperGridMode(false);
             if (_volume == null) _volume = VolumeIntegrator.Instance;
             if (_volume == null || surfaceNetsCompute == null || scanMeshMaterial == null)
                 throw new InvalidOperationException("HERA 缺少体积、计算着色器或网格材质");
@@ -832,9 +1049,11 @@ namespace Genesis.RoomScan
             {
                 if (!_heraReplay.BeginFrozenFinalization())
                     throw new InvalidOperationException("HERA 增量层无法转入全场收尾");
+                if (_supportTruth != null) _supportTruth.Visible = false;
+                if (_coarseSkin != null) _coarseSkin.Visible = false;
                 _heraReplay.SetDiagnosticColoring(true);
                 _heraReplay.SetVisible(true);
-                Logger.Info("HERA：沿用已上屏增量父页开始冻结收尾，交接期不撤网格");
+                Logger.Info("HERA：A键已封存当前增量前台，仅补未建页，交接期不撤网格");
                 return;
             }
 
@@ -845,6 +1064,8 @@ namespace Genesis.RoomScan
             _heraReplay = new HeraHierarchicalReplay(
                 _volume, surfaceNetsCompute, scanMeshMaterial,
                 transform, gameObject.layer, parent32, child16, ExtractCurrentVolume);
+            if (_supportTruth != null) _supportTruth.Visible = false;
+            if (_coarseSkin != null) _coarseSkin.Visible = false;
             _heraReplay.SetDiagnosticColoring(true);
             _heraReplay.SetVisible(true);
             Logger.Info("HERA：冻结 TSDF 回放已启动；64³只记账，32³分流，16³按需精修");
@@ -916,8 +1137,10 @@ namespace Genesis.RoomScan
             string directory = Path.Combine(Application.persistentDataPath, "ScanCoverDiagnostics");
             Directory.CreateDirectory(directory);
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
-            string path = Path.Combine(directory, $"hera_frozen_{stamp}.txt");
+            string path = Path.Combine(directory, $"hera_frozen_{_captureModeToken}_{stamp}.txt");
             var sb = new StringBuilder(32768);
+            sb.AppendLine($"capture_mode={_captureModeToken}");
+            sb.AppendLine($"capture_mode_label={_captureModeLabel}");
             sb.AppendLine($"volume_voxels={_volume.VoxelCount.x},{_volume.VoxelCount.y},{_volume.VoxelCount.z}");
             sb.AppendLine($"voxel_size_m={_volume.VoxelSize.ToString("R", CultureInfo.InvariantCulture)}");
             sb.AppendLine($"integration_count={_volume.IntegrationCount}");
@@ -1202,12 +1425,13 @@ namespace Genesis.RoomScan
                 string session = string.IsNullOrEmpty(_ledgerSessionId) || _ledgerSessionId == "未开始"
                     ? DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)
                     : _ledgerSessionId;
-                string stem = "geometry_stage1_" + session;
+                string stem = $"geometry_stage1_{_captureModeToken}_{session}";
                 var csv = new StringBuilder(4096);
                 _geometryStability.AppendCsv(csv, session);
                 var summary = new StringBuilder(4096);
                 summary.AppendLine("QRS 第一阶段纯几何快照");
                 summary.AppendLine($"会话: {session}");
+                summary.AppendLine($"采集模式: {_captureModeLabel} ({_captureModeToken})");
                 summary.AppendLine($"导出原因: {reason}");
                 summary.AppendLine($"导出(UTC): {DateTime.UtcNow:O}");
                 _geometryStability.AppendSummary(summary);
@@ -1324,7 +1548,7 @@ namespace Genesis.RoomScan
         private LedgerExportPayload BuildLedgerExportPayload(string reason)
         {
             string outputDir = Path.Combine(Application.persistentDataPath, "ScanCoverDiagnostics");
-            string stem = "mesh_ledger_" + _ledgerSessionId;
+            string stem = $"mesh_ledger_{_captureModeToken}_{_ledgerSessionId}";
             var csv = new StringBuilder(4096 + _ledgerSamples.Count * 256);
             csv.Append("session_id,utc,elapsed_s,extract_serial,mode");
             for (int i = 0; i < CounterNames.Length; i++)
@@ -1370,6 +1594,7 @@ namespace Genesis.RoomScan
             var sb = new StringBuilder(4096);
             sb.AppendLine("QRS 网格累计诊断账");
             sb.AppendLine($"会话: {_ledgerSessionId}");
+            sb.AppendLine($"采集模式: {_captureModeLabel} ({_captureModeToken})");
             sb.AppendLine($"开始(UTC): {_ledgerStartedUtc:O}");
             sb.AppendLine($"结束(UTC): {DateTime.UtcNow:O}");
             sb.AppendLine($"结束原因: {reason}");
@@ -1815,6 +2040,8 @@ namespace Genesis.RoomScan
         /// </summary>
         public void DisposeOnly()
         {
+            SetPaperGridMode(false);
+            _supportTruth?.ResetHistory();
             DisposeFrozenHeraReplay();
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
@@ -1835,6 +2062,8 @@ namespace Genesis.RoomScan
         /// </summary>
         public void Reinitialize()
         {
+            SetPaperGridMode(false);
+            _supportTruth?.ResetHistory();
             DisposeFrozenHeraReplay();
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();

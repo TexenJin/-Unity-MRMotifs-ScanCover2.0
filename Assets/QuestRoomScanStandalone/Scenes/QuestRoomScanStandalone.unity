@@ -219,7 +219,7 @@ MonoBehaviour:
   wireframeMode: 1
   wireThickness: 1
   meshDisplayStride: 1
-  meshGridSpacing: 0.3
+  meshGridSpacing: 0.12
   confidenceViz: 1
   geometryTruthView: 1
   enableHeadExclusion: 1
@@ -228,6 +228,7 @@ MonoBehaviour:
   abMaxChunksPerTick: 3
   keepFrozenReplayAfterExport: 1
   enableFrozenBlockSupervisor: 1
+  enableGunGelCleanRoomExperiment: 0
   frozenBlockWindowSeconds: 1
   frozenBlockMinSurfaceVoxels: 600
   frozenBlockStabilityTolerance: 24
@@ -243,10 +244,12 @@ MonoBehaviour:
   liveTrackBlockCooldownSeconds: 0.5
   liveTrackMaxPagesPerSecond: 10
   liveTrackMinSurfaceVoxels: 16
+  liveTrackViewportMargin: 0.18
+  liveTrackVisibleDeadlineSeconds: 0.35
+  liveTrackBackgroundDeadlineSeconds: 2
+  liveTrackMaxPagesPerSweep: 5
   enableIncrementalHeraRefine: 1
-  frozenPageInvalidateGraceSeconds: 8
   frozenPageRequeueCooldownSeconds: 15
-  frozenRefreezeMinThaws: 2
   enablePlaneFitShadow: 1
   planeFitShadowCompute: {fileID: 7200000, guid: cf3a91b27e4d4f58a6c0d9e1b2a34f56, type: 3}
   enablePlaneFlatten: 1
@@ -257,6 +260,7 @@ MonoBehaviour:
   planeFlattenRepageMaxPerTick: 8
   logLevel: 1
   showStatusBadge: 1
+  showDetailedRuntimeStatus: 0
   showDebugHud: 1
   showDepthPreview: 0
   showDepthPointCloud: 0
@@ -285,10 +289,19 @@ MonoBehaviour:
   renderProductionMesh: 1
   surfaceNetsCompute: {fileID: 7200000, guid: 642ed88bf212b4bc38e224b13f42362e, type: 3}
   coarseSkinCompute: {fileID: 7200000, guid: b63ebfaab5fc49b7b8f3ca0d93f4110a, type: 3}
+  coarseSkinShader: {fileID: 4800000, guid: 4706e501d76044fda2dc2c371bfa8c16, type: 3}
   coarseSkinStride: 4
   coarseSkinMinWeight: 0.04
   coarseSkinHz: 4
-  enableCoarseSkin: 0
+  enableCoarseSkin: 1
+  coarseSkinRouteValidation: 1
+  supportTruthCompute: {fileID: 7200000, guid: dba65707c49d4936a893cb434406b3ca, type: 3}
+  supportTruthShader: {fileID: 4800000, guid: e8074dd27747421f9cf5bb3e40bf8338, type: 3}
+  supportTruthStride: 2
+  supportTruthMinWeight: 0.04
+  supportTruthHz: 4
+  supportTruthSurfelRadius: 0.07
+  supportTruthHoldSeconds: 0.75
   gpuVertexBudgetPercent: 0.08
   diagnosticReadbackHz: 2
   enableGeometryStabilityDiagnostics: 1

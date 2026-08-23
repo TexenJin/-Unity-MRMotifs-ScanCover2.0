@@ -142,6 +142,7 @@ RWStructuredBuffer<uint>      _HeraInteriorShadowDrawIndirectArgs;
 RWStructuredBuffer<uint>      _HeraBoundaryShadowIndices;
 RWStructuredBuffer<uint>      _HeraBoundaryShadowDrawIndirectArgs;
 uint _HeraSourceIndexCount;
+uint _HeraMatureOnly;
 
 RWStructuredBuffer<uint>      _Counters;         // [0] = vertex count, [1] = index count
 RWStructuredBuffer<uint>      _DispatchArgs;     // [0,1,2] = indirect dispatch group counts
@@ -756,6 +757,20 @@ void TemporalBlend(uint3 id : SV_DispatchThreadID)
     int3 coord  = Unflatten((int)v.voxelFlatIdx);
 
     int3 localCoord = coord - _MapMin;
+
+    // Exact page-face vertices are shared identities: the negative page sees
+    // them at CoreMax while the positive page sees them at CoreMin. Letting
+    // each page blend that same global TSDF vertex through its private temporal
+    // texture gives the two copies different ages and can pull them apart.
+    // Publish the current global-TSDF extraction directly on shared faces;
+    // interior vertices keep the existing temporal damping.
+    bool sharedPageFace = any(coord == _CoreMin) || any(coord == _CoreMax);
+    if (sharedPageFace)
+    {
+        _TemporalState[localCoord] = float4(v.pos, 0.0);
+        return;
+    }
+
     float4 prev    = _TemporalState[localCoord];
     float  prevAge = prev.w;
 
@@ -1706,6 +1721,13 @@ void FilterHeraCleanTriangles(uint3 id : SV_DispatchThreadID)
     uint encoded0 = _Indices[triangleBase];
     uint encoded1 = _Indices[triangleBase + 1u];
     uint encoded2 = _Indices[triangleBase + 2u];
+    // A live 32^3 page is a sheet of paper that may be written in spatial
+    // installments.  Its first front-buffer contains only temporally mature
+    // triangles; pending claims remain in the worker and may become a later
+    // additive installment.  Frozen/final HERA pages deliberately keep the
+    // complete historical stream.
+    if (_HeraMatureOnly != 0u && (encoded0 >> 30u) != 2u)
+        return;
     uint raw0 = encoded0 & kCandidateIndexMask;
     uint raw1 = encoded1 & kCandidateIndexMask;
     uint raw2 = encoded2 & kCandidateIndexMask;
@@ -1757,7 +1779,10 @@ void ClassifyHeraInternalMixed(uint3 id : SV_DispatchThreadID)
     if (triangleBase + 2u >= _HeraSourceIndexCount)
         return;
 
-    uint raw0 = _Indices[triangleBase] & kCandidateIndexMask;
+    uint encodedSource0 = _Indices[triangleBase];
+    if (_HeraMatureOnly != 0u && (encodedSource0 >> 30u) != 2u)
+        return;
+    uint raw0 = encodedSource0 & kCandidateIndexMask;
     uint raw1 = _Indices[triangleBase + 1u] & kCandidateIndexMask;
     uint raw2 = _Indices[triangleBase + 2u] & kCandidateIndexMask;
     if (raw0 >= _SnapshotVertexCount || raw1 >= _SnapshotVertexCount || raw2 >= _SnapshotVertexCount)
