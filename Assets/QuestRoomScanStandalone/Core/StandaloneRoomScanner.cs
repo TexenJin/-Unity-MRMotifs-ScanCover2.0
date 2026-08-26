@@ -325,6 +325,7 @@ namespace Genesis.RoomScan
         private bool _chunkAbDiagnosticColoring = true;
         private ObservationCoverageOverlay _coverageOverlay;
         private DepthPointCloudOverlay _depthPointCloudOverlay;
+        private GunGelCourtOverlay _gunGelCourtOverlay;
         private bool _bbPresentationCaptured;
         private bool _bbRestoreMeshVisible;
         private bool _bbRestoreCoarseSkinVisible;
@@ -369,7 +370,7 @@ namespace Genesis.RoomScan
             if (_meshExtractor != null && _meshExtractor.IsPaperFineHybridVisible)
             {
                 bool paperGrid = _meshExtractor.TogglePaperOwnedGrid();
-                NotifyInput(paperGrid ? "纸网：纸拓扑纯显" : "纸网：HERA旧网格");
+                NotifyInput(paperGrid ? "纸网：v2.3纸拓扑" : "纸网：HERA旧网格");
                 RefreshStatusBadge();
                 return;
             }
@@ -415,6 +416,17 @@ namespace Genesis.RoomScan
         public void ToggleMeshDisplay()
         {
             if (_meshExtractor == null) return;
+            // 点诊断和纸/HERA共用一个前景席位。若 X 档仍保持 Visible，Update()
+            // 会在下一帧再次把刚切出的纸面压回隐藏。切网格档时先明确退出点诊断，
+            // 但不恢复旧快照；下面的路线切换/总闸负责只打开用户刚选中的新档。
+            if ((_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible) ||
+                (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible))
+            {
+                _gunGelCourtOverlay?.SetVisible(false);
+                _depthPointCloudOverlay?.SetVisible(false);
+                _depthPointCloudOverlay?.SetAcquiring(false);
+                _bbPresentationCaptured = false;
+            }
             if (_meshExtractor.IsRouteValidationActive)
             {
                 string route = _meshExtractor.CycleRouteValidationView();
@@ -633,6 +645,10 @@ namespace Genesis.RoomScan
             if (_depthPointCloudOverlay == null)
                 _depthPointCloudOverlay = gameObject.AddComponent<DepthPointCloudOverlay>();
             _depthPointCloudOverlay.SetVisible(false);
+            _gunGelCourtOverlay = GetComponent<GunGelCourtOverlay>();
+            if (_gunGelCourtOverlay == null)
+                _gunGelCourtOverlay = gameObject.AddComponent<GunGelCourtOverlay>();
+            _gunGelCourtOverlay.SetVisible(false);
             StartCoroutine(ConfigureCameraForPassthrough());
             if (showStatusBadge)
                 StartCoroutine(CreateStatusBadgeWhenCameraReady());
@@ -642,7 +658,7 @@ namespace Genesis.RoomScan
             Logger.Info(enableFrozenChunkAbExperiment
                 ? (enableHeraHierarchicalReplay
                     ? (enableIncrementalHeraRefine
-                        ? "增量精修就绪 — 扳机采集，成熟块自动定稿上屏，X BB反投影，A 冻结全场回放"
+                        ? "增量精修就绪 — 扳机采集，X 裁决海/BB，A 冻结全场回放"
                         : "HERA 就绪 — 扳机采集，A 冻结并自动 32→16，B 导出并清派生网格")
                     : "切块 A/B 就绪 — 扳机采集，A 冻结，Y 换 64/32/16，B 导出并清当前档")
                 : "QRS 独立链就绪 — 右手柄扳机开始扫描，A 暂停，B 停止清空");
@@ -768,12 +784,18 @@ namespace Genesis.RoomScan
                         string compactGunGel = _volumeIntegrator != null
                             ? _volumeIntegrator.GetGunGelEvidenceShadowCompact()
                             : "无";
+                        string compactPairedCapture = _depthCapture == null ? ""
+                            : _depthCapture.PairedFrameCaptureActive
+                                ? $" · 双采开(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped}/{_depthCapture.ReplayFusionCaptureDropped})"
+                                : _depthCapture.PairedFrameCapturePending > 0
+                                    ? $" · 双采写(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped}/{_depthCapture.ReplayFusionCaptureDropped})"
+                                    : "";
                         _statusBadgeText.text =
                             $"● 采集·{compactMode}  覆{coverage,3:0}%  质{compactQuality:F2}  帧{compactFps:0}\n" +
                             $"枪胶:{compactGunGel}\n" +
                             $"{(_meshExtractor != null ? _meshExtractor.RouteValidationLabel : "无显示")} " +
                             $"{(_meshExtractor != null ? _meshExtractor.SupportTruthStatsCompact : "纸无")} · " +
-                            $"冻{compactFreeze}  实{(enableLiveTrack ? "开" : "停")}  页{compactPages}  融{integrationHz:0}Hz · A冻结";
+                            $"冻{compactFreeze}  实{(enableLiveTrack ? "开" : "停")}  页{compactPages}  融{integrationHz:0}Hz · A冻结{compactPairedCapture}";
                         return;
                     }
                     string frozenTail = _frozenBlockUnfreezeEvents > 0
@@ -866,7 +888,7 @@ namespace Genesis.RoomScan
                             confTail += $"折{_volumeIntegrator.LastCarveStats[92]}";
                     }
                     string secondLine = _meshExtractor != null && _meshExtractor.HasIncrementalHera
-                        ? $"精修 {_meshExtractor.IncrementalHeraPagesCommitted} 页 · 视线:{GazeBlockStatus()} · X 点阵 · A 冻结{liveGate}{confTail}"
+                        ? $"精修 {_meshExtractor.IncrementalHeraPagesCommitted} 页 · 视线:{GazeBlockStatus()} · X 裁决海/BB · A 冻结{liveGate}{confTail}"
                         : "黄=待成网 绿=已可出网 · A 冻结";
                     // 计时账第三行：拍=提取实际节拍(/s) 落=入队→落地 回=派发→回读
                     // 融/提=各自 CPU 耗时(ms)。判读：拍远低于16=被融合帧挤占；
@@ -896,9 +918,9 @@ namespace Genesis.RoomScan
                         : $" 时稳{_depthCapture.LastTemporalStablePixels}变{_depthCapture.LastTemporalChangedPixels}";
                     string pairedCaptureLabel = _depthCapture == null ? ""
                         : _depthCapture.PairedFrameCaptureActive
-                            ? $" 双采开(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped})"
+                            ? $" 双采开(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped}/{_depthCapture.ReplayFusionCaptureDropped})"
                             : _depthCapture.PairedFrameCapturePending > 0
-                                ? $" 双采写(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped})"
+                                ? $" 双采写(待{_depthCapture.PairedFrameCapturePending}丢{_depthCapture.PairedFrameCaptureDropped}/{_depthCapture.ReplayFusionCaptureDropped})"
                                 : "";
                     string toggleLine = $"闸[责{accountabilityLabel} 实{(enableLiveTrack ? "开" : "关")} 冻{frozenLabel} " +
                                         $"融{integrationHz:0} 滤{filterLabel} " +
@@ -1394,6 +1416,7 @@ namespace Genesis.RoomScan
         {
             _coverageOverlay?.SetAcquiring(false);
             _depthPointCloudOverlay?.SetAcquiring(false);
+            _gunGelCourtOverlay?.SetVisible(false);
             if (IsScanning) PauseScanning();
         }
 
@@ -1401,9 +1424,12 @@ namespace Genesis.RoomScan
         {
             UpdateHud();
 
-            // BB 验证态只允许反投影点上屏。异步新建的 HERA/粗皮页也会被
+            // 点诊断态只允许当前点层上屏。异步新建的 HERA/粗皮页也会被
             // 下一帧重新压回隐藏，但其后台融合、提取和提交继续运行。
-            if (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible)
+            bool pointDiagnosticVisible =
+                (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible) ||
+                (_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible);
+            if (pointDiagnosticVisible)
             {
                 _coverageOverlay?.SetMarkersVisible(false);
                 if (_meshExtractor != null && _meshExtractor.IsAnyMeshVisible)
@@ -2411,7 +2437,7 @@ namespace Genesis.RoomScan
             cs.SetInt(FitVoxCountXID, vox.x);
             cs.SetInt(FitVoxCountYID, vox.y);
             cs.SetInt(FitVoxCountZID, vox.z);
-            cs.SetInt(FitEyeID, 0); // 左眼片：逐眼交替清洗，旧一拍无妨（影子实验）
+            cs.SetInt(FitEyeID, DepthCapture.FusionEyeIndex); // 与生产融合一致使用右眼片
             _planeFitStats.SetData(PlaneFitZero);
             _planeFitAccumKernel.DispatchFit(_depthCapture.DepthWidth, _depthCapture.DepthHeight, 1);
             _planeFitPending = true;
@@ -2544,7 +2570,7 @@ namespace Genesis.RoomScan
             cs.SetInt(FitVoxCountXID, vox.x);
             cs.SetInt(FitVoxCountYID, vox.y);
             cs.SetInt(FitVoxCountZID, vox.z);
-            cs.SetInt(FitEyeID, 0); // 左眼片（与 B1 同：旧一拍无妨）
+            cs.SetInt(FitEyeID, DepthCapture.FusionEyeIndex); // 与生产融合一致使用右眼片
             cs.SetFloat(FlatMinDeltaID, planeFlattenMinDelta);
             cs.SetFloat(FlatMinConfID, planeFlattenMinConf);
             cs.SetFloat(FlatMinCohID, planeFlattenMinCoherence);
@@ -3148,6 +3174,15 @@ namespace Genesis.RoomScan
                 _depthCapture.StartDepthCapture();
 
                 bool resuming = HasStarted;
+                // 新空卷必须从第一帧开始建独立回放契约；若等扫到一半才手动开，
+                // 离线端缺少初始 TSDF/候选状态，形式上有文件却不能从零复现。
+                if (!resuming && !_depthCapture.PairedFrameCaptureActive)
+                {
+                    bool replayStarted = _depthCapture.TogglePairedFrameCapture();
+                    Logger.Info(replayStarted
+                        ? "独立回放会话已随新空卷自动开始"
+                        : "独立回放会话启动失败；本轮扫描仍可继续但不会产出可复现包");
+                }
                 if (!resuming && !enableFrozenChunkAbExperiment)
                     _meshExtractor.BeginLedgerSession();
                 if (enableFrozenChunkAbExperiment)
@@ -3161,6 +3196,7 @@ namespace Genesis.RoomScan
                         _meshExtractor.BeginIncrementalHera(abMaxChunksPerTick);
                 }
                 _depthPointCloudOverlay?.SetAcquiring(true);
+                if (!resuming) _gunGelCourtOverlay?.SetSealed(false);
                 HasStarted = true;
                 _hudStatus = resuming ? "扫描中(继续)" : "扫描中";
                 _hudLastError = "";
@@ -3206,19 +3242,39 @@ namespace Genesis.RoomScan
             if (!enableFrozenChunkAbExperiment)
             {
                 PauseScanning();
+                SealGunGelCourtViewIfVisible();
                 return;
             }
             if (_chunkAbFrozen || !HasStarted) return;
 
             _coverageOverlay?.SetAcquiring(false);
             PauseScanning();
+            SealGunGelCourtViewIfVisible();
+            // A 是本次扫描的自然终点：若独立回放会话仍在采集，先停止接收新帧，
+            // 让会话封装器接管几何/纸/枪胶/MRUK伴随物并等待全部回读写盘后原子封口。
+            bool replayPackageFinalizing = _depthCapture != null &&
+                                           _depthCapture.PairedFrameCaptureActive;
+            if (replayPackageFinalizing)
+                _depthCapture.TogglePairedFrameCapture();
             // 必须在 BeginFrozenHeraReplay 替换增量 32³ 管线之前落账，
             // 否则扫描期的块同步债会被冻结回放状态覆盖。
-            string geometrySnapshot = _meshExtractor != null
+            string geometrySnapshot = !replayPackageFinalizing && _meshExtractor != null
                 ? _meshExtractor.ExportFirstStageGeometrySnapshot("A键冻结前")
                 : "";
             if (!string.IsNullOrEmpty(geometrySnapshot))
                 Logger.Info($"A键已封存第一阶段诊断: {geometrySnapshot}");
+            // 枪胶候选层在淘汰前保留稳定 ID / 双证词 / 反对票 / 空间位置；
+            // 与纸层并行落盘，供 hold=4/6 之后按世界位置追责数据源。
+            if (!replayPackageFinalizing && _volumeIntegrator != null &&
+                !_volumeIntegrator.RequestGunGelCandidateAuditExport("A键冻结前",
+                    path =>
+                    {
+                        if (!string.IsNullOrEmpty(path))
+                            Logger.Info($"A键已封存枪胶候选黑匣子: {path}");
+                    }))
+                Logger.Warning("A键枪胶候选黑匣子未启动（影子层未就绪或已有导出在途）");
+            if (replayPackageFinalizing)
+                Logger.Info("A键：独立回放会话正在统一封存几何、枪胶与系统房间网格");
             _chunkAbFrozen = true;
             if (enableHeraHierarchicalReplay)
             {
@@ -3234,6 +3290,22 @@ namespace Genesis.RoomScan
             Logger.Info(enableHeraHierarchicalReplay
                 ? "共享 TSDF 已冻结；当前 HERA 前台已封存，仅补未建页"
                 : $"共享 TSDF 已冻结；开始 {ActiveChunkAbSize}³ 只读切块回放");
+        }
+
+        private void SealGunGelCourtViewIfVisible()
+        {
+            if (_gunGelCourtOverlay == null || !_gunGelCourtOverlay.Visible) return;
+            if (_volumeIntegrator == null ||
+                !_volumeIntegrator.RequestGunGelCourtSeal(success =>
+                {
+                    _gunGelCourtOverlay?.SetSealed(success);
+                    NotifyInput(success
+                        ? "裁决海已封存：绿静海/红浪头"
+                        : "裁决海封存失败：账本已变化");
+                }))
+                NotifyInput("裁决海封存未启动（枪胶层未就绪或正在封存）");
+            else
+                NotifyInput("裁决海封存中：等待在途枪弹排空");
         }
 
         /// <summary>Y: cycle 64³/32³/16³ against the same frozen TSDF.</summary>
@@ -3348,15 +3420,21 @@ namespace Genesis.RoomScan
             RefreshStatusBadge();
         }
 
-        /// <summary>X：呼出/收起融合前 BB 反投影留痕；不写 TSDF，数据账不受显示影响。</summary>
+        /// <summary>
+        /// X：关 → 枪胶裁决海 → BB 反投影 → 关。裁决海绿=稳定候选、红=锁存浪头；
+        /// 两层均不写 TSDF，显示开关不改变数据账。
+        /// </summary>
         public void ToggleCoverageMarkers()
         {
-            if (_depthPointCloudOverlay == null) return;
-            bool visible = !_depthPointCloudOverlay.Visible;
-            // 旧黄/绿 TSDF 就绪片会污染“深度先验”观察，BB 验证期间保持隐藏；
-            // 视角覆盖账本仍在后台统计。
+            if (_depthPointCloudOverlay == null || _gunGelCourtOverlay == null) return;
+            bool courtWasVisible = _gunGelCourtOverlay.Visible;
+            bool bbWasVisible = _depthPointCloudOverlay.Visible;
+            bool enteringDiagnostic = !courtWasVisible && !bbWasVisible;
+
+            // 旧 TSDF/HERA/纸面会污染融合前层的观察；诊断期间保持隐藏，
+            // 视角覆盖账本及生产计算仍在后台继续。
             _coverageOverlay?.SetMarkersVisible(false);
-            if (visible)
+            if (enteringDiagnostic)
             {
                 _bbPresentationCaptured = true;
                 _bbRestoreMeshVisible = _meshExtractor != null && _meshExtractor.IsAnyMeshVisible;
@@ -3367,9 +3445,31 @@ namespace Genesis.RoomScan
                 showManagementBlockWireOverlay = false;
                 _managementBlockWireOverlay?.SetVisible(false);
             }
-            _depthPointCloudOverlay.SetVisible(visible);
-            _depthPointCloudOverlay.SetAcquiring(IsScanning);
-            if (!visible && _bbPresentationCaptured)
+
+            if (enteringDiagnostic)
+            {
+                _depthPointCloudOverlay.SetVisible(false);
+                _gunGelCourtOverlay.SetVisible(true);
+                NotifyInput("枪胶裁决海：绿静海/红浪头（A封存）");
+            }
+            else if (courtWasVisible)
+            {
+                _gunGelCourtOverlay.SetVisible(false);
+                _depthPointCloudOverlay.SetVisible(true);
+                _depthPointCloudOverlay.SetAcquiring(IsScanning);
+                NotifyInput("BB反投影：白正视/洋红掠射");
+            }
+            else
+            {
+                _depthPointCloudOverlay.SetVisible(false);
+                _depthPointCloudOverlay.SetAcquiring(false);
+                _gunGelCourtOverlay.SetVisible(false);
+                NotifyInput("点诊断：关");
+            }
+
+            bool diagnosticStillVisible = _gunGelCourtOverlay.Visible ||
+                                          _depthPointCloudOverlay.Visible;
+            if (!diagnosticStillVisible && _bbPresentationCaptured)
             {
                 _meshExtractor?.SetCurrentMeshDisplayVisible(_bbRestoreMeshVisible);
                 _meshExtractor?.SetCoarseSkinVisible(_bbRestoreCoarseSkinVisible);
@@ -3377,7 +3477,6 @@ namespace Genesis.RoomScan
                 _managementBlockWireOverlay?.SetVisible(_bbRestoreManagementBlocks);
                 _bbPresentationCaptured = false;
             }
-            NotifyInput(visible ? "BB反投影：开(白正视/洋红掠射)" : "BB反投影：关");
             RefreshStatusBadge();
         }
 

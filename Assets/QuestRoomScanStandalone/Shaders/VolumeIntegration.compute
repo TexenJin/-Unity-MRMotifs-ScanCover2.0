@@ -13,6 +13,8 @@ RWTexture3D<float2> gsVolumeRW;
 RWTexture3D<float4> gsColorVolumeRW;
 RWTexture3D<float> gsAdmissionTraceRW;
 Texture2DArray<uint> gsEdgeReasonTex;
+Texture2DArray<uint> gsTemporalReasonTex;
+int gsTemporalReasonAvailable;
 RWStructuredBuffer<uint> _DirtyChunkEpochs;
 RWStructuredBuffer<uint> _DirtyBoundaryEpochs;
 // 32^3 HERA parent-page liveness ledger.  This is deliberately separate from
@@ -50,7 +52,7 @@ uint gsFrozenChunkSize;        // 冻结块边长（体素）；0=冻结系统�
 float gsFrozenMatureWeight;    // 长熟体素权重门槛：成熟度普查只数 abs(weight)≥此值 的体素。
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
-RWStructuredBuffer<uint> _CarveStats; // 0..9=矛盾/延拦；10..27=现有只读账；28..44=膨胀供体出生证明（只读）
+RWStructuredBuffer<uint> _CarveStats; // 0..92=既有账；93..167=FOV账；168..176=枪胶逐体素准入账
 // ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
 // 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
 // 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
@@ -93,8 +95,82 @@ float4x4 gsFusionCorrection;    // 枪胶受保护融合：同帧世界法线随
 // 噪声模型加权（08-21 造炮，w∝1/σ²(d,θ,ω)）：运动质量分由 C# 按角速度+线速度合成
 // （1=静止满权→地板），距离/掠射角指数默认 1=保持原线性。定罪链见 VolumeIntegrator 注释。
 float gsNoiseMotionQuality;
+float gsMotionAuthorityQuality; // 始终反映真实运动质量，不受“噪声加权”开关影响
+float gsMotionConfirmQualityMin; // 取得正式面发布/纠偏权限的最低运动质量
 float gsNoiseDistExp;
 float gsNoiseAngExp;
+
+// ── 枪胶逐点/逐体素生产准入 ───────────────────────────────────
+// 两个缓冲来自与当前延迟融合帧完全相同的 GunGel FrameSlot。基线与 B 影子
+// 绑定零缓冲并将 enable=0，因此这份契约只改变受保护生产 A。
+struct GunGelObservation
+{
+    float4 positionSigma;
+    float4 normalQuality;
+    float4 rawPositionDelta;
+    // 只读归因尾部，保持与 GunGelEvidenceShadow Observation 的 64-byte
+    // StructuredBuffer 契约一致；生产融合不消费这些诊断字段。
+    uint4 sourceReason;
+};
+
+struct GunGelCorrespondence
+{
+    float4 sourceValid; // w=证据位，见下方 GUNGEL_*；不是布尔值
+    float4 targetSigma;
+    float4 normalAngle;
+};
+
+StructuredBuffer<GunGelObservation> gsGunGelObservations;
+StructuredBuffer<GunGelCorrespondence> gsGunGelCorrespondences;
+int2 gsGunGelObservationGrid;
+int gsGunGelPixelStride;
+float gsGunGelAdmissionEnable;
+
+static const uint GUNGEL_OBSERVATION_VALID = 1u << 0;
+static const uint GUNGEL_RAW_AVAILABLE = 1u << 1;
+static const uint GUNGEL_DUAL_AGREE = 1u << 2;
+static const uint GUNGEL_STABLE_MATCH = 1u << 3;
+static const uint GUNGEL_STABLE_DUAL = 1u << 4;
+static const uint GUNGEL_UNOPPOSED = 1u << 5;
+
+// 0=准入；1..7 依次为观测无效/无平台原始/双证冲突/无稳定候选/
+// 候选双证未成熟/候选已有反对票/全分辨率像素与低分辨率枪胶点不相干。
+uint GunGelAdmissionStatus(int2 depthPixel, float3 depthPosition,
+                           float3 depthNormal, float depthRange)
+{
+    if (gsGunGelAdmissionEnable < 0.5)
+        return 0u;
+
+    int stride = max(gsGunGelPixelStride, 1);
+    int2 grid = clamp(depthPixel / stride, int2(0, 0),
+                      max(gsGunGelObservationGrid - 1, int2(0, 0)));
+    uint index = (uint)(grid.y * gsGunGelObservationGrid.x + grid.x);
+    GunGelCorrespondence correspondence = gsGunGelCorrespondences[index];
+    uint flags = (uint)round(max(correspondence.sourceValid.w, 0.0));
+    if ((flags & GUNGEL_OBSERVATION_VALID) == 0u) return 1u;
+    if ((flags & GUNGEL_RAW_AVAILABLE) == 0u) return 2u;
+    if ((flags & GUNGEL_DUAL_AGREE) == 0u) return 3u;
+    if ((flags & GUNGEL_STABLE_MATCH) == 0u) return 4u;
+    if ((flags & GUNGEL_STABLE_DUAL) == 0u) return 5u;
+    if ((flags & GUNGEL_UNOPPOSED) == 0u) return 6u;
+
+    GunGelObservation observation = gsGunGelObservations[index];
+    float3 samplePosition = mul(gsFusionCorrection,
+                                float4(observation.positionSigma.xyz, 1.0)).xyz;
+    float3 sampleNormal = mul((float3x3)gsFusionCorrection,
+                              observation.normalQuality.xyz);
+    float sampleNormalLength = length(sampleNormal);
+    float depthNormalLength = length(depthNormal);
+    float localityLimit = max(0.06,
+                              depthRange * 0.025 +
+                              max(observation.positionSigma.w, 0.004) * 3.0);
+    if (distance(depthPosition, samplePosition) > localityLimit ||
+        !(sampleNormalLength > 0.25) || !(depthNormalLength > 0.25) ||
+        abs(dot(depthNormal / depthNormalLength,
+                sampleNormal / sampleNormalLength)) < 0.5)
+        return 7u;
+    return 0u;
+}
 
 #define EXCLUSION_TOP 0.25
 // 08-19 实机定罪：BOTTOM 1.7 时站立头高 1.6m→圆柱下沿 −0.1m，脚下整片地板
@@ -243,8 +319,8 @@ void ConfidenceSeed(uint3 coord)
 //   bit 4     = at least one accepted write was next to an abstaining pixel
 //   bit 5     = seed frame occurred above 60 deg/s (birth-frozen: written only
 //               at seed time, never OR-accumulated by later growth frames)
-//   bit 6     = retired (was edge-cleaner signature; saturated to ~100% at
-//               triangle level and carried no actionable signal)
+//   bit 6     = at least one accepted observation came from the outer FOV
+//               sample ring (diagnostic provenance only; never gates writes)
 //   bit 7     = the provisional voxel crossed the formal threshold through the
 //               explicit second-consistent-raw fast promotion
 // Source is a birth certificate and is never OR-merged with later observations.
@@ -257,6 +333,75 @@ uint DecodeAdmissionTrace(float encoded)
 float EncodeAdmissionTrace(uint packed)
 {
     return saturate((float)(packed & 255u) / 255.0);
+}
+
+// Diagnostic-only FOV sample ledger.  A "sample" here is one near-surface
+// voxel/sample opportunity in the actual production integration dispatch, not
+// a unique camera pixel.  Ratios are therefore comparable across rings while
+// remaining on the exact path that can create or remove geometry.
+uint FovLedgerRing(int2 pixel)
+{
+    float2 uv = (float2(pixel) + 0.5) / float2(gsDepthTexSize);
+    float rectangularRadius = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
+    return rectangularRadius < 0.50 ? 0u : (rectangularRadius < 0.84 ? 1u : 2u);
+}
+
+// 视野位置可靠度（生产语义，不是裁边）：
+//   中心圈 = 完整证据；中圈 = 折权证据；外围圈 = 只能建立/维持暂存候选。
+// 右眼双路黑匣子已确认平台深度在外围的厚尾明显扩大。外围仍可先铺 provisional，
+// 保住“看哪先有候选”的响应；但它不能单独把候选转正，也不能拉动/啃掉已经由
+// 中心或中圈确认的成熟面。后续视线转正后，由更可靠的位置完成晋升或替换。
+float FovProductionReliability(uint ring)
+{
+    return ring == 0u ? 1.0 : (ring == 1u ? 0.65 : 0.20);
+}
+
+bool FovCanConfirmSurface(uint ring)
+{
+    return ring < 2u;
+}
+
+uint TemporalLedgerReason(int2 pixel)
+{
+    if (gsTemporalReasonAvailable == 0) return 0u;
+    return min(gsTemporalReasonTex[uint3(uint2(pixel), GS_FUSION_EYE)], 6u);
+}
+
+void RecordFovLedgerBase(uint ring, uint reason)
+{
+    if (gsWriteAdmissionTrace <= 0.5) return; // production pass only
+    InterlockedAdd(_CarveStats[93u + reason], 1u);   // examined by reason
+    InterlockedAdd(_CarveStats[100u + ring], 1u);   // examined by ring
+    if (ring == 2u) InterlockedAdd(_CarveStats[129u + reason], 1u);
+}
+
+void RecordFovLedgerPositive(uint ring, uint reason)
+{
+    if (gsWriteAdmissionTrace <= 0.5) return;
+    InterlockedAdd(_CarveStats[103u + ring], 1u);
+    InterlockedAdd(_CarveStats[115u + reason], 1u);
+    if (ring == 2u) InterlockedAdd(_CarveStats[136u + reason], 1u);
+}
+
+void RecordFovLedgerContradiction(uint ring, uint reason)
+{
+    if (gsWriteAdmissionTrace <= 0.5) return;
+    // Count only at a branch that actually writes reduced support/weight.
+    InterlockedAdd(_CarveStats[106u + ring], 1u);
+    InterlockedAdd(_CarveStats[122u + reason], 1u);
+    if (ring == 2u) InterlockedAdd(_CarveStats[143u + reason], 1u);
+}
+
+void RecordFovLedgerFacing(uint ring, float normDot, uint outcomeOffset)
+{
+    if (gsWriteAdmissionTrace <= 0.5) return;
+    // outcomeOffset: 0=examined, 3=applied carve, 6=positive write.
+    // Grazing and front-facing are intentionally disjoint; the middle-angle
+    // population stays in the ring totals but not in either confound bucket.
+    if (normDot < 0.30)
+        InterlockedAdd(_CarveStats[150u + outcomeOffset + ring], 1u);
+    else if (normDot >= 0.60)
+        InterlockedAdd(_CarveStats[159u + outcomeOffset + ring], 1u);
 }
 
 // Donor-to-receiver path classification. The exact same result feeds both the
@@ -272,9 +417,9 @@ uint ClassifyDilationDonorPath(int2 donorPx, int2 receiverPx, float donorDistanc
     bool crossedDepthJump = false;
 
     int2 startPx = clamp(donorPx, int2(0, 0), pmax);
-    float startNdc = gsDepthTex[uint3(uint2(startPx), 0)];
+    float startNdc = gsDepthTex[uint3(uint2(startPx), GS_FUSION_EYE)];
     bool previousValid = startNdc > 0.0;
-    float previousLinear = previousValid ? gsDepthNDCToLinear(startNdc) : 0.0;
+    float previousLinear = previousValid ? gsDepthNDCToLinear(startNdc, GS_FUSION_EYE) : 0.0;
 
     [loop]
     for (int i = 1; i <= DILATION_PATH_PROBES; i++)
@@ -285,11 +430,11 @@ uint ClassifyDilationDonorPath(int2 donorPx, int2 receiverPx, float donorDistanc
             int2(round(lerp(float2(donorPx), float2(receiverPx), t))),
             int2(0, 0), pmax);
 
-        uint pathReason = gsEdgeReasonTex[uint3(uint2(pathPx), 0)];
+        uint pathReason = gsEdgeReasonTex[uint3(uint2(pathPx), GS_FUSION_EYE)];
         if ((pathReason & (1u << 7)) != 0)
             crossedKnownEdge = true;
 
-        float pathNdc = gsDepthTex[uint3(uint2(pathPx), 0)];
+        float pathNdc = gsDepthTex[uint3(uint2(pathPx), GS_FUSION_EYE)];
         bool currentValid = pathNdc > 0.0;
         if (!currentValid)
         {
@@ -298,7 +443,7 @@ uint ClassifyDilationDonorPath(int2 donorPx, int2 receiverPx, float donorDistanc
             continue;
         }
 
-        float currentLinear = gsDepthNDCToLinear(pathNdc);
+        float currentLinear = gsDepthNDCToLinear(pathNdc, GS_FUSION_EYE);
         if (previousValid)
         {
             float jumpLimit = max(gsDiagDepthGapBase, currentLinear * gsDiagDepthGapScale)
@@ -417,26 +562,26 @@ void Prune(uint3 id : SV_DispatchThreadID)
 void Integrate(uint id : SV_DispatchThreadID)
 {
     float3 vLocalPos = gsFrustumVolume[id];
-    float3 vWorldPos = mul(gsDepthViewInv[0], float4(vLocalPos, 1)).xyz;
+    float3 vWorldPos = mul(gsDepthViewInv[GS_FUSION_EYE], float4(vLocalPos, 1)).xyz;
     uint3 coord = gsWorldToVoxel(vWorldPos);
     float3 voxPos = gsVoxelToWorld(coord);
 
-    float3 eyePos = gsDepthEyePos();
+    float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
     float3 eyeToVox = voxPos - eyePos;
     float voxEyeDist = length(eyeToVox);
 
-    float3 voxView = mul(gsDepthView[0], float4(voxPos, 1)).xyz;
+    float3 voxView = mul(gsDepthView[GS_FUSION_EYE], float4(voxPos, 1)).xyz;
     if (voxView.z > -0.05) return;
 
-    float3 voxNDC = gsDepthWorldToNDC(voxPos);
+    float3 voxNDC = gsDepthWorldToNDC(voxPos, GS_FUSION_EYE);
 
     if (voxNDC.x < 0.01 || voxNDC.x > 0.99 || voxNDC.y < 0.01 || voxNDC.y > 0.99)
         return;
 
-    float depthNDC = gsDepthSample(voxNDC.xy);
+    float depthNDC = gsDepthSample(voxNDC.xy, GS_FUSION_EYE);
     float3 depthNorm = normalize(mul((float3x3)gsFusionCorrection,
-                                     gsDepthNormalSample(voxNDC.xy).xyz));
-    float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC));
+                                     gsDepthNormalSample(voxNDC.xy, GS_FUSION_EYE).xyz));
+    float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC), GS_FUSION_EYE);
 
     float3 eyeToDepth = depthPos - eyePos;
     float depthEyeDist = length(eyeToDepth);
@@ -453,20 +598,29 @@ void Integrate(uint id : SV_DispatchThreadID)
     int2 depthPixel = int2(voxNDC.xy * float2(gsDepthTexSize));
     int2 depthPixelMax = int2((int)gsDepthTexSize.x - 1, (int)gsDepthTexSize.y - 1);
     depthPixel = clamp(depthPixel, int2(0, 0), depthPixelMax);
-    uint receiverEdgeReason = gsEdgeReasonTex[uint3(uint2(depthPixel), 0)];
+    uint fovLedgerRing = FovLedgerRing(depthPixel);
+    float fovProductionReliability = FovProductionReliability(fovLedgerRing);
+    bool fovCanConfirmSurface = FovCanConfirmSurface(fovLedgerRing);
+    bool fovOuterObservation = !fovCanConfirmSurface;
+    bool motionCanConfirmSurface =
+        gsMotionAuthorityQuality >= gsMotionConfirmQualityMin;
+    bool observationCanConfirmSurface =
+        fovCanConfirmSurface && motionCanConfirmSurface;
+    uint temporalLedgerReason = TemporalLedgerReason(depthPixel);
+    uint receiverEdgeReason = gsEdgeReasonTex[uint3(uint2(depthPixel), GS_FUSION_EYE)];
     bool grazingPlaneRescued = (receiverEdgeReason & (1u << 10)) != 0;
     bool nearAbstainNeighbour = false;
     // Always measure the context for the forensic ledger. The production gate
     // still honours gsAbstainSeedGuard below, so disabling it remains byte-for-
     // byte equivalent for TSDF admission.
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1, 0), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1, 0), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 0, 1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 0,-1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1, 1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1,-1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1, 1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
-    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1,-1), int2(0, 0), depthPixelMax)), 0)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1, 0), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1, 0), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 0, 1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 0,-1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1, 1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2( 1,-1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1, 1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
+    if (gsDepthTex[uint3(uint2(clamp(depthPixel + int2(-1,-1), int2(0, 0), depthPixelMax)), GS_FUSION_EYE)] == 0) nearAbstainNeighbour = true;
 
     float rawProjectiveSdf = depthEyeDist - voxEyeDist;
     float sDist = grazingPlaneRescued
@@ -477,7 +631,33 @@ void Integrate(uint id : SV_DispatchThreadID)
 
     bool empty = sDist >= 1.0;
     float sDistNorm = min(sDist / gsVoxDist, 1);
+    bool fovLedgerNearSurface = abs(sDistNorm) < 0.5;
+    if (fovLedgerNearSurface)
+    {
+        RecordFovLedgerBase(fovLedgerRing, temporalLedgerReason);
+        RecordFovLedgerFacing(fovLedgerRing, normDot, 0u);
+    }
     bool withinBand = sDistNorm >= -gsVoxMin / gsVoxSize;
+
+    // 真正的生产准入点：从这里往下的种子、增长、冻结票和所有 carve 旁路
+    // 都必须由同帧稳定候选 + 双证词 + 零反对票授权。它不是整帧位姿闸；
+    // 同一帧内不同像素/体素可以分别通过或弃权。168..176 为闭环黑匣子账。
+    if (gsGunGelAdmissionEnable > 0.5)
+    {
+        uint gunGelStatus = GunGelAdmissionStatus(
+            depthPixel, depthPos, depthNorm, depthEyeDist);
+        // 统计只在当前深度表面窄带采一票，避免同一射线沿途大量体素争抢
+        // 九个全局原子计数器；裁决本身仍覆盖该射线参与融合的每个体素。
+        if (fovLedgerNearSurface)
+        {
+            InterlockedAdd(_CarveStats[168], 1u);
+            uint gunGelLedgerSlot = gunGelStatus == 0u
+                ? 169u : 169u + gunGelStatus;
+            InterlockedAdd(_CarveStats[gunGelLedgerSlot], 1u);
+        }
+        if (gunGelStatus != 0u)
+            return;
+    }
     // 标准 TSDF 窄带约束：法线投影只能改变融合权重/方向语义，不能把原始射线上已经
     // 远离观测表面的体素压成“近零交叉”。前表面(+raw)与后表面(-raw)必须双向约束。
     // 只阻止播种/增长，下面的矛盾扣减通道仍可清理既有错误。
@@ -488,8 +668,8 @@ void Integrate(uint id : SV_DispatchThreadID)
     bool rawGateFront = rawProjectiveSdf > rawSeedLimit;
 
     float dilatedDepthNDC = gsSampleDilatedDepth(voxNDC.xy);
-    float dilatedDepthLinear = gsDepthNDCToLinear(dilatedDepthNDC);
-    float depthLinear = gsDepthNDCToLinear(depthNDC);
+    float dilatedDepthLinear = gsDepthNDCToLinear(dilatedDepthNDC, GS_FUSION_EYE);
+    float depthLinear = gsDepthNDCToLinear(depthNDC, GS_FUSION_EYE);
     bool acceptableDepthDisparity = depthLinear < dilatedDepthLinear + gsDepthDispThresh;
     bool unoccludedByDilation = abs(voxView.z) < dilatedDepthLinear || acceptableDepthDisparity;
     // DepthEdgeClean bit 10 is only written after coherent same-plane support
@@ -534,12 +714,14 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // 只统计有存量的体素（y>0.001），空体素无所谓矛盾。
     float2 oldCensus = gsVolumeRW[coord];
     bool contradictedCensus = oldCensus.y > 0.001 && sDistNorm > oldCensus.x + 0.2;
+    bool fovCanChallengeCensus = observationCanConfirmSurface ||
+                                 abs(oldCensus.y) < gsFormalSurfaceWeight;
     // 排除区不对称放行（治"排除区双向封锁"）：排除圆柱内只拦写不拦抹——播种/增长照旧禁止
     //（防手入网），但矛盾扣减放行。幽灵落进头周圆柱会被冻结永驻（实机：手挥到身体前方留下
     // 的幽灵永不消，右半画面伸展手臂留下的能消——中线分界=手臂伸展/回收决定的圆柱内外）。
     // 区内本就种不进合法几何，扣减只杀"头曾在别处时溜进来"的存量，零误伤。
     bool exclCarve = gsCarveInsideExclusion > 0.5 && !outsideExclusions;
-    if (contradictedCensus)
+    if (contradictedCensus && fovCanChallengeCensus)
     {
         if (valid)                      InterlockedAdd(_CarveStats[0], 1); // 票投出
         else if (exclCarve)             InterlockedAdd(_CarveStats[5], 1); // 排内抹（不对称放行，实际扣减）
@@ -565,33 +747,50 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
 
     // 排除区内矛盾体素：跳过全部写路径，只扣信心不动 TSDF（与 blend 地板分支同语义，
     // 同样保底 1 个 R8G8_SNorm 量化步长防吞票）
-    if (!valid && exclCarve && contradictedCensus)
+    if (!valid && exclCarve && contradictedCensus && fovCanChallengeCensus)
     {
         float exDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
         float exAngF = saturate(normDot);
         float exQ2 = exDistF * exDistF * exAngF * exAngF;
         float exStep = max(exQ2 * gsCarveGain, 1.0 / 127.0);
+        if (fovLedgerNearSurface)
+        {
+            RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+            RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+        }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - exStep, 0.0)));
         return;
     }
 
     // 膨胀闸绕行扣减：只扣信心不动 TSDF，保底 1 量化步长。强裕量（nrMargin，距离自适应）——
     // 适用对象=缝隙区被前景膨胀足迹罩住、但当帧原始深度确实看穿且墙明确在存量后方的体素。
-    if (!valid && dilationBypass && oldCensus.y > 0.001 && sDistNorm > oldCensus.x + nrMargin)
+    if (!valid && dilationBypass && oldCensus.y > 0.001 &&
+        fovCanChallengeCensus && sDistNorm > oldCensus.x + nrMargin)
     {
         float byDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
         float byAngF = saturate(normDot);
         float byQ2 = byDistF * byDistF * byAngF * byAngF;
         float byStep = max(byQ2 * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
+        if (fovLedgerNearSurface)
+        {
+            RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+            RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+        }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - byStep, 0.0)));
         return;
     }
 
     // 法线闸绕行扣减（强裕量版）：角因子不计（法线不可信正是被拦原因），距离因子+保底步长慢速必达。
-    if (!valid && normalBypass && oldCensus.y > 0.001 && sDistNorm > oldCensus.x + nrMargin)
+    if (!valid && normalBypass && oldCensus.y > 0.001 &&
+        fovCanChallengeCensus && sDistNorm > oldCensus.x + nrMargin)
     {
         float nrDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
         float nrStep = max(nrDistF * nrDistF * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
+        if (fovLedgerNearSurface)
+        {
+            RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+            RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+        }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - nrStep, 0.0)));
         return;
     }
@@ -632,7 +831,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // evaluated only after an accepted write and additionally requires the raw
     // receiver measurement to agree with the local zero-crossing geometry.
     // gsDepthTex is Texture2DArray<float>: xy, array slice, mip level.
-    float receiverRawDepthNdc = gsDepthTex.Load(int4(admissionPx, 0, 0));
+    float receiverRawDepthNdc = gsDepthTex.Load(int4(admissionPx, GS_FUSION_EYE, 0));
     bool receiverOwnsRawDepth = receiverRawDepthNdc > 0.0;
     uint admissionSource = receiverOwnsRawDepth ? 1u :
                            (admissionDonorDistancePx <= 0.5 ? 1u :
@@ -668,7 +867,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // Voxel-lifetime forensic signature. These flags are carried beside the
     // immutable birth source and later OR-reduced onto emitted triangles. They
     // are observations only: none of them participate in a production gate.
-    // (64u edge-signature bit retired: triangle-level saturation made it noise.)
+    // Bit 6 is attached separately at accepted writes so it records the outer
+    // FOV provenance of geometry, rather than merely the current observation.
     uint currentAuditFlags = (grazingPlaneRescued ? 8u : 0u) |
                              (nearAbstainNeighbour ? 16u : 0u) |
                              (gsDiagnosticAngularSpeed > 60.0 ? 32u : 0u);
@@ -716,7 +916,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         // the accepted near-zero supply population. Slot 26 is an overlap alarm: the
         // cleaner marked the exact source pixel killed but fusion still saw it as supply.
         int2 reasonPx = admissionPx;
-        uint edgeReason = gsEdgeReasonTex[uint3(uint2(reasonPx), 0)];
+        uint edgeReason = gsEdgeReasonTex[uint3(uint2(reasonPx), GS_FUSION_EYE)];
         bool rKilled = (edgeReason & (1u << 7)) != 0;
         bool rSkirt = (edgeReason & (1u << 2)) != 0;
         bool rCrossEye = (edgeReason & (1u << 6)) != 0;
@@ -755,7 +955,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                                 (localDepthGap <= 0.30 ? 35 : 36));
             InterlockedAdd(_CarveStats[donorGapSlot], 1);
 
-            uint donorReason = gsEdgeReasonTex[uint3(uint2(donorPx), 0)];
+            uint donorReason = gsEdgeReasonTex[uint3(uint2(donorPx), GS_FUSION_EYE)];
             bool dKilled = (donorReason & (1u << 7)) != 0;
             bool dSkirt = (donorReason & (1u << 2)) != 0;
             bool dCrossEye = (donorReason & (1u << 6)) != 0;
@@ -843,7 +1043,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) |
             (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) |
             (1u << 10);
-        bool stableFrozenVoteSource = receiverOwnsRawDepth &&
+        bool stableFrozenVoteSource = observationCanConfirmSurface &&
+                                      receiverOwnsRawDepth &&
                                       !nearAbstainNeighbour &&
                                       (receiverEdgeReason & frozenVoteUnsafeReasonMask) == 0u;
         if (gsFrozenBlockEnable > 0.5 && gsFrozenChunkSize != 0 &&
@@ -887,9 +1088,16 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     if (nearAbstain)
     {
         bool c0 = sDistNorm > oldVal + 0.2;
-        if (!wasEmpty && c0)
+        bool fovCanChallengeStored = observationCanConfirmSurface ||
+                                     weight < gsFormalSurfaceWeight;
+        if (!wasEmpty && c0 && fovCanChallengeStored)
         {
             float abstainWeight = max(weight - max(q2 * gsCarveGain, 1.0 / 127.0), 0.0);
+            if (fovLedgerNearSurface)
+            {
+                RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+                RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+            }
             WriteTrackedTsdf(coord, float2(oldVal, abstainWeight));
             ConfidenceObserve(coord, oldVal, sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
@@ -925,6 +1133,11 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 max(PRUNE_WEIGHT + 1.0 / 127.0,
                     gsFormalSurfaceWeight - 1.0 / 127.0));
             WriteTrackedTsdf(coord, float2(sDistNorm, provisionalWeight));
+            if (fovLedgerNearSurface)
+            {
+                RecordFovLedgerPositive(fovLedgerRing, temporalLedgerReason);
+                RecordFovLedgerFacing(fovLedgerRing, normDot, 6u);
+            }
             ConfidenceSeed(coord); // 置信度通道：出生记无分歧
             InterlockedAdd(_CarveStats[68], 1);
             InterlockedAdd(_CarveStats[70u + admissionSource], 1u); // 71..73 seed source
@@ -953,7 +1166,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             {
                 uint seedTrace = admissionSource |
                                  (rawGeometryConfirmed ? 4u : 0u) |
-                                 currentAuditFlags;
+                                 currentAuditFlags |
+                                 (fovLedgerRing == 2u ? 64u : 0u);
                 gsAdmissionTraceRW[coord] = EncodeAdmissionTrace(seedTrace);
             }
 
@@ -997,8 +1211,17 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float obsDelta = abs(sDistNorm - oldVal);
     bool obsDiscount = gsMatureObsEnable > 0.5 && matureSurfaceObs &&
                        obsDelta <= gsMatureObsMargin;
-    float q2obs = obsDiscount ? q2 * gsMatureObsDiscount : q2;
+    // 位置可靠度只作用于已存在候选的增长/融合。首次外围样本仍可出生为 provisional，
+    // 因而不会把视野边缘重新变成硬裁剪盲区。
+    float q2obs = (obsDiscount ? q2 * gsMatureObsDiscount : q2) *
+                  fovProductionReliability;
     if (obsDiscount) InterlockedAdd(_CarveStats[92], 1); // 折让命中（HUD 折N）
+
+    // 外围或运动不足的观测对正式面只保留“看见过”的只读账权，不再拥有几何、
+    // 权重、置信度或颜色的改写权。否则镜头畸变和位姿/深度时延会把成熟单层
+    // 慢慢拉成鼓包、凹陷，甚至用假自由空间票将其啃穿。
+    if (!observationCanConfirmSurface && weight >= gsFormalSurfaceWeight)
+        return;
 
     bool contradicted = sDistNorm > oldVal + 0.2;
     // 自由空间对称扣减：主矛盾通道乘 gsFreeSpaceCarveBoost（默认 2，可关回 1）。
@@ -1019,6 +1242,11 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             InterlockedAdd(_CarveStats[67], 1); // 危险膨胀路径拦增长/改写
         if (contradicted)
         {
+            if (fovLedgerNearSurface)
+            {
+                RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+                RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+            }
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
             // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
             ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
@@ -1040,6 +1268,11 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         // 赞成票太弱不配改写 TSDF，但反对票仍然生效（只扣信心，不动距离值）
         if (contradicted)
         {
+            if (fovLedgerNearSurface)
+            {
+                RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+                RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+            }
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
             // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
             ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
@@ -1066,7 +1299,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float newWeight = contradicted ? carvedWeight : min(weight + q2obs * gsWeightGrowth, gsMaxWeight); // M1：折让带内权重慢涨
     // 救援降级①：救援样本不享快速转正——混合斜坡伪造品恰恰能产出"第二次一致原始
     // 观测"，快速转正对它不是防线而是加速器。救援面只能走自然增长慢慢爬到正式阈值。
-    bool consistentRawRepeat = !contradicted && !grazingPlaneRescued &&
+    bool consistentRawRepeat = observationCanConfirmSurface &&
+                               !contradicted && !grazingPlaneRescued &&
                                receiverOwnsRawDepth &&
                                rawGeometryConfirmed &&
                                abs(oldVal - sDistNorm) <= 0.35;
@@ -1083,10 +1317,20 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                                quantizedFormalFloor >= gsFormalSurfaceWeight;
         newWeight = max(newWeight, quantizedFormalFloor);
     }
+    // 自然增长同样不能绕过“外围/运动不足不可单独转正”的契约。保留一个 R8
+    // 量化步长的距离，让低权限候选持续存在但始终低于正式出网门槛。
+    if (!observationCanConfirmSurface && weight < gsFormalSurfaceWeight)
+    {
+        float outerFormalCeiling = max(PRUNE_WEIGHT + 1.0 / 127.0,
+                                       gsFormalSurfaceWeight - 1.0 / 127.0);
+        newWeight = min(newWeight, outerFormalCeiling);
+    }
     bool promotedToFormal = weight < gsFormalSurfaceWeight &&
                             newWeight >= gsFormalSurfaceWeight;
     if (promotedToFormal)
     {
+        if (gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[109u + fovLedgerRing], 1u);
         InterlockedAdd(_CarveStats[69], 1); // provisional -> formal
         InterlockedAdd(_CarveStats[fastPromotionApplied ? 78u : 77u], 1u);
         uint priorTrace = DecodeAdmissionTrace(gsAdmissionTraceRW[coord]);
@@ -1104,8 +1348,22 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (fastPromotionApplied && currentAuditFlags != 0u) InterlockedAdd(_CarveStats[88], 1u);
     }
     if (weight >= gsFormalSurfaceWeight && newWeight < gsFormalSurfaceWeight)
+    {
         InterlockedAdd(_CarveStats[70], 1); // formal -> below mesh threshold
+        if (gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[112u + fovLedgerRing], 1u);
+    }
+    if (fovLedgerNearSurface && contradicted)
+    {
+        RecordFovLedgerContradiction(fovLedgerRing, temporalLedgerReason);
+        RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
+    }
     WriteTrackedTsdf(coord, float2(newTsdf, newWeight));
+    if (fovLedgerNearSurface && !contradicted)
+    {
+        RecordFovLedgerPositive(fovLedgerRing, temporalLedgerReason);
+        RecordFovLedgerFacing(fovLedgerRing, normDot, 6u);
+    }
     // 赞成帧也记账：一致→EMA 收敛向 0。M1.1 折让带内按"一致"记账（Δ=0）——
     // 不喂分歧（视角偏差不啃绿）且保留养绿通道（盯着看 EMA 向 0 收敛=有迹可循）。
     // M1 初版"跳过记账"被实机判死：带内=全部小分歧观测=唯一恢复通道，跳过=熟面
@@ -1132,7 +1390,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         // 运动位(32u)出生定格：只从 oldTrace 继承（种子出生时定格），增长帧不再
         // OR 进来——旧版终身累积让任何一次快转帧最终污染体素全生命周期（三角级
         // 98% 饱和，失去区分度）。救援(8u)/临近弃权(16u)仍是累积型观察位。
-        uint lifecycleAuditFlags = (oldTrace & 0x38u) | (currentAuditFlags & 0x18u) |
+        uint lifecycleAuditFlags = (oldTrace & 0x78u) | (currentAuditFlags & 0x18u) |
+                                   (fovLedgerRing == 2u ? 64u : 0u) |
                                    (fastPromotionApplied ? 128u : 0u);
         uint updatedTrace = birthSource |
                             ((confirmedNow || preserveStableConfirmation) ? 4u : 0u) |

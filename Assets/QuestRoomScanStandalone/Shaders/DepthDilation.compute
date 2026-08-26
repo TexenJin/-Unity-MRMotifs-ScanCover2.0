@@ -14,7 +14,7 @@ float gsVoxSize;
 [numthreads(8, 8, 1)]
 void InitDepthDilation(uint2 coord : SV_DispatchThreadID)
 {
-    float depth = gsDepthTex[uint3(coord.xy, 0)];
+    float depth = gsDepthTex[uint3(coord.xy, GS_FUSION_EYE)];
 
     float4 val = float4(0, 0, 0, 0);
     val.xy = (float2)coord.xy;
@@ -46,7 +46,7 @@ static const int2 kOffsets[8] =
 void DilateDepthStep(uint2 coord : SV_DispatchThreadID)
 {
     float4 val = gsDilateSrc[coord];
-    float focalLength = gsDepthProj[0]._m00;
+    float focalLength = gsDepthProj[GS_FUSION_EYE]._m00;
 
     [unroll]
     for (int i = 0; i < 8; i++)
@@ -59,7 +59,7 @@ void DilateDepthStep(uint2 coord : SV_DispatchThreadID)
 
         float4 srcVal = gsDilateSrc[srcCoord];
 
-        float srcDepthLinear = gsDepthNDCToLinear(srcVal.z);
+        float srcDepthLinear = gsDepthNDCToLinear(srcVal.z, GS_FUSION_EYE);
         float pixelSize = 2.0 * srcDepthLinear / (focalLength * gsDepthTexSize.x);
         float radius = (gsVoxDist + gsVoxSize) / pixelSize;
 

@@ -150,6 +150,7 @@ namespace Genesis.RoomScan
                 }
                 else
                 {
+                    // 普通 X：关 → 枪胶裁决海 → BB 反投影 → 关。
                     scanner.ToggleCoverageMarkers();
                     // ToggleCoverageMarkers 内部会写一次提示，因此诊断握值必须放在
                     // 它之后，确保实机截图能看见而不是被“BB反投影”提示覆盖。

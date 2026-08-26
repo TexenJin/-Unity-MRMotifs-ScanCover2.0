@@ -1,6 +1,5 @@
 // QRS 独立链 - 深度实时预览（HUD 小窗用）
-// 直接采样 DepthCapture 全局绑定的 gsDepthTex（slice 0，与融合 kernel 同一只眼），
-// 用 gsDepthProj[0] 把 NDC 深度线性化成米。
+// 直接采样 DepthCapture 全局绑定的双眼 gsDepthTex；生产融合当前使用 slice 1（右眼）。
 // v2：turbo 全谱色带（0.3m=红 → 4m=深红，途经橙黄绿青蓝紫）+ 每 0.5m 一条品红对比色等深线，
 //     房间内 1~3m 的窄深度区间也能拉开色差，斑块轮廓一眼可辨；无效/超范围=深暗底。
 // 放在 Resources 下是为了保证打进包（运行时用 Resources.Load 取，Shader.Find 会被裁剪）。
@@ -66,7 +65,7 @@ Shader "QRS/DepthPreview"
 
             fixed4 frag(v2f i) : SV_Target
             {
-                // 左右眼对比模式：左半窗=eye0（融合用眼），右半窗=eye1。
+                // 左右眼对比模式：左半窗=eye0（左眼），右半窗=eye1（生产融合右眼）。
                 // 裁决"幽灵是否为双眼共享幻觉"：幽灵斑块只在左半存在→右眼可作异议证据源；
                 // 两半都有→Meta 深度同源重投影，右眼无独立证据，只能上自有双目。
                 int eye = i.uv.x < 0.5 ? 0 : 1;

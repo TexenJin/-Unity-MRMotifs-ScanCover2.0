@@ -83,6 +83,7 @@ namespace ScanCover.EvidenceCapture.Editor
             }
             roomMeshRoot.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
             roomMeshRoot.transform.localScale = Vector3.one;
+            roomMeshRoot.SetActive(true);
 
             MRUK mruk = roomMeshRoot.GetComponent<MRUK>();
             if (mruk == null)
@@ -96,6 +97,9 @@ namespace ScanCover.EvidenceCapture.Editor
             mruk.SceneSettings.DataSource = MRUK.SceneDataSource.Device;
             mruk.SceneSettings.LoadSceneOnStartup = true;
             mruk.SceneSettings.EnableHighFidelityScene = false;
+            // This companion must never move the production TrackingSpace.  It is a
+            // read-only reference source; QRS owns the scan coordinate contract.
+            mruk.EnableWorldLock = false;
 
             ScanCoverMetaSceneMeshAuditExporter meshExporter = roomMeshRoot.GetComponent<ScanCoverMetaSceneMeshAuditExporter>();
             if (meshExporter == null)

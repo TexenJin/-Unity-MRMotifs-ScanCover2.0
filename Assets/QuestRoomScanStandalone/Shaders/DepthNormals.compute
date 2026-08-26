@@ -45,7 +45,7 @@ void CenterDepthSample(uint3 id : SV_DispatchThreadID)
     int2 offset = int2(id.xy) - int2(4, 4);
     int2 pixel = int2(gsDepthTexSize / 2) + offset;
     pixel = clamp(pixel, int2(0, 0), int2(gsDepthTexSize) - 1);
-    gsCenterDepthSamples[id.y * 8u + id.x] = gsDepthTex[uint3(pixel, 0)];
+    gsCenterDepthSamples[id.y * 8u + id.x] = gsDepthTex[uint3(pixel, GS_FUSION_EYE)];
 }
 
 // Editor simulation: convert mono linear depth to stereo NDC depth

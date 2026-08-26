@@ -68,7 +68,7 @@ namespace Genesis.RoomScan
         private Shader supportTruthShader;
         [SerializeField, Range(1, 4), Tooltip("支撑采样步长：2=10cm 格点边；纸面三角共享这些边上的零交叉顶点。")]
         private int supportTruthStride = 2;
-        [SerializeField, Range(0.01f, 0.08f), Tooltip("局部零交叉两端的最低 TSDF 权重。")]
+        [SerializeField, Range(0.01f, 0.08f), Tooltip("局部零交叉候选/审计点的最低 TSDF 权重；公共纸皮的正式发布门槛统一使用 VolumeIntegrator.MinMeshWeight。")]
         private float supportTruthMinWeight = 0.04f;
         [SerializeField, Range(1f, 12f), Tooltip("支撑真值刷新频率。")]
         private float supportTruthHz = 4f;
@@ -259,7 +259,7 @@ namespace Genesis.RoomScan
             string[] forensicConfirmation = { "unknown", "pending", "confirmed", "mixed" };
             string[] forensicSource = { "untracked", "self", "direct", "relay", "mixed" };
             string[] forensicRisk =
-                { "plane_rescue_seen", "near_abstain_seen", "motion_gt_60_birth", "retired_edge_bit", "fast_promotion" };
+                { "plane_rescue_seen", "near_abstain_seen", "motion_gt_60_birth", "fov_outer_sample_seen", "fast_promotion" };
             for (int e = 0; e < forensicEvidence.Length; e++)
                 names.Add($"emitted_evidence_{forensicEvidence[e]}");
             for (int q = 0; q < forensicConfirmation.Length; q++)
@@ -742,7 +742,7 @@ namespace Genesis.RoomScan
         public string RouteValidationLabel => !IsRouteValidationActive
             ? "常规网格"
             : _routeValidationView == RouteValidationView.PaperFineHybrid
-                ? (_paperOwnedGrid ? "纸拓扑网格" : "HERA旧网格")
+                ? (_paperOwnedGrid ? "v2.3纸拓扑" : "HERA旧网格")
                 : _routeValidationView == RouteValidationView.SupportTruth
                 ? (_supportTruthAuditMode ? "支撑圆点" : "纸拓扑独显")
                 : _routeValidationView == RouteValidationView.CoarseSkin
@@ -1384,6 +1384,12 @@ namespace Genesis.RoomScan
             Logger.Info($"累计账开始: {_ledgerSessionId}");
         }
 
+        /// <summary>v2.3 纸拓扑不携带实验版发布黑匣子。</summary>
+        public bool RequestPaperAuditExport(string reason, Action<string> completed = null)
+        {
+            return false;
+        }
+
         public string GetLedgerSessionStatsCompact()
         {
             string state = _ledgerOpen ? "记账中" : "未记账";
@@ -1435,6 +1441,7 @@ namespace Genesis.RoomScan
                 summary.AppendLine($"导出原因: {reason}");
                 summary.AppendLine($"导出(UTC): {DateTime.UtcNow:O}");
                 _geometryStability.AppendSummary(summary);
+                _volume?.AppendForensicLedgerReport(summary);
                 _persistentChunks?.AppendSyncDebtSummary(summary, "生产64³提取块");
                 _persistentChunks?.AppendVisualQualityReport(summary, "生产提取块");
                 if (HasIncrementalHera)
@@ -1447,9 +1454,13 @@ namespace Genesis.RoomScan
                 var spatialCsv = new StringBuilder(4096);
                 _geometryStability.AppendSpatialCsv(spatialCsv, session);
                 string spatialPath = Path.Combine(outputDir, stem + "_spatial.csv");
+                var fovSampleCsv = new StringBuilder(4096);
+                _volume?.AppendFovSampleLedgerCsv(fovSampleCsv, session);
+                string fovSamplePath = Path.Combine(outputDir, stem + "_fov_sample_ledger.csv");
                 string summaryPath = Path.Combine(outputDir, stem + "_summary.txt");
                 File.WriteAllText(csvPath, csv.ToString(), new UTF8Encoding(true));
                 File.WriteAllText(spatialPath, spatialCsv.ToString(), new UTF8Encoding(true));
+                File.WriteAllText(fovSamplePath, fovSampleCsv.ToString(), new UTF8Encoding(true));
                 File.WriteAllText(summaryPath, summary.ToString(), new UTF8Encoding(true));
                 Logger.Info($"第一阶段几何快照已保存: {summaryPath}");
                 return summaryPath;

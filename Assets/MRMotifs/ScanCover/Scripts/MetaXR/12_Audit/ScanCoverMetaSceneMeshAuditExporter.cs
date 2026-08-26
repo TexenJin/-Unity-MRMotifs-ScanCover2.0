@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using Meta.XR.BuildingBlocks;
 using UnityEngine;
 
 [DisallowMultipleComponent]
@@ -24,11 +25,76 @@ public sealed class ScanCoverMetaSceneMeshAuditExporter : MonoBehaviour
     public bool exportComponentInventory = true;
     public bool debugLog = true;
 
+    [Header("Quest Runtime Input")]
+    [Tooltip("在 Quest 独立运行时允许右手 B 键导出。")]
+    public bool enableRightControllerExportInput = true;
+    public OVRInput.RawButton exportButton = OVRInput.RawButton.B;
+
     public string LastExportDirectory { get; private set; }
     public string LastIssue { get; private set; }
     public int LastExportedMeshCount { get; private set; }
     public int LastExportedVertexCount { get; private set; }
     public int LastExportedTriangleCount { get; private set; }
+
+    private bool _runtimeExportInProgress;
+    private bool _exportRequestedWhileLoading;
+    private RoomMeshEvent _roomMeshEvent;
+    private bool _roomMeshEventBound;
+
+    private void OnEnable()
+    {
+        BindRoomMeshEvent();
+    }
+
+    private void Start()
+    {
+        BindRoomMeshEvent();
+        WriteRuntimeStatus(sceneMeshRoot != null ? "room_mesh_ready" : "waiting_for_room_mesh");
+    }
+
+    private void OnDisable()
+    {
+        if (_roomMeshEventBound && _roomMeshEvent != null)
+            _roomMeshEvent.OnRoomMeshLoadCompleted.RemoveListener(OnRoomMeshLoaded);
+        _roomMeshEventBound = false;
+    }
+
+    private void BindRoomMeshEvent()
+    {
+        if (_roomMeshEventBound)
+            return;
+        _roomMeshEvent = GetComponent<RoomMeshEvent>();
+        if (_roomMeshEvent == null)
+        {
+            LastIssue = "RoomMeshEvent is missing from the Meta Scene Mesh object.";
+            return;
+        }
+        _roomMeshEvent.OnRoomMeshLoadCompleted.RemoveListener(OnRoomMeshLoaded);
+        _roomMeshEvent.OnRoomMeshLoadCompleted.AddListener(OnRoomMeshLoaded);
+        _roomMeshEventBound = true;
+    }
+
+    private void OnRoomMeshLoaded(MeshFilter roomMeshFilter)
+    {
+        if (roomMeshFilter == null || roomMeshFilter.sharedMesh == null ||
+            roomMeshFilter.sharedMesh.vertexCount <= 0)
+        {
+            LastIssue = "Room Mesh load completed without exportable triangle data.";
+            WriteRuntimeStatus("room_mesh_invalid");
+            return;
+        }
+
+        sceneMeshRoot = roomMeshFilter.transform;
+        searchWholeSceneWhenRootMissing = false;
+        LastIssue = string.Empty;
+        WriteRuntimeStatus("room_mesh_ready");
+
+        if (_exportRequestedWhileLoading)
+        {
+            _exportRequestedWhileLoading = false;
+            PerformRuntimeExport();
+        }
+    }
 
     private sealed class MeshRecord
     {
@@ -51,6 +117,56 @@ public sealed class ScanCoverMetaSceneMeshAuditExporter : MonoBehaviour
     public bool ExportAuditPackage()
     {
         return ExportAuditPackageToDirectory(CreateSessionDirectory());
+    }
+
+    private void Update()
+    {
+        if (!enableRightControllerExportInput || _runtimeExportInProgress)
+            return;
+        bool pressed = OVRInput.GetDown(exportButton, OVRInput.Controller.RTouch) ||
+                       OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch);
+        if (!pressed)
+            return;
+
+        if (sceneMeshRoot == null)
+        {
+            _exportRequestedWhileLoading = true;
+            LastIssue = "B was pressed before the Quest Room Mesh finished loading; export is queued.";
+            WriteRuntimeStatus("button_queued_waiting_for_room_mesh");
+            return;
+        }
+
+        PerformRuntimeExport();
+    }
+
+    private void PerformRuntimeExport()
+    {
+        if (_runtimeExportInProgress)
+            return;
+        _runtimeExportInProgress = true;
+        try
+        {
+            WriteRuntimeStatus("button_pressed");
+            bool ok = ExportAuditPackage();
+            WriteRuntimeStatus(ok ? "complete" : "failed");
+            if (debugLog)
+            {
+                if (ok)
+                    Debug.Log($"[ScanCoverMetaSceneMeshAuditExporter] Quest export complete: {LastExportDirectory}", this);
+                else
+                    Debug.LogWarning($"[ScanCoverMetaSceneMeshAuditExporter] Quest export failed: {LastIssue}", this);
+            }
+        }
+        catch (Exception exception)
+        {
+            LastIssue = exception.GetType().Name + ": " + exception.Message;
+            WriteRuntimeStatus("exception");
+            Debug.LogException(exception, this);
+        }
+        finally
+        {
+            _runtimeExportInProgress = false;
+        }
     }
 
     public bool ExportAuditPackageToDirectory(string sessionDir)
@@ -198,10 +314,45 @@ public sealed class ScanCoverMetaSceneMeshAuditExporter : MonoBehaviour
     private string CreateSessionDirectory()
     {
         string root = string.IsNullOrWhiteSpace(exportDirectoryOverride)
-            ? Path.Combine(ProjectRoot(), "ScanCoverExports", "MetaSceneMeshAuditSessions")
+            ? DefaultExportRoot()
             : exportDirectoryOverride;
         string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
         return Path.Combine(root, $"{sessionPrefix}_{stamp}");
+    }
+
+    private static string DefaultExportRoot()
+    {
+        if (Application.isEditor)
+            return Path.Combine(ProjectRoot(), "ScanCoverExports", "MetaSceneMeshAuditSessions");
+        return Path.Combine(Application.persistentDataPath,
+            "ScanCoverDiagnostics", "system_room_mesh");
+    }
+
+    private void WriteRuntimeStatus(string state)
+    {
+        if (Application.isEditor)
+            return;
+        try
+        {
+            string root = DefaultExportRoot();
+            Directory.CreateDirectory(root);
+            string json = "{\n" +
+                          "  \"state\": " + Json(state) + ",\n" +
+                          "  \"utc\": " + Json(DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)) + ",\n" +
+                          "  \"scene\": " + Json(UnityEngine.SceneManagement.SceneManager.GetActiveScene().path) + ",\n" +
+                          "  \"issue\": " + Json(LastIssue ?? string.Empty) + ",\n" +
+                          "  \"lastExportDirectory\": " + Json(LastExportDirectory ?? string.Empty) + ",\n" +
+                          "  \"meshCount\": " + LastExportedMeshCount + ",\n" +
+                          "  \"vertexCount\": " + LastExportedVertexCount + ",\n" +
+                          "  \"triangleCount\": " + LastExportedTriangleCount + "\n" +
+                          "}\n";
+            File.WriteAllText(Path.Combine(root, "export_status.json"), json, new UTF8Encoding(false));
+        }
+        catch (Exception exception)
+        {
+            Debug.LogWarning("[ScanCoverMetaSceneMeshAuditExporter] Failed to write runtime status: " +
+                             exception.Message, this);
+        }
     }
 
     private static string ProjectRoot()

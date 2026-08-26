@@ -20,6 +20,7 @@ namespace Genesis.RoomScan
     [DefaultExecutionOrder(-40)]
     public class DepthCapture : MonoBehaviour
     {
+        public const int FusionEyeIndex = 1;
         public static DepthCapture Instance { get; private set; }
 
         [SerializeField] private ComputeShader depthNormalCompute;
@@ -30,6 +31,11 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader handMaskCompute;
         [Tooltip("源头时序滤波 compute；留空则 Resources/DepthTemporalFilter 兜底装载（免场景 YAML 接线）。")]
         [SerializeField] private ComputeShader temporalFilterCompute;
+
+        [Header("枪胶双证词（数据层）")]
+        [SerializeField, Tooltip("每个实际消费的深度帧在任何预处理前复制融合眼平台深度，" +
+                                 "与预处理后深度共同作为枪胶候选的两份独立证词。")]
+        private bool enableGunGelDualTestimony = true;
 
         [Header("源头时序滤波（08-20，数据层第一刀）")]
         [Tooltip("深度先跨帧稳定再进双边/缘洗/TSDF：当前像素重建世界点，重投影到上一拍历史；" +
@@ -184,6 +190,7 @@ namespace Genesis.RoomScan
         public static readonly int DilateStepSizeID = Shader.PropertyToID("gsDilateStepSize");
         public static readonly int DilatedDepthTexID = Shader.PropertyToID("gsDilatedDepth");
         public static readonly int EdgeReasonTexID = Shader.PropertyToID("gsEdgeReasonTex");
+        public static readonly int TemporalReasonTexID = Shader.PropertyToID("gsTemporalReasonTex");
         public static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
         public static readonly int VoxSizeShaderID = Shader.PropertyToID("gsVoxSize");
 
@@ -244,6 +251,7 @@ namespace Genesis.RoomScan
         // 源头时序滤波 property IDs（_SrcDepth/_DstDepth/_DepthW/_DepthH 与双边同名同 ID，复用）
         private static readonly int TemporalHistDepthID = Shader.PropertyToID("_HistDepth");
         private static readonly int TemporalNextHistDepthID = Shader.PropertyToID("_NextHistDepth");
+        private static readonly int TemporalReasonRWID = Shader.PropertyToID("_TemporalReason");
         private static readonly int TemporalStatsID = Shader.PropertyToID("_TemporalStats");
         private static readonly int TemporalCurProjID = Shader.PropertyToID("_CurProj");
         private static readonly int TemporalCurProjInvID = Shader.PropertyToID("_CurProjInv");
@@ -257,6 +265,10 @@ namespace Genesis.RoomScan
         private static readonly int TemporalAlphaID = Shader.PropertyToID("_TemporalAlpha");
         private static readonly int TemporalChangeBaseID = Shader.PropertyToID("_TemporalChangeBase");
         private static readonly int TemporalChangeScaleID = Shader.PropertyToID("_TemporalChangeScale");
+        private static readonly int WitnessSourceDepthID = Shader.PropertyToID("_SourceDepth");
+        private static readonly int WitnessDestDepthID = Shader.PropertyToID("_DestDepth");
+        private static readonly int WitnessCaptureSizeID = Shader.PropertyToID("_CaptureSize");
+        private static readonly int WitnessSourceEyeID = Shader.PropertyToID("_SourceEyeIndex");
 
         /// <summary>逐眼交替节拍：每次融合前预处理只洗一只眼，0/1 翻转。</summary>
         private int _preprocessEye;
@@ -270,14 +282,14 @@ namespace Genesis.RoomScan
         // ── 中心深度采样（实时轨落点锚定）──
         // 08-18 实机视频定案：实时轨落点写死 1.5m，站 2.5m 外看墙时落点飘在半空，
         // slab 七块全是空块 → "空块不排" → 正眼盯着的墙永远不长网。改为每次巡视
-        // 从深度图中心 8×8（左眼片）取中位数距离，落点钉在实际表面略后方。
+        // 从深度图中心 8×8（生产右眼片）取中位数距离，落点钉在实际表面略后方。
         private bool _centerDepthRequested;
         private bool _centerDepthPending;
         private ComputeKernelHelper _centerDepthKernel;
         private ComputeBuffer _centerDepthSamplesBuffer;
         private static readonly int CenterDepthSamplesID = Shader.PropertyToID("gsCenterDepthSamples");
 
-        /// <summary>最近一次中心深度中位数（米，左眼线性化）；&lt;0 = 尚无有效样本。</summary>
+        /// <summary>最近一次中心深度中位数（米，生产右眼线性化）；&lt;0 = 尚无有效样本。</summary>
         public float LastCenterDepthMeters { get; private set; } = -1f;
 
         /// <summary>深度帧尺寸（B1 平面拟合影子内核 dispatch 用）；无深度帧时为 0。</summary>
@@ -362,6 +374,16 @@ namespace Genesis.RoomScan
         /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
         public Texture DepthTex => _depthTex;
 
+        private ComputeShader _platformWitnessCopyShader;
+        private int _platformWitnessCopyKernel = -1;
+        private RenderTexture _platformDepthWitnessTex;
+        /// <summary>
+        /// 当前被融合消费帧的右眼平台直接深度快照（单层 R32）。它在手罩、时序、
+        /// 双边和缘洗之前复制，只供枪胶双证词使用，不参与显示。
+        /// </summary>
+        public Texture PlatformDepthWitnessTex =>
+            enableGunGelDualTestimony ? _platformDepthWitnessTex : null;
+
         private RenderTexture _normTex;
         /// <summary>World-space normals computed from the depth texture via the DepthNorm compute shader.</summary>
         public RenderTexture NormTex => _normTex;
@@ -390,6 +412,11 @@ namespace Genesis.RoomScan
         private RenderTexture _temporalDepthTex;
         private RenderTexture _temporalHistReadTex;
         private RenderTexture _temporalHistWriteTex;
+        private RenderTexture _temporalReasonTex;
+        /// <summary>逐像素时序判因（0..6），只供融合黑匣子读取，不参与任何生产裁决。</summary>
+        public RenderTexture TemporalReasonTex => TemporalFilterEnabled && _hasTemporalHistory
+            ? _temporalReasonTex
+            : null;
         private ComputeBuffer _temporalStats;
         private bool _temporalStatsReadbackPending;
         private int _temporalSinceStats;
@@ -444,6 +471,8 @@ namespace Genesis.RoomScan
         private bool _started;
         private bool _dilationDirty;
         private int _frameCount;
+        /// <summary>当前平台深度帧序号；供独立回放会话关联源帧与融合尝试。</summary>
+        public int CurrentPlatformFrame => _frameCount;
         private float _lastLogTime;
         private PairedDepthFrameRecorder _pairedFrameRecorder;
 
@@ -459,7 +488,7 @@ namespace Genesis.RoomScan
 
         /// <summary>平台前处理/本工程后处理双路逐帧采集是否正在接收新帧。</summary>
         public bool PairedFrameCaptureActive => _pairedFrameRecorder != null && _pairedFrameRecorder.IsCapturing;
-        /// <summary>双路采集当前会话目录；设备端位于 ScanCoverDiagnostics/depth_pair_capture 下。</summary>
+        /// <summary>独立回放会话目录；设备端位于 ScanCoverDiagnostics/replay_sessions 下。</summary>
         public string PairedFrameCaptureDirectory => _pairedFrameRecorder != null
             ? _pairedFrameRecorder.SessionDirectory
             : string.Empty;
@@ -470,6 +499,10 @@ namespace Genesis.RoomScan
         /// <summary>因回读/写盘队列满而明确丢弃的帧对数量。</summary>
         public int PairedFrameCaptureDropped => _pairedFrameRecorder != null
             ? _pairedFrameRecorder.DroppedPairCount
+            : 0;
+        /// <summary>因独立会话 GPU 回读队列满而丢失的融合输入快照数。</summary>
+        public int ReplayFusionCaptureDropped => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.DroppedFusionFrameCount
             : 0;
 
         public bool TogglePairedFrameCapture()
@@ -786,6 +819,7 @@ namespace Genesis.RoomScan
             if (_dilationA) { Destroy(_dilationA); _dilationA = null; }
             if (_dilationB) { Destroy(_dilationB); _dilationB = null; }
             if (_simulatedDepthTex) { Destroy(_simulatedDepthTex); _simulatedDepthTex = null; }
+            if (_platformDepthWitnessTex) { Destroy(_platformDepthWitnessTex); _platformDepthWitnessTex = null; }
             if (_filteredDepthTex) { Destroy(_filteredDepthTex); _filteredDepthTex = null; }
             if (_edgeCleanedDepthTex) { Destroy(_edgeCleanedDepthTex); _edgeCleanedDepthTex = null; }
             if (_edgeReasonTex) { Destroy(_edgeReasonTex); _edgeReasonTex = null; }
@@ -801,6 +835,7 @@ namespace Genesis.RoomScan
             if (_temporalDepthTex) { Destroy(_temporalDepthTex); _temporalDepthTex = null; }
             if (_temporalHistReadTex) { Destroy(_temporalHistReadTex); _temporalHistReadTex = null; }
             if (_temporalHistWriteTex) { Destroy(_temporalHistWriteTex); _temporalHistWriteTex = null; }
+            if (_temporalReasonTex) { Destroy(_temporalReasonTex); _temporalReasonTex = null; }
             _temporalStats?.Release();
             _temporalStats = null;
             _temporalStatsReadbackPending = false;
@@ -891,11 +926,12 @@ namespace Genesis.RoomScan
             if (!_preprocessDirty || !DepthAvailable) return;
             _preprocessDirty = false;
 
-            // VolumeIntegration.compute 的融合采样固定读取 texture-array slice 0。
-            // 因此每次只清洗融合真正消费的第 0 眼：保持单眼 GPU 成本不变，
-            // 避免“第 1 眼刚更新、陈旧第 0 眼却配当前位姿进入 TSDF”的错层融合。
-            _preprocessEye = 0;
+            // VolumeIntegration.compute 的融合采样固定读取右眼 texture-array slice 1。
+            // 因此每次只清洗融合真正消费的右眼：保持单眼 GPU 成本不变，
+            // 避免“一只眼刚更新、另一只眼却配当前位姿进入 TSDF”的错层融合。
+            _preprocessEye = FusionEyeIndex;
 
+            CapturePlatformDepthWitness();
             ApplyHandMask(); // 手部打码必须在时序/双边之前：滤波邻域会把弃权值洇回有效像素
             ApplyTemporalFilter(); // 数据层第一刀：深度先跨帧稳定再进空间滤波/TSDF
             ApplyBilateralFilter();
@@ -906,6 +942,59 @@ namespace Genesis.RoomScan
             _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
             DispatchCenterDepthSample();
             Preprocessed?.Invoke();
+        }
+
+        private void CapturePlatformDepthWitness()
+        {
+            if (!enableGunGelDualTestimony || _depthTex == null)
+                return;
+            if (_platformWitnessCopyShader == null || _platformWitnessCopyKernel < 0)
+            {
+                _platformWitnessCopyShader = Resources.Load<ComputeShader>("DepthPairCaptureCopy");
+                if (_platformWitnessCopyShader == null)
+                {
+                    Logger.Warning("枪胶双证词：缺少 Resources/DepthPairCaptureCopy.compute，退回单证词");
+                    return;
+                }
+                _platformWitnessCopyKernel = _platformWitnessCopyShader.FindKernel("CopyDepth");
+            }
+
+            int width = _depthTex.width;
+            int height = _depthTex.height;
+            bool recreate = _platformDepthWitnessTex == null ||
+                            _platformDepthWitnessTex.width != width ||
+                            _platformDepthWitnessTex.height != height;
+            if (recreate)
+            {
+                if (_platformDepthWitnessTex) Destroy(_platformDepthWitnessTex);
+                if (!SystemInfo.IsFormatSupported(GraphicsFormat.R32_SFloat,
+                                                   GraphicsFormatUsage.LoadStore))
+                {
+                    Logger.Warning("枪胶双证词：设备不支持 R32_SFloat UAV，退回单证词");
+                    _platformDepthWitnessTex = null;
+                    return;
+                }
+                _platformDepthWitnessTex = new RenderTexture(width, height, 0,
+                    GraphicsFormat.R32_SFloat, 1)
+                {
+                    name = "GunGel_PlatformDepthWitness",
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 1,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _platformDepthWitnessTex.Create();
+            }
+
+            _platformWitnessCopyShader.SetTexture(_platformWitnessCopyKernel,
+                WitnessSourceDepthID, _depthTex);
+            _platformWitnessCopyShader.SetTexture(_platformWitnessCopyKernel,
+                WitnessDestDepthID, _platformDepthWitnessTex);
+            _platformWitnessCopyShader.SetInts(WitnessCaptureSizeID, width, height);
+            _platformWitnessCopyShader.SetInt(WitnessSourceEyeID, FusionEyeIndex);
+            _platformWitnessCopyShader.Dispatch(_platformWitnessCopyKernel,
+                Mathf.CeilToInt(width / 8f), Mathf.CeilToInt(height / 8f), 1);
         }
 
         /// <summary>
@@ -1011,7 +1100,7 @@ namespace Genesis.RoomScan
                 }
             }
 
-            TrackDepthAngularSpeed(poses[0].rotation, poses[0].position);
+            TrackDepthAngularSpeed(poses[FusionEyeIndex].rotation, poses[FusionEyeIndex].position);
 
             for (int i = 0; i < 2; i++)
             {
@@ -1165,15 +1254,18 @@ namespace Genesis.RoomScan
 
             int w = _depthTex.width;
             int h = _depthTex.height;
-            bool recreate = _temporalDepthTex == null || _temporalDepthTex.width != w || _temporalDepthTex.height != h;
+            bool recreate = _temporalDepthTex == null || _temporalReasonTex == null ||
+                            _temporalDepthTex.width != w || _temporalDepthTex.height != h;
             if (recreate)
             {
                 if (_temporalDepthTex) Destroy(_temporalDepthTex);
                 if (_temporalHistReadTex) Destroy(_temporalHistReadTex);
                 if (_temporalHistWriteTex) Destroy(_temporalHistWriteTex);
+                if (_temporalReasonTex) Destroy(_temporalReasonTex);
                 _temporalDepthTex = CreateTemporalDepthTexture(w, h, "DepthTemporalOut");
                 _temporalHistReadTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistRead");
                 _temporalHistWriteTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistWrite");
+                _temporalReasonTex = CreateTemporalReasonTexture(w, h);
                 _hasTemporalHistory = false;
             }
 
@@ -1188,6 +1280,7 @@ namespace Genesis.RoomScan
             _temporalKernel.Set(TemporalHistDepthID, _temporalHistReadTex);
             _temporalKernel.Set(BilDstDepthID, _temporalDepthTex);
             _temporalKernel.Set(TemporalNextHistDepthID, _temporalHistWriteTex);
+            _temporalKernel.Set(TemporalReasonRWID, _temporalReasonTex);
             _temporalKernel.Set(TemporalStatsID, _temporalStats);
             cs.SetInt(BilDepthWID, w);
             cs.SetInt(BilDepthHID, h);
@@ -1230,6 +1323,21 @@ namespace Genesis.RoomScan
             var rt = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
             {
                 name = name,
+                dimension = TextureDimension.Tex2DArray,
+                volumeDepth = 2,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            rt.Create();
+            return rt;
+        }
+
+        private static RenderTexture CreateTemporalReasonTexture(int w, int h)
+        {
+            var rt = new RenderTexture(w, h, 0, GraphicsFormat.R32_UInt, 1)
+            {
+                name = "DepthTemporalReason",
                 dimension = TextureDimension.Tex2DArray,
                 volumeDepth = 2,
                 enableRandomWrite = true,

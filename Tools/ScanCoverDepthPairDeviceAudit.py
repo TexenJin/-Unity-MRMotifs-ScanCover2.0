@@ -25,8 +25,15 @@ DEFAULT_ADB = Path(
 )
 PACKAGE_ROOT = (
     "/sdcard/Android/data/com.pcaii.scancover.quest3/files/"
-    "ScanCoverDiagnostics/depth_pair_capture"
+    "ScanCoverDiagnostics/replay_sessions"
 )
+
+
+def recorded_eye(record: dict) -> int:
+    """Return the texture eye that was actually written, never metadata eye 0 by habit."""
+    eye = int(record.get("recordedEyeIndex", 1))
+    poses = record.get("trackingPoses", [])
+    return max(0, min(eye, len(poses) - 1)) if poses else eye
 
 
 @dataclass
@@ -67,7 +74,7 @@ def latest_session(adb: Path, serial: str) -> str:
 
 
 def load_metadata(adb: Path, serial: str, session: str) -> list[dict]:
-    frames = session + "/frames"
+    frames = session + "/depth_pairs/frames"
     separator = b"\n__QRS_META_SPLIT__\n"
     script = (
         f'for f in "{frames}"/*_meta.json; do cat "$f"; '
@@ -97,7 +104,8 @@ def annotate_motion(records: list[dict]) -> dict[str, list[dict]]:
     groups: dict[str, list[dict]] = {"still": [], "slow": [], "fast": []}
     previous = None
     for record in records:
-        pose = record["trackingPoses"][0]
+        eye = recorded_eye(record)
+        pose = record["trackingPoses"][eye]
         position = np.asarray(pose["position"], dtype=np.float64)
         rotation = np.asarray(pose["rotation"], dtype=np.float64)
         if previous is None:
@@ -133,7 +141,7 @@ def fetch_pair_batch(
     session: str,
     records: list[dict],
 ) -> list[tuple[dict, np.ndarray, np.ndarray]]:
-    frames = session + "/frames"
+    frames = session + "/depth_pairs/frames"
     names: list[str] = []
     for record in records:
         stem = f"frame_{int(record['pairIndex']):06d}"
@@ -180,8 +188,9 @@ def add_depth_metrics(bucket: Bucket, record: dict, raw: np.ndarray, post: np.nd
     bucket.removed += int(np.count_nonzero(raw_valid & ~post_valid))
     bucket.introduced += int(np.count_nonzero(~raw_valid & post_valid))
     if np.any(common):
-        raw_m = linearize(raw[common], record["projection"][0])
-        post_m = linearize(post[common], record["projection"][0])
+        eye = recorded_eye(record)
+        raw_m = linearize(raw[common], record["projection"][eye])
+        post_m = linearize(post[common], record["projection"][eye])
         usable = np.isfinite(raw_m) & np.isfinite(post_m) & (raw_m <= 10.0) & (post_m <= 10.0)
         bucket.diffs.append(np.abs(raw_m[usable] - post_m[usable]).astype(np.float32))
 
@@ -201,11 +210,12 @@ def backproject_points(record: dict, depth: np.ndarray, stride: int = 8) -> np.n
     v = grid_y[valid].astype(np.float64) / height
     ndc = sampled[valid].astype(np.float64)
     hcs = np.stack((u * 2.0 - 1.0, v * 2.0 - 1.0, ndc * 2.0 - 1.0, np.ones_like(u)))
-    projection_inverse = np.asarray(record["projectionInverse"][0], dtype=np.float64).reshape(4, 4)
-    view_inverse = np.asarray(record["viewInverse"][0], dtype=np.float64).reshape(4, 4)
+    eye_index = recorded_eye(record)
+    projection_inverse = np.asarray(record["projectionInverse"][eye_index], dtype=np.float64).reshape(4, 4)
+    view_inverse = np.asarray(record["viewInverse"][eye_index], dtype=np.float64).reshape(4, 4)
     world_h = view_inverse @ (projection_inverse @ hcs)
     world = (world_h[:3] / world_h[3]).T
-    eye = np.asarray(record["trackingPoses"][0]["position"], dtype=np.float64)
+    eye = np.asarray(record["trackingPoses"][eye_index]["position"], dtype=np.float64)
     distance = np.linalg.norm(world - eye, axis=1)
     keep = np.isfinite(world).all(axis=1) & (distance >= 0.15) & (distance <= 8.0)
     return world[keep].astype(np.float32)

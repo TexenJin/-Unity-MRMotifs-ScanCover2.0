@@ -22,7 +22,7 @@ namespace Genesis.RoomScan
     {
         private const int EyeCount = 2;
         private const int RecordedLayerCount = 1;
-        private const int FusionEyeIndex = 0;
+        private const int FusionEyeIndex = DepthCapture.FusionEyeIndex;
         private const int MaxOutstandingPairs = 24;
         private const string CopyShaderResource = "DepthPairCaptureCopy";
 
@@ -43,31 +43,50 @@ namespace Genesis.RoomScan
         private int _writesInFlight;
         private int _droppedPairs;
         private int _readbackErrors;
+        private int _writeErrors;
+        private bool _depthDrainReported;
+        private ScanReplaySessionPackage _sessionPackage;
+        private DepthCapture _depthCapture;
         private readonly object _manifestLock = new object();
 
         private static readonly int SourceDepthId = Shader.PropertyToID("_SourceDepth");
         private static readonly int DestDepthId = Shader.PropertyToID("_DestDepth");
         private static readonly int CaptureSizeId = Shader.PropertyToID("_CaptureSize");
+        private static readonly int SourceEyeIndexId = Shader.PropertyToID("_SourceEyeIndex");
 
         public bool IsCapturing => _isCapturing;
         public string SessionDirectory => _sessionDirectory;
-        public int OutstandingPairCount => Volatile.Read(ref _pendingReadbackPairs) +
-                                           Volatile.Read(ref _writesInFlight);
+        internal int LocalOutstandingPairCount => Volatile.Read(ref _pendingReadbackPairs) +
+                                                  Volatile.Read(ref _writesInFlight);
+        public int OutstandingPairCount => LocalOutstandingPairCount +
+                                           (_sessionPackage != null ? _sessionPackage.OutstandingCount : 0);
         public int DroppedPairCount => Volatile.Read(ref _droppedPairs);
+        public int DroppedFusionFrameCount => _sessionPackage != null
+            ? _sessionPackage.DroppedFusionFrames
+            : 0;
 
         public bool StartCapture()
         {
             if (_isCapturing) return true;
+            VolumeIntegrator volume = VolumeIntegrator.Instance;
+            if (volume != null && volume.IntegrationCount > 0)
+            {
+                Logger.Warning(
+                    "独立复现会话必须从空体积的第一帧开始；当前体积已有融合数据，拒绝中途新开会话。" +
+                    "请先完成/清空本次扫描，再开始下一次采集。");
+                return false;
+            }
             if (!EnsureShader()) return false;
+            _depthCapture = GetComponent<DepthCapture>();
 
             string root = Path.Combine(
                 Application.persistentDataPath,
                 "ScanCoverDiagnostics",
-                "depth_pair_capture");
+                "replay_sessions");
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
             _sessionDirectory = Path.Combine(root, "session_" + stamp);
-            _framesDirectory = Path.Combine(_sessionDirectory, "frames");
-            _manifestPath = Path.Combine(_sessionDirectory, "manifest.csv");
+            _framesDirectory = Path.Combine(_sessionDirectory, "depth_pairs", "frames");
+            _manifestPath = Path.Combine(_sessionDirectory, "depth_pairs", "manifest.csv");
 
             try
             {
@@ -76,9 +95,12 @@ namespace Genesis.RoomScan
                     "pairIndex,platformFrame,timestampNs,timestampValid,unityFrame,unscaledTime,width,height,layers,updatedProcessedEye,rawFile,processedFile,metadataFile,status\n",
                     new UTF8Encoding(false));
                 File.WriteAllText(
-                    Path.Combine(_sessionDirectory, "schema.json"),
+                    Path.Combine(_sessionDirectory, "depth_pairs", "schema.json"),
                     BuildSchemaJson(),
                     new UTF8Encoding(false));
+                _sessionPackage = GetComponent<ScanReplaySessionPackage>() ??
+                                  gameObject.AddComponent<ScanReplaySessionPackage>();
+                _sessionPackage.Begin(_sessionDirectory);
             }
             catch (Exception e)
             {
@@ -90,8 +112,10 @@ namespace Genesis.RoomScan
             _pairSequence = 0;
             _droppedPairs = 0;
             _readbackErrors = 0;
+            _writeErrors = 0;
             _stagedEligible = false;
             _stagedPlatformFrame = -1;
+            _depthDrainReported = false;
             _isCapturing = true;
             Logger.Info("双路深度采集开始：" + _sessionDirectory);
             return true;
@@ -102,6 +126,7 @@ namespace Genesis.RoomScan
             if (!_isCapturing) return;
             _isCapturing = false;
             _stagedEligible = false;
+            _sessionPackage?.End();
             WriteStatusFile("stopped");
             Logger.Info($"双路深度采集停止：帧对={_pairSequence}，丢={_droppedPairs}，" +
                         $"回读错={_readbackErrors}，待写={OutstandingPairCount}，目录={_sessionDirectory}");
@@ -126,7 +151,7 @@ namespace Genesis.RoomScan
             _stagedPlatformFrame = platformFrame;
             if (!_isCapturing || platformDepth == null) return;
 
-            if (OutstandingPairCount >= MaxOutstandingPairs)
+            if (LocalOutstandingPairCount >= MaxOutstandingPairs)
             {
                 Interlocked.Increment(ref _droppedPairs);
                 return;
@@ -164,7 +189,7 @@ namespace Genesis.RoomScan
                 return;
 
             _stagedEligible = false;
-            if (OutstandingPairCount >= MaxOutstandingPairs)
+            if (LocalOutstandingPairCount >= MaxOutstandingPairs)
             {
                 Interlocked.Increment(ref _droppedPairs);
                 return;
@@ -172,6 +197,14 @@ namespace Genesis.RoomScan
 
             CopyDepth(processedDepth, _processedSnapshot);
             _stagedMetadata.updatedProcessedEye = updatedEye;
+            if (_depthCapture != null)
+            {
+                _stagedMetadata.angularDegPerSec = _depthCapture.SmoothedDepthAngularSpeed;
+                _stagedMetadata.linearMps = _depthCapture.SmoothedDepthLinearSpeed;
+                _stagedMetadata.worldPoses = new Pose[EyeCount];
+                for (int eye = 0; eye < EyeCount; eye++)
+                    _stagedMetadata.worldPoses[eye] = _depthCapture.TrackingToWorld(_stagedMetadata.poses[eye]);
+            }
 
             int pairIndex = ++_pairSequence;
             var pending = new PendingPair
@@ -235,12 +268,24 @@ namespace Genesis.RoomScan
             string metadataName = stem + "_meta.json";
             try
             {
-                File.WriteAllBytes(Path.Combine(pending.framesDirectory, rawName), FloatsToBytes(pending.platform));
-                File.WriteAllBytes(Path.Combine(pending.framesDirectory, processedName), FloatsToBytes(pending.processed));
-                File.WriteAllText(
-                    Path.Combine(pending.framesDirectory, metadataName),
-                    BuildFrameJson(pending),
-                    new UTF8Encoding(false));
+                byte[] rawBytes = FloatsToBytes(pending.platform);
+                byte[] processedBytes = FloatsToBytes(pending.processed);
+                string metadata = BuildFrameJson(pending);
+                string rawPath = Path.Combine(pending.framesDirectory, rawName);
+                string processedPath = Path.Combine(pending.framesDirectory, processedName);
+                string metadataPath = Path.Combine(pending.framesDirectory, metadataName);
+                if (_sessionPackage != null)
+                {
+                    _sessionPackage.WriteImmutableBytes(rawPath, rawBytes);
+                    _sessionPackage.WriteImmutableBytes(processedPath, processedBytes);
+                    _sessionPackage.WriteImmutableText(metadataPath, metadata);
+                }
+                else
+                {
+                    File.WriteAllBytes(rawPath, rawBytes);
+                    File.WriteAllBytes(processedPath, processedBytes);
+                    File.WriteAllText(metadataPath, metadata, new UTF8Encoding(false));
+                }
 
                 string row = BuildManifestRow(pending, rawName, processedName, metadataName, "ok");
                 lock (_manifestLock)
@@ -248,6 +293,7 @@ namespace Genesis.RoomScan
             }
             catch (Exception)
             {
+                Interlocked.Increment(ref _writeErrors);
                 AppendManifestError(pending);
             }
             finally
@@ -322,6 +368,7 @@ namespace Genesis.RoomScan
             _copyShader.SetTexture(_copyKernel, SourceDepthId, source);
             _copyShader.SetTexture(_copyKernel, DestDepthId, destination);
             _copyShader.SetInts(CaptureSizeId, destination.width, destination.height);
+            _copyShader.SetInt(SourceEyeIndexId, FusionEyeIndex);
             _copyShader.Dispatch(
                 _copyKernel,
                 Mathf.CeilToInt(destination.width / 8f),
@@ -338,7 +385,10 @@ namespace Genesis.RoomScan
                               "requestedPairs=" + _pairSequence + "\n" +
                               "droppedPairs=" + _droppedPairs + "\n" +
                               "readbackErrors=" + _readbackErrors + "\n" +
-                              "outstandingPairs=" + OutstandingPairCount + "\n";
+                              "writeErrors=" + _writeErrors + "\n" +
+                              "outstandingDepthPairs=" + LocalOutstandingPairCount + "\n" +
+                              "outstandingSessionWork=" + OutstandingPairCount + "\n" +
+                              "droppedFusionFrames=" + DroppedFusionFrameCount + "\n";
                 lock (_manifestLock)
                     File.WriteAllText(Path.Combine(_sessionDirectory, "status.txt"), text, new UTF8Encoding(false));
             }
@@ -385,10 +435,22 @@ namespace Genesis.RoomScan
                    "  \"matrixEncoding\": \"row-major m00..m33\",\n" +
                    "  \"pairing\": \"only frames consumed by QRS PreprocessLatestFrame are emitted\",\n" +
                    "  \"recordedTextureLayers\": 1,\n" +
-                   "  \"recordedEyeIndex\": 0,\n" +
-                   "  \"eyeMetadata\": \"pose, FOV and matrices are retained for both runtime eyes, while both binary streams contain only fusion eye slice 0\",\n" +
-                   "  \"updatedProcessedEye\": \"fixed to fusion eye slice 0\"\n" +
+                   "  \"recordedEyeIndex\": 1,\n" +
+                   "  \"eyeMetadata\": \"pose, FOV and matrices are retained for both runtime eyes, while both binary streams contain only fusion eye slice 1 (right)\",\n" +
+                   "  \"updatedProcessedEye\": \"fixed to fusion eye slice 1 (right)\"\n" +
                    "}\n";
+        }
+
+        private void Update()
+        {
+            if (_isCapturing || _depthDrainReported || LocalOutstandingPairCount > 0)
+                return;
+            _depthDrainReported = true;
+            // 先写深度流自己的最终状态，再通知会话封口；否则这个文件可能在
+            // capture_complete.json 生成之后又被覆盖，破坏校验清单。
+            WriteStatusFile("depth_streams_drained");
+            _sessionPackage?.NotifyDepthStreamsComplete(
+                _droppedPairs, _readbackErrors, _writeErrors);
         }
 
         private static string BuildFrameJson(PendingPair pending)
@@ -408,10 +470,15 @@ namespace Genesis.RoomScan
             sb.Append("  \"layers\": ").Append(pending.layers).AppendLine(",");
             sb.Append("  \"recordedEyeIndex\": ").Append(FusionEyeIndex).AppendLine(",");
             sb.Append("  \"updatedProcessedEye\": ").Append(m.updatedProcessedEye).AppendLine(",");
+            sb.Append("  \"angularDegPerSec\": ").Append(Format(m.angularDegPerSec)).AppendLine(",");
+            sb.Append("  \"linearMps\": ").Append(Format(m.linearMps)).AppendLine(",");
             sb.Append("  \"farIsInfinite\": ").Append(float.IsInfinity(m.nearFar.y) ? "true" : "false").AppendLine(",");
             sb.Append("  \"nearFarMetres\": [").Append(Format(m.nearFar.x)).Append(',')
                 .Append(Format(m.nearFar.y)).AppendLine("],");
             AppendPoseArray(sb, m.poses);
+            sb.AppendLine(",");
+            sb.Append("  \"worldPoses\": ");
+            AppendPoseValues(sb, m.worldPoses ?? m.poses);
             sb.AppendLine(",");
             AppendFovArray(sb, m.fovs);
             sb.AppendLine(",");
@@ -429,7 +496,13 @@ namespace Genesis.RoomScan
 
         private static void AppendPoseArray(StringBuilder sb, Pose[] poses)
         {
-            sb.Append("  \"trackingPoses\": [");
+            sb.Append("  \"trackingPoses\": ");
+            AppendPoseValues(sb, poses);
+        }
+
+        private static void AppendPoseValues(StringBuilder sb, Pose[] poses)
+        {
+            sb.Append('[');
             for (int i = 0; i < EyeCount; i++)
             {
                 if (i > 0) sb.Append(',');
@@ -545,11 +618,14 @@ namespace Genesis.RoomScan
             public int updatedProcessedEye;
             public Vector2 nearFar;
             public Pose[] poses;
+            public Pose[] worldPoses;
             public XRFov[] fovs;
             public Matrix4x4[] projection;
             public Matrix4x4[] projectionInverse;
             public Matrix4x4[] view;
             public Matrix4x4[] viewInverse;
+            public float angularDegPerSec;
+            public float linearMps;
         }
     }
 }

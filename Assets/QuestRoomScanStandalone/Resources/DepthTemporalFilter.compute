@@ -10,7 +10,18 @@ Texture2DArray<float>   _SrcDepth;
 Texture2DArray<float>   _HistDepth;
 RWTexture2DArray<float> _DstDepth;
 RWTexture2DArray<float> _NextHistDepth;
+RWTexture2DArray<uint>  _TemporalReason;
 RWStructuredBuffer<uint> _TemporalStats; // 0=稳定混合 1=真变化放行
+
+// Per-pixel, diagnostic-only reason carried into the production fusion ledger.
+// 0=disabled/unset, 1=first frame, 2=current invalid, 3=previous FOV miss,
+// 4=history invalid, 5=history hit but changed, 6=history hit and stable.
+#define TEMPORAL_REASON_FIRST_FRAME       1u
+#define TEMPORAL_REASON_CURRENT_INVALID   2u
+#define TEMPORAL_REASON_PREV_FOV_MISS     3u
+#define TEMPORAL_REASON_HISTORY_INVALID   4u
+#define TEMPORAL_REASON_CHANGED           5u
+#define TEMPORAL_REASON_STABLE            6u
 
 int _DepthW;
 int _DepthH;
@@ -69,6 +80,7 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     {
         _DstDepth[coord] = 0.0;
         _NextHistDepth[coord] = _HasPrev != 0 ? _HistDepth[coord] : 0.0;
+        _TemporalReason[coord] = TEMPORAL_REASON_CURRENT_INVALID;
         return;
     }
 
@@ -79,6 +91,7 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     {
         _DstDepth[coord] = cur;
         _NextHistDepth[coord] = cur;
+        _TemporalReason[coord] = TEMPORAL_REASON_FIRST_FRAME;
         return;
     }
 
@@ -87,6 +100,7 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     {
         _DstDepth[coord] = cur;
         _NextHistDepth[coord] = cur;
+        _TemporalReason[coord] = TEMPORAL_REASON_PREV_FOV_MISS;
         InterlockedAdd(_TemporalStats[1], 1u);
         return;
     }
@@ -98,6 +112,7 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     {
         _DstDepth[coord] = cur;
         _NextHistDepth[coord] = cur;
+        _TemporalReason[coord] = TEMPORAL_REASON_HISTORY_INVALID;
         return;
     }
 
@@ -111,6 +126,7 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
         // 真变化直通：手、家具、新遮挡不吃滤波残影；历史同步换轨。
         _DstDepth[coord] = cur;
         _NextHistDepth[coord] = cur;
+        _TemporalReason[coord] = TEMPORAL_REASON_CHANGED;
         InterlockedAdd(_TemporalStats[1], 1u);
         return;
     }
@@ -120,5 +136,6 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     filteredNdc = saturate(filteredNdc);
     _DstDepth[coord] = filteredNdc;
     _NextHistDepth[coord] = filteredNdc;
+    _TemporalReason[coord] = TEMPORAL_REASON_STABLE;
     InterlockedAdd(_TemporalStats[0], 1u);
 }

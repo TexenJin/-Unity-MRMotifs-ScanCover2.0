@@ -178,7 +178,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   _monoscopic: 0
   _sharpenType: 0
-  _enableDynamicResolution: 0
+  _disableRecording: 0
+  _enableDynamicResolution: 1
   minDynamicResolutionScale: 1
   maxDynamicResolutionScale: 1
   quest2MinDynamicResolutionScale: 0.7
@@ -189,8 +190,13 @@ MonoBehaviour:
   maxRenderScale: 1
   _headPoseRelativeOffsetRotation: {x: 0, y: 0, z: 0}
   _headPoseRelativeOffsetTranslation: {x: 0, y: 0, z: 0}
-  profilerTcpPort: 32419
-  expandMixedRealityCapturePropertySheet: 0
+  enableCoreMetricsRelease: 0
+  enableCoreMetricsDevelopment: 1
+  coreMetricVisibility:
+    visibleMemoryMetricStats: 0
+    visibleMemoryMetricGraphs: 0
+    visibleRenderMetricStats: 0
+    visibleRenderMetricGraphs: 0
   enableMixedReality: 0
   compositionMethod: 0
   extraHiddenLayers:
@@ -230,6 +236,7 @@ MonoBehaviour:
   requestEyeTrackingPermissionOnStartup: 0
   requestScenePermissionOnStartup: 1
   requestRecordAudioPermissionOnStartup: 0
+  requestPassthroughCameraAccessPermissionOnStartup: 0
   _localDimming: 1
   _trackingOriginType: 1
   usePositionTracking: 1
@@ -243,6 +250,8 @@ MonoBehaviour:
   SimultaneousHandsAndControllersEnabled: 0
   _readOnlyWideMotionModeHandPosesEnabled: 0
   wideMotionModeHandPosesEnabled: 0
+  _readOnlyFastMotionModeHandPosesEnabled: 0
+  fastMotionModeHandPosesEnabled: 0
   dynamicResolutionVersion: 1
 --- !u!114 &185941385
 MonoBehaviour:
@@ -954,30 +963,6 @@ MonoBehaviour:
   installationRoutineCheckpoint:
     _installationRoutineId: 
     _installationVariants: []
---- !u!114 &1576650816
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1576650811}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 3da7e2c8b4f64de48a8c7f3d2e9ab521, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  sceneMeshRoot: {fileID: 0}
-  searchWholeSceneWhenRootMissing: 1
-  includeInactiveChildren: 1
-  requireRenderer: 0
-  requireRendererEnabled: 0
-  exportDirectoryOverride: 
-  sessionPrefix: ScanCover_MetaSceneMeshAudit
-  exportLocalRawObjects: 1
-  exportWorldAlignedObjects: 1
-  exportCombinedWorldObj: 1
-  exportComponentInventory: 1
-  debugLog: 1
 --- !u!4 &1576650815
 Transform:
   m_ObjectHideFlags: 0
@@ -993,6 +978,32 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1576650816
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1576650811}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3da7e2c8b4f64de48a8c7f3d2e9ab521, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  sceneMeshRoot: {fileID: 0}
+  searchWholeSceneWhenRootMissing: 0
+  includeInactiveChildren: 1
+  requireRenderer: 0
+  requireRendererEnabled: 0
+  exportDirectoryOverride: 
+  sessionPrefix: ScanCover_MetaSceneMeshAudit
+  exportLocalRawObjects: 1
+  exportWorldAlignedObjects: 1
+  exportCombinedWorldObj: 1
+  exportComponentInventory: 1
+  debugLog: 1
+  enableRightControllerExportInput: 1
+  exportButton: 2
 --- !u!1 &1692314159
 GameObject:
   m_ObjectHideFlags: 0

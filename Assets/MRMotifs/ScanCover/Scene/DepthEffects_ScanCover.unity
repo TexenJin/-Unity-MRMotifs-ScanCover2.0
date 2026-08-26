@@ -88524,7 +88524,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &910000000000100002
 Transform:
   m_ObjectHideFlags: 0
@@ -88564,7 +88564,7 @@ MonoBehaviour:
   <RoomRemovedEvent>k__BackingField:
     m_PersistentCalls:
       m_Calls: []
-  EnableWorldLock: 1
+  EnableWorldLock: 0
   TrackingSpaceOffset:
     e00: 1
     e01: 0
@@ -88655,7 +88655,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f452ec0ad8aa4b98ac0b133be36e6f92, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  enableRightControllerExportInput: 1
+  enableRightControllerExportInput: 0
   exportButton: 2
   inputDebounceSeconds: 0.75
   roomMeshCapture: {fileID: 910000000000100005}

@@ -29,8 +29,8 @@ namespace Genesis.RoomScan
         [SerializeField, Range(1f, 8f), Tooltip("BB 留痕寿命（秒）")]
         private float trailLifetime = 3f;
 
-        [SerializeField, Tooltip("与生产融合一致使用左眼深度；仅诊断视差时才切右眼")]
-        private bool useRightEye;
+        [SerializeField, Tooltip("与生产融合一致使用右眼深度；关闭时仅用于诊断左眼视差")]
+        private bool useRightEye = true;
 
         private sealed class TrailLayer
         {
@@ -212,7 +212,7 @@ namespace Genesis.RoomScan
             }
 
             _built = true;
-            Logger.Info($"BB 反投影探针已建: {gridWidth}x{gridHeight} 点 × {_layers.Length} 层，左眼生产源，留痕 {trailLifetime:0.0}s");
+            Logger.Info($"BB 反投影探针已建: {gridWidth}x{gridHeight} 点 × {_layers.Length} 层，右眼生产源，留痕 {trailLifetime:0.0}s");
         }
 
         private void CaptureSnapshot(float now)

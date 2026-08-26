@@ -23,6 +23,7 @@ from ScanCoverDepthPairDeviceAudit import (
     fetch_pair_batch,
     latest_session,
     load_metadata,
+    recorded_eye,
 )
 
 
@@ -539,8 +540,9 @@ def frame_observations(
     u = sample_x.astype(np.float64) / width
     v = sample_y.astype(np.float64) / height
     hcs = np.stack((u * 2.0 - 1.0, v * 2.0 - 1.0, sample_d * 2.0 - 1.0, np.ones_like(u)))
-    projection_inverse = np.asarray(record["projectionInverse"][0], dtype=np.float64).reshape(4, 4)
-    view_inverse = np.asarray(record["viewInverse"][0], dtype=np.float64).reshape(4, 4)
+    eye_index = recorded_eye(record)
+    projection_inverse = np.asarray(record["projectionInverse"][eye_index], dtype=np.float64).reshape(4, 4)
+    view_inverse = np.asarray(record["viewInverse"][eye_index], dtype=np.float64).reshape(4, 4)
     world_h = view_inverse @ (projection_inverse @ hcs)
     world = (world_h[:3] / world_h[3]).T
     count = grid_x.size
@@ -550,7 +552,7 @@ def frame_observations(
     valid = valid_depth[:count] & valid_depth[count : count * 2] & valid_depth[count * 2 :]
 
     normals, normal_valid = normalize_rows(-np.cross(horizontal - center, vertical - center))
-    eye = np.asarray(record["trackingPoses"][0]["position"], dtype=np.float64)
+    eye = np.asarray(record["trackingPoses"][eye_index]["position"], dtype=np.float64)
     views, view_valid = normalize_rows(eye[None, :] - center)
     ranges = np.linalg.norm(center - eye[None, :], axis=1)
     valid &= normal_valid & view_valid & np.isfinite(ranges) & (ranges >= 0.15) & (ranges <= max_depth)
@@ -569,7 +571,7 @@ def frame_observations(
 def add_motion_speeds(records: list[dict]) -> None:
     previous = None
     for record in records:
-        pose = record["trackingPoses"][0]
+        pose = record["trackingPoses"][recorded_eye(record)]
         position = np.asarray(pose["position"], dtype=np.float64)
         if previous is None:
             dt = 0.0

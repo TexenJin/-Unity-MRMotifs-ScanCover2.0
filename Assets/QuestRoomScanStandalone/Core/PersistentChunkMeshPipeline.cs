@@ -2008,7 +2008,7 @@ namespace Genesis.RoomScan
             string[] evidenceNames = { "depth_support", "history_only", "free_space_contradiction", "insufficient_or_mixed" };
             string[] confirmationNames = { "unknown", "pending", "confirmed", "mixed" };
             string[] sourceNames = { "untracked", "self", "direct", "relay", "mixed" };
-            string[] riskNames = { "plane_rescue_seen", "near_abstain_seen", "motion_gt_60_birth", "retired_edge_bit", "fast_promotion" };
+            string[] riskNames = { "plane_rescue_seen", "near_abstain_seen", "motion_gt_60_birth", "fov_outer_sample_seen", "fast_promotion" };
 
             sb.AppendLine();
             sb.AppendLine("forensic_geometry_ledger:");

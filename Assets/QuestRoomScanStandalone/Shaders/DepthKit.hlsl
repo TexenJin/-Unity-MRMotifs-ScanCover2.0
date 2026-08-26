@@ -15,6 +15,10 @@ uniform float4x4 gsDepthViewInv[2];
 
 uniform float4 gsDepthZParams; // (near, far, 0, 0)
 
+// Production fusion eye. Meta/Unity texture-array convention is 0=left,
+// 1=right. Keep every compute path that includes DepthKit on the same eye.
+static const int GS_FUSION_EYE = 1;
+
 float3 gsDepthEyePos(int eye = 0)
 {
     return gsDepthViewInv[eye]._m03_m13_m23;

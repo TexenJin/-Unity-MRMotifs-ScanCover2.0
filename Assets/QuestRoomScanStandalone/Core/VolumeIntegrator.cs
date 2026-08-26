@@ -137,6 +137,8 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.05f, 2f)] private float noiseMotionLinRefMps = 0.3f;
         [Tooltip("运动质量地板：再快也保留此比例权重，防断粮、防与整帧闸之间出死区。 (default 0.15)")]
         [SerializeField, Range(0.01f, 1f)] private float noiseMotionFloor = 0.15f;
+        [Tooltip("运动证据取得正式发布/纠偏权限的最低质量。低于此值仍可留下暂存候选，但不能转正、改写正式面、投冻结票或触发纸皮替换。 (default 0.70)")]
+        [SerializeField, Range(0.15f, 1f)] private float motionConfirmQualityMin = 0.70f;
         [Tooltip("距离噪声指数：>1 让远距观测降权更陡（深度 σ 随距离平方增长）。1=保持现有线性不动。 (default 1)")]
         [SerializeField, Range(0.5f, 3f)] private float noiseDistExponent = 1f;
         [Tooltip("掠射角噪声指数：>1 让掠射观测降权更陡。1=保持现有线性不动。 (default 1)")]
@@ -264,6 +266,8 @@ namespace Genesis.RoomScan
         private static readonly int FormalSurfaceWeightID = Shader.PropertyToID("gsFormalSurfaceWeight");
         private static readonly int DiagnosticAngularSpeedID = Shader.PropertyToID("gsDiagnosticAngularSpeed");
         private static readonly int NoiseMotionQualityID = Shader.PropertyToID("gsNoiseMotionQuality");
+        private static readonly int MotionAuthorityQualityID = Shader.PropertyToID("gsMotionAuthorityQuality");
+        private static readonly int MotionConfirmQualityMinID = Shader.PropertyToID("gsMotionConfirmQualityMin");
         private static readonly int NoiseDistExpID = Shader.PropertyToID("gsNoiseDistExp");
         private static readonly int NoiseAngExpID = Shader.PropertyToID("gsNoiseAngExp");
         private static readonly int CamRGBID = Shader.PropertyToID("gsCamRGB");
@@ -276,6 +280,11 @@ namespace Genesis.RoomScan
         private static readonly int CamCurrentResID = Shader.PropertyToID("gsCamCurrentRes");
         private static readonly int CamExposureID = Shader.PropertyToID("gsCamExposure");
         private static readonly int FusionCorrectionID = Shader.PropertyToID("gsFusionCorrection");
+        private static readonly int GunGelObservationsID = Shader.PropertyToID("gsGunGelObservations");
+        private static readonly int GunGelCorrespondencesID = Shader.PropertyToID("gsGunGelCorrespondences");
+        private static readonly int GunGelObservationGridID = Shader.PropertyToID("gsGunGelObservationGrid");
+        private static readonly int GunGelPixelStrideID = Shader.PropertyToID("gsGunGelPixelStride");
+        private static readonly int GunGelAdmissionEnableID = Shader.PropertyToID("gsGunGelAdmissionEnable");
         private static readonly int UseRawProjectiveSdfID = Shader.PropertyToID("gsUseRawProjectiveSdf");
         private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
@@ -288,6 +297,7 @@ namespace Genesis.RoomScan
         private static readonly int ConfidenceLowMinID = Shader.PropertyToID("gsConfidenceLowMin");
         private static readonly int ConfidenceStatsID = Shader.PropertyToID("_ConfidenceStats");
         private static readonly int ConfidenceGlobalTexID = Shader.PropertyToID("gsConfidence");
+        private static readonly int TemporalReasonAvailableID = Shader.PropertyToID("gsTemporalReasonAvailable");
         private static readonly int BakeSrcAdmissionTraceID = Shader.PropertyToID("gsBakeSrcAdmissionTrace");
         private static readonly int PruneZOffsetID = Shader.PropertyToID("gsPruneZOffset");
         private static readonly int PruneZCountID = Shader.PropertyToID("gsPruneZCount");
@@ -397,12 +407,22 @@ namespace Genesis.RoomScan
         // 68..70: provisional seeds, promotions and formal-surface demotions.
         // 71..89: read-only lifecycle forensics: seed source/risk, promotion
         // mechanism, promotion-time risk and immutable birth source.
-        private const int CarveStatsCount = 93; // 91=相干闸拦下的噪声票（v2，只读账）；92=M1 成熟面观测折让命中
+        private const int CarveStatsCount = 177; // 93..167=FOV账；168..176=枪胶逐体素准入契约账
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
         public readonly uint[] LastProjectiveShadowCarveStats = new uint[CarveStatsCount];
         public readonly ulong[] CumulativeCarveStats = new ulong[CarveStatsCount];
+        private sealed class FovLedgerPeriod
+        {
+            public int Index;
+            public DateTime Utc;
+            public float ElapsedSeconds;
+            public uint[] Counters;
+        }
+        private readonly List<FovLedgerPeriod> _fovLedgerPeriods = new List<FovLedgerPeriod>(256);
+        private float _fovLedgerStartedRealtime;
+        private int _fovLedgerPeriodIndex;
         /// <summary>是否已有至少一轮矛盾票读回。</summary>
         public bool HasCarveStats { get; private set; }
         public bool HasProjectiveShadowCarveStats { get; private set; }
@@ -437,6 +457,23 @@ namespace Genesis.RoomScan
         public event Action TopologyInvalidated;
 
         public ComputeBuffer DirtyChunkEpochs => _dirtyChunkEpochs;
+
+        internal bool TryGetGunGelPaperAuthority(
+            out GunGelEvidenceShadow.PaperAuthorityBuffers authority)
+        {
+            authority = default;
+            return enableGunGelEvidenceShadow && _gunGelEvidenceShadow != null &&
+                _gunGelEvidenceShadow.TryGetPaperAuthority(out authority);
+        }
+
+        /// <summary>枪胶裁决海面的只读 GPU 缓冲；显示层不能写回生产链。</summary>
+        internal bool TryGetGunGelCourtBuffers(
+            out GunGelEvidenceShadow.CourtBuffers court)
+        {
+            court = default;
+            return enableGunGelEvidenceShadow && _gunGelEvidenceShadow != null &&
+                _gunGelEvidenceShadow.TryGetCourtBuffers(out court);
+        }
 
         /// <summary>最新脏块 epoch 快照（CPU 侧，实时轨内容闸用；异步回读，帧级新鲜）。</summary>
         public uint[] LatestDirtyChunkEpochs { get; private set; }
@@ -536,10 +573,12 @@ namespace Genesis.RoomScan
 
         private sealed class GunGelDeferredFrame
         {
+            public RenderTexture RawDepth;
             public RenderTexture Depth;
             public RenderTexture Normal;
             public RenderTexture DilatedDepth;
             public RenderTexture EdgeReason;
+            public RenderTexture TemporalReason;
             public Matrix4x4[] View;
             public Matrix4x4[] Projection;
             public Matrix4x4[] ViewInverse;
@@ -547,6 +586,7 @@ namespace Genesis.RoomScan
             public readonly Vector4[] ExclusionPositions = new Vector4[64];
             public int ExclusionCount;
             public int FrameIndex;
+            public int PlatformFrame;
             public int Generation;
             public float AngularSpeed;
             public float LinearSpeed;
@@ -567,6 +607,8 @@ namespace Genesis.RoomScan
         public float MotionQuality => _motionQuality;
         private float _motionQuality = 1f;
         private GunGelEvidenceShadow _gunGelEvidenceShadow;
+        private ComputeBuffer _gunGelDummyObservations;
+        private ComputeBuffer _gunGelDummyCorrespondences;
         private bool _gunGelRuntimeFailureReported;
         private readonly GunGelDeferredFrame[] _gunGelDeferredFrames =
             new GunGelDeferredFrame[GunGelDeferredSlotCount];
@@ -578,6 +620,7 @@ namespace Genesis.RoomScan
         private float _gunGelLastAppliedMm;
         private string _gunGelLastFusionDecision = "预热";
         private bool _gunGelGuardedFusionRuntimeHalted;
+        private int _replayFusionAttemptIndex;
 
         /// <summary>
         /// 当前空卷选择是否为枪胶受保护融合。只读暴露给扫描器，用于把
@@ -603,6 +646,33 @@ namespace Genesis.RoomScan
                 ? _gunGelEvidenceShadow.GetCompact()
                 : "未就绪";
             return fusion + " · " + shadow;
+        }
+
+        /// <summary>
+        /// 在扫描冻结点只读封存枪胶候选账本；不等待 Unity 编辑器，也不改变
+        /// TSDF、候选裁决或显示状态。返回 false 表示影子层未就绪/已有导出在途。
+        /// </summary>
+        public bool RequestGunGelCandidateAuditExport(string reason,
+            Action<string> completed = null)
+        {
+            if (_gunGelEvidenceShadow == null || !enableGunGelEvidenceShadow ||
+                _gunGelEvidenceShadow.AuditExportPending)
+                return false;
+            StartCoroutine(_gunGelEvidenceShadow.ExportAuditAsync(reason, completed));
+            return true;
+        }
+
+        /// <summary>
+        /// A 键请求枪胶裁决层停止收新帧并等待已提交裁决排空。完成后稳定候选
+        /// 与锁存浪头保留在原 GPU 缓冲，直到 B 清卷或销毁。
+        /// </summary>
+        public bool RequestGunGelCourtSeal(Action<bool> completed = null)
+        {
+            if (_gunGelEvidenceShadow == null || !enableGunGelEvidenceShadow ||
+                _gunGelEvidenceShadow.CourtSealPending)
+                return false;
+            StartCoroutine(_gunGelEvidenceShadow.SealCourtAsync(completed));
+            return true;
         }
 
         public string ToggleGunGelGuardedFusionExperiment()
@@ -719,6 +789,13 @@ namespace Genesis.RoomScan
             _carveStats.SetData(ZeroCarveStats);
             _integrateKernel.Set(CarveStatsID, _carveStats);
 
+            // Integrate 内核始终声明枪胶 SRV；基线/B 影子虽然关闭准入，Vulkan
+            // 描述符仍需有效绑定。两个 1 元素零缓冲只负责占位，不参与裁决。
+            _gunGelDummyObservations = new ComputeBuffer(1, sizeof(float) * 12);
+            _gunGelDummyCorrespondences = new ComputeBuffer(1, sizeof(float) * 12);
+            _gunGelDummyObservations.SetData(new float[12]);
+            _gunGelDummyCorrespondences.SetData(new float[12]);
+
             if (enableProjectiveShadow)
             {
                 _projectiveShadowCarveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
@@ -741,6 +818,10 @@ namespace Genesis.RoomScan
             _projectiveShadowCarveStats = null;
             _confidenceStats?.Release();
             _confidenceStats = null;
+            _gunGelDummyObservations?.Release();
+            _gunGelDummyObservations = null;
+            _gunGelDummyCorrespondences?.Release();
+            _gunGelDummyCorrespondences = null;
             ReleaseFrozenBlockBuffers();
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
@@ -888,18 +969,24 @@ namespace Genesis.RoomScan
             {
                 GunGelDeferredFrame frame = _gunGelDeferredFrames[i];
                 if (frame == null) continue;
+                _gunGelEvidenceShadow?.ReleaseFrameDecision(frame.Decision);
+                frame.Decision = default;
                 frame.Pending = false;
                 frame.Ready = false;
                 frame.Generation = _gunGelDeferredGeneration;
                 if (!releaseTextures) continue;
+                if (frame.RawDepth) Destroy(frame.RawDepth);
                 if (frame.Depth) Destroy(frame.Depth);
                 if (frame.Normal) Destroy(frame.Normal);
                 if (frame.DilatedDepth) Destroy(frame.DilatedDepth);
                 if (frame.EdgeReason) Destroy(frame.EdgeReason);
+                if (frame.TemporalReason) Destroy(frame.TemporalReason);
+                frame.RawDepth = null;
                 frame.Depth = null;
                 frame.Normal = null;
                 frame.DilatedDepth = null;
                 frame.EdgeReason = null;
+                frame.TemporalReason = null;
             }
         }
 
@@ -974,6 +1061,16 @@ namespace Genesis.RoomScan
             int generation = _gunGelDeferredGeneration;
             try
             {
+                if (depth.PlatformDepthWitnessTex != null)
+                {
+                    frame.RawDepth = EnsureGunGelFrameCopy(frame.RawDepth,
+                        depth.PlatformDepthWitnessTex, $"GunGelRawDepth_{frameIndex}");
+                }
+                else if (frame.RawDepth)
+                {
+                    Destroy(frame.RawDepth);
+                    frame.RawDepth = null;
+                }
                 frame.Depth = EnsureGunGelFrameCopy(frame.Depth, depth.DepthTex,
                     $"GunGelDepth_{frameIndex}");
                 frame.Normal = EnsureGunGelFrameCopy(frame.Normal, depth.NormTex,
@@ -982,6 +1079,16 @@ namespace Genesis.RoomScan
                     depth.DilatedDepthTex, $"GunGelDilated_{frameIndex}");
                 frame.EdgeReason = EnsureGunGelFrameCopy(frame.EdgeReason,
                     depth.EdgeReasonTex, $"GunGelEdge_{frameIndex}");
+                if (depth.TemporalReasonTex != null)
+                {
+                    frame.TemporalReason = EnsureGunGelFrameCopy(frame.TemporalReason,
+                        depth.TemporalReasonTex, $"GunGelTemporalReason_{frameIndex}");
+                }
+                else if (frame.TemporalReason)
+                {
+                    Destroy(frame.TemporalReason);
+                    frame.TemporalReason = null;
+                }
                 frame.View = (Matrix4x4[])depth.View.Clone();
                 frame.Projection = (Matrix4x4[])depth.Proj.Clone();
                 frame.ViewInverse = (Matrix4x4[])depth.ViewInv.Clone();
@@ -992,6 +1099,7 @@ namespace Genesis.RoomScan
                     if (ExclusionZones[i] != null)
                         frame.ExclusionPositions[i] = ExclusionZones[i].position;
                 frame.FrameIndex = frameIndex;
+                frame.PlatformFrame = depth.CurrentPlatformFrame;
                 frame.Generation = generation;
                 frame.AngularSpeed = angularSpeed;
                 frame.LinearSpeed = linearSpeed;
@@ -1000,13 +1108,20 @@ namespace Genesis.RoomScan
                 frame.Ready = false;
 
                 bool dispatched = _gunGelEvidenceShadow.Dispatch(
-                    frame.Depth, frame.Normal, depth.DepthWidth, depth.DepthHeight,
+                    frame.RawDepth, frame.Depth, frame.Normal,
+                    frame.EdgeReason, frame.TemporalReason,
+                    depth.DepthWidth, depth.DepthHeight,
                     frame.ProjectionInverse, frame.ViewInverse,
-                    motionQuality, frameIndex,
+                    motionQuality, angularSpeed, linearSpeed,
+                    frame.PlatformFrame, frameIndex,
                     decision =>
                     {
                         if (frame.Generation != _gunGelDeferredGeneration ||
-                            decision.FrameIndex != frame.FrameIndex) return;
+                            decision.FrameIndex != frame.FrameIndex)
+                        {
+                            _gunGelEvidenceShadow?.ReleaseFrameDecision(decision);
+                            return;
+                        }
                         frame.Decision = decision;
                         frame.Pending = false;
                         frame.Ready = true;
@@ -1051,6 +1166,7 @@ namespace Genesis.RoomScan
         {
             GunGelEvidenceShadow.FrameDecision decision = frame.Decision;
             if (!decision.ReadbackSucceeded) { reason = "回读"; return false; }
+            if (!decision.HasFusionAdmissionBuffers) { reason = "缺证"; return false; }
             if (frame.AngularSpeed > gunGelFusionMaxAngularSpeed) { reason = "快角"; return false; }
             if (frame.LinearSpeed > gunGelFusionMaxLinearSpeed) { reason = "快移"; return false; }
             if (decision.EffectiveRank < 6) { reason = "欠秩"; return false; }
@@ -1072,9 +1188,11 @@ namespace Genesis.RoomScan
             }
         }
 
-        private static void ReleaseGunGelDeferredFrame(GunGelDeferredFrame frame)
+        private void ReleaseGunGelDeferredFrame(GunGelDeferredFrame frame)
         {
             if (frame == null) return;
+            _gunGelEvidenceShadow?.ReleaseFrameDecision(frame.Decision);
+            frame.Decision = default;
             frame.Pending = false;
             frame.Ready = false;
         }
@@ -1340,6 +1458,16 @@ namespace Genesis.RoomScan
                 LastCarveStats[i] = data[i];
                 CumulativeCarveStats[i] += data[i];
             }
+            var periodCounters = new uint[CarveStatsCount - 93];
+            for (int i = 93; i < CarveStatsCount; i++)
+                periodCounters[i - 93] = data[i];
+            _fovLedgerPeriods.Add(new FovLedgerPeriod
+            {
+                Index = _fovLedgerPeriodIndex++,
+                Utc = DateTime.UtcNow,
+                ElapsedSeconds = Mathf.Max(0f, Time.realtimeSinceStartup - _fovLedgerStartedRealtime),
+                Counters = periodCounters
+            });
             HasCarveStats = true;
             _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
             _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
@@ -1538,6 +1666,171 @@ namespace Genesis.RoomScan
             sb.AppendLine($"promotion_mechanism_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionMechanismSum}");
             sb.AppendLine($"promotion_birth_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionBirthSum}");
             sb.AppendLine($"formal_demotion_total={U(CumulativeCarveStats[70])}");
+            AppendFovSampleLedgerSummary(sb);
+        }
+
+        private static readonly string[] FovLedgerRingNames = { "center", "mid", "outer" };
+        private static readonly string[] TemporalLedgerReasonNames =
+        {
+            "disabled_or_unset", "first_frame", "current_invalid", "previous_fov_miss",
+            "history_invalid", "history_hit_changed", "history_hit_stable"
+        };
+
+        private void AppendFovSampleLedgerSummary(StringBuilder sb)
+        {
+            static string U(ulong value) => value.ToString(CultureInfo.InvariantCulture);
+            sb.AppendLine();
+            sb.AppendLine("fov_temporal_sample_ledger:");
+            sb.AppendLine("scope=production_near_surface_voxel_sample_opportunities;diagnostic_only=true");
+            sb.AppendLine("aggregation=completed_gpu_readback_periods;the_last_partial_period_may_follow_in_the_later_frozen_report");
+            sb.AppendLine("ring_definition=center<0.50;mid=0.50..0.84;outer>=0.84;radius=max(abs(2u-1),abs(2v-1))");
+            for (int ring = 0; ring < 3; ring++)
+            {
+                sb.AppendLine($"examined_ring_{FovLedgerRingNames[ring]}={U(CumulativeCarveStats[100 + ring])}");
+                sb.AppendLine($"positive_write_ring_{FovLedgerRingNames[ring]}={U(CumulativeCarveStats[103 + ring])}");
+                sb.AppendLine($"applied_carve_ring_{FovLedgerRingNames[ring]}={U(CumulativeCarveStats[106 + ring])}");
+                sb.AppendLine($"promotion_ring_{FovLedgerRingNames[ring]}={U(CumulativeCarveStats[109 + ring])}");
+                sb.AppendLine($"demotion_ring_{FovLedgerRingNames[ring]}={U(CumulativeCarveStats[112 + ring])}");
+            }
+            for (int reason = 0; reason < 7; reason++)
+            {
+                string name = TemporalLedgerReasonNames[reason];
+                sb.AppendLine($"examined_reason_{name}={U(CumulativeCarveStats[93 + reason])}");
+                sb.AppendLine($"positive_write_reason_{name}={U(CumulativeCarveStats[115 + reason])}");
+                sb.AppendLine($"applied_carve_reason_{name}={U(CumulativeCarveStats[122 + reason])}");
+                sb.AppendLine($"outer_examined_reason_{name}={U(CumulativeCarveStats[129 + reason])}");
+                sb.AppendLine($"outer_positive_write_reason_{name}={U(CumulativeCarveStats[136 + reason])}");
+                sb.AppendLine($"outer_applied_carve_reason_{name}={U(CumulativeCarveStats[143 + reason])}");
+            }
+            for (int ring = 0; ring < 3; ring++)
+            {
+                string name = FovLedgerRingNames[ring];
+                sb.AppendLine($"grazing_examined_ring_{name}={U(CumulativeCarveStats[150 + ring])}");
+                sb.AppendLine($"grazing_applied_carve_ring_{name}={U(CumulativeCarveStats[153 + ring])}");
+                sb.AppendLine($"grazing_positive_write_ring_{name}={U(CumulativeCarveStats[156 + ring])}");
+                sb.AppendLine($"front_examined_ring_{name}={U(CumulativeCarveStats[159 + ring])}");
+                sb.AppendLine($"front_applied_carve_ring_{name}={U(CumulativeCarveStats[162 + ring])}");
+                sb.AppendLine($"front_positive_write_ring_{name}={U(CumulativeCarveStats[165 + ring])}");
+            }
+            double centerContradictionRate = LedgerRate(CumulativeCarveStats[106], CumulativeCarveStats[100]);
+            double outerContradictionRate = LedgerRate(CumulativeCarveStats[108], CumulativeCarveStats[102]);
+            double frontCenterContradictionRate = LedgerRate(CumulativeCarveStats[162], CumulativeCarveStats[159]);
+            double frontOuterContradictionRate = LedgerRate(CumulativeCarveStats[164], CumulativeCarveStats[161]);
+            double outerPrevFovMissRate = LedgerRate(CumulativeCarveStats[146], CumulativeCarveStats[132]);
+            double outerStableRate = LedgerRate(CumulativeCarveStats[149], CumulativeCarveStats[135]);
+            double outerCenterRatio = LedgerRatio(outerContradictionRate, centerContradictionRate);
+            double frontOuterCenterRatio = LedgerRatio(frontOuterContradictionRate, frontCenterContradictionRate);
+            double missStableRatio = LedgerRatio(outerPrevFovMissRate, outerStableRate);
+            sb.AppendLine($"center_applied_carve_rate={centerContradictionRate.ToString("F6", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"outer_applied_carve_rate={outerContradictionRate.ToString("F6", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"outer_vs_center_applied_carve_ratio={LedgerNumber(outerCenterRatio)}");
+            sb.AppendLine($"front_outer_vs_center_applied_carve_ratio={LedgerNumber(frontOuterCenterRatio)}");
+            sb.AppendLine($"outer_prev_fov_miss_vs_stable_applied_carve_ratio={LedgerNumber(missStableRatio)}");
+            sb.AppendLine($"edge_hypothesis_verdict={FovLedgerVerdict(outerCenterRatio, frontOuterCenterRatio, missStableRatio)}");
+            sb.AppendLine("edge_hypothesis_note=association_only;front_facing_and_temporal_controls_reduce_grazing_confound;does_not_prove_display_lens_distortion");
+            sb.AppendLine($"period_count={_fovLedgerPeriods.Count.ToString(CultureInfo.InvariantCulture)}");
+        }
+
+        private static double LedgerRate(ulong numerator, ulong denominator)
+        {
+            return denominator > 0 ? (double)numerator / denominator : double.NaN;
+        }
+
+        private static double LedgerRatio(double numeratorRate, double denominatorRate)
+        {
+            if (double.IsNaN(numeratorRate) || double.IsNaN(denominatorRate))
+                return double.NaN;
+            if (denominatorRate > 0d)
+                return numeratorRate / denominatorRate;
+            return numeratorRate > 0d ? double.PositiveInfinity : double.NaN;
+        }
+
+        private static string LedgerNumber(double value)
+        {
+            if (double.IsNaN(value)) return "insufficient";
+            if (double.IsPositiveInfinity(value)) return "infinite";
+            return value.ToString("F3", CultureInfo.InvariantCulture);
+        }
+
+        private string FovLedgerVerdict(double outerCenter, double frontOuterCenter, double missStable)
+        {
+            if (CumulativeCarveStats[100] < 1000 || CumulativeCarveStats[102] < 1000)
+                return "insufficient_samples";
+            bool outerElevated = !double.IsNaN(outerCenter) && outerCenter >= 1.5;
+            bool survivesFacingControl = !double.IsNaN(frontOuterCenter) && frontOuterCenter >= 1.5;
+            bool temporalMissElevated = !double.IsNaN(missStable) && missStable >= 1.5;
+            if (outerElevated && (survivesFacingControl || temporalMissElevated))
+                return "edge_association_supported";
+            if (outerElevated)
+                return "edge_association_grazing_confound_not_closed";
+            return "edge_association_not_supported";
+        }
+
+        public void AppendFovSampleLedgerCsv(StringBuilder sb, string session)
+        {
+            if (sb == null) return;
+            sb.AppendLine("session,period,utc,elapsed_s,scope,outcome,ring,temporal_reason,count");
+            AppendFovSampleLedgerCsvRows(sb, session, -1, "", -1f, CumulativeCarveStats);
+            for (int p = 0; p < _fovLedgerPeriods.Count; p++)
+            {
+                FovLedgerPeriod period = _fovLedgerPeriods[p];
+                var expanded = new ulong[CarveStatsCount];
+                for (int i = 93; i < CarveStatsCount; i++)
+                    expanded[i] = period.Counters[i - 93];
+                AppendFovSampleLedgerCsvRows(
+                    sb, session, period.Index,
+                    period.Utc.ToString("O", CultureInfo.InvariantCulture),
+                    period.ElapsedSeconds, expanded);
+            }
+        }
+
+        private static void AppendFovSampleLedgerCsvRows(
+            StringBuilder sb, string session, int period, string utc,
+            float elapsedSeconds, IReadOnlyList<ulong> counters)
+        {
+            string elapsed = elapsedSeconds < 0f
+                ? ""
+                : elapsedSeconds.ToString("F3", CultureInfo.InvariantCulture);
+            void Row(string scope, string outcome, string ring, string reason, ulong count)
+            {
+                sb.Append(session).Append(',').Append(period).Append(',').Append(utc).Append(',').Append(elapsed).Append(',')
+                  .Append(scope).Append(',').Append(outcome).Append(',').Append(ring).Append(',').Append(reason).Append(',')
+                  .Append(count).AppendLine();
+            }
+            for (int ring = 0; ring < 3; ring++)
+            {
+                string name = FovLedgerRingNames[ring];
+                Row("ring", "examined", name, "all", counters[100 + ring]);
+                Row("ring", "positive_write", name, "all", counters[103 + ring]);
+                Row("ring", "applied_carve", name, "all", counters[106 + ring]);
+                Row("ring", "promotion", name, "all", counters[109 + ring]);
+                Row("ring", "demotion", name, "all", counters[112 + ring]);
+                Row("grazing", "examined", name, "all", counters[150 + ring]);
+                Row("grazing", "applied_carve", name, "all", counters[153 + ring]);
+                Row("grazing", "positive_write", name, "all", counters[156 + ring]);
+                Row("front", "examined", name, "all", counters[159 + ring]);
+                Row("front", "applied_carve", name, "all", counters[162 + ring]);
+                Row("front", "positive_write", name, "all", counters[165 + ring]);
+            }
+            for (int reason = 0; reason < 7; reason++)
+            {
+                string name = TemporalLedgerReasonNames[reason];
+                Row("reason", "examined", "all", name, counters[93 + reason]);
+                Row("reason", "positive_write", "all", name, counters[115 + reason]);
+                Row("reason", "applied_carve", "all", name, counters[122 + reason]);
+                Row("outer_cross", "examined", "outer", name, counters[129 + reason]);
+                Row("outer_cross", "positive_write", "outer", name, counters[136 + reason]);
+                Row("outer_cross", "applied_carve", "outer", name, counters[143 + reason]);
+            }
+            Row("gungel_admission", "examined", "all", "all", counters[168]);
+            Row("gungel_admission", "accepted", "all", "all", counters[169]);
+            Row("gungel_admission", "rejected", "all", "observation_invalid", counters[170]);
+            Row("gungel_admission", "rejected", "all", "raw_unavailable", counters[171]);
+            Row("gungel_admission", "rejected", "all", "dual_disagree", counters[172]);
+            Row("gungel_admission", "rejected", "all", "stable_candidate_missing", counters[173]);
+            Row("gungel_admission", "rejected", "all", "stable_dual_immature", counters[174]);
+            Row("gungel_admission", "rejected", "all", "candidate_opposed", counters[175]);
+            Row("gungel_admission", "rejected", "all", "pixel_cell_mismatch", counters[176]);
         }
 
         /// <summary>KinectFusion raw-projective 影子体的独立矛盾票摘要。</summary>
@@ -1683,6 +1976,8 @@ namespace Genesis.RoomScan
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
             compute.SetFloat(DiagnosticAngularSpeedID, 0f);
             compute.SetFloat(NoiseMotionQualityID, 1f);
+            compute.SetFloat(MotionAuthorityQualityID, 1f);
+            compute.SetFloat(MotionConfirmQualityMinID, motionConfirmQualityMin);
             compute.SetFloat(NoiseDistExpID, noiseDistExponent);
             compute.SetFloat(NoiseAngExpID, noiseAngleExponent);
             compute.SetFloat(MatureObsEnableID, enableMatureSurfaceObsDiscount ? 1f : 0f);
@@ -1752,6 +2047,9 @@ namespace Genesis.RoomScan
             if (_frozenChunkVotes != null) _frozenChunkVotes.SetData(_voteZeros);
             if (_chunkMaturity != null) _chunkMaturity.SetData(_maturityZeros);
             Array.Clear(CumulativeCarveStats, 0, CumulativeCarveStats.Length);
+            _fovLedgerPeriods.Clear();
+            _fovLedgerPeriodIndex = 0;
+            _fovLedgerStartedRealtime = Time.realtimeSinceStartup;
             HasCarveStats = false;
             HasProjectiveShadowCarveStats = false;
             _gunGelEvidenceShadow?.Clear();
@@ -1776,6 +2074,9 @@ namespace Genesis.RoomScan
             _gunGelLastAppliedMm = 0f;
             _gunGelLastFusionDecision = "预热";
             _gunGelGuardedFusionRuntimeHalted = false;
+            _fovLedgerPeriods.Clear();
+            _fovLedgerPeriodIndex = 0;
+            _fovLedgerStartedRealtime = Time.realtimeSinceStartup;
             ResetGunGelDeferredFrames(false);
         }
 
@@ -2075,7 +2376,7 @@ namespace Genesis.RoomScan
         {
             if (!DepthCapture.DepthAvailable) return;
 
-            Matrix4x4 depthProj = Shader.GetGlobalMatrixArray(DepthCapture.ProjID)[0];
+            Matrix4x4 depthProj = Shader.GetGlobalMatrixArray(DepthCapture.ProjID)[DepthCapture.FusionEyeIndex];
             FrustumPlanes frustum = depthProj.decomposeProjection;
             frustum.zFar = maxUpdateDist;
 
@@ -2139,11 +2440,14 @@ namespace Genesis.RoomScan
             if (_volume == null || _integrateKernel.Shader == null) return;
             if (!_frustumReady) SetupFrustumVolume();
             if (!_frustumReady) return;
+            int replayAttemptIndex = ++_replayFusionAttemptIndex;
 
             Texture fusionDepth = dc.DepthTex;
             Texture fusionNormal = dc.NormTex;
             Texture fusionDilatedDepth = dc.DilatedDepthTex;
             Texture fusionEdgeReason = dc.EdgeReasonTex;
+            Texture fusionTemporalReason = dc.TemporalReasonTex;
+            bool fusionTemporalReasonAvailable = fusionTemporalReason != null;
             Matrix4x4[] fusionView = dc.View;
             Matrix4x4[] fusionProjection = dc.Proj;
             Matrix4x4[] fusionViewInverse = dc.ViewInv;
@@ -2161,16 +2465,14 @@ namespace Genesis.RoomScan
             float currentAngularSpeed = dc.SmoothedDepthAngularSpeed;
             float currentLinearSpeed = dc.SmoothedDepthLinearSpeed;
             _smoothedAngSpeed = currentAngularSpeed;
-            _motionQuality = 1f;
-            if (noiseMotionWeightEnable)
-            {
-                float a = noiseMotionAngRefDegPerSec > 0f
-                    ? currentAngularSpeed / noiseMotionAngRefDegPerSec : 0f;
-                float l = noiseMotionLinRefMps > 0f
-                    ? currentLinearSpeed / noiseMotionLinRefMps : 0f;
-                _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
-                    Mathf.Clamp01(Mathf.Max(a, l)));
-            }
+            // 运动质量同时是融合降权和正式发布权限的共同事实源。即使关闭
+            // “噪声模型加权”，保护罩仍必须知道当前运动状态，不能退化为满权。
+            float motionAngularRatio = noiseMotionAngRefDegPerSec > 0f
+                ? currentAngularSpeed / noiseMotionAngRefDegPerSec : 0f;
+            float motionLinearRatio = noiseMotionLinRefMps > 0f
+                ? currentLinearSpeed / noiseMotionLinRefMps : 0f;
+            _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
+                Mathf.Clamp01(Mathf.Max(motionAngularRatio, motionLinearRatio)));
 
             bool currentHardGated = motionGateDegPerSec > 0f &&
                                     currentAngularSpeed > motionGateDegPerSec;
@@ -2205,9 +2507,48 @@ namespace Genesis.RoomScan
                 if (!TryGetOldestResolvedGunGelFrame(out deferredFrame)) return;
                 if (!AcceptGunGelFrame(deferredFrame, out string rejectReason))
                 {
+                    // 欠秩/少配通常是候选账本尚未长成，而不是源帧本身不可靠。
+                    // 这两类帧只准以恒等校正养候选，不准投反对票、淘汰候选或写
+                    // TSDF；否则会形成“无候选→无配准→永远无候选”的启动自锁。
+                    // 其余拒绝帧仍只有浪头诊断权，完全不能改候选账本。
+                    bool bootstrapObservation = rejectReason == "欠秩" ||
+                                                rejectReason == "少配";
+                    if (bootstrapObservation)
+                        _gunGelEvidenceShadow?.BootstrapFrameDecision(
+                            deferredFrame.Decision);
+                    else
+                        _gunGelEvidenceShadow?.AdjudicateFrameDecision(
+                            deferredFrame.Decision, false);
                     _gunGelFusionRejected++;
                     _gunGelLastFusionDecision = rejectReason;
                     _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
+                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                        replayAttemptIndex, deferredFrame.PlatformFrame, false,
+                        "gungel_reject:" + rejectReason, true, deferredFrame.FrameIndex,
+                        deferredFrame.Decision.TranslationMm,
+                        deferredFrame.Decision.RotationDeg,
+                        deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
+                        deferredFrame.MotionQuality);
+                    ReleaseGunGelDeferredFrame(deferredFrame);
+                    return;
+                }
+
+                // 先完成严格逐点裁决，再提交候选事务；只有二者都成功，本帧才可
+                // 继续进入 TSDF。这样被“撞顶/快角/位大”拒绝的帧不会提前改动
+                // 稳定候选，逐点 Correspondence 也一定来自同一候选账本版本。
+                if (_gunGelEvidenceShadow == null ||
+                    !_gunGelEvidenceShadow.AdjudicateFrameDecision(
+                        deferredFrame.Decision, true))
+                {
+                    _gunGelFusionRejected++;
+                    _gunGelLastFusionDecision = "事务";
+                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                        replayAttemptIndex, deferredFrame.PlatformFrame, false,
+                        "gungel_reject:事务", true, deferredFrame.FrameIndex,
+                        deferredFrame.Decision.TranslationMm,
+                        deferredFrame.Decision.RotationDeg,
+                        deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
+                        deferredFrame.MotionQuality);
                     ReleaseGunGelDeferredFrame(deferredFrame);
                     return;
                 }
@@ -2218,6 +2559,8 @@ namespace Genesis.RoomScan
                 fusionNormal = deferredFrame.Normal;
                 fusionDilatedDepth = deferredFrame.DilatedDepth;
                 fusionEdgeReason = deferredFrame.EdgeReason;
+                fusionTemporalReason = deferredFrame.TemporalReason;
+                fusionTemporalReasonAvailable = fusionTemporalReason != null;
                 fusionView = deferredFrame.View;
                 fusionProjection = deferredFrame.Projection;
                 fusionViewInverse = deferredFrame.ViewInverse;
@@ -2230,6 +2573,10 @@ namespace Genesis.RoomScan
             }
             else if (currentHardGated)
             {
+                ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                    replayAttemptIndex, dc.CurrentPlatformFrame, false,
+                    "motion_hard_gate", false, -1, 0f, 0f,
+                    currentAngularSpeed, currentLinearSpeed, _motionQuality);
                 return;
             }
 
@@ -2290,6 +2637,8 @@ namespace Genesis.RoomScan
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
             compute.SetFloat(DiagnosticAngularSpeedID, _smoothedAngSpeed);
             compute.SetFloat(NoiseMotionQualityID, noiseMotionWeightEnable ? _motionQuality : 1f);
+            compute.SetFloat(MotionAuthorityQualityID, _motionQuality);
+            compute.SetFloat(MotionConfirmQualityMinID, motionConfirmQualityMin);
             compute.SetFloat(NoiseDistExpID, noiseDistExponent);
             compute.SetFloat(NoiseAngExpID, noiseAngleExponent);
             compute.SetFloat(FrozenBlockEnableID, frozenBlockEnable ? 1f : 0f);
@@ -2321,8 +2670,65 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(DepthCapture.NormTexID, fusionNormal);
             _integrateKernel.Set(DepthCapture.DilatedDepthTexID, fusionDilatedDepth);
             _integrateKernel.Set(DepthCapture.EdgeReasonTexID, fusionEdgeReason);
+            Texture temporalReason = fusionTemporalReason != null
+                ? fusionTemporalReason
+                : fusionEdgeReason; // texture binding must remain valid even when the diagnostic is unavailable
+            _integrateKernel.Set(DepthCapture.TemporalReasonTexID, temporalReason);
+            compute.SetInt(TemporalReasonAvailableID, fusionTemporalReasonAvailable ? 1 : 0);
 
-            // A: unchanged production path (projective difference scaled by normal cosine).
+            // 枪胶不再只修整帧位姿：生产 A 直接消费“同一延迟帧”的逐点证据。
+            // Correspondence.w 编码稳定候选、平台/预处理双证词与反对票状态；
+            // Integrate 再按当前体素投影像素做局部一致性复核。基线与 B 影子绑定
+            // 零缓冲且关闭开关，确保对照链不被实验准入污染。
+            bool gunGelAdmissionActive = usingGuardedFrame &&
+                                          deferredFrame.Decision.HasFusionAdmissionBuffers;
+            ComputeBuffer gunGelObservations = gunGelAdmissionActive
+                ? deferredFrame.Decision.FusionObservations
+                : _gunGelDummyObservations;
+            ComputeBuffer gunGelCorrespondences = gunGelAdmissionActive
+                ? deferredFrame.Decision.FusionCorrespondences
+                : _gunGelDummyCorrespondences;
+            _integrateKernel.Set(GunGelObservationsID, gunGelObservations);
+            _integrateKernel.Set(GunGelCorrespondencesID, gunGelCorrespondences);
+            compute.SetInts(GunGelObservationGridID,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridX : 1,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridY : 1);
+            compute.SetInt(GunGelPixelStrideID,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 1);
+            compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
+
+            // 独立会话记录的是生产 Integrate 此刻真正绑定的完整输入：不仅是深度，
+            // 还包括逐点枪胶准入、实际 RGB 副本及其针孔内外参。记录动作只旁路回读，
+            // 不参与当前帧裁决，也不改变任何 compute 绑定。
+            ScanReplaySessionPackage.Active?.RecordAcceptedInput(
+                replayAttemptIndex,
+                usingGuardedFrame ? deferredFrame.PlatformFrame : dc.CurrentPlatformFrame,
+                usingGuardedFrame ? "gungel_accept" : "baseline_accept",
+                usingGuardedFrame,
+                usingGuardedFrame ? deferredFrame.FrameIndex : -1,
+                usingGuardedFrame ? deferredFrame.Decision.TranslationMm : 0f,
+                usingGuardedFrame ? deferredFrame.Decision.RotationDeg : 0f,
+                _smoothedAngSpeed,
+                usingGuardedFrame ? deferredFrame.LinearSpeed : currentLinearSpeed,
+                _motionQuality,
+                fusionDepth, fusionNormal, fusionDilatedDepth,
+                fusionEdgeReason, fusionTemporalReason,
+                fusionProjection, fusionView, fusionProjectionInverse, fusionViewInverse,
+                gunGelAdmissionActive,
+                gunGelAdmissionActive ? gunGelObservations : null,
+                gunGelAdmissionActive ? gunGelCorrespondences : null,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridX : 0,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridY : 0,
+                gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 0,
+                productionCamAvailable,
+                productionCamAvailable ? _camFrameCopy : null,
+                _pendingCamPos, _pendingCamRot, _pendingFocalLen, _pendingPrincipalPt,
+                _pendingSensorRes, _pendingCurrentRes,
+                usingGuardedFrame ? deferredFrame.Decision.Correction : Matrix4x4.identity,
+                _exclusionPositions, numExclusions);
+
+            // A: production path (projective difference scaled by normal cosine), now
+            // guarded per projected voxel by the exact same-frame GunGel evidence above.
             BeginDirtyEpoch();
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(WriteColorID, 1f);
@@ -2338,6 +2744,7 @@ namespace Genesis.RoomScan
             // unscaled ray-depth difference. No color/global production state is written.
             if (_projectiveShadowVolume != null && _projectiveShadowCarveStats != null)
             {
+                compute.SetFloat(GunGelAdmissionEnableID, 0f);
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
@@ -2354,6 +2761,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
                 compute.SetFloat(ConfidenceWriteID, 1f);
+                compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
                 ConfigureDirtyTracking(true);
                 compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
                 _integrateKernel.Set(VolumeRWID, _volume);

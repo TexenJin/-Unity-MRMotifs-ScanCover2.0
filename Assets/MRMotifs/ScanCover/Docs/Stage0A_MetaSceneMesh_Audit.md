@@ -46,11 +46,28 @@ Enter Play Mode on Quest/Link, wait for Meta Scene Mesh to load, then press:
 
 `Export Meta Scene Mesh Audit Package`
 
+For a standalone Quest build of this scene, wait until the room mesh is visible,
+then press the right-controller `B` button once.  The export is written under:
+
+`Android/data/<application-id>/files/ScanCoverDiagnostics/system_room_mesh/ScanCover_MetaSceneMeshAudit_*`
+
+Build `Assets/MRMotifs/ScanCover/Scene/Meta Scene Mesh.unity` through the
+project's normal Quest build workflow.  Keep the registered application id
+`com.pcaii.scancover.quest3`; changing to an unregistered side-by-side id makes
+Meta's Scene/Anchor service reject the room query as `ERROR_PACKAGE_UNTRUSTED`.
+
+`system_room_mesh/export_status.json` is created as soon as the correct scene
+starts (`ready`) and changes to `button_pressed`, `complete`, `failed`, or
+`exception`, so runtime operation no longer depends on visual guesswork.
+
 ## Output
 
 Default output directory:
 
 `ScanCoverExports/MetaSceneMeshAuditSessions/ScanCover_MetaSceneMeshAudit_*`
+
+The path above is the Unity Editor/Quest Link default.  Standalone Quest uses
+the persistent-data path documented in the operation section.
 
 Expected files:
 
