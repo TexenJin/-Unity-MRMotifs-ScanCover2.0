@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./docs/images/scancover-xr-hero.png" alt="ScanCover XR：证据驱动的空间重建" width="100%">
+</p>
+
 # ScanCover：Quest 3 实时房间几何重建实验工程
 
 ScanCover 是一个基于 Unity 6、Meta XR 与 Quest 3 环境深度的实时空间重建研究工程。
