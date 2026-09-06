@@ -153,9 +153,8 @@ def validate(root: Path, allow_incomplete: bool) -> tuple[list[Check], dict]:
             meta_path = root / "fusion_inputs" / "frames" / row["metaFile"]
             if meta_path.is_file():
                 try:
-                    admission = json.loads(meta_path.read_text("utf-8")).get(
-                        "gunGelAdmission", {}
-                    )
+                    fusion_meta = json.loads(meta_path.read_text("utf-8"))
+                    admission = fusion_meta.get("gunGelAdmission", {})
                     layout = str(admission.get("observationLayout", ""))
                     if int(admission.get("observationStrideBytes", -1)) != 64:
                         gun_gel_contract_errors.append(
@@ -165,6 +164,35 @@ def validate(root: Path, allow_incomplete: bool) -> tuple[list[Check], dict]:
                         gun_gel_contract_errors.append(
                             f"{row.get('sequence')}:correspondenceStrideBytes"
                         )
+                    if fusion_meta.get("schema") == "scancover.fusion_input.v2":
+                        pre_identity = str(admission.get("preTransactionIdentityFile", ""))
+                        final_identity = str(admission.get("finalIdentityFile", ""))
+                        for label, value in (
+                            ("preTransactionIdentityFile", pre_identity),
+                            ("finalIdentityFile", final_identity),
+                        ):
+                            if value and (root / "fusion_inputs" / "frames" / value).is_file():
+                                continue
+                            gun_gel_contract_errors.append(
+                                f"{row.get('sequence')}:{label}"
+                            )
+                        correspondence_count = int(admission.get("correspondenceCount", -1))
+                        if int(admission.get("preTransactionIdentityStrideBytes", -1)) != 16:
+                            gun_gel_contract_errors.append(
+                                f"{row.get('sequence')}:preTransactionIdentityStrideBytes"
+                            )
+                        if int(admission.get("finalIdentityStrideBytes", -1)) != 16:
+                            gun_gel_contract_errors.append(
+                                f"{row.get('sequence')}:finalIdentityStrideBytes"
+                            )
+                        if int(admission.get("preTransactionIdentityCount", -1)) != correspondence_count:
+                            gun_gel_contract_errors.append(
+                                f"{row.get('sequence')}:preTransactionIdentityCount"
+                            )
+                        if int(admission.get("finalIdentityCount", -1)) != correspondence_count:
+                            gun_gel_contract_errors.append(
+                                f"{row.get('sequence')}:finalIdentityCount"
+                            )
                     if "uint4 sourceReason" not in layout:
                         gun_gel_contract_errors.append(
                             f"{row.get('sequence')}:observationLayout"

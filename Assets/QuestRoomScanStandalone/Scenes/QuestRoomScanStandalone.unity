@@ -252,7 +252,7 @@ MonoBehaviour:
   frozenPageRequeueCooldownSeconds: 15
   enablePlaneFitShadow: 1
   planeFitShadowCompute: {fileID: 7200000, guid: cf3a91b27e4d4f58a6c0d9e1b2a34f56, type: 3}
-  enablePlaneFlatten: 1
+  enablePlaneFlatten: 0
   planeFlattenMinDelta: 0.3
   planeFlattenMinConf: 0.25
   planeFlattenIntervalSec: 0.5
@@ -356,6 +356,10 @@ MonoBehaviour:
   carveBypassMargin: 0.5
   carveBypassBoost: 2
   freeSpaceCarveBoost: 2
+  enableMatureSurfaceObsDiscount: 1
+  matureSurfaceObsWeightMin: 0.5
+  matureSurfaceObsMargin: 0.15
+  matureSurfaceObsDiscount: 0.05
   rescueSeedDistOnly: 1
   abstainSeedGuard: 1
   rawSeedGate: 1

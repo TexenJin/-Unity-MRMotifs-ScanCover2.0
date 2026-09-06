@@ -127,11 +127,10 @@ namespace Genesis.RoomScan
         private bool enablePlaneFitShadow = true;
         [SerializeField] private ComputeShader planeFitShadowCompute;
 
-        [Header("平面拍平（B2 写入，振荡断根）")]
-        [SerializeField, Tooltip("B2 逐像素泼溅拍平：观测面附近'持续矛盾'的体素 sd 直接改写为观测值" +
-                 "——只写 sd 不动 weight（冻块负 weight 保留=不解冻修冻块几何），穿越票失根=振荡断根。" +
-                 "持久闸=置信度分歧 EMA：瞬态手/行人进冻块不会被烙进几何；压完观测一致 EMA 衰减自然停手。 (default true)")]
-        private bool enablePlaneFlatten = true;
+        [Header("平面拍平（B2 已退出生产）")]
+        [SerializeField, Tooltip("B2 会绕过枪胶逐点准入，直接用预处理深度改写 TSDF；这会把近平行的错误深度压进几何，并抹平床/枕头等真实层次。" +
+                 "生产默认关闭；B1 影子拟合仍保留只读诊断。")]
+        private bool enablePlaneFlatten = false;
         [SerializeField, Range(0.1f, 0.6f), Tooltip("显著区阈值（sd 归一，1=截断带 15cm）：|观测-存量| 超此才压。0.3≈4.5cm；平墙实测 O-12mm 天然免疫")]
         private float planeFlattenMinDelta = 0.3f;
         [SerializeField, Range(0.05f, 0.6f), Tooltip("持久矛盾门槛（分歧 EMA，0-1）：EMA 超此才认定持续矛盾。0.25≈3.75cm；折角实测 ~0.67")]
@@ -326,10 +325,30 @@ namespace Genesis.RoomScan
         private ObservationCoverageOverlay _coverageOverlay;
         private DepthPointCloudOverlay _depthPointCloudOverlay;
         private GunGelCourtOverlay _gunGelCourtOverlay;
+        private InstantDepthShellOverlay _instantDepthShellOverlay;
         private bool _bbPresentationCaptured;
         private bool _bbRestoreMeshVisible;
         private bool _bbRestoreCoarseSkinVisible;
         private bool _bbRestoreManagementBlocks;
+        // X 路线中“壳纸合流后的仅纸对照”是一个独立观察态。
+        // 此时即时壳不上屏、但仍在后台采证，且不得被误判为
+        // 整条 X 诊断链已退出。
+        private bool _shellPaperOnlyView;
+        // 仅纸档的绘制级纠错隔离：稳定 Reject 单元不上屏；恢复
+        // 两个独立安全支撑视角后，仍须等实际纸面贴合新目标。
+        // 不修改 TSDF 或候选账本。
+        private const int PaperCorrectionHashProbeCount = 24;
+        private readonly List<VirtualProbeShadowAdjudicator.PaperCorrectionCell>
+            _paperCorrectionCells =
+                new List<VirtualProbeShadowAdjudicator.PaperCorrectionCell>(128);
+        private ScanReplaySessionPackage _paperCorrectionSession;
+        private ComputeBuffer _paperCorrectionKeyHash;
+        private ComputeBuffer _paperCorrectionTargetHash;
+        private Vector4[] _paperCorrectionKeyEntries;
+        private Vector4[] _paperCorrectionTargetEntries;
+        private int _paperCorrectionRevision = int.MinValue;
+        private int _paperCorrectionCellCount;
+        private int _paperCorrectionHashMask = -1;
         private float _heraFreezeStartedAt = -1f;
         private float _heraLastProgressAt = -1f;
         private string _heraLastProgressSignature = "";
@@ -420,12 +439,18 @@ namespace Genesis.RoomScan
             // 会在下一帧再次把刚切出的纸面压回隐藏。切网格档时先明确退出点诊断，
             // 但不恢复旧快照；下面的路线切换/总闸负责只打开用户刚选中的新档。
             if ((_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible) ||
-                (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible))
+                (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible) ||
+                (_instantDepthShellOverlay != null && _instantDepthShellOverlay.Visible) ||
+                _shellPaperOnlyView)
             {
                 _gunGelCourtOverlay?.SetVisible(false);
                 _depthPointCloudOverlay?.SetVisible(false);
                 _depthPointCloudOverlay?.SetAcquiring(false);
+                _instantDepthShellOverlay?.SetVisible(false);
+                _instantDepthShellOverlay?.SetAcquiring(IsScanning);
                 _bbPresentationCaptured = false;
+                _shellPaperOnlyView = false;
+                ApplyDisplayMode();
             }
             if (_meshExtractor.IsRouteValidationActive)
             {
@@ -438,6 +463,31 @@ namespace Genesis.RoomScan
                 ? _meshExtractor.ToggleIncrementalHeraVisible()
                 : _meshExtractor.ToggleProductionMeshVisible();
             NotifyInput(visible ? "网格显示：开" : "网格显示：关（后台继续）");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// 明确进入生产观察档：只让真实 TSDF 的公共纸皮拥有前景。
+        /// 红绿点、BB 点云、粗皮、HERA 对照与管理框全部退出；后台生产不变。
+        /// </summary>
+        public void ShowProductionPaperView()
+        {
+            _gunGelCourtOverlay?.SetVisible(false);
+            _depthPointCloudOverlay?.SetVisible(false);
+            _depthPointCloudOverlay?.SetAcquiring(false);
+            _instantDepthShellOverlay?.SetVisible(false);
+            _instantDepthShellOverlay?.SetAcquiring(IsScanning);
+            _coverageOverlay?.SetMarkersVisible(false);
+            showManagementBlockWireOverlay = false;
+            _managementBlockWireOverlay?.SetVisible(false);
+            _bbPresentationCaptured = false;
+            _shellPaperOnlyView = false;
+            ApplyDisplayMode();
+
+            string route = _meshExtractor != null
+                ? _meshExtractor.ShowProductionPaperView()
+                : "无显示";
+            NotifyInput($"生产观察：{route}");
             RefreshStatusBadge();
         }
 
@@ -570,11 +620,26 @@ namespace Genesis.RoomScan
         private MeshExtractor _meshExtractor;
         private PassthroughCameraProvider _cameraProvider;
 
-        [Header("Minimal Status Badge")]
-        [SerializeField] private bool showStatusBadge = true;
+        [Header("Persistent Primary Status Badge")]
         [SerializeField, Tooltip("开启后恢复冻结票、置信度、页面债、计时账等完整诊断 HUD；默认隐藏，后台统计不受影响。")]
         private bool showDetailedRuntimeStatus = false;
         private UnityEngine.UI.Text _statusBadgeText;
+        private UnityEngine.UI.Text _statusBadgeHeaderText;
+        private UnityEngine.UI.Text _statusBadgeRightText;
+        private const float DiagnosticHudWidth = 2280f;
+        private const float DiagnosticHudHeaderHeight = 78f;
+        private const float DiagnosticHudPadding = 24f;
+        private GameObject _probeReticleRoot;
+        private RectTransform _probeTargetMarkerRect;
+        private UnityEngine.UI.Text _probeReticleLabel;
+        private ProbeEvidenceGraphic _probeEvidenceGraphic;
+        private readonly VirtualProbeShadowAdjudicator.GuidanceCellVisual[]
+            _probeEvidenceCells =
+                new VirtualProbeShadowAdjudicator.GuidanceCellVisual[96];
+        private readonly List<UnityEngine.UI.Graphic> _probeFrameGraphics =
+            new List<UnityEngine.UI.Graphic>(4);
+        private readonly List<UnityEngine.UI.Graphic> _probeMarkerGraphics =
+            new List<UnityEngine.UI.Graphic>(5);
 
         /// <summary>正在融合（未暂停）。</summary>
         public bool IsScanning { get; private set; }
@@ -649,9 +714,14 @@ namespace Genesis.RoomScan
             if (_gunGelCourtOverlay == null)
                 _gunGelCourtOverlay = gameObject.AddComponent<GunGelCourtOverlay>();
             _gunGelCourtOverlay.SetVisible(false);
+            _instantDepthShellOverlay = GetComponent<InstantDepthShellOverlay>();
+            if (_instantDepthShellOverlay == null)
+                _instantDepthShellOverlay = gameObject.AddComponent<InstantDepthShellOverlay>();
+            _instantDepthShellOverlay.SetVisible(false);
             StartCoroutine(ConfigureCameraForPassthrough());
-            if (showStatusBadge)
-                StartCoroutine(CreateStatusBadgeWhenCameraReady());
+            // 主操作 HUD 是采集契约的一部分，始终创建；不再受场景勾选项或
+            // 采集/冻结档位控制。只有相机尚未生成时会等待相机。
+            StartCoroutine(CreateStatusBadgeWhenCameraReady());
             if (showDebugHud)
                 StartCoroutine(CreateHudWhenCameraReady());
             Application.logMessageReceived += OnLogMessage;
@@ -678,55 +748,426 @@ namespace Genesis.RoomScan
 
             var root = new GameObject("[QRS] Minimal Status Badge");
             root.transform.SetParent(Camera.main.transform, false);
-            root.transform.localPosition = new Vector3(0f, -0.24f, 0.9f);
+            root.transform.localPosition = new Vector3(0f, -0.14f, 0.9f);
             root.transform.localRotation = Quaternion.identity;
-            root.transform.localScale = Vector3.one * 0.00048f;
+            root.transform.localScale = Vector3.one * 0.00036f;
 
             var canvas = root.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.WorldSpace;
             canvas.overrideSorting = true;
-            canvas.sortingOrder = 32767;
+            // This canvas owns the diagnostic text only, not the performance graphs.
+            canvas.sortingOrder = 32760;
             var rootRect = root.GetComponent<RectTransform>();
-            rootRect.sizeDelta = new Vector2(900f, 330f);
+            rootRect.pivot = new Vector2(0.5f, 1f);
+            rootRect.sizeDelta = new Vector2(DiagnosticHudWidth, 640f);
 
             Material badgeMaterial = null;
+            Material badgeBackgroundMaterial = null;
             var badgeShader = Resources.Load<Shader>("HUDAlwaysOnTop");
             if (badgeShader != null)
-                badgeMaterial = new Material(badgeShader);
+            {
+                badgeBackgroundMaterial = new Material(badgeShader)
+                {
+                    renderQueue = 4990
+                };
+                badgeMaterial = new Material(badgeShader)
+                {
+                    renderQueue = 4991
+                };
+            }
+
+            // Retired acquisition square and oversized yellow phase counters.
+            // Do not create their canvas; FPS/GPU overlays are independent.
+            if (_probeReticleRoot != null) _probeReticleRoot.SetActive(false);
 
             var bg = new GameObject("Bg");
             bg.transform.SetParent(root.transform, false);
             var image = bg.AddComponent<UnityEngine.UI.Image>();
-            image.color = new Color(0f, 0f, 0f, 0.68f);
-            if (badgeMaterial != null) image.material = badgeMaterial;
+            // This is an occluding plate, not a translucent tint.  A dedicated
+            // render queue places it after every scan/diagnostic wire material;
+            // text uses the next queue so the plate can never cover its owner.
+            image.color = new Color(0.008f, 0.012f, 0.018f, 1f);
+            if (badgeBackgroundMaterial != null)
+                image.material = badgeBackgroundMaterial;
             var bgRect = bg.GetComponent<RectTransform>();
             bgRect.anchorMin = Vector2.zero;
             bgRect.anchorMax = Vector2.one;
             bgRect.offsetMin = Vector2.zero;
             bgRect.offsetMax = Vector2.zero;
 
-            var textObject = new GameObject("Text");
-            textObject.transform.SetParent(root.transform, false);
-            _statusBadgeText = textObject.AddComponent<UnityEngine.UI.Text>();
-            _statusBadgeText.font = font;
-            _statusBadgeText.fontSize = 36;
-            _statusBadgeText.alignment = TextAnchor.MiddleLeft;
-            _statusBadgeText.horizontalOverflow = HorizontalWrapMode.Wrap;
-            _statusBadgeText.verticalOverflow = VerticalWrapMode.Overflow;
-            if (badgeMaterial != null) _statusBadgeText.material = badgeMaterial;
+            _statusBadgeHeaderText = CreateDiagnosticHudText(root.transform, "Header", font,
+                badgeMaterial, 0f, 1f, DiagnosticHudPadding);
+            _statusBadgeText = CreateDiagnosticHudText(root.transform, "Relay", font,
+                badgeMaterial, 0f, 0.5f, DiagnosticHudHeaderHeight);
+            _statusBadgeRightText = CreateDiagnosticHudText(root.transform, "Attribution", font,
+                badgeMaterial, 0.5f, 1f, DiagnosticHudHeaderHeight);
+            RefreshStatusBadge();
+        }
+
+        private static UnityEngine.UI.Text CreateDiagnosticHudText(Transform root, string name,
+            Font font, Material material, float left, float right, float top)
+        {
+            var textObject = new GameObject(name);
+            textObject.transform.SetParent(root, false);
+            var text = textObject.AddComponent<UnityEngine.UI.Text>();
+            text.font = font;
+            text.fontSize = 26;
+            text.alignment = TextAnchor.UpperLeft;
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
+            text.verticalOverflow = VerticalWrapMode.Overflow;
+            text.raycastTarget = false;
+            if (material != null) text.material = material;
             var outline = textObject.AddComponent<UnityEngine.UI.Outline>();
             outline.effectColor = new Color(0f, 0f, 0f, 0.95f);
             outline.effectDistance = new Vector2(2f, -2f);
             var textRect = textObject.GetComponent<RectTransform>();
-            textRect.anchorMin = Vector2.zero;
-            textRect.anchorMax = Vector2.one;
-            textRect.offsetMin = new Vector2(28f, 20f);
-            textRect.offsetMax = new Vector2(-28f, -20f);
+            textRect.anchorMin = new Vector2(left, 0f);
+            textRect.anchorMax = new Vector2(right, 1f);
+            textRect.offsetMin = new Vector2(DiagnosticHudPadding, DiagnosticHudPadding);
+            textRect.offsetMax = new Vector2(-DiagnosticHudPadding, -top);
+            return text;
+        }
 
-            RefreshStatusBadge();
+        private void CreateProbeTargetReticle(Camera cam, Font font, Material material)
+        {
+            if (cam == null || _probeReticleRoot != null) return;
+
+            var go = new GameObject("[QRS] Reject Acquisition Reticle");
+            _probeReticleRoot = go;
+            go.transform.SetParent(cam.transform, false);
+
+            var canvas = go.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.WorldSpace;
+            canvas.overrideSorting = true;
+            canvas.sortingOrder = 32767;
+
+            const float distance = 1f;
+            const float canvasWidthPx = 1000f;
+            float viewHeight = 2f * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) * distance;
+            float viewWidth = viewHeight * Mathf.Max(0.1f, cam.aspect);
+            float canvasHeightPx = canvasWidthPx * viewHeight / Mathf.Max(0.001f, viewWidth);
+            var root = go.GetComponent<RectTransform>();
+            root.sizeDelta = new Vector2(canvasWidthPx, canvasHeightPx);
+            go.transform.localPosition = Vector3.forward * distance;
+            go.transform.localRotation = Quaternion.identity;
+            go.transform.localScale = Vector3.one * (viewWidth / canvasWidthPx);
+
+            const float halfAngleDeg = 7f;
+            float halfY = 0.5f * Mathf.Tan(halfAngleDeg * Mathf.Deg2Rad) /
+                          Mathf.Max(0.001f, Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad));
+            float halfX = halfY / Mathf.Max(0.1f, cam.aspect);
+            float x0 = Mathf.Clamp01(0.5f - halfX);
+            float x1 = Mathf.Clamp01(0.5f + halfX);
+            float y0 = Mathf.Clamp01(0.5f - halfY);
+            float y1 = Mathf.Clamp01(0.5f + halfY);
+            Color waiting = new Color(1f, 0.76f, 0.16f, 0.95f);
+
+            _probeFrameGraphics.Add(AddProbeReticleLine(go.transform, "框左",
+                new Vector2(x0, y0), new Vector2(x0, y1), new Vector2(3f, 0f), waiting, material));
+            _probeFrameGraphics.Add(AddProbeReticleLine(go.transform, "框右",
+                new Vector2(x1, y0), new Vector2(x1, y1), new Vector2(3f, 0f), waiting, material));
+            _probeFrameGraphics.Add(AddProbeReticleLine(go.transform, "框下",
+                new Vector2(x0, y0), new Vector2(x1, y0), new Vector2(0f, 3f), waiting, material));
+            _probeFrameGraphics.Add(AddProbeReticleLine(go.transform, "框上",
+                new Vector2(x0, y1), new Vector2(x1, y1), new Vector2(0f, 3f), waiting, material));
+
+            var evidenceGo = new GameObject("框内证据状态");
+            evidenceGo.transform.SetParent(go.transform, false);
+            _probeEvidenceGraphic = evidenceGo.AddComponent<ProbeEvidenceGraphic>();
+            _probeEvidenceGraphic.raycastTarget = false;
+            _probeEvidenceGraphic.color = Color.white;
+            if (material != null) _probeEvidenceGraphic.material = material;
+            var evidenceRect = evidenceGo.GetComponent<RectTransform>();
+            evidenceRect.anchorMin = Vector2.zero;
+            evidenceRect.anchorMax = Vector2.one;
+            evidenceRect.offsetMin = Vector2.zero;
+            evidenceRect.offsetMax = Vector2.zero;
+
+            var labelGo = new GameObject("取景状态");
+            labelGo.transform.SetParent(go.transform, false);
+            _probeReticleLabel = labelGo.AddComponent<UnityEngine.UI.Text>();
+            _probeReticleLabel.text = "等待双采";
+            _probeReticleLabel.font = font;
+            _probeReticleLabel.fontSize = 23;
+            _probeReticleLabel.fontStyle = FontStyle.Bold;
+            _probeReticleLabel.alignment = TextAnchor.UpperCenter;
+            _probeReticleLabel.color = waiting;
+            _probeReticleLabel.raycastTarget = false;
+            if (material != null) _probeReticleLabel.material = material;
+            var labelRect = labelGo.GetComponent<RectTransform>();
+            labelRect.anchorMin = new Vector2(0.5f, y1);
+            labelRect.anchorMax = new Vector2(0.5f, y1);
+            labelRect.pivot = new Vector2(0.5f, 0f);
+            labelRect.anchoredPosition = new Vector2(0f, 10f);
+            labelRect.sizeDelta = new Vector2(720f, 104f);
+
+            var markerGo = new GameObject("Reject真实位置");
+            markerGo.transform.SetParent(go.transform, false);
+            _probeTargetMarkerRect = markerGo.AddComponent<RectTransform>();
+            _probeTargetMarkerRect.anchorMin = new Vector2(0.5f, 0.5f);
+            _probeTargetMarkerRect.anchorMax = new Vector2(0.5f, 0.5f);
+            _probeTargetMarkerRect.pivot = new Vector2(0.5f, 0.5f);
+            _probeTargetMarkerRect.sizeDelta = new Vector2(48f, 48f);
+            _probeMarkerGraphics.Add(AddProbeMarkerBar(markerGo.transform, "左", new Vector2(-18f, 0f), new Vector2(14f, 3f), waiting, material));
+            _probeMarkerGraphics.Add(AddProbeMarkerBar(markerGo.transform, "右", new Vector2(18f, 0f), new Vector2(14f, 3f), waiting, material));
+            _probeMarkerGraphics.Add(AddProbeMarkerBar(markerGo.transform, "上", new Vector2(0f, 18f), new Vector2(3f, 14f), waiting, material));
+            _probeMarkerGraphics.Add(AddProbeMarkerBar(markerGo.transform, "下", new Vector2(0f, -18f), new Vector2(3f, 14f), waiting, material));
+            _probeMarkerGraphics.Add(AddProbeMarkerBar(markerGo.transform, "中心", Vector2.zero, new Vector2(5f, 5f), waiting, material));
+            markerGo.SetActive(false);
+        }
+
+        private static UnityEngine.UI.Image AddProbeReticleLine(
+            Transform parent, string name, Vector2 anchorMin, Vector2 anchorMax,
+            Vector2 sizeDelta, Color color, Material material)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            var image = go.AddComponent<UnityEngine.UI.Image>();
+            image.color = color;
+            image.raycastTarget = false;
+            if (material != null) image.material = material;
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = anchorMin;
+            rt.anchorMax = anchorMax;
+            rt.anchoredPosition = Vector2.zero;
+            rt.sizeDelta = sizeDelta;
+            return image;
+        }
+
+        private static UnityEngine.UI.Image AddProbeMarkerBar(
+            Transform parent, string name, Vector2 position, Vector2 size,
+            Color color, Material material)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            var image = go.AddComponent<UnityEngine.UI.Image>();
+            image.color = color;
+            image.raycastTarget = false;
+            if (material != null) image.material = material;
+            var rt = go.GetComponent<RectTransform>();
+            rt.anchorMin = new Vector2(0.5f, 0.5f);
+            rt.anchorMax = new Vector2(0.5f, 0.5f);
+            rt.pivot = new Vector2(0.5f, 0.5f);
+            rt.anchoredPosition = position;
+            rt.sizeDelta = size;
+            return image;
+        }
+
+        private void UpdateProbeTargetReticle()
+        {
+            if (_probeReticleRoot == null || _probeReticleLabel == null) return;
+            ScanReplaySessionPackage session = ScanReplaySessionPackage.Active;
+            var frame = session != null
+                ? session.ProbeFollowupGuidanceFrame
+                : default;
+            int evidenceCount = session != null
+                ? session.CopyProbeFollowupGuidanceVisuals(_probeEvidenceCells)
+                : 0;
+            _probeEvidenceGraphic?.SetEvidence(Camera.main, _probeEvidenceCells,
+                evidenceCount);
+            int phaseProvisional = 0, phaseStable = 0, phaseVote1 = 0,
+                phaseVote2 = 0, phaseReject = 0, phaseCleared = 0;
+            for (int i = 0; i < evidenceCount; i++)
+            {
+                switch (_probeEvidenceCells[i].Phase)
+                {
+                    case 0: phaseProvisional++; break;
+                    case 1: phaseStable++; break;
+                    case 2: phaseVote1++; break;
+                    case 3: phaseVote2++; break;
+                    case 4: phaseReject++; break;
+                    case 5: break;
+                    case 6: break;
+                    case 7: phaseCleared++; break;
+                    case 8: phaseCleared++; break;
+                }
+            }
+
+            Color color;
+            if (session == null)
+            {
+                color = new Color(0.68f, 0.72f, 0.76f, 0.9f);
+            }
+            else if (!frame.Active)
+            {
+                color = new Color(1f, 0.76f, 0.16f, 0.95f);
+            }
+            else if (frame.Pending > 0 && frame.ObservedRecently > 0)
+            {
+                color = new Color(0.20f, 1f, 0.38f, 0.98f);
+            }
+            else if (frame.Pending > 0)
+            {
+                color = new Color(1f, 0.56f, 0.08f, 0.98f);
+            }
+            else if (frame.ResolvedFree + frame.ResolvedSupport > 0)
+            {
+                color = new Color(0.20f, 1f, 0.38f, 0.98f);
+            }
+            else if (frame.Expired > 0)
+            {
+                color = new Color(0.70f, 0.72f, 0.76f, 0.95f);
+            }
+            else
+            {
+                color = new Color(0.28f, 0.86f, 1f, 0.95f);
+            }
+
+            for (int i = 0; i < _probeFrameGraphics.Count; i++)
+                if (_probeFrameGraphics[i] != null) _probeFrameGraphics[i].color = color;
+            for (int i = 0; i < _probeMarkerGraphics.Count; i++)
+                if (_probeMarkerGraphics[i] != null) _probeMarkerGraphics[i].color = color;
+            _probeReticleLabel.color = color;
+            _probeReticleLabel.text =
+                $"自动 ID{frame.RegisteredFingerprints:0000} " +
+                $"反1{frame.ChallengeOne:000} 反2{frame.ChallengeTwo:000} " +
+                $"拒{frame.Pending:000}\n" +
+                $"证空{frame.ResolvedFree:000} 面返{frame.ResolvedSupport:000} " +
+                $"撤{frame.ChallengesClearedBySupport:000} 命{frame.ObservedRecently:000}\n" +
+                $"窗 灰{phaseProvisional:00}绿{phaseStable:00} " +
+                $"黄{phaseVote1:00}橙{phaseVote2:00}红{phaseReject:00}" +
+                $"撤迹{phaseCleared:00}";
+
+            if (_probeTargetMarkerRect != null)
+                _probeTargetMarkerRect.gameObject.SetActive(false);
         }
 
         private void RefreshStatusBadge()
+        {
+            if (_statusBadgeText == null) return;
+
+            string runState;
+            if (IsSaveAndClearInProgress)
+            {
+                runState = "保存";
+                _statusBadgeText.color = new Color(1f, 0.78f, 0.2f, 1f);
+            }
+            else if (_chunkAbFrozen)
+            {
+                runState = "冻结";
+                _statusBadgeText.color = new Color(0.25f, 0.95f, 1f, 1f);
+            }
+            else if (IsScanning)
+            {
+                runState = "采集";
+                _statusBadgeText.color = new Color(0.25f, 1f, 0.45f, 1f);
+            }
+            else if (HasStarted)
+            {
+                runState = "暂停";
+                _statusBadgeText.color = new Color(1f, 0.78f, 0.2f, 1f);
+            }
+            else
+            {
+                runState = "待机";
+                _statusBadgeText.color = new Color(0.75f, 0.8f, 0.85f, 1f);
+            }
+
+            string viewState;
+            if (_shellPaperOnlyView)
+                viewState = "合流仅纸";
+            else if (_instantDepthShellOverlay != null && _instantDepthShellOverlay.Visible)
+                viewState = _instantDepthShellOverlay.CompositeWithProduction
+                    ? "壳纸合流"
+                    : "即时外壳";
+            else if (_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible)
+                viewState = "裁决海";
+            else if (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible)
+                viewState = "BB点云";
+            else if (_meshExtractor == null || !_meshExtractor.IsAnyMeshVisible)
+                viewState = "显示关闭";
+            else
+                viewState = _meshExtractor.RouteValidationLabel;
+
+            string productionAdmission = GunGelGuardedFusionEnabled
+                ? "邻证同面"
+                : "原始旁路";
+
+            string probeHud = ScanReplaySessionPackage.Active != null
+                ? ScanReplaySessionPackage.Active.ProbeFollowupGuidanceHudFixed
+                : ScanReplaySessionPackage.ProbeFollowupGuidanceHudEmpty;
+            ScanReplaySessionPackage replayPackage = ScanReplaySessionPackage.Active ??
+                                                     ScanReplaySessionPackage.Latest;
+            string sealHud = replayPackage != null
+                ? replayPackage.SealHudFixed
+                : "封包[未开始  ] 校验000% 安全退出[否]";
+
+            float quality = _volumeIntegrator != null
+                ? Mathf.Clamp(_volumeIntegrator.MotionQuality, 0f, 9.99f)
+                : 0f;
+            int angular = Mathf.Clamp(Mathf.RoundToInt(
+                _volumeIntegrator != null
+                    ? _volumeIntegrator.SmoothedAngularSpeed
+                    : 0f), 0, 999);
+            float linear = Mathf.Clamp(
+                _depthCapture != null ? _depthCapture.SmoothedDepthLinearSpeed : 0f,
+                0f, 9.99f);
+            int fps = Mathf.Clamp(Mathf.RoundToInt(
+                1f / Mathf.Max(0.001f, Time.smoothDeltaTime)), 0, 999);
+
+            string pairedState = _depthCapture == null
+                ? "无"
+                : _depthCapture.PairedFrameCaptureActive
+                    ? "开"
+                    : _depthCapture.PairedFrameCapturePending > 0 ? "写" : "关";
+            int pairedPending = _depthCapture != null
+                ? Mathf.Clamp(_depthCapture.PairedFrameCapturePending, 0, 9999)
+                : 0;
+            int pairedDropped = _depthCapture != null
+                ? Mathf.Clamp(_depthCapture.PairedFrameCaptureDropped, 0, 9999)
+                : 0;
+            int replayDropped = _depthCapture != null
+                ? Mathf.Clamp(_depthCapture.ReplayFusionCaptureDropped, 0, 9999)
+                : 0;
+            int viewCoverage = Mathf.Clamp(Mathf.RoundToInt(
+                _coverageOverlay != null ? _coverageOverlay.CoveragePercent : 0f),
+                0, 100);
+
+            // Fixed semantic columns in every view. Visibility must never select diagnostics.
+            _statusBadgeHeaderText.color = _statusBadgeText.color;
+            _statusBadgeRightText.color = _statusBadgeText.color;
+            _statusBadgeHeaderText.text =
+                $"状态[{HudFixedSlot(runState, 4)}] 模式[{HudFixedSlot(CaptureModeLabel, 4)}] " +
+                $"视图[{HudFixedSlot(viewState, 8)}]  全档诊断常驻\n" +
+                $"生产准入[{HudFixedSlot(productionAdmission, 6)}] 蒙皮[原生5cm诊断]  " +
+                (_meshExtractor != null ? _meshExtractor.SparseFoundationHudFixed : "蒙皮暂无数据");
+            _statusBadgeText.text =
+                (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.RelayDiagnosticsFixed :
+                    "[接力·整批采样]\n审计未就绪\n[覆盖与冻结]\n暂无数据") +
+                "\n[口径]\n残=均值/峰值(mm)；无样本不算通过\n读/找=本段命中率；齐=命中内对齐率\n后段只验前段对齐样本，非全场覆盖率";
+            _statusBadgeRightText.text =
+                (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.AttributionDiagnosticsFixed :
+                    "[错位归因]\n暂无数据\n[融合写入]\n暂无数据") + "\n[运行与采集]\n" +
+                probeHud + "\n" +
+                $"输入 质{quality:0.00} 角{angular:000}°/s " +
+                $"线{linear:0.00}m/s 帧{fps:000}\n" +
+                $"采集 双采[{HudFixedSlot(pairedState, 2)}] 待{pairedPending:0000} " +
+                $"丢{pairedDropped:0000}/{replayDropped:0000} 视域覆{viewCoverage:000}%\n" +
+                sealHud;
+
+            // Grow below the performance graphs, with no paging, scrolling, or view gates.
+            var badgeRect = _statusBadgeText.transform.parent as RectTransform;
+            if (badgeRect != null)
+            {
+                float bodyTop = Mathf.Max(DiagnosticHudHeaderHeight,
+                    _statusBadgeHeaderText.preferredHeight + DiagnosticHudPadding * 2f);
+                _statusBadgeText.rectTransform.offsetMax = new Vector2(-DiagnosticHudPadding, -bodyTop);
+                _statusBadgeRightText.rectTransform.offsetMax = new Vector2(-DiagnosticHudPadding, -bodyTop);
+                float badgeHeight = bodyTop + DiagnosticHudPadding + Mathf.Max(
+                    _statusBadgeText.preferredHeight, _statusBadgeRightText.preferredHeight);
+                badgeRect.sizeDelta = new Vector2(DiagnosticHudWidth, Mathf.Max(640f, badgeHeight));
+            }
+        }
+
+        private static string HudFixedSlot(string value, int width)
+        {
+            value ??= string.Empty;
+            if (value.Length > width) return value.Substring(0, width);
+            return value.PadRight(width, ' ');
+        }
+
+        // 仅保留旧实现供历史排查；实机主 HUD 不再进入这些按阶段换版的分支。
+        private void RefreshLegacyStatusBadge()
         {
             if (_statusBadgeText == null) return;
 
@@ -936,6 +1377,10 @@ namespace Genesis.RoomScan
                     // 枪胶影必须钉在采集态精简 HUD：详细 HUD 在增量 HERA 采集时不会显示，
                     // 只接 UpdateHud 会导致实机无论截图或录像都看不到校枪/K3 读数。
                     string gunGelLine = $"枪胶影:{(_volumeIntegrator != null ? _volumeIntegrator.GetGunGelEvidenceShadowCompact() : "无")}";
+                    string rejectGuideLine = "Reject复核:" +
+                        (ScanReplaySessionPackage.Active != null
+                            ? ScanReplaySessionPackage.Active.ProbeFollowupGuidanceCompact
+                            : "未记录·启用双采后显示");
                     if (_meshExtractor != null && _meshExtractor.HasIncrementalHera)
                     {
                         string geometryLine = $"{_meshExtractor.GetGeometryStabilityStatsCompact()} · " +
@@ -946,10 +1391,10 @@ namespace Genesis.RoomScan
                                             $"回{_meshExtractor.IncrementalHeraAvgDispatchToCallbackMs:0}ms " +
                                             $"融{_emaIntegrateMs:0.0}提{_emaHeraTickMs:0.0}ms " +
                                             $"温{OVRPlugin.batteryTemperature:0}°";
-                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{geometryLine}\n{timingLine}\n{toggleLine}\n{gunGelLine}";
+                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{geometryLine}\n{timingLine}\n{toggleLine}\n{gunGelLine}\n{rejectGuideLine}";
                     }
                     else
-                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}\n{gunGelLine}";
+                        _statusBadgeText.text = $"● 采集中·胶0822·{CaptureModeLabel} · 覆盖{coverage,3:0}%{watch}{frozenTail}\n{secondLine}\n{toggleLine}\n{gunGelLine}\n{rejectGuideLine}";
                     return;
                 }
 
@@ -1130,8 +1575,13 @@ namespace Genesis.RoomScan
             // 置顶材质：WorldSpace Canvas 走 UI/Default 时 ZTest=LEqual 会被网格/墙面挡住，
             // 换 QRS/HUDAlwaysOnTop（ZTest Always + Overlay 队列）。Resources 加载防裁剪，找不到静默回退。
             Material hudMat = null;
+            Material hudBackgroundMat = null;
             var hudShader = Resources.Load<Shader>("HUDAlwaysOnTop");
-            if (hudShader != null) hudMat = new Material(hudShader);
+            if (hudShader != null)
+            {
+                hudBackgroundMat = new Material(hudShader) { renderQueue = 4990 };
+                hudMat = new Material(hudShader) { renderQueue = 4991 };
+            }
 
             var textGo = new GameObject("Text");
             textGo.transform.SetParent(canvasGo.transform, false);
@@ -1152,13 +1602,13 @@ namespace Genesis.RoomScan
             // 开深度预览时右侧留出 320px 给小窗，文字不压图
             rt.offsetMax = new Vector2(showDepthPreview ? -258f : -18f, -12f);
 
-            // 半透明黑底，保证在透视画面上可读
+            // Opaque high-contrast plate; render after all room wireframes.
             var bgGo = new GameObject("Bg");
             bgGo.transform.SetParent(canvasGo.transform, false);
             bgGo.transform.SetAsFirstSibling();
             var img = bgGo.AddComponent<UnityEngine.UI.Image>();
-            img.color = new Color(0f, 0f, 0f, 0.55f);
-            if (hudMat != null) img.material = hudMat;
+            img.color = new Color(0.008f, 0.012f, 0.018f, 1f);
+            if (hudBackgroundMat != null) img.material = hudBackgroundMat;
             var brt = bgGo.GetComponent<RectTransform>();
             brt.anchorMin = Vector2.zero;
             brt.anchorMax = Vector2.one;
@@ -1348,6 +1798,7 @@ namespace Genesis.RoomScan
                 $"供料账:{(_volumeIntegrator != null ? _volumeIntegrator.GetSupplyLedgerCompact() : "无")}\n" +
                 $"断层影:{(_volumeIntegrator != null ? _volumeIntegrator.GetAdaptiveGapShadowCompact() : "无")}\n" +
                 $"枪胶影:{(_volumeIntegrator != null ? _volumeIntegrator.GetGunGelEvidenceShadowCompact() : "无")}\n" +
+                $"Reject复核:{(ScanReplaySessionPackage.Active != null ? ScanReplaySessionPackage.Active.ProbeFollowupGuidanceCompact : "未记录·启用双采后显示")}\n" +
                 $"边缘源:{(_volumeIntegrator != null ? _volumeIntegrator.GetEdgeSourceLedgerCompact() : "无")}\n" +
                 $"供体证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationDonorLedgerCompact() : "无")}\n" +
                 $"路径证:{(_volumeIntegrator != null ? _volumeIntegrator.GetDilationPathLedgerCompact() : "无")}\n" +
@@ -1396,6 +1847,8 @@ namespace Genesis.RoomScan
                 _volumeIntegrator.Cleared -= ResetFrozenBlockSupervisor;
             if (_diagnosticRoiFrame != null)
                 Destroy(_diagnosticRoiFrame);
+            if (_probeReticleRoot != null)
+                Destroy(_probeReticleRoot);
             _planeFitStats?.Release();
             _planeFitStats = null;
             _planeFlatStats?.Release();
@@ -1410,6 +1863,13 @@ namespace Genesis.RoomScan
             _planeProbeStats = null;
             _planeProbeBlocks?.Release();
             _planeProbeBlocks = null;
+            Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
+            _paperCorrectionKeyHash?.Release();
+            _paperCorrectionKeyHash = null;
+            _paperCorrectionTargetHash?.Release();
+            _paperCorrectionTargetHash = null;
+            _paperCorrectionKeyEntries = null;
+            _paperCorrectionTargetEntries = null;
         }
 
         private void OnDisable()
@@ -1417,18 +1877,41 @@ namespace Genesis.RoomScan
             _coverageOverlay?.SetAcquiring(false);
             _depthPointCloudOverlay?.SetAcquiring(false);
             _gunGelCourtOverlay?.SetVisible(false);
+            _instantDepthShellOverlay?.SetAcquiring(false);
+            _instantDepthShellOverlay?.SetVisible(false);
             if (IsScanning) PauseScanning();
         }
 
         private void Update()
         {
             UpdateHud();
+            if (_probeReticleRoot != null && _probeReticleRoot.activeSelf)
+                _probeReticleRoot.SetActive(false);
+
+            bool probeSessionActive = ScanReplaySessionPackage.Active != null;
+            // Repeat the idempotent request so a support renderer created after
+            // session start still receives the observation alpha contract.
+            _meshExtractor?.SetPaperObservationTransparency(probeSessionActive);
+            // The display-level correction quarantine is intentionally dormant.
+            // The last device-visible baseline publishes the native 5 cm paper
+            // directly; do not rebuild or upload a correction hash from Update.
+            Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
+
+            // 主 HUD 由自己的稳定时钟刷新，不再依赖网格提取、页面提交或冻结回放
+            // 恰好发生。这样 Reject 的倒计时/方位/换位资格最多约 0.25s 延迟。
+            if (_statusBadgeText != null && Time.unscaledTime >= _badgeNextRefresh)
+            {
+                _badgeNextRefresh = Time.unscaledTime + 0.25f;
+                RefreshStatusBadge();
+            }
 
             // 点诊断态只允许当前点层上屏。异步新建的 HERA/粗皮页也会被
             // 下一帧重新压回隐藏，但其后台融合、提取和提交继续运行。
             bool pointDiagnosticVisible =
                 (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible) ||
-                (_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible);
+                (_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible) ||
+                (_instantDepthShellOverlay != null && _instantDepthShellOverlay.Visible &&
+                 !_instantDepthShellOverlay.CompositeWithProduction);
             if (pointDiagnosticVisible)
             {
                 _coverageOverlay?.SetMarkersVisible(false);
@@ -1500,7 +1983,10 @@ namespace Genesis.RoomScan
                 // 队10途0、落 20s）——提取超时 3 个节拍即让融合让路一帧，
                 // 扫描降频保命、网格出网不断流。刀A（同帧叠加）已炸毁退役。
                 float heraInterval = enableLiveTrack ? MeshInterval * 0.5f : MeshInterval;
-                bool heraDue = !directTruthRoute && t - _lastMeshTime >= heraInterval;
+                // A direct truth view pauses HERA itself, not the shared
+                // extraction-only clock: the uniform 10 cm foundation consumes
+                // that slot and must keep following dirty TSDF chunks.
+                bool heraDue = t - _lastMeshTime >= heraInterval;
                 bool tickStarved = heraDue && t - _lastMeshTime >= heraInterval * 3f &&
                                    _meshExtractor.HasIncrementalHera;
                 bool integrateNow = integrationDue && !tickStarved;
@@ -1510,12 +1996,15 @@ namespace Genesis.RoomScan
                     ProvideColorFrame();
                     _depthCapture?.PreprocessLatestFrame();
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    _volumeIntegrator.Integrate();
+                    bool dispatched = _volumeIntegrator.Integrate();
                     sw.Stop();
                     float iMs = (float)sw.Elapsed.TotalMilliseconds;
                     _emaIntegrateMs = _emaIntegrateMs < 0f ? iMs : Mathf.Lerp(_emaIntegrateMs, iMs, 0.25f);
-                    Integrated?.Invoke();
-                    _integrateCount++;
+                    if (dispatched)
+                    {
+                        Integrated?.Invoke();
+                        _integrateCount++;
+                    }
                     RefreshStatusBadge();
                 }
                 if (!integrateNow && heraDue && _meshExtractor.HasIncrementalHera)
@@ -1555,9 +2044,12 @@ namespace Genesis.RoomScan
 
                 ProvideColorFrame();
                 _depthCapture?.PreprocessLatestFrame();
-                _volumeIntegrator.Integrate();
-                Integrated?.Invoke();
-                _integrateCount++;
+                bool dispatched = _volumeIntegrator.Integrate();
+                if (dispatched)
+                {
+                    Integrated?.Invoke();
+                    _integrateCount++;
+                }
             }
 
             if (meshDue && !integrateThisFrame)
@@ -3169,11 +3661,14 @@ namespace Genesis.RoomScan
                 _lastMeshTime = t;
                 _cameraAvailable = false;
 
+                bool resuming = HasStarted;
+                if (!resuming)
+                    _instantDepthShellOverlay?.ResetProductionWitnessLedger();
+
                 // 阶段 3：相机 + 深度（此时启动安全）
                 _cameraProvider?.StartCapture();
                 _depthCapture.StartDepthCapture();
 
-                bool resuming = HasStarted;
                 // 新空卷必须从第一帧开始建独立回放契约；若等扫到一半才手动开，
                 // 离线端缺少初始 TSDF/候选状态，形式上有文件却不能从零复现。
                 if (!resuming && !_depthCapture.PairedFrameCaptureActive)
@@ -3196,6 +3691,7 @@ namespace Genesis.RoomScan
                         _meshExtractor.BeginIncrementalHera(abMaxChunksPerTick);
                 }
                 _depthPointCloudOverlay?.SetAcquiring(true);
+                _instantDepthShellOverlay?.SetAcquiring(true);
                 if (!resuming) _gunGelCourtOverlay?.SetSealed(false);
                 HasStarted = true;
                 _hudStatus = resuming ? "扫描中(继续)" : "扫描中";
@@ -3222,6 +3718,7 @@ namespace Genesis.RoomScan
             IsScanning = false;
 
             _depthPointCloudOverlay?.SetAcquiring(false);
+            _instantDepthShellOverlay?.SetAcquiring(false);
 
             _cameraProvider?.StopCapture();
             _depthCapture.StopDepthCapture();
@@ -3409,6 +3906,7 @@ namespace Genesis.RoomScan
 
             _volumeIntegrator.Clear();
             _volumeIntegrator.ResetSessionCounters();
+            _instantDepthShellOverlay?.ResetProductionWitnessLedger();
             yield return null;
             if (_meshExtractor.IsInitialized)
                 _meshExtractor.DisposeOnly(); // 下一次扳机分帧重建，避免 B 键同帧释放+重分配
@@ -3421,15 +3919,26 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// X：关 → 枪胶裁决海 → BB 反投影 → 关。裁决海绿=稳定候选、红=锁存浪头；
-        /// 两层均不写 TSDF，显示开关不改变数据账。
+        /// X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳独显 → 壳纸合流
+        /// → 合流仅纸 → 关。“合流仅纸”保留同一次生产纸状态，只隐藏
+        /// 即时壳；已经跨视角确认需要纠正的局部同时撤销绘制权，
+        /// 直到两个独立安全支撑视角恢复候选，且纸面真正贴合新目标。
+        /// 即时外壳只读当前清洗深度，短寿命三角膜不写 TSDF；通过独立视角
+        /// 复核的三角仅发布存在证词，供后续原始深度辅助已有 provisional 转正；
+        /// 在该档按 A 只钉住诊断快照，生产扫描继续。
         /// </summary>
         public void ToggleCoverageMarkers()
         {
-            if (_depthPointCloudOverlay == null || _gunGelCourtOverlay == null) return;
+            if (_depthPointCloudOverlay == null || _gunGelCourtOverlay == null ||
+                _instantDepthShellOverlay == null) return;
             bool courtWasVisible = _gunGelCourtOverlay.Visible;
             bool bbWasVisible = _depthPointCloudOverlay.Visible;
-            bool enteringDiagnostic = !courtWasVisible && !bbWasVisible;
+            bool shellWasVisible = _instantDepthShellOverlay.Visible;
+            bool shellWasComposite = shellWasVisible &&
+                                     _instantDepthShellOverlay.CompositeWithProduction;
+            bool paperOnlyWasVisible = _shellPaperOnlyView;
+            bool enteringDiagnostic = !paperOnlyWasVisible &&
+                                      !courtWasVisible && !bbWasVisible && !shellWasVisible;
 
             // 旧 TSDF/HERA/纸面会污染融合前层的观察；诊断期间保持隐藏，
             // 视角覆盖账本及生产计算仍在后台继续。
@@ -3448,27 +3957,72 @@ namespace Genesis.RoomScan
 
             if (enteringDiagnostic)
             {
+                _shellPaperOnlyView = false;
                 _depthPointCloudOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetAcquiring(IsScanning);
                 _gunGelCourtOverlay.SetVisible(true);
-                NotifyInput("枪胶裁决海：绿静海/红浪头（A封存）");
+                NotifyInput("枪胶裁决海：红点=浪头≠Reject；框内红十字才是Reject");
             }
             else if (courtWasVisible)
             {
+                _shellPaperOnlyView = false;
                 _gunGelCourtOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetAcquiring(IsScanning);
                 _depthPointCloudOverlay.SetVisible(true);
                 _depthPointCloudOverlay.SetAcquiring(IsScanning);
                 NotifyInput("BB反投影：白正视/洋红掠射");
             }
-            else
+            else if (bbWasVisible)
             {
+                _shellPaperOnlyView = false;
+                _gunGelCourtOverlay.SetVisible(false);
+                _depthPointCloudOverlay.SetVisible(false);
+                _depthPointCloudOverlay.SetAcquiring(false);
+                _instantDepthShellOverlay.SetVisible(true);
+                _instantDepthShellOverlay.SetAcquiring(IsScanning);
+                NotifyInput("即时外壳：绿=共面救回；独立复核证词仅辅助已有候选转正");
+            }
+            else if (shellWasVisible && !shellWasComposite)
+            {
+                // 不重新 SetVisible，避免切合流时清空刚看到的即时壳。纸皮明确
+                // 回到真实 TSDF 生产档，外壳只作为短寿命前景叠加。
+                string route = _meshExtractor != null
+                    ? _meshExtractor.ShowProductionPaperView()
+                    : "无纸皮";
+                _meshExtractor?.SetCoarseSkinVisible(false);
+                showManagementBlockWireOverlay = false;
+                _managementBlockWireOverlay?.SetVisible(false);
+                _instantDepthShellOverlay.SetCompositeWithProduction(true);
+                _shellPaperOnlyView = false;
+                NotifyInput($"壳纸合流：{route}近共面优先；更近即时壳保留前景；拒绝片不参与");
+            }
+            else if (shellWasComposite)
+            {
+                // 不离开 X 诊断链：只撤掉即时壳的上屏，保留已打开的
+                // 原生5cm生产纸皮和后台壳采证，不重选、不重启网格来源。
+                _instantDepthShellOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetAcquiring(IsScanning);
+                _shellPaperOnlyView = true;
+                NotifyInput("合流仅纸：壳已隐藏，只看同一份原生5cm生产网格");
+            }
+            else if (paperOnlyWasVisible)
+            {
+                // 分色观察档已移除；仅纸档后直接退出 X 链。
+                _shellPaperOnlyView = false;
                 _depthPointCloudOverlay.SetVisible(false);
                 _depthPointCloudOverlay.SetAcquiring(false);
                 _gunGelCourtOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetVisible(false);
+                _instantDepthShellOverlay.SetAcquiring(IsScanning);
                 NotifyInput("点诊断：关");
             }
 
             bool diagnosticStillVisible = _gunGelCourtOverlay.Visible ||
-                                          _depthPointCloudOverlay.Visible;
+                                          _depthPointCloudOverlay.Visible ||
+                                          _instantDepthShellOverlay.Visible ||
+                                          _shellPaperOnlyView;
             if (!diagnosticStillVisible && _bbPresentationCaptured)
             {
                 _meshExtractor?.SetCurrentMeshDisplayVisible(_bbRestoreMeshVisible);
@@ -3477,7 +4031,24 @@ namespace Genesis.RoomScan
                 _managementBlockWireOverlay?.SetVisible(_bbRestoreManagementBlocks);
                 _bbPresentationCaptured = false;
             }
+            ApplyDisplayMode();
             RefreshStatusBadge();
+        }
+
+        /// <summary>
+        /// A 在即时外壳档的专用语义：钉住当前短时膜作世界空间对照，不触碰生产冻结。
+        /// 返回 true 表示本次 A 已被影子层消费。
+        /// </summary>
+        public bool TryFreezeInstantShellSnapshot()
+        {
+            if (_instantDepthShellOverlay == null || !_instantDepthShellOverlay.Visible)
+                return false;
+            bool success = _instantDepthShellOverlay.FreezeDiagnosticSnapshot();
+            NotifyInput(success
+                ? "即时外壳快照已钉住；生产仍在采集"
+                : "即时外壳快照未就绪；请先扳机采集");
+            RefreshStatusBadge();
+            return true;
         }
 
         /// <summary>
@@ -3600,8 +4171,148 @@ namespace Genesis.RoomScan
         private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
         private static readonly int ConfidenceVizID = Shader.PropertyToID("_RSConfidenceViz");
         private static readonly int GeometryTruthViewID = Shader.PropertyToID("_RSGeometryTruthView");
+        private static readonly int PaperCorrectionHideActiveID =
+            Shader.PropertyToID("_RSPaperCorrectionHideActive");
+        private static readonly int PaperCorrectionKeyHashID =
+            Shader.PropertyToID("_RSPaperCorrectionKeyHash");
+        private static readonly int PaperCorrectionTargetHashID =
+            Shader.PropertyToID("_RSPaperCorrectionTargetHash");
+        private static readonly int PaperCorrectionHashMaskID =
+            Shader.PropertyToID("_RSPaperCorrectionHashMask");
         private bool _confidenceVizApplied;
         private float _lastConfidenceStatsTime = -10f;
+
+        private void RefreshPaperCorrectionMask()
+        {
+            // Retained only as a compatibility seam for the replay ledger.
+            // Rendering must stay on the last visible native-5-cm baseline.
+            Shader.SetGlobalInt(PaperCorrectionHashMaskID, -1);
+            Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
+        }
+
+        private void RebuildPaperCorrectionHash()
+        {
+            _paperCorrectionCellCount = _paperCorrectionCells.Count;
+            if (_paperCorrectionCellCount == 0)
+            {
+                _paperCorrectionHashMask = -1;
+                Shader.SetGlobalInt(PaperCorrectionHashMaskID, -1);
+                return;
+            }
+
+            int capacity = 64;
+            while (capacity < _paperCorrectionCellCount * 4)
+                capacity <<= 1;
+
+            while (true)
+            {
+                if (_paperCorrectionKeyEntries == null ||
+                    _paperCorrectionKeyEntries.Length != capacity)
+                {
+                    _paperCorrectionKeyEntries = new Vector4[capacity];
+                    _paperCorrectionTargetEntries = new Vector4[capacity];
+                }
+                else
+                {
+                    Array.Clear(_paperCorrectionKeyEntries, 0,
+                        _paperCorrectionKeyEntries.Length);
+                    Array.Clear(_paperCorrectionTargetEntries, 0,
+                        _paperCorrectionTargetEntries.Length);
+                }
+
+                if (TryPopulatePaperCorrectionHash(capacity)) break;
+                capacity <<= 1;
+            }
+
+            if (_paperCorrectionKeyHash == null ||
+                _paperCorrectionKeyHash.count != capacity)
+            {
+                _paperCorrectionKeyHash?.Release();
+                _paperCorrectionTargetHash?.Release();
+                _paperCorrectionKeyHash = new ComputeBuffer(
+                    capacity, sizeof(float) * 4, ComputeBufferType.Structured);
+                _paperCorrectionTargetHash = new ComputeBuffer(
+                    capacity, sizeof(float) * 4, ComputeBufferType.Structured);
+            }
+            _paperCorrectionKeyHash.SetData(_paperCorrectionKeyEntries);
+            _paperCorrectionTargetHash.SetData(_paperCorrectionTargetEntries);
+            _paperCorrectionHashMask = capacity - 1;
+            Shader.SetGlobalBuffer(PaperCorrectionKeyHashID,
+                _paperCorrectionKeyHash);
+            Shader.SetGlobalBuffer(PaperCorrectionTargetHashID,
+                _paperCorrectionTargetHash);
+            Shader.SetGlobalInt(PaperCorrectionHashMaskID,
+                _paperCorrectionHashMask);
+        }
+
+        private bool TryPopulatePaperCorrectionHash(int capacity)
+        {
+            int mask = capacity - 1;
+            for (int i = 0; i < _paperCorrectionCells.Count; i++)
+            {
+                VirtualProbeShadowAdjudicator.PaperCorrectionCell cell =
+                    _paperCorrectionCells[i];
+                if (cell.Axis < 0 || cell.Axis > 5) continue;
+                int axisFamily = cell.Axis / 2;
+                int start = (int)(PaperCorrectionHash(
+                    cell.X, cell.Y, cell.Z, axisFamily) & (uint)mask);
+                bool inserted = false;
+                for (int probe = 0; probe < PaperCorrectionHashProbeCount; probe++)
+                {
+                    int slot = (start + probe) & mask;
+                    Vector4 entry = _paperCorrectionKeyEntries[slot];
+                    if (entry.w == 0f)
+                    {
+                        _paperCorrectionKeyEntries[slot] = new Vector4(
+                            cell.X, cell.Y, cell.Z,
+                            (cell.Mode << 4) | (axisFamily + 1));
+                        _paperCorrectionTargetEntries[slot] = new Vector4(
+                            cell.Target.x, cell.Target.y, cell.Target.z, 0f);
+                        inserted = true;
+                        break;
+                    }
+                    if (Mathf.RoundToInt(entry.x) == cell.X &&
+                        Mathf.RoundToInt(entry.y) == cell.Y &&
+                        Mathf.RoundToInt(entry.z) == cell.Z &&
+                        (Mathf.RoundToInt(entry.w) & 15) == axisFamily + 1)
+                    {
+                        int storedMode = Mathf.RoundToInt(entry.w) >> 4;
+                        if (storedMode == 1 || cell.Mode == 1)
+                        {
+                            entry.w = (1 << 4) | (axisFamily + 1);
+                            _paperCorrectionKeyEntries[slot] = entry;
+                        }
+                        else if (Vector3.Distance(
+                                     _paperCorrectionTargetEntries[slot],
+                                     cell.Target) > 0.015f)
+                        {
+                            // Two recovered targets disagree inside one oriented
+                            // cell: keep it hidden instead of choosing one.
+                            entry.w = (1 << 4) | (axisFamily + 1);
+                            _paperCorrectionKeyEntries[slot] = entry;
+                        }
+                        inserted = true;
+                        break;
+                    }
+                }
+                if (!inserted) return false;
+            }
+            return true;
+        }
+
+        private static uint PaperCorrectionHash(int x, int y, int z,
+            int axisFamily)
+        {
+            unchecked
+            {
+                uint hash = (uint)x * 73856093u;
+                hash ^= (uint)y * 19349663u;
+                hash ^= (uint)z * 83492791u;
+                hash ^= (uint)axisFamily * 2654435761u;
+                hash ^= hash >> 16;
+                return hash;
+            }
+        }
 
         private void SetSafeShaderDefaults()
         {
@@ -3621,6 +4332,10 @@ namespace Genesis.RoomScan
             Shader.SetGlobalFloat(GridSpacingID, meshGridSpacing);
             Shader.SetGlobalFloat(ConfidenceVizID, confidenceViz ? 1f : 0f);
             Shader.SetGlobalFloat(GeometryTruthViewID, geometryTruthView ? 1f : 0f);
+            // Keep the unverified display quarantine de-authorized even when a
+            // stale replay session still owns correction candidates.
+            Shader.SetGlobalInt(PaperCorrectionHashMaskID, -1);
+            Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
         }
     }
 }

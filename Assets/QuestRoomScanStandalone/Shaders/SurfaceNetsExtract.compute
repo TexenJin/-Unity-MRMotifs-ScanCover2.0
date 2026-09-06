@@ -14,6 +14,7 @@
 
 #pragma kernel ClearCounters
 #pragma kernel ClassifyAndEmit
+#pragma kernel BuildFoundationClusters
 #pragma kernel BuildVertexDispatchArgs
 #pragma kernel InitSmooth
 #pragma kernel SmoothVertices
@@ -77,6 +78,15 @@ uint   _CandidateExtractionEpoch;
 uint   _CandidateHistoryUpdateEnabled;
 uint   _CandidateHistoryCapacity;
 uint   _CandidateHistoryMask;
+uint   _FoundationTopologyMode;
+uint   _FoundationCellStride;
+uint   _FoundationFeatureRecognition;
+float  _FoundationNormalClusterDotMin;
+float  _FoundationCornerNormalDotMax;
+float  _FoundationChamferWidthVoxels;
+uint   _FoundationSimplifyEnabled;
+float  _FoundationSimplifyNormalDotMin;
+float  _FoundationSimplifyPlaneResidualVoxels;
 uint   _VisualQualityEnabled;
 
 // ──────────────────────────────────────────────────────────────────
@@ -250,6 +260,47 @@ bool TrySampleObservedSDF(int3 coord, out float value)
     return observed;
 }
 
+// Local TSDF gradient used only by the foundation feature recognizer. It is
+// sampled at each real zero crossing, before the cell's normals/positions are
+// averaged together. Missing neighbours fall back to a one-sided difference;
+// no observation is invented and no value is written back to the TSDF.
+bool TryFoundationGradient(float3 voxelPos, out float3 normal)
+{
+    int3 hi = max((int3)_VoxCount - 2, int3(1, 1, 1));
+    int3 c = clamp((int3)round(voxelPos), int3(1, 1, 1), hi);
+
+    float center;
+    bool centerObserved = TrySampleObservedSDF(c, center);
+    float xp, xm, yp, ym, zp, zm;
+    bool hasXp = TrySampleObservedSDF(c + int3(1, 0, 0), xp);
+    bool hasXm = TrySampleObservedSDF(c - int3(1, 0, 0), xm);
+    bool hasYp = TrySampleObservedSDF(c + int3(0, 1, 0), yp);
+    bool hasYm = TrySampleObservedSDF(c - int3(0, 1, 0), ym);
+    bool hasZp = TrySampleObservedSDF(c + int3(0, 0, 1), zp);
+    bool hasZm = TrySampleObservedSDF(c - int3(0, 0, 1), zm);
+
+    float dx = hasXp && hasXm ? xp - xm :
+               (centerObserved && hasXp ? xp - center :
+               (centerObserved && hasXm ? center - xm : 0.0));
+    float dy = hasYp && hasYm ? yp - ym :
+               (centerObserved && hasYp ? yp - center :
+               (centerObserved && hasYm ? center - ym : 0.0));
+    float dz = hasZp && hasZm ? zp - zm :
+               (centerObserved && hasZp ? zp - center :
+               (centerObserved && hasZm ? center - zm : 0.0));
+
+    float3 gradient = float3(dx, dy, dz);
+    float gradientLengthSq = dot(gradient, gradient);
+    if (gradientLengthSq <= 1e-6)
+    {
+        normal = float3(0.0, 1.0, 0.0);
+        return false;
+    }
+
+    normal = gradient * rsqrt(gradientLengthSq);
+    return true;
+}
+
 // Read-only current-geometry evidence for every emitted Surface-Nets vertex.
 // This projects the already-emitted vertex into the current stereo depth frame;
 // it never changes TSDF fusion, extraction, or topology. The older residual
@@ -375,9 +426,23 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     int3 coord = _MapMin + (int3)id;
     int flatIdx = MapFlatten(coord);
 
-    if (coord.x >= (int)_VoxCount.x - 1 ||
-        coord.y >= (int)_VoxCount.y - 1 ||
-        coord.z >= (int)_VoxCount.z - 1)
+    // The foundation route uses a globally anchored coarse lattice. Skipped
+    // coordinates remain explicit holes in the regional lookup map, while
+    // adjacent coarse cells still share one vertex. Never create a dense mesh
+    // and discard alternating triangles: that would break connectivity.
+    int cellStride = _FoundationTopologyMode != 0u
+        ? max((int)_FoundationCellStride, 1)
+        : 1;
+    int3 coarseRemainder = coord - (coord / cellStride) * cellStride;
+    if (any(coarseRemainder != int3(0, 0, 0)))
+    {
+        _CoordVertMap[flatIdx] = -1;
+        return;
+    }
+
+    if (coord.x >= (int)_VoxCount.x - cellStride ||
+        coord.y >= (int)_VoxCount.y - cellStride ||
+        coord.z >= (int)_VoxCount.z - cellStride)
     {
         _CoordVertMap[flatIdx] = -1;
         return;
@@ -388,8 +453,13 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint numCrossings    = 0;
     uint numBadCrossings = 0;
     uint rejectedUnknownEdges = 0;
+    bool foundationMultipleCrossings = false;
     bool anyObservedEndpoint = false;
-    bool strictObserved = _StrictObservedEdges > 0.5;
+    // Uniform 10 cm foundation cells are allowed to use only real, formally
+    // supported 5 cm samples.  Treating an unknown endpoint as SDF zero was the
+    // old source of coarse bridges across holes and unrelated depth layers.
+    bool strictObserved = _StrictObservedEdges > 0.5 ||
+                          (_FoundationTopologyMode != 0u && cellStride > 1);
     bool traceEndpointSeen = false;
     uint firstAdmissionSource = 0u;
     uint firstConfirmationState = 0u;
@@ -404,14 +474,64 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint confirmedSourceMask = 0u;       // bits 0..2: self/direct/relay seen confirmed
     uint lifecycleRiskMask = 0u;         // bits 0..4: plane/near-abstain/motion(birth-frozen)/retired/fast-promotion
 
+    // Foundation-only feature witnesses. Each group accumulates zero-crossing
+    // positions and their pre-averaging TSDF normals. A third unmatched family
+    // makes the cell ambiguous rather than forcing a false corner.
+    float3 featureNormalSum0 = float3(0.0, 0.0, 0.0);
+    float3 featureNormalSum1 = float3(0.0, 0.0, 0.0);
+    float3 featurePositionSum0 = float3(0.0, 0.0, 0.0);
+    float3 featurePositionSum1 = float3(0.0, 0.0, 0.0);
+    uint featureCount0 = 0u;
+    uint featureCount1 = 0u;
+    bool featureAmbiguous = false;
+
     [unroll]
     for (uint e = 0; e < 12; e++)
     {
-        int3 cA = coord + kCornerOffs[kEdgeA[e]];
-        int3 cB = coord + kCornerOffs[kEdgeB[e]];
+        int3 cA = coord + kCornerOffs[kEdgeA[e]] * cellStride;
+        int3 cB = coord + kCornerOffs[kEdgeB[e]] * cellStride;
 
         float2 sA = _TsdfVolume[cA];
         float2 sB = _TsdfVolume[cB];
+
+        // A 10 cm edge is not sampled as one long chord.  Bracket its zero
+        // crossing on the two native 5 cm segments so depth remains tied to the
+        // fine TSDF.  All three nodes must be formally readable.  Two crossings
+        // on one coarse edge mean multiple layers inside the cell; reject that
+        // cell rather than average the layers into a false surface.
+        if (_FoundationTopologyMode != 0u && cellStride == 2)
+        {
+            int3 cMid = (cA + cB) / 2;
+            float2 sMid = _TsdfVolume[cMid];
+            bool observedA = abs(sA.y) >= _MinWeight;
+            bool observedMid = abs(sMid.y) >= _MinWeight;
+            bool observedB = abs(sB.y) >= _MinWeight;
+            if (!observedA || !observedMid || !observedB)
+            {
+                rejectedUnknownEdges++;
+                continue;
+            }
+
+            bool crossesFirst = (sA.x < 0.0) != (sMid.x < 0.0);
+            bool crossesSecond = (sMid.x < 0.0) != (sB.x < 0.0);
+            if (crossesFirst && crossesSecond)
+            {
+                foundationMultipleCrossings = true;
+                continue;
+            }
+            if (!crossesFirst && !crossesSecond)
+                continue;
+            if (crossesFirst)
+            {
+                cB = cMid;
+                sB = sMid;
+            }
+            else
+            {
+                cA = cMid;
+                sA = sMid;
+            }
+        }
 
         bool emptyA;
         bool emptyB;
@@ -446,8 +566,57 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         {
             if (emptyA || emptyB) numBadCrossings++;
             float t = valA / change;
-            posCoord += (float3)cA + t * (float3)(cB - cA);
+            float3 crossingPosition = (float3)cA + t * (float3)(cB - cA);
+            posCoord += crossingPosition;
             numCrossings++;
+
+            if (_FoundationTopologyMode != 0u &&
+                _FoundationFeatureRecognition != 0u &&
+                !emptyA && !emptyB)
+            {
+                float3 crossingNormal;
+                if (TryFoundationGradient(crossingPosition, crossingNormal))
+                {
+                    if (featureCount0 == 0u)
+                    {
+                        featureNormalSum0 = crossingNormal;
+                        featurePositionSum0 = crossingPosition;
+                        featureCount0 = 1u;
+                    }
+                    else
+                    {
+                        float3 normal0 = normalize(featureNormalSum0);
+                        float alignment0 = dot(crossingNormal, normal0);
+                        float alignment1 = featureCount1 > 0u
+                            ? dot(crossingNormal, normalize(featureNormalSum1))
+                            : -2.0;
+
+                        if (alignment0 >= _FoundationNormalClusterDotMin &&
+                            alignment0 >= alignment1)
+                        {
+                            featureNormalSum0 += crossingNormal;
+                            featurePositionSum0 += crossingPosition;
+                            featureCount0++;
+                        }
+                        else if (featureCount1 == 0u)
+                        {
+                            featureNormalSum1 = crossingNormal;
+                            featurePositionSum1 = crossingPosition;
+                            featureCount1 = 1u;
+                        }
+                        else if (alignment1 >= _FoundationNormalClusterDotMin)
+                        {
+                            featureNormalSum1 += crossingNormal;
+                            featurePositionSum1 += crossingPosition;
+                            featureCount1++;
+                        }
+                        else
+                        {
+                            featureAmbiguous = true;
+                        }
+                    }
+                }
+            }
 
             // Only endpoints of edges that actually contributed a zero
             // crossing may settle the emitted cell's ledgers. Reading all eight
@@ -490,15 +659,80 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             InterlockedAdd(_Counters[3], 1);
     }
 
-    if (numCrossings < 3 || numCrossings == numBadCrossings)
+    if (foundationMultipleCrossings || numCrossings < 3 ||
+        numCrossings == numBadCrossings)
     {
         _CoordVertMap[flatIdx] = -1;
         return;
     }
 
     posCoord /= (float)numCrossings;
+
+    // Two stable, non-opposed normal families describe an actual edge. Fit a
+    // plane to each family, solve their shared corner nearest the ordinary
+    // Surface-Nets point, then retreat a fixed distance along the angle
+    // bisector. That produces one consistent chamfer band instead of letting
+    // a noisy mixture pull every corner cell to a different arbitrary point.
+    bool foundationCorner = false;
+    if (_FoundationTopologyMode != 0u &&
+        _FoundationFeatureRecognition != 0u &&
+        !featureAmbiguous &&
+        featureCount0 >= 2u && featureCount1 >= 2u)
+    {
+        float coherence0 = length(featureNormalSum0) / (float)featureCount0;
+        float coherence1 = length(featureNormalSum1) / (float)featureCount1;
+        float3 featureNormal0 = normalize(featureNormalSum0);
+        float3 featureNormal1 = normalize(featureNormalSum1);
+        float normalDot = dot(featureNormal0, featureNormal1);
+
+        // Nearly opposite families are the two sides of a thin object, not a
+        // bevel. Three-family cells were marked ambiguous above. The upper
+        // bound rejects ordinary curvature and noisy single planes.
+        if (coherence0 >= 0.90 && coherence1 >= 0.90 &&
+            normalDot > -0.25 && normalDot <= _FoundationCornerNormalDotMax)
+        {
+            float3 planePoint0 = featurePositionSum0 / (float)featureCount0;
+            float3 planePoint1 = featurePositionSum1 / (float)featureCount1;
+            float rhs0 = dot(featureNormal0, planePoint0) - dot(featureNormal0, posCoord);
+            float rhs1 = dot(featureNormal1, planePoint1) - dot(featureNormal1, posCoord);
+            float denominator = 1.0 - normalDot * normalDot;
+
+            if (denominator > 0.05)
+            {
+                float alpha = (rhs0 - normalDot * rhs1) / denominator;
+                float beta = (rhs1 - normalDot * rhs0) / denominator;
+                float3 cornerPoint = posCoord + alpha * featureNormal0 + beta * featureNormal1;
+                float3 bisector = featureNormal0 + featureNormal1;
+                float bisectorLengthSq = dot(bisector, bisector);
+
+                if (bisectorLengthSq > 1e-5)
+                {
+                    bisector *= rsqrt(bisectorLengthSq);
+                    float3 chamferDirection = bisector;
+                    // TSDF sign conventions may reverse both normals. Choose
+                    // the side containing the cell's ordinary crossing mean;
+                    // the bevel therefore remains inside the observed cell.
+                    if (dot(chamferDirection, posCoord - cornerPoint) < 0.0)
+                        chamferDirection = -chamferDirection;
+
+                    float maxInset = max(0.0, dot(posCoord - cornerPoint, chamferDirection));
+                    float inset = min(_FoundationChamferWidthVoxels, maxInset);
+                    float3 chamferPoint = cornerPoint + chamferDirection * inset;
+                    float edgeMargin = min(0.15, (float)cellStride * 0.1);
+                    posCoord = clamp(chamferPoint,
+                                     (float3)coord + edgeMargin,
+                                     (float3)(coord + cellStride) - edgeMargin);
+                    // Shading keeps the TSDF-consistent angle-bisector normal;
+                    // only the positional retreat chooses the in-cell side.
+                    gradDir = bisector;
+                    foundationCorner = true;
+                }
+            }
+        }
+    }
+
     float3 worldPos = VoxelCoordToWorld(posCoord);
-    float3 norm     = normalize(gradDir);
+    float3 norm = normalize(gradDir);
 
     float4 col = _ColorVolume[coord];
     // Threshold must stay below ~2/255: after save/load, coverage alpha is quantized to 8-bit
@@ -650,6 +884,131 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
 
     _Vertices[compactIdx]     = v;
     _CoordVertMap[flatIdx]    = (int)compactIdx;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Foundation constrained simplification
+//  Native 5 cm Surface-Nets vertices already own the depth here. This pass
+//  may only alias a complete, planar 2x2x2 group to one representative. It
+//  never re-samples a 10 cm TSDF edge and never merges distinct depth layers.
+// ══════════════════════════════════════════════════════════════════
+[numthreads(4, 4, 4)]
+void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
+{
+    if (_FoundationSimplifyEnabled == 0u || any(id >= _MapCount))
+        return;
+
+    int3 anchor = _MapMin + (int3)id;
+    const int clusterStride = 2;
+    int3 remainder = anchor - (anchor / clusterStride) * clusterStride;
+    if (any(remainder != int3(0, 0, 0)))
+        return;
+
+    int3 clusterMax = anchor + int3(1, 1, 1);
+    if (any(clusterMax >= (int3)_VoxCount) ||
+        !InsideMap(anchor) || !InsideMap(clusterMax))
+        return;
+
+    float3 positionSum = float3(0.0, 0.0, 0.0);
+    float3 normalSum = float3(0.0, 0.0, 0.0);
+    int3 activeMin = int3(1, 1, 1);
+    int3 activeMax = int3(0, 0, 0);
+    uint activeCount = 0u;
+
+    [unroll]
+    for (uint i = 0u; i < 8u; i++)
+    {
+        int3 offset = int3((int)(i & 1u),
+                           (int)((i >> 1u) & 1u),
+                           (int)((i >> 2u) & 1u));
+        int vertexIndex = _CoordVertMap[MapFlatten(anchor + offset)];
+        if (vertexIndex < 0)
+            continue;
+
+        GPUVertex vertex = _Vertices[(uint)vertexIndex];
+        float normalLengthSq = dot(vertex.norm, vertex.norm);
+        if (normalLengthSq <= 0.25)
+            return;
+
+        positionSum += vertex.pos;
+        normalSum += vertex.norm * rsqrt(normalLengthSq);
+        activeMin = min(activeMin, offset);
+        activeMax = max(activeMax, offset);
+        activeCount++;
+    }
+
+    // Four witnesses spanning two tangential axes describe a surface patch.
+    // Smaller/linear sets are usually a hole rim, thin feature or page fringe.
+    if (activeCount < 4u)
+        return;
+    int3 activeSpan = activeMax - activeMin;
+    uint varyingAxes = (activeSpan.x > 0 ? 1u : 0u) +
+                       (activeSpan.y > 0 ? 1u : 0u) +
+                       (activeSpan.z > 0 ? 1u : 0u);
+    if (varyingAxes < 2u)
+        return;
+
+    float normalSumLength = length(normalSum);
+    float normalCoherence = normalSumLength / (float)activeCount;
+    if (normalCoherence < _FoundationSimplifyNormalDotMin || normalSumLength <= 1e-5)
+        return;
+
+    float3 averageNormal = normalSum / normalSumLength;
+    float3 averagePosition = positionSum / (float)activeCount;
+    float maxPlaneResidual = 0.0;
+    float minNormalDot = 1.0;
+    float bestDistanceSq = 1e30;
+    int representativeIndex = -1;
+
+    [unroll]
+    for (uint j = 0u; j < 8u; j++)
+    {
+        int3 offset = int3((int)(j & 1u),
+                           (int)((j >> 1u) & 1u),
+                           (int)((j >> 2u) & 1u));
+        int vertexIndex = _CoordVertMap[MapFlatten(anchor + offset)];
+        if (vertexIndex < 0)
+            continue;
+
+        GPUVertex vertex = _Vertices[(uint)vertexIndex];
+        float3 vertexNormal = normalize(vertex.norm);
+        minNormalDot = min(minNormalDot, dot(vertexNormal, averageNormal));
+        maxPlaneResidual = max(maxPlaneResidual,
+            abs(dot(vertex.pos - averagePosition, averageNormal)));
+        float3 centerDelta = vertex.pos - averagePosition;
+        float centerDistanceSq = dot(centerDelta, centerDelta);
+        if (centerDistanceSq < bestDistanceSq)
+        {
+            bestDistanceSq = centerDistanceSq;
+            representativeIndex = vertexIndex;
+        }
+    }
+
+    float residualLimit = _FoundationSimplifyPlaneResidualVoxels * _VoxSize;
+    if (representativeIndex < 0 ||
+        minNormalDot < _FoundationSimplifyNormalDotMin ||
+        maxPlaneResidual > residualLimit)
+        return;
+
+    // Tangentially centre the representative while preserving the normal
+    // depth of an existing fine vertex. This cannot drift to the midpoint of
+    // two layers because the residual test above rejects such a cluster.
+    GPUVertex representative = _Vertices[(uint)representativeIndex];
+    float signedDepthDelta = dot(averagePosition - representative.pos, averageNormal);
+    representative.pos = averagePosition - averageNormal * signedDepthDelta;
+    representative.norm = averageNormal;
+    _Vertices[(uint)representativeIndex] = representative;
+
+    [unroll]
+    for (uint k = 0u; k < 8u; k++)
+    {
+        int3 offset = int3((int)(k & 1u),
+                           (int)((k >> 1u) & 1u),
+                           (int)((k >> 2u) & 1u));
+        int flatIndex = MapFlatten(anchor + offset);
+        if (_CoordVertMap[flatIndex] >= 0)
+            _CoordVertMap[flatIndex] = representativeIndex;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1363,34 +1722,62 @@ void AuditVisualTriangle(uint index0, uint index1, uint index2, int3 ownerCoord,
 
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
-    if (any(coord - d1 < 0))       return;
-    if (any(coord - d2 < 0))       return;
-    if (any(coord + axis >= (int3)_VoxCount)) return;
+    int topologyStride = _FoundationTopologyMode != 0u
+        ? max((int)_FoundationCellStride, 1)
+        : 1;
+    int3 topologyAxis = axis * topologyStride;
+    int3 topologyD1 = d1 * topologyStride;
+    int3 topologyD2 = d2 * topologyStride;
+
+    if (any(coord - topologyD1 < 0)) return;
+    if (any(coord - topologyD2 < 0)) return;
+    if (any(coord + topologyAxis >= (int3)_VoxCount)) return;
 
     float va;
     float vb;
-    if (_StrictObservedEdges > 0.5)
+    bool strictTopologyEdge = _StrictObservedEdges > 0.5 ||
+                              (_FoundationTopologyMode != 0u && topologyStride > 1);
+    if (strictTopologyEdge)
     {
         bool observedA = TrySampleObservedSDF(coord, va);
-        bool observedB = TrySampleObservedSDF(coord + axis, vb);
+        bool observedB = TrySampleObservedSDF(coord + topologyAxis, vb);
         if (!observedA || !observedB)
         {
             InterlockedAdd(_Counters[4], 1);
             return;
         }
+
+        // Match the vertex classifier: a visible 10 cm edge is backed by all
+        // three native 5 cm samples and exactly one fine zero crossing. Missing
+        // support is a hole; two crossings are multiple layers, not one edge.
+        if (_FoundationTopologyMode != 0u && topologyStride == 2)
+        {
+            float vm;
+            bool observedMid = TrySampleObservedSDF(coord + axis, vm);
+            if (!observedMid)
+            {
+                InterlockedAdd(_Counters[4], 1);
+                return;
+            }
+
+            bool crossesFirst = (va < 0.0) != (vm < 0.0);
+            bool crossesSecond = (vm < 0.0) != (vb < 0.0);
+            if (crossesFirst == crossesSecond)
+                return;
+        }
     }
     else
     {
         va = SampleSDF(coord);
-        vb = SampleSDF(coord + axis);
+        vb = SampleSDF(coord + topologyAxis);
     }
     if ((va < 0) == (vb < 0)) return;
 
     // A chunk may inspect the halo but must never dereference a neighbour
     // outside its regional coordinate map.
-    int3 cb = coord - d1;
-    int3 cc = coord - (d1 + d2);
-    int3 cd = coord - d2;
+    int3 cb = coord - topologyD1;
+    int3 cc = coord - (topologyD1 + topologyD2);
+    int3 cd = coord - topologyD2;
     if (!InsideMap(coord) || !InsideMap(cb) || !InsideMap(cc) || !InsideMap(cd))
         return;
 
@@ -1422,6 +1809,94 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
                                   confirmationA == confirmationD)
         ? min(confirmationA, 3u)
         : 3u;
+
+    // The foundation is a uniform 10 cm topology consumer whose depth remains
+    // bracketed by native 5 cm TSDF samples. It does not inherit the old
+    // per-triangle candidate archive or diagnostic colours.
+    if (_FoundationTopologyMode != 0u)
+    {
+        float3 posA = _Vertices[(uint)a].pos;
+        float3 posB = _Vertices[(uint)b].pos;
+        float3 posC = _Vertices[(uint)c].pos;
+        float3 posD = _Vertices[(uint)d].pos;
+        float diagAC = dot(posA - posC, posA - posC);
+        float diagBD = dot(posB - posD, posB - posD);
+        // A planar coarse cell normally has two almost-equal diagonals. Always
+        // choosing AC in that tie creates a directional comb across the whole
+        // wall. Alternate only near-equal ties using global coarse-cell parity;
+        // a materially shorter diagonal still wins to suppress needle faces.
+        float diagonalTolerance = max(diagAC, diagBD) * 0.05;
+        bool nearTie = abs(diagAC - diagBD) <= diagonalTolerance;
+        uint coarseParity = (uint)(coord.x / topologyStride +
+                                   coord.y / topologyStride +
+                                   coord.z / topologyStride) + axisSlot;
+        bool useAC = nearTie ? ((coarseParity & 1u) == 0u) : (diagAC < diagBD);
+        const uint foundationClass = 2u;
+        uint3 triangle0;
+        uint3 triangle1;
+        if (va < 0 && useAC)
+        {
+            triangle0 = uint3((uint)c, (uint)b, (uint)a);
+            triangle1 = uint3((uint)d, (uint)c, (uint)a);
+        }
+        else if (va < 0)
+        {
+            triangle0 = uint3((uint)d, (uint)b, (uint)a);
+            triangle1 = uint3((uint)d, (uint)c, (uint)b);
+        }
+        else if (useAC)
+        {
+            triangle0 = uint3((uint)a, (uint)c, (uint)d);
+            triangle1 = uint3((uint)a, (uint)b, (uint)c);
+        }
+        else
+        {
+            triangle0 = uint3((uint)a, (uint)b, (uint)d);
+            triangle1 = uint3((uint)b, (uint)c, (uint)d);
+        }
+
+        bool valid0 = triangle0.x != triangle0.y &&
+                      triangle0.y != triangle0.z &&
+                      triangle0.z != triangle0.x;
+        bool valid1 = triangle1.x != triangle1.y &&
+                      triangle1.y != triangle1.z &&
+                      triangle1.z != triangle1.x;
+        if (valid0)
+        {
+            float3 edge01 = _Vertices[triangle0.y].pos - _Vertices[triangle0.x].pos;
+            float3 edge02 = _Vertices[triangle0.z].pos - _Vertices[triangle0.x].pos;
+            float3 faceCross0 = cross(edge01, edge02);
+            valid0 = dot(faceCross0, faceCross0) > 1e-10;
+        }
+        if (valid1)
+        {
+            float3 edge11 = _Vertices[triangle1.y].pos - _Vertices[triangle1.x].pos;
+            float3 edge12 = _Vertices[triangle1.z].pos - _Vertices[triangle1.x].pos;
+            float3 faceCross1 = cross(edge11, edge12);
+            valid1 = dot(faceCross1, faceCross1) > 1e-10;
+        }
+
+        uint emittedIndexCount = (valid0 ? 3u : 0u) + (valid1 ? 3u : 0u);
+        if (emittedIndexCount == 0u)
+            return;
+        uint baseIdx;
+        InterlockedAdd(_Counters[1], emittedIndexCount, baseIdx);
+        uint writeIndex = baseIdx;
+        if (valid0)
+        {
+            _Indices[writeIndex    ] = EncodeCandidateIndex(triangle0.x, foundationClass);
+            _Indices[writeIndex + 1] = EncodeCandidateIndex(triangle0.y, foundationClass);
+            _Indices[writeIndex + 2] = EncodeCandidateIndex(triangle0.z, foundationClass);
+            writeIndex += 3u;
+        }
+        if (valid1)
+        {
+            _Indices[writeIndex    ] = EncodeCandidateIndex(triangle1.x, foundationClass);
+            _Indices[writeIndex + 1] = EncodeCandidateIndex(triangle1.y, foundationClass);
+            _Indices[writeIndex + 2] = EncodeCandidateIndex(triangle1.z, foundationClass);
+        }
+        return;
+    }
 
     // One quad produces two triangles. Both ledgers are audit-only and never
     // change topology, winding, vertex positions, or production admission.

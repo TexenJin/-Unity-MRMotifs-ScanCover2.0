@@ -49,10 +49,10 @@ float gsFrozenVoteQualityMin;  // 穿越票最低质量（防低质掠射噪声�
 float gsFrozenVoteMargin;      // 穿越票矛盾杆（归一化单位，1=截断距离），随距离自适应放大
 uint3 gsFrozenChunkCount;      // 冻结块网格（独立于脏账本块——可更细，v1=32³≈1.6m）
 uint gsFrozenChunkSize;        // 冻结块边长（体素）；0=冻结系统关闭
-float gsFrozenMatureWeight;    // 长熟体素权重门槛：成熟度普查只数 abs(weight)≥此值 的体素。
+float gsFrozenMatureWeight;    // 逐体素冻结资格/成熟度普查下限；冻结同时不得低于可读权重。
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
-RWStructuredBuffer<uint> _CarveStats; // 0..92=既有账；93..167=FOV账；168..176=枪胶逐体素准入账
+RWStructuredBuffer<uint> _CarveStats; // 0..92既有；93..167 FOV；168..176枪胶；177..179旧壳证词；180..197写入生命周期；198弱冻恢复（重叠账）
 // ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
 // 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
 // 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
@@ -90,6 +90,7 @@ float gsDilationBlockRelay;     // 1=两跳及以上接力供料不得播种/增
 float gsDilationBlockSparse;    // 1=路径探针间距过大的长距供料不得播种/增长
 float gsProvisionalSeedWeight;  // 新表面暂存权重，必须低于正式出网阈值
 float gsFormalSurfaceWeight;    // 与 Surface Nets _MinWeight 对齐的正式表面阈值
+float3 gsFrustumPhaseOffset;    // 8相位半体素覆盖；仅抖动采样格，不改变任何准入判据
 float gsDiagnosticAngularSpeed; // 只读：当前深度位姿的平滑头部角速度（deg/s）
 float4x4 gsFusionCorrection;    // 枪胶受保护融合：同帧世界法线随位姿小修正一起旋转；基线=单位阵
 // 噪声模型加权（08-21 造炮，w∝1/σ²(d,θ,ω)）：运动质量分由 C# 按角速度+线速度合成
@@ -126,6 +127,30 @@ int2 gsGunGelObservationGrid;
 int gsGunGelPixelStride;
 float gsGunGelAdmissionEnable;
 
+// ── 经验证即时壳存在证词 ──────────────────────────────────────
+// 这是低分辨率空间 epoch 账，不是深度场。它只能帮助当前合格的原始深度
+// 把已有 provisional 体素转正；不能播种、不能移动 TSDF、不能授权正式面改写。
+StructuredBuffer<uint> gsShellWitnessEpochs;
+int3 gsShellWitnessCellCount;
+int gsShellWitnessStride;
+uint gsShellWitnessEpoch;
+uint gsShellWitnessMaxAge;
+float gsShellWitnessEnable;
+
+bool HasFreshVerifiedShellWitness(uint3 coord)
+{
+    if (gsShellWitnessEnable <= 0.5 || gsShellWitnessEpoch == 0u ||
+        any(gsShellWitnessCellCount <= 0)) return false;
+    int stride = max(gsShellWitnessStride, 1);
+    int3 cell = clamp((int3)coord / stride, int3(0, 0, 0),
+                      gsShellWitnessCellCount - 1);
+    uint index = (uint)(cell.x + gsShellWitnessCellCount.x *
+                 (cell.y + gsShellWitnessCellCount.y * cell.z));
+    uint witnessedAt = gsShellWitnessEpochs[index];
+    return witnessedAt > 0u && gsShellWitnessEpoch >= witnessedAt &&
+           gsShellWitnessEpoch - witnessedAt <= gsShellWitnessMaxAge;
+}
+
 static const uint GUNGEL_OBSERVATION_VALID = 1u << 0;
 static const uint GUNGEL_RAW_AVAILABLE = 1u << 1;
 static const uint GUNGEL_DUAL_AGREE = 1u << 2;
@@ -133,18 +158,15 @@ static const uint GUNGEL_STABLE_MATCH = 1u << 3;
 static const uint GUNGEL_STABLE_DUAL = 1u << 4;
 static const uint GUNGEL_UNOPPOSED = 1u << 5;
 
-// 0=准入；1..7 依次为观测无效/无平台原始/双证冲突/无稳定候选/
-// 候选双证未成熟/候选已有反对票/全分辨率像素与低分辨率枪胶点不相干。
-uint GunGelAdmissionStatus(int2 depthPixel, float3 depthPosition,
-                           float3 depthNormal, float depthRange)
-{
-    if (gsGunGelAdmissionEnable < 0.5)
-        return 0u;
+uint ClassifyDilationDonorPath(int2 donorPx, int2 receiverPx,
+                               float donorDistancePx);
 
-    int stride = max(gsGunGelPixelStride, 1);
-    int2 grid = clamp(depthPixel / stride, int2(0, 0),
-                      max(gsGunGelObservationGrid - 1, int2(0, 0)));
-    uint index = (uint)(grid.y * gsGunGelObservationGrid.x + grid.x);
+// 对一个低分辨率枪胶组执行完整生产准入。这个函数既用于原绑定组，也用于
+// 邻组回退；回退不是放宽门槛，邻组仍必须拥有完整六位生产权限，并且它的
+// 实际观测位置/法线必须重新与当前全分辨率深度点相干。
+uint GunGelGroupAdmissionStatus(uint index, float3 depthPosition,
+                                float3 depthNormal, float depthRange)
+{
     GunGelCorrespondence correspondence = gsGunGelCorrespondences[index];
     uint flags = (uint)round(max(correspondence.sourceValid.w, 0.0));
     if ((flags & GUNGEL_OBSERVATION_VALID) == 0u) return 1u;
@@ -170,6 +192,137 @@ uint GunGelAdmissionStatus(int2 depthPixel, float3 depthPosition,
                 sampleNormal / sampleNormalLength)) < 0.5)
         return 7u;
     return 0u;
+}
+
+// 邻组只能替原组证明“同一连续表面”，不能把另一张平行面借来放行。
+// 外层仍沿用完整枪胶契约；这里再用法向深度残差和深度图路径把跨层、
+// 跨轮廓及跨无效带的证人挡住，并给所有合格证人计算确定性的择优分数。
+bool GunGelNeighbourSameSurfaceBranch(uint index, int2 depthPixel,
+                                      float3 depthPosition,
+                                      float3 depthNormal, float depthRange,
+                                      out float score)
+{
+    score = 1e9;
+    GunGelObservation observation = gsGunGelObservations[index];
+    float3 samplePosition = mul(gsFusionCorrection,
+                                float4(observation.positionSigma.xyz, 1.0)).xyz;
+    float3 sampleNormal = mul((float3x3)gsFusionCorrection,
+                              observation.normalQuality.xyz);
+    float sampleNormalLength = length(sampleNormal);
+    float depthNormalLength = length(depthNormal);
+    if (!(sampleNormalLength > 0.25) || !(depthNormalLength > 0.25))
+        return false;
+
+    float3 depthNormalUnit = depthNormal / depthNormalLength;
+    float3 sampleNormalUnit = sampleNormal / sampleNormalLength;
+    float normalAgreement = abs(dot(depthNormalUnit, sampleNormalUnit));
+    if (normalAgreement < 0.5)
+        return false;
+
+    float sigma = max(observation.positionSigma.w, 0.004);
+    float localityLimit = max(0.06, depthRange * 0.025 + sigma * 3.0);
+    float euclideanResidual = distance(depthPosition, samplePosition);
+    if (euclideanResidual > localityLimit)
+        return false;
+
+    // 不允许邻证跨越一个 5cm 体素去借另一张近平行面。20--35mm 的动态带
+    // 只吸收低分辨率分组量化误差，不承担几何拍平。
+    float branchLimit = min(0.035, max(0.020, sigma * 3.0 + depthRange * 0.003));
+    float normalSeparation = abs(dot(depthPosition - samplePosition,
+                                     depthNormalUnit));
+    if (normalSeparation > branchLimit)
+        return false;
+
+    uint packedPixel = observation.sourceReason.x;
+    int2 sourcePixel = int2((int)(packedPixel & 0xffffu),
+                            (int)((packedPixel >> 16u) & 0xffffu));
+    int2 pmax = int2(gsDepthTexSize) - 1;
+    if (any(sourcePixel < int2(0, 0)) || any(sourcePixel > pmax))
+        return false;
+
+    float sourceDistancePx = length(float2(sourcePixel - depthPixel));
+    if (ClassifyDilationDonorPath(sourcePixel, depthPixel,
+                                  sourceDistancePx) != 0u)
+        return false;
+
+    score = normalSeparation / max(branchLimit, 1e-4) +
+            0.25 * euclideanResidual / max(localityLimit, 1e-4) +
+            (1.0 - normalAgreement);
+    return true;
+}
+
+// 0=准入；1..7 依次为观测无效/无平台原始/双证冲突/无稳定候选/
+// 候选双证未成熟/候选已有反对票/全分辨率像素与低分辨率枪胶点不相干。
+uint GunGelAdmissionStatus(int2 depthPixel, float3 depthPosition,
+                           float3 depthNormal, float depthRange)
+{
+    if (gsGunGelAdmissionEnable < 0.5)
+        return 0u;
+
+    int stride = max(gsGunGelPixelStride, 1);
+    int2 grid = clamp(depthPixel / stride, int2(0, 0),
+                      max(gsGunGelObservationGrid - 1, int2(0, 0)));
+    uint index = (uint)(grid.y * gsGunGelObservationGrid.x + grid.x);
+    uint originalStatus = GunGelGroupAdmissionStatus(
+        index, depthPosition, depthNormal, depthRange);
+    if (originalStatus == 0u)
+        return 0u;
+
+    // 原料无效、原始深度缺失、双证冲突或已有反对票都不能被邻组洗白。
+    // 邻证只解决低分辨率分组把一个正确像素绑错证人的问题。
+    if (originalStatus == 1u || originalStatus == 2u ||
+        originalStatus == 3u || originalStatus == 6u)
+        return originalStatus;
+
+    // 8x8 低分辨率组在折角/物体轮廓处可能由左上采样点代表了另一表面，
+    // 导致组内其余正确深度永久被绑错证人。只在原组失败后搜索相邻八组；
+    // 全部通过完整生产契约且属于同一表面分支的邻组参加择优，消除原先
+    // “左上到右下第一个命中者”造成的方向偏置。
+    bool foundNeighbour = false;
+    float bestScore = 1e9;
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            if (dx == 0 && dy == 0)
+                continue;
+            int2 neighbour = grid + int2(dx, dy);
+            if (any(neighbour < int2(0, 0)) ||
+                any(neighbour >= gsGunGelObservationGrid))
+                continue;
+            uint neighbourIndex =
+                (uint)(neighbour.y * gsGunGelObservationGrid.x + neighbour.x);
+            if (GunGelGroupAdmissionStatus(neighbourIndex, depthPosition,
+                                           depthNormal, depthRange) != 0u)
+                continue;
+            float neighbourScore;
+            if (!GunGelNeighbourSameSurfaceBranch(neighbourIndex, depthPixel,
+                                                   depthPosition, depthNormal,
+                                                   depthRange, neighbourScore))
+                continue;
+            if (neighbourScore < bestScore)
+            {
+                bestScore = neighbourScore;
+                foundNeighbour = true;
+            }
+        }
+    }
+    if (foundNeighbour)
+        return 0u;
+    return originalStatus;
+}
+
+// 枪胶在生产融合中的权限边界：
+//   1/2/4/5 = 没有观测、没有第二路原始深度、没有稳定候选或候选尚未成熟。
+//               这些都只是“无法作证”，不能否决当前已经通过平台深度、法线、
+//               边缘、运动和窄带检查的全分辨率样本。
+//   3/6/7 = 两路深度明确冲突、候选已有反对票，或完整证人与当前像素不在
+//           同一局部表面。它们才是枪胶有权执行的明确局部反证。
+bool GunGelStatusBlocksWrite(uint status)
+{
+    return status == 3u || status == 6u || status == 7u;
 }
 
 #define EXCLUSION_TOP 0.25
@@ -277,6 +430,19 @@ void MarkDirtyChunk(uint3 coord, float2 before, float2 after)
         InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 4u], gsDirtyChunkEpoch);
     if (page.z + 1u < gsFrozenChunkCount.z && pageUpper.z < halo)
         InterlockedMax(_ActivePageBoundaryEpochs[pageFaceBase + 5u], gsDirtyChunkEpoch);
+}
+
+// A mature BLOCK does not imply that every support voxel in it is mature.
+// Use the same per-voxel floor for freeze admission and legacy repair. Do not
+// lower the extraction/read threshold to make an under-supported voxel pass.
+float FreezeSupportWeightFloor()
+{
+    return max(gsFrozenMatureWeight, max(gsDirtyMinWeight, 0.001));
+}
+
+bool IsImmatureFrozenSupport(float signedWeight)
+{
+    return signedWeight < 0.0 && -signedWeight < FreezeSupportWeightFloor();
 }
 
 void WriteTrackedTsdf(uint3 coord, float2 value)
@@ -561,7 +727,13 @@ void Prune(uint3 id : SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void Integrate(uint id : SV_DispatchThreadID)
 {
-    float3 vLocalPos = gsFrustumVolume[id];
+    // A camera-local lattice at exactly the world voxel pitch can repeatedly
+    // round onto the same world cells while leaving adjacent interpolation
+    // corners untouched.  Cycle a centred half-voxel phase across accepted
+    // frames.  The selected cell is still reprojected at its exact world centre
+    // below and must pass every ordinary production gate, so this is coverage
+    // scheduling rather than depth dilation or threshold relaxation.
+    float3 vLocalPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
     float3 vWorldPos = mul(gsDepthViewInv[GS_FUSION_EYE], float4(vLocalPos, 1)).xyz;
     uint3 coord = gsWorldToVoxel(vWorldPos);
     float3 voxPos = gsVoxelToWorld(coord);
@@ -636,12 +808,17 @@ void Integrate(uint id : SV_DispatchThreadID)
     {
         RecordFovLedgerBase(fovLedgerRing, temporalLedgerReason);
         RecordFovLedgerFacing(fovLedgerRing, normDot, 0u);
+        // 180..197 are a read-only near-surface write-lifecycle ledger.  The
+        // projective shadow executes the same kernel, so only production A
+        // (the pass that owns the admission sidecar) is allowed to count it.
+        if (gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[180], 1u); // write opportunity
     }
     bool withinBand = sDistNorm >= -gsVoxMin / gsVoxSize;
 
-    // 真正的生产准入点：从这里往下的种子、增长、冻结票和所有 carve 旁路
-    // 都必须由同帧稳定候选 + 双证词 + 零反对票授权。它不是整帧位姿闸；
-    // 同一帧内不同像素/体素可以分别通过或弃权。168..176 为闭环黑匣子账。
+    // 枪胶只拥有明确反证的局部否决权，不再拥有“证词不齐即断粮”的授权权。
+    // 1/2/4/5 仍进入黑匣子归因，但按弃权处理并交还普通生产门继续裁决；
+    // 3/6/7 才阻止当前样本写入。168..176 保留原始原因分类，181 只数实际阻断。
     if (gsGunGelAdmissionEnable > 0.5)
     {
         uint gunGelStatus = GunGelAdmissionStatus(
@@ -655,8 +832,12 @@ void Integrate(uint id : SV_DispatchThreadID)
                 ? 169u : 169u + gunGelStatus;
             InterlockedAdd(_CarveStats[gunGelLedgerSlot], 1u);
         }
-        if (gunGelStatus != 0u)
+        if (GunGelStatusBlocksWrite(gunGelStatus))
+        {
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[181], 1u); // per-point admission rejected
             return;
+        }
     }
     // 标准 TSDF 窄带约束：法线投影只能改变融合权重/方向语义，不能把原始射线上已经
     // 远离观测表面的体素压成“近零交叉”。前表面(+raw)与后表面(-raw)必须双向约束。
@@ -759,6 +940,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
         }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - exStep, 0.0)));
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[194], 1u);
         return;
     }
 
@@ -777,6 +960,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
         }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - byStep, 0.0)));
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[194], 1u);
         return;
     }
 
@@ -792,10 +977,24 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
         }
         WriteTrackedTsdf(coord, float2(oldCensus.x, max(oldCensus.y - nrStep, 0.0)));
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[194], 1u);
         return;
     }
 
-    if (!valid) return;
+    if (!valid)
+    {
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+        {
+            // Exclusive first-failing production gate, so these four slots
+            // can be reconciled against the opportunity total.
+            uint rejectSlot = !outsideExclusions ? 182u :
+                              (!validSurfaceNormal ? 183u :
+                              (!unoccludedByDilation ? 184u : 185u));
+            InterlockedAdd(_CarveStats[rejectSlot], 1u);
+        }
+        return;
+    }
 
     float distFactor = pow(saturate(1.0 - voxEyeDist / gsMaxUpdateDist), gsNoiseDistExp);
     // 救援降级③：救援样本不再享受 0.5 角度地板。混合斜坡是多帧一致的系统性伪造品，
@@ -1014,6 +1213,18 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     }
 
     float2 old = gsVolumeRW[coord];
+    [branch]
+    if (IsImmatureFrozenSupport(old.y))
+    {
+        // Repair legacy blanket freezes only after the ordinary upstream
+        // admission gates. Sign-only repair preserves TSDF and abs(weight).
+        // All downstream source, motion, contradiction and growth gates still
+        // apply; reopening is NOT an accepted write or a completed hole.
+        old.y = -old.y;
+        gsVolumeRW[coord] = old;
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[198], 1u);
+    }
     if (old.y < 0)
     {
         // 冻结体素穿越票：积分全停，但新观测若与存量几何矛盾，记进所属块票箱，
@@ -1078,6 +1289,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 }
             }
         }
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[197], 1u); // frozen census, observation only
         return; // frozen voxel — skip integration
     }
     float oldVal = old.x;
@@ -1087,6 +1300,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // 弃权邻域写闸执行：只扣（矛盾成立时）不种/不长——切断帘锚点的零星复种
     if (nearAbstain)
     {
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[186], 1u);
         bool c0 = sDistNorm > oldVal + 0.2;
         bool fovCanChallengeStored = observationCanConfirmSurface ||
                                      weight < gsFormalSurfaceWeight;
@@ -1099,6 +1314,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
             }
             WriteTrackedTsdf(coord, float2(oldVal, abstainWeight));
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[194], 1u);
             ConfidenceObserve(coord, oldVal, sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
             {
@@ -1120,6 +1337,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (gsMotionSeedBlock > 0.0 && gsDiagnosticAngularSpeed > gsMotionSeedBlock)
         {
             InterlockedAdd(_CarveStats[90], 1); // 运动种子闸拦截
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[188], 1u);
             return;
         }
         if (seedGateQuality >= MIN_QUALITY_SEED && !rawGateBlock && !dilationPositiveWriteBlocked)
@@ -1140,6 +1359,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             }
             ConfidenceSeed(coord); // 置信度通道：出生记无分歧
             InterlockedAdd(_CarveStats[68], 1);
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[192], 1u); // accepted provisional seed
             InterlockedAdd(_CarveStats[70u + admissionSource], 1u); // 71..73 seed source
             // T2 补洞票：冻块只冻结"已有数据"体素，块内空体素继续积分——所以
             // 冻块里的洞（早冻时没长完的区）后来数据长满，全靠种子出生证明。
@@ -1185,11 +1406,17 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         else if (seedGateQuality >= MIN_QUALITY_SEED && rawGateBlock)
         {
             InterlockedAdd(_CarveStats[rawGateFront ? 8 : 9], 1);
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[189], 1u);
         }
         else if (seedGateQuality >= MIN_QUALITY_SEED && dilationPositiveWriteBlocked)
         {
             InterlockedAdd(_CarveStats[66], 1); // 危险膨胀路径拦播种
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[190], 1u);
         }
+        else if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[187], 1u); // seed quality/support insufficient
         return;
     }
 
@@ -1221,7 +1448,11 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // 权重、置信度或颜色的改写权。否则镜头畸变和位姿/深度时延会把成熟单层
     // 慢慢拉成鼓包、凹陷，甚至用假自由空间票将其啃穿。
     if (!observationCanConfirmSurface && weight >= gsFormalSurfaceWeight)
+    {
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[191], 1u); // FOV/motion authority abstained
         return;
+    }
 
     bool contradicted = sDistNorm > oldVal + 0.2;
     // 自由空间对称扣减：主矛盾通道乘 gsFreeSpaceCarveBoost（默认 2，可关回 1）。
@@ -1240,6 +1471,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
             InterlockedAdd(_CarveStats[rawGateFront ? 8 : 9], 1);
         if (dilationPositiveWriteBlocked)
             InterlockedAdd(_CarveStats[67], 1); // 危险膨胀路径拦增长/改写
+        if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[rawGateBlock ? 189u : 190u], 1u);
         if (contradicted)
         {
             if (fovLedgerNearSurface)
@@ -1248,6 +1481,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
             }
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[194], 1u);
             // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
             ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
@@ -1274,6 +1509,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                 RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
             }
             WriteTrackedTsdf(coord, float2(oldVal, carvedWeight));
+            if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+                InterlockedAdd(_CarveStats[194], 1u);
             // M1.1：折让带内按"一致"记账（Δ=0），见主融合段同款注释
             ConfidenceObserve(coord, oldVal, obsDiscount ? oldVal : sDistNorm, quality); // 矛盾扣分进置信度账
             if (gsWriteAdmissionTrace > 0.5)
@@ -1284,6 +1521,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
                     : 0.0;
             }
         }
+        else if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+            InterlockedAdd(_CarveStats[196], 1u); // readable but vote quantizes to no write
         return;
     }
 
@@ -1297,10 +1536,23 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     float newTsdf = contradicted ? oldVal : lerp(oldVal, sDistNorm, blend);
     // 矛盾帧只扣不增、不挪面：反对票与赞成票同帧抵消或同时拉动几何都是设计缺陷。
     float newWeight = contradicted ? carvedWeight : min(weight + q2obs * gsWeightGrowth, gsMaxWeight); // M1：折让带内权重慢涨
-    // 救援降级①：救援样本不享快速转正——混合斜坡伪造品恰恰能产出"第二次一致原始
-    // 观测"，快速转正对它不是防线而是加速器。救援面只能走自然增长慢慢爬到正式阈值。
+    // 救援样本默认不享快速转正。唯一例外是：同一空间单元已被另一独立视角的
+    // 壳三角复核，并且本帧自己仍是直接原始深度、窄带相干、具备运动/FOV 权限。
+    // 壳证词没有深度，不能替本帧写位置，只解除“救援来源不得快转”这一项限制。
+    bool verifiedShellWitness = HasFreshVerifiedShellWitness(coord);
+    bool shellWitnessPromotionCandidate = observationCanConfirmSurface &&
+                                          !contradicted && grazingPlaneRescued &&
+                                          receiverOwnsRawDepth && rawGeometryConfirmed &&
+                                          abs(oldVal - sDistNorm) <= 0.35 &&
+                                          weight < gsFormalSurfaceWeight;
+    if (gsShellWitnessEnable > 0.5 && shellWitnessPromotionCandidate)
+    {
+        InterlockedAdd(_CarveStats[177], 1u);
+        if (verifiedShellWitness) InterlockedAdd(_CarveStats[178], 1u);
+    }
     bool consistentRawRepeat = observationCanConfirmSurface &&
-                               !contradicted && !grazingPlaneRescued &&
+                               !contradicted &&
+                               (!grazingPlaneRescued || verifiedShellWitness) &&
                                receiverOwnsRawDepth &&
                                rawGeometryConfirmed &&
                                abs(oldVal - sDistNorm) <= 0.35;
@@ -1346,6 +1598,8 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         if (grazingPlaneRescued && gsDiagnosticAngularSpeed > 60.0) InterlockedAdd(_CarveStats[86], 1u);
         if (nearAbstainNeighbour && gsDiagnosticAngularSpeed > 60.0) InterlockedAdd(_CarveStats[87], 1u);
         if (fastPromotionApplied && currentAuditFlags != 0u) InterlockedAdd(_CarveStats[88], 1u);
+        if (fastPromotionApplied && grazingPlaneRescued && verifiedShellWitness)
+            InterlockedAdd(_CarveStats[179], 1u);
     }
     if (weight >= gsFormalSurfaceWeight && newWeight < gsFormalSurfaceWeight)
     {
@@ -1359,6 +1613,12 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         RecordFovLedgerFacing(fovLedgerRing, normDot, 3u);
     }
     WriteTrackedTsdf(coord, float2(newTsdf, newWeight));
+    if (fovLedgerNearSurface && gsWriteAdmissionTrace > 0.5)
+    {
+        InterlockedAdd(_CarveStats[contradicted ? 194u : 193u], 1u);
+        if (!contradicted && newWeight < gsFormalSurfaceWeight)
+            InterlockedAdd(_CarveStats[195], 1u); // accepted, still provisional/weak
+    }
     if (fovLedgerNearSurface && !contradicted)
     {
         RecordFovLedgerPositive(fovLedgerRing, temporalLedgerReason);
@@ -1427,7 +1687,7 @@ void FreezeInFrustum(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= gsVoxCount)) return;
     float2 vol = gsVolumeRW[id];
-    if (vol.y <= 0) return; // empty or already frozen
+    if (vol.y < FreezeSupportWeightFloor()) return; // empty, frozen or still growing
 
     float3 worldPos = gsVoxelToWorld(id);
     float2 uv = ProjectToCameraUV(worldPos);
@@ -1454,7 +1714,7 @@ void UnfreezeInFrustum(uint3 id : SV_DispatchThreadID)
 
 // ──────────────────────────────────────────────────────────────────
 //  逐块可逆冻结执行器：CPU 上传 set/clear 块位图，全体素过一遍翻符号。
-//  set: weight>0 → 翻负（冻结）；clear: weight<0 → 翻正（解冻）。
+//  set: 仅达到逐体素成熟/可读门槛的正权重翻负；clear: 负权重翻正。
 //  abs(weight) 不变 → 提取层符号透明，不标脏、不重提网格；解冻块的
 //  修复由后续正常积分自然标脏驱动。主卷与影子卷由 C# 换绑各跑一次。
 // ──────────────────────────────────────────────────────────────────
@@ -1473,9 +1733,15 @@ void ApplyChunkFreezeMask(uint3 id : SV_DispatchThreadID)
     uint bit = 1u << (chunkIndex & 31u);
 
     float2 vol = gsVolumeRW[id];
-    if (vol.y > 0.0 && (_ChunkFreezeSetMask[word] & bit) != 0u)
-        gsVolumeRW[id] = float2(vol.x, -vol.y);
-    else if (vol.y < 0.0 && (_ChunkFreezeClearMask[word] & bit) != 0u)
+    // Clear wins if both masks are set. Weak positive supports in an otherwise
+    // frozen page retain their normal integration path and dirty-page updates.
+    if ((_ChunkFreezeClearMask[word] & bit) != 0u)
+    {
+        if (vol.y < 0.0)
+            gsVolumeRW[id] = float2(vol.x, -vol.y);
+    }
+    else if (vol.y >= FreezeSupportWeightFloor() &&
+             (_ChunkFreezeSetMask[word] & bit) != 0u)
         gsVolumeRW[id] = float2(vol.x, -vol.y);
 }
 

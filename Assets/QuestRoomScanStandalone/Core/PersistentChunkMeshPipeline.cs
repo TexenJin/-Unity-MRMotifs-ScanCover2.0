@@ -37,6 +37,8 @@ namespace Genesis.RoomScan
             public readonly bool StaticReplay;
             public readonly bool StaticReplayAutoQueueAll;
             public readonly bool HeraFilterCleanTriangles;
+            public readonly bool FoundationAtomicReplacement;
+            public readonly bool ShowCompletedChunksImmediately;
 
             public Config(
                 int haloVoxels,
@@ -57,7 +59,9 @@ namespace Genesis.RoomScan
                 int chunkSize,
                 bool staticReplay,
                 bool staticReplayAutoQueueAll = true,
-                bool heraFilterCleanTriangles = false)
+                bool heraFilterCleanTriangles = false,
+                bool foundationAtomicReplacement = false,
+                bool showCompletedChunksImmediately = false)
             {
                 HaloVoxels = Mathf.Max(1, haloVoxels);
                 MaxChunksPerTick = Mathf.Max(1, maxChunksPerTick);
@@ -78,6 +82,8 @@ namespace Genesis.RoomScan
                 StaticReplay = staticReplay;
                 StaticReplayAutoQueueAll = staticReplayAutoQueueAll;
                 HeraFilterCleanTriangles = heraFilterCleanTriangles;
+                FoundationAtomicReplacement = foundationAtomicReplacement;
+                ShowCompletedChunksImmediately = showCompletedChunksImmediately;
             }
         }
 
@@ -566,6 +572,7 @@ namespace Genesis.RoomScan
         public int CommitWatchdogResets { get; private set; }
         public int ChunkCount => _chunks.Count;
         public int ChunkSize => _config.ChunkSize;
+        public bool IsVisible => _visible && !Failed;
         public int3 ChunkGridCount => _chunkCount;
         public int BuiltChunkCount
         {
@@ -596,6 +603,63 @@ namespace Genesis.RoomScan
                     count += _chunks[i].AcceptedIndices / 3;
                 return count;
             }
+        }
+
+        /// <summary>
+        /// Feeds the immutable committed front buffers to a diagnostic raster
+        /// kernel. Hidden route-validation views still count: the caller is
+        /// auditing the production paper that would be drawn, not the current
+        /// operator display mode. No snapshot, draw argument or admission state
+        /// is modified by this method.
+        /// </summary>
+        internal int DispatchCommittedTrianglesForRelayAudit(
+            ComputeShader diagnosticCompute, int kernel,
+            int verticesId, int indicesId, int vertexCountId,
+            int indexCountId, int localToWorldId,
+            int triangleOffsetId, int triangleCapacityId,
+            int triangleCapacity)
+        {
+            if (_disposed || Failed || diagnosticCompute == null || kernel < 0 ||
+                triangleCapacity <= 0)
+                return 0;
+
+            int dispatchedTriangles = 0;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                GPUChunkMeshSnapshot snapshot = chunk.Snapshot;
+                if (!chunk.Built || !chunk.RequestedVisible || snapshot == null ||
+                    snapshot.VertexBuffer == null || snapshot.IndexBuffer == null)
+                    continue;
+
+                int vertexCount = Mathf.Min(chunk.SnapshotVertexCount,
+                    snapshot.VertexBuffer.count);
+                int indexCount = Mathf.Min(chunk.SnapshotIndexCount,
+                    snapshot.IndexBuffer.count);
+                indexCount -= indexCount % 3;
+                if (vertexCount <= 0 || indexCount <= 0) continue;
+
+                int remainingTriangles = triangleCapacity - dispatchedTriangles;
+                if (remainingTriangles <= 0) break;
+                int dispatchTriangleCount = Mathf.Min(indexCount / 3,
+                    remainingTriangles);
+                int dispatchIndexCount = dispatchTriangleCount * 3;
+
+                diagnosticCompute.SetBuffer(kernel, verticesId, snapshot.VertexBuffer);
+                diagnosticCompute.SetBuffer(kernel, indicesId, snapshot.IndexBuffer);
+                diagnosticCompute.SetInt(vertexCountId, vertexCount);
+                diagnosticCompute.SetInt(indexCountId, dispatchIndexCount);
+                diagnosticCompute.SetInt(triangleOffsetId, dispatchedTriangles);
+                diagnosticCompute.SetInt(triangleCapacityId, triangleCapacity);
+                Matrix4x4 localToWorld = chunk.GameObject != null
+                    ? chunk.GameObject.transform.localToWorldMatrix
+                    : _parent.localToWorldMatrix;
+                diagnosticCompute.SetMatrix(localToWorldId, localToWorld);
+                diagnosticCompute.Dispatch(kernel,
+                    Mathf.CeilToInt(dispatchTriangleCount / 64f), 1, 1);
+                dispatchedTriangles += dispatchTriangleCount;
+            }
+            return dispatchedTriangles;
         }
         public int ReplayCleanPageCount => CountReplayPages(1);
         public int ReplayQuestionablePageCount => CountReplayPages(2);
@@ -747,7 +811,9 @@ namespace Genesis.RoomScan
 
         private void ApplyVisibility()
         {
-            bool show = _visible && (_config.StaticReplay || InitialBuildComplete) && !Failed;
+            bool show = _visible &&
+                (_config.StaticReplay || InitialBuildComplete || _config.ShowCompletedChunksImmediately) &&
+                !Failed;
             for (int i = 0; i < _chunks.Count; i++)
             {
                 if (_chunks[i].Renderer != null)
@@ -946,6 +1012,12 @@ namespace Genesis.RoomScan
         private void BuildLayout()
         {
             int chunkSize = _config.ChunkSize;
+            // The uniform 10 cm foundation needs its native 5 cm midpoint and
+            // neighbouring coarse-cell identities at page seams. This halo is
+            // read support only; it grants no additional emit ownership.
+            int haloVoxels = _config.FoundationAtomicReplacement
+                ? math.max(_config.HaloVoxels, 2)
+                : _config.HaloVoxels;
             int3 voxels = _volume.VoxelCount;
             int3 cellCount = math.max(voxels - 1, 0);
             _chunkCount = (cellCount + chunkSize - 1) / chunkSize;
@@ -960,8 +1032,8 @@ namespace Genesis.RoomScan
                 // Core cells are half-open.  One extra voxel is needed because a
                 // cell samples its +XYZ corners; the remaining halo feeds smoothing
                 // and neighbouring-cell topology without granting emit ownership.
-                int3 mapMin = math.max(coreMin - _config.HaloVoxels, 0);
-                int3 mapMax = math.min(coreMax + _config.HaloVoxels + 1, voxels);
+                int3 mapMin = math.max(coreMin - haloVoxels, 0);
+                int3 mapMax = math.min(coreMax + haloVoxels + 1, voxels);
                 int index = Flatten(coord);
                 _chunks.Add(new Chunk
                 {
@@ -1001,6 +1073,39 @@ namespace Genesis.RoomScan
                 DiagnosticRoiRect = _config.DiagnosticRoiRect,
                 DiagnosticRoiSplitX = _config.DiagnosticRoiSplitX
             };
+            if (_config.FoundationAtomicReplacement)
+            {
+                // Foundation mesh is a lean, reversible view of the stable
+                // TSDF. It must not inherit HERA maturity history, post-mesh
+                // smoothing or another dense temporal volume.
+                chunk.Surface.CandidateHistoryUpdateEnabled = false;
+                chunk.Surface.FoundationTopologyMode = true;
+                // Diagnostic baseline: expose the native 5 cm Surface-Nets
+                // topology directly.  This removes the coarse-cell amplification
+                // from coverage diagnosis, so a visible hole maps back to the
+                // TSDF support that actually failed instead of one missing fine
+                // sample suppressing several neighbouring 10 cm cells/quads.
+                // This is one scale only; the direct 10 cm topology is dormant.
+                chunk.Surface.FoundationCellStride = 1;
+                // The attempted corner chamfer consumed those already-aliased
+                // coarse vertices and amplified their displacement. Keep the
+                // feature path dormant until it operates on a depth-faithful
+                // fine surface rather than raw coarse TSDF corners.
+                chunk.Surface.FoundationFeatureRecognition = false;
+                chunk.Surface.FoundationNormalClusterDotMin = 0.8660254f; // 30 degrees
+                chunk.Surface.FoundationCornerNormalDotMax = 0.7071068f;  // 45 degrees
+                chunk.Surface.FoundationChamferWidthVoxels = 0f;
+                // Keep the old conditional 5->10 collapse disabled.  The
+                // diagnostic baseline must remain uniformly native 5 cm rather
+                // than reintroducing a mixed 5/10 cm display.
+                chunk.Surface.FoundationConstrainedSimplification = false;
+                chunk.Surface.FoundationSimplifyNormalDotMin = 0.9659258f; // 15 degrees
+                chunk.Surface.FoundationSimplifyPlaneResidualVoxels = 0.2f; // ~1 cm
+                chunk.Surface.SmoothIterations = 0;
+                chunk.Surface.TemporalAlphaMax = 1f;
+                chunk.Surface.TemporalAlphaMin = 1f;
+                chunk.Surface.VisualQualityDiagnosticsEnabled = false;
+            }
             chunk.Surface.EnsureBuffers(
                 _volume.VoxelCount,
                 chunk.MapMin,
@@ -1027,26 +1132,31 @@ namespace Genesis.RoomScan
                 // HERA owns its presentation classes. Legacy pink isolation is
                 // not allowed to remove a triangle after the HERA identity
                 // ledger accepted it into the final stream.
-                chunk.Renderer.SetPinkIsolation(!(_config.StaticReplay && _config.HeraFilterCleanTriangles));
+                chunk.Renderer.SetPinkIsolation(
+                    !_config.FoundationAtomicReplacement &&
+                    !(_config.StaticReplay && _config.HeraFilterCleanTriangles));
                 chunk.Renderer.RenderVisible = false;
 
-                chunk.HeraInteriorShadowRenderer = chunk.GameObject.AddComponent<GPUMeshRenderer>();
-                chunk.HeraInteriorShadowRenderer.GpuMeshMaterial = _material;
-                chunk.HeraInteriorShadowRenderer.Initialize(null, GetPaddedCoreBounds(chunk));
-                chunk.HeraInteriorShadowRenderer.SetHeraLocalAcceptedPatchDisplay(_diagnosticColoring);
-                // This exact local-patch stream is already isolated by its own
-                // index buffer and must not be filtered a second time.
-                chunk.HeraInteriorShadowRenderer.SetPinkIsolation(false);
-                chunk.HeraInteriorShadowRenderer.RenderVisible = false;
+                if (_config.StaticReplay && _config.HeraFilterCleanTriangles)
+                {
+                    chunk.HeraInteriorShadowRenderer = chunk.GameObject.AddComponent<GPUMeshRenderer>();
+                    chunk.HeraInteriorShadowRenderer.GpuMeshMaterial = _material;
+                    chunk.HeraInteriorShadowRenderer.Initialize(null, GetPaddedCoreBounds(chunk));
+                    chunk.HeraInteriorShadowRenderer.SetHeraLocalAcceptedPatchDisplay(_diagnosticColoring);
+                    // This exact local-patch stream is already isolated by its own
+                    // index buffer and must not be filtered a second time.
+                    chunk.HeraInteriorShadowRenderer.SetPinkIsolation(false);
+                    chunk.HeraInteriorShadowRenderer.RenderVisible = false;
 
-                chunk.HeraBoundaryShadowRenderer = chunk.GameObject.AddComponent<GPUMeshRenderer>();
-                chunk.HeraBoundaryShadowRenderer.GpuMeshMaterial = _material;
-                chunk.HeraBoundaryShadowRenderer.Initialize(null, GetPaddedCoreBounds(chunk));
-                chunk.HeraBoundaryShadowRenderer.SetHeraLocalAcceptedPatchDisplay(_diagnosticColoring);
-                // Boundary triangles are copied from the canonical source-page
-                // index stream; this renderer must not classify them again.
-                chunk.HeraBoundaryShadowRenderer.SetPinkIsolation(false);
-                chunk.HeraBoundaryShadowRenderer.RenderVisible = false;
+                    chunk.HeraBoundaryShadowRenderer = chunk.GameObject.AddComponent<GPUMeshRenderer>();
+                    chunk.HeraBoundaryShadowRenderer.GpuMeshMaterial = _material;
+                    chunk.HeraBoundaryShadowRenderer.Initialize(null, GetPaddedCoreBounds(chunk));
+                    chunk.HeraBoundaryShadowRenderer.SetHeraLocalAcceptedPatchDisplay(_diagnosticColoring);
+                    // Boundary triangles are copied from the canonical source-page
+                    // index stream; this renderer must not classify them again.
+                    chunk.HeraBoundaryShadowRenderer.SetPinkIsolation(false);
+                    chunk.HeraBoundaryShadowRenderer.RenderVisible = false;
+                }
             }
         }
 
@@ -1094,6 +1204,21 @@ namespace Genesis.RoomScan
                     RequestHeraFilteredCommit(
                         chunk, candidateEpoch, vertices, indices, requestGeneration,
                         spatialMature, spatialOccupancy);
+                    return;
+                }
+                if (_config.FoundationAtomicReplacement)
+                {
+                    // One completed candidate replaces exactly one chunk front.
+                    // No append-only salvage, maturity colour, or old topology
+                    // survives this transaction. The previous immutable front
+                    // remains visible until CopyCurrentMeshTo has been queued.
+                    RecordLocalReplacement(
+                        chunk, candidateEpoch, vertices, indices, spatialOccupancy,
+                        true, "foundation_atomic_replace");
+                    PublishFullCandidate(
+                        chunk, candidateEpoch, vertices, indices,
+                        spatialMature, spatialOccupancy);
+                    FinishCandidateCommit(chunk, candidateEpoch);
                     return;
                 }
                 bool spatialDestructive = IsSpatialRegression(chunk, spatialMature);
@@ -2179,7 +2304,8 @@ namespace Genesis.RoomScan
                 ApplyVisibility();
                 Logger.Info($"Persistent chunk mesh takeover ready: chunks={_chunks.Count}");
             }
-            else if (InitialBuildComplete || _config.StaticReplay)
+            else if (InitialBuildComplete || _config.StaticReplay ||
+                     _config.ShowCompletedChunksImmediately)
             {
                 chunk.Renderer.RenderVisible = _visible && chunk.RequestedVisible && chunk.Built &&
                     chunk.Snapshot != null && chunk.AcceptedIndices > 0;

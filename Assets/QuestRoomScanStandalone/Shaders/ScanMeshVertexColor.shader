@@ -21,7 +21,6 @@ Shader "Genesis/ScanMeshVertexColor"
             // not make triangle winding a visibility/admission rule: ceiling
             // triangles can legitimately be wound away from the headset.
             Cull Off
-
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag

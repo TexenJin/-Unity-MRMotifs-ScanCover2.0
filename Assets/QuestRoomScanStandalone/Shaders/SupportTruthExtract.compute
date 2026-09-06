@@ -16,6 +16,7 @@ int3  _VoxCount;
 float _VoxSize;
 int   _SupportStride;
 float _SupportMinWeight;
+float _SupportProductionMinWeight;
 int3  _SupportSampleCount;
 uint  _SupportMaxPoints;
 uint  _SupportMaxTopologyIndices;
@@ -27,7 +28,8 @@ int3  _SupportTopologyCellCount;
 RWStructuredBuffer<float4> _SupportPoints;       // xyz=world position, w=min endpoint weight
 RWStructuredBuffer<float4> _SupportNormals;      // xyz=TSDF normal, w=topology class 0..3
 // x=node*3+axis. y packs persistent paper evidence:
-// bits 0..7 confirmations, 8..15 missing-without-evidence, 16..23 conflicts.
+// bits 0..7 audit confirmations, 8..15 missing-without-evidence,
+// 16..23 conflicts, 24..31 production-qualified confirmations.
 RWStructuredBuffer<uint2>  _SupportPointCells;
 RWStructuredBuffer<int>    _SupportCellPointMap; // node*3+axis -> point (-1 = no crossing)
 // 0=points 1=point overflow 2=topology indices 3=index overflow
@@ -44,6 +46,11 @@ RWStructuredBuffer<uint2>  _SupportTopologyCellStates;
 // labels for the guarded multi-sheet fallback.  Published topology therefore
 // owns geometry as well as connectivity.
 RWStructuredBuffer<uint4>  _SupportTopologyCellGeometry;
+// Read-only production audit written once per topology-cell dispatch.
+// x packs raw/mature edge masks plus lifecycle flags; y packs the first
+// topology break, evidence counts and attempted triangles. No audit value is
+// consumed by extraction, adjudication or rendering.
+RWStructuredBuffer<uint2>  _SupportTopologyCellAudit;
 RWStructuredBuffer<uint>   _SupportDrawArgs;     // independent-Surfel indirect args
 RWStructuredBuffer<uint>   _SupportTopologyDrawArgs;
 
@@ -60,6 +67,44 @@ static const uint kTopologyFaceShift = 12u;
 static const uint kTopologyOwnedBit = 1u << 24u;
 static const uint kTopologyClusterFallbackBit = 1u << 25u;
 
+static const uint kAuditHadPublished       = 1u << 0u;
+static const uint kAuditCandidateClosed    = 1u << 1u;
+static const uint kAuditCommitting         = 1u << 2u;
+static const uint kAuditClosedRing         = 1u << 3u;
+static const uint kAuditFallback           = 1u << 4u;
+static const uint kAuditFinalPublished     = 1u << 5u;
+static const uint kAuditVertexOverflow     = 1u << 6u;
+
+static const uint kAuditCauseNoRawCrossing     = 1u;
+static const uint kAuditCauseRawInsufficient   = 2u;
+static const uint kAuditCauseRawNotMature      = 3u;
+static const uint kAuditCauseFaceParityOpen    = 4u;
+static const uint kAuditCauseClosedGraphFailed = 5u;
+static const uint kAuditCauseFallbackRejected  = 6u;
+static const uint kAuditCauseCandidateEmitted  = 7u;
+static const uint kAuditCausePublishedReplay   = 8u;
+static const uint kAuditCauseVertexOverflow    = 9u;
+static const uint kAuditCauseOtherNoEmit       = 10u;
+static const uint kAuditCausePublishedMissing  = 11u;
+
+void WriteTopologyCellAudit(int flat, uint rawEdgeMask, uint matureEdgeMask,
+    uint flags, uint cause, uint oddFaceCount, uint materializedEdgeCount,
+    uint maxSheetCount, uint triangleAttempts, uint revocationEvidence)
+{
+    uint packedMasks = (rawEdgeMask & 0x0FFFu) |
+        ((matureEdgeMask & 0x0FFFu) << 12u) |
+        ((flags & 0xFFu) << 24u);
+    uint packedCause = (cause & 0x0Fu) |
+        ((countbits(rawEdgeMask) & 0x0Fu) << 4u) |
+        ((countbits(matureEdgeMask) & 0x0Fu) << 8u) |
+        ((min(oddFaceCount, 7u) & 0x07u) << 12u) |
+        ((min(materializedEdgeCount, 15u) & 0x0Fu) << 15u) |
+        ((min(maxSheetCount, 15u) & 0x0Fu) << 19u) |
+        ((min(triangleAttempts, 15u) & 0x0Fu) << 23u) |
+        ((min(revocationEvidence, 31u) & 0x1Fu) << 27u);
+    _SupportTopologyCellAudit[flat] = uint2(packedMasks, packedCause);
+}
+
 uint PaperConfirmationCount(uint state)
 {
     return state & kPaperStateMask;
@@ -75,11 +120,18 @@ uint PaperConflictCount(uint state)
     return (state >> 16u) & kPaperStateMask;
 }
 
-uint PackPaperState(uint confirmations, uint missing, uint conflicts)
+uint PaperProductionConfirmationCount(uint state)
+{
+    return (state >> 24u) & kPaperStateMask;
+}
+
+uint PackPaperState(uint confirmations, uint missing, uint conflicts,
+    uint productionConfirmations)
 {
     return min(confirmations, kPaperStateMask) |
         (min(missing, kPaperStateMask) << 8u) |
-        (min(conflicts, kPaperStateMask) << 16u);
+        (min(conflicts, kPaperStateMask) << 16u) |
+        (min(productionConfirmations, kPaperStateMask) << 24u);
 }
 
 int FlattenSampleCell(int3 c)
@@ -205,8 +257,10 @@ void SupportEmitCrossings(uint3 id : SV_DispatchThreadID)
         _SupportNormals[pointIndex] = float4(
             EstimateNormal(crossingPosition, step), 0.0);
         uint mapIndex = (uint)(flat * 3 + axis);
+        uint productionConfirmations = crossingWeight >= _SupportProductionMinWeight
+            ? 1u : 0u;
         _SupportPointCells[pointIndex] = uint2(
-            mapIndex, PackPaperState(1u, 0u, 0u));
+            mapIndex, PackPaperState(1u, 0u, 0u, productionConfirmations));
         _SupportCellPointMap[mapIndex] = (int)pointIndex;
     }
 }
@@ -232,6 +286,7 @@ void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
         return;
 
     uint confirmations = max(PaperConfirmationCount(previousState), 1u);
+    uint productionConfirmations = PaperProductionConfirmationCount(previousState);
     uint missing = PaperMissingCount(previousState);
     uint conflicts = PaperConflictCount(previousState);
     int currentIndex = _SupportCellPointMap[mapIndex];
@@ -249,6 +304,9 @@ void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
         if (positionGap <= compatibleGap)
         {
             uint refinedConfirmations = min(confirmations + 1u, 255u);
+            uint refinedProductionConfirmations = currentPoint.w >= _SupportProductionMinWeight
+                ? min(productionConfirmations + 1u, 255u)
+                : productionConfirmations;
             float refinement = 1.0 / (float)min(refinedConfirmations, 8u);
             currentPoint.xyz = lerp(previousPoint.xyz, currentPoint.xyz, refinement);
             currentPoint.w = max(previousPoint.w, currentPoint.w);
@@ -261,19 +319,21 @@ void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
                     blendedNormal * rsqrt(normalLengthSq), 0.0);
             _SupportPoints[currentIndex] = currentPoint;
             _SupportPointCells[currentIndex] = uint2(mapIndex,
-                PackPaperState(refinedConfirmations, 0u, 0u));
+                PackPaperState(refinedConfirmations, 0u, 0u,
+                    refinedProductionConfirmations));
         }
         else
         {
             uint nextConflicts = min(conflicts + 1u, 255u);
-            if (confirmations >= kPaperOwnedConfirmations &&
+            if (productionConfirmations >= kPaperOwnedConfirmations &&
                 nextConflicts < kPaperReplaceConflicts)
             {
                 _SupportPoints[currentIndex] = previousPoint;
                 _SupportNormals[currentIndex] = float4(
                     _SupportPreviousNormals[id.x].xyz, 0.0);
                 _SupportPointCells[currentIndex] = uint2(mapIndex,
-                    PackPaperState(confirmations, 0u, nextConflicts));
+                    PackPaperState(confirmations, 0u, nextConflicts,
+                        productionConfirmations));
             }
             // At the third conflict the fresh point already in currentIndex is
             // accepted as a new candidate; its state from Emit remains 1/0/0.
@@ -292,8 +352,12 @@ void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
                              int3(0, 0, _SupportStride);
     float2 sampleA = _TsdfVolume[a];
     float2 sampleB = _TsdfVolume[a + step];
-    bool endpointsObserved = abs(sampleA.y) >= _SupportMinWeight &&
-                             abs(sampleB.y) >= _SupportMinWeight;
+    // A weak audit observation may keep a candidate visible, but it cannot
+    // contradict or retire production-owned paper.
+    float contradictionWeight = productionConfirmations >= kPaperOwnedConfirmations
+        ? _SupportProductionMinWeight : _SupportMinWeight;
+    bool endpointsObserved = abs(sampleA.y) >= contradictionWeight &&
+                             abs(sampleB.y) >= contradictionWeight;
     bool stillCrosses = (sampleA.x <= 0.0 && sampleB.x >= 0.0) ||
                         (sampleB.x <= 0.0 && sampleA.x >= 0.0);
     bool explicitConflict = endpointsObserved && !stillCrosses;
@@ -333,7 +397,8 @@ void SupportRetainPrevious(uint3 id : SV_DispatchThreadID)
     _SupportPoints[pointIndex] = _SupportPreviousPoints[id.x];
     _SupportNormals[pointIndex] = float4(_SupportPreviousNormals[id.x].xyz, 0.0);
     _SupportPointCells[pointIndex] = uint2(mapIndex,
-        PackPaperState(confirmations, nextMissing, nextConflicts));
+        PackPaperState(confirmations, nextMissing, nextConflicts,
+            productionConfirmations));
     _SupportCellPointMap[mapIndex] = (int)pointIndex;
 }
 
@@ -578,7 +643,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         evidencePointIndices[gatherEdge] = pointIndex;
         rawEdgeMask |= 1u << gatherEdge;
         uint pointState = _SupportPointCells[pointIndex].y;
-        if (PaperConfirmationCount(pointState) >= kPaperOwnedConfirmations &&
+        if (PaperProductionConfirmationCount(pointState) >= kPaperOwnedConfirmations &&
             PaperConflictCount(pointState) < kPaperReplaceConflicts)
             candidateEdgeMask |= 1u << gatherEdge;
     }
@@ -590,7 +655,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
     {
         int3 node = cell + kTopologyCornerNode[cornerIndex];
         cornerSamples[cornerIndex] = _TsdfVolume[node * _SupportStride];
-        if (abs(cornerSamples[cornerIndex].y) < _SupportMinWeight)
+        if (abs(cornerSamples[cornerIndex].y) < _SupportProductionMinWeight)
             allCornersObserved = false;
     }
 
@@ -601,6 +666,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         (publishedState.x >> kTopologyFaceShift) & 0x3Fu;
     bool hasPublishedTopology =
         (publishedState.x & kTopologyOwnedBit) != 0u;
+    bool hadPublishedAtStart = hasPublishedTopology;
     bool publishedUsesClusterFallback =
         (publishedState.x & kTopologyClusterFallbackBit) != 0u;
     uint4 publishedGeometry = _SupportTopologyCellGeometry[topologyFlat];
@@ -609,6 +675,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
     // crossings. That guarantees a closed face-contour graph before the old
     // topology is touched; 1/3-edge partial candidates wait in shadow.
     bool candidateClosed = countbits(candidateEdgeMask) >= 3u;
+    uint candidateOddFaceCount = 0u;
     [unroll]
     for (uint candidateFaceIndex = 0u; candidateFaceIndex < 6u; candidateFaceIndex++)
     {
@@ -619,7 +686,10 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
             ((candidateEdgeMask >> faceEdges.z) & 1u) +
             ((candidateEdgeMask >> faceEdges.w) & 1u);
         if (faceCount == 1u || faceCount == 3u)
+        {
             candidateClosed = false;
+            candidateOddFaceCount++;
+        }
     }
 
     // Published geometry is a cell-local snapshot and no longer depends on the
@@ -656,15 +726,16 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         publishedPointsAvailable = false;
     }
 
-    // A never-published cell may use a guarded multi-sheet fallback even when
-    // face parity is incomplete.  This fills complex desk/edge cells only when
-    // their points can be separated into coherent surface sheets.
-    bool candidateFallbackEligible = countbits(candidateEdgeMask) >= 3u;
-    bool committingCandidate = candidateClosed ||
-        (!hasPublishedTopology && candidateFallbackEligible);
+    // Production publication is closed-topology only. Candidate-assisted
+    // multi-sheet fallback remains diagnostic code below, but can no longer
+    // acquire ownership or publish a guessed fan into the final paper.
+    bool committingCandidate = candidateClosed;
     bool forceClusterFallback =
         (committingCandidate && !candidateClosed) ||
         (!committingCandidate && publishedUsesClusterFallback);
+    uint auditFlags = hadPublishedAtStart ? kAuditHadPublished : 0u;
+    if (candidateClosed) auditFlags |= kAuditCandidateClosed;
+    if (committingCandidate) auditFlags |= kAuditCommitting;
     uint selectedEdgeMask = committingCandidate
         ? candidateEdgeMask
         : publishedPointsAvailable ? publishedEdgeMask : 0u;
@@ -674,6 +745,19 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         if (hasPublishedTopology)
             _SupportTopologyCellStates[topologyFlat] = uint2(
                 publishedState.x, cellRevocationEvidence);
+        if (hasPublishedTopology) auditFlags |= kAuditFinalPublished;
+        uint earlyCause = rawEdgeMask == 0u
+            ? kAuditCauseNoRawCrossing
+            : countbits(rawEdgeMask) < 3u
+                ? kAuditCauseRawInsufficient
+                : countbits(candidateEdgeMask) < 3u
+                    ? kAuditCauseRawNotMature
+                : candidateOddFaceCount > 0u
+                    ? kAuditCauseFaceParityOpen
+                    : kAuditCauseOtherNoEmit;
+        WriteTopologyCellAudit(topologyFlat, rawEdgeMask, candidateEdgeMask,
+            auditFlags, earlyCause, candidateOddFaceCount, 0u, 0u, 0u,
+            cellRevocationEvidence);
         return;
     }
 
@@ -693,6 +777,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
     // later shared-edge depth jumps cannot pull an old triangle into a flap.
     uint4 candidateGeometry = uint4(0u, 0u, 0u, 0u);
     bool topologyVertexOverflow = false;
+    uint materializedEdgeCount = 0u;
     [unroll]
     for (uint materializeEdge = 0u; materializeEdge < 12u; materializeEdge++)
     {
@@ -733,9 +818,20 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         edgePointIndices[materializeEdge] = topologyPointIndex;
         if (topologyPointIndex < 0)
             topologyVertexOverflow = true;
+        else
+            materializedEdgeCount++;
     }
     if (topologyVertexOverflow)
+    {
+        auditFlags |= kAuditVertexOverflow;
+        if (hasPublishedTopology) auditFlags |= kAuditFinalPublished;
+        WriteTopologyCellAudit(topologyFlat, rawEdgeMask, candidateEdgeMask,
+            auditFlags, kAuditCauseVertexOverflow, candidateOddFaceCount,
+            materializedEdgeCount, 0u, 0u, cellRevocationEvidence);
         return;
+    }
+    bool publishedSnapshotMissingMaterialization = !committingCandidate &&
+        materializedEdgeCount < crossingCount;
 
     uint resolvedFaceChoices = committingCandidate ? 0u : publishedFaceChoices;
 
@@ -895,6 +991,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
 
     uint visitedMask = 0u;
     bool emittedAny = false;
+    uint triangleAttempts = 0u;
     [loop]
     for (uint startEdge = 0u; startEdge < 12u; startEdge++)
     {
@@ -964,6 +1061,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
             uint pointB = (uint)edgePointIndices[ringEdges[fanStep]];
             uint pointC = (uint)edgePointIndices[ringEdges[fanStep + 1u]];
             EmitTopologyTriangle(anchorPoint, pointB, pointC, referenceNormal);
+            triangleAttempts++;
             emittedAny = true;
         }
     }
@@ -985,6 +1083,29 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
             _SupportTopologyCellStates[topologyFlat] = uint2(
                 publishedState.x, cellRevocationEvidence);
         }
+        auditFlags |= kAuditClosedRing | kAuditFinalPublished;
+        WriteTopologyCellAudit(topologyFlat, rawEdgeMask, candidateEdgeMask,
+            auditFlags, publishedSnapshotMissingMaterialization
+                ? kAuditCausePublishedMissing
+                : committingCandidate ? kAuditCauseCandidateEmitted :
+                    kAuditCausePublishedReplay,
+            candidateOddFaceCount, materializedEdgeCount, 0u, triangleAttempts,
+            cellRevocationEvidence);
+        return;
+    }
+
+    // A formally closed candidate that failed the contour graph is not allowed
+    // to fall through into the auxiliary cluster fan. Preserve an existing
+    // atomic publication, otherwise leave an honest hole for later evidence.
+    if (committingCandidate)
+    {
+        if (hasPublishedTopology)
+            _SupportTopologyCellStates[topologyFlat] = uint2(
+                publishedState.x, cellRevocationEvidence);
+        if (hasPublishedTopology) auditFlags |= kAuditFinalPublished;
+        WriteTopologyCellAudit(topologyFlat, rawEdgeMask, candidateEdgeMask,
+            auditFlags, kAuditCauseClosedGraphFailed, candidateOddFaceCount,
+            materializedEdgeCount, 0u, triangleAttempts, cellRevocationEvidence);
         return;
     }
 
@@ -1007,6 +1128,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
     clusterSeedNormals[1] = float3(0.0, 1.0, 0.0);
     clusterSeedNormals[2] = float3(0.0, 1.0, 0.0);
     uint clusterCount = 0u;
+    uint maxSheetCount = 0u;
     float planeTolerance = max(_VoxSize * 0.55,
         _VoxSize * (float)_SupportStride * 0.18);
 
@@ -1081,6 +1203,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
             sheetNormal += pointNormal;
             sheetCount++;
         }
+        maxSheetCount = max(maxSheetCount, sheetCount);
         if (sheetCount < 3u)
             continue;
 
@@ -1161,6 +1284,7 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
             uint pointB = (uint)edgePointIndices[sheetEdges[fanStep]];
             uint pointC = (uint)edgePointIndices[sheetEdges[fanStep + 1u]];
             EmitTopologyTriangle(sheetAnchor, pointB, pointC, sheetNormal);
+            triangleAttempts++;
             emittedAny = true;
         }
     }
@@ -1188,6 +1312,23 @@ void SupportBuildTopology(uint3 id : SV_DispatchThreadID)
         _SupportTopologyCellStates[topologyFlat] = uint2(
             publishedState.x, cellRevocationEvidence);
     }
+    auditFlags |= kAuditFallback;
+    if (emittedAny || (!committingCandidate && hasPublishedTopology))
+        auditFlags |= kAuditFinalPublished;
+    uint finalCause = publishedSnapshotMissingMaterialization
+        ? kAuditCausePublishedMissing
+        : !committingCandidate
+            ? kAuditCausePublishedReplay
+        : candidateOddFaceCount > 0u
+            ? kAuditCauseFaceParityOpen
+        : candidateClosed
+            ? kAuditCauseClosedGraphFailed
+            : emittedAny
+                ? kAuditCauseCandidateEmitted
+                : kAuditCauseFallbackRejected;
+    WriteTopologyCellAudit(topologyFlat, rawEdgeMask, candidateEdgeMask,
+        auditFlags, finalCause, candidateOddFaceCount, materializedEdgeCount,
+        maxSheetCount, triangleAttempts, cellRevocationEvidence);
 }
 
 [numthreads(1, 1, 1)]

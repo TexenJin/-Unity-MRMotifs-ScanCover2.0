@@ -1,3 +1,9 @@
+using System;
+using System.Collections;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -61,6 +67,7 @@ namespace Genesis.RoomScan
         private GraphicsBuffer _cellPointMap;
         private GraphicsBuffer _topologyCellStates;
         private GraphicsBuffer _topologyCellGeometry;
+        private GraphicsBuffer _topologyCellAudit;
         private Bounds _bounds;
 
         private int _kClear;
@@ -76,6 +83,7 @@ namespace Genesis.RoomScan
         private float _voxSize;
         private int _stride = 2;
         private float _minWeight = 0.04f;
+        private float _productionMinWeight = 0.08f;
         private float _hz = 4f;
         private int _maxPoints = 65536;
         private int _maxTopologyIndices;
@@ -89,7 +97,9 @@ namespace Genesis.RoomScan
         private bool _visible;
         private bool _auditMode = true;
         private bool _paperGridEnabled;
+        private bool _observationTransparent;
         private bool _statsReadbackPending;
+        private bool _holeAuditExportPending;
         private float _nextStatsReadbackTime;
         private uint _lastPointCount;
         private uint _lastTopologyTriangleCount;
@@ -98,13 +108,18 @@ namespace Genesis.RoomScan
         private static bool _missingLogged;
 
         private static readonly Color TruthColor = new Color(1.0f, 0.52f, 0.08f, 0.92f);
-        private static readonly Color PaperColor = new Color(0.11f, 0.15f, 0.18f, 1.0f);
+        private static readonly Color PaperColorOpaque =
+            new Color(0.11f, 0.15f, 0.18f, 1.0f);
+        private static readonly Color PaperColorProbe =
+            new Color(0.11f, 0.15f, 0.18f, 0.16f);
 
         private static readonly int ID_TsdfVolume = Shader.PropertyToID("_TsdfVolume");
         private static readonly int ID_VoxCount = Shader.PropertyToID("_VoxCount");
         private static readonly int ID_VoxSize = Shader.PropertyToID("_VoxSize");
         private static readonly int ID_SupportStride = Shader.PropertyToID("_SupportStride");
         private static readonly int ID_SupportMinWeight = Shader.PropertyToID("_SupportMinWeight");
+        private static readonly int ID_SupportProductionMinWeight =
+            Shader.PropertyToID("_SupportProductionMinWeight");
         private static readonly int ID_SupportSampleCount = Shader.PropertyToID("_SupportSampleCount");
         private static readonly int ID_SupportMaxPoints = Shader.PropertyToID("_SupportMaxPoints");
         private static readonly int ID_SupportMaxTopologyIndices = Shader.PropertyToID("_SupportMaxTopologyIndices");
@@ -120,6 +135,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_SupportTopologyNormals = Shader.PropertyToID("_SupportTopologyNormals");
         private static readonly int ID_SupportTopologyCellStates = Shader.PropertyToID("_SupportTopologyCellStates");
         private static readonly int ID_SupportTopologyCellGeometry = Shader.PropertyToID("_SupportTopologyCellGeometry");
+        private static readonly int ID_SupportTopologyCellAudit = Shader.PropertyToID("_SupportTopologyCellAudit");
         private static readonly int ID_SupportMaxTopologyVertices = Shader.PropertyToID("_SupportMaxTopologyVertices");
         private static readonly int ID_SupportTopologyDrawArgs = Shader.PropertyToID("_SupportTopologyDrawArgs");
         private static readonly int ID_SupportPreviousPoints = Shader.PropertyToID("_SupportPreviousPoints");
@@ -158,6 +174,8 @@ namespace Genesis.RoomScan
             _back.TopologyDrawArgs.SetData(new uint[5]);
             if (_topologyCellStates != null)
                 _topologyCellStates.SetData(new uint2[_totalTopologyCells]);
+            if (_topologyCellAudit != null)
+                _topologyCellAudit.SetData(new uint2[_totalTopologyCells]);
             _lastPointCount = 0;
             _lastTopologyTriangleCount = 0;
             _lastTopologyOverflow = 0;
@@ -185,9 +203,25 @@ namespace Genesis.RoomScan
             }
         }
 
+        /// <summary>
+        /// Operator-only passthrough aid. It changes paper alpha while a probe
+        /// session is active, but never changes support extraction or topology.
+        /// </summary>
+        public bool ObservationTransparent
+        {
+            get => _observationTransparent;
+            set
+            {
+                if (_observationTransparent == value) return;
+                _observationTransparent = value;
+                _props?.SetColor(ID_SupportPaperColor,
+                    value ? PaperColorProbe : PaperColorOpaque);
+            }
+        }
+
         public bool Initialize(ComputeShader compute, Shader truthShader, int3 voxCount,
-            float voxSize, int stride, float minWeight, float extractHz, float surfelRadius,
-            float holdSeconds)
+            float voxSize, int stride, float minWeight, float productionMinWeight,
+            float extractHz, float surfelRadius, float holdSeconds)
         {
             if (_ready) return true;
 
@@ -212,6 +246,10 @@ namespace Genesis.RoomScan
             _voxSize = voxSize;
             _stride = Mathf.Max(1, stride);
             _minWeight = minWeight;
+            // Audit crossings intentionally remain permissive. Only crossings
+            // that independently satisfy the real mesh threshold may collect
+            // production confirmations and acquire paper ownership.
+            _productionMinWeight = Mathf.Max(_minWeight, productionMinWeight);
             _hz = Mathf.Clamp(extractHz, 0.5f, 30f);
             _holdFrames = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(0f, holdSeconds) * _hz), 0, 12);
             _sampleCount = new int3(
@@ -248,6 +286,11 @@ namespace Genesis.RoomScan
             // paper cell's two-phase commit.
             _topologyCellGeometry = new GraphicsBuffer(
                 GraphicsBuffer.Target.Structured, _totalTopologyCells, 16);
+            // Diagnostic-only per-cell outcome. The topology kernel writes it,
+            // but no production kernel or renderer ever reads it.
+            _topologyCellAudit = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, _totalTopologyCells, 8);
+            _topologyCellAudit.SetData(new uint2[_totalTopologyCells]);
 
             _kClear = compute.FindKernel("SupportClear");
             _kClearCells = compute.FindKernel("SupportClearCells");
@@ -265,6 +308,7 @@ namespace Genesis.RoomScan
             _compute.SetFloat(ID_VoxSize, _voxSize);
             _compute.SetInt(ID_SupportStride, _stride);
             _compute.SetFloat(ID_SupportMinWeight, _minWeight);
+            _compute.SetFloat(ID_SupportProductionMinWeight, _productionMinWeight);
             _compute.SetInt(ID_SupportMaxPoints, _maxPoints);
             _compute.SetInt(ID_SupportMaxTopologyIndices, _maxTopologyIndices);
             _compute.SetInt(ID_SupportMaxTopologyVertices, _maxTopologyVertices);
@@ -278,10 +322,12 @@ namespace Genesis.RoomScan
             BindBuffer(_kTopology, ID_SupportCellPointMap, _cellPointMap);
             BindBuffer(_kTopology, ID_SupportTopologyCellStates, _topologyCellStates);
             BindBuffer(_kTopology, ID_SupportTopologyCellGeometry, _topologyCellGeometry);
+            BindBuffer(_kTopology, ID_SupportTopologyCellAudit, _topologyCellAudit);
 
             _props = new MaterialPropertyBlock();
             _props.SetColor(ID_SupportColor, TruthColor);
-            _props.SetColor(ID_SupportPaperColor, PaperColor);
+            _props.SetColor(ID_SupportPaperColor,
+                _observationTransparent ? PaperColorProbe : PaperColorOpaque);
             _props.SetFloat(ID_SupportAuditMode, 1f);
             _props.SetFloat(ID_SupportPaperGrid, 0f);
             _props.SetFloat(ID_SupportTopologyMesh, 0f);
@@ -295,6 +341,7 @@ namespace Genesis.RoomScan
             Logger.Info($"支撑拓扑审计已初始化：采样步长={_stride * _voxSize:0.00}m，" +
                 $"片半径={surfelRadius:0.00}m，格={_sampleCount}，" +
                 $"上限={_maxPoints}，纸面拓扑格={_topologyCellCount}，" +
+                $"候选门槛={_minWeight:0.00}，生产门槛={_productionMinWeight:0.00}，" +
                 $"提取={_hz:0.#}Hz，候选会合窗={_holdFrames / _hz:0.00}s，" +
                 $"成纸后按反证撤销");
             return true;
@@ -356,6 +403,277 @@ namespace Genesis.RoomScan
             });
         }
 
+        /// <summary>
+        /// Export the current paper-cell first-break ledger. Readback and file
+        /// writing are asynchronous; this path observes production state only.
+        /// </summary>
+        public bool RequestHoleCauseAuditExport(string reason, Action<string> completed = null)
+        {
+            if (!_ready || _holeAuditExportPending || _topologyCellAudit == null ||
+                _front == null || _front.Counters == null || _front.TopologyDrawArgs == null)
+                return false;
+
+            _holeAuditExportPending = true;
+            StartCoroutine(ExportHoleCauseAuditRoutine(reason ?? string.Empty, completed));
+            return true;
+        }
+
+        private IEnumerator ExportHoleCauseAuditRoutine(string reason, Action<string> completed)
+        {
+            string outputPath = string.Empty;
+            Exception failure = null;
+            AsyncGPUReadbackRequest auditRequest = default;
+            AsyncGPUReadbackRequest counterRequest = default;
+            AsyncGPUReadbackRequest argsRequest = default;
+            try
+            {
+                // Capture one coherent command-stream snapshot without blocking
+                // A-button handling or the render thread on GetData().
+                auditRequest = AsyncGPUReadback.Request(_topologyCellAudit);
+                counterRequest = AsyncGPUReadback.Request(_front.Counters);
+                argsRequest = AsyncGPUReadback.Request(_front.TopologyDrawArgs);
+            }
+            catch (Exception e)
+            {
+                failure = e;
+            }
+
+            if (failure == null)
+            {
+                while (!auditRequest.done || !counterRequest.done || !argsRequest.done)
+                    yield return null;
+
+                if (auditRequest.hasError || counterRequest.hasError || argsRequest.hasError)
+                    failure = new IOException("paper hole audit GPU readback failed");
+            }
+
+            Task<string> writeTask = null;
+            if (failure == null)
+            {
+                try
+                {
+                    var nativeAudit = auditRequest.GetData<uint2>();
+                    var nativeCounters = counterRequest.GetData<uint>();
+                    var nativeArgs = argsRequest.GetData<uint>();
+                    var audit = new uint2[nativeAudit.Length];
+                    var counters = new uint[nativeCounters.Length];
+                    var drawArgs = new uint[nativeArgs.Length];
+                    nativeAudit.CopyTo(audit);
+                    nativeCounters.CopyTo(counters);
+                    nativeArgs.CopyTo(drawArgs);
+
+                    int3 topologyCount = _topologyCellCount;
+                    int3 voxelCount = _voxCount;
+                    int stride = _stride;
+                    float voxelSize = _voxSize;
+                    string directory = Path.Combine(Application.persistentDataPath,
+                        "ScanCoverDiagnostics", "paper_hole_audit",
+                        DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture));
+                    writeTask = Task.Run(() => WriteHoleCauseAudit(
+                        directory, reason, audit, counters, drawArgs, topologyCount,
+                        voxelCount, stride, voxelSize));
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            }
+
+            if (writeTask != null)
+            {
+                while (!writeTask.IsCompleted)
+                    yield return null;
+                if (writeTask.IsFaulted)
+                    failure = writeTask.Exception?.GetBaseException() ??
+                        new IOException("paper hole audit write failed");
+                else if (writeTask.IsCanceled)
+                    failure = new TaskCanceledException("paper hole audit write canceled");
+                else
+                    outputPath = writeTask.Result;
+            }
+
+            if (failure == null)
+                Logger.Info("纸面空白原因账已保存: " + outputPath);
+            else
+                Logger.Error("纸面空白原因账导出失败: " +
+                    failure.GetType().Name + ": " + failure.Message);
+
+            _holeAuditExportPending = false;
+            try { completed?.Invoke(outputPath); }
+            catch (Exception callbackError)
+            {
+                Logger.Error("纸面空白原因账回调失败: " + callbackError.Message);
+            }
+        }
+
+        private static string WriteHoleCauseAudit(string directory, string reason,
+            uint2[] audit, uint[] counters, uint[] drawArgs, int3 topologyCount,
+            int3 voxelCount, int stride, float voxelSize)
+        {
+            Directory.CreateDirectory(directory);
+            bool[] surfaceRelevant = new bool[audit.Length];
+            for (int i = 0; i < audit.Length; i++)
+            {
+                uint packedMasks = audit[i].x;
+                uint rawMask = packedMasks & 0x0FFFu;
+                uint matureMask = (packedMasks >> 12) & 0x0FFFu;
+                uint flags = packedMasks >> 24;
+                surfaceRelevant[i] = rawMask != 0u || matureMask != 0u ||
+                    (flags & 0x3Fu) != 0u;
+            }
+
+            long[] causes = new long[16];
+            long rows = 0;
+            long directSurfaceRows = 0;
+            long emptyHaloRows = 0;
+            string csvPath = Path.Combine(directory, "paper_hole_cells.csv");
+            using (var writer = new StreamWriter(csvPath, false, new UTF8Encoding(false), 1 << 20))
+            {
+                writer.WriteLine("cell_x,cell_y,cell_z,world_x_m,world_y_m,world_z_m," +
+                    "cause,cause_code,raw_mask,mature_mask,raw_edges,mature_edges," +
+                    "odd_faces,materialized_edges,max_sheet_members,triangle_attempts," +
+                    "revocation_evidence,had_published,candidate_closed,committing," +
+                    "closed_ring,fallback,final_published,vertex_overflow,empty_surface_halo");
+                int slice = topologyCount.x * topologyCount.y;
+                for (int flat = 0; flat < audit.Length; flat++)
+                {
+                    uint packedMasks = audit[flat].x;
+                    uint packedCause = audit[flat].y;
+                    uint cause = packedCause & 0x0Fu;
+                    int z = flat / slice;
+                    int rem = flat - z * slice;
+                    int y = rem / topologyCount.x;
+                    int x = rem - y * topologyCount.x;
+                    bool halo = !surfaceRelevant[flat] && cause == 1u &&
+                        HasSurfaceNeighbour(surfaceRelevant, x, y, z, topologyCount);
+                    if (!surfaceRelevant[flat] && !halo)
+                        continue;
+
+                    uint rawMask = packedMasks & 0x0FFFu;
+                    uint matureMask = (packedMasks >> 12) & 0x0FFFu;
+                    uint flags = packedMasks >> 24;
+                    uint rawEdges = (packedCause >> 4) & 0x0Fu;
+                    uint matureEdges = (packedCause >> 8) & 0x0Fu;
+                    uint oddFaces = (packedCause >> 12) & 0x07u;
+                    uint materializedEdges = (packedCause >> 15) & 0x0Fu;
+                    uint maxSheetCount = (packedCause >> 19) & 0x0Fu;
+                    uint triangleAttempts = (packedCause >> 23) & 0x0Fu;
+                    uint revocation = (packedCause >> 27) & 0x1Fu;
+                    float worldX = ((x + 0.5f) * stride + 0.5f - voxelCount.x * 0.5f) * voxelSize;
+                    float worldY = ((y + 0.5f) * stride + 0.5f - voxelCount.y * 0.5f) * voxelSize;
+                    float worldZ = ((z + 0.5f) * stride + 0.5f - voxelCount.z * 0.5f) * voxelSize;
+                    writer.WriteLine(string.Join(",",
+                        x.ToString(CultureInfo.InvariantCulture),
+                        y.ToString(CultureInfo.InvariantCulture),
+                        z.ToString(CultureInfo.InvariantCulture),
+                        worldX.ToString("0.######", CultureInfo.InvariantCulture),
+                        worldY.ToString("0.######", CultureInfo.InvariantCulture),
+                        worldZ.ToString("0.######", CultureInfo.InvariantCulture),
+                        HoleCauseName(cause),
+                        cause.ToString(CultureInfo.InvariantCulture),
+                        rawMask.ToString("X3", CultureInfo.InvariantCulture),
+                        matureMask.ToString("X3", CultureInfo.InvariantCulture),
+                        rawEdges.ToString(CultureInfo.InvariantCulture),
+                        matureEdges.ToString(CultureInfo.InvariantCulture),
+                        oddFaces.ToString(CultureInfo.InvariantCulture),
+                        materializedEdges.ToString(CultureInfo.InvariantCulture),
+                        maxSheetCount.ToString(CultureInfo.InvariantCulture),
+                        triangleAttempts.ToString(CultureInfo.InvariantCulture),
+                        revocation.ToString(CultureInfo.InvariantCulture),
+                        (flags & 1u) != 0u ? "1" : "0",
+                        (flags & 2u) != 0u ? "1" : "0",
+                        (flags & 4u) != 0u ? "1" : "0",
+                        (flags & 8u) != 0u ? "1" : "0",
+                        (flags & 16u) != 0u ? "1" : "0",
+                        (flags & 32u) != 0u ? "1" : "0",
+                        (flags & 64u) != 0u ? "1" : "0",
+                        halo ? "1" : "0"));
+                    rows++;
+                    if (halo) emptyHaloRows++; else directSurfaceRows++;
+                    if (cause < causes.Length) causes[cause]++;
+                }
+            }
+
+            string summaryPath = Path.Combine(directory, "paper_hole_summary.json");
+            var json = new StringBuilder(2048);
+            json.Append("{\n  \"schema\": \"scancover.paper_hole_audit.v1\",\n")
+                .Append("  \"capturedUtc\": \"")
+                .Append(DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)).Append("\",\n")
+                .Append("  \"reason\": \"").Append(JsonEscape(reason)).Append("\",\n")
+                .Append("  \"readOnly\": true,\n")
+                .Append("  \"topologyCellCount\": [").Append(topologyCount.x).Append(',')
+                .Append(topologyCount.y).Append(',').Append(topologyCount.z).Append("],\n")
+                .Append("  \"voxelCount\": [").Append(voxelCount.x).Append(',')
+                .Append(voxelCount.y).Append(',').Append(voxelCount.z).Append("],\n")
+                .Append("  \"supportStride\": ").Append(stride).Append(",\n")
+                .Append("  \"voxelSizeM\": ").Append(voxelSize.ToString("0.######", CultureInfo.InvariantCulture)).Append(",\n")
+                .Append("  \"exportedRows\": ").Append(rows).Append(",\n")
+                .Append("  \"directSurfaceRows\": ").Append(directSurfaceRows).Append(",\n")
+                .Append("  \"emptySurfaceHaloRows\": ").Append(emptyHaloRows).Append(",\n")
+                .Append("  \"gpuCounters\": {")
+                .Append("\"points\":").Append(ArrayValue(counters, 0)).Append(',')
+                .Append("\"pointOverflow\":").Append(ArrayValue(counters, 1)).Append(',')
+                .Append("\"topologyIndicesReserved\":").Append(ArrayValue(counters, 2)).Append(',')
+                .Append("\"topologyIndexOverflow\":").Append(ArrayValue(counters, 3)).Append(',')
+                .Append("\"topologyVerticesReserved\":").Append(ArrayValue(counters, 4)).Append(',')
+                .Append("\"topologyVertexOverflow\":").Append(ArrayValue(counters, 5)).Append("},\n")
+                .Append("  \"topologyDrawIndexCount\": ").Append(ArrayValue(drawArgs, 0)).Append(",\n")
+                .Append("  \"causeCounts\": {");
+            bool first = true;
+            for (uint cause = 1u; cause <= 11u; cause++)
+            {
+                if (!first) json.Append(',');
+                json.Append("\n    \"").Append(HoleCauseName(cause)).Append("\": ")
+                    .Append(causes[cause]);
+                first = false;
+            }
+            json.Append("\n  }\n}\n");
+            File.WriteAllText(summaryPath, json.ToString(), new UTF8Encoding(false));
+            return directory;
+        }
+
+        private static bool HasSurfaceNeighbour(bool[] relevant, int x, int y, int z, int3 count)
+        {
+            int slice = count.x * count.y;
+            int flat = x + y * count.x + z * slice;
+            return (x > 0 && relevant[flat - 1]) ||
+                   (x + 1 < count.x && relevant[flat + 1]) ||
+                   (y > 0 && relevant[flat - count.x]) ||
+                   (y + 1 < count.y && relevant[flat + count.x]) ||
+                   (z > 0 && relevant[flat - slice]) ||
+                   (z + 1 < count.z && relevant[flat + slice]);
+        }
+
+        private static string HoleCauseName(uint cause)
+        {
+            return cause switch
+            {
+                1u => "no_raw_crossing",
+                2u => "raw_crossing_insufficient",
+                3u => "raw_not_mature",
+                4u => "face_parity_open",
+                5u => "closed_graph_failed",
+                6u => "fallback_rejected",
+                7u => "candidate_emitted",
+                8u => "published_replay",
+                9u => "topology_vertex_overflow",
+                10u => "other_no_emit",
+                11u => "published_snapshot_missing_materialization",
+                _ => "unknown"
+            };
+        }
+
+        private static uint ArrayValue(uint[] values, int index)
+        {
+            return values != null && index >= 0 && index < values.Length ? values[index] : 0u;
+        }
+
+        private static string JsonEscape(string value)
+        {
+            return (value ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"")
+                .Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+
         private void LateUpdate()
         {
             if (!_ready || !_visible) return;
@@ -380,17 +698,20 @@ namespace Genesis.RoomScan
             _cellPointMap?.Release();
             _topologyCellStates?.Release();
             _topologyCellGeometry?.Release();
+            _topologyCellAudit?.Release();
             _front = null;
             _back = null;
             _cellPointMap = null;
             _topologyCellStates = null;
             _topologyCellGeometry = null;
+            _topologyCellAudit = null;
             if (_material != null)
             {
                 Destroy(_material);
                 _material = null;
             }
             _statsReadbackPending = false;
+            _holeAuditExportPending = false;
             _ready = false;
         }
 

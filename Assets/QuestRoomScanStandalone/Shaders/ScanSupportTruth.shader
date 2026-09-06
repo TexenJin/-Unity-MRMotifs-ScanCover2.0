@@ -16,7 +16,6 @@ Shader "Genesis/ScanSupportTruth"
             ZWrite On
             ZTest LEqual
             Cull Off
-
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
@@ -157,6 +156,7 @@ Shader "Genesis/ScanSupportTruth"
                 // its real barycentric edges: a synthetic world grid would hide
                 // the very connectivity this route is meant to audit.
                 half3 paper = _SupportPaperColor.rgb;
+                half paperAlpha = saturate(_SupportPaperColor.a);
                 if (topologyMesh)
                 {
                     float thickness = max(_RSWireThickness, 0.55);
@@ -169,8 +169,12 @@ Shader "Genesis/ScanSupportTruth"
                         min(edgeRamp.y, edgeRamp.z));
                     paper = lerp(paper, half3(0.96, 0.98, 1.0),
                         saturate(edgeCoverage));
+                    // During probe acquisition the fill becomes transparent,
+                    // while true topology edges remain legible over passthrough.
+                    paperAlpha = lerp(paperAlpha, 0.94h,
+                        saturate(edgeCoverage));
                 }
-                return half4(paper, 1.0);
+                return half4(paper, paperAlpha);
             }
             ENDHLSL
         }

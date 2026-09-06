@@ -92,7 +92,7 @@ namespace Genesis.RoomScan
             {
                 Directory.CreateDirectory(_framesDirectory);
                 File.WriteAllText(_manifestPath,
-                    "pairIndex,platformFrame,timestampNs,timestampValid,unityFrame,unscaledTime,width,height,layers,updatedProcessedEye,rawFile,processedFile,metadataFile,status\n",
+                    "pairIndex,platformFrame,timestampNs,timestampValid,callbackUnityFrame,callbackUnscaledTime,preprocessUnityFrame,preprocessUnscaledTime,callbackToPreprocessMs,width,height,layers,updatedProcessedEye,rawFile,processedFile,metadataFile,status\n",
                     new UTF8Encoding(false));
                 File.WriteAllText(
                     Path.Combine(_sessionDirectory, "depth_pairs", "schema.json"),
@@ -164,6 +164,7 @@ namespace Genesis.RoomScan
             }
 
             CopyDepth(platformDepth, _platformSnapshot);
+            Camera callbackCamera = Camera.main;
             _stagedMetadata = new FrameMetadata
             {
                 platformFrame = platformFrame,
@@ -171,6 +172,12 @@ namespace Genesis.RoomScan
                 timestampNs = timestampNs,
                 unityFrame = Time.frameCount,
                 unscaledTime = Time.unscaledTimeAsDouble,
+                callbackUnityFrame = Time.frameCount,
+                callbackUnscaledTime = Time.unscaledTimeAsDouble,
+                callbackHeadAvailable = callbackCamera != null,
+                callbackHeadWorldPose = callbackCamera != null
+                    ? new Pose(callbackCamera.transform.position, callbackCamera.transform.rotation)
+                    : new Pose(Vector3.zero, Quaternion.identity),
                 nearFar = nearFar,
                 poses = new[] { pose0, pose1 },
                 fovs = new[] { fov0, fov1 },
@@ -197,6 +204,13 @@ namespace Genesis.RoomScan
 
             CopyDepth(processedDepth, _processedSnapshot);
             _stagedMetadata.updatedProcessedEye = updatedEye;
+            _stagedMetadata.preprocessUnityFrame = Time.frameCount;
+            _stagedMetadata.preprocessUnscaledTime = Time.unscaledTimeAsDouble;
+            Camera preprocessCamera = Camera.main;
+            _stagedMetadata.preprocessHeadAvailable = preprocessCamera != null;
+            _stagedMetadata.preprocessHeadWorldPose = preprocessCamera != null
+                ? new Pose(preprocessCamera.transform.position, preprocessCamera.transform.rotation)
+                : new Pose(Vector3.zero, Quaternion.identity);
             if (_depthCapture != null)
             {
                 _stagedMetadata.angularDegPerSec = _depthCapture.SmoothedDepthAngularSpeed;
@@ -411,8 +425,12 @@ namespace Genesis.RoomScan
                 m.platformFrame.ToString(CultureInfo.InvariantCulture),
                 m.timestampNs.ToString(CultureInfo.InvariantCulture),
                 m.timestampValid ? "1" : "0",
-                m.unityFrame.ToString(CultureInfo.InvariantCulture),
-                m.unscaledTime.ToString("R", CultureInfo.InvariantCulture),
+                m.callbackUnityFrame.ToString(CultureInfo.InvariantCulture),
+                m.callbackUnscaledTime.ToString("R", CultureInfo.InvariantCulture),
+                m.preprocessUnityFrame.ToString(CultureInfo.InvariantCulture),
+                m.preprocessUnscaledTime.ToString("R", CultureInfo.InvariantCulture),
+                ((m.preprocessUnscaledTime - m.callbackUnscaledTime) * 1000.0)
+                    .ToString("R", CultureInfo.InvariantCulture),
                 pending.width.ToString(CultureInfo.InvariantCulture),
                 pending.height.ToString(CultureInfo.InvariantCulture),
                 pending.layers.ToString(CultureInfo.InvariantCulture),
@@ -434,6 +452,7 @@ namespace Genesis.RoomScan
                    "  \"linearizeMetres\": \"z=ndc*2-1; metres=abs(projection.m23/(z+projection.m22))\",\n" +
                    "  \"matrixEncoding\": \"row-major m00..m33\",\n" +
                    "  \"pairing\": \"only frames consumed by QRS PreprocessLatestFrame are emitted\",\n" +
+                   "  \"timingLineage\": \"platform callback time and current head pose, preprocessing consumption time and current head pose; fusion consumption time is joined by platformFrame/sourceFrame in fusion_inputs\",\n" +
                    "  \"recordedTextureLayers\": 1,\n" +
                    "  \"recordedEyeIndex\": 1,\n" +
                    "  \"eyeMetadata\": \"pose, FOV and matrices are retained for both runtime eyes, while both binary streams contain only fusion eye slice 1 (right)\",\n" +
@@ -465,6 +484,23 @@ namespace Genesis.RoomScan
             sb.Append("  \"timestampNs\": ").Append(m.timestampNs).AppendLine(",");
             sb.Append("  \"unityFrame\": ").Append(m.unityFrame).AppendLine(",");
             sb.Append("  \"unscaledTime\": ").Append(Format(m.unscaledTime)).AppendLine(",");
+            sb.Append("  \"callbackUnityFrame\": ").Append(m.callbackUnityFrame).AppendLine(",");
+            sb.Append("  \"callbackUnscaledTime\": ").Append(Format(m.callbackUnscaledTime)).AppendLine(",");
+            sb.Append("  \"preprocessUnityFrame\": ").Append(m.preprocessUnityFrame).AppendLine(",");
+            sb.Append("  \"preprocessUnscaledTime\": ").Append(Format(m.preprocessUnscaledTime)).AppendLine(",");
+            sb.Append("  \"callbackToPreprocessMs\": ")
+                .Append(Format((m.preprocessUnscaledTime - m.callbackUnscaledTime) * 1000.0))
+                .AppendLine(",");
+            sb.Append("  \"callbackHeadWorldPose\": {\"available\":")
+                .Append(m.callbackHeadAvailable ? "true" : "false")
+                .Append(",\"pose\":");
+            AppendPoseValue(sb, m.callbackHeadWorldPose);
+            sb.AppendLine("},");
+            sb.Append("  \"preprocessHeadWorldPose\": {\"available\":")
+                .Append(m.preprocessHeadAvailable ? "true" : "false")
+                .Append(",\"pose\":");
+            AppendPoseValue(sb, m.preprocessHeadWorldPose);
+            sb.AppendLine("},");
             sb.Append("  \"width\": ").Append(pending.width).AppendLine(",");
             sb.Append("  \"height\": ").Append(pending.height).AppendLine(",");
             sb.Append("  \"layers\": ").Append(pending.layers).AppendLine(",");
@@ -514,6 +550,15 @@ namespace Genesis.RoomScan
                     .Append(Format(p.rotation.w)).Append("]}");
             }
             sb.Append(']');
+        }
+
+        private static void AppendPoseValue(StringBuilder sb, Pose pose)
+        {
+            sb.Append("{\"position\":[").Append(Format(pose.position.x)).Append(',')
+                .Append(Format(pose.position.y)).Append(',').Append(Format(pose.position.z))
+                .Append("],\"rotation\":[").Append(Format(pose.rotation.x)).Append(',')
+                .Append(Format(pose.rotation.y)).Append(',').Append(Format(pose.rotation.z))
+                .Append(',').Append(Format(pose.rotation.w)).Append("]}");
         }
 
         private static void AppendFovArray(StringBuilder sb, XRFov[] fovs)
@@ -615,6 +660,14 @@ namespace Genesis.RoomScan
             public long timestampNs;
             public int unityFrame;
             public double unscaledTime;
+            public int callbackUnityFrame;
+            public double callbackUnscaledTime;
+            public int preprocessUnityFrame;
+            public double preprocessUnscaledTime;
+            public bool callbackHeadAvailable;
+            public Pose callbackHeadWorldPose;
+            public bool preprocessHeadAvailable;
+            public Pose preprocessHeadWorldPose;
             public int updatedProcessedEye;
             public Vector2 nearFar;
             public Pose[] poses;

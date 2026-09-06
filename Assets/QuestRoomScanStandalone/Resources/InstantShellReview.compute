@@ -1,0 +1,1218 @@
+#pragma kernel ReviewShells
+#pragma kernel AuditConnectivity
+#pragma kernel PublishVerifiedWitnesses
+#pragma kernel ClearPaperAuditCells
+#pragma kernel RasterizePaperAuditTriangles
+#pragma kernel AuditRelay
+
+// 即时壳之间的只读重投影复核。状态码：
+// 0=当前原料缺失 1=尚无参考壳 2=同视重复吻合
+// 3=独立视角吻合 4=同视深度冲突 5=同视法线冲突
+// 6=参考视锥外/参考处无有效原料 7=独立深度冲突 8=独立法线冲突。
+// 本文件只写影子状态纹理、统计账和低分辨率存在证词 epoch；接力核只读
+// TSDF 做残差审计，不写深度、TSDF 几何、枪胶候选或纸皮。
+
+Texture2D<float4> _CurrentSnapshot;
+Texture2D<float4> _ReferenceSnapshot;
+Texture3D<float2> _TsdfVolume;
+RWTexture2D<uint> _ReviewState;
+RWTexture2D<uint> _ReviewResidualMm;
+RWTexture2D<uint> _ConnectivityState;
+RWTexture2D<uint> _PlaneConnectivityState;
+RWStructuredBuffer<uint> _ReviewCounters;
+RWStructuredBuffer<uint> _VerifiedWitnessEpochs;
+RWStructuredBuffer<uint> _PaperAuditCells;
+RWStructuredBuffer<uint> _RelayMaturityCells;
+
+struct RelayPaperVertex
+{
+    float3 pos;
+    float3 norm;
+    uint packedColor;
+    uint voxelFlatIdx;
+};
+
+struct RelayPaperTriangle
+{
+    float3 p0;
+    float3 p1;
+    float3 p2;
+};
+
+StructuredBuffer<RelayPaperVertex> _RelayPaperVertices;
+StructuredBuffer<uint> _RelayPaperIndices;
+RWStructuredBuffer<RelayPaperTriangle> _RelayPaperTriangles;
+
+float4x4 _CurrentProj;
+float4x4 _CurrentProjInv;
+float4x4 _CurrentViewInv;
+float4x4 _ReferenceProj;
+float4x4 _ReferenceProjInv;
+float4x4 _ReferenceView;
+float4x4 _ReferenceViewInv;
+int2 _SourceSize;
+int2 _ReviewGridSize;
+int _PixelStep;
+int _HasReference;
+int _ReferencePoseIndependent;
+float3 _CurrentCameraWorld;
+float3 _ReferenceCameraWorld;
+float _MinIndependentRayCos;
+int3 _WitnessVoxelCount;
+int3 _WitnessCellCount;
+int _WitnessStride;
+float _WitnessVoxelSize;
+uint _WitnessEpoch;
+int3 _TsdfVoxelCount;
+float _TsdfVoxelSize;
+float _TsdfTruncationDistance;
+float _RelayMinTsdfWeight;
+float _RelayTsdfToleranceMeters;
+float _RelayZeroToleranceMeters;
+float _RelayPaperToleranceMeters;
+float _RelayPaperSearchMeters;
+int3 _PaperAuditCellCount;
+int _PaperAuditStride;
+int _PaperAuditCellTotal;
+int _RelayPaperVertexCount;
+int _RelayPaperIndexCount;
+float4x4 _RelayPaperLocalToWorld;
+int _RelayPaperTriangleOffset;
+int _RelayPaperTriangleCapacity;
+int _RelayPaperTriangleCount;
+uint _RelayAuditEpoch;
+int _RelayTimingRisk;
+int _RelayPoseRisk;
+
+float LinearizeDepth(float ndc, float4x4 projection)
+{
+    float z = ndc * 2.0 - 1.0;
+    return abs(projection[2][3] / (z + projection[2][2]));
+}
+
+bool PackedValid(float4 packed, float4x4 projection)
+{
+    float depth = LinearizeDepth(packed.r, projection);
+    return depth > 0.12 && depth < 8.0 && length(packed.gba) > 0.25;
+}
+
+float3 ReconstructWorld(int2 pixel, float ndc, float4x4 projectionInv,
+                        float4x4 viewInv)
+{
+    float2 uv = (float2(pixel) + 0.5) / float2(_SourceSize);
+    float4 hcs = float4(float3(uv, ndc) * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(viewInv, mul(projectionInv, hcs));
+    float safeW = abs(worldH.w) > 0.00001 ? worldH.w : 0.00001;
+    return worldH.xyz / safeW;
+}
+
+void CountState(uint state)
+{
+    if (state == 1u || state == 6u) InterlockedAdd(_ReviewCounters[3], 1u); // 无证词
+    else if (state == 2u) InterlockedAdd(_ReviewCounters[4], 1u); // 同视重复
+    else if (state == 3u) InterlockedAdd(_ReviewCounters[5], 1u); // 独立吻合
+    else if (state == 4u) InterlockedAdd(_ReviewCounters[6], 1u); // 同视深度冲突
+    else if (state == 5u) InterlockedAdd(_ReviewCounters[7], 1u); // 同视法线冲突
+    else if (state == 7u) InterlockedAdd(_ReviewCounters[8], 1u); // 独立深度冲突
+    else if (state == 8u) InterlockedAdd(_ReviewCounters[9], 1u); // 独立法线冲突
+}
+
+// 0=成功成面 1=至少一个端点原料缺失 2=仅深差拒绝
+// 3=仅法线拒绝 4=深差与法线同时拒绝。
+uint ClassifyTriangle(float4 a, float4 b, float4 c)
+{
+    if (!PackedValid(a, _CurrentProj) || !PackedValid(b, _CurrentProj) ||
+        !PackedValid(c, _CurrentProj))
+        return 1u;
+
+    float da = LinearizeDepth(a.r, _CurrentProj);
+    float db = LinearizeDepth(b.r, _CurrentProj);
+    float dc = LinearizeDepth(c.r, _CurrentProj);
+    float minDepth = min(da, min(db, dc));
+    float maxDepth = max(da, max(db, dc));
+    float hardGap = max(0.030, minDepth * 0.025);
+    bool depthRejected = (maxDepth - minDepth) > hardGap;
+
+    float3 na = normalize(a.gba);
+    float3 nb = normalize(b.gba);
+    float3 nc = normalize(c.gba);
+    float normalCoherence = min(dot(na, nb), min(dot(nb, nc), dot(nc, na)));
+    bool normalRejected = normalCoherence <= 0.35;
+    if (depthRejected && normalRejected) return 4u;
+    if (depthRejected) return 2u;
+    if (normalRejected) return 3u;
+    return 0u;
+}
+
+void CountConnectivity(uint state)
+{
+    InterlockedAdd(_ReviewCounters[12], 1u);
+    if (state == 0u) InterlockedAdd(_ReviewCounters[13], 1u);
+    else if (state == 1u) InterlockedAdd(_ReviewCounters[14], 1u);
+    else if (state == 2u) InterlockedAdd(_ReviewCounters[15], 1u);
+    else if (state == 3u) InterlockedAdd(_ReviewCounters[16], 1u);
+    else if (state == 4u) InterlockedAdd(_ReviewCounters[17], 1u);
+}
+
+// 共面影子状态：0=旧规则已接纳 1=四点共面救回 2=点缺
+// 3=法线分裂守住 4=不共面守住 5=法线/几何面不符守住
+// 6=旧法拒 7=旧双拒 8=邻域不足待定。
+uint PlaneShadowState(uint oldState, bool patchValid, uint patchReason)
+{
+    if (oldState == 0u) return 0u;
+    if (oldState == 1u) return 2u;
+    if (oldState == 3u) return 6u;
+    if (oldState == 4u) return 7u;
+    if (!patchValid) return 8u;
+    if (patchReason == 0u) return 1u;
+    if (patchReason == 1u) return 3u;
+    if (patchReason == 2u) return 4u;
+    return 5u;
+}
+
+void CountPlaneShadow(uint state)
+{
+    if (state == 0u || state == 1u) InterlockedAdd(_ReviewCounters[18], 1u);
+    if (state == 1u) InterlockedAdd(_ReviewCounters[19], 1u);
+    else if (state == 3u || state == 4u || state == 5u)
+        InterlockedAdd(_ReviewCounters[20], 1u);
+    else if (state == 8u) InterlockedAdd(_ReviewCounters[21], 1u);
+}
+
+[numthreads(8, 8, 1)]
+void ReviewShells(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= (uint)_ReviewGridSize.x ||
+        dispatchId.y >= (uint)_ReviewGridSize.y) return;
+
+    int2 pixel = min(int2(dispatchId.xy) * max(_PixelStep, 1), _SourceSize - 1);
+    InterlockedAdd(_ReviewCounters[0], 1u);
+
+    float4 current = _CurrentSnapshot.Load(int3(pixel, 0));
+    if (!PackedValid(current, _CurrentProj))
+    {
+        _ReviewState[pixel] = 0u;
+        _ReviewResidualMm[pixel] = 0u;
+        InterlockedAdd(_ReviewCounters[2], 1u);
+        return;
+    }
+
+    InterlockedAdd(_ReviewCounters[1], 1u);
+    if (_HasReference == 0)
+    {
+        _ReviewState[pixel] = 1u;
+        _ReviewResidualMm[pixel] = 0u;
+        CountState(1u);
+        return;
+    }
+
+    float3 currentWorld = ReconstructWorld(pixel, current.r,
+                                           _CurrentProjInv, _CurrentViewInv);
+    float4 referenceClip = mul(_ReferenceProj,
+                               mul(_ReferenceView, float4(currentWorld, 1.0)));
+    if (abs(referenceClip.w) < 0.00001)
+    {
+        _ReviewState[pixel] = 6u;
+        _ReviewResidualMm[pixel] = 0u;
+        CountState(6u);
+        return;
+    }
+
+    float2 referenceUv = referenceClip.xy / referenceClip.w * 0.5 + 0.5;
+    if (referenceUv.x < 0.0 || referenceUv.y < 0.0 ||
+        referenceUv.x > 1.0 || referenceUv.y > 1.0)
+    {
+        _ReviewState[pixel] = 6u;
+        _ReviewResidualMm[pixel] = 0u;
+        CountState(6u);
+        return;
+    }
+
+    int2 referencePixel = clamp(int2(referenceUv * float2(_SourceSize)),
+                                int2(0, 0), _SourceSize - 1);
+    float4 reference = _ReferenceSnapshot.Load(int3(referencePixel, 0));
+    if (!PackedValid(reference, _ReferenceProj))
+    {
+        _ReviewState[pixel] = 6u;
+        _ReviewResidualMm[pixel] = 0u;
+        CountState(6u);
+        return;
+    }
+
+    float3 referenceWorld = ReconstructWorld(referencePixel, reference.r,
+                                             _ReferenceProjInv, _ReferenceViewInv);
+    float currentDepth = LinearizeDepth(current.r, _CurrentProj);
+    float allowedResidual = clamp(currentDepth * 0.015, 0.025, 0.060);
+    float positionResidual = length(referenceWorld - currentWorld);
+    float3 currentNormal = normalize(current.gba);
+    float3 referenceNormal = normalize(reference.gba);
+    float normalAgreement = abs(dot(currentNormal, referenceNormal));
+    float3 currentRay = normalize(currentWorld - _CurrentCameraWorld);
+    float3 referenceRay = normalize(currentWorld - _ReferenceCameraWorld);
+    float rayAgreement = dot(currentRay, referenceRay);
+    bool independentWitness = _ReferencePoseIndependent != 0 &&
+                              rayAgreement < _MinIndependentRayCos;
+    uint residualMm = (uint)clamp(round(positionResidual * 1000.0), 0.0, 65535.0);
+
+    uint state;
+    if (positionResidual > allowedResidual)
+        state = independentWitness ? 7u : 4u;
+    else if (normalAgreement < 0.75)
+        state = independentWitness ? 8u : 5u;
+    else if (!independentWitness)
+        state = 2u;
+    else
+        state = 3u;
+
+    _ReviewState[pixel] = state;
+    _ReviewResidualMm[pixel] = residualMm;
+    CountState(state);
+    if (state == 7u)
+    {
+        InterlockedAdd(_ReviewCounters[10], residualMm);
+        InterlockedMax(_ReviewCounters[11], residualMm);
+    }
+}
+
+bool SampleObservedTsdf(float3 worldPosition, out float sdf)
+{
+    sdf = 0.0;
+    if (any(_TsdfVoxelCount < 2) || _TsdfVoxelSize <= 0.0)
+        return false;
+
+    // Voxel centres live at (index + 0.5 - count/2) * voxelSize.
+    float3 centreIndex = worldPosition / _TsdfVoxelSize +
+                         (float3)_TsdfVoxelCount * 0.5 - 0.5;
+    int3 lo = (int3)floor(centreIndex);
+    if (any(lo < 0) || any(lo + 1 >= _TsdfVoxelCount))
+        return false;
+    float3 f = saturate(centreIndex - (float3)lo);
+
+    float2 s000 = _TsdfVolume.Load(int4(lo + int3(0,0,0), 0));
+    float2 s100 = _TsdfVolume.Load(int4(lo + int3(1,0,0), 0));
+    float2 s010 = _TsdfVolume.Load(int4(lo + int3(0,1,0), 0));
+    float2 s110 = _TsdfVolume.Load(int4(lo + int3(1,1,0), 0));
+    float2 s001 = _TsdfVolume.Load(int4(lo + int3(0,0,1), 0));
+    float2 s101 = _TsdfVolume.Load(int4(lo + int3(1,0,1), 0));
+    float2 s011 = _TsdfVolume.Load(int4(lo + int3(0,1,1), 0));
+    float2 s111 = _TsdfVolume.Load(int4(lo + int3(1,1,1), 0));
+    float supportFloor = max(_RelayMinTsdfWeight, 0.001);
+    if (abs(s000.y) < supportFloor || abs(s100.y) < supportFloor ||
+        abs(s010.y) < supportFloor || abs(s110.y) < supportFloor ||
+        abs(s001.y) < supportFloor || abs(s101.y) < supportFloor ||
+        abs(s011.y) < supportFloor || abs(s111.y) < supportFloor)
+        return false;
+
+    float s00 = lerp(s000.x, s100.x, f.x);
+    float s10 = lerp(s010.x, s110.x, f.x);
+    float s01 = lerp(s001.x, s101.x, f.x);
+    float s11 = lerp(s011.x, s111.x, f.x);
+    sdf = lerp(lerp(s00, s10, f.y), lerp(s01, s11, f.y), f.z);
+    return true;
+}
+
+// Exclusive reason for a failed trilinear TSDF read.
+// 0=readable, 1=outside interpolation volume, 2=nearest voxel never written,
+// 3=nearest voxel has weight but is below the production support floor,
+// 4=nearest voxel is supported but one or more interpolation neighbours are
+//   missing/underweight, 5=unexpected fallback.
+uint ClassifyUnreadableTsdf(float3 worldPosition)
+{
+    if (any(_TsdfVoxelCount < 2) || _TsdfVoxelSize <= 0.0)
+        return 1u;
+
+    float3 centreIndex = worldPosition / _TsdfVoxelSize +
+                         (float3)_TsdfVoxelCount * 0.5 - 0.5;
+    int3 lo = (int3)floor(centreIndex);
+    if (any(lo < 0) || any(lo + 1 >= _TsdfVoxelCount))
+        return 1u;
+
+    int3 nearestIndex = clamp((int3)round(centreIndex), int3(0, 0, 0),
+                              _TsdfVoxelCount - 1);
+    float centreWeight = abs(_TsdfVolume.Load(int4(nearestIndex, 0)).y);
+    float supportFloor = max(_RelayMinTsdfWeight, 0.001);
+    if (centreWeight <= 0.000001)
+        return 2u;
+    if (centreWeight < supportFloor)
+        return 3u;
+
+    float w000 = abs(_TsdfVolume.Load(int4(lo + int3(0,0,0), 0)).y);
+    float w100 = abs(_TsdfVolume.Load(int4(lo + int3(1,0,0), 0)).y);
+    float w010 = abs(_TsdfVolume.Load(int4(lo + int3(0,1,0), 0)).y);
+    float w110 = abs(_TsdfVolume.Load(int4(lo + int3(1,1,0), 0)).y);
+    float w001 = abs(_TsdfVolume.Load(int4(lo + int3(0,0,1), 0)).y);
+    float w101 = abs(_TsdfVolume.Load(int4(lo + int3(1,0,1), 0)).y);
+    float w011 = abs(_TsdfVolume.Load(int4(lo + int3(0,1,1), 0)).y);
+    float w111 = abs(_TsdfVolume.Load(int4(lo + int3(1,1,1), 0)).y);
+    if (w000 < supportFloor || w100 < supportFloor ||
+        w010 < supportFloor || w110 < supportFloor ||
+        w001 < supportFloor || w101 < supportFloor ||
+        w011 < supportFloor || w111 < supportFloor)
+        return 4u;
+    return 0u;
+}
+
+float3 RelayVolumeMin();
+uint FlattenPaperCell(int3 cell);
+
+// Read-only freeze cross-audit on the SAME eight supports used for TSDF
+// interpolation. Bit 0: any frozen support (context, not guilt).
+// Bit 1: frozen support below read floor (direct support deficit).
+// Bit 2: nearest voxel is frozen and below the read floor.
+uint RelayFrozenSupportFlags(float3 worldPosition)
+{
+    if (any(_TsdfVoxelCount < 2) || _TsdfVoxelSize <= 0.0) return 0u;
+    float3 indexPosition = worldPosition / _TsdfVoxelSize +
+                           (float3)_TsdfVoxelCount * 0.5 - 0.5;
+    int3 lo = (int3)floor(indexPosition);
+    if (any(lo < 0) || any(lo + 1 >= _TsdfVoxelCount)) return 0u;
+    float floorWeight = max(_RelayMinTsdfWeight, 0.001);
+    uint flags = 0u;
+    [unroll]
+    for (uint corner = 0u; corner < 8u; corner++)
+    {
+        int3 offset = int3(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+        float signedWeight = _TsdfVolume.Load(int4(lo + offset, 0)).y;
+        if (signedWeight < 0.0)
+        {
+            flags |= 1u;
+            if (abs(signedWeight) < floorWeight) flags |= 2u;
+        }
+    }
+    int3 nearestIndex = clamp((int3)round(indexPosition), int3(0,0,0), _TsdfVoxelCount - 1);
+    float centreWeight = _TsdfVolume.Load(int4(nearestIndex, 0)).y;
+    if (centreWeight < 0.0 && abs(centreWeight) < floorWeight) flags |= 4u;
+    return flags;
+}
+
+uint RelayViewBin(float3 worldPosition)
+{
+    float3 ray = normalize(worldPosition - _CurrentCameraWorld);
+    float3 a = abs(ray);
+    if (a.x >= a.y && a.x >= a.z) return ray.x >= 0.0 ? 0u : 1u;
+    if (a.y >= a.z) return ray.y >= 0.0 ? 2u : 3u;
+    return ray.z >= 0.0 ? 4u : 5u;
+}
+
+// Persistent, diagnostic-only 10 cm maturity ledger.  Only cells first seen
+// unreadable enter the clock; a later readable sample closes the interval.
+// packed: bits 0..2 maturity rank, 3..18 first audit epoch, 19..21 first view bin.
+void UpdateRelayMaturity(float3 worldPosition, uint currentRank, uint freezeFlags)
+{
+    if (_PaperAuditCellTotal <= 0 || any(_PaperAuditCellCount <= 0) ||
+        _PaperAuditStride <= 0 || _TsdfVoxelSize <= 0.0)
+        return;
+    float cellSize = _TsdfVoxelSize * (float)_PaperAuditStride;
+    int3 cell = (int3)floor((worldPosition - RelayVolumeMin()) / cellSize);
+    if (any(cell < 0) || any(cell >= _PaperAuditCellCount)) return;
+    uint flat = FlattenPaperCell(cell);
+    uint epoch = _RelayAuditEpoch & 0xffffu;
+    uint viewBin = RelayViewBin(worldPosition);
+
+    [loop]
+    for (uint attempt = 0u; attempt < 8u; attempt++)
+    {
+        uint oldPacked = _RelayMaturityCells[flat];
+        // Keep this CAS path as real control flow. FXC otherwise tries to
+        // flatten the atomic write with the early return/continue after
+        // inlining into AuditRelay, failing with "flattened side effect".
+        [branch]
+        if (oldPacked == 0u)
+        {
+            if (currentRank >= 4u) return; // already healthy at first sight
+            uint initial = (currentRank & 7u) | (epoch << 3u) |
+                           ((viewBin & 7u) << 19u);
+            uint original;
+            InterlockedCompareExchange(_RelayMaturityCells[flat], 0u, initial, original);
+            if (original == 0u)
+            {
+                InterlockedAdd(_ReviewCounters[53], 1u); // newly tracked hole
+                return;
+            }
+            continue;
+        }
+
+        uint oldRank = oldPacked & 7u;
+        uint firstEpoch = (oldPacked >> 3u) & 0xffffu;
+        uint firstView = (oldPacked >> 19u) & 7u;
+        uint age = (epoch - firstEpoch) & 0xffffu;
+        if (currentRank >= 4u && oldRank < 4u)
+        {
+            uint closed = (oldPacked & ~7u) | 4u;
+            uint original;
+            InterlockedCompareExchange(_RelayMaturityCells[flat], oldPacked, closed, original);
+            if (original == oldPacked)
+            {
+                InterlockedAdd(_ReviewCounters[54], 1u); // hole became readable
+                InterlockedAdd(_ReviewCounters[55], min(age, 65535u));
+                if (firstView != viewBin)
+                    InterlockedAdd(_ReviewCounters[57], 1u);
+                return;
+            }
+            continue;
+        }
+        if (oldRank < 4u && currentRank < 4u)
+        {
+            [branch]
+            if (age >= 8u)
+            {
+                InterlockedAdd(_ReviewCounters[56], 1u); // >=8 audits, not exact wall time
+                if ((freezeFlags & 2u) != 0u) InterlockedAdd(_ReviewCounters[72], 1u);
+            }
+            if (currentRank > oldRank)
+            {
+                uint advanced = (oldPacked & ~7u) | currentRank;
+                uint ignored;
+                InterlockedCompareExchange(_RelayMaturityCells[flat], oldPacked,
+                                           advanced, ignored);
+            }
+        }
+        return;
+    }
+}
+
+bool RelayShellHasTwoNormalGroups(float4 a, float4 b, float4 c, float4 d)
+{
+    if (!PackedValid(a, _CurrentProj) || !PackedValid(b, _CurrentProj) ||
+        !PackedValid(c, _CurrentProj) || !PackedValid(d, _CurrentProj))
+        return false;
+    float3 n0 = normalize(a.gba);
+    float3 n1 = normalize(b.gba);
+    float3 n2 = normalize(c.gba);
+    float3 n3 = normalize(d.gba);
+    float minimumAgreement = min(min(abs(dot(n0, n1)), abs(dot(n0, n2))),
+                                 min(abs(dot(n1, n3)), abs(dot(n2, n3))));
+    return minimumAgreement < 0.60;
+}
+
+// Uses the same eight TSDF samples as trilinear interpolation and asks whether
+// their local gradients split into incompatible directions.  This is a direct
+// symptom of two surface families sharing one interpolation cell; it remains
+// an accusation counter and never changes the stored field.
+bool RelayTsdfGradientSplit(float3 worldPosition)
+{
+    float3 centreIndex = worldPosition / _TsdfVoxelSize +
+                         (float3)_TsdfVoxelCount * 0.5 - 0.5;
+    int3 lo = (int3)floor(centreIndex);
+    if (any(lo < 0) || any(lo + 1 >= _TsdfVoxelCount)) return false;
+    float2 v000 = _TsdfVolume.Load(int4(lo + int3(0,0,0), 0));
+    float2 v100 = _TsdfVolume.Load(int4(lo + int3(1,0,0), 0));
+    float2 v010 = _TsdfVolume.Load(int4(lo + int3(0,1,0), 0));
+    float2 v110 = _TsdfVolume.Load(int4(lo + int3(1,1,0), 0));
+    float2 v001 = _TsdfVolume.Load(int4(lo + int3(0,0,1), 0));
+    float2 v101 = _TsdfVolume.Load(int4(lo + int3(1,0,1), 0));
+    float2 v011 = _TsdfVolume.Load(int4(lo + int3(0,1,1), 0));
+    float2 v111 = _TsdfVolume.Load(int4(lo + int3(1,1,1), 0));
+    float support = max(_RelayMinTsdfWeight, 0.001);
+    if (abs(v000.y) < support || abs(v100.y) < support ||
+        abs(v010.y) < support || abs(v110.y) < support ||
+        abs(v001.y) < support || abs(v101.y) < support ||
+        abs(v011.y) < support || abs(v111.y) < support)
+        return false;
+    float3 g0 = float3(v100.x-v000.x, v010.x-v000.x, v001.x-v000.x);
+    float3 g1 = float3(v110.x-v010.x, v010.x-v000.x, v011.x-v010.x);
+    float3 g2 = float3(v101.x-v001.x, v011.x-v001.x, v001.x-v000.x);
+    float3 g3 = float3(v111.x-v011.x, v111.x-v101.x, v111.x-v110.x);
+    float l0 = length(g0), l1 = length(g1), l2 = length(g2), l3 = length(g3);
+    if (min(min(l0, l1), min(l2, l3)) < 0.02) return false;
+    g0 /= l0; g1 /= l1; g2 /= l2; g3 /= l3;
+    float minimumAgreement = min(min(abs(dot(g0, g1)), abs(dot(g0, g2))),
+                                 min(abs(dot(g1, g3)), abs(dot(g2, g3))));
+    return minimumAgreement < 0.55;
+}
+
+bool RelayIsOblique(float3 shellWorld, float3 packedNormal)
+{
+    float3 viewRay = normalize(shellWorld - _CurrentCameraWorld);
+    float incidenceCos = abs(dot(normalize(packedNormal), -viewRay));
+    return incidenceCos < 0.45;
+}
+
+void AccumulateRelayDepthNeighbour(int2 neighbourPixel,
+                                   inout float minDepth,
+                                   inout float maxDepth,
+                                   inout uint validNeighbours)
+{
+    neighbourPixel = clamp(neighbourPixel, int2(0, 0), _SourceSize - 1);
+    float4 neighbourSample = _CurrentSnapshot.Load(int3(neighbourPixel, 0));
+    if (!PackedValid(neighbourSample, _CurrentProj))
+        return;
+    float neighbourDepth = LinearizeDepth(neighbourSample.r, _CurrentProj);
+    minDepth = min(minDepth, neighbourDepth);
+    maxDepth = max(maxDepth, neighbourDepth);
+    validNeighbours++;
+}
+
+bool RelayIsDepthEdge(int2 pixel, float centreDepth)
+{
+    int neighbourStep = max(_PixelStep, 1);
+    float minDepth = centreDepth;
+    float maxDepth = centreDepth;
+    uint validNeighbours = 0u;
+    AccumulateRelayDepthNeighbour(pixel + int2(-neighbourStep, 0),
+                                  minDepth, maxDepth, validNeighbours);
+    AccumulateRelayDepthNeighbour(pixel + int2(neighbourStep, 0),
+                                  minDepth, maxDepth, validNeighbours);
+    AccumulateRelayDepthNeighbour(pixel + int2(0, -neighbourStep),
+                                  minDepth, maxDepth, validNeighbours);
+    AccumulateRelayDepthNeighbour(pixel + int2(0, neighbourStep),
+                                  minDepth, maxDepth, validNeighbours);
+    if (validNeighbours < 2u)
+        return true;
+    float edgeThreshold = max(0.040, centreDepth * 0.025);
+    return (maxDepth - minDepth) > edgeThreshold;
+}
+
+// A two-snapshot reprojection conflict is intentionally labelled as a merged
+// temporal/pose clue: these inputs cannot distinguish clock skew from pose
+// error without an external timestamped ground truth trajectory.
+bool RelayHasTemporalPoseConflict(float3 shellWorld, float centreDepth)
+{
+    if (_HasReference == 0)
+        return false;
+    float4 referenceClip = mul(_ReferenceProj,
+                               mul(_ReferenceView, float4(shellWorld, 1.0)));
+    if (abs(referenceClip.w) < 0.00001)
+        return false;
+    float2 referenceUv = referenceClip.xy / referenceClip.w * 0.5 + 0.5;
+    if (referenceUv.x < 0.0 || referenceUv.y < 0.0 ||
+        referenceUv.x > 1.0 || referenceUv.y > 1.0)
+        return false;
+    int2 referencePixel = clamp(int2(referenceUv * float2(_SourceSize)),
+                                int2(0, 0), _SourceSize - 1);
+    float4 referenceSample = _ReferenceSnapshot.Load(int3(referencePixel, 0));
+    if (!PackedValid(referenceSample, _ReferenceProj))
+        return false;
+    float3 referenceWorld = ReconstructWorld(referencePixel, referenceSample.r,
+                                             _ReferenceProjInv,
+                                             _ReferenceViewInv);
+    float allowedResidual = clamp(centreDepth * 0.015, 0.025, 0.060);
+    return length(referenceWorld - shellWorld) > allowedResidual;
+}
+
+bool RelayHasMultipleTsdfLayers(float3 shellWorld)
+{
+    float3 viewRay = shellWorld - _CurrentCameraWorld;
+    float rayLength = length(viewRay);
+    if (rayLength <= 0.05 || _TsdfVoxelSize <= 0.0)
+        return false;
+    viewRay /= rayLength;
+
+    const int sampleCount = 17;
+    float startOffset = -4.0 * _TsdfVoxelSize;
+    float sampleStep = 0.5 * _TsdfVoxelSize;
+    bool previousValid = false;
+    float previousSdf = 0.0;
+    float previousOffset = startOffset;
+    float lastCrossingOffset = -1e20;
+    uint crossingCount = 0u;
+    [unroll]
+    for (int i = 0; i < sampleCount; i++)
+    {
+        float offset = startOffset + (float)i * sampleStep;
+        float sdf;
+        bool valid = SampleObservedTsdf(shellWorld + viewRay * offset, sdf);
+        if (valid && previousValid &&
+            ((sdf < 0.0 && previousSdf >= 0.0) ||
+             (sdf > 0.0 && previousSdf <= 0.0)))
+        {
+            float denominator = previousSdf - sdf;
+            float t = abs(denominator) > 1e-6
+                ? saturate(previousSdf / denominator)
+                : 0.5;
+            float crossingOffset = lerp(previousOffset, offset, t);
+            if (crossingCount == 0u ||
+                abs(crossingOffset - lastCrossingOffset) >= _TsdfVoxelSize)
+            {
+                crossingCount++;
+                lastCrossingOffset = crossingOffset;
+                if (crossingCount >= 2u)
+                    return true;
+            }
+        }
+        previousValid = valid;
+        if (valid)
+        {
+            previousSdf = sdf;
+            previousOffset = offset;
+        }
+    }
+    return false;
+}
+
+uint FlattenPaperCell(int3 cell)
+{
+    return (uint)(cell.x + _PaperAuditCellCount.x *
+        (cell.y + _PaperAuditCellCount.y * cell.z));
+}
+
+float3 RelayVolumeMin()
+{
+    return -0.5 * (float3)_TsdfVoxelCount * _TsdfVoxelSize;
+}
+
+float3 RelayVolumeSize()
+{
+    return (float3)_TsdfVoxelCount * _TsdfVoxelSize;
+}
+
+float PaperPointSegmentDistance(float3 queryPosition, float3 a, float3 b)
+{
+    float3 edge = b - a;
+    float edgeLengthSq = dot(edge, edge);
+    if (edgeLengthSq <= 1e-10)
+        return length(queryPosition - a);
+    float t = saturate(dot(queryPosition - a, edge) / edgeLengthSq);
+    return length(queryPosition - (a + edge * t));
+}
+
+float PaperPointTriangleDistance(float3 queryPosition,
+                                 RelayPaperTriangle paperFace)
+{
+    float3 a = paperFace.p0;
+    float3 b = paperFace.p1;
+    float3 c = paperFace.p2;
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 areaVector = cross(ab, ac);
+    if (dot(areaVector, areaVector) <= 1e-12)
+        return min(PaperPointSegmentDistance(queryPosition, a, b),
+                   min(PaperPointSegmentDistance(queryPosition, b, c),
+                       PaperPointSegmentDistance(queryPosition, c, a)));
+
+    // Closest-point regions from Real-Time Collision Detection. This returns
+    // the exact Euclidean distance to the finite triangle, including edges.
+    float3 ap = queryPosition - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return length(ap);
+
+    float3 bp = queryPosition - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return length(bp);
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    {
+        float v = d1 / max(d1 - d3, 1e-10);
+        return length(queryPosition - (a + v * ab));
+    }
+
+    float3 cp = queryPosition - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return length(cp);
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    {
+        float w = d2 / max(d2 - d6, 1e-10);
+        return length(queryPosition - (a + w * ac));
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    {
+        float3 bc = c - b;
+        float w = (d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-10);
+        return length(queryPosition - (b + w * bc));
+    }
+
+    float inverseDenominator = 1.0 / max(va + vb + vc, 1e-10);
+    float vFace = vb * inverseDenominator;
+    float wFace = vc * inverseDenominator;
+    return length(queryPosition - (a + ab * vFace + ac * wFace));
+}
+
+void PublishPaperAuditTriangleCell(int3 cell, uint triangleId,
+                                   RelayPaperTriangle paperFace)
+{
+    float cellSize = _TsdfVoxelSize * (float)_PaperAuditStride;
+    if (any(cell < 0) || any(cell >= _PaperAuditCellCount))
+        return;
+
+    float3 cellCentre = RelayVolumeMin() + ((float3)cell + 0.5) * cellSize;
+    uint distanceMm = min((uint)round(
+        PaperPointTriangleDistance(cellCentre, paperFace) * 1000.0), 16382u);
+    // Distance is the primary sort key; the lower eighteen bits identify the
+    // exact committed triangle used for the final point-to-face measurement.
+    uint stored = (distanceMm << 18u) | (triangleId & 0x3ffffu);
+    uint ignored;
+    InterlockedMin(_PaperAuditCells[FlattenPaperCell(cell)], stored, ignored);
+}
+
+[numthreads(64, 1, 1)]
+void ClearPaperAuditCells(uint3 dispatchId : SV_DispatchThreadID)
+{
+    // C# dispatches this kernel only for a positive allocation. Avoid the
+    // mixed signed max/cast form here because some Vulkan HLSL translators
+    // resolve it inconsistently.
+    if (_PaperAuditCellTotal <= 0 || dispatchId.x >= (uint)_PaperAuditCellTotal) return;
+    _PaperAuditCells[dispatchId.x] = 0xffffffffu;
+}
+
+[numthreads(64, 1, 1)]
+void RasterizePaperAuditTriangles(uint3 dispatchId : SV_DispatchThreadID)
+{
+    // "triangle" is an HLSL geometry-input keyword on Vulkan; do not use it
+    // as a local identifier even inside a compute kernel.
+    uint triangleIndex = dispatchId.x;
+    uint firstIndex = triangleIndex * 3u;
+    if (_RelayPaperIndexCount <= 0 ||
+        firstIndex + 2u >= (uint)_RelayPaperIndexCount) return;
+
+    // Production snapshots preserve the candidate class in index bits 30..31.
+    // The production render shader strips those bits before vertex lookup; the
+    // relay audit must decode the exact same payload or every confirmed
+    // triangle looks like an out-of-range vertex on the diagnostic path.
+    const uint relayPaperIndexMask = 0x3fffffffu;
+    uint i0 = _RelayPaperIndices[firstIndex + 0u] & relayPaperIndexMask;
+    uint i1 = _RelayPaperIndices[firstIndex + 1u] & relayPaperIndexMask;
+    uint i2 = _RelayPaperIndices[firstIndex + 2u] & relayPaperIndexMask;
+    if (_RelayPaperVertexCount <= 0 ||
+        i0 >= (uint)_RelayPaperVertexCount ||
+        i1 >= (uint)_RelayPaperVertexCount ||
+        i2 >= (uint)_RelayPaperVertexCount)
+        return;
+
+    uint globalTriangleId = (uint)(_RelayPaperTriangleOffset + (int)triangleIndex);
+    if (_RelayPaperTriangleCapacity <= 0 ||
+        globalTriangleId >= (uint)_RelayPaperTriangleCapacity)
+        return;
+
+    // Surface-Nets vertices are already emitted in world coordinates (the
+    // production render shader consumes gv.pos directly), so applying the
+    // chunk transform here would measure a transformed copy of the paper.
+    RelayPaperTriangle paperFace;
+    paperFace.p0 = _RelayPaperVertices[i0].pos;
+    paperFace.p1 = _RelayPaperVertices[i1].pos;
+    paperFace.p2 = _RelayPaperVertices[i2].pos;
+    _RelayPaperTriangles[globalTriangleId] = paperFace;
+
+    if (_PaperAuditCellTotal <= 0 || any(_PaperAuditCellCount <= 0) ||
+        _PaperAuditStride <= 0 || _TsdfVoxelSize <= 0.0)
+        return;
+
+    float cellSize = _TsdfVoxelSize * (float)_PaperAuditStride;
+    float3 halfCell = float3(cellSize * 0.5, cellSize * 0.5, cellSize * 0.5);
+    float3 boundsMin = min(paperFace.p0, min(paperFace.p1, paperFace.p2)) - halfCell;
+    float3 boundsMax = max(paperFace.p0, max(paperFace.p1, paperFace.p2)) + halfCell;
+    float3 volumeMin = RelayVolumeMin();
+    float3 volumeMax = volumeMin + RelayVolumeSize();
+    if (any(boundsMax < volumeMin) || any(boundsMin >= volumeMax))
+        return;
+    int3 minCell = clamp((int3)floor((boundsMin - RelayVolumeMin()) / cellSize),
+                         int3(0, 0, 0), _PaperAuditCellCount - 1);
+    int3 maxCell = clamp((int3)floor((boundsMax - RelayVolumeMin()) / cellSize),
+                         int3(0, 0, 0), _PaperAuditCellCount - 1);
+
+    [loop]
+    for (int z = minCell.z; z <= maxCell.z; z++)
+    [loop]
+    for (int y = minCell.y; y <= maxCell.y; y++)
+    [loop]
+    for (int x = minCell.x; x <= maxCell.x; x++)
+        PublishPaperAuditTriangleCell(int3(x, y, z), globalTriangleId,
+                                      paperFace);
+}
+
+bool FindNearestPaperTriangle(float3 worldPosition, out float residualMeters)
+{
+    residualMeters = 0.0;
+    if (_PaperAuditCellTotal <= 0 || any(_PaperAuditCellCount <= 0) ||
+        _PaperAuditStride <= 0 || _TsdfVoxelSize <= 0.0)
+        return false;
+
+    float cellSize = _TsdfVoxelSize * (float)_PaperAuditStride;
+    int3 centre = (int3)floor((worldPosition - RelayVolumeMin()) / cellSize);
+    int radius = clamp((int)ceil(max(_RelayPaperSearchMeters, cellSize) /
+                                 cellSize), 1, 2);
+    float best = 1e30;
+    bool found = false;
+
+    [loop]
+    for (int z = -2; z <= 2; z++)
+    [loop]
+    for (int y = -2; y <= 2; y++)
+    [loop]
+    for (int x = -2; x <= 2; x++)
+    {
+        if (abs(x) > radius || abs(y) > radius || abs(z) > radius) continue;
+        int3 cell = centre + int3(x, y, z);
+        if (any(cell < 0) || any(cell >= _PaperAuditCellCount)) continue;
+        uint stored = _PaperAuditCells[FlattenPaperCell(cell)];
+        if (stored == 0xffffffffu) continue;
+        uint triangleId = stored & 0x3ffffu;
+        if (_RelayPaperTriangleCount <= 0 ||
+            triangleId >= (uint)_RelayPaperTriangleCount)
+            continue;
+        float residual = PaperPointTriangleDistance(
+            worldPosition, _RelayPaperTriangles[triangleId]);
+        if (residual < best)
+        {
+            best = residual;
+            found = true;
+        }
+    }
+
+    if (!found || best > _RelayPaperSearchMeters) return false;
+    residualMeters = best;
+    return true;
+}
+
+bool FindNearestTsdfZero(float3 probeWorld, float3 cameraWorld,
+                         out float residualMeters, out float3 zeroWorld)
+{
+    residualMeters = 0.0;
+    zeroWorld = probeWorld;
+    float3 ray = probeWorld - cameraWorld;
+    float rayLength = length(ray);
+    if (rayLength <= 0.05)
+        return false;
+    ray /= rayLength;
+
+    // Search only a four-voxel band centred on the independently verified
+    // probe hit. A remote second layer must never win this audit.
+    const int sampleCount = 9;
+    float startOffset = -2.0 * _TsdfVoxelSize;
+    float step = 0.5 * _TsdfVoxelSize;
+    bool previousValid = false;
+    float previousSdf = 0.0;
+    float previousOffset = startOffset;
+    float bestResidual = 1e30;
+    float bestOffset = 0.0;
+    bool found = false;
+
+    [unroll]
+    for (int i = 0; i < sampleCount; i++)
+    {
+        float offset = startOffset + (float)i * step;
+        float sdf;
+        bool valid = SampleObservedTsdf(probeWorld + ray * offset, sdf);
+        if (valid && previousValid &&
+            ((sdf <= 0.0 && previousSdf >= 0.0) ||
+             (sdf >= 0.0 && previousSdf <= 0.0)))
+        {
+            float denominator = previousSdf - sdf;
+            float t = abs(denominator) > 1e-6
+                ? saturate(previousSdf / denominator)
+                : 0.5;
+            float zeroOffset = lerp(previousOffset, offset, t);
+            float candidateResidual = abs(zeroOffset);
+            if (candidateResidual < bestResidual)
+            {
+                bestResidual = candidateResidual;
+                bestOffset = zeroOffset;
+                found = true;
+            }
+        }
+        previousValid = valid;
+        if (valid)
+        {
+            previousSdf = sdf;
+            previousOffset = offset;
+        }
+    }
+    residualMeters = found ? bestResidual : 0.0;
+    zeroWorld = found ? probeWorld + ray * bestOffset : probeWorld;
+    return found;
+}
+
+// Read-only direct relay audit. The current instantaneous shell is the source
+// ruler; historical reprojection cannot vote on acceptance and is used only
+// as a temporal/pose correlation flag. Its separate witness-publication kernel
+// is left untouched here. Each later stage is judged only after the preceding
+// stage aligned, so a downstream component cannot be blamed for an upstream
+// absence or offset.
+[numthreads(8, 8, 1)]
+void AuditRelay(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x + 1u >= (uint)_ReviewGridSize.x ||
+        dispatchId.y + 1u >= (uint)_ReviewGridSize.y) return;
+
+    int step = max(_PixelStep, 1);
+    int2 p00 = min(int2(dispatchId.xy) * step, _SourceSize - 1);
+    int2 p10 = min(p00 + int2(step, 0), _SourceSize - 1);
+    int2 p01 = min(p00 + int2(0, step), _SourceSize - 1);
+    int2 p11 = min(p00 + int2(step, step), _SourceSize - 1);
+    float4 s00 = _CurrentSnapshot.Load(int3(p00, 0));
+    float4 s10 = _CurrentSnapshot.Load(int3(p10, 0));
+    float4 s01 = _CurrentSnapshot.Load(int3(p01, 0));
+    float4 s11 = _CurrentSnapshot.Load(int3(p11, 0));
+    uint first = ClassifyTriangle(s00, s10, s01);
+    uint second = ClassifyTriangle(s10, s11, s01);
+    if (first != 0u && second != 0u) return;
+
+    // Sample a vertex that actually belongs to one of the emitted shell
+    // triangles. Raw depth pixels rejected by shell connectivity must not be
+    // allowed to accuse downstream stages.
+    int2 pixel = first == 0u ? p00 : p11;
+    float4 current = _CurrentSnapshot.Load(int3(pixel, 0));
+    if (!PackedValid(current, _CurrentProj))
+        return;
+    float3 shellWorld = ReconstructWorld(pixel, current.r,
+                                         _CurrentProjInv, _CurrentViewInv);
+    InterlockedAdd(_ReviewCounters[26], 1u); // valid instantaneous-shell samples
+
+    uint freezeFlags = RelayFrozenSupportFlags(shellWorld);
+    float tsdf;
+    if (!SampleObservedTsdf(shellWorld, tsdf))
+    {
+        uint unreadableReason = ClassifyUnreadableTsdf(shellWorld);
+        if (unreadableReason == 1u) InterlockedAdd(_ReviewCounters[39], 1u);
+        else if (unreadableReason == 2u) InterlockedAdd(_ReviewCounters[40], 1u);
+        else if (unreadableReason == 3u) InterlockedAdd(_ReviewCounters[41], 1u);
+        else if (unreadableReason == 4u) InterlockedAdd(_ReviewCounters[42], 1u);
+        else InterlockedAdd(_ReviewCounters[43], 1u);
+        // 66..73: freeze overlap; every denominator is the same audit batch.
+        if ((freezeFlags & 1u) != 0u) InterlockedAdd(_ReviewCounters[66], 1u);
+        if (unreadableReason == 3u && (freezeFlags & 4u) != 0u)
+            InterlockedAdd(_ReviewCounters[67], 1u);
+        if (unreadableReason == 4u && (freezeFlags & 2u) != 0u)
+            InterlockedAdd(_ReviewCounters[68], 1u);
+        if (unreadableReason == 2u && (freezeFlags & 1u) != 0u)
+            InterlockedAdd(_ReviewCounters[69], 1u);
+        if ((freezeFlags & 2u) != 0u) InterlockedAdd(_ReviewCounters[73], 1u);
+        uint maturityRank = unreadableReason == 3u ? 2u :
+                            (unreadableReason == 4u ? 3u : 1u);
+        UpdateRelayMaturity(shellWorld, maturityRank, freezeFlags);
+        return;
+    }
+    UpdateRelayMaturity(shellWorld, 4u, freezeFlags);
+
+    uint tsdfResidualMm = (uint)clamp(round(abs(tsdf) *
+        max(_TsdfTruncationDistance, 0.0001) * 1000.0), 0.0, 65535.0);
+    InterlockedAdd(_ReviewCounters[27], 1u); // TSDF fully readable
+    InterlockedAdd(_ReviewCounters[29], tsdfResidualMm);
+    InterlockedMax(_ReviewCounters[30], tsdfResidualMm);
+
+    float centreDepth = LinearizeDepth(current.r, _CurrentProj);
+    bool isOblique = RelayIsOblique(shellWorld, current.gba);
+    bool isDepthEdge = RelayIsDepthEdge(pixel, centreDepth);
+    bool hasTemporalPoseConflict = RelayHasTemporalPoseConflict(shellWorld,
+                                                                centreDepth);
+    bool hasMultipleLayers = RelayHasMultipleTsdfLayers(shellWorld);
+    bool shellCornerCandidate = RelayShellHasTwoNormalGroups(s00, s10, s01, s11);
+    bool tsdfGradientSplit = shellCornerCandidate && RelayTsdfGradientSplit(shellWorld);
+    if ((float)tsdfResidualMm > _RelayTsdfToleranceMeters * 1000.0)
+    {
+        if ((freezeFlags & 1u) != 0u) InterlockedAdd(_ReviewCounters[71], 1u);
+        bool attributed = false;
+        if (isOblique) { InterlockedAdd(_ReviewCounters[44], 1u); attributed = true; }
+        if (isDepthEdge) { InterlockedAdd(_ReviewCounters[45], 1u); attributed = true; }
+        if (hasTemporalPoseConflict)
+        {
+            InterlockedAdd(_ReviewCounters[46], 1u);
+            if (_RelayTimingRisk != 0) InterlockedAdd(_ReviewCounters[62], 1u);
+            if (_RelayPoseRisk != 0) InterlockedAdd(_ReviewCounters[63], 1u);
+            attributed = true;
+        }
+        if (hasMultipleLayers)
+        {
+            InterlockedAdd(_ReviewCounters[47], 1u);
+            attributed = true;
+        }
+        if (shellCornerCandidate)
+        {
+            InterlockedAdd(_ReviewCounters[58], 1u);
+            if (tsdfGradientSplit) InterlockedAdd(_ReviewCounters[59], 1u);
+            attributed = true;
+        }
+        if (!attributed) InterlockedAdd(_ReviewCounters[48], 1u);
+        return;
+    }
+    InterlockedAdd(_ReviewCounters[28], 1u); // readable TSDF aligned
+    if ((freezeFlags & 1u) != 0u) InterlockedAdd(_ReviewCounters[70], 1u);
+    if (isOblique) InterlockedAdd(_ReviewCounters[49], 1u);
+    if (isDepthEdge) InterlockedAdd(_ReviewCounters[50], 1u);
+    if (hasTemporalPoseConflict) InterlockedAdd(_ReviewCounters[51], 1u);
+    if (hasMultipleLayers) InterlockedAdd(_ReviewCounters[52], 1u);
+    if (hasTemporalPoseConflict)
+    {
+        if (_RelayTimingRisk != 0) InterlockedAdd(_ReviewCounters[64], 1u);
+        if (_RelayPoseRisk != 0) InterlockedAdd(_ReviewCounters[65], 1u);
+    }
+    if (shellCornerCandidate)
+    {
+        InterlockedAdd(_ReviewCounters[60], 1u);
+        if (tsdfGradientSplit) InterlockedAdd(_ReviewCounters[61], 1u);
+    }
+
+    float zeroResidualMeters;
+    float3 zeroWorld;
+    if (!FindNearestTsdfZero(shellWorld, _CurrentCameraWorld,
+                             zeroResidualMeters, zeroWorld))
+        return;
+
+    uint zeroResidualMm = (uint)clamp(round(zeroResidualMeters * 1000.0),
+                                     0.0, 65535.0);
+    InterlockedAdd(_ReviewCounters[31], 1u); // local TSDF zero found
+    InterlockedAdd(_ReviewCounters[33], zeroResidualMm);
+    InterlockedMax(_ReviewCounters[34], zeroResidualMm);
+    if (zeroResidualMeters > _RelayZeroToleranceMeters)
+        return;
+    InterlockedAdd(_ReviewCounters[32], 1u); // zero aligned with shell
+
+    float paperResidualMeters;
+    if (!FindNearestPaperTriangle(zeroWorld, paperResidualMeters))
+        return;
+
+    uint paperResidualMm = (uint)clamp(round(paperResidualMeters * 1000.0),
+                                      0.0, 65535.0);
+    InterlockedAdd(_ReviewCounters[35], 1u); // committed paper found
+    InterlockedAdd(_ReviewCounters[37], paperResidualMm);
+    InterlockedMax(_ReviewCounters[38], paperResidualMm);
+    if (paperResidualMeters <= _RelayPaperToleranceMeters)
+        InterlockedAdd(_ReviewCounters[36], 1u); // paper aligned
+}
+
+[numthreads(8, 8, 1)]
+void AuditConnectivity(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x + 1u >= (uint)_ReviewGridSize.x ||
+        dispatchId.y + 1u >= (uint)_ReviewGridSize.y) return;
+
+    int step = max(_PixelStep, 1);
+    int2 p00 = min(int2(dispatchId.xy) * step, _SourceSize - 1);
+    int2 p10 = min(p00 + int2(step, 0), _SourceSize - 1);
+    int2 p01 = min(p00 + int2(0, step), _SourceSize - 1);
+    int2 p11 = min(p00 + int2(step, step), _SourceSize - 1);
+    float4 s00 = _CurrentSnapshot.Load(int3(p00, 0));
+    float4 s10 = _CurrentSnapshot.Load(int3(p10, 0));
+    float4 s01 = _CurrentSnapshot.Load(int3(p01, 0));
+    float4 s11 = _CurrentSnapshot.Load(int3(p11, 0));
+
+    uint first = ClassifyTriangle(s00, s10, s01);
+    uint second = ClassifyTriangle(s10, s11, s01);
+    _ConnectivityState[p00] = first | (second << 8);
+    CountConnectivity(first);
+    CountConnectivity(second);
+
+    bool patchValid = PackedValid(s00, _CurrentProj) && PackedValid(s10, _CurrentProj) &&
+                      PackedValid(s01, _CurrentProj) && PackedValid(s11, _CurrentProj);
+    uint patchReason = 0u;
+    if (patchValid)
+    {
+        float3 w00 = ReconstructWorld(p00, s00.r, _CurrentProjInv, _CurrentViewInv);
+        float3 w10 = ReconstructWorld(p10, s10.r, _CurrentProjInv, _CurrentViewInv);
+        float3 w01 = ReconstructWorld(p01, s01.r, _CurrentProjInv, _CurrentViewInv);
+        float3 w11 = ReconstructWorld(p11, s11.r, _CurrentProjInv, _CurrentViewInv);
+        float3 n00 = normalize(s00.gba);
+        float3 n10 = normalize(s10.gba);
+        float3 n01 = normalize(s01.gba);
+        float3 n11 = normalize(s11.gba);
+        float normalCoherence = min(min(dot(n00, n10), dot(n00, n01)),
+                                    min(dot(n10, n11), dot(n01, n11)));
+        float3 averageNormalRaw = n00 + n10 + n01 + n11;
+        float averageNormalLength = length(averageNormalRaw);
+        float3 averageNormal = averageNormalRaw / max(averageNormalLength, 0.0001);
+        float3 geometricRaw = cross(w10 - w00, w01 - w00) +
+                              cross(w11 - w10, w01 - w10);
+        float geometricLength = length(geometricRaw);
+        float3 geometricNormal = geometricRaw / max(geometricLength, 0.000001);
+        float normalGeometryAgreement = abs(dot(averageNormal, geometricNormal));
+        // centroid 是 HLSL 插值修饰关键字；Vulkan 后端不可用作变量名。
+        float3 patchCentre = (w00 + w10 + w01 + w11) * 0.25;
+        float planeResidual = max(max(abs(dot(w00 - patchCentre, averageNormal)),
+                                      abs(dot(w10 - patchCentre, averageNormal))),
+                                  max(abs(dot(w01 - patchCentre, averageNormal)),
+                                      abs(dot(w11 - patchCentre, averageNormal))));
+        float centreDepth = (LinearizeDepth(s00.r, _CurrentProj) +
+                             LinearizeDepth(s10.r, _CurrentProj) +
+                             LinearizeDepth(s01.r, _CurrentProj) +
+                             LinearizeDepth(s11.r, _CurrentProj)) * 0.25;
+        float planeTolerance = clamp(0.004 + centreDepth * 0.003, 0.006, 0.015);
+
+        if (normalCoherence < 0.70 || averageNormalLength < 0.5)
+            patchReason = 1u;
+        else if (geometricLength < 0.000001 || planeResidual > planeTolerance)
+            patchReason = 2u;
+        else if (normalGeometryAgreement < 0.75)
+            patchReason = 3u;
+    }
+
+    uint planeFirst = PlaneShadowState(first, patchValid, patchReason);
+    uint planeSecond = PlaneShadowState(second, patchValid, patchReason);
+    _PlaneConnectivityState[p00] = planeFirst | (planeSecond << 8);
+    CountPlaneShadow(planeFirst);
+    CountPlaneShadow(planeSecond);
+}
+
+bool ReviewIsIndependentSupport(uint state)
+{
+    return state == 3u;
+}
+
+bool ReviewIsIndependentConflict(uint state)
+{
+    return state == 7u || state == 8u;
+}
+
+void PublishTriangleWitness(float4 a, float4 b, float4 c,
+                            int2 pa, int2 pb, int2 pc,
+                            uint planeState)
+{
+    // 生产证词只接受原生连通面。四点共面“救回”只能继续留在
+    // 即时壳观察层，不得给稳定纸供证：前景物与背后墙面的深度断层
+    // 正是“局部可拟平，但不属于同一表面”的主要场景。
+    if (planeState != 0u) return;
+
+    uint ra = _ReviewState[pa];
+    uint rb = _ReviewState[pb];
+    uint rc = _ReviewState[pc];
+    if (ReviewIsIndependentConflict(ra) || ReviewIsIndependentConflict(rb) ||
+        ReviewIsIndependentConflict(rc)) return;
+    uint independentVotes = (ReviewIsIndependentSupport(ra) ? 1u : 0u) +
+                            (ReviewIsIndependentSupport(rb) ? 1u : 0u) +
+                            (ReviewIsIndependentSupport(rc) ? 1u : 0u);
+    // 三个顶点全部必须获得独立视角证词。“2/3 多数通过”会把
+    // 第三个位于遮挡边界的顶点一并写入存在账，造成跨层授权。
+    if (independentVotes < 3u) return;
+
+    InterlockedAdd(_ReviewCounters[24], 1u);
+    float3 wa = ReconstructWorld(pa, a.r, _CurrentProjInv, _CurrentViewInv);
+    float3 wb = ReconstructWorld(pb, b.r, _CurrentProjInv, _CurrentViewInv);
+    float3 wc = ReconstructWorld(pc, c.r, _CurrentProjInv, _CurrentViewInv);
+    float3 centreWorld = (wa + wb + wc) / 3.0;
+    // VolumeHelpers 的世界卷以原点为中心。这里显式传入体素尺寸，避免把
+    // 显示网格的像素步长误当空间尺寸。
+    float3 voxelFloat = centreWorld / max(_WitnessVoxelSize, 0.0001) +
+                        (float3)_WitnessVoxelCount * 0.5;
+    if (any(voxelFloat < 0.0) || any(voxelFloat >= (float3)_WitnessVoxelCount))
+    {
+        InterlockedAdd(_ReviewCounters[25], 1u);
+        return;
+    }
+    int3 voxel = (int3)floor(voxelFloat);
+    int stride = max(_WitnessStride, 1);
+    int3 cell = clamp(voxel / stride, int3(0, 0, 0), _WitnessCellCount - 1);
+    uint index = (uint)(cell.x + _WitnessCellCount.x *
+                 (cell.y + _WitnessCellCount.y * cell.z));
+    InterlockedMax(_VerifiedWitnessEpochs[index], _WitnessEpoch);
+}
+
+[numthreads(8, 8, 1)]
+void PublishVerifiedWitnesses(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x + 1u >= (uint)_ReviewGridSize.x ||
+        dispatchId.y + 1u >= (uint)_ReviewGridSize.y ||
+        any(_WitnessCellCount <= 0) || _WitnessEpoch == 0u) return;
+
+    int step = max(_PixelStep, 1);
+    int2 p00 = min(int2(dispatchId.xy) * step, _SourceSize - 1);
+    int2 p10 = min(p00 + int2(step, 0), _SourceSize - 1);
+    int2 p01 = min(p00 + int2(0, step), _SourceSize - 1);
+    int2 p11 = min(p00 + int2(step, step), _SourceSize - 1);
+    float4 s00 = _CurrentSnapshot.Load(int3(p00, 0));
+    float4 s10 = _CurrentSnapshot.Load(int3(p10, 0));
+    float4 s01 = _CurrentSnapshot.Load(int3(p01, 0));
+    float4 s11 = _CurrentSnapshot.Load(int3(p11, 0));
+    if (!PackedValid(s00, _CurrentProj) || !PackedValid(s10, _CurrentProj) ||
+        !PackedValid(s01, _CurrentProj) || !PackedValid(s11, _CurrentProj)) return;
+
+    uint packedPlane = _PlaneConnectivityState[p00];
+    PublishTriangleWitness(s00, s10, s01, p00, p10, p01, packedPlane & 255u);
+    PublishTriangleWitness(s10, s11, s01, p10, p11, p01,
+                           (packedPlane >> 8) & 255u);
+}

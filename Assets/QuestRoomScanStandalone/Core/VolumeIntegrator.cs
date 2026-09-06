@@ -34,6 +34,8 @@ namespace Genesis.RoomScan
         [Tooltip("头部排除区半径（仅 StandaloneRoomScanner 开启排除区时生效）。0.6 = QRS 原版（防手入网但头周覆盖空洞大），0.35 = 折中")]
         [SerializeField, Range(0.1f, 1f)] private float exclusionRadius = 0.35f;
         [SerializeField] private int maxFrustumPositions = 1000000;
+        [SerializeField, Tooltip("在不增加每帧样本数的前提下，让视锥采样格逐帧走完8个半体素相位。只改变哪些世界体素获得同一套已准入深度证据；不放宽深度、法线、边缘、运动或枪胶门禁。用于消除相机格与世界5cm格对齐造成的漏写、弱权重和八邻域缺样。")]
+        private bool enableFrustumPhaseCoverage = true;
 
         [Header("校枪—分层凝胶（GPU 证据层）")]
         [Tooltip("同吃生产预处理深度/法线/姿态，估计融合专用小修正并维护 K<=3 局部候选。本层自身不写 TSDF；下方受保护实验可选择消费结果。")]
@@ -46,8 +48,8 @@ namespace Genesis.RoomScan
         [SerializeField, Range(10, 120)] private int gunGelReportInterval = 30;
 
         [Header("枪胶受保护融合实验")]
-        [Tooltip("开=同帧预处理深度先留在三槽流水线，校枪完成后仅把秩/匹配/运动/幅度全部合格的帧校正后送入生产 TSDF；" +
-                 "快转、快移、撞30mm上限或解算不足的帧整帧弃权。关=原始生产融合。新实验默认开，必须从空 TSDF 开始对比。")]
+        [Tooltip("开=同帧预处理深度先留在三槽流水线：校枪可靠时应用小修正；欠秩、少配、缺证或修正解越界时撤销校正权并以原始位姿进入普通生产门；" +
+                 "只有明确快转/快移仍整帧停笔。逐点枪胶同样只拦双证冲突、已有反对票和跨面错配。关=原始生产融合。必须从空 TSDF 开始对比。")]
         [SerializeField] private bool enableGunGelGuardedFusionExperiment = true;
         [Tooltip("校枪参与生产融合所需的最少点面对应数。实机健康帧约1500；低于此值说明可见稳定凝胶不足。")]
         [SerializeField, Range(128, 4096)] private int gunGelFusionMinCorrespondences = 800;
@@ -145,8 +147,8 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.5f, 3f)] private float noiseAngleExponent = 1f;
 
         [Header("M1 成熟面观测折让")]
-        [Tooltip("总开关：已长熟的面对小矛盾新观测打折接收——几何不跟、权重慢涨、分歧按一致记账。真变化全速放行。08-20 用户拍板停用（非撤回）：M1.1 实机信高+5 但颜色体系仍不符合直觉，回 pre-M1 基线对表业内路线后再定去向。代码保留，勾上即复活。 (default false)")]
-        [SerializeField] private bool enableMatureSurfaceObsDiscount = false;
+        [Tooltip("总开关：已长熟的面对小偏差新观测打折接收——几何大幅少跟、权重慢涨、分歧按一致记账；超过小偏差带的真变化仍走原有纠错通道。它只作用于已达最大成熟门槛的存量面，不阻止空点/弱点继续补覆盖。 (default true)")]
+        [SerializeField] private bool enableMatureSurfaceObsDiscount = true;
         [Tooltip("折让判据的成熟门槛：weight≥此值的面才享折让。拍板口径 0.5=长熟面——不复用 frozenMatureWeight（实为 0.15=刚转正，折让会把爬坡期增长拖慢 20 倍）。 (default 0.5)")]
         [SerializeField, Range(0.1f, 1f)] private float matureSurfaceObsWeightMin = 0.5f;
         [Tooltip("小矛盾带半宽（归一化 sd，0.15≈2.2cm）：|新观测-存量|≤此值才折让；超带=真变化全速放行。必须小于矛盾杆 0.2 才有意义。 (default 0.15)")]
@@ -231,6 +233,7 @@ namespace Genesis.RoomScan
         private static readonly int VoxMinID = Shader.PropertyToID("gsVoxMin");
         private static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
         private static readonly int FrustumVolumeID = Shader.PropertyToID("gsFrustumVolume");
+        private static readonly int FrustumPhaseOffsetID = Shader.PropertyToID("gsFrustumPhaseOffset");
         private static readonly int DepthDispThreshID = Shader.PropertyToID("gsDepthDispThresh");
         private static readonly int NumExclusionsID = Shader.PropertyToID("gsNumExclusions");
         private static readonly int ExclusionHeadsID = Shader.PropertyToID("gsExclusionHeads");
@@ -285,6 +288,12 @@ namespace Genesis.RoomScan
         private static readonly int GunGelObservationGridID = Shader.PropertyToID("gsGunGelObservationGrid");
         private static readonly int GunGelPixelStrideID = Shader.PropertyToID("gsGunGelPixelStride");
         private static readonly int GunGelAdmissionEnableID = Shader.PropertyToID("gsGunGelAdmissionEnable");
+        private static readonly int ShellWitnessEpochsID = Shader.PropertyToID("gsShellWitnessEpochs");
+        private static readonly int ShellWitnessCellCountID = Shader.PropertyToID("gsShellWitnessCellCount");
+        private static readonly int ShellWitnessStrideID = Shader.PropertyToID("gsShellWitnessStride");
+        private static readonly int ShellWitnessEpochID = Shader.PropertyToID("gsShellWitnessEpoch");
+        private static readonly int ShellWitnessMaxAgeID = Shader.PropertyToID("gsShellWitnessMaxAge");
+        private static readonly int ShellWitnessEnableID = Shader.PropertyToID("gsShellWitnessEnable");
         private static readonly int UseRawProjectiveSdfID = Shader.PropertyToID("gsUseRawProjectiveSdf");
         private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
@@ -357,6 +366,7 @@ namespace Genesis.RoomScan
         private ComputeBuffer _frozenChunkVotes;
         private ComputeBuffer _frozenChunkBits; // T2：当前已冻块位图（1 位/块），补洞票的块冻结态判据
         private ComputeBuffer _chunkMaturity;
+        private ComputeBuffer _dummyShellWitnessEpochs;
         private uint[] _voteZeros;
         private uint[] _maturityZeros;
         private int3 _frozenChunkCount;
@@ -407,7 +417,7 @@ namespace Genesis.RoomScan
         // 68..70: provisional seeds, promotions and formal-surface demotions.
         // 71..89: read-only lifecycle forensics: seed source/risk, promotion
         // mechanism, promotion-time risk and immutable birth source.
-        private const int CarveStatsCount = 177; // 93..167=FOV账；168..176=枪胶逐体素准入契约账
+        private const int CarveStatsCount = 199; // 180..197=写入生命周期；198=未成熟冻结恢复（重叠账）
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
@@ -447,6 +457,20 @@ namespace Genesis.RoomScan
 
         /// <summary>Total number of integration passes dispatched since startup or the last clear.</summary>
         public int IntegrationCount { get; private set; }
+        // Eight centred half-voxel phases.  The per-frame budget is unchanged;
+        // over eight accepted integrations the camera-local lattice no longer
+        // keeps selecting the same subset of the world-aligned TSDF lattice.
+        private static readonly Vector3[] FrustumCoveragePhases =
+        {
+            new Vector3(-0.25f, -0.25f, -0.25f),
+            new Vector3( 0.25f,  0.25f, -0.25f),
+            new Vector3( 0.25f, -0.25f,  0.25f),
+            new Vector3(-0.25f,  0.25f,  0.25f),
+            new Vector3( 0.25f, -0.25f, -0.25f),
+            new Vector3(-0.25f,  0.25f, -0.25f),
+            new Vector3(-0.25f, -0.25f,  0.25f),
+            new Vector3( 0.25f,  0.25f,  0.25f)
+        };
         public int WarmupIntegrations => warmupIntegrations;
 
         /// <summary>Raised after each integration compute dispatch (before pruning).</summary>
@@ -616,6 +640,7 @@ namespace Genesis.RoomScan
         private int _gunGelCaptureFrameIndex;
         private int _gunGelFusionAccepted;
         private int _gunGelFusionRejected;
+        private int _gunGelFusionRawFallback;
         private int _gunGelFusionQueueAbstained;
         private float _gunGelLastAppliedMm;
         private string _gunGelLastFusionDecision = "预热";
@@ -639,7 +664,8 @@ namespace Genesis.RoomScan
             else if (_gunGelGuardedFusionRuntimeHalted)
                 fusion = "融试熔断→基线";
             else
-                fusion = $"融试用{_gunGelFusionAccepted}弃{_gunGelFusionRejected}" +
+                fusion = $"融试校{_gunGelFusionAccepted}拒校{_gunGelFusionRejected}" +
+                         $"原{_gunGelFusionRawFallback}" +
                          $"队{CountGunGelDeferredFrames()}失{_gunGelFusionQueueAbstained}" +
                          $"末{_gunGelLastFusionDecision}{_gunGelLastAppliedMm:F1}mm";
             string shadow = _gunGelEvidenceShadow != null
@@ -795,6 +821,10 @@ namespace Genesis.RoomScan
             _gunGelDummyCorrespondences = new ComputeBuffer(1, sizeof(float) * 12);
             _gunGelDummyObservations.SetData(new float[12]);
             _gunGelDummyCorrespondences.SetData(new float[12]);
+            _dummyShellWitnessEpochs = new ComputeBuffer(1, sizeof(uint),
+                ComputeBufferType.Structured);
+            _dummyShellWitnessEpochs.SetData(new uint[1]);
+            _integrateKernel.Set(ShellWitnessEpochsID, _dummyShellWitnessEpochs);
 
             if (enableProjectiveShadow)
             {
@@ -822,6 +852,8 @@ namespace Genesis.RoomScan
             _gunGelDummyObservations = null;
             _gunGelDummyCorrespondences?.Release();
             _gunGelDummyCorrespondences = null;
+            _dummyShellWitnessEpochs?.Release();
+            _dummyShellWitnessEpochs = null;
             ReleaseFrozenBlockBuffers();
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
@@ -1497,6 +1529,30 @@ namespace Genesis.RoomScan
             return v >= 10000u ? (v / 10000f).ToString("0.0") + "万" : v.ToString();
         }
 
+        /// <summary>
+        /// 即时壳→TSDF 的生产写入闭环。180 是近表面机会；其余槽只记录既有
+        /// 生产分支的实际去向，不参与融合、权重或提取。HUD 在即时壳档直接显示。
+        /// </summary>
+        public string GetFusionAdmissionDiagnosticsCompact()
+        {
+            if (!HasCarveStats || LastCarveStats.Length < CarveStatsCount) return "融写 统计中";
+            uint opportunities = LastCarveStats[180];
+            uint accepted = LastCarveStats[192] + LastCarveStats[193] + LastCarveStats[194];
+            int acceptedPercent = opportunities > 0u
+                ? Mathf.Clamp(Mathf.RoundToInt(accepted * 100f / opportunities), 0, 100)
+                : 0;
+            return $"融写 机{FormatCarveCount(opportunities)} 成{acceptedPercent:000}% " +
+                   $"胶{FormatCarveCount(LastCarveStats[181])} 排{FormatCarveCount(LastCarveStats[182])} " +
+                   $"法{FormatCarveCount(LastCarveStats[183])} 胀{FormatCarveCount(LastCarveStats[184])} " +
+                   $"带{FormatCarveCount(LastCarveStats[185])}\n" +
+                   $"融阻 弃{FormatCarveCount(LastCarveStats[186])} 弱{FormatCarveCount(LastCarveStats[187])} " +
+                   $"动{FormatCarveCount(LastCarveStats[188])} 射{FormatCarveCount(LastCarveStats[189])} " +
+                   $"借{FormatCarveCount(LastCarveStats[190])} 权{FormatCarveCount(LastCarveStats[191])} " +
+                   $"缓{FormatCarveCount(LastCarveStats[195])} 吞{FormatCarveCount(LastCarveStats[196])} " +
+                   $"冻{FormatCarveCount(LastCarveStats[197])}\n" +
+                   $"冻修 未熟恢复{FormatCarveCount(LastCarveStats[198])}（非补齐）";
+        }
+
         /// <summary>矛盾票普查的一行中文摘要（HUD 用）。</summary>
         public string GetCarveStatsCompact()
         {
@@ -1666,6 +1722,29 @@ namespace Genesis.RoomScan
             sb.AppendLine($"promotion_mechanism_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionMechanismSum}");
             sb.AppendLine($"promotion_birth_reconcile_delta={(long)CumulativeCarveStats[69] - (long)promotionBirthSum}");
             sb.AppendLine($"formal_demotion_total={U(CumulativeCarveStats[70])}");
+            sb.AppendLine($"shell_witness_promotion_candidates={U(CumulativeCarveStats[177])}");
+            sb.AppendLine($"shell_witness_fresh_hits={U(CumulativeCarveStats[178])}");
+            sb.AppendLine($"shell_witness_promotions={U(CumulativeCarveStats[179])}");
+            sb.AppendLine("relay_fusion_write_lifecycle:");
+            sb.AppendLine($"opportunities_near_surface={U(CumulativeCarveStats[180])}");
+            sb.AppendLine($"reject_gungel={U(CumulativeCarveStats[181])}");
+            sb.AppendLine($"reject_exclusion={U(CumulativeCarveStats[182])}");
+            sb.AppendLine($"reject_normal={U(CumulativeCarveStats[183])}");
+            sb.AppendLine($"reject_dilation={U(CumulativeCarveStats[184])}");
+            sb.AppendLine($"reject_truncation_band={U(CumulativeCarveStats[185])}");
+            sb.AppendLine($"abstain_neighbour={U(CumulativeCarveStats[186])}");
+            sb.AppendLine($"seed_support_low={U(CumulativeCarveStats[187])}");
+            sb.AppendLine($"seed_motion_block={U(CumulativeCarveStats[188])}");
+            sb.AppendLine($"raw_projective_block={U(CumulativeCarveStats[189])}");
+            sb.AppendLine($"borrowed_dilation_block={U(CumulativeCarveStats[190])}");
+            sb.AppendLine($"fov_motion_authority_abstain={U(CumulativeCarveStats[191])}");
+            sb.AppendLine($"accepted_seed={U(CumulativeCarveStats[192])}");
+            sb.AppendLine($"accepted_positive_update={U(CumulativeCarveStats[193])}");
+            sb.AppendLine($"accepted_contradiction_carve={U(CumulativeCarveStats[194])}");
+            sb.AppendLine($"accepted_still_provisional={U(CumulativeCarveStats[195])}");
+            sb.AppendLine($"quantized_no_write={U(CumulativeCarveStats[196])}");
+            sb.AppendLine($"frozen_observation_only={U(CumulativeCarveStats[197])}");
+            sb.AppendLine($"immature_frozen_reopened_overlap={U(CumulativeCarveStats[198])}");
             AppendFovSampleLedgerSummary(sb);
         }
 
@@ -1823,14 +1902,17 @@ namespace Genesis.RoomScan
                 Row("outer_cross", "applied_carve", "outer", name, counters[143 + reason]);
             }
             Row("gungel_admission", "examined", "all", "all", counters[168]);
-            Row("gungel_admission", "accepted", "all", "all", counters[169]);
-            Row("gungel_admission", "rejected", "all", "observation_invalid", counters[170]);
-            Row("gungel_admission", "rejected", "all", "raw_unavailable", counters[171]);
-            Row("gungel_admission", "rejected", "all", "dual_disagree", counters[172]);
-            Row("gungel_admission", "rejected", "all", "stable_candidate_missing", counters[173]);
-            Row("gungel_admission", "rejected", "all", "stable_dual_immature", counters[174]);
-            Row("gungel_admission", "rejected", "all", "candidate_opposed", counters[175]);
-            Row("gungel_admission", "rejected", "all", "pixel_cell_mismatch", counters[176]);
+            Row("gungel_admission", "witness_accepted", "all", "all", counters[169]);
+            Row("gungel_admission", "abstained_allow_raw", "all", "observation_invalid", counters[170]);
+            Row("gungel_admission", "abstained_allow_raw", "all", "raw_unavailable", counters[171]);
+            Row("gungel_admission", "blocked_explicit_conflict", "all", "dual_disagree", counters[172]);
+            Row("gungel_admission", "abstained_allow_raw", "all", "stable_candidate_missing", counters[173]);
+            Row("gungel_admission", "abstained_allow_raw", "all", "stable_dual_immature", counters[174]);
+            Row("gungel_admission", "blocked_explicit_conflict", "all", "candidate_opposed", counters[175]);
+            Row("gungel_admission", "blocked_explicit_conflict", "all", "pixel_cell_mismatch", counters[176]);
+            Row("shell_witness", "examined", "all", "rescued_provisional", counters[177]);
+            Row("shell_witness", "fresh_hit", "all", "independent_verified", counters[178]);
+            Row("shell_witness", "promotion", "all", "second_raw_confirmed", counters[179]);
         }
 
         /// <summary>KinectFusion raw-projective 影子体的独立矛盾票摘要。</summary>
@@ -1974,6 +2056,10 @@ namespace Genesis.RoomScan
             compute.SetFloat(DilationBlockSparseID, dilationBlockSparseWrites ? 1f : 0f);
             compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
+            Vector3 frustumPhase = enableFrustumPhaseCoverage
+                ? FrustumCoveragePhases[IntegrationCount & 7] * voxelSize
+                : Vector3.zero;
+            compute.SetVector(FrustumPhaseOffsetID, frustumPhase);
             compute.SetFloat(DiagnosticAngularSpeedID, 0f);
             compute.SetFloat(NoiseMotionQualityID, 1f);
             compute.SetFloat(MotionAuthorityQualityID, 1f);
@@ -2009,6 +2095,11 @@ namespace Genesis.RoomScan
         /// <see cref="ReallocateVolumes"/>).
         /// </summary>
         public void Clear()
+        {
+            ClearInternal(preserveGunGelEvidence: false);
+        }
+
+        private void ClearInternal(bool preserveGunGelEvidence)
         {
             if (_volume == null || _clearKernel.Shader == null) return;
 
@@ -2052,7 +2143,11 @@ namespace Genesis.RoomScan
             _fovLedgerStartedRealtime = Time.realtimeSinceStartup;
             HasCarveStats = false;
             HasProjectiveShadowCarveStats = false;
-            _gunGelEvidenceShadow?.Clear();
+            // 用户清卷/重定位时证据与体素一起失效；暖机结束只丢传感器启动期
+            // TSDF，不得把刚养成的枪胶候选同时抹掉，否则会制造第二次冷启动
+            // 并再次让欠秩/少配拖住覆盖。
+            if (!preserveGunGelEvidence)
+                _gunGelEvidenceShadow?.Clear();
             ResetGunGelDeferredFrames(false);
             MarkAllChunksDirty();
             Cleared?.Invoke();
@@ -2070,6 +2165,7 @@ namespace Genesis.RoomScan
             _gunGelCaptureFrameIndex = 0;
             _gunGelFusionAccepted = 0;
             _gunGelFusionRejected = 0;
+            _gunGelFusionRawFallback = 0;
             _gunGelFusionQueueAbstained = 0;
             _gunGelLastAppliedMm = 0f;
             _gunGelLastFusionDecision = "预热";
@@ -2202,8 +2298,8 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Freeze all voxels currently visible in the camera frustum.
-        /// Frozen voxels are encoded as negative weight and skip integration.
+        /// Freeze mature voxels currently visible in the camera frustum.
+        /// Immature supports remain writable; mature frozen weights are negative.
         /// Requires camera data to have been provided via SetCameraData.
         /// </summary>
         public void FreezeInView(Vector3 camPos, Quaternion camRot,
@@ -2216,6 +2312,7 @@ namespace Genesis.RoomScan
             }
             SetFrustumCameraUniforms(_freezeKernel, camPos, camRot,
                 focalLen, principalPt, sensorRes, currentRes);
+            ConfigureFreezeSupportWeight();
             _freezeKernel.Set(VolumeRWID, _volume);
             _freezeKernel.DispatchFit(_volume);
             if (_projectiveShadowVolume != null)
@@ -2277,7 +2374,7 @@ namespace Genesis.RoomScan
         public int3 FrozenChunkCount => _frozenChunkCount;
 
         /// <summary>
-        /// 上传 set/clear 块位图并翻符号：set=冻结（weight 正→负），clear=解冻（负→正），
+        /// 上传 set/clear 块位图并翻符号：set=只冻达到逐体素门槛的正权重，clear=负→正，
         /// 解冻块票箱同批清零。主卷与影子卷各执行一次。掩码一次性消费——返回时两个
         /// 传入数组已被清零，GPU 侧掩码同步复位，残留位不会误伤下一批。
         /// 提取层 abs(weight) 对符号透明：本调用不标脏、不触发重提网格。
@@ -2285,6 +2382,7 @@ namespace Genesis.RoomScan
         public void ApplyChunkFreezeMasks(uint[] setMask, uint[] clearMask)
         {
             if (!FrozenBlockReady || setMask == null || clearMask == null) return;
+            ConfigureFreezeSupportWeight();
             _chunkFreezeSetMask.SetData(setMask);
             _chunkFreezeClearMask.SetData(clearMask);
             _applyFreezeMaskKernel.DispatchFit(_volume);
@@ -2299,6 +2397,12 @@ namespace Genesis.RoomScan
             System.Array.Clear(clearMask, 0, clearMask.Length);
             _chunkFreezeSetMask.SetData(setMask);
             _chunkFreezeClearMask.SetData(clearMask);
+        }
+
+        private void ConfigureFreezeSupportWeight()
+        {
+            compute.SetFloat(FrozenMatureWeightID, frozenMatureWeight);
+            compute.SetFloat(DirtyMinWeightID, minMeshWeight);
         }
 
         /// <summary>清零成熟度账并重新普查一遍（调度器每窗调用，回读 ChunkMaturity）。</summary>
@@ -2429,17 +2533,17 @@ namespace Genesis.RoomScan
         /// Dispatches one TSDF + color integration pass from the current depth frame.
         /// Handles frustum setup, exclusion zones, warmup clearing, and periodic pruning.
         /// </summary>
-        public void Integrate()
+        public bool Integrate()
         {
             var dc = DepthCapture.Instance;
-            if (dc == null || !DepthCapture.DepthAvailable || dc.DepthTex == null) return;
+            if (dc == null || !DepthCapture.DepthAvailable || dc.DepthTex == null) return false;
             // Defensive: with lazy GPU alloc a stray Integrate() before
             // ReallocateVolumes can land here. RoomScanner.StartScanning()
             // always calls ReallocateVolumes first, so this is just a
             // safety net.
-            if (_volume == null || _integrateKernel.Shader == null) return;
+            if (_volume == null || _integrateKernel.Shader == null) return false;
             if (!_frustumReady) SetupFrustumVolume();
-            if (!_frustumReady) return;
+            if (!_frustumReady) return false;
             int replayAttemptIndex = ++_replayFusionAttemptIndex;
 
             Texture fusionDepth = dc.DepthTex;
@@ -2454,6 +2558,8 @@ namespace Genesis.RoomScan
             Matrix4x4[] fusionProjectionInverse = dc.ProjInv;
             GunGelDeferredFrame deferredFrame = null;
             bool usingGuardedFrame = false;
+            bool gunGelCorrectionApplied = false;
+            string acceptedInputReason = "baseline_accept";
 
             // 运动闸：转头时积分位姿与深度帧存在帧差，写入会切向涂抹成搓衣板褶皱、
             // 矛盾票也会按错位投影啃到真表面。超阈值整帧停笔（不集成、不扣减），
@@ -2504,13 +2610,12 @@ namespace Genesis.RoomScan
             // 最老帧尚在回读时宁可短暂停笔，绝不用上一帧校正硬套当前帧。
             if (guardedExperimentActive && !_gunGelGuardedFusionRuntimeHalted)
             {
-                if (!TryGetOldestResolvedGunGelFrame(out deferredFrame)) return;
+                if (!TryGetOldestResolvedGunGelFrame(out deferredFrame)) return false;
                 if (!AcceptGunGelFrame(deferredFrame, out string rejectReason))
                 {
-                    // 欠秩/少配通常是候选账本尚未长成，而不是源帧本身不可靠。
-                    // 这两类帧只准以恒等校正养候选，不准投反对票、淘汰候选或写
-                    // TSDF；否则会形成“无候选→无配准→永远无候选”的启动自锁。
-                    // 其余拒绝帧仍只有浪头诊断权，完全不能改候选账本。
+                    // 欠秩、少配、回读/证据缺失和超出校正解算范围，只能说明
+                    // 枪胶无法安全给出修正，不能证明同帧平台深度无效。除明确的
+                    // 快速运动外，这些帧退回恒等位姿，由普通深度生产门继续裁决。
                     bool bootstrapObservation = rejectReason == "欠秩" ||
                                                 rejectReason == "少配";
                     if (bootstrapObservation)
@@ -2520,40 +2625,51 @@ namespace Genesis.RoomScan
                         _gunGelEvidenceShadow?.AdjudicateFrameDecision(
                             deferredFrame.Decision, false);
                     _gunGelFusionRejected++;
-                    _gunGelLastFusionDecision = rejectReason;
+                    bool explicitMotionConflict = rejectReason == "快角" ||
+                                                  rejectReason == "快移";
+                    _gunGelLastFusionDecision = explicitMotionConflict
+                        ? rejectReason : "原" + rejectReason;
                     _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
-                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
-                        replayAttemptIndex, deferredFrame.PlatformFrame, false,
-                        "gungel_reject:" + rejectReason, true, deferredFrame.FrameIndex,
-                        deferredFrame.Decision.TranslationMm,
-                        deferredFrame.Decision.RotationDeg,
-                        deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
-                        deferredFrame.MotionQuality);
-                    ReleaseGunGelDeferredFrame(deferredFrame);
-                    return;
-                }
+                    if (explicitMotionConflict)
+                    {
+                        ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                            replayAttemptIndex, deferredFrame.PlatformFrame, false,
+                            "gungel_reject:" + rejectReason, true, deferredFrame.FrameIndex,
+                            deferredFrame.Decision.TranslationMm,
+                            deferredFrame.Decision.RotationDeg,
+                            deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
+                            deferredFrame.MotionQuality);
+                        ReleaseGunGelDeferredFrame(deferredFrame);
+                        return false;
+                    }
 
-                // 先完成严格逐点裁决，再提交候选事务；只有二者都成功，本帧才可
-                // 继续进入 TSDF。这样被“撞顶/快角/位大”拒绝的帧不会提前改动
-                // 稳定候选，逐点 Correspondence 也一定来自同一候选账本版本。
-                if (_gunGelEvidenceShadow == null ||
-                    !_gunGelEvidenceShadow.AdjudicateFrameDecision(
-                        deferredFrame.Decision, true))
+                    _gunGelFusionRawFallback++;
+                    acceptedInputReason = "gungel_raw_fallback:" + rejectReason;
+                }
+                else if (_gunGelEvidenceShadow == null ||
+                         !_gunGelEvidenceShadow.AdjudicateFrameDecision(
+                             deferredFrame.Decision, true))
                 {
+                    // 候选事务失败同样只撤销枪胶修正权。原始延迟帧仍可走普通
+                    // TSDF门禁；否则一个旁路账本错误会把整个生产融合一并熔断。
                     _gunGelFusionRejected++;
-                    _gunGelLastFusionDecision = "事务";
-                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
-                        replayAttemptIndex, deferredFrame.PlatformFrame, false,
-                        "gungel_reject:事务", true, deferredFrame.FrameIndex,
-                        deferredFrame.Decision.TranslationMm,
-                        deferredFrame.Decision.RotationDeg,
-                        deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
-                        deferredFrame.MotionQuality);
-                    ReleaseGunGelDeferredFrame(deferredFrame);
-                    return;
+                    _gunGelFusionRawFallback++;
+                    _gunGelLastFusionDecision = "原事务";
+                    _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
+                    acceptedInputReason = "gungel_raw_fallback:事务";
+                }
+                else
+                {
+                    ApplyGunGelCorrection(deferredFrame);
+                    gunGelCorrectionApplied = true;
+                    acceptedInputReason = "gungel_corrected";
+                    _gunGelFusionAccepted++;
+                    _gunGelLastFusionDecision = "校";
+                    _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
                 }
 
-                ApplyGunGelCorrection(deferredFrame);
+                // 无论使用校正还是原始位姿，都消费同一张延迟帧，禁止把这一帧的
+                // 枪胶结果套到当前相机帧。二者的唯一区别是修正矩阵及逐点反证权。
                 usingGuardedFrame = true;
                 fusionDepth = deferredFrame.Depth;
                 fusionNormal = deferredFrame.Normal;
@@ -2567,9 +2683,6 @@ namespace Genesis.RoomScan
                 fusionProjectionInverse = deferredFrame.ProjectionInverse;
                 _smoothedAngSpeed = deferredFrame.AngularSpeed;
                 _motionQuality = deferredFrame.MotionQuality;
-                _gunGelFusionAccepted++;
-                _gunGelLastFusionDecision = "校";
-                _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
             }
             else if (currentHardGated)
             {
@@ -2577,7 +2690,7 @@ namespace Genesis.RoomScan
                     replayAttemptIndex, dc.CurrentPlatformFrame, false,
                     "motion_hard_gate", false, -1, 0f, 0f,
                     currentAngularSpeed, currentLinearSpeed, _motionQuality);
-                return;
+                return false;
             }
 
             compute.SetMatrixArray(DepthCapture.ViewID, fusionView);
@@ -2585,7 +2698,9 @@ namespace Genesis.RoomScan
             compute.SetMatrixArray(DepthCapture.ViewInvID, fusionViewInverse);
             compute.SetMatrixArray(DepthCapture.ProjInvID, fusionProjectionInverse);
             compute.SetMatrix(FusionCorrectionID,
-                usingGuardedFrame ? deferredFrame.Decision.Correction : Matrix4x4.identity);
+                gunGelCorrectionApplied
+                    ? deferredFrame.Decision.Correction
+                    : Matrix4x4.identity);
 
             int numExclusions;
             if (usingGuardedFrame)
@@ -2635,6 +2750,13 @@ namespace Genesis.RoomScan
             compute.SetFloat(DilationBlockSparseID, dilationBlockSparseWrites ? 1f : 0f);
             compute.SetFloat(ProvisionalSeedWeightID, provisionalSeedWeight);
             compute.SetFloat(FormalSurfaceWeightID, minMeshWeight);
+            // Advance the camera-local lattice only on frames that actually
+            // reach integration. SetShaderConstants establishes the initial
+            // value; this accepted-frame cycle supplies the coverage benefit.
+            Vector3 frustumPhase = enableFrustumPhaseCoverage
+                ? FrustumCoveragePhases[IntegrationCount & 7] * voxelSize
+                : Vector3.zero;
+            compute.SetVector(FrustumPhaseOffsetID, frustumPhase);
             compute.SetFloat(DiagnosticAngularSpeedID, _smoothedAngSpeed);
             compute.SetFloat(NoiseMotionQualityID, noiseMotionWeightEnable ? _motionQuality : 1f);
             compute.SetFloat(MotionAuthorityQualityID, _motionQuality);
@@ -2680,7 +2802,7 @@ namespace Genesis.RoomScan
             // Correspondence.w 编码稳定候选、平台/预处理双证词与反对票状态；
             // Integrate 再按当前体素投影像素做局部一致性复核。基线与 B 影子绑定
             // 零缓冲且关闭开关，确保对照链不被实验准入污染。
-            bool gunGelAdmissionActive = usingGuardedFrame &&
+            bool gunGelAdmissionActive = gunGelCorrectionApplied &&
                                           deferredFrame.Decision.HasFusionAdmissionBuffers;
             ComputeBuffer gunGelObservations = gunGelAdmissionActive
                 ? deferredFrame.Decision.FusionObservations
@@ -2697,17 +2819,39 @@ namespace Genesis.RoomScan
                 gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 1);
             compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
 
+            // 旧历史探针的生产证词通路已停权。保留下面的空绑定是为了让
+            // compute 参数布局与黑匣子计数保持兼容，但生产 Integrate 永远收到
+            // enable=0；即时壳与三段接力诊断仍是只读观察者。
+            ComputeBuffer shellWitnessEpochs = null;
+            int3 shellWitnessCellCount = new int3(1, 1, 1);
+            int shellWitnessStride = 1;
+            uint shellWitnessEpoch = 0u;
+            uint shellWitnessMaxAge = 0u;
+            bool shellWitnessActive = false;
+            _integrateKernel.Set(ShellWitnessEpochsID,
+                shellWitnessActive ? shellWitnessEpochs : _dummyShellWitnessEpochs);
+            compute.SetInts(ShellWitnessCellCountID,
+                shellWitnessActive ? shellWitnessCellCount.x : 1,
+                shellWitnessActive ? shellWitnessCellCount.y : 1,
+                shellWitnessActive ? shellWitnessCellCount.z : 1);
+            compute.SetInt(ShellWitnessStrideID, shellWitnessActive ? shellWitnessStride : 1);
+            compute.SetInt(ShellWitnessEpochID,
+                shellWitnessActive ? unchecked((int)shellWitnessEpoch) : 0);
+            compute.SetInt(ShellWitnessMaxAgeID,
+                shellWitnessActive ? unchecked((int)shellWitnessMaxAge) : 0);
+            compute.SetFloat(ShellWitnessEnableID, shellWitnessActive ? 1f : 0f);
+
             // 独立会话记录的是生产 Integrate 此刻真正绑定的完整输入：不仅是深度，
             // 还包括逐点枪胶准入、实际 RGB 副本及其针孔内外参。记录动作只旁路回读，
             // 不参与当前帧裁决，也不改变任何 compute 绑定。
             ScanReplaySessionPackage.Active?.RecordAcceptedInput(
                 replayAttemptIndex,
                 usingGuardedFrame ? deferredFrame.PlatformFrame : dc.CurrentPlatformFrame,
-                usingGuardedFrame ? "gungel_accept" : "baseline_accept",
+                acceptedInputReason,
                 usingGuardedFrame,
                 usingGuardedFrame ? deferredFrame.FrameIndex : -1,
-                usingGuardedFrame ? deferredFrame.Decision.TranslationMm : 0f,
-                usingGuardedFrame ? deferredFrame.Decision.RotationDeg : 0f,
+                gunGelCorrectionApplied ? deferredFrame.Decision.TranslationMm : 0f,
+                gunGelCorrectionApplied ? deferredFrame.Decision.RotationDeg : 0f,
                 _smoothedAngSpeed,
                 usingGuardedFrame ? deferredFrame.LinearSpeed : currentLinearSpeed,
                 _motionQuality,
@@ -2717,6 +2861,12 @@ namespace Genesis.RoomScan
                 gunGelAdmissionActive,
                 gunGelAdmissionActive ? gunGelObservations : null,
                 gunGelAdmissionActive ? gunGelCorrespondences : null,
+                gunGelAdmissionActive
+                    ? deferredFrame.Decision.FusionPreTransactionCorrespondenceIdentity
+                    : null,
+                gunGelAdmissionActive
+                    ? deferredFrame.Decision.FusionCorrespondenceIdentity
+                    : null,
                 gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridX : 0,
                 gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridY : 0,
                 gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 0,
@@ -2724,7 +2874,9 @@ namespace Genesis.RoomScan
                 productionCamAvailable ? _camFrameCopy : null,
                 _pendingCamPos, _pendingCamRot, _pendingFocalLen, _pendingPrincipalPt,
                 _pendingSensorRes, _pendingCurrentRes,
-                usingGuardedFrame ? deferredFrame.Decision.Correction : Matrix4x4.identity,
+                gunGelCorrectionApplied
+                    ? deferredFrame.Decision.Correction
+                    : Matrix4x4.identity,
                 _exclusionPositions, numExclusions);
 
             // A: production path (projective difference scaled by normal cosine), now
@@ -2745,6 +2897,7 @@ namespace Genesis.RoomScan
             if (_projectiveShadowVolume != null && _projectiveShadowCarveStats != null)
             {
                 compute.SetFloat(GunGelAdmissionEnableID, 0f);
+                compute.SetFloat(ShellWitnessEnableID, 0f);
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
@@ -2762,6 +2915,7 @@ namespace Genesis.RoomScan
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
                 compute.SetFloat(ConfidenceWriteID, 1f);
                 compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
+                compute.SetFloat(ShellWitnessEnableID, shellWitnessActive ? 1f : 0f);
                 ConfigureDirtyTracking(true);
                 compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
                 _integrateKernel.Set(VolumeRWID, _volume);
@@ -2775,7 +2929,7 @@ namespace Genesis.RoomScan
             if (warmupIntegrations > 0 && IntegrationCount == warmupIntegrations)
             {
                 Logger.Info($"Warmup complete ({warmupIntegrations} frames), clearing volume to discard sensor startup noise");
-                Clear();
+                ClearInternal(preserveGunGelEvidence: true);
             }
 
             float t = Time.time;
@@ -2838,6 +2992,7 @@ namespace Genesis.RoomScan
             }
 
             Integrated?.Invoke();
+            return true;
         }
 
         /// <summary>

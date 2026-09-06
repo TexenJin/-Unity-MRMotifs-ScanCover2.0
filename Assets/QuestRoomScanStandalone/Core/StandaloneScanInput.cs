@@ -5,18 +5,19 @@ namespace Genesis.RoomScan
     /// <summary>
     /// QRS 独立测试链的右手柄输入：
     ///   扳机       = 开始 / 继续采集共享 TSDF
-    ///   A          = 冻结共享 TSDF（先隐藏采集覆盖片）
+    ///   A          = 冻结共享 TSDF；即时外壳档中只钉住影子快照，生产继续
     ///   Y          = 在 64³ / 32³ / 16³ 只读回放档之间循环
     ///   B          = 只导出并清空当前档，不清共享 TSDF
-    ///   右摇杆按下 = 路线验证期间：纸网合流→支撑真值→三角粗皮→HERA→纸网合流；
-    ///                否则冻结回放后切状态着色。两个直接视图保留融合但暂停 HERA。
+    ///   右摇杆按下 = 一键回到真实 TSDF 的生产纸皮观察档；
+    ///   右握把+右摇杆按下 = 纸皮→支撑真值→三角粗皮→HERA 的诊断视图循环。
     ///   右摇杆方向+按下 = 追责/性能热键：上=实时轨 / 左=胶冻↔原冻（仅空卷） / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
     ///   左摇杆按下 = 支撑真值档切拓扑审计/外皮片实体；纸网合流档切纸主网格/旧真边对照
     ///   左摇杆上+按下 = 源头时序滤波开关（盯墙养绿 A/B 热键，HUD 闸行 时开/时关 回显）
     ///   左摇杆下+按下 = 第一阶段纯白几何 / 原状态色切换（仅显示层）
     ///   左摇杆右+按下 = 32³融合管理块线框开关（青稳/黄热/红双热/洋红已解冻）
     ///   左摇杆左+按下 = 空卷时切换胶冻 / 原冻（与右摇杆左同义，便于实机操作）
-    ///   左握把+X = 平台前处理 / QRS 后处理双路逐帧采集开关（普通 X 仍是 BB 反投影显示）
+    ///   左握把+X = 平台前处理 / QRS 后处理双路逐帧采集开关
+    ///   普通 X     = 裁决海→BB点云→即时外壳→壳纸合流→关
     /// 每次按键给一下短震动作为反馈。
     /// </summary>
     public class StandaloneScanInput : MonoBehaviour
@@ -53,7 +54,11 @@ namespace Genesis.RoomScan
             if (OVRInput.GetDown(OVRInput.Button.One, controller))
             {
                 scanner.NotifyInput("A键");
-                if (scanner.IsChunkAbExperimentEnabled)
+                if (scanner.TryFreezeInstantShellSnapshot())
+                {
+                    Pulse();
+                }
+                else if (scanner.IsChunkAbExperimentEnabled)
                 {
                     scanner.FreezeChunkAbTsdf();
                     Pulse();
@@ -111,10 +116,18 @@ namespace Genesis.RoomScan
                 }
                 else
                 {
-                    // 着色切换只在冻结回放后有意义（ToggleChunkAbDisplayMode 未冻结
-                    // 直接早退=空转）；扫描中路线验证时切纸网合流/支撑真值/三角粗皮/HERA，
-                    // 否则沿用网格显示总闸。
-                    if (scanner.IsChunkAbFrozen)
+                    // 无组合键永远回真实生产纸皮，避免录屏误落在 HERA/粗皮/点层。
+                    // 原来的路线诊断循环保留在右握把组合键，不影响故障排查能力。
+                    float rightGrip = OVRInput.Get(
+                        OVRInput.RawAxis1D.RHandTrigger,
+                        OVRInput.Controller.RTouch);
+                    bool rightGripHeld =
+                        OVRInput.Get(OVRInput.RawButton.RHandTrigger,
+                                     OVRInput.Controller.RTouch) ||
+                        rightGrip > 0.35f;
+                    if (!rightGripHeld)
+                        scanner.ShowProductionPaperView();
+                    else if (scanner.IsChunkAbFrozen)
                         scanner.ToggleChunkAbDisplayMode();
                     else
                         scanner.ToggleMeshDisplay();
@@ -150,7 +163,7 @@ namespace Genesis.RoomScan
                 }
                 else
                 {
-                    // 普通 X：关 → 枪胶裁决海 → BB 反投影 → 关。
+                    // 普通 X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳 → 壳纸合流 → 关。
                     scanner.ToggleCoverageMarkers();
                     // ToggleCoverageMarkers 内部会写一次提示，因此诊断握值必须放在
                     // 它之后，确保实机截图能看见而不是被“BB反投影”提示覆盖。

@@ -13,6 +13,7 @@ namespace Genesis.RoomScan
         // Kernel indices
         private readonly int _kClearCounters;
         private readonly int _kClassifyAndEmit;
+        private readonly int _kBuildFoundationClusters;
         private readonly int _kBuildVertexDispatchArgs;
         private readonly int _kInitSmooth;
         private readonly int _kSmoothVertices;
@@ -79,6 +80,21 @@ namespace Genesis.RoomScan
         public float TemporalDeadzone { get; set; } = 0.001f;
         public bool StrictObservedEdges { get; set; }
         public bool CandidateHistoryUpdateEnabled { get; set; } = true;
+        /// <summary>
+        /// Lean foundation topology. Production uses a globally anchored
+        /// 10 cm lattice while each coarse edge remains bracketed by native
+        /// 5 cm TSDF samples. Visible topology never falls back to 5 cm. Direct
+        /// stride-2 TSDF extraction and corner chamfering remain dormant.
+        /// </summary>
+        public bool FoundationTopologyMode { get; set; }
+        public int FoundationCellStride { get; set; } = 1;
+        public bool FoundationFeatureRecognition { get; set; }
+        public float FoundationNormalClusterDotMin { get; set; } = 0.8660254f;
+        public float FoundationCornerNormalDotMax { get; set; } = 0.7071068f;
+        public float FoundationChamferWidthVoxels { get; set; }
+        public bool FoundationConstrainedSimplification { get; set; }
+        public float FoundationSimplifyNormalDotMin { get; set; } = 0.9659258f;
+        public float FoundationSimplifyPlaneResidualVoxels { get; set; } = 0.2f;
         public bool VisualQualityDiagnosticsEnabled { get; set; }
         public bool DiagnosticRoiEnabled { get; set; } = true;
         public Vector4 DiagnosticRoiRect { get; set; } = new Vector4(0.2f, 0.25f, 0.8f, 0.75f);
@@ -133,6 +149,15 @@ namespace Genesis.RoomScan
         private static readonly int ID_CandidateHistoryUpdateEnabled = Shader.PropertyToID("_CandidateHistoryUpdateEnabled");
         private static readonly int ID_CandidateHistoryCapacity = Shader.PropertyToID("_CandidateHistoryCapacity");
         private static readonly int ID_CandidateHistoryMask = Shader.PropertyToID("_CandidateHistoryMask");
+        private static readonly int ID_FoundationTopologyMode = Shader.PropertyToID("_FoundationTopologyMode");
+        private static readonly int ID_FoundationCellStride = Shader.PropertyToID("_FoundationCellStride");
+        private static readonly int ID_FoundationFeatureRecognition = Shader.PropertyToID("_FoundationFeatureRecognition");
+        private static readonly int ID_FoundationNormalClusterDotMin = Shader.PropertyToID("_FoundationNormalClusterDotMin");
+        private static readonly int ID_FoundationCornerNormalDotMax = Shader.PropertyToID("_FoundationCornerNormalDotMax");
+        private static readonly int ID_FoundationChamferWidthVoxels = Shader.PropertyToID("_FoundationChamferWidthVoxels");
+        private static readonly int ID_FoundationSimplifyEnabled = Shader.PropertyToID("_FoundationSimplifyEnabled");
+        private static readonly int ID_FoundationSimplifyNormalDotMin = Shader.PropertyToID("_FoundationSimplifyNormalDotMin");
+        private static readonly int ID_FoundationSimplifyPlaneResidualVoxels = Shader.PropertyToID("_FoundationSimplifyPlaneResidualVoxels");
         private static readonly int ID_VisualQualityEnabled = Shader.PropertyToID("_VisualQualityEnabled");
         private static readonly int ID_SnapshotVertices = Shader.PropertyToID("_SnapshotVertices");
         private static readonly int ID_SnapshotIndices = Shader.PropertyToID("_SnapshotIndices");
@@ -208,6 +233,7 @@ namespace Genesis.RoomScan
 
             _kClearCounters = compute.FindKernel("ClearCounters");
             _kClassifyAndEmit = compute.FindKernel("ClassifyAndEmit");
+            _kBuildFoundationClusters = compute.FindKernel("BuildFoundationClusters");
             _kBuildVertexDispatchArgs = compute.FindKernel("BuildVertexDispatchArgs");
             _kInitSmooth = compute.FindKernel("InitSmooth");
             _kSmoothVertices = compute.FindKernel("SmoothVertices");
@@ -568,7 +594,12 @@ namespace Genesis.RoomScan
             _mapVoxels = mapVoxels;
             _maxVertices = Mathf.Max(1024, (int)(mapVoxels * vertexBudgetPercent));
             _maxIndices = _maxVertices * 18;
-            _candidateHistoryCapacity = Mathf.NextPowerOfTwo(Mathf.Clamp(mapVoxels * 2, 4096, CandidateHistoryCapacity));
+            // The foundation route deliberately owns no candidate-history
+            // archive. Keep one harmless bound slot so the shared shader
+            // bindings stay valid without paying ~1 MB per observed chunk.
+            _candidateHistoryCapacity = CandidateHistoryUpdateEnabled
+                ? Mathf.NextPowerOfTwo(Mathf.Clamp(mapVoxels * 2, 4096, CandidateHistoryCapacity))
+                : 1;
 
             const GraphicsBuffer.Target structuredIndirect =
                 GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.IndirectArguments;
@@ -580,22 +611,27 @@ namespace Genesis.RoomScan
             _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CounterCount, 4);
             _dispatchArgs = new GraphicsBuffer(structuredIndirect, 3, 4);
             _drawIndirectArgs = new GraphicsBuffer(structuredIndirect, 5, 4);
-            _smoothPosA = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, Float3Stride);
-            _smoothPosB = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, Float3Stride);
+            int smoothCapacity = SmoothIterations > 0 ? _maxVertices : 1;
+            _smoothPosA = new GraphicsBuffer(GraphicsBuffer.Target.Structured, smoothCapacity, Float3Stride);
+            _smoothPosB = new GraphicsBuffer(GraphicsBuffer.Target.Structured, smoothCapacity, Float3Stride);
             _candidateHistoryKeys = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _candidateHistoryCapacity, 4);
             _candidateHistoryStates = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _candidateHistoryCapacity, 4);
 
-            // Temporal state as RWTexture3D<float4> -- avoids the 128MB structured buffer limit.
-            // 256^3 x RGBA32Float = 256MB as a 3D texture, which Quest supports (same as TSDF volume path).
-            _temporalState = new RenderTexture(mapCount.x, mapCount.y, 0, GraphicsFormat.R32G32B32A32_SFloat)
+            if (TemporalAlphaMax < 1f)
             {
-                dimension = TextureDimension.Tex3D,
-                volumeDepth = mapCount.z,
-                enableRandomWrite = true,
-                filterMode = FilterMode.Point,
-                wrapMode = TextureWrapMode.Clamp
-            };
-            _temporalState.Create();
+                // Temporal state is optional. The uniform foundation consumes the
+                // already-stable TSDF and sets alpha=1, so it must not allocate
+                // another dense float4 history volume per active chunk.
+                _temporalState = new RenderTexture(mapCount.x, mapCount.y, 0, GraphicsFormat.R32G32B32A32_SFloat)
+                {
+                    dimension = TextureDimension.Tex3D,
+                    volumeDepth = mapCount.z,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _temporalState.Create();
+            }
 
             _temporalInitialized = false;
             _candidateHistoryInitialized = false;
@@ -606,8 +642,8 @@ namespace Genesis.RoomScan
                             + (long)_maxIndices * 4
                             + (long)_maxVertices * 4
                             + CounterCount * 4 + 3 * 4 + 5 * 4
-                            + (long)_maxVertices * Float3Stride * 2
-                            + (long)mapVoxels * 16
+                            + (long)smoothCapacity * Float3Stride * 2
+                            + (TemporalAlphaMax < 1f ? (long)mapVoxels * 16 : 0L)
                             + (long)_candidateHistoryCapacity * 8;
             Logger.Info($"[GPUSurfaceNets] Allocated buffers: vox={voxCount}, map={mapMin}+{mapCount}, core={coreMin}..{coreMax}, " +
                       $"maxVerts={_maxVertices}, maxIdx={_maxIndices}, " +
@@ -671,6 +707,23 @@ namespace Genesis.RoomScan
             }
             _compute.SetInt(ID_CandidateExtractionEpoch, unchecked((int)_candidateExtractionEpoch));
             _compute.SetInt(ID_CandidateHistoryUpdateEnabled, CandidateHistoryUpdateEnabled ? 1 : 0);
+            _compute.SetInt(ID_FoundationTopologyMode, FoundationTopologyMode ? 1 : 0);
+            _compute.SetInt(ID_FoundationCellStride,
+                FoundationTopologyMode ? Mathf.Max(1, FoundationCellStride) : 1);
+            _compute.SetInt(ID_FoundationFeatureRecognition,
+                FoundationTopologyMode && FoundationFeatureRecognition ? 1 : 0);
+            _compute.SetFloat(ID_FoundationNormalClusterDotMin,
+                Mathf.Clamp(FoundationNormalClusterDotMin, -1f, 1f));
+            _compute.SetFloat(ID_FoundationCornerNormalDotMax,
+                Mathf.Clamp(FoundationCornerNormalDotMax, -1f, 1f));
+            _compute.SetFloat(ID_FoundationChamferWidthVoxels,
+                Mathf.Max(0f, FoundationChamferWidthVoxels));
+            _compute.SetInt(ID_FoundationSimplifyEnabled,
+                FoundationTopologyMode && FoundationConstrainedSimplification ? 1 : 0);
+            _compute.SetFloat(ID_FoundationSimplifyNormalDotMin,
+                Mathf.Clamp(FoundationSimplifyNormalDotMin, -1f, 1f));
+            _compute.SetFloat(ID_FoundationSimplifyPlaneResidualVoxels,
+                Mathf.Max(0f, FoundationSimplifyPlaneResidualVoxels));
             _compute.SetInt(ID_VisualQualityEnabled, VisualQualityDiagnosticsEnabled ? 1 : 0);
 
             _compute.SetTexture(_kClassifyAndEmit, ID_TsdfVolume, tsdfVolume);
@@ -693,6 +746,12 @@ namespace Genesis.RoomScan
             int gy = CeilDiv(_mapCount.y, 4);
             int gz = CeilDiv(_mapCount.z, 4);
             _compute.Dispatch(_kClassifyAndEmit, gx, gy, gz);
+
+            // 2b. Depth-faithful adaptive reduction. The native 5 cm vertices
+            // already exist; this stage only aliases geometrically compatible
+            // 2x2x2 groups to one representative before topology is emitted.
+            if (FoundationTopologyMode && FoundationConstrainedSimplification)
+                _compute.Dispatch(_kBuildFoundationClusters, gx, gy, gz);
 
             // 3. Build dispatch args from vertex count
             _compute.Dispatch(_kBuildVertexDispatchArgs, 1, 1, 1);
@@ -799,6 +858,9 @@ namespace Genesis.RoomScan
             BindBuffer(_kClassifyAndEmit, ID_Vertices, _vertices);
             BindBuffer(_kClassifyAndEmit, ID_VertexAdmissionClass, _vertexAdmissionClass);
             BindBuffer(_kClassifyAndEmit, ID_Counters, _counters);
+
+            BindBuffer(_kBuildFoundationClusters, ID_CoordVertMap, _coordVertMap);
+            BindBuffer(_kBuildFoundationClusters, ID_Vertices, _vertices);
 
             BindBuffer(_kBuildVertexDispatchArgs, ID_Counters, _counters);
             BindBuffer(_kBuildVertexDispatchArgs, ID_DispatchArgs, _dispatchArgs);

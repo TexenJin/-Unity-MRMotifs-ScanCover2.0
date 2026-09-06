@@ -4,8 +4,12 @@
 
 #pragma kernel ClearCells
 #pragma kernel ClearStats
+#pragma kernel ClearDirectProjectionAudit
 #pragma kernel BuildObservations
 #pragma kernel BuildCorrespondences
+#pragma kernel CaptureDirectProjectionAudit
+#pragma kernel CommitRetirementGateWitnesses
+#pragma kernel CaptureRetirementGhostAudit
 #pragma kernel CaptureCourtWaves
 #pragma kernel UpdateCandidates
 #pragma kernel ComputeCandidateConsensus
@@ -24,7 +28,8 @@ struct Observation
     // 原始证词只负责晋升与反证，生产几何仍使用预处理后的 positionSigma。
     float4 rawPositionDelta;
     // x=像素坐标打包(x低16/y高16)，y=缘洗位，z=时序判因，w=平台帧号。
-    // 这些字段只用于黑匣子归因，不参与候选或融合裁决。
+    // 像素/平台帧仍只用于黑匣子；缘洗位与时序判因决定候选几何写入权和
+    // 首次稳定晋升，仍不改变候选匹配或逐点融合权限。
     uint4 sourceReason;
 };
 
@@ -44,6 +49,8 @@ Texture2DArray<uint>   _EdgeReasonTex;
 Texture2DArray<uint>   _TemporalReasonTex;
 float4x4 _DepthProjInv[2];
 float4x4 _DepthViewInv[2];
+float4x4 _DepthProj[2];
+float4x4 _DepthView[2];
 float4x4 _Correction;
 int2 _DepthSize;
 int2 _ObservationGrid;
@@ -66,15 +73,50 @@ float _MaxDepth;
 
 RWStructuredBuffer<Observation> _Observations;
 RWStructuredBuffer<Correspondence> _Correspondences;
+// 只读回放血缘：x=候选索引+1，y=稳定ID，z=双证成熟票，w=反对票。
+// 生产融合不读取此缓冲；它只回答最终对应究竟命中了哪一个候选。
+RWStructuredBuffer<uint4> _CorrespondenceIdentity;
 RWStructuredBuffer<int4> _CellKeys;
 RWStructuredBuffer<uint> _CellState; // 0 空，1 初始化中，2 就绪
 RWStructuredBuffer<uint> _CellLock;
 RWStructuredBuffer<float4> _CandidateCenterSigma;
 RWStructuredBuffer<float4> _CandidateNormalSupport;
 RWStructuredBuffer<float4> _CandidateFirstViewAngle;
-RWStructuredBuffer<uint4> _CandidateMeta; // x=观测数 y=0胚/1稳 z=末帧 w=保留
+RWStructuredBuffer<uint4> _CandidateMeta; // x=观测数 y=0胚/1稳 z=末次安全几何帧 w=出生帧
 // x=双证词一致支持数 y=连续可靠反对票 z=稳定ID w=末次反对票帧+1
 RWStructuredBuffer<uint4> _CandidateEvidence;
+// 最近两张通过精确足迹复核的相干支持票：xy=最新帧+1/稳定ID，
+// zw=上一帧+1/稳定ID。direct45 可能先于较旧生产事务写入，所以退场时必须
+// 选择“身份一致且不晚于退场帧”的最新票，不能让未来票覆盖合法历史。
+// Challenge/Retire 的生产判定绝不读取它。
+RWStructuredBuffer<uint4> _CandidateDirectSupportReceipt;
+// 稳定候选达到旧三票退场条件后不再立即清零，而是进入候选自身的待退场账。
+// State: x=stableID，y=待退场起始帧+1，z=末次裁决(1不足/2冲突/3支撑否决/4证空删除)，
+// w=同视线支撑/证空互相作废的累计对数。四张 witness 各保存 xyz=候选射线，
+// w=观察帧+1；只在待退场期间写入，候选正常生长与纸皮均不读取。
+RWStructuredBuffer<uint4> _CandidateRetirementGateState;
+RWStructuredBuffer<float4> _CandidateRetirementSupportA;
+RWStructuredBuffer<float4> _CandidateRetirementSupportB;
+RWStructuredBuffer<float4> _CandidateRetirementFreeA;
+RWStructuredBuffer<float4> _CandidateRetirementFreeB;
+// 0进入待退场，1跨视角支撑否决，2跨视角证空删除，3冲突等待，4证据不足等待，
+// 5同视线矛盾对，6支撑收据，7证空收据，8普通支撑/反对票回落取消，
+// 9换轨接班取消，10稳定身份重开。均为累计生产裁决账。
+RWStructuredBuffer<uint> _RetirementGateCounters;
+// 候选出生到晋升的只读血缘。生产内核只写、不读取这三组出生快照；它们不能
+// 改变候选匹配、稳定晋升、反对票或融合权限。下方独立帧账不是出生快照：
+// 它负责安全几何写入、几何租约与首次稳定晋升。
+RWStructuredBuffer<uint4> _CandidateBirthSourceReason;
+RWStructuredBuffer<float4> _CandidateBirthMotionView;  // 角速/线速/运动质量/视野半径
+RWStructuredBuffer<float4> _CandidateBirthDeltaQuality; // 原预差/观测sigma/距离/质量
+// 四个饱和8位计数：promotion-authority / hard-edge-or-unrescued-grazing /
+// temporal-risk / outer-or-motion-risk。第一格同时是几何写入票：必须既无最终边缘
+// 反证，也无时序风险；风险证据只证明“这里可能有面”，不能塑形中心、法线或厚度。
+RWStructuredBuffer<uint> _CandidateEvidenceClassCounts;
+// x=取得晋升权的独立帧数，y=候选被观察到的独立帧数，
+// z=末次晋升权帧+1，w=末次观察帧+1。按帧计票，避免同一张深度图里一串
+// 相邻像素伪装成多张独立证词。
+RWStructuredBuffer<uint4> _CandidatePromotionAuthority;
 // 稳定候选换轨采用两阶段事务：Mark 只登记一对一的旧/新候选，Apply 才转移
 // stableID 并清退旧候选。这样同一 dispatch 内不会一边遍历邻域一边拆候选。
 // 值为 candidateIndex+1，0 表示当前没有换轨事务。
@@ -85,6 +127,35 @@ RWStructuredBuffer<uint> _CandidatePredecessor;
 RWStructuredBuffer<uint> _CandidateConsensus;
 RWStructuredBuffer<uint> _NextStableId;
 RWStructuredBuffer<uint> _Stats;
+// 候选足迹精确反投影的只读影子账。前三行是计数器，其后每条记录占
+// 9 个 uint4。生产候选、TSDF、纸皮和网格从不读取此缓冲。
+RWStructuredBuffer<uint4> _DirectProjectionAudit;
+int _DirectProjectionAuditCapacity;
+// 被旧生产规则真实删除、但退场前16帧仍有精确支持的稳定候选，会复制到这个
+// 独立幽灵账：旧结论观察8个有效可见帧，连续视角收据最多记32次。
+// 生产候选、TSDF、纸皮与显示均不读取它。
+RWStructuredBuffer<uint> _RetirementGhostCounters; // x=创建 y=溢出
+RWStructuredBuffer<uint4> _RetirementGhostIdentity; // stable/candidate/retire/support frame
+RWStructuredBuffer<float4> _RetirementGhostCenterSigma;
+RWStructuredBuffer<float4> _RetirementGhostNormalSupport;
+RWStructuredBuffer<float4> _RetirementGhostOriginCamera;
+// x=状态(1待/2支撑重现/3持续证空/4证据不足) y=有效可见帧数
+// z=末次评估帧+1 w=保留
+RWStructuredBuffer<uint4> _RetirementGhostState;
+// support/free/mixed/abstain 帧数
+RWStructuredBuffer<uint4> _RetirementGhostClasses;
+// 独立视角只读收据：每个幽灵最多保留固定数量的后续有效可见观察。
+// State: x=收据数 y=末次观察帧+1；Meta: x=帧 y=分类，其余保留。
+RWStructuredBuffer<uint4> _RetirementGhostObservationState;
+RWStructuredBuffer<uint4> _RetirementGhostObservationMeta;
+// Camera: xyz=当前相机世界位置 w=相对退场相机的完整位移。
+RWStructuredBuffer<float4> _RetirementGhostObservationCamera;
+// View: x=横向基线m y=候选射线分离角deg z=入射余弦 w=运动质量。
+RWStructuredBuffer<float4> _RetirementGhostObservationView;
+// Residual: x=平均有符号残差m y=平均绝对残差m z=RMS残差m w=最大绝对残差m。
+RWStructuredBuffer<float4> _RetirementGhostObservationResidual;
+int _RetirementGhostCapacity;
+int _RetirementGhostObservationCapacity;
 // 黑匣子累计账不随 HUD 周期清零。淘汰事件采用覆盖最旧记录的有界环，
 // 只参与冻结导出，绝不反向参与候选裁决。
 RWStructuredBuffer<uint> _AuditTotals;
@@ -92,7 +163,16 @@ RWStructuredBuffer<uint> _RetireAuditCounters;
 RWStructuredBuffer<uint4> _RetireAuditMeta;
 RWStructuredBuffer<float4> _RetireAuditGeometry;
 RWStructuredBuffer<uint4> _RetireAuditEvidence;
+// 普通退场：x=安全几何末帧，y=反对票末帧+1，z=选中的支持帧+1，
+// w 位标志：1近期、2稳定ID匹配、4帧序合法、8见到未来票、16见到任意票。
+// 换轨退场(reason=3)继续沿用 z=后继索引、w=后继原稳定ID。
 RWStructuredBuffer<uint4> _RetireAuditTiming;
+// 每条真实退场同时封存当时的生产待退场账。State: x=待退场帧+1，
+// y=末次裁决，z=同视线作废对，w=身份匹配；Frames 保存支撑A/B、证空A/B
+// 的帧+1；Angles.xy 保存支撑/证空两票的射线夹角。只写黑匣子。
+RWStructuredBuffer<uint4> _RetireAuditGateState;
+RWStructuredBuffer<uint4> _RetireAuditGateWitnessFrames;
+RWStructuredBuffer<float4> _RetireAuditGateWitnessAngles;
 int _RetireAuditCapacity;
 
 // “枪胶裁决海面”只读诊断缓冲。以稳定 ID 为索引，每个局部稳定表面只保留
@@ -108,6 +188,21 @@ RWStructuredBuffer<float4> _CourtWaveMotionView;       // x=角速度 y=线速�
 RWStructuredBuffer<uint> _CourtWaveCounters;           // x=独立浪头数 y=峰值更新数 z=容量溢出
 int _CourtWaveCapacity;
 
+// 每次胚胎首次晋升为稳定候选时封存一张“晋升凭证”。采用有界覆盖环，
+// 即使候选随后被淘汰或换轨，最初错误层如何出生、如何通过双证词仍可追溯。
+RWStructuredBuffer<uint> _PromotionAuditCounters;
+RWStructuredBuffer<uint4> _PromotionAuditMeta; // candidate/stable/birthFrame/promotionFrame
+RWStructuredBuffer<float4> _PromotionAuditGeometry; // 晋升中心xyz/sigma方差
+RWStructuredBuffer<uint4> _PromotionAuditBirthSourceReason;
+RWStructuredBuffer<uint4> _PromotionAuditSourceReason;
+RWStructuredBuffer<float4> _PromotionAuditBirthMotionView;
+RWStructuredBuffer<float4> _PromotionAuditMotionView;
+RWStructuredBuffer<float4> _PromotionAuditDeltaSigma; // birthDelta/promoDelta/birthSigma/promoSigma
+RWStructuredBuffer<float4> _PromotionAuditQualityRange; // birthRange/promoRange/birthQuality/promoQuality
+RWStructuredBuffer<uint4> _PromotionAuditSupport; // packedClasses/obs/dual/asuint(viewSpread)
+RWStructuredBuffer<uint4> _PromotionAuditAuthority; // authorityFrames/observedFrames/required/reserved
+int _PromotionAuditCapacity;
+
 static const float SIGMA_FLOOR = 0.004;
 static const float SIGMA_CEILING = 0.030;
 static const float SPAWN_Z = 3.0;
@@ -115,13 +210,23 @@ static const float STABLE_SUPPORT = 4.0;
 static const float STABLE_SIGMA = 0.020;
 static const float STABLE_VIEW_DEG = 3.0;
 static const uint STABLE_DUAL_SUPPORT = 3u;
+static const uint STABLE_PROMOTION_AUTHORITY_MIN = 2u;
 static const uint RETIRE_CONTRADICTIONS = 3u;
 static const uint EMBRYO_STALE_FRAMES = 180u;
+static const uint DIRECT_SUPPORT_VETO_WINDOW_FRAMES = 16u;
+static const uint RETIREMENT_GHOST_SETTLE_FRAMES = 8u;
+static const float RETIREMENT_GATE_SAME_VIEW_DEG = 0.25;
+static const float RETIREMENT_GATE_CROSS_VIEW_DEG = 1.0;
 static const float DUAL_AGREE_BASE = 0.025;
 static const float DUAL_AGREE_RANGE_SCALE = 0.010;
 static const float CHALLENGE_MOTION_MIN = 0.70;
 static const float FREE_SPACE_MARGIN_BASE = 0.060;
 static const float FREE_SPACE_MARGIN_RANGE_SCALE = 0.015;
+static const float DIRECT_PROJECTION_FREE_GAP = 0.045;
+static const float DIRECT_PROJECTION_SUPPORT_BAND = 0.018;
+static const float DIRECT_PROJECTION_OUTER_RADIUS = 0.75;
+static const float DIRECT_PROJECTION_MIN_INCIDENCE = 0.15;
+static const int DIRECT_PROJECTION_MAX_PIXEL_RADIUS = 5;
 static const uint SUCCESSION_STALE_FRAMES = 2u;
 static const uint SUCCESSION_MIN_CONSENSUS = 3u;
 static const uint SUCCESSION_CONSENSUS_MARGIN = 2u;
@@ -133,6 +238,11 @@ static const uint CORR_DUAL_AGREE = 1u << 2;
 static const uint CORR_STABLE_MATCH = 1u << 3;
 static const uint CORR_STABLE_DUAL = 1u << 4;
 static const uint CORR_UNOPPOSED = 1u << 5;
+// 只读诊断高位。低六位仍是唯一生产权限；这三位只把“无稳定匹配”拆成
+// 没找到候选 / 厚度残差失败 / 法向失败，不增加缓冲、原子或任何裁决分支。
+static const uint CORR_DIAG_STABLE_FOUND = 1u << 6;
+static const uint CORR_DIAG_RESIDUAL_PASS = 1u << 7;
+static const uint CORR_DIAG_NORMAL_PASS = 1u << 8;
 static const uint CORR_FUSION_AUTHORITY =
     CORR_OBSERVATION_VALID | CORR_RAW_AVAILABLE | CORR_DUAL_AGREE |
     CORR_STABLE_MATCH | CORR_STABLE_DUAL | CORR_UNOPPOSED;
@@ -144,6 +254,130 @@ static const uint COURT_PENDING_DUAL_IMMATURE = 3u;
 static const uint COURT_REJECTED_RAW_MISSING = 4u;
 static const uint COURT_REJECTED_DUAL_DISAGREE = 5u;
 static const uint COURT_REJECTED_OPPOSED = 6u;
+// 缘洗位分成两类语义：
+// - span_jump/gap/dual_cluster/grazing_span 只是“进入复核”的上下文签名；
+// - skirt/cross_eye/rejected_edge，以及没有被局部平面救回的 grazing，才是
+//   “不能独立任命几何真值”的最终反证。
+// 不能再用一个平面位掩码把两类信号压成同一张否决票，否则真实斜视墙面会
+// 在有深度、也通过局部平面支持的情况下仍然永远拿不到稳定候选身份。
+bool HasPromotionHardEdgeRisk(uint edgeReason)
+{
+    bool skirt = (edgeReason & (1u << 2)) != 0u;
+    bool crossEye = (edgeReason & (1u << 6)) != 0u;
+    bool rejectedEdge = (edgeReason & (1u << 7)) != 0u;
+    bool grazing = (edgeReason & (1u << 4)) != 0u;
+    bool grazingRescued = (edgeReason & (1u << 10)) != 0u;
+    bool unrescuedGrazing = grazing && !grazingRescued;
+    return skirt || crossEye || rejectedEdge || unrescuedGrazing;
+}
+
+float ObservationViewRadius(Observation observation)
+{
+    uint packedPixel = observation.sourceReason.x;
+    float2 pixel = float2(packedPixel & 0xffffu, packedPixel >> 16u);
+    float2 uv = (pixel + 0.5) / max(float2(_DepthSize), 1.0);
+    return max(abs(uv.x * 2.0 - 1.0), abs(uv.y * 2.0 - 1.0));
+}
+
+uint IncrementPackedByte(uint packed, uint lane, bool increment)
+{
+    if (!increment) return packed;
+    uint shift = lane * 8u;
+    uint value = (packed >> shift) & 0xffu;
+    if (value < 0xffu) value++;
+    return (packed & ~(0xffu << shift)) | (value << shift);
+}
+
+bool IsPromotionAuthorityObservation(Observation observation)
+{
+    uint edgeReason = observation.sourceReason.y;
+    uint temporalReason = observation.sourceReason.z;
+    bool temporalRisk = _HasTemporalReason != 0 && temporalReason != 6u;
+    bool edgeRisk = HasPromotionHardEdgeRisk(edgeReason);
+    // 与既有正式融合权限对齐：最外圈本就没有新增表面的生产权，低运动质量
+    // 本就只应降权。它们可以证明存在，但不能反过来选举几何真值。
+    bool outerRisk = ObservationViewRadius(observation) >= 0.84;
+    bool motionRisk = _MotionQuality < 0.70;
+    return !edgeRisk && !temporalRisk && !outerRisk && !motionRisk;
+}
+
+uint AccumulateEvidenceClasses(uint packed, Observation observation, float viewRadius)
+{
+    uint edgeReason = observation.sourceReason.y;
+    uint temporalReason = observation.sourceReason.z;
+    bool temporalRisk = _HasTemporalReason != 0 && temporalReason != 6u;
+    bool outerOrMotionRisk = viewRadius >= 0.70 || _MotionQuality < 0.70;
+    bool edgeRisk = HasPromotionHardEdgeRisk(edgeReason);
+    bool promotionAuthority = IsPromotionAuthorityObservation(observation);
+    packed = IncrementPackedByte(packed, 0u, promotionAuthority);
+    packed = IncrementPackedByte(packed, 1u, edgeRisk);
+    packed = IncrementPackedByte(packed, 2u, temporalRisk);
+    packed = IncrementPackedByte(packed, 3u, outerOrMotionRisk);
+    return packed;
+}
+
+uint4 AccumulatePromotionAuthorityFrames(uint4 state, Observation observation)
+{
+    uint frameToken = (uint)_FrameIndex + 1u;
+    if (state.w != frameToken)
+    {
+        state.y = min(state.y + 1u, 65535u);
+        state.w = frameToken;
+    }
+    if (IsPromotionAuthorityObservation(observation) && state.z != frameToken)
+    {
+        state.x = min(state.x + 1u, 65535u);
+        state.z = frameToken;
+    }
+    return state;
+}
+
+uint RequiredStablePromotionAuthorityFrames(uint observedFrames)
+{
+    // 不再用“安全票占全部观察的固定比例”饿住长期可见的真实表面。
+    // 两张独立安全帧只负责证明几何确实被安全证据重建过；几何成熟度、
+    // 双证词与视角展开仍由原有门槛共同裁决。
+    return STABLE_PROMOTION_AUTHORITY_MIN;
+}
+
+bool HasStablePromotionAuthority(uint4 authorityState)
+{
+    return authorityState.x >=
+        RequiredStablePromotionAuthorityFrames(authorityState.y);
+}
+
+void RecordPromotionAudit(uint candidateIndex, uint stableId, uint4 meta,
+                          float4 centerSigma, float4 firstViewAngle, uint4 evidence,
+                          Observation observation)
+{
+    uint sequence;
+    InterlockedAdd(_PromotionAuditCounters[0], 1u, sequence);
+    uint ring = sequence % (uint)_PromotionAuditCapacity;
+    _PromotionAuditMeta[ring] = uint4(candidateIndex, stableId, meta.w,
+                                      (uint)_FrameIndex);
+    _PromotionAuditGeometry[ring] = centerSigma;
+    _PromotionAuditBirthSourceReason[ring] = _CandidateBirthSourceReason[candidateIndex];
+    _PromotionAuditSourceReason[ring] = observation.sourceReason;
+    _PromotionAuditBirthMotionView[ring] = _CandidateBirthMotionView[candidateIndex];
+    _PromotionAuditMotionView[ring] = float4(_AngularSpeed, _LinearSpeed,
+                                             _MotionQuality,
+                                             ObservationViewRadius(observation));
+    float4 birthDeltaQuality = _CandidateBirthDeltaQuality[candidateIndex];
+    _PromotionAuditDeltaSigma[ring] = float4(birthDeltaQuality.x,
+        observation.rawPositionDelta.w, birthDeltaQuality.y,
+        observation.positionSigma.w);
+    float3 cameraWorld = mul(_Correction,
+        mul(_DepthViewInv[FUSION_EYE], float4(0, 0, 0, 1))).xyz;
+    _PromotionAuditQualityRange[ring] = float4(birthDeltaQuality.z,
+        distance(centerSigma.xyz, cameraWorld), birthDeltaQuality.w,
+        observation.normalQuality.w);
+    _PromotionAuditSupport[ring] = uint4(
+        _CandidateEvidenceClassCounts[candidateIndex], meta.x, evidence.x,
+        asuint(firstViewAngle.w));
+    uint4 authority = _CandidatePromotionAuthority[candidateIndex];
+    _PromotionAuditAuthority[ring] = uint4(authority.x, authority.y,
+        RequiredStablePromotionAuthorityFrames(authority.y), 0u);
+}
 
 // 枪胶生产准入与裁决海面必须共用同一条几何厚度带。
 // 若这里出现两套阈值，诊断已经钉红的浪头仍可能取得融合权限，污染 TSDF。
@@ -325,9 +559,20 @@ void ClearCells(uint id : SV_DispatchThreadID)
         _CandidateFirstViewAngle[id] = 0;
         _CandidateMeta[id] = 0;
         _CandidateEvidence[id] = 0;
+        _CandidateBirthSourceReason[id] = 0;
+        _CandidateBirthMotionView[id] = 0;
+        _CandidateBirthDeltaQuality[id] = float4(-1.0, 0.0, 0.0, 0.0);
+        _CandidateEvidenceClassCounts[id] = 0u;
+        _CandidatePromotionAuthority[id] = 0u;
         _CandidateSuccessor[id] = 0u;
         _CandidatePredecessor[id] = 0u;
         _CandidateConsensus[id] = 0u;
+        _CandidateDirectSupportReceipt[id] = 0u;
+        _CandidateRetirementGateState[id] = 0u;
+        _CandidateRetirementSupportA[id] = 0;
+        _CandidateRetirementSupportB[id] = 0;
+        _CandidateRetirementFreeA[id] = 0;
+        _CandidateRetirementFreeB[id] = 0;
     }
     if (id < (uint)_CourtWaveCapacity)
     {
@@ -345,10 +590,34 @@ void ClearCells(uint id : SV_DispatchThreadID)
         _NextStableId[0] = 1u;
         _RetireAuditCounters[0] = 0u;
         [unroll]
-        for (uint i = 0u; i < 9u; i++) _AuditTotals[i] = 0u;
+        for (uint i = 0u; i < 13u; i++) _AuditTotals[i] = 0u;
         _CourtWaveCounters[0] = 0u;
         _CourtWaveCounters[1] = 0u;
         _CourtWaveCounters[2] = 0u;
+        _PromotionAuditCounters[0] = 0u;
+        _RetirementGhostCounters[0] = 0u;
+        _RetirementGhostCounters[1] = 0u;
+        [unroll]
+        for (uint i = 0u; i < 11u; i++) _RetirementGateCounters[i] = 0u;
+    }
+    if (id < (uint)_RetirementGhostCapacity)
+    {
+        _RetirementGhostIdentity[id] = 0u;
+        _RetirementGhostCenterSigma[id] = 0;
+        _RetirementGhostNormalSupport[id] = 0;
+        _RetirementGhostOriginCamera[id] = 0;
+        _RetirementGhostState[id] = 0u;
+        _RetirementGhostClasses[id] = 0u;
+        _RetirementGhostObservationState[id] = 0u;
+    }
+    uint ghostObservationCount = (uint)(_RetirementGhostCapacity *
+                                         _RetirementGhostObservationCapacity);
+    if (id < ghostObservationCount)
+    {
+        _RetirementGhostObservationMeta[id] = 0u;
+        _RetirementGhostObservationCamera[id] = 0;
+        _RetirementGhostObservationView[id] = 0;
+        _RetirementGhostObservationResidual[id] = 0;
     }
 }
 
@@ -356,6 +625,616 @@ void ClearCells(uint id : SV_DispatchThreadID)
 void ClearStats(uint id : SV_DispatchThreadID)
 {
     if (id < 25u) _Stats[id] = 0u;
+}
+
+[numthreads(3, 1, 1)]
+void ClearDirectProjectionAudit(uint id : SV_DispatchThreadID)
+{
+    if (id < 3u) _DirectProjectionAudit[id] = 0u;
+}
+
+float DirectProjectionRange(uint2 pixel, float depth)
+{
+    float2 uv = (float2)pixel / (float2)_DepthSize;
+    float4 hcs = float4(float3(uv, depth) * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_DepthViewInv[FUSION_EYE],
+                        mul(_DepthProjInv[FUSION_EYE], hcs));
+    float3 world = worldH.xyz / worldH.w;
+    float3 cameraWorld = mul(_DepthViewInv[FUSION_EYE],
+                             float4(0, 0, 0, 1)).xyz;
+    return distance(world, cameraWorld);
+}
+
+float RetirementWitnessAngleDeg(float3 left, float3 right)
+{
+    float leftLength = length(left);
+    float rightLength = length(right);
+    if (leftLength <= 1e-6 || rightLength <= 1e-6) return 0.0;
+    return degrees(acos(clamp(dot(left / leftLength, right / rightLength),
+                                  -1.0, 1.0)));
+}
+
+bool RetirementWitnessValid(float4 witness, uint pendingToken,
+                            uint maximumFrameToken)
+{
+    uint token = (uint)round(max(witness.w, 0.0));
+    return token != 0u && token >= pendingToken && token <= maximumFrameToken;
+}
+
+void InsertRetirementWitness(float3 ray, uint frameToken,
+                             inout float4 witnessA, inout float4 witnessB)
+{
+    if ((uint)round(max(witnessA.w, 0.0)) == frameToken ||
+        (uint)round(max(witnessB.w, 0.0)) == frameToken) return;
+    float4 incoming = float4(normalize(ray), (float)frameToken);
+    if (witnessA.w <= 0.0)
+    {
+        witnessA = incoming;
+        return;
+    }
+    if (witnessB.w <= 0.0)
+    {
+        witnessB = incoming;
+        return;
+    }
+
+    // 固定两格不取“最新两张”，而保留三者中射线夹角最大的那一对；这样自然
+    // 头部小幅移动能够积累独立视角，重复同位帧不会挤掉真正分离的证词。
+    float angleAB = RetirementWitnessAngleDeg(witnessA.xyz, witnessB.xyz);
+    float angleAC = RetirementWitnessAngleDeg(witnessA.xyz, incoming.xyz);
+    float angleBC = RetirementWitnessAngleDeg(witnessB.xyz, incoming.xyz);
+    if (angleAC > angleAB && angleAC >= angleBC)
+        witnessB = incoming;
+    else if (angleBC > angleAB)
+        witnessA = incoming;
+}
+
+uint InvalidateSameViewOpposition(float3 ray,
+                                  inout float4 oppositeA,
+                                  inout float4 oppositeB)
+{
+    uint invalidatedPairs = 0u;
+    if (oppositeA.w > 0.0 &&
+        RetirementWitnessAngleDeg(ray, oppositeA.xyz) <=
+        RETIREMENT_GATE_SAME_VIEW_DEG)
+    {
+        oppositeA = 0;
+        invalidatedPairs++;
+    }
+    if (oppositeB.w > 0.0 &&
+        RetirementWitnessAngleDeg(ray, oppositeB.xyz) <=
+        RETIREMENT_GATE_SAME_VIEW_DEG)
+    {
+        oppositeB = 0;
+        invalidatedPairs++;
+    }
+    return invalidatedPairs;
+}
+
+bool HasRetirementWitnessPair(float4 witnessA, float4 witnessB,
+                              uint pendingToken, uint maximumFrameToken)
+{
+    return RetirementWitnessValid(witnessA, pendingToken, maximumFrameToken) &&
+           RetirementWitnessValid(witnessB, pendingToken, maximumFrameToken) &&
+           RetirementWitnessAngleDeg(witnessA.xyz, witnessB.xyz) >=
+           RETIREMENT_GATE_CROSS_VIEW_DEG;
+}
+
+void ClearRetirementGate(uint id)
+{
+    _CandidateRetirementGateState[id] = 0u;
+    _CandidateRetirementSupportA[id] = 0;
+    _CandidateRetirementSupportB[id] = 0;
+    _CandidateRetirementFreeA[id] = 0;
+    _CandidateRetirementFreeB[id] = 0;
+}
+
+uint RetirementWitnessFrameToken(float4 witness)
+{
+    return witness.w <= 0.0 ? 0u : (uint)round(witness.w);
+}
+
+void SnapshotRetirementGateAudit(uint auditIndex, uint candidateIndex,
+                                 uint stableId)
+{
+    uint4 gateState = _CandidateRetirementGateState[candidateIndex];
+    bool identityValid = stableId != 0u && gateState.x == stableId &&
+                         gateState.y != 0u;
+    if (!identityValid)
+    {
+        _RetireAuditGateState[auditIndex] = 0u;
+        _RetireAuditGateWitnessFrames[auditIndex] = 0u;
+        _RetireAuditGateWitnessAngles[auditIndex] = 0;
+        return;
+    }
+
+    float4 supportA = _CandidateRetirementSupportA[candidateIndex];
+    float4 supportB = _CandidateRetirementSupportB[candidateIndex];
+    float4 freeA = _CandidateRetirementFreeA[candidateIndex];
+    float4 freeB = _CandidateRetirementFreeB[candidateIndex];
+    uint supportAToken = RetirementWitnessFrameToken(supportA);
+    uint supportBToken = RetirementWitnessFrameToken(supportB);
+    uint freeAToken = RetirementWitnessFrameToken(freeA);
+    uint freeBToken = RetirementWitnessFrameToken(freeB);
+    float supportAngle = supportAToken != 0u && supportBToken != 0u
+        ? RetirementWitnessAngleDeg(supportA.xyz, supportB.xyz) : 0.0;
+    float freeAngle = freeAToken != 0u && freeBToken != 0u
+        ? RetirementWitnessAngleDeg(freeA.xyz, freeB.xyz) : 0.0;
+    _RetireAuditGateState[auditIndex] = uint4(
+        gateState.y, gateState.z, gateState.w, 1u);
+    _RetireAuditGateWitnessFrames[auditIndex] = uint4(
+        supportAToken, supportBToken, freeAToken, freeBToken);
+    _RetireAuditGateWitnessAngles[auditIndex] = float4(
+        supportAngle, freeAngle, 0.0, 0.0);
+}
+
+// 足迹裁决不是“多数票”。候选方差先变成投影不确定范围；范围里任意可靠
+// 支持都会阻断自由空间证明，只有每一个足迹像素都由双路一致的更远深度
+// 覆盖，才形成一张自由票。缺深度、前景/背景混合、硬边或时序风险均弃权。
+[numthreads(128, 1, 1)]
+void CaptureDirectProjectionAudit(uint id : SV_DispatchThreadID)
+{
+    uint candidateCount = (uint)(_TableCapacity * _CandidateCapacity);
+    if (id >= candidateCount || _HasRawDepth == 0 ||
+        _MotionQuality < CHALLENGE_MOTION_MIN) return;
+    uint4 meta = _CandidateMeta[id];
+    uint4 evidence = _CandidateEvidence[id];
+    if (meta.y != 1u || evidence.z == 0u) return;
+    InterlockedAdd(_DirectProjectionAudit[0].y, 1u);
+
+    float4 centerSigma = _CandidateCenterSigma[id];
+    float3 center = centerSigma.xyz;
+    float3 normal = _CandidateNormalSupport[id].xyz;
+    float normalLength = length(normal);
+    if (normalLength <= 1e-5) return;
+    float4 clip = mul(_DepthProj[FUSION_EYE],
+                      mul(_DepthView[FUSION_EYE], float4(center, 1.0)));
+    if (clip.w <= 1e-6) return;
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = (ndc.xy + 1.0) * 0.5;
+    float viewRadius = max(abs(ndc.x), abs(ndc.y));
+    float3 camera = mul(_DepthViewInv[FUSION_EYE],
+                        float4(0, 0, 0, 1)).xyz;
+    float3 toCandidate = center - camera;
+    float candidateRange = length(toCandidate);
+    float incidence = abs(dot(normal / normalLength,
+                              toCandidate / max(candidateRange, 1e-6)));
+    if (any(uv < 0.0) || any(uv >= 1.0) ||
+        viewRadius > DIRECT_PROJECTION_OUTER_RADIUS ||
+        incidence < DIRECT_PROJECTION_MIN_INCIDENCE ||
+        candidateRange < 0.15 || candidateRange > _MaxDepth)
+        return;
+    InterlockedAdd(_DirectProjectionAudit[0].z, 1u);
+
+    uint2 centerPixel = (uint2)clamp(round(uv * (float2)_DepthSize),
+                                    0.0, (float2)(_DepthSize - 1));
+    float sigmaMetres = sqrt(max(centerSigma.w,
+                                 SIGMA_FLOOR * SIGMA_FLOOR));
+    float focalPixels = 0.5 * max(abs(_DepthProj[FUSION_EYE][0][0]) *
+                                      (float)_DepthSize.x,
+                                  abs(_DepthProj[FUSION_EYE][1][1]) *
+                                      (float)_DepthSize.y);
+    float requestedRadius = max(1.0, ceil(2.0 * sigmaMetres * focalPixels /
+                                         max(candidateRange, 0.15)));
+    bool radiusClamped = requestedRadius > DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+    int pixelRadius = (int)clamp(requestedRadius, 1.0,
+                                 (float)DIRECT_PROJECTION_MAX_PIXEL_RADIUS);
+
+    uint totalSamples = 0u;
+    uint validSamples = 0u;
+    uint supportSamples = 0u;
+    uint freeSamples = 0u;
+    uint foregroundSamples = 0u;
+    uint neutralSamples = 0u;
+    uint invalidSamples = 0u;
+    uint dualDisagreeSamples = 0u;
+    uint hardEdgeSamples = 0u;
+    uint temporalRiskSamples = 0u;
+    float minGap = 1e9;
+    float maxGap = -1e9;
+    float gapSum = 0.0;
+    float maxRawPostDifference = 0.0;
+
+    for (int offsetY = -DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+         offsetY <= DIRECT_PROJECTION_MAX_PIXEL_RADIUS; offsetY++)
+    {
+        for (int offsetX = -DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+             offsetX <= DIRECT_PROJECTION_MAX_PIXEL_RADIUS; offsetX++)
+        {
+            if (abs(offsetX) > pixelRadius || abs(offsetY) > pixelRadius)
+                continue;
+            totalSamples++;
+            int2 signedPixel = clamp(int2(centerPixel) + int2(offsetX, offsetY),
+                                     int2(0, 0), _DepthSize - 1);
+            uint2 pixel = (uint2)signedPixel;
+            float rawDepth = _RawDepthTex[uint3(pixel, (uint)_RawDepthEye)];
+            float postDepth = _DepthTex[uint3(pixel, FUSION_EYE)];
+            if (!(rawDepth > 0.0 && rawDepth < 1.0 &&
+                  postDepth > 0.0 && postDepth < 1.0))
+            {
+                invalidSamples++;
+                continue;
+            }
+            float rawRange = DirectProjectionRange(pixel, rawDepth);
+            float postRange = DirectProjectionRange(pixel, postDepth);
+            float rawPostDifference = abs(rawRange - postRange);
+            maxRawPostDifference = max(maxRawPostDifference, rawPostDifference);
+            float dualLimit = DUAL_AGREE_BASE +
+                              postRange * DUAL_AGREE_RANGE_SCALE;
+            if (rawPostDifference > dualLimit)
+            {
+                invalidSamples++;
+                dualDisagreeSamples++;
+                continue;
+            }
+
+            validSamples++;
+            float observedRange = min(rawRange, postRange);
+            float gap = observedRange - candidateRange;
+            minGap = min(minGap, gap);
+            maxGap = max(maxGap, gap);
+            gapSum += gap;
+            float supportResidual = abs(0.5 * (rawRange + postRange) -
+                                        candidateRange);
+            if (supportResidual <= DIRECT_PROJECTION_SUPPORT_BAND)
+                supportSamples++;
+            else if (gap >= DIRECT_PROJECTION_FREE_GAP)
+                freeSamples++;
+            else if (gap <= -DIRECT_PROJECTION_SUPPORT_BAND)
+                foregroundSamples++;
+            else
+                neutralSamples++;
+
+            uint edgeReason = _EdgeReasonTex[uint3(pixel, FUSION_EYE)];
+            uint temporalReason = _TemporalReasonTex[uint3(pixel, FUSION_EYE)];
+            if (HasPromotionHardEdgeRisk(edgeReason)) hardEdgeSamples++;
+            if (_HasTemporalReason != 0 && temporalReason != 6u)
+                temporalRiskSamples++;
+        }
+    }
+    InterlockedAdd(_DirectProjectionAudit[0].w, 1u);
+
+    bool universalFree = totalSamples > 0u &&
+                         validSamples == totalSamples &&
+                         freeSamples == totalSamples &&
+                         hardEdgeSamples == 0u &&
+                         temporalRiskSamples == 0u && !radiusClamped;
+    bool coherentSupport = supportSamples > 0u && freeSamples == 0u &&
+                           foregroundSamples == 0u;
+    bool mixedBoundary = supportSamples > 0u || foregroundSamples > 0u ||
+                         (freeSamples > 0u &&
+                          (foregroundSamples > 0u || neutralSamples > 0u)) ||
+                         hardEdgeSamples > 0u || temporalRiskSamples > 0u;
+    uint classification;
+    if (universalFree) classification = 2u;
+    else if (coherentSupport) classification = 1u;
+    else if (mixedBoundary) classification = 3u;
+    else if (invalidSamples > 0u || radiusClamped) classification = 4u;
+    else classification = 5u;
+
+    if (classification == 1u)
+    {
+        InterlockedAdd(_DirectProjectionAudit[1].x, 1u);
+        uint supportToken = (uint)_FrameIndex + 1u;
+        uint4 receipt = _CandidateDirectSupportReceipt[id];
+        if (receipt.x != supportToken || receipt.y != evidence.z)
+        {
+            receipt.z = receipt.x;
+            receipt.w = receipt.y;
+            receipt.x = supportToken;
+            receipt.y = evidence.z;
+            _CandidateDirectSupportReceipt[id] = receipt;
+        }
+    }
+    else if (classification == 2u) InterlockedAdd(_DirectProjectionAudit[1].y, 1u);
+    else if (classification == 3u) InterlockedAdd(_DirectProjectionAudit[1].z, 1u);
+    else if (classification == 4u) InterlockedAdd(_DirectProjectionAudit[2].x, 1u);
+    else InterlockedAdd(_DirectProjectionAudit[2].y, 1u);
+    if (radiusClamped) InterlockedAdd(_DirectProjectionAudit[2].z, 1u);
+
+    uint recordIndex;
+    InterlockedAdd(_DirectProjectionAudit[0].x, 1u, recordIndex);
+    if (recordIndex >= (uint)_DirectProjectionAuditCapacity)
+    {
+        InterlockedAdd(_DirectProjectionAudit[1].w, 1u);
+        return;
+    }
+    uint baseIndex = 3u + recordIndex * 9u;
+    _DirectProjectionAudit[baseIndex + 0u] =
+        uint4(evidence.z, id, meta.z, classification);
+    _DirectProjectionAudit[baseIndex + 1u] =
+        uint4(asuint(center.x), asuint(center.y), asuint(center.z),
+              asuint(centerSigma.w));
+    _DirectProjectionAudit[baseIndex + 2u] =
+        uint4(asuint(normal.x / normalLength), asuint(normal.y / normalLength),
+              asuint(normal.z / normalLength), asuint(candidateRange));
+    _DirectProjectionAudit[baseIndex + 3u] =
+        uint4(asuint(camera.x), asuint(camera.y), asuint(camera.z), asuint(viewRadius));
+    _DirectProjectionAudit[baseIndex + 4u] =
+        uint4(asuint(validSamples > 0u ? minGap : 0.0),
+              asuint(validSamples > 0u ? maxGap : 0.0),
+              asuint(validSamples > 0u ? gapSum / (float)validSamples : 0.0),
+              asuint(incidence));
+    _DirectProjectionAudit[baseIndex + 5u] =
+        uint4(totalSamples, validSamples, supportSamples, freeSamples);
+    _DirectProjectionAudit[baseIndex + 6u] =
+        uint4(foregroundSamples, neutralSamples, invalidSamples, (uint)pixelRadius);
+    _DirectProjectionAudit[baseIndex + 7u] =
+        uint4(hardEdgeSamples, temporalRiskSamples, dualDisagreeSamples,
+              radiusClamped ? 1u : 0u);
+    _DirectProjectionAudit[baseIndex + 8u] =
+        uint4(asuint(maxRawPostDifference), 0u, 0u, 0u);
+}
+
+// direct45 先于整帧生产裁决采样，所以 Capture 只能写本帧暂存账。只有在
+// AdjudicateSlot 明确接纳该帧后才调用本核，把证词提交给候选待退场账；被拒帧
+// 因而不能绕过生产事务取得删除或保留权限。
+[numthreads(128, 1, 1)]
+void CommitRetirementGateWitnesses(uint recordIndex : SV_DispatchThreadID)
+{
+    uint recordCount = min(_DirectProjectionAudit[0].x,
+                           (uint)_DirectProjectionAuditCapacity);
+    if (recordIndex >= recordCount) return;
+    uint baseIndex = 3u + recordIndex * 9u;
+    uint4 recordMeta = _DirectProjectionAudit[baseIndex + 0u];
+    uint stableId = recordMeta.x;
+    uint candidateIndex = recordMeta.y;
+    uint classification = recordMeta.w;
+    uint candidateCount = (uint)(_TableCapacity * _CandidateCapacity);
+    if (candidateIndex >= candidateCount || stableId == 0u ||
+        (classification != 1u && classification != 2u)) return;
+
+    uint4 candidateMeta = _CandidateMeta[candidateIndex];
+    uint4 evidence = _CandidateEvidence[candidateIndex];
+    uint4 gateState = _CandidateRetirementGateState[candidateIndex];
+    uint frameToken = (uint)_FrameIndex + 1u;
+    if (candidateMeta.y != 1u || evidence.z != stableId ||
+        gateState.x != stableId || gateState.y == 0u ||
+        frameToken < gateState.y || evidence.y < RETIRE_CONTRADICTIONS)
+        return;
+
+    uint4 centerBits = _DirectProjectionAudit[baseIndex + 1u];
+    uint4 cameraBits = _DirectProjectionAudit[baseIndex + 3u];
+    float3 center = float3(asfloat(centerBits.x), asfloat(centerBits.y),
+                           asfloat(centerBits.z));
+    float3 camera = float3(asfloat(cameraBits.x), asfloat(cameraBits.y),
+                           asfloat(cameraBits.z));
+    float3 ray = center - camera;
+    if (dot(ray, ray) <= 1e-8) return;
+    ray = normalize(ray);
+
+    float4 supportA = _CandidateRetirementSupportA[candidateIndex];
+    float4 supportB = _CandidateRetirementSupportB[candidateIndex];
+    float4 freeA = _CandidateRetirementFreeA[candidateIndex];
+    float4 freeB = _CandidateRetirementFreeB[candidateIndex];
+    uint invalidatedPairs = 0u;
+    if (classification == 1u)
+    {
+        InterlockedAdd(_RetirementGateCounters[6], 1u);
+        invalidatedPairs = InvalidateSameViewOpposition(ray, freeA, freeB);
+        if (invalidatedPairs == 0u)
+            InsertRetirementWitness(ray, frameToken, supportA, supportB);
+    }
+    else
+    {
+        InterlockedAdd(_RetirementGateCounters[7], 1u);
+        invalidatedPairs = InvalidateSameViewOpposition(ray, supportA, supportB);
+        if (invalidatedPairs == 0u)
+            InsertRetirementWitness(ray, frameToken, freeA, freeB);
+    }
+    if (invalidatedPairs != 0u)
+    {
+        gateState.w = min(gateState.w + invalidatedPairs, 65535u);
+        InterlockedAdd(_RetirementGateCounters[5], invalidatedPairs);
+    }
+    _CandidateRetirementSupportA[candidateIndex] = supportA;
+    _CandidateRetirementSupportB[candidateIndex] = supportB;
+    _CandidateRetirementFreeA[candidateIndex] = freeA;
+    _CandidateRetirementFreeB[candidateIndex] = freeB;
+    _CandidateRetirementGateState[candidateIndex] = gateState;
+}
+
+// 与 live direct45 使用同一足迹、同一双路深度和同一风险语义；只是不再依赖
+// 已被生产删除的候选表。返回 0 表示当前帧不可见，1/2/3/4/5 与 live 分类一致。
+uint ClassifyRetirementGhostFootprint(float4 centerSigma, float3 normal,
+                                      out float4 residualStats,
+                                      out uint4 sampleStats)
+{
+    residualStats = 0;
+    sampleStats = 0u;
+    float normalLength = length(normal);
+    if (normalLength <= 1e-5) return 0u;
+    float3 center = centerSigma.xyz;
+    float4 clip = mul(_DepthProj[FUSION_EYE],
+                      mul(_DepthView[FUSION_EYE], float4(center, 1.0)));
+    if (clip.w <= 1e-6) return 0u;
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = (ndc.xy + 1.0) * 0.5;
+    float viewRadius = max(abs(ndc.x), abs(ndc.y));
+    float3 camera = mul(_DepthViewInv[FUSION_EYE],
+                        float4(0, 0, 0, 1)).xyz;
+    float3 toCandidate = center - camera;
+    float candidateRange = length(toCandidate);
+    float incidence = abs(dot(normal / normalLength,
+                              toCandidate / max(candidateRange, 1e-6)));
+    if (any(uv < 0.0) || any(uv >= 1.0) ||
+        viewRadius > DIRECT_PROJECTION_OUTER_RADIUS ||
+        incidence < DIRECT_PROJECTION_MIN_INCIDENCE ||
+        candidateRange < 0.15 || candidateRange > _MaxDepth)
+        return 0u;
+
+    uint2 centerPixel = (uint2)clamp(round(uv * (float2)_DepthSize),
+                                    0.0, (float2)(_DepthSize - 1));
+    float sigmaMetres = sqrt(max(centerSigma.w,
+                                 SIGMA_FLOOR * SIGMA_FLOOR));
+    float focalPixels = 0.5 * max(abs(_DepthProj[FUSION_EYE][0][0]) *
+                                      (float)_DepthSize.x,
+                                  abs(_DepthProj[FUSION_EYE][1][1]) *
+                                      (float)_DepthSize.y);
+    float requestedRadius = max(1.0, ceil(2.0 * sigmaMetres * focalPixels /
+                                         max(candidateRange, 0.15)));
+    bool radiusClamped = requestedRadius > DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+    int pixelRadius = (int)clamp(requestedRadius, 1.0,
+                                 (float)DIRECT_PROJECTION_MAX_PIXEL_RADIUS);
+    uint totalSamples = 0u;
+    uint validSamples = 0u;
+    uint supportSamples = 0u;
+    uint freeSamples = 0u;
+    uint foregroundSamples = 0u;
+    uint neutralSamples = 0u;
+    uint invalidSamples = 0u;
+    uint hardEdgeSamples = 0u;
+    uint temporalRiskSamples = 0u;
+    float signedResidualSum = 0.0;
+    float absoluteResidualSum = 0.0;
+    float squaredResidualSum = 0.0;
+    float maxAbsoluteResidual = 0.0;
+    for (int offsetY = -DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+         offsetY <= DIRECT_PROJECTION_MAX_PIXEL_RADIUS; offsetY++)
+    {
+        for (int offsetX = -DIRECT_PROJECTION_MAX_PIXEL_RADIUS;
+             offsetX <= DIRECT_PROJECTION_MAX_PIXEL_RADIUS; offsetX++)
+        {
+            if (abs(offsetX) > pixelRadius || abs(offsetY) > pixelRadius)
+                continue;
+            totalSamples++;
+            int2 signedPixel = clamp(int2(centerPixel) + int2(offsetX, offsetY),
+                                     int2(0, 0), _DepthSize - 1);
+            uint2 pixel = (uint2)signedPixel;
+            float rawDepth = _RawDepthTex[uint3(pixel, (uint)_RawDepthEye)];
+            float postDepth = _DepthTex[uint3(pixel, FUSION_EYE)];
+            if (!(rawDepth > 0.0 && rawDepth < 1.0 &&
+                  postDepth > 0.0 && postDepth < 1.0))
+            {
+                invalidSamples++;
+                continue;
+            }
+            float rawRange = DirectProjectionRange(pixel, rawDepth);
+            float postRange = DirectProjectionRange(pixel, postDepth);
+            float dualLimit = DUAL_AGREE_BASE +
+                              postRange * DUAL_AGREE_RANGE_SCALE;
+            if (abs(rawRange - postRange) > dualLimit)
+            {
+                invalidSamples++;
+                continue;
+            }
+            validSamples++;
+            float observedRange = min(rawRange, postRange);
+            float gap = observedRange - candidateRange;
+            float signedResidual = 0.5 * (rawRange + postRange) -
+                                   candidateRange;
+            float supportResidual = abs(signedResidual);
+            signedResidualSum += signedResidual;
+            absoluteResidualSum += supportResidual;
+            squaredResidualSum += signedResidual * signedResidual;
+            maxAbsoluteResidual = max(maxAbsoluteResidual, supportResidual);
+            if (supportResidual <= DIRECT_PROJECTION_SUPPORT_BAND)
+                supportSamples++;
+            else if (gap >= DIRECT_PROJECTION_FREE_GAP)
+                freeSamples++;
+            else if (gap <= -DIRECT_PROJECTION_SUPPORT_BAND)
+                foregroundSamples++;
+            else
+                neutralSamples++;
+            uint edgeReason = _EdgeReasonTex[uint3(pixel, FUSION_EYE)];
+            uint temporalReason = _TemporalReasonTex[uint3(pixel, FUSION_EYE)];
+            if (HasPromotionHardEdgeRisk(edgeReason)) hardEdgeSamples++;
+            if (_HasTemporalReason != 0 && temporalReason != 6u)
+                temporalRiskSamples++;
+        }
+    }
+    sampleStats = uint4(totalSamples, validSamples, supportSamples, freeSamples);
+    if (validSamples > 0u)
+    {
+        float inverseValid = 1.0 / (float)validSamples;
+        residualStats = float4(signedResidualSum * inverseValid,
+                               absoluteResidualSum * inverseValid,
+                               sqrt(squaredResidualSum * inverseValid),
+                               maxAbsoluteResidual);
+    }
+    bool universalFree = totalSamples > 0u &&
+                         validSamples == totalSamples &&
+                         freeSamples == totalSamples &&
+                         hardEdgeSamples == 0u &&
+                         temporalRiskSamples == 0u && !radiusClamped;
+    bool coherentSupport = supportSamples > 0u && freeSamples == 0u &&
+                           foregroundSamples == 0u;
+    bool mixedBoundary = supportSamples > 0u || foregroundSamples > 0u ||
+                         (freeSamples > 0u &&
+                          (foregroundSamples > 0u || neutralSamples > 0u)) ||
+                         hardEdgeSamples > 0u || temporalRiskSamples > 0u;
+    if (universalFree) return 2u;
+    if (coherentSupport) return 1u;
+    if (mixedBoundary) return 3u;
+    if (invalidSamples > 0u || radiusClamped) return 4u;
+    return 5u;
+}
+
+[numthreads(128, 1, 1)]
+void CaptureRetirementGhostAudit(uint id : SV_DispatchThreadID)
+{
+    uint created = min(_RetirementGhostCounters[0],
+                       (uint)_RetirementGhostCapacity);
+    if (id >= created || _HasRawDepth == 0 ||
+        _MotionQuality < CHALLENGE_MOTION_MIN) return;
+    uint4 identity = _RetirementGhostIdentity[id];
+    uint4 state = _RetirementGhostState[id];
+    uint4 observationState = _RetirementGhostObservationState[id];
+    if (identity.x == 0u || (uint)_FrameIndex <= identity.z ||
+        observationState.x >= (uint)_RetirementGhostObservationCapacity) return;
+    uint frameToken = (uint)_FrameIndex + 1u;
+    if (observationState.y == frameToken) return;
+    float4 residualStats;
+    uint4 sampleStats;
+    uint classification = ClassifyRetirementGhostFootprint(
+        _RetirementGhostCenterSigma[id],
+        _RetirementGhostNormalSupport[id].xyz,
+        residualStats, sampleStats);
+    if (classification == 0u) return;
+
+    float3 center = _RetirementGhostCenterSigma[id].xyz;
+    float3 normal = normalize(_RetirementGhostNormalSupport[id].xyz);
+    float3 originCamera = _RetirementGhostOriginCamera[id].xyz;
+    float3 currentCamera = mul(_DepthViewInv[FUSION_EYE],
+                               float4(0, 0, 0, 1)).xyz;
+    float3 baseline = currentCamera - originCamera;
+    float3 originRay = normalize(center - originCamera);
+    float3 currentRay = normalize(center - currentCamera);
+    float axialBaseline = dot(baseline, originRay);
+    float lateralBaseline = length(baseline - axialBaseline * originRay);
+    float raySeparationDeg = degrees(acos(clamp(dot(originRay, currentRay),
+                                                -1.0, 1.0)));
+    float incidence = abs(dot(normal, currentRay));
+    uint observationIndex = id * (uint)_RetirementGhostObservationCapacity +
+                            observationState.x;
+    _RetirementGhostObservationMeta[observationIndex] =
+        uint4((uint)_FrameIndex, classification, sampleStats.y, sampleStats.x);
+    _RetirementGhostObservationCamera[observationIndex] =
+        float4(currentCamera, length(baseline));
+    _RetirementGhostObservationView[observationIndex] =
+        float4(lateralBaseline, raySeparationDeg, incidence, _MotionQuality);
+    _RetirementGhostObservationResidual[observationIndex] = residualStats;
+    observationState.x++;
+    observationState.y = frameToken;
+    _RetirementGhostObservationState[id] = observationState;
+
+    // 旧8帧结论继续保留作同批对照；即使它已经决出，独立视角收据仍继续积累，
+    // 直到固定容量耗尽或会话封口。这里没有任何生产读者。
+    if (state.x != 1u) return;
+
+    uint4 classes = _RetirementGhostClasses[id];
+    state.y++;
+    state.z = frameToken;
+    if (classification == 1u) classes.x++;
+    else if (classification == 2u) classes.y++;
+    else if (classification == 3u) classes.z++;
+    else classes.w++;
+    if (classification == 1u)
+        state.x = 2u; // 支撑重现：旧生产删除应被保护。
+    else if (state.y >= RETIREMENT_GHOST_SETTLE_FRAMES)
+        state.x = classes.y == state.y ? 3u : 4u;
+    _RetirementGhostClasses[id] = classes;
+    _RetirementGhostState[id] = state;
 }
 
 [numthreads(8, 8, 1)]
@@ -446,6 +1325,7 @@ void BuildCorrespondences(uint id : SV_DispatchThreadID)
     output.sourceValid = float4(observation.positionSigma.xyz, 0.0);
     output.targetSigma = 0;
     output.normalAngle = 0;
+    uint4 identity = 0u;
     uint evidenceFlags = 0u;
     if (observation.positionSigma.w > 0.0)
         evidenceFlags |= CORR_OBSERVATION_VALID;
@@ -465,25 +1345,34 @@ void BuildCorrespondences(uint id : SV_DispatchThreadID)
         uint candidateIndex;
         float score, residual, angle;
         if (FindBestStable(observation.positionSigma.xyz, observation.normalQuality.xyz,
-                           observation.positionSigma.w, candidateIndex, score, residual, angle) &&
-            angle <= 45.0)
+                           observation.positionSigma.w, candidateIndex, score, residual, angle))
         {
+            uint4 candidateEvidence = _CandidateEvidence[candidateIndex];
+            identity = uint4(candidateIndex + 1u, candidateEvidence.z,
+                             candidateEvidence.x, candidateEvidence.y);
             float4 candidate = _CandidateCenterSigma[candidateIndex];
             float combinedSigma = sqrt(max(candidate.w, SIGMA_FLOOR * SIGMA_FLOOR) +
                                        observation.positionSigma.w * observation.positionSigma.w);
+            // 高三位只是旁观血缘：即使没有取得低六位生产权限，也把“找到谁、
+            // 厚度是否通过、法向是否通过”留下。CPU 校枪只读取低六位，故这不会
+            // 放宽任何生产门；target/normal 让虚拟探针能保留连续残差而非只记成败。
+            evidenceFlags |= CORR_DIAG_STABLE_FOUND;
+            if (residual <= GunGelStableResidualLimit(combinedSigma))
+                evidenceFlags |= CORR_DIAG_RESIDUAL_PASS;
+            if (angle <= 45.0)
+                evidenceFlags |= CORR_DIAG_NORMAL_PASS;
+            output.targetSigma = float4(candidate.xyz, combinedSigma);
+            output.normalAngle = float4(normalize(_CandidateNormalSupport[candidateIndex].xyz), angle);
             // 校枪对应保持宽门：它需要容纳尚未求解的整帧一致偏移。
             // 真正的生产融合权限会在校枪完成后由 CaptureCourtWaves
             // 依据共享的严格厚度带重新生成，不能直接沿用这里的宽门结果。
-            if (residual <= 5.0 * combinedSigma)
+            if (angle <= 45.0 && residual <= 5.0 * combinedSigma)
             {
                 evidenceFlags |= CORR_STABLE_MATCH;
-                uint4 candidateEvidence = _CandidateEvidence[candidateIndex];
                 if (candidateEvidence.x >= STABLE_DUAL_SUPPORT)
                     evidenceFlags |= CORR_STABLE_DUAL;
                 if (candidateEvidence.y == 0u)
                     evidenceFlags |= CORR_UNOPPOSED;
-                output.targetSigma = float4(candidate.xyz, combinedSigma);
-                output.normalAngle = float4(normalize(_CandidateNormalSupport[candidateIndex].xyz), angle);
                 if ((evidenceFlags & CORR_FUSION_AUTHORITY) == CORR_FUSION_AUTHORITY)
                     InterlockedAdd(_Stats[1], 1u);
             }
@@ -491,6 +1380,7 @@ void BuildCorrespondences(uint id : SV_DispatchThreadID)
     }
     output.sourceValid.w = (float)evidenceFlags;
     _Correspondences[id] = output;
+    _CorrespondenceIdentity[id] = identity;
 }
 
 // 在整帧校枪修正已经求出、候选被本帧更新之前，先用严格厚度带重建生产融合权限，
@@ -509,6 +1399,7 @@ void CaptureCourtWaves(uint id : SV_DispatchThreadID)
     production.sourceValid = float4(observation.positionSigma.xyz, 0.0);
     production.targetSigma = 0;
     production.normalAngle = 0;
+    _CorrespondenceIdentity[id] = 0u;
     uint flags = 0u;
     if (observation.positionSigma.w <= 0.0)
     {
@@ -538,12 +1429,19 @@ void CaptureCourtWaves(uint id : SV_DispatchThreadID)
         _Correspondences[id] = production;
         return;
     }
+    flags |= CORR_DIAG_STABLE_FOUND;
 
     uint4 evidence = _CandidateEvidence[candidateIndex];
     uint stableId = evidence.z;
+    _CorrespondenceIdentity[id] = uint4(candidateIndex + 1u, stableId,
+                                        evidence.x, evidence.y);
     float4 candidate = _CandidateCenterSigma[candidateIndex];
     float combinedSigma = sqrt(max(candidate.w, SIGMA_FLOOR * SIGMA_FLOOR) + sigma * sigma);
-    bool stableMatch = residual <= GunGelStableResidualLimit(combinedSigma) && angle <= 45.0;
+    bool residualPass = residual <= GunGelStableResidualLimit(combinedSigma);
+    bool normalPass = angle <= 45.0;
+    if (residualPass) flags |= CORR_DIAG_RESIDUAL_PASS;
+    if (normalPass) flags |= CORR_DIAG_NORMAL_PASS;
+    bool stableMatch = residualPass && normalPass;
     bool dualMature = evidence.x >= STABLE_DUAL_SUPPORT;
     bool unopposed = evidence.y == 0u;
 
@@ -626,6 +1524,7 @@ void RebuildProductionCorrespondences(uint id : SV_DispatchThreadID)
     production.sourceValid = float4(observation.positionSigma.xyz, 0.0);
     production.targetSigma = 0;
     production.normalAngle = 0;
+    _CorrespondenceIdentity[id] = 0u;
     uint flags = 0u;
     if (observation.positionSigma.w <= 0.0)
     {
@@ -653,12 +1552,18 @@ void RebuildProductionCorrespondences(uint id : SV_DispatchThreadID)
     if (FindBestStable(samplePosition, sampleNormal, sigma,
                        candidateIndex, score, residual, angle))
     {
+        flags |= CORR_DIAG_STABLE_FOUND;
         float4 candidate = _CandidateCenterSigma[candidateIndex];
         float combinedSigma = sqrt(max(candidate.w,
             SIGMA_FLOOR * SIGMA_FLOOR) + sigma * sigma);
-        bool stableMatch = residual <= GunGelStableResidualLimit(combinedSigma) &&
-                           angle <= 45.0;
+        bool residualPass = residual <= GunGelStableResidualLimit(combinedSigma);
+        bool normalPass = angle <= 45.0;
+        if (residualPass) flags |= CORR_DIAG_RESIDUAL_PASS;
+        if (normalPass) flags |= CORR_DIAG_NORMAL_PASS;
+        bool stableMatch = residualPass && normalPass;
         uint4 evidence = _CandidateEvidence[candidateIndex];
+        _CorrespondenceIdentity[id] = uint4(candidateIndex + 1u, evidence.z,
+                                            evidence.x, evidence.y);
         if (stableMatch)
         {
             flags |= CORR_STABLE_MATCH;
@@ -727,11 +1632,34 @@ void UpdateCandidates(uint id : SV_DispatchThreadID)
         if (empty >= 0)
         {
             uint index = (uint)empty;
+            bool geometryAuthority = IsPromotionAuthorityObservation(observation);
             _CandidateCenterSigma[index] = float4(samplePosition, max(sigma * sigma, SIGMA_FLOOR * SIGMA_FLOOR));
-            _CandidateNormalSupport[index] = float4(sampleNormal, quality);
+            // 风险出生点仍保留一个仅供聚类/重逢的临时锚点，但没有几何支持权。
+            // 第一张安全帧到来时会原子重置这三个几何量，风险锚点不会混入 EMA。
+            _CandidateNormalSupport[index] = float4(sampleNormal,
+                                                     geometryAuthority ? quality : 0.0);
             _CandidateFirstViewAngle[index] = float4(view, 0.0);
-            _CandidateMeta[index] = uint4(1u, 0u, (uint)_FrameIndex, 0u);
+            // meta.w 封存出生帧；生产逻辑从不读取该分量。
+            _CandidateMeta[index] = uint4(1u, 0u, (uint)_FrameIndex,
+                                          (uint)_FrameIndex);
             _CandidateEvidence[index] = uint4(dualAgree ? 1u : 0u, 0u, 0u, 0u);
+            float viewRadius = ObservationViewRadius(observation);
+            _CandidateBirthSourceReason[index] = observation.sourceReason;
+            _CandidateBirthMotionView[index] = float4(_AngularSpeed, _LinearSpeed,
+                                                       _MotionQuality, viewRadius);
+            _CandidateBirthDeltaQuality[index] = float4(
+                observation.rawPositionDelta.w, sigma, sampleRange, quality);
+            _CandidateEvidenceClassCounts[index] =
+                AccumulateEvidenceClasses(0u, observation, viewRadius);
+            _CandidatePromotionAuthority[index] =
+                AccumulatePromotionAuthorityFrames(uint4(0u, 0u, 0u, 0u),
+                                                    observation);
+            _CandidateDirectSupportReceipt[index] = 0u;
+            if (_CandidateRetirementGateState[index].y != 0u)
+                InterlockedAdd(_RetirementGateCounters[10], 1u);
+            ClearRetirementGate(index);
+            if (!geometryAuthority)
+                InterlockedAdd(_AuditTotals[10], 1u);
             InterlockedAdd(_Stats[2], 1u);
         }
         else
@@ -759,34 +1687,86 @@ void UpdateCandidates(uint id : SV_DispatchThreadID)
     }
     float residual, angle;
     float score = CandidateScore(bestIndex, samplePosition, sampleNormal, sigma, residual, angle);
-    float robustWeight = 1.0 / (1.0 + (score / SPAWN_Z) * (score / SPAWN_Z));
-    float effective = max(quality * robustWeight, 1e-4);
     float4 centerSigma = _CandidateCenterSigma[bestIndex];
     float4 normalSupport = _CandidateNormalSupport[bestIndex];
-    float alpha = min(0.20, effective / max(normalSupport.w + effective, 1e-5));
-    float3 alignedNormal = dot(normalSupport.xyz, sampleNormal) >= 0.0 ? sampleNormal : -sampleNormal;
-    centerSigma.xyz = lerp(centerSigma.xyz, samplePosition, alpha);
-    centerSigma.w = clamp(lerp(centerSigma.w, residual * residual, alpha),
-                          SIGMA_FLOOR * SIGMA_FLOOR, SIGMA_CEILING * SIGMA_CEILING);
-    normalSupport.xyz = normalize(lerp(normalize(normalSupport.xyz), alignedNormal, alpha));
-    normalSupport.w += effective;
     float4 firstViewAngle = _CandidateFirstViewAngle[bestIndex];
     uint4 evidence = _CandidateEvidence[bestIndex];
-    firstViewAngle.w = max(firstViewAngle.w,
-                           degrees(acos(clamp(dot(normalize(firstViewAngle.xyz), view), -1.0, 1.0))));
     uint wasStable = meta.y;
     meta.x = min(meta.x + 1u, 65535u);
-    meta.z = (uint)_FrameIndex;
+    uint packedClasses = AccumulateEvidenceClasses(
+        _CandidateEvidenceClassCounts[bestIndex], observation,
+        ObservationViewRadius(observation));
+    _CandidateEvidenceClassCounts[bestIndex] = packedClasses;
+    uint4 previousPromotionAuthority = _CandidatePromotionAuthority[bestIndex];
+    bool geometryAuthorityObservation = IsPromotionAuthorityObservation(observation);
+    bool hadAuthorityGeometry = previousPromotionAuthority.x != 0u;
+    uint4 promotionAuthority = AccumulatePromotionAuthorityFrames(
+        previousPromotionAuthority, observation);
+    _CandidatePromotionAuthority[bestIndex] = promotionAuthority;
+    if (geometryAuthorityObservation)
+    {
+        // meta.z 是最后一次安全几何续租帧。风险点不能借“我仍看得到”阻止
+        // 正确挑战层把旧稳定轨判为陈旧并原子接管。
+        meta.z = (uint)_FrameIndex;
+        if (wasStable == 0u && !hadAuthorityGeometry)
+        {
+            // 候选可能由风险点先占位。第一张安全证词必须重建几何原点，不能让
+            // 后来的安全票给已经污染的中心“补签”。
+            centerSigma = float4(samplePosition,
+                                 max(sigma * sigma, SIGMA_FLOOR * SIGMA_FLOOR));
+            normalSupport = float4(sampleNormal, max(quality, 1e-4));
+            firstViewAngle = float4(view, 0.0);
+            InterlockedAdd(_AuditTotals[11], 1u);
+        }
+        else
+        {
+            float robustWeight = 1.0 /
+                (1.0 + (score / SPAWN_Z) * (score / SPAWN_Z));
+            float effective = max(quality * robustWeight, 1e-4);
+            float alpha = min(0.20,
+                effective / max(normalSupport.w + effective, 1e-5));
+            float3 alignedNormal = dot(normalSupport.xyz, sampleNormal) >= 0.0
+                ? sampleNormal : -sampleNormal;
+            centerSigma.xyz = lerp(centerSigma.xyz, samplePosition, alpha);
+            centerSigma.w = clamp(lerp(centerSigma.w, residual * residual, alpha),
+                                  SIGMA_FLOOR * SIGMA_FLOOR,
+                                  SIGMA_CEILING * SIGMA_CEILING);
+            normalSupport.xyz = normalize(lerp(normalize(normalSupport.xyz),
+                                                alignedNormal, alpha));
+            normalSupport.w += effective;
+            firstViewAngle.w = max(firstViewAngle.w,
+                degrees(acos(clamp(dot(normalize(firstViewAngle.xyz), view),
+                                   -1.0, 1.0))));
+        }
+    }
+    else
+    {
+        // 风险证据仍计入存在/双证词账，但不能写几何或刷新几何租约。
+        InterlockedAdd(_AuditTotals[10], 1u);
+        if (wasStable != 0u)
+            InterlockedAdd(_AuditTotals[12], 1u);
+    }
     if (dualAgree)
         evidence.x = min(evidence.x + 1u, 65535u);
     // A fresh agreeing observation is affirmative evidence, so opposition must
     // be consecutive rather than accumulated across unrelated old frames.
     if (dualAgree)
         evidence.y = 0u;
-    bool stable = normalSupport.w >= STABLE_SUPPORT &&
-                  sqrt(centerSigma.w) <= STABLE_SIGMA &&
-                  firstViewAngle.w >= STABLE_VIEW_DEG &&
-                   evidence.x >= STABLE_DUAL_SUPPORT;
+    bool legacyStableReady = normalSupport.w >= STABLE_SUPPORT &&
+                             sqrt(centerSigma.w) <= STABLE_SIGMA &&
+                             firstViewAngle.w >= STABLE_VIEW_DEG &&
+                             evidence.x >= STABLE_DUAL_SUPPORT;
+    bool promotionAuthorityReady = HasStablePromotionAuthority(promotionAuthority);
+    // 晋升发生的这一票也必须拥有几何权，避免“前两张安全票开门、当前风险票
+    // 恰好完成旧成熟门”再次给风险几何签发稳定证。
+    bool stable = legacyStableReady && promotionAuthorityReady &&
+                  geometryAuthorityObservation;
+    if (wasStable == 0u && legacyStableReady && !promotionAuthorityReady)
+    {
+        // 这是“原规则本会晋升、现因危险票占主导而延后”的评估次数。
+        // 只进累计黑匣子，不改变候选寿命或已有稳定面的更新能力。
+        InterlockedAdd(_AuditTotals[9], 1u);
+    }
     // Stable is a one-way promotion. A transient loss of raw witness or view
     // quality cannot silently demote it; only the explicit retirement contract
     // below is allowed to remove a stable candidate.
@@ -798,6 +1778,9 @@ void UpdateCandidates(uint id : SV_DispatchThreadID)
         evidence.z = stableId;
         InterlockedAdd(_Stats[18], 1u);
         InterlockedAdd(_AuditTotals[7], 1u);
+        // 只读诊断：在首次晋升这一刻原样封存出生与晋升证据。
+        RecordPromotionAudit(bestIndex, stableId, meta, centerSigma,
+                             firstViewAngle, evidence, observation);
     }
     _CandidateCenterSigma[bestIndex] = centerSigma;
     _CandidateNormalSupport[bestIndex] = normalSupport;
@@ -989,6 +1972,11 @@ void ApplyCandidateSuccessions(uint id : SV_DispatchThreadID)
     newEvidence.z = oldEvidence.z;
     newEvidence.y = 0u;
     _CandidateEvidence[successor] = newEvidence;
+    // 接班候选继承稳定 ID，但不能继承自己胚胎期或前一身份留下的待退场证词。
+    uint4 successorGateState = _CandidateRetirementGateState[successor];
+    if (successorGateState.y != 0u)
+        InterlockedAdd(_RetirementGateCounters[9], 1u);
+    ClearRetirementGate(successor);
 
     uint auditSequence;
     InterlockedAdd(_RetireAuditCounters[0], 1u, auditSequence);
@@ -1000,12 +1988,23 @@ void ApplyCandidateSuccessions(uint id : SV_DispatchThreadID)
         oldMeta.x, oldMeta.y, oldEvidence.x, oldEvidence.y);
     _RetireAuditTiming[auditIndex] = uint4(
         oldMeta.z, oldEvidence.w, successor, successorPreviousStableId);
+    SnapshotRetirementGateAudit(auditIndex, id, oldEvidence.z);
+    uint4 oldGateState = _CandidateRetirementGateState[id];
+    if (oldGateState.y != 0u && oldGateState.x == oldEvidence.z)
+        InterlockedAdd(_RetirementGateCounters[9], 1u);
 
     _CandidateCenterSigma[id] = 0;
     _CandidateNormalSupport[id] = 0;
     _CandidateFirstViewAngle[id] = 0;
     _CandidateMeta[id] = 0;
     _CandidateEvidence[id] = 0;
+    _CandidateBirthSourceReason[id] = 0;
+    _CandidateBirthMotionView[id] = 0;
+    _CandidateBirthDeltaQuality[id] = float4(-1.0, 0.0, 0.0, 0.0);
+    _CandidateEvidenceClassCounts[id] = 0u;
+    _CandidatePromotionAuthority[id] = 0u;
+    _CandidateDirectSupportReceipt[id] = 0u;
+    ClearRetirementGate(id);
     _CandidateSuccessor[id] = 0u;
     _CandidatePredecessor[successor] = 0u;
     InterlockedAdd(_Stats[24], 1u);
@@ -1117,8 +2116,9 @@ void ChallengeCandidates(uint id : SV_DispatchThreadID)
     }
 }
 
-// 淘汰只接受两类明确证据：连续可靠射线看穿，或从未成熟的胚胎长期无人支持。
-// 稳定候选绝不因转头、遮挡或单纯过时而消失。
+// 三张连续看穿票只负责把稳定候选送进待退场，不再直接删除。待退场后必须取得
+// 两张至少相隔1度的精确足迹证空才执行删除；同样的跨视角支撑会取消退场并清票。
+// 同视线矛盾或证词不足都保持原候选。未成熟胚胎的超时清理由旧规则独立处理。
 [numthreads(128, 1, 1)]
 void RetireCandidates(uint id : SV_DispatchThreadID)
 {
@@ -1133,7 +2133,76 @@ void RetireCandidates(uint id : SV_DispatchThreadID)
     bool expiredEmbryo = meta.y == 0u && (uint)_FrameIndex >
         meta.z + EMBRYO_STALE_FRAMES;
     if (!contradicted && !expiredEmbryo)
+    {
+        // 支撑或接班逻辑已经清除了反对票时，旧的待退场证词也必须一起作废。
+        uint4 inactiveGateState = _CandidateRetirementGateState[id];
+        if (meta.y != 0u && inactiveGateState.y != 0u)
+        {
+            if (inactiveGateState.x == evidence.z)
+                InterlockedAdd(_RetirementGateCounters[8], 1u);
+            else
+                InterlockedAdd(_RetirementGateCounters[10], 1u);
+            ClearRetirementGate(id);
+        }
         return;
+    }
+
+    if (contradicted && meta.y != 0u && evidence.z != 0u)
+    {
+        uint currentFrameToken = (uint)_FrameIndex + 1u;
+        uint4 gateState = _CandidateRetirementGateState[id];
+        if (gateState.x != evidence.z || gateState.y == 0u)
+        {
+            // 三票到达只开启新的观察窗口；本帧及更早的证词没有删除权限。
+            if (gateState.y != 0u && gateState.x != evidence.z)
+                InterlockedAdd(_RetirementGateCounters[10], 1u);
+            ClearRetirementGate(id);
+            _CandidateRetirementGateState[id] = uint4(
+                evidence.z, currentFrameToken, 1u, 0u);
+            InterlockedAdd(_RetirementGateCounters[0], 1u);
+            return;
+        }
+
+        float4 supportA = _CandidateRetirementSupportA[id];
+        float4 supportB = _CandidateRetirementSupportB[id];
+        float4 freeA = _CandidateRetirementFreeA[id];
+        float4 freeB = _CandidateRetirementFreeB[id];
+        bool supportCrossView = HasRetirementWitnessPair(
+            supportA, supportB, gateState.y, currentFrameToken);
+        bool freeCrossView = HasRetirementWitnessPair(
+            freeA, freeB, gateState.y, currentFrameToken);
+
+        if (supportCrossView && freeCrossView)
+        {
+            gateState.z = 2u;
+            _CandidateRetirementGateState[id] = gateState;
+            InterlockedAdd(_RetirementGateCounters[3], 1u);
+            return;
+        }
+        if (supportCrossView)
+        {
+            gateState.z = 3u;
+            _CandidateRetirementGateState[id] = gateState;
+            InterlockedAdd(_RetirementGateCounters[1], 1u);
+            evidence.y = 0u;
+            evidence.w = 0u;
+            _CandidateEvidence[id] = evidence;
+            ClearRetirementGate(id);
+            return;
+        }
+        if (!freeCrossView)
+        {
+            gateState.z = 1u;
+            _CandidateRetirementGateState[id] = gateState;
+            InterlockedAdd(_RetirementGateCounters[4], 1u);
+            return;
+        }
+
+        // 只有这条分支拥有稳定候选的真实删除权限。
+        gateState.z = 4u;
+        _CandidateRetirementGateState[id] = gateState;
+        InterlockedAdd(_RetirementGateCounters[2], 1u);
+    }
 
     // 在清零候选前封存稳定 ID、淘汰原因、最终证词和世界位置。
     // 序号单调递增，超过容量后覆盖最旧项；导出端可由总序号恢复顺序。
@@ -1145,13 +2214,83 @@ void RetireCandidates(uint id : SV_DispatchThreadID)
     _RetireAuditGeometry[auditIndex] = _CandidateCenterSigma[id];
     _RetireAuditEvidence[auditIndex] = uint4(
         meta.x, meta.y, evidence.x, evidence.y);
-    _RetireAuditTiming[auditIndex] = uint4(meta.z, evidence.w, 0u, 0u);
+    uint4 directReceipt = _CandidateDirectSupportReceipt[id];
+    uint directSupportToken = 0u;
+    bool anySupportReceiptSeen = directReceipt.x != 0u || directReceipt.z != 0u;
+    bool supportIdentitySeen = false;
+    bool supportFutureSeen = false;
+    if (directReceipt.y == evidence.z && directReceipt.x != 0u)
+    {
+        supportIdentitySeen = true;
+        uint latestFrame = directReceipt.x - 1u;
+        if (latestFrame <= (uint)_FrameIndex)
+            directSupportToken = directReceipt.x;
+        else
+            supportFutureSeen = true;
+    }
+    if (directReceipt.w == evidence.z && directReceipt.z != 0u)
+    {
+        supportIdentitySeen = true;
+        uint previousFrame = directReceipt.z - 1u;
+        if (previousFrame <= (uint)_FrameIndex &&
+            directReceipt.z > directSupportToken)
+            directSupportToken = directReceipt.z;
+        else if (previousFrame > (uint)_FrameIndex)
+            supportFutureSeen = true;
+    }
+    uint directSupportFrame = directSupportToken == 0u
+        ? 0u : directSupportToken - 1u;
+    bool supportFrameOrderValid = directSupportToken != 0u;
+    bool recentDirectSupport = supportFrameOrderValid &&
+        (uint)_FrameIndex - directSupportFrame <= DIRECT_SUPPORT_VETO_WINDOW_FRAMES;
+    uint directReceiptFlags = (recentDirectSupport ? 1u : 0u) |
+                              (supportIdentitySeen ? 2u : 0u) |
+                              (supportFrameOrderValid ? 4u : 0u) |
+                              (supportFutureSeen ? 8u : 0u) |
+                              (anySupportReceiptSeen ? 16u : 0u);
+    _RetireAuditTiming[auditIndex] = uint4(
+        meta.z, evidence.w, directSupportToken, directReceiptFlags);
+    SnapshotRetirementGateAudit(auditIndex, id, evidence.z);
+
+    // 只把“旧生产已真实删除、但刚刚仍被精确足迹支持”的稳定候选复制进
+    // 零权限幽灵账。生产删除照常发生；旧结论看8帧，连续视角账继续记到容量上限。
+    if (contradicted && meta.y != 0u && evidence.z != 0u &&
+        recentDirectSupport)
+    {
+        uint ghostIndex;
+        InterlockedAdd(_RetirementGhostCounters[0], 1u, ghostIndex);
+        if (ghostIndex < (uint)_RetirementGhostCapacity)
+        {
+            _RetirementGhostIdentity[ghostIndex] = uint4(
+                evidence.z, id, (uint)_FrameIndex, directSupportFrame);
+            _RetirementGhostCenterSigma[ghostIndex] =
+                _CandidateCenterSigma[id];
+            _RetirementGhostNormalSupport[ghostIndex] =
+                _CandidateNormalSupport[id];
+            _RetirementGhostOriginCamera[ghostIndex] =
+                mul(_DepthViewInv[FUSION_EYE], float4(0, 0, 0, 1));
+            _RetirementGhostState[ghostIndex] = uint4(1u, 0u, 0u, 0u);
+            _RetirementGhostClasses[ghostIndex] = 0u;
+            _RetirementGhostObservationState[ghostIndex] = 0u;
+        }
+        else
+        {
+            InterlockedAdd(_RetirementGhostCounters[1], 1u);
+        }
+    }
 
     _CandidateCenterSigma[id] = 0;
     _CandidateNormalSupport[id] = 0;
     _CandidateFirstViewAngle[id] = 0;
     _CandidateMeta[id] = 0;
     _CandidateEvidence[id] = 0;
+    _CandidateBirthSourceReason[id] = 0;
+    _CandidateBirthMotionView[id] = 0;
+    _CandidateBirthDeltaQuality[id] = float4(-1.0, 0.0, 0.0, 0.0);
+    _CandidateEvidenceClassCounts[id] = 0u;
+    _CandidatePromotionAuthority[id] = 0u;
+    _CandidateDirectSupportReceipt[id] = 0u;
+    ClearRetirementGate(id);
     if (contradicted)
     {
         InterlockedAdd(_Stats[16], 1u);

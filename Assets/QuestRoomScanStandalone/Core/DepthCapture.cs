@@ -473,6 +473,20 @@ namespace Genesis.RoomScan
         private int _frameCount;
         /// <summary>当前平台深度帧序号；供独立回放会话关联源帧与融合尝试。</summary>
         public int CurrentPlatformFrame => _frameCount;
+        private long _lastDepthTimestampNs;
+        private bool _hasDepthTimestamp;
+        private float _lastDepthArrivalRealtime;
+        /// <summary>平台深度相邻时间戳间隔（毫秒）；无平台时间戳时退回本地到达间隔。</summary>
+        public float LastDepthFrameIntervalMs { get; private set; }
+        /// <summary>最近消费帧从回调到预处理完成的本地帧龄（毫秒）。</summary>
+        public float LastPreprocessAgeMs { get; private set; }
+        /// <summary>平台时间戳严格倒退累计次数；不包含重复帧。</summary>
+        public uint DepthTimestampBackstepCount { get; private set; }
+        public uint DepthTimestampRepeatCount { get; private set; }
+        public bool LastDepthTimestampRepeated { get; private set; }
+        /// <summary>最近一帧的平台时间戳是否倒退；仅影响本次审计，避免一次旧故障永久污染后续样本。</summary>
+        public bool LastDepthTimestampBackstepped { get; private set; }
+        public bool HasDepthTimestamp => _hasDepthTimestamp;
         private float _lastLogTime;
         private PairedDepthFrameRecorder _pairedFrameRecorder;
 
@@ -742,6 +756,15 @@ namespace Genesis.RoomScan
         public void StartDepthCapture()
         {
             _captureActive = true;
+            _hasDepthTimestamp = false;
+            _lastDepthTimestampNs = 0;
+            _lastDepthArrivalRealtime = 0f;
+            LastDepthFrameIntervalMs = 0f;
+            LastPreprocessAgeMs = 0f;
+            DepthTimestampBackstepCount = 0u;
+            DepthTimestampRepeatCount = 0u;
+            LastDepthTimestampRepeated = false;
+            LastDepthTimestampBackstepped = false;
             if (!_permissionReady || _arOcclusionManager == null) return;
             if (!_arOcclusionManager.enabled)
                 _arOcclusionManager.enabled = true;
@@ -772,6 +795,10 @@ namespace Genesis.RoomScan
             }
             DepthAvailable = false;
             _hasTemporalHistory = false; // 停扫后再开必须重新种历史，防隔夜残影
+            _hasDepthTimestamp = false;
+            _lastDepthArrivalRealtime = 0f;
+            LastDepthTimestampBackstepped = false;
+            LastDepthTimestampRepeated = false;
         }
 
         private void OnApplicationPause(bool paused)
@@ -867,6 +894,37 @@ namespace Genesis.RoomScan
         private void OnDepthFrame(AROcclusionFrameEventArgs args)
         {
             _frameCount++;
+            float arrivalRealtime = Time.realtimeSinceStartup;
+            LastDepthTimestampBackstepped = false;
+            LastDepthTimestampRepeated = false;
+            bool hasTimestampNow = args.TryGetTimestamp(out long timestampNowNs);
+            if (hasTimestampNow)
+            {
+                if (_hasDepthTimestamp)
+                {
+                    long deltaNs = timestampNowNs - _lastDepthTimestampNs;
+                    if (deltaNs > 0)
+                        LastDepthFrameIntervalMs = Mathf.Clamp(deltaNs / 1000000f, 0f, 999f);
+                    else if (deltaNs < 0)
+                    {
+                        DepthTimestampBackstepCount++;
+                        LastDepthTimestampBackstepped = true;
+                    }
+                    else
+                    {
+                        DepthTimestampRepeatCount++;
+                        LastDepthTimestampRepeated = true;
+                    }
+                }
+                _lastDepthTimestampNs = timestampNowNs;
+                _hasDepthTimestamp = true;
+            }
+            else if (_lastDepthArrivalRealtime > 0f)
+            {
+                LastDepthFrameIntervalMs = Mathf.Clamp(
+                    (arrivalRealtime - _lastDepthArrivalRealtime) * 1000f, 0f, 999f);
+            }
+            _lastDepthArrivalRealtime = arrivalRealtime;
             if (_frameCount <= 3 || _frameCount % 100 == 0)
                 Logger.Info($"OnDepthFrame #{_frameCount}, textures={args.externalTextures.Count}");
 
@@ -941,6 +999,10 @@ namespace Genesis.RoomScan
             _dilationDirty = true;
             _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
             DispatchCenterDepthSample();
+            LastPreprocessAgeMs = _lastDepthArrivalRealtime > 0f
+                ? Mathf.Clamp((Time.realtimeSinceStartup - _lastDepthArrivalRealtime) * 1000f,
+                              0f, 999f)
+                : 0f;
             Preprocessed?.Invoke();
         }
 

@@ -66,7 +66,7 @@ namespace Genesis.RoomScan
         private ComputeShader supportTruthCompute;
         [SerializeField, Tooltip("支撑真值显示 shader 强引用，防止 Android 构建裁剪。")]
         private Shader supportTruthShader;
-        [SerializeField, Range(1, 4), Tooltip("支撑采样步长：2=10cm 格点边；纸面三角共享这些边上的零交叉顶点。")]
+        [SerializeField, Range(1, 4), Tooltip("支撑采样步长：2=10cm 格点边。旧纸皮对照使用此晶格；当前均匀基础蒙皮使用独立同尺度粗格。")]
         private int supportTruthStride = 2;
         [SerializeField, Range(0.01f, 0.08f), Tooltip("局部零交叉候选/审计点的最低 TSDF 权重；公共纸皮的正式发布门槛统一使用 VolumeIntegrator.MinMeshWeight。")]
         private float supportTruthMinWeight = 0.04f;
@@ -101,6 +101,14 @@ namespace Genesis.RoomScan
         [SerializeField, Min(0.5f), Tooltip("GPU dirty-ledger polling rate. This is a tiny counter readback, not a mesh readback.")]
         private float dirtyLedgerReadbackHz = 5f;
 
+        [Header("Native 5 cm Diagnostic Foundation Skin")]
+        [SerializeField, Tooltip("诊断期直接发布原生5cm TSDF零交叉，只显示单一5cm拓扑；停用直接10cm粗格，避免把一个细格缺样放大成多个可见缺口。完整块原子替换。")]
+        private bool enableSparseFoundationSkin = true;
+        [SerializeField, Range(1, 3), Tooltip("每次提取节拍最多重建的原生5cm诊断蒙皮块数。")]
+        private int sparseFoundationChunksPerTick = 1;
+        [SerializeField, Range(0.08f, 0.24f), Tooltip("活动块临时顶点容量；只影响固定工作缓冲上限，不改变TSDF准入。")]
+        private float sparseFoundationVertexBudgetPercent = 0.18f;
+
         [Header("断崖只读诊断框")]
         [SerializeField, Tooltip("只限制诊断计数与导出，不影响融合、提取或生产网格。")]
         private bool enableDiagnosticRoi = true;
@@ -132,17 +140,19 @@ namespace Genesis.RoomScan
         private SupportTruthRenderer _supportTruth;
         private enum RouteValidationView
         {
+            SparseFoundation,
             PaperFineHybrid,
             SupportTruth,
             CoarseSkin,
             Hera
         }
-        private RouteValidationView _routeValidationView = RouteValidationView.PaperFineHybrid;
+        private RouteValidationView _routeValidationView = RouteValidationView.SparseFoundation;
         private bool _supportTruthAuditMode = true;
         private bool _paperOwnedGrid = true;
         private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
         private GeometryStabilityMonitor _geometryStability;
         private PersistentChunkMeshPipeline _persistentChunks;
+        private PersistentChunkMeshPipeline _sparseFoundationSkin;
         private PersistentChunkMeshPipeline _chunkAbReplay;
         private HeraHierarchicalReplay _heraReplay;
         private int _chunkAbReplaySize;
@@ -321,7 +331,34 @@ namespace Genesis.RoomScan
         }
 
         internal GPUSurfaceNets GpuSurfaceNets => _gpuSurfaceNets;
+
+        /// <summary>
+        /// Read-only bridge for the instantaneous-shell relay audit. It exposes
+        /// only already committed 5-to-10cm production-paper snapshots to the
+        /// supplied diagnostic kernel; candidates and hidden comparison routes
+        /// are never substituted for the production front buffer.
+        /// </summary>
+        internal int DispatchProductionPaperRelayRaster(
+            ComputeShader diagnosticCompute, int kernel,
+            int verticesId, int indicesId, int vertexCountId,
+            int indexCountId, int localToWorldId,
+            int triangleOffsetId, int triangleCapacityId,
+            int triangleCapacity)
+        {
+            return _sparseFoundationSkin?.DispatchCommittedTrianglesForRelayAudit(
+                diagnosticCompute, kernel, verticesId, indicesId,
+                vertexCountId, indexCountId, localToWorldId,
+                triangleOffsetId, triangleCapacityId, triangleCapacity) ?? 0;
+        }
+
+        internal int ProductionPaperCommittedTriangleCount =>
+            _sparseFoundationSkin == null
+                ? 0
+                : (int)Math.Min(int.MaxValue,
+                    _sparseFoundationSkin.AcceptedTriangleCount);
+
         public bool IsInitialized => _gpuSurfaceNets != null || _persistentChunks != null ||
+                                     _sparseFoundationSkin != null ||
                                      _chunkAbReplay != null || _heraReplay != null;
         public bool HasFrozenChunkReplay => _heraReplay != null || _chunkAbReplay != null;
         public bool HasFrozenHeraReplay => _heraReplay != null;
@@ -471,6 +508,7 @@ namespace Genesis.RoomScan
         {
             EnsureSupportTruth();
             EnsureCoarseSkin();
+            EnsureSparseFoundationSkin();
             if (_gpuSurfaceNets != null || _persistentChunks != null) return;
             Init();
         }
@@ -485,7 +523,8 @@ namespace Genesis.RoomScan
             _supportTruth = gameObject.AddComponent<SupportTruthRenderer>();
             if (!_supportTruth.Initialize(supportTruthCompute, supportTruthShader,
                     _volume.VoxelCount, _volume.VoxelSize, supportTruthStride,
-                    supportTruthMinWeight, supportTruthHz, supportTruthSurfelRadius,
+                    supportTruthMinWeight, _volume.MinMeshWeight,
+                    supportTruthHz, supportTruthSurfelRadius,
                     supportTruthHoldSeconds))
             {
                 Destroy(_supportTruth);
@@ -515,11 +554,67 @@ namespace Genesis.RoomScan
             }
         }
 
+        /// <summary>
+        /// Creates the independent native 5 cm diagnostic foundation consumer.
+        /// It reuses the TSDF evidence and the volume dirty ledger, allocates
+        /// working storage only for observed chunks, and publishes each completed
+        /// chunk as one immutable front. No HERA page identity is shared.
+        /// </summary>
+        private void EnsureSparseFoundationSkin()
+        {
+            if (_sparseFoundationSkin != null || !enableSparseFoundationSkin)
+                return;
+            if (_volume == null) _volume = VolumeIntegrator.Instance;
+            if (_volume == null || surfaceNetsCompute == null || scanMeshMaterial == null)
+                return;
+
+            try
+            {
+                var config = new PersistentChunkMeshPipeline.Config(
+                    extractionHaloVoxels,
+                    sparseFoundationChunksPerTick,
+                    dirtyLedgerReadbackHz,
+                    sparseFoundationVertexBudgetPercent,
+                    0,                    // no post-mesh smoothing: preserve real relief
+                    0f,
+                    0f,
+                    1f,                   // no second temporal history volume
+                    1f,
+                    0f,
+                    convergenceThreshold,
+                    0f,
+                    false,
+                    diagnosticRoiRect,
+                    diagnosticRoiSplitX,
+                    _volume.ExtractionChunkSize,
+                    false,
+                    true,
+                    false,
+                    true,                 // full per-chunk atomic replacement
+                    true);                // reveal each completed chunk immediately
+                _sparseFoundationSkin = new PersistentChunkMeshPipeline(
+                    _volume, surfaceNetsCompute, scanMeshMaterial,
+                    transform, gameObject.layer, config, ExtractCurrentVolume);
+                _sparseFoundationSkin.SetDiagnosticColoring(false);
+                _sparseFoundationSkin.SetVisible(false);
+                Logger.Info($"原生5cm诊断蒙皮已就绪：直接显示TSDF零交叉、停用10cm粗格放大；块{_volume.ExtractionChunkSize}³，" +
+                            $"每拍{sparseFoundationChunksPerTick}块，活动顶点预算" +
+                            $"{sparseFoundationVertexBudgetPercent:P0}");
+            }
+            catch (Exception ex)
+            {
+                _sparseFoundationSkin?.Dispose();
+                _sparseFoundationSkin = null;
+                Logger.Error($"原生5cm诊断蒙皮初始化失败，旧纸皮仍可用：{ex.Message}");
+            }
+        }
+
         private void OnDestroy()
         {
             DisposeFrozenHeraReplay();
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
+            DisposeSparseFoundationSkin();
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
         }
@@ -679,9 +774,26 @@ namespace Genesis.RoomScan
 
         /// <summary>HUD"显"读数：当前真正在画网格的那条路径是否可见。</summary>
         public bool IsAnyMeshVisible =>
+            IsSparseFoundationVisible ||
             IsSupportTruthVisible ||
             IsCoarseSkinVisible ||
             (HasIncrementalHera ? IsIncrementalHeraVisible : IsProductionMeshVisible);
+
+        public bool IsSparseFoundationVisible =>
+            _sparseFoundationSkin != null && _sparseFoundationSkin.IsVisible &&
+            IsRouteValidationActive &&
+            _routeValidationView == RouteValidationView.SparseFoundation;
+
+        public string SparseFoundationStatsCompact => _sparseFoundationSkin == null
+            ? "原生5cm无"
+            : $"原生5cm 块{_sparseFoundationSkin.BuiltChunkCount}/{_sparseFoundationSkin.ChunkCount} " +
+              $"面{_sparseFoundationSkin.AcceptedTriangleCount}";
+
+        public string SparseFoundationHudFixed => _sparseFoundationSkin == null
+            ? "原生5cm 块000/000 面0000000"
+            : $"原生5cm 块{Mathf.Clamp(_sparseFoundationSkin.BuiltChunkCount, 0, 999):000}/" +
+              $"{Mathf.Clamp(_sparseFoundationSkin.ChunkCount, 0, 999):000} 面" +
+              $"{Math.Min(_sparseFoundationSkin.AcceptedTriangleCount, 9999999L):0000000}";
 
         /// <summary>
         /// 诊断呈现总闸的显式 setter。只改变当前拥有前景的生产/HERA绘制路径，
@@ -723,26 +835,29 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// All four views read the same TSDF. Paper topology is now a true
+        /// All validation views read the same TSDF. Paper topology is a true
         /// isolated producer/view: HERA neither draws nor accumulates page work
         /// while paper owns the foreground. The left-stick comparison resumes
         /// HERA and shows the old page mesh by itself.
         /// </summary>
         public bool IsRouteValidationActive =>
             coarseSkinRouteValidation && _supportTruth != null &&
-            _coarseSkin != null && HasIncrementalHera;
+            _coarseSkin != null && _sparseFoundationSkin != null && HasIncrementalHera;
 
         public bool RouteValidationPausesHera =>
             IsRouteValidationActive &&
-            (_routeValidationView == RouteValidationView.SupportTruth ||
+            (_routeValidationView == RouteValidationView.SparseFoundation ||
+             _routeValidationView == RouteValidationView.SupportTruth ||
              _routeValidationView == RouteValidationView.CoarseSkin ||
              (_routeValidationView == RouteValidationView.PaperFineHybrid &&
               _paperOwnedGrid));
 
         public string RouteValidationLabel => !IsRouteValidationActive
             ? "常规网格"
-            : _routeValidationView == RouteValidationView.PaperFineHybrid
-                ? (_paperOwnedGrid ? "v2.3纸拓扑" : "HERA旧网格")
+            : _routeValidationView == RouteValidationView.SparseFoundation
+                ? "原生5cm诊断"
+                : _routeValidationView == RouteValidationView.PaperFineHybrid
+                ? (_paperOwnedGrid ? "生产纸皮" : "HERA旧网格")
                 : _routeValidationView == RouteValidationView.SupportTruth
                 ? (_supportTruthAuditMode ? "支撑圆点" : "纸拓扑独显")
                 : _routeValidationView == RouteValidationView.CoarseSkin
@@ -752,13 +867,15 @@ namespace Genesis.RoomScan
         public string CycleRouteValidationView()
         {
             if (!IsRouteValidationActive) return "常规网格";
-            _routeValidationView = _routeValidationView == RouteValidationView.PaperFineHybrid
-                ? RouteValidationView.SupportTruth
+            _routeValidationView = _routeValidationView == RouteValidationView.SparseFoundation
+                ? RouteValidationView.PaperFineHybrid
+                : _routeValidationView == RouteValidationView.PaperFineHybrid
+                    ? RouteValidationView.SupportTruth
                 : _routeValidationView == RouteValidationView.SupportTruth
                     ? RouteValidationView.CoarseSkin
                     : _routeValidationView == RouteValidationView.CoarseSkin
                         ? RouteValidationView.Hera
-                        : RouteValidationView.PaperFineHybrid;
+                        : RouteValidationView.SparseFoundation;
             if (_routeValidationView == RouteValidationView.SupportTruth)
                 _supportTruthAuditMode = Shader.GetGlobalFloat("_RSWireframe") > 0.5f;
             ApplyRouteValidationVisibility(true);
@@ -766,12 +883,33 @@ namespace Genesis.RoomScan
             return RouteValidationLabel;
         }
 
+        /// <summary>
+        /// 一键回到真实生产观察档。这里只选择当前 TSDF 的公共纸拓扑消费者，
+        /// 不创建替代几何，也不改变融合、候选、冻结或提取裁决。
+        /// </summary>
+        public string ShowProductionPaperView()
+        {
+            if (!IsRouteValidationActive)
+            {
+                SetCurrentMeshDisplayVisible(true);
+                return "常规网格";
+            }
+
+            _routeValidationView = RouteValidationView.SparseFoundation;
+            ApplyRouteValidationVisibility(true);
+            Logger.Info("生产观察档：原生5cm TSDF零交叉单一显示（完整块原子发布，10cm粗格停用）");
+            return RouteValidationLabel;
+        }
+
         private void ApplyRouteValidationVisibility(bool visible)
         {
+            bool sparseFoundationVisible = visible &&
+                _routeValidationView == RouteValidationView.SparseFoundation;
             bool hybridVisible = visible &&
                 _routeValidationView == RouteValidationView.PaperFineHybrid;
             bool paperTopologyVisible = hybridVisible && _paperOwnedGrid;
             bool oldHeraVisible = hybridVisible && !_paperOwnedGrid;
+            _sparseFoundationSkin?.SetVisible(sparseFoundationVisible);
             SetPaperGridMode(paperTopologyVisible);
             if (_supportTruth != null)
             {
@@ -797,6 +935,12 @@ namespace Genesis.RoomScan
             if (_supportTruth != null &&
                 _routeValidationView == RouteValidationView.SupportTruth)
                 _supportTruth.AuditMode = audit;
+        }
+
+        public void SetPaperObservationTransparency(bool enabled)
+        {
+            if (_supportTruth != null)
+                _supportTruth.ObservationTransparent = enabled;
         }
 
         public bool TogglePaperOwnedGrid()
@@ -845,6 +989,7 @@ namespace Genesis.RoomScan
 
             EnsureSupportTruth();
             EnsureCoarseSkin();
+            EnsureSparseFoundationSkin();
             if (_heraReplay != null)
             {
                 if (_heraReplay.IsIncremental) return;
@@ -858,12 +1003,13 @@ namespace Genesis.RoomScan
                 transform, gameObject.layer, parent32, child16, ExtractCurrentVolume,
                 incrementalMode: true);
             _heraReplay.SetDiagnosticColoring(true);
-            if (coarseSkinRouteValidation && _supportTruth != null && _coarseSkin != null)
+            if (coarseSkinRouteValidation && _supportTruth != null && _coarseSkin != null &&
+                _sparseFoundationSkin != null)
             {
-                _routeValidationView = RouteValidationView.PaperFineHybrid;
+                _routeValidationView = RouteValidationView.SparseFoundation;
                 _paperOwnedGrid = true;
                 ApplyRouteValidationVisibility(true);
-                Logger.Info("支架路线验证：默认纸拓扑网格纯隔离（HERA不上屏且暂停排页）；左摇杆切HERA旧网格，右摇杆循环支撑圆点/三角粗皮/HERA对照/纸拓扑网格");
+                Logger.Info("支架路线验证：默认原生5cm诊断蒙皮；右摇杆可循环旧纸皮/支撑圆点/三角粗皮/HERA对照");
             }
             else
             {
@@ -1030,6 +1176,7 @@ namespace Genesis.RoomScan
         public void BeginFrozenHeraReplay(int maxChunksPerTick)
         {
             SetPaperGridMode(false);
+            _sparseFoundationSkin?.SetVisible(false);
             if (_volume == null) _volume = VolumeIntegrator.Instance;
             if (_volume == null || surfaceNetsCompute == null || scanMeshMaterial == null)
                 throw new InvalidOperationException("HERA 缺少体积、计算着色器或网格材质");
@@ -1098,7 +1245,14 @@ namespace Genesis.RoomScan
 
         public void TickFrozenHeraReplay()
         {
-            _heraReplay?.Tick();
+            // Direct diagnostic-foundation / old-paper views pause HERA page production, but
+            // the foundation still has to consume dirty TSDF chunks. This is
+            // the shared extraction-only frame reserved by the scanner.
+            if (_heraReplay == null || _heraReplay.IsIncremental)
+                _sparseFoundationSkin?.Tick();
+            if (_heraReplay != null &&
+                (!_heraReplay.IsIncremental || !RouteValidationPausesHera))
+                _heraReplay?.Tick();
         }
 
         public bool ToggleFrozenHeraReplayColoring()
@@ -1167,6 +1321,11 @@ namespace Genesis.RoomScan
         /// </summary>
         public void Extract()
         {
+            // The native 5 cm diagnostic foundation is an independent consumer of the same dirty
+            // TSDF ledger. It keeps progressing even while HERA or the old
+            // paper route is hidden for comparison.
+            _sparseFoundationSkin?.Tick();
+
             if (_gpuSurfaceNets == null && _persistentChunks == null) return;
 
             if (_persistentChunks != null && !_legacyFallbackActive)
@@ -1384,10 +1543,15 @@ namespace Genesis.RoomScan
             Logger.Info($"累计账开始: {_ledgerSessionId}");
         }
 
-        /// <summary>v2.3 纸拓扑不携带实验版发布黑匣子。</summary>
+        /// <summary>
+        /// Export the read-only paper-cell first-break ledger. The renderer owns
+        /// the GPU audit buffer; this method only reconnects the existing replay
+        /// session artifact hook.
+        /// </summary>
         public bool RequestPaperAuditExport(string reason, Action<string> completed = null)
         {
-            return false;
+            return _supportTruth != null && _supportTruth.IsReady &&
+                _supportTruth.RequestHoleCauseAuditExport(reason, completed);
         }
 
         public string GetLedgerSessionStatsCompact()
@@ -2056,6 +2220,7 @@ namespace Genesis.RoomScan
             DisposeFrozenHeraReplay();
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
+            DisposeSparseFoundationSkin();
             if (_gpuRenderer != null)
             {
                 _gpuRenderer.RenderVisible = false;
@@ -2078,6 +2243,7 @@ namespace Genesis.RoomScan
             DisposeFrozenHeraReplay();
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
+            DisposeSparseFoundationSkin();
             if (_gpuRenderer != null)
             {
                 _gpuRenderer.RenderVisible = false;
@@ -2095,6 +2261,12 @@ namespace Genesis.RoomScan
         {
             _persistentChunks?.Dispose();
             _persistentChunks = null;
+        }
+
+        private void DisposeSparseFoundationSkin()
+        {
+            _sparseFoundationSkin?.Dispose();
+            _sparseFoundationSkin = null;
         }
     }
 }
