@@ -1,3 +1,9 @@
+using System;
+using System.Collections;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
@@ -13,7 +19,8 @@ namespace Genesis.RoomScan
     ///
     /// 每个小三角会同时检查三个端点。深度断裂过大时整片丢弃；接近断裂或掠射的
     /// 可疑片保留为黄/红边，便于直接观察“原料膜”从哪里开始失真。历史片很快退场，
-    /// A 键只复制一份世界锁定快照，生产扫描继续运行。
+    /// A 键只临时锁住一层世界空间壳，再按解除；不导出、不入历史，
+    /// 生产扫描继续运行。
     /// </summary>
     public sealed class InstantDepthShellOverlay : MonoBehaviour
     {
@@ -148,6 +155,13 @@ namespace Genesis.RoomScan
         private uint _relayAuditEpoch;
         private ShellLayer[] _liveLayers;
         private ShellLayer _frozenLayer;
+        private bool _diagnosticFreezeActive;
+        private InstantSeedPlanePreview _seedPreview;
+        private bool _seedPreviewVisible;
+        private bool _seedPreviewCapturePending;
+        private bool _automaticSeedCaptureActive;
+        private float _nextAutomaticSeedAttemptAt;
+        private int _automaticSeedAttemptCount;
         private ReviewReference[] _reviewHistory;
         private int _nextReviewHistory;
         private float _nextReviewHistoryAt;
@@ -163,6 +177,7 @@ namespace Genesis.RoomScan
         private int _reviewGridWidth;
         private int _reviewGridHeight;
         private bool _reviewReadbackPending;
+        private bool _paperOccupancyExportPending;
         private int _reviewEpoch;
         private float _nextReviewReadbackAt;
         private uint _reviewBatchSequence;
@@ -334,6 +349,7 @@ namespace Genesis.RoomScan
         private static readonly int PaperAuditCellCountID = Shader.PropertyToID("_PaperAuditCellCount");
         private static readonly int PaperAuditStrideID = Shader.PropertyToID("_PaperAuditStride");
         private static readonly int PaperAuditCellTotalID = Shader.PropertyToID("_PaperAuditCellTotal");
+        private static readonly int PaperAuditClearOffsetID = Shader.PropertyToID("_PaperAuditClearOffset");
         internal static readonly int RelayPaperVerticesID = Shader.PropertyToID("_RelayPaperVertices");
         internal static readonly int RelayPaperIndicesID = Shader.PropertyToID("_RelayPaperIndices");
         internal static readonly int RelayPaperVertexCountID = Shader.PropertyToID("_RelayPaperVertexCount");
@@ -370,7 +386,14 @@ namespace Genesis.RoomScan
         /// 只验证生产观感。此标志不改变任何深度或融合数据。
         /// </summary>
         public bool CompositeWithProduction { get; private set; }
-        public bool HasFrozenSnapshot => _frozenLayer != null && _frozenLayer.Valid;
+        public bool HasFrozenSnapshot => _diagnosticFreezeActive &&
+                                         _frozenLayer != null && _frozenLayer.Valid;
+        public bool DiagnosticFreezeActive => HasFrozenSnapshot;
+        public bool SeedPreviewVisible => _visible && _seedPreviewVisible;
+        public string SeedPreviewStatus => _seedPreview != null
+            ? _seedPreview.Status : "种子观察未就绪";
+        public bool AutomaticSeedCaptureActive => _automaticSeedCaptureActive;
+        public int AutomaticSeedAttemptCount => _automaticSeedAttemptCount;
         public int WitnessMaxAgeCaptures => Mathf.Max(1, witnessMaxAgeCaptures);
 
         /// <summary>
@@ -497,6 +520,20 @@ namespace Genesis.RoomScan
         public void SetVisible(bool visible)
         {
             _visible = visible && enabled;
+            if (!_visible)
+            {
+                _seedPreviewVisible = false;
+                if (!_automaticSeedCaptureActive)
+                    _seedPreviewCapturePending = false;
+                ApplySeedCaptureState();
+            }
+            // 定格只属于当次即时壳观察。离开该显示档即作废，
+            // 避免绕一圈 X 档后又看到上一次的旧定格层。
+            if (!_visible && _diagnosticFreezeActive)
+            {
+                _diagnosticFreezeActive = false;
+                if (_frozenLayer != null) _frozenLayer.Valid = false;
+            }
             if (_visible)
             {
                 CompositeWithProduction = false;
@@ -513,6 +550,7 @@ namespace Genesis.RoomScan
 
         public void SetCompositeWithProduction(bool composite)
         {
+            if (composite) SetSeedPreviewVisible(false);
             CompositeWithProduction = _visible && composite;
             SetRejectedTriangleVisibility(!CompositeWithProduction);
             SetDepthAwareOwnership(CompositeWithProduction);
@@ -537,10 +575,21 @@ namespace Genesis.RoomScan
 
         public void ClearAll()
         {
+            _automaticSeedCaptureActive = false;
+            _automaticSeedAttemptCount = 0;
+            _nextAutomaticSeedAttemptAt = 0f;
+            _seedPreviewCapturePending = false;
+            _seedPreviewVisible = false;
+            // ClearAll is also called by B-save/clear and by the first start of
+            // a new roll.  Leaving this latch set would make Integrate reject
+            // every frame forever even though the preview is no longer shown.
+            DepthCapture.Instance?.SetSeedPlanePreviewActive(false);
+            _seedPreview?.SetCaptureState(false, false);
             _nextLayer = 0;
             _lastCaptureAt = -1f;
             _nextReviewHistory = 0;
             _nextReviewHistoryAt = 0f;
+            _diagnosticFreezeActive = false;
             _reviewEpoch++;
             _reviewMissingPercent = 0;
             _reviewNoWitnessPercent = 0;
@@ -584,12 +633,165 @@ namespace Genesis.RoomScan
             }
         }
 
-        /// <summary>钉住当前清洗深度与当刻位姿；不暂停采集、不冻结 TSDF。</summary>
-        public bool FreezeDiagnosticSnapshot()
+        /// <summary>
+        /// A 键视差实验：首次按下复制当前最新的一层即时壳，
+        /// 只显示这层世界锁定表面；再按解除。生产采集、GunGel 和 TSDF
+        /// 全程不停，定格层也永不向生产发布数据。
+        /// </summary>
+        public bool ToggleDiagnosticFreeze(out bool frozen)
         {
-            if (!_visible || !_built || !DepthCapture.DepthAvailable || _frozenLayer == null)
+            frozen = _diagnosticFreezeActive;
+            if (!_visible || _seedPreviewVisible || !_built || _frozenLayer == null)
                 return false;
-            return CaptureInto(_frozenLayer, Time.unscaledTime, true);
+
+            if (_diagnosticFreezeActive)
+            {
+                _diagnosticFreezeActive = false;
+                _frozenLayer.Valid = false;
+                ApplyDiagnosticFreezeVisibility();
+                frozen = false;
+                return true;
+            }
+
+            if (!DepthCapture.DepthAvailable)
+                return false;
+
+            float now = Time.unscaledTime;
+            bool captured = CopyLatestLiveLayerIntoFrozen(now) ||
+                            CaptureInto(_frozenLayer, now, true);
+            if (!captured)
+                return false;
+
+            _diagnosticFreezeActive = true;
+            ApplyDiagnosticFreezeVisibility();
+            frozen = true;
+            return true;
+        }
+
+        private bool CopyLatestLiveLayerIntoFrozen(float now)
+        {
+            if (_liveLayers == null || _frozenLayer == null)
+                return false;
+
+            ShellLayer latest = null;
+            for (int i = 0; i < _liveLayers.Length; i++)
+            {
+                ShellLayer candidate = _liveLayers[i];
+                if (candidate == null || !candidate.Valid || candidate.Snapshot == null)
+                    continue;
+                if (latest == null || candidate.CapturedAt > latest.CapturedAt)
+                    latest = candidate;
+            }
+            if (latest == null || latest.Material == null || _frozenLayer.Material == null)
+                return false;
+
+            // 复制正在显示的已封装 GPU 内容，而不是在按键 Update
+            // 里重读一次可能已被下一帧复用的全局深度纹理。
+            Graphics.CopyTexture(latest.Snapshot, _frozenLayer.Snapshot);
+            Graphics.CopyTexture(latest.ReviewState, _frozenLayer.ReviewState);
+            Graphics.CopyTexture(latest.ReviewResidualMm, _frozenLayer.ReviewResidualMm);
+            Graphics.CopyTexture(latest.ConnectivityState, _frozenLayer.ConnectivityState);
+            Graphics.CopyTexture(latest.PlaneConnectivityState,
+                _frozenLayer.PlaneConnectivityState);
+            _frozenLayer.Material.SetMatrix(ProjID, latest.Material.GetMatrix(ProjID));
+            _frozenLayer.Material.SetMatrix(ProjInvID, latest.Material.GetMatrix(ProjInvID));
+            _frozenLayer.Material.SetMatrix(ViewInvID, latest.Material.GetMatrix(ViewInvID));
+            _frozenLayer.Material.SetFloat(AgeID, 0f);
+            _frozenLayer.Material.SetFloat(FrozenID, 1f);
+            _frozenLayer.CapturedAt = now;
+            _frozenLayer.Valid = true;
+            return true;
+        }
+
+        private void ApplyDiagnosticFreezeVisibility()
+        {
+            if (_liveLayers != null)
+                for (int i = 0; i < _liveLayers.Length; i++)
+                    if (_liveLayers[i]?.Renderer != null)
+                        _liveLayers[i].Renderer.enabled = _visible &&
+                            !_seedPreviewVisible && !_diagnosticFreezeActive &&
+                            _liveLayers[i].Valid;
+            if (_frozenLayer?.Renderer != null)
+                _frozenLayer.Renderer.enabled = _visible &&
+                    !_seedPreviewVisible && _diagnosticFreezeActive &&
+                    _frozenLayer.Valid;
+        }
+
+        /// <summary>
+        /// 单帧中央圆拟合并暂存生产基底；观察期间不写卷，离开观察且卷为空时
+        /// 才由共享深度入口送入 GunGel/裁决/TSDF。
+        /// </summary>
+        public void SetSeedPreviewVisible(bool visible)
+        {
+            _seedPreviewVisible = visible && _visible;
+            if (_seedPreviewVisible) _seedPreviewCapturePending = true;
+            ApplySeedCaptureState();
+            if (_seedPreviewVisible)
+            {
+                _diagnosticFreezeActive = false;
+                if (_frozenLayer != null) _frozenLayer.Valid = false;
+                RequestSeedPreviewCapture();
+            }
+            ApplyDiagnosticFreezeVisibility();
+        }
+
+        /// <summary>A 键重新取一张单帧；之前结果保持可见直到新结果完成。</summary>
+        public bool RequestSeedPreviewCapture()
+        {
+            if ((!_seedPreviewVisible && !_automaticSeedCaptureActive) ||
+                _seedPreview == null) return false;
+            // The first capture after entering this view must be a fresh frame,
+            // not a shell already displayed before the X press.
+            _seedPreviewCapturePending = true;
+            return true;
+        }
+
+        private bool CaptureSeedPreviewFrom(ShellLayer source)
+        {
+            if ((!_seedPreviewVisible && !_automaticSeedCaptureActive) ||
+                _seedPreview == null || source == null ||
+                source.Material == null)
+                return false;
+            return _seedPreview.Capture(source.Snapshot,
+                source.Material.GetMatrix(ProjInvID),
+                source.Material.GetMatrix(ViewInvID), _pixelStep);
+        }
+
+        /// <summary>
+        /// On a new empty roll, acquire the first qualified centre-disc ruler
+        /// before the only TSDF is allowed to write.  This is deliberately
+        /// hidden: it changes the production input, not the selected view.
+        /// </summary>
+        public bool BeginAutomaticSeedCapture()
+        {
+            DepthCapture depth = DepthCapture.Instance;
+            if (depth == null || !depth.SeedPlaneExperimentEnabled)
+                return false;
+
+            depth.ClearSeedPlanePatches();
+            _automaticSeedCaptureActive = true;
+            _automaticSeedAttemptCount = 0;
+            _nextAutomaticSeedAttemptAt = 0f;
+            _seedPreviewCapturePending = true;
+            ApplySeedCaptureState();
+            Logger.Info("新空卷：融合前自动抓取中央60%合格基底；成功前TSDF保持关闭");
+            return true;
+        }
+
+        private void ApplySeedCaptureState()
+        {
+            bool active = _seedPreviewVisible || _automaticSeedCaptureActive;
+            DepthCapture.Instance?.SetSeedPlanePreviewActive(active);
+            _seedPreview?.SetCaptureState(active, _seedPreviewVisible);
+        }
+
+        private void CompleteAutomaticSeedCapture()
+        {
+            if (!_automaticSeedCaptureActive) return;
+            _automaticSeedCaptureActive = false;
+            _seedPreviewCapturePending = false;
+            ApplySeedCaptureState();
+            Logger.Info($"融合前基底已自动抓取并放行唯一TSDF；尝试{_automaticSeedAttemptCount}次");
         }
 
         private void Update()
@@ -622,11 +824,13 @@ namespace Genesis.RoomScan
                     layer.Material.SetFloat(AgeID, CompositeWithProduction
                         ? 0f
                         : Mathf.Clamp01(age / Mathf.Max(0.1f, liveLifetime)));
-                    layer.Renderer.enabled = _visible;
+                    layer.Renderer.enabled = _visible && !_seedPreviewVisible &&
+                                             !_diagnosticFreezeActive;
                 }
             }
             if (_frozenLayer != null && _frozenLayer.Valid)
-                _frozenLayer.Renderer.enabled = _visible;
+                _frozenLayer.Renderer.enabled = _visible && !_seedPreviewVisible &&
+                                                _diagnosticFreezeActive;
         }
 
         private void OnDepthPreprocessed()
@@ -640,6 +844,16 @@ namespace Genesis.RoomScan
             }
 
             float now = Time.unscaledTime;
+            DepthCapture depth = DepthCapture.Instance;
+            if (_automaticSeedCaptureActive && depth != null)
+            {
+                if (depth.HasStagedSeedPlanes)
+                    CompleteAutomaticSeedCapture();
+                else if (!_seedPreviewCapturePending &&
+                         (_seedPreview == null || !_seedPreview.IsPending) &&
+                         now >= _nextAutomaticSeedAttemptAt)
+                    _seedPreviewCapturePending = true;
+            }
             if (now < _nextCaptureAt || _liveLayers == null || _liveLayers.Length == 0) return;
             _nextCaptureAt = now + captureInterval;
             ShellLayer layer = null;
@@ -660,6 +874,24 @@ namespace Genesis.RoomScan
             {
                 _lastCaptureAt = now;
                 _nextLayer = (selectedLayer + 1) % _liveLayers.Length;
+                if (_seedPreviewCapturePending)
+                {
+                    bool started = CaptureSeedPreviewFrom(layer);
+                    if (started)
+                    {
+                        _seedPreviewCapturePending = false;
+                        if (_automaticSeedCaptureActive)
+                        {
+                            _automaticSeedAttemptCount++;
+                            _nextAutomaticSeedAttemptAt = now + 0.5f;
+                        }
+                    }
+                    else if (_automaticSeedCaptureActive)
+                    {
+                        _seedPreviewCapturePending = false;
+                        _nextAutomaticSeedAttemptAt = now + 0.5f;
+                    }
+                }
             }
         }
 
@@ -715,6 +947,10 @@ namespace Genesis.RoomScan
             for (int i = 0; i < _liveLayers.Length; i++)
                 _liveLayers[i] = CreateLayer($"[QRS] Instant Shell Live {i:00}", shellShader, false);
             _frozenLayer = CreateLayer("[QRS] Instant Shell Frozen", shellShader, true);
+            _seedPreview = GetComponent<InstantSeedPlanePreview>();
+            if (_seedPreview == null)
+                _seedPreview = gameObject.AddComponent<InstantSeedPlanePreview>();
+            ApplySeedCaptureState();
             _reviewHistory = new ReviewReference[Mathf.Clamp(reviewHistoryCount, 1, 24)];
             for (int i = 0; i < _reviewHistory.Length; i++)
             {
@@ -947,7 +1183,9 @@ namespace Genesis.RoomScan
             layer.Material.SetFloat(FrozenID, frozen ? 1f : 0f);
             layer.CapturedAt = now;
             layer.Valid = true;
-            layer.Renderer.enabled = _visible;
+            layer.Renderer.enabled = _visible &&
+                !_seedPreviewVisible &&
+                (frozen ? _diagnosticFreezeActive : !_diagnosticFreezeActive);
             if (!frozen)
                 RecordReviewReference(layer.Snapshot, currentProj, currentProjInv,
                     currentView, currentViewInv, now);
@@ -1058,6 +1296,7 @@ namespace Genesis.RoomScan
                     _reviewCompute.SetBuffer(_clearPaperAuditKernel, PaperAuditCellsID,
                         _paperAuditCells);
                     _reviewCompute.SetInt(PaperAuditCellTotalID, _paperAuditCellTotal);
+                    _reviewCompute.SetInt(PaperAuditClearOffsetID, 0);
                     _reviewCompute.Dispatch(_clearPaperAuditKernel,
                         Mathf.CeilToInt(_paperAuditCellTotal / 64f), 1, 1);
 
@@ -1468,9 +1707,13 @@ namespace Genesis.RoomScan
             if (_liveLayers != null)
                 for (int i = 0; i < _liveLayers.Length; i++)
                     if (_liveLayers[i].Renderer != null)
-                        _liveLayers[i].Renderer.enabled = visible && _liveLayers[i].Valid;
+                        _liveLayers[i].Renderer.enabled = visible &&
+                            !_seedPreviewVisible && !_diagnosticFreezeActive &&
+                            _liveLayers[i].Valid;
             if (_frozenLayer != null && _frozenLayer.Renderer != null)
-                _frozenLayer.Renderer.enabled = visible && _frozenLayer.Valid;
+                _frozenLayer.Renderer.enabled = visible &&
+                    !_seedPreviewVisible && _diagnosticFreezeActive &&
+                    _frozenLayer.Valid;
         }
 
         private void SetRejectedTriangleVisibility(bool visible)
@@ -1707,6 +1950,247 @@ namespace Genesis.RoomScan
             _relayTemporalGoodBaselinePercent = 0;
             if (_relayMaturityCells != null && _relayMaturityCells.IsValid())
                 _relayMaturityCells.SetData(new uint[_relayMaturityCells.count]);
+        }
+
+        /// <summary>
+        /// Rasterize the exact committed native-5cm production paper into the
+        /// TSDF cell lattice.  This stop-time audit is independent of shell or
+        /// SupportTruth visibility and never feeds production.
+        /// </summary>
+        internal bool RequestProductionPaperOccupancyAuditExport(
+            string reason, MeshExtractor extractor, Action<string> completed = null)
+        {
+            if (_paperOccupancyExportPending || _reviewCompute == null ||
+                _clearPaperAuditKernel < 0 || _rasterizePaperAuditKernel < 0 ||
+                extractor == null || VolumeIntegrator.Instance == null ||
+                VolumeIntegrator.Instance.Volume == null)
+                return false;
+
+            int triangleCount = extractor.ProductionPaperCommittedTriangleCount;
+            if (triangleCount <= 0 || triangleCount > MaxPaperAuditTriangleCapacity)
+                return false;
+
+            _paperOccupancyExportPending = true;
+            StartCoroutine(ExportProductionPaperOccupancy(
+                reason ?? string.Empty, extractor, triangleCount, completed));
+            return true;
+        }
+
+        private IEnumerator ExportProductionPaperOccupancy(
+            string reason, MeshExtractor extractor, int expectedTriangles,
+            Action<string> completed)
+        {
+            string outputPath = string.Empty;
+            Exception failure = null;
+            ComputeBuffer cells = null;
+            uint[] occupancy = null;
+            int3 voxelCount = int3.zero;
+            int3 cellCount = int3.zero;
+            float voxelSize = 0f;
+            int rasterizedTriangles = 0;
+
+            try
+            {
+                VolumeIntegrator volume = VolumeIntegrator.Instance;
+                voxelCount = volume.VoxelCount;
+                voxelSize = volume.VoxelSize;
+                cellCount = new int3(
+                    Mathf.Max(1, voxelCount.x - 1),
+                    Mathf.Max(1, voxelCount.y - 1),
+                    Mathf.Max(1, voxelCount.z - 1));
+                int total = checked(cellCount.x * cellCount.y * cellCount.z);
+                cells = new ComputeBuffer(total, sizeof(uint), ComputeBufferType.Structured);
+                occupancy = new uint[total];
+
+                _reviewCompute.SetBuffer(_clearPaperAuditKernel, PaperAuditCellsID, cells);
+                _reviewCompute.SetInt(PaperAuditCellTotalID, total);
+                const int maxGroups = 65535;
+                const int threadsPerGroup = 64;
+                int clearOffset = 0;
+                while (clearOffset < total)
+                {
+                    int batchCells = Mathf.Min(total - clearOffset,
+                        maxGroups * threadsPerGroup);
+                    _reviewCompute.SetInt(PaperAuditClearOffsetID, clearOffset);
+                    _reviewCompute.Dispatch(_clearPaperAuditKernel,
+                        Mathf.CeilToInt(batchCells / (float)threadsPerGroup), 1, 1);
+                    clearOffset += batchCells;
+                }
+
+                EnsurePaperAuditTriangleCapacity(expectedTriangles);
+                if (_paperAuditTriangles == null || !_paperAuditTriangles.IsValid())
+                    throw new InvalidOperationException("production paper triangle audit buffer unavailable");
+
+                _reviewCompute.SetBuffer(_rasterizePaperAuditKernel, PaperAuditCellsID, cells);
+                _reviewCompute.SetBuffer(_rasterizePaperAuditKernel,
+                    RelayPaperTrianglesID, _paperAuditTriangles);
+                _reviewCompute.SetInts(TsdfVoxelCountID,
+                    voxelCount.x, voxelCount.y, voxelCount.z);
+                _reviewCompute.SetFloat(TsdfVoxelSizeID, voxelSize);
+                _reviewCompute.SetInts(PaperAuditCellCountID,
+                    cellCount.x, cellCount.y, cellCount.z);
+                _reviewCompute.SetInt(PaperAuditStrideID, 1);
+                _reviewCompute.SetInt(PaperAuditCellTotalID, total);
+                rasterizedTriangles = extractor.DispatchProductionPaperRelayRaster(
+                    _reviewCompute, _rasterizePaperAuditKernel,
+                    RelayPaperVerticesID, RelayPaperIndicesID,
+                    RelayPaperVertexCountID, RelayPaperIndexCountID,
+                    RelayPaperLocalToWorldID, RelayPaperTriangleOffsetID,
+                    RelayPaperTriangleCapacityID, _paperAuditTriangleCapacity);
+                _reviewCompute.SetInt(RelayPaperTriangleCountID, rasterizedTriangles);
+                if (rasterizedTriangles != expectedTriangles)
+                    throw new InvalidDataException(
+                        $"production paper raster incomplete: expected {expectedTriangles}, got {rasterizedTriangles}");
+            }
+            catch (Exception e)
+            {
+                failure = e;
+            }
+
+            if (failure == null)
+            {
+                const int valuesPerReadback = (1 << 20) / sizeof(uint);
+                int copied = 0;
+                while (copied < occupancy.Length && failure == null)
+                {
+                    int valueCount = Mathf.Min(valuesPerReadback, occupancy.Length - copied);
+                    AsyncGPUReadbackRequest request = default;
+                    try
+                    {
+                        request = AsyncGPUReadback.Request(cells,
+                            valueCount * sizeof(uint), copied * sizeof(uint));
+                    }
+                    catch (Exception e)
+                    {
+                        failure = new IOException(
+                            $"production paper occupancy readback request failed at cell {copied}", e);
+                    }
+                    if (failure != null) break;
+                    while (!request.done) yield return null;
+                    if (request.hasError)
+                    {
+                        failure = new IOException(
+                            $"production paper occupancy GPU readback failed at cell {copied}");
+                        break;
+                    }
+
+                    try
+                    {
+                        var source = request.GetData<uint>();
+                        if (source.Length != valueCount)
+                            throw new InvalidDataException(
+                                $"occupancy readback length mismatch at cell {copied}: {source.Length}/{valueCount}");
+                        for (int i = 0; i < valueCount; i++) occupancy[copied + i] = source[i];
+                        copied += valueCount;
+                    }
+                    catch (Exception e)
+                    {
+                        failure = e;
+                    }
+                    yield return null;
+                }
+            }
+
+            Task<string> writeTask = null;
+            if (failure == null)
+            {
+                int3 capturedVoxelCount = voxelCount;
+                int3 capturedCellCount = cellCount;
+                float capturedVoxelSize = voxelSize;
+                int capturedRasterizedTriangles = rasterizedTriangles;
+                string directory = Path.Combine(Application.persistentDataPath,
+                    "ScanCoverDiagnostics", "paper_hole_audit",
+                    DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture));
+                try
+                {
+                    writeTask = Task.Run(() => WriteProductionPaperOccupancy(
+                        directory, reason, occupancy, capturedVoxelCount,
+                        capturedCellCount, capturedVoxelSize, expectedTriangles,
+                        capturedRasterizedTriangles));
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            }
+
+            if (writeTask != null)
+            {
+                while (!writeTask.IsCompleted) yield return null;
+                if (writeTask.IsFaulted)
+                    failure = writeTask.Exception?.GetBaseException() ??
+                        new IOException("production paper occupancy write failed");
+                else if (writeTask.IsCanceled)
+                    failure = new TaskCanceledException(
+                        "production paper occupancy write canceled");
+                else
+                    outputPath = writeTask.Result;
+            }
+
+            cells?.Release();
+            _paperOccupancyExportPending = false;
+            if (failure == null)
+                Logger.Info("原生5cm正式纸皮占用账已保存: " + outputPath);
+            else
+                Logger.Error("原生5cm正式纸皮占用账导出失败: " +
+                    failure.GetType().Name + ": " + failure.Message);
+            try { completed?.Invoke(outputPath); }
+            catch (Exception callbackError)
+            {
+                Logger.Error("原生5cm正式纸皮占用账回调失败: " + callbackError.Message);
+            }
+        }
+
+        private static string WriteProductionPaperOccupancy(
+            string directory, string reason, uint[] occupancy,
+            int3 voxelCount, int3 cellCount, float voxelSize,
+            int productionTriangles, int rasterizedTriangles)
+        {
+            Directory.CreateDirectory(directory);
+            long occupiedCells = 0;
+            string binaryPath = Path.Combine(directory,
+                "production_paper_occupancy.r32_uint.bin");
+            using (var stream = new FileStream(binaryPath, FileMode.Create,
+                FileAccess.Write, FileShare.None, 1 << 20))
+            using (var writer = new BinaryWriter(stream))
+            {
+                for (int i = 0; i < occupancy.Length; i++)
+                {
+                    uint value = occupancy[i];
+                    writer.Write(value);
+                    if (value != 0xffffffffu) occupiedCells++;
+                }
+            }
+            if (productionTriangles > 0 && occupiedCells == 0)
+                throw new InvalidDataException(
+                    "production paper contains triangles but occupancy is empty");
+
+            string schema = "{\n" +
+                "  \"schema\": \"scancover.production_paper_occupancy.v1\",\n" +
+                "  \"reason\": \"" + JsonEscape(reason) + "\",\n" +
+                "  \"voxelCount\": [" + voxelCount.x + "," + voxelCount.y + "," + voxelCount.z + "],\n" +
+                "  \"cellCount\": [" + cellCount.x + "," + cellCount.y + "," + cellCount.z + "],\n" +
+                "  \"paperStrideVoxels\": 1,\n" +
+                "  \"voxelSizeMetres\": " + voxelSize.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
+                "  \"productionTriangles\": " + productionTriangles + ",\n" +
+                "  \"rasterizedTriangles\": " + rasterizedTriangles + ",\n" +
+                "  \"occupiedCells\": " + occupiedCells + ",\n" +
+                "  \"emptyValue\": 4294967295,\n" +
+                "  \"packing\": \"distanceMm14 in bits18..31; nearest triangle id18 in bits0..17\",\n" +
+                "  \"indexOrder\": \"x-fastest, then y, then z\",\n" +
+                "  \"source\": \"exact committed native-5cm production paper snapshots\",\n" +
+                "  \"authority\": \"diagnostic only; never sampled by production\"\n" +
+                "}\n";
+            File.WriteAllText(Path.Combine(directory,
+                "production_paper_occupancy_schema.json"), schema,
+                new UTF8Encoding(false));
+            return directory;
+        }
+
+        private static string JsonEscape(string value)
+        {
+            return (value ?? string.Empty).Replace("\\", "\\\\")
+                .Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
         }
 
         private void OnDestroy()

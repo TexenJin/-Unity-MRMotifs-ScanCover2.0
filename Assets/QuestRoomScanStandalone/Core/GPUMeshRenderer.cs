@@ -27,6 +27,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_SuppressPink = Shader.PropertyToID("_RSSuppressPink");
         private static readonly int ID_TemporalIllegalActive = Shader.PropertyToID("_RSTemporalIllegalActive");
         private static readonly int ID_HeraReplayActive = Shader.PropertyToID("_RSHeraReplayActive");
+        private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
 
         // Display-only A/B colors. They never feed back into extraction or TSDF state.
         private static readonly Color ProductionColor = new Color(1.0f, 0.62f, 0.02f, 0.96f);
@@ -39,6 +40,7 @@ namespace Genesis.RoomScan
         private bool _suppressPink = true;
         private bool _temporalIllegalCandidateActive;
         private bool _heraReplayActive;
+        private bool _productGridMode;
 
         private bool _renderVisible = true;
 
@@ -115,6 +117,16 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Draws a world-anchored 10 cm grid over the complete native candidate
+        /// surface. This changes no indices and therefore cannot introduce
+        /// holes, slivers or cross-page topology damage.
+        /// </summary>
+        public void SetProductGridDisplay(bool enabled)
+        {
+            _productGridMode = enabled;
+        }
+
+        /// <summary>
         /// Display-only quarantine for confirmation-only mixed triangles.
         /// The TSDF, admission trace and cumulative ledger remain untouched.
         /// </summary>
@@ -173,6 +185,7 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_SuppressPink, _suppressPink ? 1f : 0f);
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
+            _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
 
             var rp = new RenderParams(gpuMeshMaterial)
             {

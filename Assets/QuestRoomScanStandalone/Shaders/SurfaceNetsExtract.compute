@@ -87,7 +87,11 @@ float  _FoundationChamferWidthVoxels;
 uint   _FoundationSimplifyEnabled;
 float  _FoundationSimplifyNormalDotMin;
 float  _FoundationSimplifyPlaneResidualVoxels;
+uint   _FoundationVisibleSkirtVoxels;
 uint   _VisualQualityEnabled;
+uint   _CounterCount;
+uint   _StageResponsibilityBase;
+uint   _StageResponsibilityEnabled;
 
 // ──────────────────────────────────────────────────────────────────
 //  GPU Vertex (32 bytes, matches StructuredBuffer in render shader)
@@ -165,8 +169,10 @@ RWStructuredBuffer<uint>      _CandidateHistoryStates;
 
 RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, w = age (-1 = uninit)
 
-// Read-only visual-quality ledger.  It classifies the final, smoothed/blended
-// mesh but never writes vertices, indices, TSDF, admission or renderer state.
+// Read-only visual-quality ledger.  It classifies the final mesh and retains
+// same-epoch plane fits for TSDF edge crossings and raw Surface-Nets vertices.
+// None of these counters writes vertices, indices, TSDF, admission or renderer
+// state.
 #define VISUAL_BIN_COUNT 64u
 #define VISUAL_PRIMARY_COUNT 8u
 #define VISUAL_FLAG_COUNT 11u
@@ -182,9 +188,17 @@ RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, 
 #define VISUAL_PLANE_MODEL_BASE 3307u
 #define VISUAL_PLANE_MODEL_STRIDE 6u
 #define VISUAL_BOUNDARY_BASE 3691u
-#define VISUAL_BOUNDARY_FACE_RESOLUTION 33u
-#define VISUAL_BOUNDARY_FACE_CELLS 1089u
-#define COUNTER_COUNT 10225u
+#define VISUAL_BOUNDARY_FACE_RESOLUTION 65u
+#define VISUAL_BOUNDARY_FACE_CELLS 4225u
+#define STAGE_CROSSING_PLANE_ACCUM_OFFSET 0u
+#define STAGE_CROSSING_PLANE_MODEL_OFFSET 640u
+#define STAGE_RAW_PLANE_ACCUM_OFFSET 1024u
+#define STAGE_RAW_PLANE_MODEL_OFFSET 1664u
+#define STAGE_RESPONSIBILITY_COUNTER_COUNT 2048u
+#define COUNTER_COUNT 31089u
+
+uint VisualSpatialBin(int3 coord);
+void VisualAccumulatePlanePointAt(uint accumBase, uint binIndex, float3 posVox);
 
 // ──────────────────────────────────────────────────────────────────
 //  Corner / edge tables  (Surface Nets cell topology)
@@ -396,12 +410,13 @@ uint ClassifyCurrentGeometryEvidence(float3 worldPos, uint knownSourceMask, out 
 // ══════════════════════════════════════════════════════════════════
 //  Kernel 0 : ClearCounters
 // ══════════════════════════════════════════════════════════════════
-[numthreads(1, 1, 1)]
+[numthreads(256, 1, 1)]
 void ClearCounters(uint3 id : SV_DispatchThreadID)
 {
-    [loop]
-    for (uint i = 0; i < (_VisualQualityEnabled != 0u ? COUNTER_COUNT : 1420u); i++)
-        _Counters[i] = 0;
+    uint count = min(_CounterCount,
+        _VisualQualityEnabled != 0u ? COUNTER_COUNT : 1420u);
+    if (id.x < count)
+        _Counters[id.x] = 0;
 }
 
 [numthreads(256, 1, 1)]
@@ -452,6 +467,33 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     float3 gradDir  = 0;
     uint numCrossings    = 0;
     uint numBadCrossings = 0;
+    bool stageResponsibilityCell = _VisualQualityEnabled != 0u &&
+        _StageResponsibilityEnabled != 0u &&
+        all(coord >= _CoreMin) && all(coord < _CoreMax);
+    uint responsibilityBin = 0u;
+    float3 responsibilityCenter = float3(0.0, 0.0, 0.0);
+    int3 crossingSum = int3(0, 0, 0);
+    uint crossingXX = 0u;
+    int crossingXY = 0;
+    int crossingXZ = 0;
+    uint crossingYY = 0u;
+    int crossingYZ = 0;
+    uint crossingZZ = 0u;
+    if (stageResponsibilityCell)
+    {
+        responsibilityBin = VisualSpatialBin(coord);
+        int3 responsibilityBinCoord = int3(
+            (int)(responsibilityBin & 3u),
+            (int)((responsibilityBin >> 2u) & 3u),
+            (int)((responsibilityBin >> 4u) & 3u));
+        int3 responsibilityExtent = max(_CoreMax - _CoreMin, int3(1, 1, 1));
+        int3 responsibilityMin = _CoreMin +
+            (responsibilityExtent * responsibilityBinCoord) / 4;
+        int3 responsibilityMax = _CoreMin +
+            (responsibilityExtent * (responsibilityBinCoord + 1)) / 4;
+        responsibilityCenter = 0.5 *
+            ((float3)responsibilityMin + (float3)responsibilityMax);
+    }
     uint rejectedUnknownEdges = 0;
     bool foundationMultipleCrossings = false;
     bool anyObservedEndpoint = false;
@@ -569,6 +611,19 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             float3 crossingPosition = (float3)cA + t * (float3)(cB - cA);
             posCoord += crossingPosition;
             numCrossings++;
+            if (stageResponsibilityCell)
+            {
+                int3 q = (int3)round(clamp(
+                    (crossingPosition - responsibilityCenter) * 4.0,
+                    -127.0, 127.0));
+                crossingSum += q;
+                crossingXX += (uint)(q.x * q.x);
+                crossingXY += q.x * q.y;
+                crossingXZ += q.x * q.z;
+                crossingYY += (uint)(q.y * q.y);
+                crossingYZ += q.y * q.z;
+                crossingZZ += (uint)(q.z * q.z);
+            }
 
             if (_FoundationTopologyMode != 0u &&
                 _FoundationFeatureRecognition != 0u &&
@@ -667,6 +722,33 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     }
 
     posCoord /= (float)numCrossings;
+    float3 rawSurfaceNetsPosition = posCoord;
+
+    // Same candidate, same page-local bin, same dirty epoch: preserve the two
+    // pre-paper geometric stages before any optional feature placement,
+    // simplification, smoothing or temporal blend.  Rejected cells never enter
+    // this ledger, so the crossing cloud and raw representative describe only
+    // geometry that can contribute to the candidate surface.
+    if (stageResponsibilityCell)
+    {
+        uint crossingBase = _StageResponsibilityBase +
+            STAGE_CROSSING_PLANE_ACCUM_OFFSET +
+            responsibilityBin * VISUAL_PLANE_ACCUM_STRIDE;
+        InterlockedAdd(_Counters[crossingBase], numCrossings);
+        InterlockedAdd(_Counters[crossingBase + 1u], (uint)crossingSum.x);
+        InterlockedAdd(_Counters[crossingBase + 2u], (uint)crossingSum.y);
+        InterlockedAdd(_Counters[crossingBase + 3u], (uint)crossingSum.z);
+        InterlockedAdd(_Counters[crossingBase + 4u], crossingXX);
+        InterlockedAdd(_Counters[crossingBase + 5u], (uint)crossingXY);
+        InterlockedAdd(_Counters[crossingBase + 6u], (uint)crossingXZ);
+        InterlockedAdd(_Counters[crossingBase + 7u], crossingYY);
+        InterlockedAdd(_Counters[crossingBase + 8u], (uint)crossingYZ);
+        InterlockedAdd(_Counters[crossingBase + 9u], crossingZZ);
+        VisualAccumulatePlanePointAt(
+            _StageResponsibilityBase + STAGE_RAW_PLANE_ACCUM_OFFSET,
+            responsibilityBin,
+            rawSurfaceNetsPosition);
+    }
 
     // Two stable, non-opposed normal families describe an actual edge. Fit a
     // plane to each family, solve their shared corner nearest the ordinary
@@ -1182,14 +1264,14 @@ void VisualBinBounds(uint binIndex, out int3 voxelMin, out int3 voxelMax)
     voxelMax = _CoreMin + (extent * (bin + 1)) / 4;
 }
 
-void VisualAccumulatePlaneVertex(uint binIndex, float3 posVox)
+void VisualAccumulatePlanePointAt(uint accumBase, uint binIndex, float3 posVox)
 {
     int3 binMin;
     int3 binMax;
     VisualBinBounds(binIndex, binMin, binMax);
     float3 binCenter = 0.5 * ((float3)binMin + (float3)binMax);
     int3 q = (int3)round(clamp((posVox - binCenter) * 4.0, -127.0, 127.0));
-    uint baseIndex = VISUAL_PLANE_ACCUM_BASE + binIndex * VISUAL_PLANE_ACCUM_STRIDE;
+    uint baseIndex = accumBase + binIndex * VISUAL_PLANE_ACCUM_STRIDE;
     InterlockedAdd(_Counters[baseIndex], 1u);
     InterlockedAdd(_Counters[baseIndex + 1u], (uint)q.x);
     InterlockedAdd(_Counters[baseIndex + 2u], (uint)q.y);
@@ -1200,6 +1282,11 @@ void VisualAccumulatePlaneVertex(uint binIndex, float3 posVox)
     InterlockedAdd(_Counters[baseIndex + 7u], (uint)(q.y * q.y));
     InterlockedAdd(_Counters[baseIndex + 8u], (uint)(q.y * q.z));
     InterlockedAdd(_Counters[baseIndex + 9u], (uint)(q.z * q.z));
+}
+
+void VisualAccumulatePlaneVertex(uint binIndex, float3 posVox)
+{
+    VisualAccumulatePlanePointAt(VISUAL_PLANE_ACCUM_BASE, binIndex, posVox);
 }
 
 uint VisualPackBoundaryVertex(float3 posVox, int3 coord)
@@ -1237,10 +1324,10 @@ void AccumulateVisualQualityVertices(uint3 id : SV_DispatchThreadID)
     uint packed = VisualPackBoundaryVertex(posVox, coord);
     int3 rel = coord - _CoreMin;
     int3 extent = _CoreMax - _CoreMin;
-    // Exact 33x33 face identities are reserved for the 32^3 management pages.
-    // Larger legacy extraction chunks keep the shape ledger but skip this seam
-    // fingerprint rather than collapsing multiple coordinates into one slot.
-    if (all(extent <= 32))
+    // One fixed 65x65 backing store covers every production management page up
+    // to 64^3.  Smaller pages use the same stride and leave the tail empty, so
+    // the CPU can compare exact face coordinates without resampling/collapsing.
+    if (all(extent <= 64))
     {
         if (coord.x == _CoreMin.x)
             VisualWriteBoundaryVertex(0u, (uint)rel.y, (uint)rel.z, packed);
@@ -1329,13 +1416,10 @@ bool VisualPlaneEigen(float xx, float xy, float xz, float yy, float yz, float zz
     return true;
 }
 
-[numthreads(64, 1, 1)]
-void FitVisualQualityPlanes(uint3 id : SV_DispatchThreadID)
+void FitVisualPlaneAt(uint binIndex, uint accumBase, uint modelBase)
 {
-    if (_VisualQualityEnabled == 0u) return;
-    if (id.x >= VISUAL_BIN_COUNT) return;
-    uint accum = VISUAL_PLANE_ACCUM_BASE + id.x * VISUAL_PLANE_ACCUM_STRIDE;
-    uint model = VISUAL_PLANE_MODEL_BASE + id.x * VISUAL_PLANE_MODEL_STRIDE;
+    uint accum = accumBase + binIndex * VISUAL_PLANE_ACCUM_STRIDE;
+    uint model = modelBase + binIndex * VISUAL_PLANE_MODEL_STRIDE;
     uint count = _Counters[accum];
     if (count < 8u) return;
 
@@ -1367,6 +1451,25 @@ void FitVisualQualityPlanes(uint3 id : SV_DispatchThreadID)
     _Counters[model + 3u] = (uint)(int)round(normal.z * 32767.0);
     _Counters[model + 4u] = (uint)round(sqrt(max(lambdaMin, 0.0)) * 256.0);
     _Counters[model + 5u] = (uint)round(saturate(thinRatio) * 1000000.0);
+}
+
+[numthreads(64, 1, 1)]
+void FitVisualQualityPlanes(uint3 id : SV_DispatchThreadID)
+{
+    if (_VisualQualityEnabled == 0u) return;
+    if (id.x >= VISUAL_BIN_COUNT) return;
+    FitVisualPlaneAt(id.x, VISUAL_PLANE_ACCUM_BASE, VISUAL_PLANE_MODEL_BASE);
+    if (_StageResponsibilityEnabled != 0u)
+    {
+        FitVisualPlaneAt(
+            id.x,
+            _StageResponsibilityBase + STAGE_CROSSING_PLANE_ACCUM_OFFSET,
+            _StageResponsibilityBase + STAGE_CROSSING_PLANE_MODEL_OFFSET);
+        FitVisualPlaneAt(
+            id.x,
+            _StageResponsibilityBase + STAGE_RAW_PLANE_ACCUM_OFFSET,
+            _StageResponsibilityBase + STAGE_RAW_PLANE_MODEL_OFFSET);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1881,6 +1984,19 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
             return;
         uint baseIdx;
         InterlockedAdd(_Counters[1], emittedIndexCount, baseIdx);
+        // The native production paper exits this branch before the legacy
+        // admission/candidate ledgers below.  Audit the exact triangles it is
+        // about to publish here, otherwise a healthy committed paper reports
+        // triangles while every within-page visual-quality counter stays zero.
+        // This is read-only accounting: no vertex, index or admission decision
+        // is changed by AuditVisualTriangle.
+        uint visualSpatialBin = MatureSpatialBin(coord);
+        if (valid0)
+            AuditVisualTriangle(triangle0.x, triangle0.y, triangle0.z,
+                                coord, visualSpatialBin);
+        if (valid1)
+            AuditVisualTriangle(triangle1.x, triangle1.y, triangle1.z,
+                                coord, visualSpatialBin);
         uint writeIndex = baseIdx;
         if (valid0)
         {
@@ -2051,9 +2167,13 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
 
-    // The halo supplies shared corners only.  Exactly one core owns the
-    // emitted faces, preventing duplicate surfaces at chunk boundaries.
-    if (any(coord < _CoreMin) || any(coord >= _CoreMax)) return;
+    // Product pages may retain a one-voxel overlap from the read halo.  This is
+    // a visible block skirt, not new evidence: both pages sample the same TSDF
+    // and neither overlap is ever fed back into fusion or adjudication.
+    int skirt = (int)min(_FoundationVisibleSkirtVoxels, 1u);
+    int3 emitMin = max(_CoreMin - skirt, _MapMin);
+    int3 emitMax = min(_CoreMax + skirt, _MapMin + (int3)_MapCount);
+    if (any(coord < emitMin) || any(coord >= emitMax)) return;
 
     TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0), 0u);
     TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1), 1u);

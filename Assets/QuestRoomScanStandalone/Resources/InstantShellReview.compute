@@ -74,6 +74,7 @@ float _RelayPaperSearchMeters;
 int3 _PaperAuditCellCount;
 int _PaperAuditStride;
 int _PaperAuditCellTotal;
+int _PaperAuditClearOffset;
 int _RelayPaperVertexCount;
 int _RelayPaperIndexCount;
 float4x4 _RelayPaperLocalToWorld;
@@ -748,8 +749,9 @@ void ClearPaperAuditCells(uint3 dispatchId : SV_DispatchThreadID)
     // C# dispatches this kernel only for a positive allocation. Avoid the
     // mixed signed max/cast form here because some Vulkan HLSL translators
     // resolve it inconsistently.
-    if (_PaperAuditCellTotal <= 0 || dispatchId.x >= (uint)_PaperAuditCellTotal) return;
-    _PaperAuditCells[dispatchId.x] = 0xffffffffu;
+    uint flat = (uint)max(0, _PaperAuditClearOffset) + dispatchId.x;
+    if (_PaperAuditCellTotal <= 0 || flat >= (uint)_PaperAuditCellTotal) return;
+    _PaperAuditCells[flat] = 0xffffffffu;
 }
 
 [numthreads(64, 1, 1)]

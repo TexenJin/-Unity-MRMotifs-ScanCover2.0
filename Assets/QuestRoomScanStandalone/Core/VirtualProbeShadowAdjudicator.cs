@@ -215,6 +215,22 @@ namespace Genesis.RoomScan
             }
         }
 
+        internal readonly struct VerdictCounts
+        {
+            internal readonly int Hold;
+            internal readonly int Accept;
+            internal readonly int Reject;
+
+            internal VerdictCounts(int hold, int accept, int reject)
+            {
+                Hold = hold;
+                Accept = accept;
+                Reject = reject;
+            }
+
+            internal int Total => Hold + Accept + Reject;
+        }
+
         private enum Verdict
         {
             Hold = 0,
@@ -388,6 +404,10 @@ namespace Genesis.RoomScan
         private int _challengesClearedBySupport;
         private int _nextFingerprintId;
         private int _correctionRevision;
+        // Every Hold/Accept/Reject transition changes the verdict-paper set.
+        // Keep this separate from the legacy correction revision,
+        // which intentionally changes only when Reject quarantine changes.
+        private int _verdictRevision;
         private string _guidanceCompact = "暂无Reject·范围0.15-5m";
         private string _guidanceHudFixed =
             "复核 待0000 证空0000 误拒0000 过期0000\n" +
@@ -459,6 +479,22 @@ namespace Genesis.RoomScan
             }
         }
 
+        internal int VerdictRevision
+        {
+            get
+            {
+                lock (_stateLock)
+                    return _verdictRevision;
+            }
+        }
+
+        internal VerdictCounts GetVerdictCounts()
+        {
+            lock (_stateLock)
+                return new VerdictCounts(_heldCells, _acceptedCells,
+                    _rejectedCells);
+        }
+
         internal int CopyPaperCorrectionCells(List<PaperCorrectionCell> destination)
         {
             if (destination == null) return 0;
@@ -510,6 +546,7 @@ namespace Genesis.RoomScan
             _challengesClearedBySupport = 0;
             _nextFingerprintId = 0;
             _correctionRevision++;
+            _verdictRevision++;
             _lastEvaluatedFrame = -1;
             _guidanceCompact = "暂无Reject·范围0.15-5m";
             _guidanceHudFixed =
@@ -1569,6 +1606,10 @@ namespace Genesis.RoomScan
             state.FingerprintAcceptedFrame = frame;
             state.FingerprintCenter = center;
             state.FingerprintNormal = SafeDirection(normal);
+            // Accept transitions happen immediately before minting. Bump again
+            // only after the approved plane is complete so the display cannot
+            // cache an Accept state whose fingerprint still has the old/empty ID.
+            _verdictRevision++;
             _graduationRace.BindFingerprint(key.X, key.Y, key.Z, key.Axis,
                 state.FingerprintGeneration, state.FingerprintId,
                 state.FingerprintAcceptedFrame);
@@ -1833,6 +1874,7 @@ namespace Genesis.RoomScan
             if (next == Verdict.Hold) _heldCells++;
             else if (next == Verdict.Accept) _acceptedCells++;
             else _rejectedCells++;
+            _verdictRevision++;
             if (correctionChanged) _correctionRevision++;
         }
 

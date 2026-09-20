@@ -13,9 +13,24 @@ SamplerState sampler_RGBGuide;
 uint  _DepthW, _DepthH;
 float _SigmaSpatial;
 float _SigmaColor;
-float _SigmaDepth;
+float _SigmaDepth; // metres (linear eye-space depth), not nonlinear NDC
 int   _FilterRadius;
 uint  _EyeOffset; // 逐眼交替：id.z 恒 0，真眼号 = _EyeOffset（08-18 帧率手术）
+float4 _LinearizeAB[2]; // projection m22/m23 for each eye
+
+float ToLinearDepth(float ndcDepth, uint eye)
+{
+    float clipZ = ndcDepth * 2.0 - 1.0;
+    return abs(_LinearizeAB[eye].y / (clipZ + _LinearizeAB[eye].x));
+}
+
+float ToNdcDepth(float linearDepth, uint eye)
+{
+    // CalculateProjectionMatrix uses m22 < 0 and m23 < 0. For positive
+    // eye-space distance: clipZ + m22 = m23 / distance.
+    float clipZ = _LinearizeAB[eye].y / max(linearDepth, 1e-6) - _LinearizeAB[eye].x;
+    return saturate(clipZ * 0.5 + 0.5);
+}
 
 [numthreads(8, 8, 1)]
 void BilateralFilter(uint3 id : SV_DispatchThreadID)
@@ -24,6 +39,15 @@ void BilateralFilter(uint3 id : SV_DispatchThreadID)
     uint eye = id.z + _EyeOffset;
 
     float centerDepth = _SrcDepth[uint3(id.xy, eye)];
+
+    // 0 is the pipeline-wide abstention value. Preserve it and never let it
+    // behave like a real near-plane sample in the bilateral neighbourhood.
+    if (centerDepth <= 0.0)
+    {
+        _DstDepth[uint3(id.xy, eye)] = centerDepth;
+        return;
+    }
+    float centerLinear = ToLinearDepth(centerDepth, eye);
 
     // Map depth pixel to guide-image UV (assumes roughly co-registered FOVs)
     float2 centerUV = float2((id.x + 0.5) / (float)_DepthW,
@@ -46,6 +70,9 @@ void BilateralFilter(uint3 id : SV_DispatchThreadID)
                 continue;
 
             float nDepth = _SrcDepth[uint3(nb, eye)];
+            if (nDepth <= 0.0)
+                continue;
+            float neighborLinear = ToLinearDepth(nDepth, eye);
 
             // Spatial weight
             float spatialDist2 = (float)(dx * dx + dy * dy);
@@ -59,14 +86,17 @@ void BilateralFilter(uint3 id : SV_DispatchThreadID)
             float wc = exp(colorDist2 * invSigmaC2);
 
             // Depth-range weight (prevents blurring across depth discontinuities)
-            float depthDiff = centerDepth - nDepth;
+            // Compare metres so the same physical separation has the same
+            // authority whether the camera is near to or far from the wall.
+            float depthDiff = centerLinear - neighborLinear;
             float wd = exp((depthDiff * depthDiff) * invSigmaD2);
 
             float w = ws * wc * wd;
             weightSum += w;
-            depthSum  += nDepth * w;
+            depthSum  += neighborLinear * w;
         }
     }
 
-    _DstDepth[uint3(id.xy, eye)] = (weightSum > 1e-8) ? depthSum / weightSum : centerDepth;
+    float filteredLinear = (weightSum > 1e-8) ? depthSum / weightSum : centerLinear;
+    _DstDepth[uint3(id.xy, eye)] = ToNdcDepth(filteredLinear, eye);
 }

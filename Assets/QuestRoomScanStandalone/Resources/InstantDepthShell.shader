@@ -67,6 +67,7 @@ Shader "QRS/InstantDepthShell"
                 float rejected : TEXCOORD5;
                 float connectivityReason : TEXCOORD6;
                 float rescued : TEXCOORD7;
+                float3 sourcePixelAndStep : TEXCOORD8;
             };
 
             float Linearize(float ndc)
@@ -107,6 +108,7 @@ Shader "QRS/InstantDepthShell"
             v2f vert(appdata v)
             {
                 v2f o;
+                o.sourcePixelAndStep = float3(v.vertex.xy, v.shellData.x);
                 float tri = v.vertex.z;
                 float2 a = v.cell;
                 float2 b;
@@ -204,7 +206,32 @@ Shader "QRS/InstantDepthShell"
 
             fixed4 frag(v2f i) : SV_Target
             {
-                float edgeDistance = min(i.bary.x, min(i.bary.y, i.bary.z));
+                // Only the standalone live/frozen diagnostic shell is cropped.
+                // The crop belongs to the captured source frame, so A-freeze
+                // keeps the same world-locked triangles while the head moves.
+                // Composite shell + production paper stays full-field.
+                if (_CompositeWithProduction < 0.5)
+                {
+                    float2 fromCentre = i.sourcePixelAndStep.xy + 0.5 -
+                                        _SnapshotTexSize * 0.5;
+                    float radius = min(_SnapshotTexSize.x, _SnapshotTexSize.y) * 0.30;
+                    clip(radius * radius - dot(fromCentre, fromCentre));
+                }
+                float3 displayBary = i.bary;
+                if (_CompositeWithProduction < 0.5)
+                {
+                    // Display-only 2x coarser triangular lattice. Underlying
+                    // fine shell vertices, depth and connectivity are unchanged;
+                    // a macro line exists only where a real fine triangle exists.
+                    float macroStep = max(i.sourcePixelAndStep.z * 2.0, 1.0);
+                    float2 tile = frac((i.sourcePixelAndStep.xy + 0.5) / macroStep);
+                    displayBary = tile.x + tile.y <= 1.0
+                        ? float3(1.0 - tile.x - tile.y, tile.x, tile.y)
+                        : float3(1.0 - tile.y, tile.x + tile.y - 1.0,
+                                 1.0 - tile.x);
+                }
+                float edgeDistance = min(displayBary.x,
+                                         min(displayBary.y, displayBary.z));
                 float edgeWidth = max(fwidth(edgeDistance) * 1.25, 0.003);
                 float edge = 1.0 - smoothstep(edgeWidth, edgeWidth * 2.2, edgeDistance);
                 // 独显档仍用年龄表达新旧；壳纸合流档的退场权则交给

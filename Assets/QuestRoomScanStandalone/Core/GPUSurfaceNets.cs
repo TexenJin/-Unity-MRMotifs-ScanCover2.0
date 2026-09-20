@@ -81,10 +81,10 @@ namespace Genesis.RoomScan
         public bool StrictObservedEdges { get; set; }
         public bool CandidateHistoryUpdateEnabled { get; set; } = true;
         /// <summary>
-        /// Lean foundation topology. Production uses a globally anchored
-        /// 10 cm lattice while each coarse edge remains bracketed by native
-        /// 5 cm TSDF samples. Visible topology never falls back to 5 cm. Direct
-        /// stride-2 TSDF extraction and corner chamfering remain dormant.
+        /// Product topology starts from native 5 cm TSDF crossings. Compatible
+        /// planar 2x2x2 groups may share representatives for a conservative
+        /// 10 cm-class presentation, while edges, thin parts, holes and layered
+        /// evidence remain native. Direct stride-2 extraction stays dormant.
         /// </summary>
         public bool FoundationTopologyMode { get; set; }
         public int FoundationCellStride { get; set; } = 1;
@@ -95,6 +95,7 @@ namespace Genesis.RoomScan
         public bool FoundationConstrainedSimplification { get; set; }
         public float FoundationSimplifyNormalDotMin { get; set; } = 0.9659258f;
         public float FoundationSimplifyPlaneResidualVoxels { get; set; } = 0.2f;
+        public int FoundationVisibleSkirtVoxels { get; set; }
         public bool VisualQualityDiagnosticsEnabled { get; set; }
         public bool DiagnosticRoiEnabled { get; set; } = true;
         public Vector4 DiagnosticRoiRect { get; set; } = new Vector4(0.2f, 0.25f, 0.8f, 0.75f);
@@ -158,7 +159,11 @@ namespace Genesis.RoomScan
         private static readonly int ID_FoundationSimplifyEnabled = Shader.PropertyToID("_FoundationSimplifyEnabled");
         private static readonly int ID_FoundationSimplifyNormalDotMin = Shader.PropertyToID("_FoundationSimplifyNormalDotMin");
         private static readonly int ID_FoundationSimplifyPlaneResidualVoxels = Shader.PropertyToID("_FoundationSimplifyPlaneResidualVoxels");
+        private static readonly int ID_FoundationVisibleSkirtVoxels = Shader.PropertyToID("_FoundationVisibleSkirtVoxels");
         private static readonly int ID_VisualQualityEnabled = Shader.PropertyToID("_VisualQualityEnabled");
+        private static readonly int ID_CounterCount = Shader.PropertyToID("_CounterCount");
+        private static readonly int ID_StageResponsibilityBase = Shader.PropertyToID("_StageResponsibilityBase");
+        private static readonly int ID_StageResponsibilityEnabled = Shader.PropertyToID("_StageResponsibilityEnabled");
         private static readonly int ID_SnapshotVertices = Shader.PropertyToID("_SnapshotVertices");
         private static readonly int ID_SnapshotIndices = Shader.PropertyToID("_SnapshotIndices");
         private static readonly int ID_SnapshotAdmissionClass = Shader.PropertyToID("_SnapshotAdmissionClass");
@@ -222,9 +227,21 @@ namespace Genesis.RoomScan
         // red geometry; it is read-only and adds only a few KB of counters.
         // 1420..3690: final-mesh visual-quality primary classes, independent
         // flags, histograms, 4^3 spatial joins and page-local plane-fit scratch.
-        // 3691..10224: six 33x33 exact shared-boundary vertex fingerprints used
-        // to distinguish a real seam candidate from a mere epoch mismatch.
-        private const int CounterCount = 10225;
+        // 3691..29040: six 65x65 exact shared-boundary vertex fingerprints used
+        // to distinguish a real seam candidate from a mere epoch mismatch and
+        // support the native 64^3 production-paper management page.
+        // Production 64^3 pages append 2048 counters for same-epoch plane
+        // accumulators/models over TSDF edge crossings and raw Surface-Nets
+        // representatives. 32^3 audit workers keep their existing allocation;
+        // they are not the committed Foundation paper this ledger adjudicates.
+        private const int StageResponsibilityCounterCount = 2048;
+        private const int LegacyCounterCount32 = 10225;
+        private const int LegacyCounterCount64 = 29041;
+        private const int CounterCount32 = LegacyCounterCount32;
+        private const int CounterCount64 = LegacyCounterCount64 + StageResponsibilityCounterCount;
+        private int _counterCount = CounterCount32;
+        private int _stageResponsibilityBase = LegacyCounterCount32;
+        private bool _stageResponsibilityEnabled;
         private const int CandidateHistoryCapacity = 1 << 19;
 
         public GPUSurfaceNets(ComputeShader compute)
@@ -594,6 +611,13 @@ namespace Genesis.RoomScan
             _mapVoxels = mapVoxels;
             _maxVertices = Mathf.Max(1024, (int)(mapVoxels * vertexBudgetPercent));
             _maxIndices = _maxVertices * 18;
+            int3 coreExtent = math.max(coreMax - coreMin, 0);
+            bool largePage = math.cmax(coreExtent) > 32;
+            _stageResponsibilityEnabled = largePage;
+            _stageResponsibilityBase = largePage
+                ? LegacyCounterCount64
+                : LegacyCounterCount32;
+            _counterCount = largePage ? CounterCount64 : CounterCount32;
             // The foundation route deliberately owns no candidate-history
             // archive. Keep one harmless bound slot so the shared shader
             // bindings stay valid without paying ~1 MB per observed chunk.
@@ -608,7 +632,7 @@ namespace Genesis.RoomScan
             _vertices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, VertexStride);
             _indices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxIndices, 4);
             _vertexAdmissionClass = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, 4);
-            _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CounterCount, 4);
+            _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _counterCount, 4);
             _dispatchArgs = new GraphicsBuffer(structuredIndirect, 3, 4);
             _drawIndirectArgs = new GraphicsBuffer(structuredIndirect, 5, 4);
             int smoothCapacity = SmoothIterations > 0 ? _maxVertices : 1;
@@ -641,7 +665,7 @@ namespace Genesis.RoomScan
                             + (long)_maxVertices * VertexStride
                             + (long)_maxIndices * 4
                             + (long)_maxVertices * 4
-                            + CounterCount * 4 + 3 * 4 + 5 * 4
+                            + _counterCount * 4 + 3 * 4 + 5 * 4
                             + (long)smoothCapacity * Float3Stride * 2
                             + (TemporalAlphaMax < 1f ? (long)mapVoxels * 16 : 0L)
                             + (long)_candidateHistoryCapacity * 8;
@@ -724,6 +748,8 @@ namespace Genesis.RoomScan
                 Mathf.Clamp(FoundationSimplifyNormalDotMin, -1f, 1f));
             _compute.SetFloat(ID_FoundationSimplifyPlaneResidualVoxels,
                 Mathf.Max(0f, FoundationSimplifyPlaneResidualVoxels));
+            _compute.SetInt(ID_FoundationVisibleSkirtVoxels,
+                FoundationTopologyMode ? Mathf.Clamp(FoundationVisibleSkirtVoxels, 0, 1) : 0);
             _compute.SetInt(ID_VisualQualityEnabled, VisualQualityDiagnosticsEnabled ? 1 : 0);
 
             _compute.SetTexture(_kClassifyAndEmit, ID_TsdfVolume, tsdfVolume);
@@ -739,7 +765,10 @@ namespace Genesis.RoomScan
                 _compute.SetTexture(_kClassifyAndEmit, DepthCapture.EdgeReasonTexID, currentEdgeReasonTexture);
             _compute.SetTexture(_kGenerateIndices, ID_TsdfVolume, tsdfVolume);
             // 1. Clear counters
-            _compute.Dispatch(_kClearCounters, 1, 1, 1);
+            int clearCounterCount = VisualQualityDiagnosticsEnabled
+                ? _counterCount
+                : 1420;
+            _compute.Dispatch(_kClearCounters, CeilDiv(clearCounterCount, 256), 1, 1);
 
             // 2. Classify & emit vertices
             int gx = CeilDiv(_mapCount.x, 4);
@@ -846,6 +875,9 @@ namespace Genesis.RoomScan
             _compute.SetInts(ID_CoreMax, _coreMax.x, _coreMax.y, _coreMax.z);
             _compute.SetInt(ID_CandidateHistoryCapacity, _candidateHistoryCapacity);
             _compute.SetInt(ID_CandidateHistoryMask, _candidateHistoryCapacity - 1);
+            _compute.SetInt(ID_CounterCount, _counterCount);
+            _compute.SetInt(ID_StageResponsibilityBase, _stageResponsibilityBase);
+            _compute.SetInt(ID_StageResponsibilityEnabled, _stageResponsibilityEnabled ? 1 : 0);
         }
 
         private void BindAllBuffers()

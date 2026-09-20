@@ -92,7 +92,7 @@ namespace Genesis.RoomScan
             {
                 Directory.CreateDirectory(_framesDirectory);
                 File.WriteAllText(_manifestPath,
-                    "pairIndex,platformFrame,timestampNs,timestampValid,callbackUnityFrame,callbackUnscaledTime,preprocessUnityFrame,preprocessUnscaledTime,callbackToPreprocessMs,width,height,layers,updatedProcessedEye,rawFile,processedFile,metadataFile,status\n",
+                    "pairIndex,platformFrame,timestampNs,timestampValid,callbackUnityFrame,callbackUnscaledTime,preprocessUnityFrame,preprocessUnscaledTime,callbackToPreprocessMs,width,height,layers,updatedProcessedEye,angularDegPerSec,linearMps,callbackHeadAvailable,callbackHeadX,callbackHeadY,callbackHeadZ,callbackHeadQx,callbackHeadQy,callbackHeadQz,callbackHeadQw,callbackPitchDeg,callbackYawDeg,callbackRollDeg,preprocessHeadAvailable,preprocessHeadX,preprocessHeadY,preprocessHeadZ,preprocessHeadQx,preprocessHeadQy,preprocessHeadQz,preprocessHeadQw,preprocessPitchDeg,preprocessYawDeg,preprocessRollDeg,callbackToPreprocessPositionMm,callbackToPreprocessRotationDeg,rawTotal,rawValid,rawInvalid,rawMinNdc,rawMaxNdc,rawMeanNdc,rawMinMetres,rawMaxMetres,rawMeanMetres,processedTotal,processedValid,processedInvalid,processedMinNdc,processedMaxNdc,processedMeanNdc,processedMinMetres,processedMaxMetres,processedMeanMetres,pairedValid,processedMinusRawMeanMetres,processedMinusRawMeanAbsMetres,processedMinusRawRmsMetres,processedMinusRawMaxAbsMetres,rawFile,processedFile,metadataFile,status\n",
                     new UTF8Encoding(false));
                 File.WriteAllText(
                     Path.Combine(_sessionDirectory, "depth_pairs", "schema.json"),
@@ -178,6 +178,9 @@ namespace Genesis.RoomScan
                 callbackHeadWorldPose = callbackCamera != null
                     ? new Pose(callbackCamera.transform.position, callbackCamera.transform.rotation)
                     : new Pose(Vector3.zero, Quaternion.identity),
+                callbackHeadEuler = callbackCamera != null
+                    ? callbackCamera.transform.eulerAngles
+                    : Vector3.zero,
                 nearFar = nearFar,
                 poses = new[] { pose0, pose1 },
                 fovs = new[] { fov0, fov1 },
@@ -211,6 +214,19 @@ namespace Genesis.RoomScan
             _stagedMetadata.preprocessHeadWorldPose = preprocessCamera != null
                 ? new Pose(preprocessCamera.transform.position, preprocessCamera.transform.rotation)
                 : new Pose(Vector3.zero, Quaternion.identity);
+            _stagedMetadata.preprocessHeadEuler = preprocessCamera != null
+                ? preprocessCamera.transform.eulerAngles
+                : Vector3.zero;
+            _stagedMetadata.callbackToPreprocessPositionMm =
+                _stagedMetadata.callbackHeadAvailable && _stagedMetadata.preprocessHeadAvailable
+                    ? Vector3.Distance(_stagedMetadata.callbackHeadWorldPose.position,
+                        _stagedMetadata.preprocessHeadWorldPose.position) * 1000f
+                    : float.NaN;
+            _stagedMetadata.callbackToPreprocessRotationDeg =
+                _stagedMetadata.callbackHeadAvailable && _stagedMetadata.preprocessHeadAvailable
+                    ? Quaternion.Angle(_stagedMetadata.callbackHeadWorldPose.rotation,
+                        _stagedMetadata.preprocessHeadWorldPose.rotation)
+                    : float.NaN;
             if (_depthCapture != null)
             {
                 _stagedMetadata.angularDegPerSec = _depthCapture.SmoothedDepthAngularSpeed;
@@ -420,6 +436,13 @@ namespace Genesis.RoomScan
             string status)
         {
             FrameMetadata m = pending.metadata;
+            Matrix4x4 projection = m.projection != null && m.projection.Length > FusionEyeIndex
+                ? m.projection[FusionEyeIndex]
+                : Matrix4x4.identity;
+            DepthStats raw = CalculateDepthStats(pending.platform, projection);
+            DepthStats processed = CalculateDepthStats(pending.processed, projection);
+            PairDeltaStats delta = CalculatePairDeltaStats(
+                pending.platform, pending.processed, projection);
             return string.Join(",",
                 pending.pairIndex.ToString(CultureInfo.InvariantCulture),
                 m.platformFrame.ToString(CultureInfo.InvariantCulture),
@@ -435,10 +458,155 @@ namespace Genesis.RoomScan
                 pending.height.ToString(CultureInfo.InvariantCulture),
                 pending.layers.ToString(CultureInfo.InvariantCulture),
                 m.updatedProcessedEye.ToString(CultureInfo.InvariantCulture),
+                Format(m.angularDegPerSec),
+                Format(m.linearMps),
+                m.callbackHeadAvailable ? "1" : "0",
+                Format(m.callbackHeadWorldPose.position.x),
+                Format(m.callbackHeadWorldPose.position.y),
+                Format(m.callbackHeadWorldPose.position.z),
+                Format(m.callbackHeadWorldPose.rotation.x),
+                Format(m.callbackHeadWorldPose.rotation.y),
+                Format(m.callbackHeadWorldPose.rotation.z),
+                Format(m.callbackHeadWorldPose.rotation.w),
+                Format(m.callbackHeadEuler.x), Format(m.callbackHeadEuler.y), Format(m.callbackHeadEuler.z),
+                m.preprocessHeadAvailable ? "1" : "0",
+                Format(m.preprocessHeadWorldPose.position.x),
+                Format(m.preprocessHeadWorldPose.position.y),
+                Format(m.preprocessHeadWorldPose.position.z),
+                Format(m.preprocessHeadWorldPose.rotation.x),
+                Format(m.preprocessHeadWorldPose.rotation.y),
+                Format(m.preprocessHeadWorldPose.rotation.z),
+                Format(m.preprocessHeadWorldPose.rotation.w),
+                Format(m.preprocessHeadEuler.x), Format(m.preprocessHeadEuler.y), Format(m.preprocessHeadEuler.z),
+                Format(m.callbackToPreprocessPositionMm),
+                Format(m.callbackToPreprocessRotationDeg),
+                raw.Total.ToString(CultureInfo.InvariantCulture),
+                raw.Valid.ToString(CultureInfo.InvariantCulture),
+                raw.Invalid.ToString(CultureInfo.InvariantCulture),
+                Format(raw.MinNdc), Format(raw.MaxNdc), Format(raw.MeanNdc),
+                Format(raw.MinMetres), Format(raw.MaxMetres), Format(raw.MeanMetres),
+                processed.Total.ToString(CultureInfo.InvariantCulture),
+                processed.Valid.ToString(CultureInfo.InvariantCulture),
+                processed.Invalid.ToString(CultureInfo.InvariantCulture),
+                Format(processed.MinNdc), Format(processed.MaxNdc), Format(processed.MeanNdc),
+                Format(processed.MinMetres), Format(processed.MaxMetres), Format(processed.MeanMetres),
+                delta.Valid.ToString(CultureInfo.InvariantCulture),
+                Format(delta.Mean), Format(delta.MeanAbs), Format(delta.Rms), Format(delta.MaxAbs),
                 rawName,
                 processedName,
                 metadataName,
                 status) + "\n";
+        }
+
+        private static DepthStats CalculateDepthStats(float[] values, Matrix4x4 projection)
+        {
+            var result = new DepthStats
+            {
+                Total = values?.Length ?? 0,
+                MinNdc = float.PositiveInfinity,
+                MaxNdc = float.NegativeInfinity,
+                MinMetres = float.PositiveInfinity,
+                MaxMetres = float.NegativeInfinity
+            };
+            if (values == null) return result.Finish();
+            double ndcSum = 0.0;
+            double metreSum = 0.0;
+            for (int i = 0; i < values.Length; i++)
+            {
+                float ndc = values[i];
+                if (!TryLinearizeMetres(ndc, projection, out float metres))
+                {
+                    result.Invalid++;
+                    continue;
+                }
+                result.Valid++;
+                result.MinNdc = Mathf.Min(result.MinNdc, ndc);
+                result.MaxNdc = Mathf.Max(result.MaxNdc, ndc);
+                result.MinMetres = Mathf.Min(result.MinMetres, metres);
+                result.MaxMetres = Mathf.Max(result.MaxMetres, metres);
+                ndcSum += ndc;
+                metreSum += metres;
+            }
+            if (result.Valid > 0)
+            {
+                result.MeanNdc = (float)(ndcSum / result.Valid);
+                result.MeanMetres = (float)(metreSum / result.Valid);
+            }
+            return result.Finish();
+        }
+
+        private static PairDeltaStats CalculatePairDeltaStats(
+            float[] raw, float[] processed, Matrix4x4 projection)
+        {
+            var result = new PairDeltaStats
+            {
+                Mean = float.NaN,
+                MeanAbs = float.NaN,
+                Rms = float.NaN,
+                MaxAbs = float.NaN
+            };
+            if (raw == null || processed == null) return result;
+            int count = Math.Min(raw.Length, processed.Length);
+            double signed = 0.0;
+            double absolute = 0.0;
+            double squared = 0.0;
+            float max = 0f;
+            for (int i = 0; i < count; i++)
+            {
+                if (!TryLinearizeMetres(raw[i], projection, out float a) ||
+                    !TryLinearizeMetres(processed[i], projection, out float b))
+                    continue;
+                float d = b - a;
+                float ad = Mathf.Abs(d);
+                result.Valid++;
+                signed += d;
+                absolute += ad;
+                squared += d * d;
+                max = Mathf.Max(max, ad);
+            }
+            if (result.Valid > 0)
+            {
+                result.Mean = (float)(signed / result.Valid);
+                result.MeanAbs = (float)(absolute / result.Valid);
+                result.Rms = (float)Math.Sqrt(squared / result.Valid);
+                result.MaxAbs = max;
+            }
+            return result;
+        }
+
+        private static bool TryLinearizeMetres(
+            float ndc, Matrix4x4 projection, out float metres)
+        {
+            metres = 0f;
+            if (float.IsNaN(ndc) || float.IsInfinity(ndc) || ndc <= 0f || ndc >= 1f)
+                return false;
+            float denominator = ndc * 2f - 1f + projection.m22;
+            if (Mathf.Abs(denominator) < 1e-7f) return false;
+            metres = Mathf.Abs(projection.m23 / denominator);
+            return !float.IsNaN(metres) && !float.IsInfinity(metres) && metres > 0f;
+        }
+
+        private struct DepthStats
+        {
+            public int Total, Valid, Invalid;
+            public float MinNdc, MaxNdc, MeanNdc;
+            public float MinMetres, MaxMetres, MeanMetres;
+
+            public DepthStats Finish()
+            {
+                if (Valid == 0)
+                {
+                    MinNdc = MaxNdc = MeanNdc = float.NaN;
+                    MinMetres = MaxMetres = MeanMetres = float.NaN;
+                }
+                return this;
+            }
+        }
+
+        private struct PairDeltaStats
+        {
+            public int Valid;
+            public float Mean, MeanAbs, Rms, MaxAbs;
         }
 
         private static string BuildSchemaJson()
@@ -495,12 +663,22 @@ namespace Genesis.RoomScan
                 .Append(m.callbackHeadAvailable ? "true" : "false")
                 .Append(",\"pose\":");
             AppendPoseValue(sb, m.callbackHeadWorldPose);
-            sb.AppendLine("},");
+            sb.Append(",\"eulerDegrees\":[")
+                .Append(Format(m.callbackHeadEuler.x)).Append(',')
+                .Append(Format(m.callbackHeadEuler.y)).Append(',')
+                .Append(Format(m.callbackHeadEuler.z)).AppendLine("]},");
             sb.Append("  \"preprocessHeadWorldPose\": {\"available\":")
                 .Append(m.preprocessHeadAvailable ? "true" : "false")
                 .Append(",\"pose\":");
             AppendPoseValue(sb, m.preprocessHeadWorldPose);
-            sb.AppendLine("},");
+            sb.Append(",\"eulerDegrees\":[")
+                .Append(Format(m.preprocessHeadEuler.x)).Append(',')
+                .Append(Format(m.preprocessHeadEuler.y)).Append(',')
+                .Append(Format(m.preprocessHeadEuler.z)).AppendLine("]},");
+            sb.Append("  \"callbackToPreprocessPositionMm\": ")
+                .Append(Format(m.callbackToPreprocessPositionMm)).AppendLine(",");
+            sb.Append("  \"callbackToPreprocessRotationDeg\": ")
+                .Append(Format(m.callbackToPreprocessRotationDeg)).AppendLine(",");
             sb.Append("  \"width\": ").Append(pending.width).AppendLine(",");
             sb.Append("  \"height\": ").Append(pending.height).AppendLine(",");
             sb.Append("  \"layers\": ").Append(pending.layers).AppendLine(",");
@@ -666,8 +844,12 @@ namespace Genesis.RoomScan
             public double preprocessUnscaledTime;
             public bool callbackHeadAvailable;
             public Pose callbackHeadWorldPose;
+            public Vector3 callbackHeadEuler;
             public bool preprocessHeadAvailable;
             public Pose preprocessHeadWorldPose;
+            public Vector3 preprocessHeadEuler;
+            public float callbackToPreprocessPositionMm;
+            public float callbackToPreprocessRotationDeg;
             public int updatedProcessedEye;
             public Vector2 nearFar;
             public Pose[] poses;

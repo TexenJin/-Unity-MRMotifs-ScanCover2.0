@@ -55,6 +55,28 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// 成功候选换轨后交给生产TSDF的一次性局部失效票。Args同时是
+        /// DispatchIndirect参数；Region的xyz为旧/新轨中点，w为拆除半径。
+        /// 候选只划定需要恢复为未知的范围，不提供重建后的表面几何。
+        /// </summary>
+        internal readonly struct SuccessionInvalidationBuffers
+        {
+            internal readonly ComputeBuffer Args;
+            internal readonly ComputeBuffer Regions;
+            internal readonly int Capacity;
+
+            internal SuccessionInvalidationBuffers(ComputeBuffer args,
+                ComputeBuffer regions, int capacity)
+            {
+                Args = args;
+                Regions = regions;
+                Capacity = capacity;
+            }
+
+            internal bool IsValid => Args != null && Regions != null && Capacity > 0;
+        }
+
+        /// <summary>
         /// “枪胶裁决海面”只读GPU视图。候选缓冲提供绿色静海；Wave缓冲按稳定ID
         /// 保存扫描期间偏离最严重的红色浪头及其当时裁决。任何生产内核都不读取后者。
         /// </summary>
@@ -202,6 +224,8 @@ namespace Genesis.RoomScan
 
         private const int TableCapacity = 65536;
         private const int CandidateCapacity = 3;
+        // 换轨是低频事件；固定上限防异常帧把局部清理扩大成全卷工作。
+        private const int SuccessionInvalidationCapacity = 64;
         private const int ProbeCount = 12;
         private const uint FusionAuthorityMask = 0x3Fu;
         // 与 GPU 的 HasPromotionHardEdgeRisk 同步。跨度、间隙和双簇只是复核上下文；
@@ -308,6 +332,12 @@ namespace Genesis.RoomScan
         private static readonly int CandidatePromotionAuthorityID = Shader.PropertyToID("_CandidatePromotionAuthority");
         private static readonly int CandidateSuccessorID = Shader.PropertyToID("_CandidateSuccessor");
         private static readonly int CandidatePredecessorID = Shader.PropertyToID("_CandidatePredecessor");
+        private static readonly int SuccessionInvalidationArgsID =
+            Shader.PropertyToID("_SuccessionInvalidationArgs");
+        private static readonly int SuccessionInvalidationCenterRadiusID =
+            Shader.PropertyToID("_SuccessionInvalidationCenterRadius");
+        private static readonly int SuccessionInvalidationCapacityID =
+            Shader.PropertyToID("_SuccessionInvalidationCapacity");
         private static readonly int CandidateConsensusID = Shader.PropertyToID("_CandidateConsensus");
         private static readonly int NextStableIdID = Shader.PropertyToID("_NextStableId");
         private static readonly int StatsID = Shader.PropertyToID("_Stats");
@@ -383,6 +413,7 @@ namespace Genesis.RoomScan
         private readonly ComputeKernelHelper _clearCells;
         private readonly ComputeKernelHelper _clearStats;
         private readonly ComputeKernelHelper _clearDirectProjectionAudit;
+        private readonly ComputeKernelHelper _clearSuccessionInvalidations;
         private readonly ComputeKernelHelper _buildObservations;
         private readonly ComputeKernelHelper _buildCorrespondences;
         private readonly ComputeKernelHelper _captureCourtWaves;
@@ -390,7 +421,6 @@ namespace Genesis.RoomScan
         private readonly ComputeKernelHelper _computeCandidateConsensus;
         private readonly ComputeKernelHelper _markCandidateSuccessions;
         private readonly ComputeKernelHelper _applyCandidateSuccessions;
-        private readonly ComputeKernelHelper _rebuildProductionCorrespondences;
         private readonly ComputeKernelHelper _challengeCandidates;
         private readonly ComputeKernelHelper _retireCandidates;
         private readonly ComputeKernelHelper _countCensus;
@@ -424,6 +454,8 @@ namespace Genesis.RoomScan
         private ComputeBuffer _candidatePromotionAuthority;
         private ComputeBuffer _candidateSuccessor;
         private ComputeBuffer _candidatePredecessor;
+        private ComputeBuffer _successionInvalidationArgs;
+        private ComputeBuffer _successionInvalidationCenterRadius;
         private ComputeBuffer _candidateConsensus;
         private ComputeBuffer _nextStableId;
         private ComputeBuffer _stats;
@@ -523,6 +555,15 @@ namespace Genesis.RoomScan
             return authority.IsValid;
         }
 
+        internal bool TryGetSuccessionInvalidations(
+            out SuccessionInvalidationBuffers invalidations)
+        {
+            invalidations = new SuccessionInvalidationBuffers(
+                _successionInvalidationArgs, _successionInvalidationCenterRadius,
+                SuccessionInvalidationCapacity);
+            return !_disposed && invalidations.IsValid;
+        }
+
         internal bool TryGetCourtBuffers(out CourtBuffers court)
         {
             court = default;
@@ -547,6 +588,8 @@ namespace Genesis.RoomScan
             _clearStats = new ComputeKernelHelper(_shader, "ClearStats");
             _clearDirectProjectionAudit = new ComputeKernelHelper(_shader,
                 "ClearDirectProjectionAudit");
+            _clearSuccessionInvalidations = new ComputeKernelHelper(_shader,
+                "ClearSuccessionInvalidations");
             _buildObservations = new ComputeKernelHelper(_shader, "BuildObservations");
             _buildCorrespondences = new ComputeKernelHelper(_shader, "BuildCorrespondences");
             _captureCourtWaves = new ComputeKernelHelper(_shader, "CaptureCourtWaves");
@@ -554,7 +597,6 @@ namespace Genesis.RoomScan
             _computeCandidateConsensus = new ComputeKernelHelper(_shader, "ComputeCandidateConsensus");
             _markCandidateSuccessions = new ComputeKernelHelper(_shader, "MarkCandidateSuccessions");
             _applyCandidateSuccessions = new ComputeKernelHelper(_shader, "ApplyCandidateSuccessions");
-            _rebuildProductionCorrespondences = new ComputeKernelHelper(_shader, "RebuildProductionCorrespondences");
             _challengeCandidates = new ComputeKernelHelper(_shader, "ChallengeCandidates");
             _retireCandidates = new ComputeKernelHelper(_shader, "RetireCandidates");
             _countCensus = new ComputeKernelHelper(_shader, "CountCensus");
@@ -603,6 +645,11 @@ namespace Genesis.RoomScan
             _candidatePromotionAuthority = new ComputeBuffer(candidateCount, CandidateMetaStride);
             _candidateSuccessor = new ComputeBuffer(candidateCount, sizeof(uint));
             _candidatePredecessor = new ComputeBuffer(candidateCount, sizeof(uint));
+            _successionInvalidationArgs = new ComputeBuffer(3, sizeof(uint),
+                ComputeBufferType.IndirectArguments);
+            _successionInvalidationArgs.SetData(new uint[] { 0u, 1u, 1u });
+            _successionInvalidationCenterRadius = new ComputeBuffer(
+                SuccessionInvalidationCapacity, CandidateFloat4Stride);
             _candidateConsensus = new ComputeBuffer(candidateCount, sizeof(uint));
             _nextStableId = new ComputeBuffer(1, sizeof(uint));
             _nextStableId.SetData(new uint[] { 1u });
@@ -678,10 +725,10 @@ namespace Genesis.RoomScan
             var kernels = new[]
             {
                 _clearCells, _clearStats, _buildObservations, _buildCorrespondences,
+                _clearSuccessionInvalidations,
                 _captureCourtWaves,
                 _updateCandidates, _computeCandidateConsensus,
                 _markCandidateSuccessions, _applyCandidateSuccessions,
-                _rebuildProductionCorrespondences,
                 _challengeCandidates, _retireCandidates,
                 _countCensus, _captureDirectProjectionAudit,
                 _commitRetirementGateWitnesses,
@@ -717,6 +764,9 @@ namespace Genesis.RoomScan
                 kernel.Set(CandidatePromotionAuthorityID, _candidatePromotionAuthority);
                 kernel.Set(CandidateSuccessorID, _candidateSuccessor);
                 kernel.Set(CandidatePredecessorID, _candidatePredecessor);
+                kernel.Set(SuccessionInvalidationArgsID, _successionInvalidationArgs);
+                kernel.Set(SuccessionInvalidationCenterRadiusID,
+                    _successionInvalidationCenterRadius);
                 kernel.Set(CandidateConsensusID, _candidateConsensus);
                 kernel.Set(NextStableIdID, _nextStableId);
                 kernel.Set(StatsID, _stats);
@@ -780,6 +830,8 @@ namespace Genesis.RoomScan
             _shader.SetInt(TableMaskID, TableCapacity - 1);
             _shader.SetInt(ProbeCountID, ProbeCount);
             _shader.SetInt(CandidateCapacityID, CandidateCapacity);
+            _shader.SetInt(SuccessionInvalidationCapacityID,
+                SuccessionInvalidationCapacity);
             _shader.SetInt(PixelStrideID, _pixelStride);
             _shader.SetFloat(CellSizeID, _cellSize);
             _shader.SetFloat(MaxDepthID, 5f);
@@ -1095,8 +1147,9 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// 整帧准入后的候选事务封口。无论接受还是拒绝，都先按当前稳定账本重建
-        /// 严格逐点证据并记录黑匣子浪头；只有接受帧可以更新、反对和淘汰候选。
+        /// 整帧准入后的候选事务封口。无论接受还是拒绝，都先按进入本批事务前的
+        /// 稳定账本生成并冻结严格逐点证据，同时记录黑匣子浪头；只有接受帧可以
+        /// 在裁决冻结后更新、反对和淘汰候选，更新结果只供下一批使用。
         /// 缓冲仍由 ReleaseFrameDecision 在 TSDF 消费结束后释放。
         /// </summary>
         internal bool AdjudicateFrameDecision(FrameDecision decision, bool commitCandidates)
@@ -1136,12 +1189,19 @@ namespace Genesis.RoomScan
             _shader.SetMatrix(CorrectionID, correction);
             _shader.SetMatrixArray(DepthViewInvID, slot.ViewInv);
 
+            // 每个候选事务拥有独立的一次性拆除票箱。即便本批被拒绝或没有换轨，
+            // 也必须先清零，防止生产融合重复消费上一批的局部失效区。
+            _clearSuccessionInvalidations.DispatchFit(1, 1, 1);
+
             _captureCourtWaves.Set(ObservationsID, slot.Observations);
             _captureCourtWaves.Set(CorrespondencesID, slot.Correspondences);
             _captureCourtWaves.Set(CorrespondenceIdentityID,
                 slot.CorrespondenceIdentity);
             _captureCourtWaves.DispatchFit(slot.ObservationCount, 1, 1);
 
+            // 到这里，本批交给 VolumeIntegration 的逐点权限已经依据事务开始时的
+            // 稳定账本冻结。下面可以维护候选账本，但严禁重新生成本批对应关系；
+            // 否则本批观测会先拖动/换掉挂点，再用新挂点给自己签字。
             if (commitCandidates)
             {
                 _updateCandidates.Set(ObservationsID, slot.Observations);
@@ -1152,11 +1212,6 @@ namespace Genesis.RoomScan
                     _computeCandidateConsensus.DispatchFit(candidateCount, 1, 1);
                     _markCandidateSuccessions.DispatchFit(candidateCount, 1, 1);
                     _applyCandidateSuccessions.DispatchFit(candidateCount, 1, 1);
-                    _rebuildProductionCorrespondences.Set(ObservationsID, slot.Observations);
-                    _rebuildProductionCorrespondences.Set(CorrespondencesID, slot.Correspondences);
-                    _rebuildProductionCorrespondences.Set(CorrespondenceIdentityID,
-                        slot.CorrespondenceIdentity);
-                    _rebuildProductionCorrespondences.DispatchFit(slot.ObservationCount, 1, 1);
                     _challengeCandidates.Set(ObservationsID, slot.Observations);
                     _challengeCandidates.DispatchFit(slot.ObservationCount, 1, 1);
                     if (slot.DirectProjectionScheduled)
@@ -2953,6 +3008,7 @@ namespace Genesis.RoomScan
                 Mathf.Max(CourtWaveCapacity, ghostObservationCount));
             _clearCells.DispatchFit(clearCount, 1, 1);
             _clearStats.DispatchFit(StatsCount, 1, 1);
+            _clearSuccessionInvalidations.DispatchFit(1, 1, 1);
             _candidateTransactionsCommitted = 0u;
             _candidateBootstrapTransactions = 0u;
             _candidateTransactionsDiscarded = 0u;
@@ -3007,6 +3063,8 @@ namespace Genesis.RoomScan
             _candidatePromotionAuthority?.Release();
             _candidateSuccessor?.Release();
             _candidatePredecessor?.Release();
+            _successionInvalidationArgs?.Release();
+            _successionInvalidationCenterRadius?.Release();
             _candidateConsensus?.Release();
             _nextStableId?.Release();
             _stats?.Release();

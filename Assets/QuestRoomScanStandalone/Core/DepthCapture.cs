@@ -32,6 +32,9 @@ namespace Genesis.RoomScan
         [Tooltip("源头时序滤波 compute；留空则 Resources/DepthTemporalFilter 兜底装载（免场景 YAML 接线）。")]
         [SerializeField] private ComputeShader temporalFilterCompute;
 
+        [Header("单帧种子平面→生产深度（实验）")]
+        [SerializeField] private bool enableSeedPlaneProductionExperiment = true;
+
         [Header("枪胶双证词（数据层）")]
         [SerializeField, Tooltip("每个实际消费的深度帧在任何预处理前复制融合眼平台深度，" +
                                  "与预处理后深度共同作为枪胶候选的两份独立证词。")]
@@ -64,7 +67,7 @@ namespace Genesis.RoomScan
         [SerializeField] private bool enableBilateralFilter = true;
         [SerializeField, Range(1f, 8f)] private float sigmaSpatial = 3.0f;
         [SerializeField, Range(0.01f, 0.5f)] private float sigmaColor = 0.1f;
-        [SerializeField, Range(0.001f, 0.1f)] private float sigmaDepth = 0.02f;
+        [SerializeField, Range(0.001f, 0.1f), Tooltip("深度域标准差（米）。0.02=只让相差约 2 cm 的邻点显著互相平滑；不再随观察距离改变实际尺度。")] private float sigmaDepth = 0.02f;
         [SerializeField, Range(1, 5)] private int filterRadius = 2;
 
         [Header("Depth Edge Clean（v0.2 边缘识别 GPU 移植）")]
@@ -239,6 +242,21 @@ namespace Genesis.RoomScan
         // 双边/缘洗共用同名 uniform，同 ID 复用（逐眼交替的眼偏移）
         private static readonly int EyeOffsetID = Shader.PropertyToID("_EyeOffset");
 
+        private const int MaxSeedPlanePatches = 8;
+        private static readonly int SeedSourceDepthID = Shader.PropertyToID("_SeedSourceDepth");
+        private static readonly int SeedSourceNormalID = Shader.PropertyToID("_SeedSourceNormal");
+        private static readonly int SeedOutputDepthID = Shader.PropertyToID("_SeedOutputDepth");
+        private static readonly int SeedImageSizeID = Shader.PropertyToID("_SeedImageSize");
+        private static readonly int SeedPlaneCountID = Shader.PropertyToID("_SeedPlaneCount");
+        private static readonly int SeedNormalOffsetID = Shader.PropertyToID("_SeedNormalOffset");
+        private static readonly int SeedAxisUMinID = Shader.PropertyToID("_SeedAxisUMin");
+        private static readonly int SeedAxisVMinID = Shader.PropertyToID("_SeedAxisVMin");
+        private static readonly int SeedMaxUVId = Shader.PropertyToID("_SeedMaxUV");
+        private static readonly int SeedProjID = Shader.PropertyToID("_SeedProj");
+        private static readonly int SeedProjInvID = Shader.PropertyToID("_SeedProjInv");
+        private static readonly int SeedViewID = Shader.PropertyToID("_SeedView");
+        private static readonly int SeedViewInvID = Shader.PropertyToID("_SeedViewInv");
+
         // 手部打码 property IDs（_DepthW/_DepthH 与双边同名同 ID，复用 BilDepthWID/BilDepthHID）
         private static readonly int RawDepthID = Shader.PropertyToID("_RawDepth");
         private static readonly int MaskedDepthID = Shader.PropertyToID("_MaskedDepth");
@@ -369,6 +387,147 @@ namespace Genesis.RoomScan
         private bool _hasHandMaskKernel;
         private ComputeKernelHelper _temporalKernel;
         private bool _hasTemporalKernel;
+        private ComputeShader _seedPlaneCompute;
+        private int _seedPlaneKernel = -1;
+        private RenderTexture _seedPlaneDepthTex;
+        private bool _seedPlanePreviewActive;
+        private bool _seedPlaneAwaitClear;
+        private int _seedPlaneCount;
+        private int _lastSeedPlaneAppliedFrame = -1;
+        private readonly Vector4[] _seedNormalOffset = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedAxisUMin = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedAxisVMin = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedMaxUV = new Vector4[MaxSeedPlanePatches];
+
+        public readonly struct SeedPlanePatch
+        {
+            public readonly Vector3 Normal, Point, AxisU, AxisV;
+            public readonly float MinU, MaxU, MinV, MaxV;
+
+            public SeedPlanePatch(Vector3 normal, Vector3 point,
+                Vector3 axisU, Vector3 axisV,
+                float minU, float maxU, float minV, float maxV)
+            {
+                Normal = normal; Point = point;
+                AxisU = axisU; AxisV = axisV;
+                MinU = minU; MaxU = maxU; MinV = minV; MaxV = maxV;
+            }
+        }
+
+        public bool SeedPlaneProductionReady => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0 && !_seedPlaneAwaitClear && !_seedPlanePreviewActive;
+        public bool SeedPlaneExperimentEnabled => enableSeedPlaneProductionExperiment;
+        public bool HasStagedSeedPlanes => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0;
+        public bool SeedPlaneAppliedToCurrentFrame =>
+            !SeedPlaneProductionReady || _lastSeedPlaneAppliedFrame == _frameCount;
+        public bool SeedPlanePreviewActive => enableSeedPlaneProductionExperiment &&
+            _seedPlanePreviewActive;
+        public bool SeedPlaneAwaitClear => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0 && _seedPlaneAwaitClear;
+        public string SeedPlaneProductionStatus => !enableSeedPlaneProductionExperiment
+            ? "关" : _seedPlaneCount == 0 ? "未取样"
+            : _seedPlaneAwaitClear ? "待清卷"
+            : _seedPlanePreviewActive ? "取样中"
+            : _lastSeedPlaneAppliedFrame >= 0 ? $"尺{_seedPlaneCount}块"
+            : $"备{_seedPlaneCount}块";
+
+        public void SetSeedPlanePreviewActive(bool active) =>
+            _seedPlanePreviewActive = active;
+
+        /// <summary>Start a genuinely new roll without inheriting its ruler.</summary>
+        public void ClearSeedPlanePatches()
+        {
+            _seedPlaneCount = 0;
+            _seedPlaneAwaitClear = false;
+            _lastSeedPlaneAppliedFrame = -1;
+            Array.Clear(_seedNormalOffset, 0, _seedNormalOffset.Length);
+            Array.Clear(_seedAxisUMin, 0, _seedAxisUMin.Length);
+            Array.Clear(_seedAxisVMin, 0, _seedAxisVMin.Length);
+            Array.Clear(_seedMaxUV, 0, _seedMaxUV.Length);
+        }
+
+        /// <summary>Stage only measured, fitted world patches.  They are a
+        /// post-TSDF product sidecar: a new set still starts on a clean roll so
+        /// the visual comparison has one unambiguous lifetime, but it never
+        /// rewrites the depth texture or TSDF input.</summary>
+        public bool StageSeedPlanePatches(IReadOnlyList<SeedPlanePatch> patches)
+        {
+            if (!enableSeedPlaneProductionExperiment || patches == null ||
+                patches.Count == 0) return false;
+            _seedPlaneCount = Mathf.Min(patches.Count, MaxSeedPlanePatches);
+            for (int i = 0; i < _seedPlaneCount; i++)
+            {
+                SeedPlanePatch patch = patches[i];
+                Vector3 normal = patch.Normal.normalized;
+                _seedNormalOffset[i] = new Vector4(normal.x, normal.y,
+                    normal.z, Vector3.Dot(normal, patch.Point));
+                _seedAxisUMin[i] = new Vector4(patch.AxisU.x,
+                    patch.AxisU.y, patch.AxisU.z, patch.MinU);
+                _seedAxisVMin[i] = new Vector4(patch.AxisV.x,
+                    patch.AxisV.y, patch.AxisV.z, patch.MinV);
+                _seedMaxUV[i] = new Vector4(patch.MaxU, patch.MaxV, 0f, 0f);
+            }
+            _lastSeedPlaneAppliedFrame = -1;
+            _seedPlaneAwaitClear = VolumeIntegrator.Instance != null &&
+                                   VolumeIntegrator.Instance.IntegrationCount > 0;
+            Logger.Info($"种子平面已暂存{_seedPlaneCount}块；" +
+                        (_seedPlaneAwaitClear ? "须清卷后才启用制品旁路" :
+                         "离开预览后启用制品旁路"));
+            return !_seedPlaneAwaitClear;
+        }
+
+        /// <summary>
+        /// Copies finite seed-plane constraints for the post-TSDF productizer.
+        /// The U/V half extents stay explicit so the shader cannot flatten a
+        /// parallel object merely because it happens to lie inside a broad
+        /// spherical neighbourhood.
+        /// </summary>
+        internal int CopySeedProductConstraints(Bounds worldBounds,
+            Vector4[] equations, Vector4[] centers,
+            Vector4[] axesU, Vector4[] axesV, int start)
+        {
+            if (!SeedPlaneProductionReady || equations == null ||
+                centers == null || axesU == null || axesV == null)
+                return 0;
+            int capacity = Mathf.Min(equations.Length,
+                Mathf.Min(centers.Length, Mathf.Min(axesU.Length, axesV.Length)));
+            int written = 0;
+            for (int i = 0; i < _seedPlaneCount && start + written < capacity; i++)
+            {
+                Vector3 normal = ((Vector3)_seedNormalOffset[i]).normalized;
+                Vector3 axisU = ((Vector3)_seedAxisUMin[i]).normalized;
+                Vector3 axisV = ((Vector3)_seedAxisVMin[i]).normalized;
+                if (normal.sqrMagnitude < 0.99f || axisU.sqrMagnitude < 0.99f ||
+                    axisV.sqrMagnitude < 0.99f)
+                    continue;
+                float minU = _seedAxisUMin[i].w;
+                float maxU = _seedMaxUV[i].x;
+                float minV = _seedAxisVMin[i].w;
+                float maxV = _seedMaxUV[i].y;
+                float halfU = Mathf.Max(0f, (maxU - minU) * 0.5f);
+                float halfV = Mathf.Max(0f, (maxV - minV) * 0.5f);
+                if (halfU <= 0f || halfV <= 0f)
+                    continue;
+                float coordinate = _seedNormalOffset[i].w;
+                Vector3 center = normal * coordinate +
+                                 axisU * ((minU + maxU) * 0.5f) +
+                                 axisV * ((minV + maxV) * 0.5f);
+                float radius = Mathf.Sqrt(halfU * halfU + halfV * halfV) + 0.02f;
+                if (worldBounds.SqrDistance(center) > radius * radius)
+                    continue;
+                int destination = start + written++;
+                equations[destination] = new Vector4(normal.x, normal.y,
+                    normal.z, coordinate);
+                centers[destination] = new Vector4(center.x, center.y,
+                    center.z, radius);
+                axesU[destination] = new Vector4(axisU.x, axisU.y, axisU.z,
+                    halfU + 0.015f);
+                axesV[destination] = new Vector4(axisV.x, axisV.y, axisV.z,
+                    halfV + 0.015f);
+            }
+            return written;
+        }
 
         private Texture _depthTex;
         /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
@@ -849,6 +1008,7 @@ namespace Genesis.RoomScan
             if (_platformDepthWitnessTex) { Destroy(_platformDepthWitnessTex); _platformDepthWitnessTex = null; }
             if (_filteredDepthTex) { Destroy(_filteredDepthTex); _filteredDepthTex = null; }
             if (_edgeCleanedDepthTex) { Destroy(_edgeCleanedDepthTex); _edgeCleanedDepthTex = null; }
+            if (_seedPlaneDepthTex) { Destroy(_seedPlaneDepthTex); _seedPlaneDepthTex = null; }
             if (_edgeReasonTex) { Destroy(_edgeReasonTex); _edgeReasonTex = null; }
             _edgeStats?.Release();
             _edgeStats = null;
@@ -996,6 +1156,11 @@ namespace Genesis.RoomScan
             ApplyDepthEdgeClean();
             SetGlobalShaderProperties();
             ComputeNormals();
+            // A captured seed is a post-TSDF product ruler.  Activate its
+            // sidecar lifetime here, but never replace _depthTex or _normTex:
+            // GunGel and the sole TSDF must continue to consume the screened
+            // Quest observation itself.
+            ActivateSeedPlaneSidecar();
             _dilationDirty = true;
             _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
             DispatchCenterDepthSample();
@@ -1463,6 +1628,9 @@ namespace Genesis.RoomScan
             cs.SetFloat(BilSigmaDepthID, sigmaDepth);
             cs.SetInt(BilFilterRadiusID, filterRadius);
             cs.SetInt(EyeOffsetID, _preprocessEye);
+            _linearizeAB[0] = new Vector4(_proj[0][2, 2], _proj[0][2, 3], 0f, 0f);
+            _linearizeAB[1] = new Vector4(_proj[1][2, 2], _proj[1][2, 3], 0f, 0f);
+            cs.SetVectorArray(EdgeLinearizeABID, _linearizeAB);
 
             _bilateralKernel.DispatchFit(w, h, 1);
 
@@ -1580,6 +1748,37 @@ namespace Genesis.RoomScan
             LastGrazingPlaneRescuedCount = data[3];
             HasEdgeCleanStats = true;
             _edgeStats?.SetData(ZeroEdgeStats);
+        }
+
+        private bool EnsureSeedPlaneCompute()
+        {
+            if (_seedPlaneKernel >= 0 && _seedPlaneCompute != null) return true;
+            _seedPlaneCompute = Resources.Load<ComputeShader>("InstantSeedDepthProject");
+            if (_seedPlaneCompute == null ||
+                !_seedPlaneCompute.HasKernel("ProjectSeedPlanes"))
+            {
+                Logger.Warning("种子平面生产入口缺少 InstantSeedDepthProject 内核；保持原深度，不伪称接入");
+                return false;
+            }
+            _seedPlaneKernel = _seedPlaneCompute.FindKernel("ProjectSeedPlanes");
+            return _seedPlaneKernel >= 0;
+        }
+
+        private void ActivateSeedPlaneSidecar()
+        {
+            if (!enableSeedPlaneProductionExperiment || _seedPlaneCount == 0 ||
+                _seedPlanePreviewActive || _depthTex == null || _normTex == null)
+                return;
+            if (_seedPlaneAwaitClear)
+            {
+                if (VolumeIntegrator.Instance != null &&
+                    VolumeIntegrator.Instance.IntegrationCount > 0)
+                    return;
+                _seedPlaneAwaitClear = false;
+            }
+            if (_lastSeedPlaneAppliedFrame < 0)
+                Logger.Info($"种面标尺旁路已启用：{_seedPlaneCount}块；原深度不改写，只约束TSDF后制品");
+            _lastSeedPlaneAppliedFrame = _frameCount;
         }
 
         private void SetGlobalShaderProperties()

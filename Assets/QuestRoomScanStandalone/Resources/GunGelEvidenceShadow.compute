@@ -5,6 +5,7 @@
 #pragma kernel ClearCells
 #pragma kernel ClearStats
 #pragma kernel ClearDirectProjectionAudit
+#pragma kernel ClearSuccessionInvalidations
 #pragma kernel BuildObservations
 #pragma kernel BuildCorrespondences
 #pragma kernel CaptureDirectProjectionAudit
@@ -15,7 +16,6 @@
 #pragma kernel ComputeCandidateConsensus
 #pragma kernel MarkCandidateSuccessions
 #pragma kernel ApplyCandidateSuccessions
-#pragma kernel RebuildProductionCorrespondences
 #pragma kernel ChallengeCandidates
 #pragma kernel RetireCandidates
 #pragma kernel CountCensus
@@ -122,6 +122,12 @@ RWStructuredBuffer<uint4> _CandidatePromotionAuthority;
 // 值为 candidateIndex+1，0 表示当前没有换轨事务。
 RWStructuredBuffer<uint> _CandidateSuccessor;
 RWStructuredBuffer<uint> _CandidatePredecessor;
+// 成功换轨只发布局部“拆旧板”票，不直接接触 TSDF。VolumeIntegration 在本批
+// 融合前消费这些球形失效区，把旧轨和连接坡恢复为未知；新轨仍须由后续原始
+// 全分辨率深度重新播种。前三个 uint 同时是 DispatchIndirect 的 xyz 参数。
+RWStructuredBuffer<uint> _SuccessionInvalidationArgs;
+RWStructuredBuffer<float4> _SuccessionInvalidationCenterRadius;
+int _SuccessionInvalidationCapacity;
 // 每帧换轨前独立计算一次局部共面支持。Mark 内核只读这个缓存，避免
 // “扫描邻域时再次扫描邻域”的嵌套展开令 Vulkan shader 编译器失控。
 RWStructuredBuffer<uint> _CandidateConsensus;
@@ -631,6 +637,15 @@ void ClearStats(uint id : SV_DispatchThreadID)
 void ClearDirectProjectionAudit(uint id : SV_DispatchThreadID)
 {
     if (id < 3u) _DirectProjectionAudit[id] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void ClearSuccessionInvalidations(uint id : SV_DispatchThreadID)
+{
+    if (id != 0u) return;
+    _SuccessionInvalidationArgs[0] = 0u;
+    _SuccessionInvalidationArgs[1] = 1u;
+    _SuccessionInvalidationArgs[2] = 1u;
 }
 
 float DirectProjectionRange(uint2 pixel, float depth)
@@ -1512,72 +1527,6 @@ void CaptureCourtWaves(uint id : SV_DispatchThreadID)
     _CourtWaveLock[stableId] = 0u;
 }
 
-// 候选事务完成后只重建生产准入，不重复写裁决海面。首轮 CaptureCourtWaves
-// 仍在 EMA/换轨之前钉住原始浪头；本轮让刚成熟或刚继承 stableID 的正确候选
-// 在同一帧取得 TSDF 权限，避免“候选已改正、融合还要等下一帧”的空转窗口。
-[numthreads(128, 1, 1)]
-void RebuildProductionCorrespondences(uint id : SV_DispatchThreadID)
-{
-    if (id >= (uint)_ObservationCount) return;
-    Observation observation = _Observations[id];
-    Correspondence production;
-    production.sourceValid = float4(observation.positionSigma.xyz, 0.0);
-    production.targetSigma = 0;
-    production.normalAngle = 0;
-    _CorrespondenceIdentity[id] = 0u;
-    uint flags = 0u;
-    if (observation.positionSigma.w <= 0.0)
-    {
-        _Correspondences[id] = production;
-        return;
-    }
-    flags |= CORR_OBSERVATION_VALID;
-
-    float3 samplePosition = mul(_Correction,
-        float4(observation.positionSigma.xyz, 1.0)).xyz;
-    float3 sampleNormal = normalize(mul((float3x3)_Correction,
-        observation.normalQuality.xyz));
-    float sigma = observation.positionSigma.w;
-    bool rawAvailable = observation.rawPositionDelta.w >= 0.0;
-    if (rawAvailable) flags |= CORR_RAW_AVAILABLE;
-    float3 cameraWorld = mul(_Correction,
-        mul(_DepthViewInv[FUSION_EYE], float4(0, 0, 0, 1))).xyz;
-    float sampleRange = distance(samplePosition, cameraWorld);
-    bool dualAgree = rawAvailable && observation.rawPositionDelta.w <=
-        DUAL_AGREE_BASE + sampleRange * DUAL_AGREE_RANGE_SCALE;
-    if (dualAgree) flags |= CORR_DUAL_AGREE;
-
-    uint candidateIndex;
-    float score, residual, angle;
-    if (FindBestStable(samplePosition, sampleNormal, sigma,
-                       candidateIndex, score, residual, angle))
-    {
-        flags |= CORR_DIAG_STABLE_FOUND;
-        float4 candidate = _CandidateCenterSigma[candidateIndex];
-        float combinedSigma = sqrt(max(candidate.w,
-            SIGMA_FLOOR * SIGMA_FLOOR) + sigma * sigma);
-        bool residualPass = residual <= GunGelStableResidualLimit(combinedSigma);
-        bool normalPass = angle <= 45.0;
-        if (residualPass) flags |= CORR_DIAG_RESIDUAL_PASS;
-        if (normalPass) flags |= CORR_DIAG_NORMAL_PASS;
-        bool stableMatch = residualPass && normalPass;
-        uint4 evidence = _CandidateEvidence[candidateIndex];
-        _CorrespondenceIdentity[id] = uint4(candidateIndex + 1u, evidence.z,
-                                            evidence.x, evidence.y);
-        if (stableMatch)
-        {
-            flags |= CORR_STABLE_MATCH;
-            production.targetSigma = float4(candidate.xyz, combinedSigma);
-            production.normalAngle = float4(
-                normalize(_CandidateNormalSupport[candidateIndex].xyz), angle);
-        }
-        if (evidence.x >= STABLE_DUAL_SUPPORT) flags |= CORR_STABLE_DUAL;
-        if (evidence.y == 0u) flags |= CORR_UNOPPOSED;
-    }
-    production.sourceValid.w = (float)flags;
-    _Correspondences[id] = production;
-}
-
 [numthreads(128, 1, 1)]
 void UpdateCandidates(uint id : SV_DispatchThreadID)
 {
@@ -1937,8 +1886,9 @@ void MarkCandidateSuccessions(uint id : SV_DispatchThreadID)
 }
 
 // 第二阶段原子发布：几何位置保留挑战者，稳定身份沿用旧候选；旧候选同批退役。
-// 下一内核会据此重建本帧逐点生产权限，TSDF 因而只再消费新轨，不会让旧/新两轨
-// 同时继续加权。既有旧零交叉由正常 TSDF 矛盾扣减/符号更新完成退场。
+// 本批逐点生产权限已在发布前冻结，因而本批不能借新轨给自己签字；新轨从下一批
+// 开始参与裁决。成功换轨另发有限局部失效票，由生产 TSDF 在本批写完后拆掉
+// 旧轨及连接坡，下一批再以新轨认可的真实深度重建。
 [numthreads(128, 1, 1)]
 void ApplyCandidateSuccessions(uint id : SV_DispatchThreadID)
 {
@@ -1992,6 +1942,30 @@ void ApplyCandidateSuccessions(uint id : SV_DispatchThreadID)
     uint4 oldGateState = _CandidateRetirementGateState[id];
     if (oldGateState.y != 0u && oldGateState.x == oldEvidence.z)
         InterlockedAdd(_RetirementGateCounters[9], 1u);
+
+    // 换候选账本本身不能清掉旧 TSDF。发布一个以旧/新轨中点为中心的有限局部
+    // 失效球，半径只覆盖一个候选单元及两轨间焊缝。即使球同时擦到新轨也无妨：
+    // 消费端把它恢复为未知，之后只能由获胜轨认可的真实深度重新长出，而不是
+    // 用候选中心直接塑造零面。
+    float3 oldCenter = _CandidateCenterSigma[id].xyz;
+    float3 newCenter = _CandidateCenterSigma[successor].xyz;
+    float separation = distance(oldCenter, newCenter);
+    float invalidationRadius = clamp(_CellSize * 0.5 + separation * 0.5,
+                                     _CellSize * 0.75, _CellSize * 1.25);
+    uint invalidationIndex;
+    InterlockedAdd(_SuccessionInvalidationArgs[0], 1u, invalidationIndex);
+    if (invalidationIndex < (uint)_SuccessionInvalidationCapacity)
+    {
+        _SuccessionInvalidationCenterRadius[invalidationIndex] =
+            float4((oldCenter + newCenter) * 0.5, invalidationRadius);
+    }
+    else
+    {
+        // DispatchIndirect 绝不能越过实际事件缓冲；并发溢出线程最终都把 x 压回
+        // 容量上限。遗漏事件留给后续批次再次竞争，不扩大成全局清卷。
+        InterlockedMin(_SuccessionInvalidationArgs[0],
+                       (uint)_SuccessionInvalidationCapacity);
+    }
 
     _CandidateCenterSigma[id] = 0;
     _CandidateNormalSupport[id] = 0;

@@ -1,0 +1,420 @@
+// Read-only InfiniTAM model prediction.
+//
+// The kernel casts the current accepted camera rays through the sole TSDF,
+// before that frame is integrated.  It never owns an RW binding to the TSDF
+// and therefore cannot alter fusion, extraction or rendering decisions.
+
+#pragma kernel ClearModelRaycastStats
+#pragma kernel RaycastModel
+
+Texture2DArray<float> gsDepthTex;
+Texture3D<float2> gsModelTsdf;
+Texture3D<float> gsModelVoteWeight;
+RWTexture2D<float> gsModelDepthRW;
+RWTexture2D<float> gsModelResidualMmRW;
+RWStructuredBuffer<uint> gsModelRaycastStats;
+
+struct ModelTrackingPair
+{
+    float4 observedValid;
+    float4 modelResidual;
+    float4 normalVote;
+};
+RWStructuredBuffer<ModelTrackingPair> gsModelTrackingPairs;
+
+uint2 gsDepthTexSize;
+uint2 gsModelOutputSize;
+uint3 gsVoxCount;
+float gsVoxSize;
+float gsVoxDist;
+float gsModelMinWeight;
+float gsModelMinObservedRange;
+float gsModelMaxObservedRange;
+int gsModelPixelStride;
+
+float4x4 gsDepthProj[2];
+float4x4 gsDepthProjInv[2];
+float4x4 gsDepthView[2];
+float4x4 gsDepthViewInv[2];
+
+static const int GS_FUSION_EYE = 1;
+// 0..19 keep the V1.3 ticket layout. V1.4 adds rejected-observation and
+// alternative-crossing evidence without changing any production resource.
+static const uint GS_STAT_COUNT = 40u;
+
+bool FiniteFloat(float value)
+{
+    return value == value && abs(value) < 3.402823e+37;
+}
+
+bool FiniteFloat3(float3 value)
+{
+    return all(value == value) && all(abs(value) < 3.402823e+37);
+}
+
+float3 DepthEyePos()
+{
+    return gsDepthViewInv[GS_FUSION_EYE]._m03_m13_m23;
+}
+
+float3 NdcToWorld(float3 ndc)
+{
+    float4 hcs = float4(ndc * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(gsDepthViewInv[GS_FUSION_EYE],
+                        mul(gsDepthProjInv[GS_FUSION_EYE], hcs));
+    return worldH.xyz / max(abs(worldH.w), 1e-7) * sign(worldH.w);
+}
+
+bool IntersectVolume(float3 origin, float3 direction, out float nearT, out float farT)
+{
+    float3 halfExtent = float3(gsVoxCount) * gsVoxSize * 0.5;
+    float3 safeDirection = float3(
+        abs(direction.x) < 1e-7 ? (direction.x < 0.0 ? -1e-7 : 1e-7) : direction.x,
+        abs(direction.y) < 1e-7 ? (direction.y < 0.0 ? -1e-7 : 1e-7) : direction.y,
+        abs(direction.z) < 1e-7 ? (direction.z < 0.0 ? -1e-7 : 1e-7) : direction.z);
+    float3 invDirection = 1.0 / safeDirection;
+    float3 t0 = (-halfExtent - origin) * invDirection;
+    float3 t1 = ( halfExtent - origin) * invDirection;
+    float3 lo = min(t0, t1);
+    float3 hi = max(t0, t1);
+    nearT = max(max(lo.x, lo.y), lo.z);
+    farT = min(min(hi.x, hi.y), hi.z);
+    nearT = max(nearT, 0.0);
+    return farT > nearT;
+}
+
+bool LoadTsdf(int3 p, out float2 voxel)
+{
+    if (any(p < 0) || any(p >= int3(gsVoxCount)))
+    {
+        voxel = 0.0;
+        return false;
+    }
+    voxel = gsModelTsdf.Load(int4(p, 0));
+    return abs(voxel.y) >= gsModelMinWeight;
+}
+
+// Interpolate only when all eight contributors are observed.  Interpolating
+// across the sentinel/unknown volume would manufacture a zero crossing that
+// is absent from the reconstruction and would make a model miss look healthy.
+bool SampleObservedTsdf(float3 worldPos, out float tsdf)
+{
+    float3 centreIndex = worldPos / gsVoxSize + float3(gsVoxCount) * 0.5 - 0.5;
+    int3 baseIndex = (int3)floor(centreIndex);
+    float3 f = frac(centreIndex);
+
+    float2 v000, v100, v010, v110, v001, v101, v011, v111;
+    bool o000 = LoadTsdf(baseIndex + int3(0, 0, 0), v000);
+    bool o100 = LoadTsdf(baseIndex + int3(1, 0, 0), v100);
+    bool o010 = LoadTsdf(baseIndex + int3(0, 1, 0), v010);
+    bool o110 = LoadTsdf(baseIndex + int3(1, 1, 0), v110);
+    bool o001 = LoadTsdf(baseIndex + int3(0, 0, 1), v001);
+    bool o101 = LoadTsdf(baseIndex + int3(1, 0, 1), v101);
+    bool o011 = LoadTsdf(baseIndex + int3(0, 1, 1), v011);
+    bool o111 = LoadTsdf(baseIndex + int3(1, 1, 1), v111);
+    bool observed = o000 && o100 && o010 && o110 &&
+                    o001 && o101 && o011 && o111;
+    if (!observed)
+    {
+        tsdf = 0.0;
+        return false;
+    }
+
+    float x00 = lerp(v000.x, v100.x, f.x);
+    float x10 = lerp(v010.x, v110.x, f.x);
+    float x01 = lerp(v001.x, v101.x, f.x);
+    float x11 = lerp(v011.x, v111.x, f.x);
+    tsdf = lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z);
+    return true;
+}
+
+float SampleVoteWeight(float3 worldPos)
+{
+    float3 centreIndex = worldPos / gsVoxSize + float3(gsVoxCount) * 0.5 - 0.5;
+    int3 baseIndex = clamp((int3)floor(centreIndex), int3(0, 0, 0),
+                           int3(gsVoxCount) - 2);
+    float3 f = saturate(centreIndex - (float3)baseIndex);
+    float w000 = gsModelVoteWeight.Load(int4(baseIndex + int3(0, 0, 0), 0));
+    float w100 = gsModelVoteWeight.Load(int4(baseIndex + int3(1, 0, 0), 0));
+    float w010 = gsModelVoteWeight.Load(int4(baseIndex + int3(0, 1, 0), 0));
+    float w110 = gsModelVoteWeight.Load(int4(baseIndex + int3(1, 1, 0), 0));
+    float w001 = gsModelVoteWeight.Load(int4(baseIndex + int3(0, 0, 1), 0));
+    float w101 = gsModelVoteWeight.Load(int4(baseIndex + int3(1, 0, 1), 0));
+    float w011 = gsModelVoteWeight.Load(int4(baseIndex + int3(0, 1, 1), 0));
+    float w111 = gsModelVoteWeight.Load(int4(baseIndex + int3(1, 1, 1), 0));
+    float x00 = lerp(w000, w100, f.x);
+    float x10 = lerp(w010, w110, f.x);
+    float x01 = lerp(w001, w101, f.x);
+    float x11 = lerp(w011, w111, f.x);
+    return max(lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z), 0.0);
+}
+
+bool SampleModelNormal(float3 worldPos, out float3 normal)
+{
+    float xp = 0.0, xm = 0.0, yp = 0.0, ym = 0.0, zp = 0.0, zm = 0.0;
+    bool valid = SampleObservedTsdf(worldPos + float3(gsVoxSize, 0.0, 0.0), xp) &&
+                 SampleObservedTsdf(worldPos - float3(gsVoxSize, 0.0, 0.0), xm) &&
+                 SampleObservedTsdf(worldPos + float3(0.0, gsVoxSize, 0.0), yp) &&
+                 SampleObservedTsdf(worldPos - float3(0.0, gsVoxSize, 0.0), ym) &&
+                 SampleObservedTsdf(worldPos + float3(0.0, 0.0, gsVoxSize), zp) &&
+                 SampleObservedTsdf(worldPos - float3(0.0, 0.0, gsVoxSize), zm);
+    float3 gradient = float3(xp - xm, yp - ym, zp - zm);
+    float gradientLengthSq = dot(gradient, gradient);
+    if (!valid || gradientLengthSq <= 1e-6)
+    {
+        normal = 0.0;
+        return false;
+    }
+    normal = gradient * rsqrt(gradientLengthSq);
+    return true;
+}
+
+[numthreads(32, 1, 1)]
+void ClearModelRaycastStats(uint id : SV_DispatchThreadID)
+{
+    if (id < GS_STAT_COUNT) gsModelRaycastStats[id] = 0u;
+}
+
+[numthreads(8, 8, 1)]
+void RaycastModel(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= gsModelOutputSize)) return;
+
+    uint trackingIndex = id.x + id.y * gsModelOutputSize.x;
+    ModelTrackingPair emptyPair;
+    emptyPair.observedValid = 0.0;
+    emptyPair.modelResidual = 0.0;
+    emptyPair.normalVote = 0.0;
+    gsModelTrackingPairs[trackingIndex] = emptyPair;
+
+    InterlockedAdd(gsModelRaycastStats[0], 1u);
+    int stride = max(gsModelPixelStride, 1);
+    uint2 pixel = min(id.xy * (uint)stride + (uint)(stride / 2),
+                      gsDepthTexSize - 1u);
+    float2 uv = (float2(pixel) + 0.5) / float2(gsDepthTexSize);
+    float rawDepth = gsDepthTex.Load(int4(pixel, GS_FUSION_EYE, 0));
+    bool hasRawToken = rawDepth != 0.0;
+    bool rawDepthValid = FiniteFloat(rawDepth) && rawDepth > 0.0 && rawDepth < 1.0;
+    float3 eye = DepthEyePos();
+    float3 observedWorld = rawDepthValid
+        ? NdcToWorld(float3(uv, rawDepth))
+        : 0.0;
+    float observedRange = rawDepthValid ? length(observedWorld - eye) : 0.0;
+    bool observedWorldFinite = rawDepthValid && FiniteFloat3(observedWorld) &&
+                               FiniteFloat(observedRange);
+    bool observedTooNear = observedWorldFinite &&
+                           observedRange < gsModelMinObservedRange;
+    bool observedTooFar = observedWorldFinite &&
+                          observedRange > gsModelMaxObservedRange;
+    bool hasObservedDepth = observedWorldFinite && !observedTooNear &&
+                            !observedTooFar;
+
+    if (hasObservedDepth)
+    {
+        InterlockedAdd(gsModelRaycastStats[1], 1u);
+        InterlockedMax(gsModelRaycastStats[29],
+            (uint)min(round(observedRange * 1000.0), 65535.0));
+    }
+    else if (!rawDepthValid && hasRawToken)
+    {
+        InterlockedAdd(gsModelRaycastStats[20], 1u);
+    }
+    else if (rawDepthValid && !observedWorldFinite)
+    {
+        InterlockedAdd(gsModelRaycastStats[21], 1u);
+    }
+    else if (observedTooNear)
+    {
+        InterlockedAdd(gsModelRaycastStats[22], 1u);
+    }
+    else if (observedTooFar)
+    {
+        InterlockedAdd(gsModelRaycastStats[23], 1u);
+    }
+
+    // Projection conventions can put the far plane at either endpoint.  Pick
+    // whichever unprojected endpoint is farther from the eye.  Valid depth
+    // rays use their exact observed world point and therefore do not depend on
+    // this fallback at all.
+    float3 end0 = NdcToWorld(float3(uv, 0.0));
+    float3 end1 = NdcToWorld(float3(uv, 1.0));
+    float3 farWorld = distance(end0, eye) > distance(end1, eye) ? end0 : end1;
+    float3 direction = normalize((hasObservedDepth ? observedWorld : farWorld) - eye);
+
+    float nearT, farT;
+    if (!IntersectVolume(eye, direction, nearT, farT))
+    {
+        gsModelDepthRW[id.xy] = 0.0;
+        gsModelResidualMmRW[id.xy] = 0.0;
+        if (hasObservedDepth)
+        {
+            InterlockedAdd(gsModelRaycastStats[9], 1u);
+            InterlockedAdd(gsModelRaycastStats[17], 1u);
+        }
+        return;
+    }
+
+    bool previousObserved = false;
+    bool sawObservedSupport = false;
+    float previousTsdf = 0.0;
+    float previousT = nearT;
+    bool hit = false;
+    float modelRange = 0.0;
+    float nearestModelRange = 0.0;
+    float nearestAbsResidual = 3.402823e+37;
+    uint crossingCount = 0u;
+    float t = nearT;
+    float alternativeSearchFar = hasObservedDepth
+        ? min(farT, observedRange + max(gsVoxDist * 2.0, gsVoxSize * 2.0))
+        : nearT;
+
+    // The room volume is at most 192 voxels along its longest ray in the
+    // default configuration.  384 bounds diagonal traversal while the TSDF
+    // magnitude still permits InfiniTAM-style larger steps in free space.
+    [loop]
+    for (int stepIndex = 0; stepIndex < 384 && t <= farT; stepIndex++)
+    {
+        // Once the first visible surface is known, only continue far enough to
+        // determine whether the current observation belongs to another nearby
+        // zero crossing. This keeps the V1.4 audit bounded and read-only.
+        if (hit && (!hasObservedDepth || t > alternativeSearchFar)) break;
+
+        float value;
+        bool observed = SampleObservedTsdf(eye + direction * t, value);
+        if (observed)
+        {
+            sawObservedSupport = true;
+            if (previousObserved && previousTsdf > 0.0 && value <= 0.0)
+            {
+                float denominator = previousTsdf - value;
+                float alpha = denominator > 1e-6 ? previousTsdf / denominator : 0.0;
+                float crossingRange = lerp(previousT, t, saturate(alpha));
+                crossingCount++;
+                if (!hit)
+                {
+                    modelRange = crossingRange;
+                    hit = true;
+                }
+                if (hasObservedDepth)
+                {
+                    float crossingAbsResidual = abs(crossingRange - observedRange);
+                    if (crossingAbsResidual < nearestAbsResidual)
+                    {
+                        nearestAbsResidual = crossingAbsResidual;
+                        nearestModelRange = crossingRange;
+                    }
+                }
+            }
+            previousObserved = true;
+            previousTsdf = value;
+            previousT = t;
+            t += max(abs(value) * gsVoxDist, gsVoxSize * 0.5);
+        }
+        else
+        {
+            // Unknown space is not a surface and also breaks sign continuity.
+            previousObserved = false;
+            t += gsVoxSize;
+        }
+    }
+
+    gsModelDepthRW[id.xy] = hit ? modelRange : 0.0;
+    gsModelResidualMmRW[id.xy] = 0.0;
+    if (!hit)
+    {
+        if (hasObservedDepth)
+        {
+            InterlockedAdd(gsModelRaycastStats[9], 1u);
+            InterlockedAdd(gsModelRaycastStats[sawObservedSupport ? 19u : 18u], 1u);
+        }
+        return;
+    }
+
+    InterlockedAdd(gsModelRaycastStats[2], 1u);
+    InterlockedMax(gsModelRaycastStats[30],
+        (uint)min(round(modelRange * 1000.0), 65535.0));
+    InterlockedMax(gsModelRaycastStats[31], crossingCount);
+    if (!hasObservedDepth)
+    {
+        InterlockedAdd(gsModelRaycastStats[10], 1u);
+        return;
+    }
+
+    InterlockedAdd(gsModelRaycastStats[3], 1u);
+    float residualMm = (modelRange - observedRange) * 1000.0;
+    float absResidualMmF = abs(residualMm);
+    uint absResidualMm = (uint)min(round(absResidualMmF), 65535.0);
+    float3 modelWorld = eye + direction * modelRange;
+    float modelVoteWeight = SampleVoteWeight(eye + direction * modelRange);
+    uint modelVoteWeightX10 = (uint)min(round(modelVoteWeight * 10.0), 1000.0);
+    gsModelResidualMmRW[id.xy] = residualMm;
+    InterlockedAdd(gsModelRaycastStats[13], absResidualMm);
+    InterlockedMax(gsModelRaycastStats[16], absResidualMm);
+    InterlockedAdd(gsModelRaycastStats[36], modelVoteWeightX10);
+    InterlockedMax(gsModelRaycastStats[37], modelVoteWeightX10);
+
+    // Frame-to-model tracking witness.  The correspondence gate is wider than
+    // the CPU production quality gate: it exposes whether one coherent rigid
+    // correction can explain the discrepancy while rejecting another room
+    // layer or a metre-scale ghost.  This shader never writes TSDF; the CPU may
+    // consume the read-back decision before fusing the retained exact frame.
+    float3 modelNormal;
+    if (abs(modelRange - observedRange) <= 0.15 &&
+        SampleModelNormal(modelWorld, modelNormal))
+    {
+        float planeResidual = dot(observedWorld - modelWorld, modelNormal);
+        if (abs(planeResidual) <= 0.08)
+        {
+            ModelTrackingPair pair;
+            pair.observedValid = float4(observedWorld, 1.0);
+            pair.modelResidual = float4(modelWorld, planeResidual);
+            pair.normalVote = float4(modelNormal, modelVoteWeight);
+            gsModelTrackingPairs[trackingIndex] = pair;
+        }
+    }
+
+    if (absResidualMmF <= 10.0) InterlockedAdd(gsModelRaycastStats[4], 1u);
+    else if (absResidualMmF <= 30.0) InterlockedAdd(gsModelRaycastStats[5], 1u);
+    else if (absResidualMmF <= 60.0) InterlockedAdd(gsModelRaycastStats[6], 1u);
+    else if (absResidualMmF <= 120.0) InterlockedAdd(gsModelRaycastStats[7], 1u);
+    else InterlockedAdd(gsModelRaycastStats[8], 1u);
+
+    if (absResidualMmF > 30.0)
+    {
+        uint maturityBucket = modelVoteWeight < 10.0 ? 32u :
+                              (modelVoteWeight < 50.0 ? 33u :
+                              (modelVoteWeight < 99.5 ? 34u : 35u));
+        InterlockedAdd(gsModelRaycastStats[maturityBucket], 1u);
+        float observedPointTsdf;
+        bool observedPointSupported = SampleObservedTsdf(observedWorld,
+                                                          observedPointTsdf);
+        InterlockedAdd(gsModelRaycastStats[observedPointSupported ? 38u : 39u], 1u);
+    }
+
+    // Negative means the stored model stands in front of the current Quest
+    // observation; positive means it sits behind it.
+    if (residualMm < -10.0)
+    {
+        InterlockedAdd(gsModelRaycastStats[11], 1u);
+        InterlockedAdd(gsModelRaycastStats[14], absResidualMm);
+    }
+    else if (residualMm > 10.0)
+    {
+        InterlockedAdd(gsModelRaycastStats[12], 1u);
+        InterlockedAdd(gsModelRaycastStats[15], absResidualMm);
+    }
+
+    if (crossingCount > 1u) InterlockedAdd(gsModelRaycastStats[24], 1u);
+    float nearestResidualMmF = nearestAbsResidual * 1000.0;
+    uint nearestResidualMm = (uint)min(round(nearestResidualMmF), 65535.0);
+    if (nearestResidualMmF <= 30.0) InterlockedAdd(gsModelRaycastStats[26], 1u);
+    InterlockedAdd(gsModelRaycastStats[27], nearestResidualMm);
+    InterlockedMax(gsModelRaycastStats[28], nearestResidualMm);
+
+    // A different crossing only counts as explanatory when it improves the
+    // observation match by more than 10 mm. Tiny interpolation differences do
+    // not masquerade as a layer-selection failure.
+    if (abs(nearestModelRange - modelRange) > gsVoxSize * 0.25 &&
+        absResidualMmF - nearestResidualMmF > 10.0)
+        InterlockedAdd(gsModelRaycastStats[25], 1u);
+}

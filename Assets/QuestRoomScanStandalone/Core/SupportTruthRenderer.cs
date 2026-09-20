@@ -157,6 +157,8 @@ namespace Genesis.RoomScan
         }
 
         public bool IsReady => _ready;
+        public int TopologyTriangleCount => (int)_lastTopologyTriangleCount;
+        public int CrossingPointCount => (int)_lastPointCount;
         public string StatsCompact => !_ready
             ? "纸无"
             : $"点{_lastPointCount} 三{_lastTopologyTriangleCount}" +
@@ -350,8 +352,12 @@ namespace Genesis.RoomScan
         private void Update()
         {
             if (!_ready || !_visible || Time.unscaledTime < _nextExtractTime) return;
-            var volume = VolumeIntegrator.Instance != null ? VolumeIntegrator.Instance.Volume : null;
-            if (volume == null || !volume.IsCreated()) return;
+            var volume = VolumeIntegrator.Instance != null
+                ? VolumeIntegrator.Instance.Volume
+                : null;
+            if (volume == null ||
+                (volume is RenderTexture renderTexture && !renderTexture.IsCreated()))
+                return;
 
             _nextExtractTime = Time.unscaledTime + 1f / _hz;
             SnapshotBuffers oldFront = _front;

@@ -191,6 +191,11 @@ namespace Genesis.RoomScan
             public uint BuiltEpoch;
             public uint ProcessedEpoch;
             public uint CandidateEpoch;
+            // TSDF geometry and post-TSDF product constraints have independent
+            // lifetimes.  A ruler/court update may need to rebuild this block
+            // without advancing the TSDF dirty epoch.
+            public uint TargetProductRevision;
+            public uint CandidateProductRevision;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
             public float CommittedAtRealtime;
@@ -202,6 +207,10 @@ namespace Genesis.RoomScan
             public bool Built;
             public bool CommitPending;
             public float CommitPendingSince;
+            // Every asynchronous product request owns one serial.  The watchdog
+            // invalidates it before retrying so a late callback cannot publish
+            // an older block over the replacement.
+            public int CommitSerial;
             public bool FrozenSnapshotSealed;
             // Live 32^3 pages are repeatable producers.  Keep their temporal
             // extraction worker and spatial front across commits; only the
@@ -270,6 +279,10 @@ namespace Genesis.RoomScan
             public readonly uint[] VisualSpatialFlags = new uint[SpatialLedgerBinCount * VisualFlagCount];
             public readonly uint[] VisualPlaneAccum = new uint[SpatialLedgerBinCount * VisualPlaneAccumStride];
             public readonly uint[] VisualPlaneModel = new uint[SpatialLedgerBinCount * VisualPlaneModelStride];
+            public readonly uint[] StageCrossingPlaneAccum = new uint[SpatialLedgerBinCount * VisualPlaneAccumStride];
+            public readonly uint[] StageCrossingPlaneModel = new uint[SpatialLedgerBinCount * VisualPlaneModelStride];
+            public readonly uint[] StageRawPlaneAccum = new uint[SpatialLedgerBinCount * VisualPlaneAccumStride];
+            public readonly uint[] StageRawPlaneModel = new uint[SpatialLedgerBinCount * VisualPlaneModelStride];
             public readonly uint[] BoundaryFingerprint = new uint[VisualBoundaryFingerprintCount];
             public uint VisualTotal;
             public readonly uint[] AcceptedSpatialMature = new uint[SpatialLedgerBinCount];
@@ -348,6 +361,9 @@ namespace Genesis.RoomScan
         private readonly int _layer;
         private readonly Config _config;
         private readonly Action<GPUSurfaceNets> _extract;
+        private readonly SurfaceProductizer _productizer;
+        private readonly ChunkQualityGate _qualityGate = new ChunkQualityGate();
+        private readonly Vector4[] _productConstraintChanges = new Vector4[64];
         private readonly struct QueueEntry
         {
             public readonly int Index;
@@ -371,6 +387,10 @@ namespace Genesis.RoomScan
         private bool _ownerLedgerReady;
         private bool _boundaryLedgerReady;
         private bool _ledgerRequestFailed;
+        private bool _finalDrainActive;
+        private bool _finalDrainLedgerSettled;
+        private bool _finalDrainRequestInFlight;
+        private bool _fullOutputAuditActive;
         private uint[] _ownerEpochSnapshot;
         private uint[] _boundaryEpochSnapshot;
         private bool _disposed;
@@ -467,9 +487,15 @@ namespace Genesis.RoomScan
         private const int VisualPlaneModelBase = 3307;
         private const int VisualPlaneModelStride = 6;
         private const int VisualBoundaryBase = 3691;
-        private const int VisualBoundaryFaceResolution = 33;
+        private const int VisualBoundaryFaceResolution = 65;
         private const int VisualBoundaryFaceCells = VisualBoundaryFaceResolution * VisualBoundaryFaceResolution;
         private const int VisualBoundaryFingerprintCount = 6 * VisualBoundaryFaceCells;
+        private const int StageResponsibilityCounterCount = 2048;
+        private const int StageResponsibilityBase64 = 29041;
+        private const int StageCrossingPlaneAccumOffset = 0;
+        private const int StageCrossingPlaneModelOffset = 640;
+        private const int StageRawPlaneAccumOffset = 1024;
+        private const int StageRawPlaneModelOffset = 1664;
         // A few early triangles are usually a fragment, not an established
         // surface.  Protection starts only after a dense bin and one of its
         // face-neighbours have remained coherent for several accepted passes.
@@ -500,6 +526,21 @@ namespace Genesis.RoomScan
         {
             public ulong Sequence;
             public float Realtime;
+            public int UnityFrame;
+            public double ScaledTime;
+            public double UnscaledTime;
+            public int PlatformFrame;
+            public int IntegrationCount;
+            public uint DirtyEpoch;
+            public bool HeadAvailable;
+            public Vector3 HeadPosition;
+            public Quaternion HeadRotation;
+            public Vector3 HeadEuler;
+            public Vector3 ChunkCenterWorld;
+            public float HeadToChunkCenterM;
+            public float AngularDegPerSec;
+            public float LinearMps;
+            public float QueueToDecisionMs;
             public int3 Chunk;
             public uint Epoch;
             public bool Initial;
@@ -524,10 +565,41 @@ namespace Genesis.RoomScan
             public int AdditivePass;
         }
 
+        private struct LocalQualityBinEvent
+        {
+            public ulong ReplacementSequence;
+            public int3 Chunk;
+            public uint Epoch;
+            public bool Initial;
+            public int Bin;
+            public long Triangles;
+            public uint CrossingSamples;
+            public bool CrossingCandidate;
+            public float CrossingRmsVox;
+            public uint RawVertices;
+            public bool RawCandidate;
+            public float RawRmsVox;
+            public uint FinalVertices;
+            public bool FinalCandidate;
+            public float FinalRmsVox;
+            public byte FirstDeformationStage;
+        }
+
         private readonly List<LocalReplacementEvent> _localReplacementEvents = new List<LocalReplacementEvent>(1024);
+        private readonly List<LocalQualityBinEvent> _localQualityBinEvents =
+            new List<LocalQualityBinEvent>(8192);
         private const int MaxLocalReplacementEvents = 65536;
+        private const int MaxLocalQualityBinEvents = 131072;
+        // Match the mature XR mesh-manager contract: bound asynchronous mesh
+        // generation globally instead of launching MaxChunksPerTick again on
+        // every frame while older GPU readbacks are still in flight.
+        private const int MaximumConcurrentProductCommits = 4;
+        private uint _productConstraintRevision = 1u;
         private ulong _localReplacementSequence;
         private ulong _localReplacementDroppedEvents;
+        private ulong _localQualityBinDroppedEvents;
+        public ulong LocalReplacementDroppedEventCount => _localReplacementDroppedEvents;
+        public ulong LocalQualityBinDroppedEventCount => _localQualityBinDroppedEvents;
         private ulong _localInitialPublishes;
         private ulong _localAcceptedCandidates;
         private ulong _localRejectedCandidates;
@@ -550,6 +622,13 @@ namespace Genesis.RoomScan
         public bool Failed { get; private set; }
         public string FailureReason { get; private set; }
         public int PendingChunkCount => _urgentQueue.Count + _dirtyQueue.Count;
+        /// <summary>
+        /// True only after an A-key seal has sampled the dirty ledger once after
+        /// scanning stopped and all resulting extraction/commit work has landed.
+        /// </summary>
+        public bool FinalDrainComplete =>
+            _finalDrainActive && _finalDrainLedgerSettled && !_readbackPending &&
+            PendingChunkCount == 0 && CommitPendingCount == 0;
         // ── 计时账（EMA 平滑，α=0.25）──
         private float _emaQueueToCommitMs = -1f;
         private float _emaDispatchToCallbackMs = -1f;
@@ -603,6 +682,55 @@ namespace Genesis.RoomScan
                     count += _chunks[i].AcceptedIndices / 3;
                 return count;
             }
+        }
+
+        public int VisualQualityPageCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < _chunks.Count; i++)
+                    if (_chunks[i].Built && _chunks[i].VisualTotal > 0u) count++;
+                return count;
+            }
+        }
+
+        /// <summary>
+        /// Bind the expensive per-triangle shape counters to the same explicit
+        /// full-output session that owns the paper replacement ledger.  This
+        /// avoids global capture timing deciding whether a committed page has
+        /// usable within-page relief data.
+        /// </summary>
+        public void SetFullOutputAuditActive(bool active)
+        {
+            if (!_config.FoundationAtomicReplacement)
+                return;
+            _fullOutputAuditActive = active;
+            for (int i = 0; i < _chunks.Count; i++)
+                if (_chunks[i].Surface != null)
+                    _chunks[i].Surface.VisualQualityDiagnosticsEnabled = active;
+        }
+
+        /// <summary>
+        /// Start an explicit post-scan settlement.  An already in-flight
+        /// periodic readback is allowed to finish but cannot satisfy the seal;
+        /// the drain always requests one fresh dirty-ledger snapshot after A.
+        /// </summary>
+        public void BeginFinalDrain()
+        {
+            if (_disposed || Failed || _config.StaticReplay)
+                return;
+            _finalDrainActive = true;
+            _finalDrainLedgerSettled = false;
+            _finalDrainRequestInFlight = false;
+            _nextReadbackTime = 0f;
+        }
+
+        public void EndFinalDrain()
+        {
+            _finalDrainActive = false;
+            _finalDrainLedgerSettled = false;
+            _finalDrainRequestInFlight = false;
         }
 
         /// <summary>
@@ -692,6 +820,8 @@ namespace Genesis.RoomScan
             _layer = layer;
             _config = config;
             _extract = extract ?? throw new ArgumentNullException(nameof(extract));
+            if (_config.FoundationAtomicReplacement)
+                _productizer = new SurfaceProductizer(parent, _volume);
 
             _volume.SetDirtyBoundaryHalo(config.HaloVoxels);
             BuildLayout();
@@ -706,13 +836,20 @@ namespace Genesis.RoomScan
             if (_disposed || Failed)
                 return;
 
+            if (_config.FoundationAtomicReplacement)
+                QueueChangedProductConstraints();
+
             // Surface workers retain the mature-triangle ledger.  Treating an
             // idle worker as disposable cache would make an out-of-view chunk
             // forget its accepted surface and relearn it from an empty state.
-            if (!_config.StaticReplay)
+            if (!_config.StaticReplay &&
+                (!_finalDrainActive || !_finalDrainLedgerSettled))
                 RequestDirtyLedgerIfDue();
 
             int budget = _config.MaxChunksPerTick;
+            if (_config.FoundationAtomicReplacement)
+                budget = Mathf.Min(budget, Mathf.Max(0,
+                    MaximumConcurrentProductCommits - CommitPendingCount));
             while (budget-- > 0 && (_urgentQueue.Count > 0 || _dirtyQueue.Count > 0))
             {
                 QueueEntry entry = _urgentQueue.Count > 0
@@ -739,16 +876,23 @@ namespace Genesis.RoomScan
                 try
                 {
                     EnsureChunkResources(chunk);
+                    if (_config.FoundationAtomicReplacement)
+                        chunk.Surface.VisualQualityDiagnosticsEnabled =
+                            _fullOutputAuditActive;
                     if (chunk.CommitPending)
                         continue;
                     uint candidateEpoch = chunk.TargetEpoch;
+                    uint candidateProductRevision = chunk.TargetProductRevision;
                     chunk.CandidateLiveProgressive = chunk.LiveProgressive;
                     _extract(chunk.Surface);
                     chunk.Renderer.UpdateBounds(GetPaddedCoreBounds(chunk));
                     chunk.CandidateEpoch = candidateEpoch;
+                    chunk.CandidateProductRevision = candidateProductRevision;
                     chunk.CommitPending = true;
                     chunk.CommitPendingSince = Time.time;
-                    RequestCandidateCommit(chunk, candidateEpoch);
+                    int commitSerial = ++chunk.CommitSerial;
+                    RequestCandidateCommit(chunk, candidateEpoch,
+                        candidateProductRevision, commitSerial);
                 }
                 catch (Exception ex)
                 {
@@ -765,6 +909,9 @@ namespace Genesis.RoomScan
                 Chunk chunk = _chunks[i];
                 if (chunk.CommitPending && Time.time - chunk.CommitPendingSince > 10f)
                 {
+                    // Retire the abandoned request before another one is
+                    // dispatched. Its callback may still arrive later.
+                    chunk.CommitSerial++;
                     chunk.CommitPending = false;
                     chunk.ForceQueueAfterCommit = false;
                     CommitWatchdogResets++;
@@ -1065,10 +1212,11 @@ namespace Genesis.RoomScan
                 TemporalDeadzone = _config.TemporalDeadzone,
                 StrictObservedEdges = false,
                 CandidateHistoryUpdateEnabled = true,
-                // Full triangle-shape atomics run only in frozen/static replay.
-                // Live production keeps only the lightweight TSDF spatial monitor,
-                // so observing quality cannot itself increase page publication debt.
-                VisualQualityDiagnosticsEnabled = _config.StaticReplay,
+                // The production paper enables its read-only final-shape pass
+                // only while a full-output session is capturing/draining.
+                VisualQualityDiagnosticsEnabled = _config.StaticReplay ||
+                    (_config.FoundationAtomicReplacement &&
+                     _fullOutputAuditActive),
                 DiagnosticRoiEnabled = _config.DiagnosticRoiEnabled,
                 DiagnosticRoiRect = _config.DiagnosticRoiRect,
                 DiagnosticRoiSplitX = _config.DiagnosticRoiSplitX
@@ -1095,16 +1243,25 @@ namespace Genesis.RoomScan
                 chunk.Surface.FoundationNormalClusterDotMin = 0.8660254f; // 30 degrees
                 chunk.Surface.FoundationCornerNormalDotMax = 0.7071068f;  // 45 degrees
                 chunk.Surface.FoundationChamferWidthVoxels = 0f;
-                // Keep the old conditional 5->10 collapse disabled.  The
-                // diagnostic baseline must remain uniformly native 5 cm rather
-                // than reintroducing a mixed 5/10 cm display.
+                // Keep the native Surface-Nets index topology intact. The
+                // former 2x2x2 representative alias rewired several cell
+                // corners to one vertex without rebuilding the surrounding
+                // quads, producing degenerate/long triangles and real holes.
+                // The 10 cm product grid is now presentation-only in the mesh
+                // shader, over this complete depth-faithful surface.
                 chunk.Surface.FoundationConstrainedSimplification = false;
                 chunk.Surface.FoundationSimplifyNormalDotMin = 0.9659258f; // 15 degrees
                 chunk.Surface.FoundationSimplifyPlaneResidualVoxels = 0.2f; // ~1 cm
+                // A one-voxel read-halo overlap is the visible mesh-block skirt:
+                // adjacent products overlap using the same authoritative TSDF,
+                // masking sub-frame commit skew without inventing geometry or
+                // feeding the overlap back into fusion/adjudication.
+                chunk.Surface.FoundationVisibleSkirtVoxels = 1;
                 chunk.Surface.SmoothIterations = 0;
                 chunk.Surface.TemporalAlphaMax = 1f;
                 chunk.Surface.TemporalAlphaMin = 1f;
-                chunk.Surface.VisualQualityDiagnosticsEnabled = false;
+                chunk.Surface.VisualQualityDiagnosticsEnabled =
+                    ScanReplaySessionPackage.FullOutputLedgerActive;
             }
             chunk.Surface.EnsureBuffers(
                 _volume.VoxelCount,
@@ -1123,6 +1280,8 @@ namespace Genesis.RoomScan
                 chunk.Renderer.GpuMeshMaterial = _material;
                 chunk.Renderer.Initialize(chunk.Surface, GetPaddedCoreBounds(chunk));
                 chunk.Renderer.SetStrictObservedDisplay(false);
+                chunk.Renderer.SetProductGridDisplay(
+                    _config.FoundationAtomicReplacement);
                 if (_config.StaticReplay && _config.HeraFilterCleanTriangles)
                     chunk.Renderer.SetHeraReplayDisplay(_diagnosticColoring);
                 else if (_config.StaticReplay)
@@ -1160,12 +1319,14 @@ namespace Genesis.RoomScan
             }
         }
 
-        private void RequestCandidateCommit(Chunk chunk, uint candidateEpoch)
+        private void RequestCandidateCommit(Chunk chunk, uint candidateEpoch,
+            uint candidateProductRevision, int commitSerial)
         {
             int requestGeneration = _generation;
             AsyncGPUReadback.Request(chunk.Surface.CountersBuffer, request =>
             {
-                if (_disposed || requestGeneration != _generation)
+                if (_disposed || requestGeneration != _generation ||
+                    commitSerial != chunk.CommitSerial)
                     return;
 
                 // 计时账：派发→首个回读回调的往返。
@@ -1185,6 +1346,17 @@ namespace Genesis.RoomScan
                 var counters = request.GetData<uint>();
                 int vertices = counters.Length > 0 ? (int)counters[0] : 0;
                 int indices = counters.Length > 1 ? (int)counters[1] : 0;
+                // The block changed again while this candidate was being
+                // extracted/read back. Keep the current immutable front and
+                // go straight to the latest epoch; an obsolete async result
+                // must never flash on screen merely because it finished first.
+                if (_config.FoundationAtomicReplacement &&
+                    (candidateEpoch < chunk.TargetEpoch ||
+                     candidateProductRevision < chunk.TargetProductRevision))
+                {
+                    FinishCandidateCommit(chunk, candidateEpoch);
+                    return;
+                }
                 if (_config.StaticReplay)
                     CaptureStaticReplayPage(chunk, counters, indices);
                 var spatialMature = new uint[SpatialLedgerBinCount];
@@ -1208,16 +1380,37 @@ namespace Genesis.RoomScan
                 }
                 if (_config.FoundationAtomicReplacement)
                 {
-                    // One completed candidate replaces exactly one chunk front.
-                    // No append-only salvage, maturity colour, or old topology
-                    // survives this transaction. The previous immutable front
-                    // remains visible until CopyCurrentMeshTo has been queued.
+                    // Product admission is deliberately downstream of the one
+                    // TSDF.  A completed raw candidate is not automatically a
+                    // visible product: stale, empty and abruptly regressive
+                    // rebuilds retain the previous immutable front.
+                    CaptureVisualQualityPage(chunk, counters);
+                    GPUChunkMeshSnapshot product = _productizer != null
+                        ? _productizer.Build(chunk.Surface, vertices, indices,
+                            chunk.Surface.GetCoreBounds(_volume.VoxelSize),
+                            _volume.VoxelSize)
+                        : null;
+                    ChunkQualityGate.Decision decision = _qualityGate.Evaluate(
+                        chunk.Index, candidateEpoch, vertices,
+                        indices, chunk.Built && chunk.Snapshot != null &&
+                        chunk.AcceptedIndices > 0,
+                        chunk.AcceptedSpatialOccupancy, spatialOccupancy);
                     RecordLocalReplacement(
                         chunk, candidateEpoch, vertices, indices, spatialOccupancy,
-                        true, "foundation_atomic_replace");
-                    PublishFullCandidate(
-                        chunk, candidateEpoch, vertices, indices,
-                        spatialMature, spatialOccupancy);
+                        decision.Publish, decision.Reason,
+                        qualitySnapshotAvailable: true);
+                    if (decision.Publish)
+                    {
+                        PublishFullCandidate(
+                            chunk, candidateEpoch, vertices, indices,
+                            spatialMature, spatialOccupancy, product);
+                        _qualityGate.RecordPublished(chunk.Index, candidateEpoch,
+                            vertices, indices, decision.State);
+                    }
+                    else
+                    {
+                        product?.Dispose();
+                    }
                     FinishCandidateCommit(chunk, candidateEpoch);
                     return;
                 }
@@ -1236,7 +1429,8 @@ namespace Genesis.RoomScan
                         CaptureVisualQualityPage(chunk, counters);
                     RecordLocalReplacement(
                         chunk, candidateEpoch, vertices, indices, spatialOccupancy,
-                        true, "accepted");
+                        true, "accepted",
+                        qualitySnapshotAvailable: _config.StaticReplay);
                     PublishFullCandidate(
                         chunk, candidateEpoch, vertices, indices,
                         spatialMature, spatialOccupancy);
@@ -1788,12 +1982,14 @@ namespace Genesis.RoomScan
             int vertices,
             int indices,
             uint[] spatialMature,
-            uint[] spatialOccupancy)
+            uint[] spatialOccupancy,
+            GPUChunkMeshSnapshot preparedProduct = null)
         {
             // Publish a complete replacement, then retire the old front
             // buffer. Rendering never observes a cleared/half-copied mesh.
-            var nextSnapshot = new GPUChunkMeshSnapshot();
-            chunk.Surface.CopyCurrentMeshTo(nextSnapshot, vertices, indices);
+            var nextSnapshot = preparedProduct ?? new GPUChunkMeshSnapshot();
+            if (preparedProduct == null)
+                chunk.Surface.CopyCurrentMeshTo(nextSnapshot, vertices, indices);
             GPUChunkMeshSnapshot previousSnapshot = chunk.Snapshot;
             chunk.Snapshot = nextSnapshot;
             chunk.Renderer.SetMeshSource(nextSnapshot);
@@ -1863,6 +2059,28 @@ namespace Genesis.RoomScan
             CopyCounterRange(counters, VisualPlaneAccumBase, chunk.VisualPlaneAccum);
             CopyCounterRange(counters, VisualPlaneModelBase, chunk.VisualPlaneModel);
             CopyCounterRange(counters, VisualBoundaryBase, chunk.BoundaryFingerprint);
+            if (counters.Length >= StageResponsibilityBase64 + StageResponsibilityCounterCount)
+            {
+                CopyCounterRange(counters,
+                    StageResponsibilityBase64 + StageCrossingPlaneAccumOffset,
+                    chunk.StageCrossingPlaneAccum);
+                CopyCounterRange(counters,
+                    StageResponsibilityBase64 + StageCrossingPlaneModelOffset,
+                    chunk.StageCrossingPlaneModel);
+                CopyCounterRange(counters,
+                    StageResponsibilityBase64 + StageRawPlaneAccumOffset,
+                    chunk.StageRawPlaneAccum);
+                CopyCounterRange(counters,
+                    StageResponsibilityBase64 + StageRawPlaneModelOffset,
+                    chunk.StageRawPlaneModel);
+            }
+            else
+            {
+                Array.Clear(chunk.StageCrossingPlaneAccum, 0, chunk.StageCrossingPlaneAccum.Length);
+                Array.Clear(chunk.StageCrossingPlaneModel, 0, chunk.StageCrossingPlaneModel.Length);
+                Array.Clear(chunk.StageRawPlaneAccum, 0, chunk.StageRawPlaneAccum.Length);
+                Array.Clear(chunk.StageRawPlaneModel, 0, chunk.StageRawPlaneModel.Length);
+            }
             chunk.VisualTotal = counters.Length > VisualTotalIndex
                 ? counters[VisualTotalIndex]
                 : 0u;
@@ -1878,6 +2096,10 @@ namespace Genesis.RoomScan
             Array.Clear(chunk.VisualSpatialFlags, 0, chunk.VisualSpatialFlags.Length);
             Array.Clear(chunk.VisualPlaneAccum, 0, chunk.VisualPlaneAccum.Length);
             Array.Clear(chunk.VisualPlaneModel, 0, chunk.VisualPlaneModel.Length);
+            Array.Clear(chunk.StageCrossingPlaneAccum, 0, chunk.StageCrossingPlaneAccum.Length);
+            Array.Clear(chunk.StageCrossingPlaneModel, 0, chunk.StageCrossingPlaneModel.Length);
+            Array.Clear(chunk.StageRawPlaneAccum, 0, chunk.StageRawPlaneAccum.Length);
+            Array.Clear(chunk.StageRawPlaneModel, 0, chunk.StageRawPlaneModel.Length);
             Array.Clear(chunk.BoundaryFingerprint, 0, chunk.BoundaryFingerprint.Length);
             chunk.VisualTotal = 0u;
         }
@@ -2439,7 +2661,8 @@ namespace Genesis.RoomScan
             uint skippedImmatureTriangles = 0u,
             int snapshotVertices = -1,
             int snapshotIndices = -1,
-            int additivePass = 0)
+            int additivePass = 0,
+            bool qualitySnapshotAvailable = false)
         {
             bool initial = !chunk.Built;
             uint oldCells = 0;
@@ -2483,10 +2706,39 @@ namespace Genesis.RoomScan
                 suspectedMovedCells += Math.Min(binLost, binAdded);
             }
 
+            DepthCapture depth = DepthCapture.Instance;
+            VolumeIntegrator volume = VolumeIntegrator.Instance;
+            Camera head = Camera.main;
+            Bounds coreBounds = chunk.Surface.GetCoreBounds(_volume.VoxelSize);
+            Transform pageTransform = chunk.GameObject != null
+                ? chunk.GameObject.transform
+                : _parent;
+            Vector3 chunkCenterWorld = pageTransform != null
+                ? pageTransform.TransformPoint(coreBounds.center)
+                : coreBounds.center;
             var entry = new LocalReplacementEvent
             {
                 Sequence = ++_localReplacementSequence,
                 Realtime = Time.realtimeSinceStartup,
+                UnityFrame = Time.frameCount,
+                ScaledTime = Time.timeAsDouble,
+                UnscaledTime = Time.unscaledTimeAsDouble,
+                PlatformFrame = depth != null ? depth.CurrentPlatformFrame : -1,
+                IntegrationCount = volume != null ? volume.IntegrationCount : -1,
+                DirtyEpoch = volume != null ? volume.DirtyEpoch : 0u,
+                HeadAvailable = head != null,
+                HeadPosition = head != null ? head.transform.position : Vector3.zero,
+                HeadRotation = head != null ? head.transform.rotation : Quaternion.identity,
+                HeadEuler = head != null ? head.transform.eulerAngles : Vector3.zero,
+                ChunkCenterWorld = chunkCenterWorld,
+                HeadToChunkCenterM = head != null
+                    ? Vector3.Distance(head.transform.position, chunkCenterWorld)
+                    : float.NaN,
+                AngularDegPerSec = depth != null ? depth.SmoothedDepthAngularSpeed : 0f,
+                LinearMps = depth != null ? depth.SmoothedDepthLinearSpeed : 0f,
+                QueueToDecisionMs = chunk.QueuedAt > 0f
+                    ? Mathf.Max(0f, (Time.time - chunk.QueuedAt) * 1000f)
+                    : -1f,
                 Chunk = chunk.Coordinate,
                 Epoch = candidateEpoch,
                 Initial = initial,
@@ -2521,6 +2773,9 @@ namespace Genesis.RoomScan
             else
                 _localReplacementDroppedEvents++;
 
+            if (accepted && qualitySnapshotAvailable)
+                RecordLocalQualityBins(entry, chunk);
+
             if (initial)
             {
                 if (accepted) _localInitialPublishes++;
@@ -2552,6 +2807,61 @@ namespace Genesis.RoomScan
             }
         }
 
+        private void RecordLocalQualityBins(LocalReplacementEvent replacement,
+            Chunk chunk)
+        {
+            const float materialResidualVox = 0.20f;
+            for (int bin = 0; bin < SpatialLedgerBinCount; bin++)
+            {
+                int primaryBase = bin * VisualPrimaryCount;
+                long triangles = 0;
+                for (int i = 0; i < VisualPrimaryCount; i++)
+                    triangles += chunk.VisualSpatialPrimary[primaryBase + i];
+                if (triangles == 0) continue;
+
+                ReadPlaneStage(chunk.StageCrossingPlaneAccum,
+                    chunk.StageCrossingPlaneModel, bin,
+                    out uint crossingSamples, out bool crossingCandidate,
+                    out float crossingRms, out _);
+                ReadPlaneStage(chunk.StageRawPlaneAccum,
+                    chunk.StageRawPlaneModel, bin,
+                    out uint rawVertices, out bool rawCandidate,
+                    out float rawRms, out _);
+                ReadPlaneStage(chunk.VisualPlaneAccum,
+                    chunk.VisualPlaneModel, bin,
+                    out uint finalVertices, out bool finalCandidate,
+                    out float finalRms, out _);
+                int category = FirstDeformationCategory(
+                    crossingCandidate, crossingRms, rawCandidate, rawRms,
+                    finalCandidate, finalRms, materialResidualVox);
+
+                if (_localQualityBinEvents.Count >= MaxLocalQualityBinEvents)
+                {
+                    _localQualityBinDroppedEvents++;
+                    continue;
+                }
+                _localQualityBinEvents.Add(new LocalQualityBinEvent
+                {
+                    ReplacementSequence = replacement.Sequence,
+                    Chunk = replacement.Chunk,
+                    Epoch = replacement.Epoch,
+                    Initial = replacement.Initial,
+                    Bin = bin,
+                    Triangles = triangles,
+                    CrossingSamples = crossingSamples,
+                    CrossingCandidate = crossingCandidate,
+                    CrossingRmsVox = crossingRms,
+                    RawVertices = rawVertices,
+                    RawCandidate = rawCandidate,
+                    RawRmsVox = rawRms,
+                    FinalVertices = finalVertices,
+                    FinalCandidate = finalCandidate,
+                    FinalRmsVox = finalRms,
+                    FirstDeformationStage = (byte)category
+                });
+            }
+        }
+
         private static uint PopCount(uint value)
         {
             value -= (value >> 1) & 0x55555555u;
@@ -2562,8 +2872,10 @@ namespace Genesis.RoomScan
         public void ResetLocalReplacementLedger()
         {
             _localReplacementEvents.Clear();
+            _localQualityBinEvents.Clear();
             _localReplacementSequence = 0;
             _localReplacementDroppedEvents = 0;
+            _localQualityBinDroppedEvents = 0;
             _localInitialPublishes = 0;
             _localAcceptedCandidates = 0;
             _localRejectedCandidates = 0;
@@ -2753,16 +3065,156 @@ namespace Genesis.RoomScan
                 }
             }
 
+            AppendStageResponsibilityReport(sb);
             AppendBoundarySeamReport(sb);
+        }
+
+        private void AppendStageResponsibilityReport(StringBuilder sb)
+        {
+            const float materialResidualVox = 0.20f;
+            string[] categories =
+            {
+                "tsdf_zero_crossing", "surface_nets_cell_reduction",
+                "post_extract_transform", "no_material_final_deformation",
+                "not_comparable"
+            };
+            var categoryBins = new long[categories.Length];
+            var categoryTriangles = new long[categories.Length];
+            bool foundation = _config.FoundationAtomicReplacement;
+            int effectiveSmoothIterations = foundation ? 0 : _config.SmoothIterations;
+            float effectiveTemporalAlphaMax = foundation ? 1f : _config.TemporalAlphaMax;
+            bool postExtractTransformEnabled = effectiveSmoothIterations > 0 ||
+                                               effectiveTemporalAlphaMax < 1f;
+
+            sb.AppendLine("stage_responsibility_contract:");
+            sb.AppendLine("scope=same_candidate_same_built_epoch_same_page_local_4x4x4_bin;read_only=true;production_gating=false");
+            sb.AppendLine("stages=tsdf_edge_zero_crossings|raw_surface_nets_cell_representatives|final_committed_candidate");
+            sb.AppendLine("first_divergence_threshold_voxel=" +
+                          materialResidualVox.ToString("F2", CultureInfo.InvariantCulture));
+            sb.AppendLine("effective_smoothing_iterations=" + effectiveSmoothIterations);
+            sb.AppendLine("effective_temporal_alpha_max=" +
+                          effectiveTemporalAlphaMax.ToString("R", CultureInfo.InvariantCulture));
+            sb.AppendLine("post_extract_transform_enabled=" + (postExtractTransformEnabled ? 1 : 0));
+            sb.AppendLine("raw_equals_final_by_production_contract=" +
+                          (!postExtractTransformEnabled ? 1 : 0));
+            sb.AppendLine("interpretation=the_first_stage_at_or_above_0.20_voxel_is_the_first_material_in_page_deformation;not_comparable_never_convicts_a_stage");
+            sb.AppendLine("stage_responsibility_spatial_csv:");
+            sb.AppendLine("chunk_x,chunk_y,chunk_z,built_epoch,bin_x,bin_y,bin_z,local_min_x_m,local_min_y_m,local_min_z_m,local_max_x_m,local_max_y_m,local_max_z_m,triangles,crossing_samples,crossing_plane_candidate,crossing_plane_rms_vox,crossing_plane_thin_ratio,raw_vertices,raw_plane_candidate,raw_plane_rms_vox,raw_plane_thin_ratio,final_vertices,final_plane_candidate,final_plane_rms_vox,final_plane_thin_ratio,first_deformation_stage");
+
+            int3 volumeCount = _volume.VoxelCount;
+            float voxelSize = _volume.VoxelSize;
+            for (int i = 0; i < _chunks.Count; i++)
+            {
+                Chunk chunk = _chunks[i];
+                if (!chunk.Built || chunk.VisualTotal == 0u) continue;
+                int3 extent = math.max(chunk.CoreMax - chunk.CoreMin, new int3(1));
+                for (int bin = 0; bin < SpatialLedgerBinCount; bin++)
+                {
+                    int primaryBase = bin * VisualPrimaryCount;
+                    long binTriangles = 0;
+                    for (int n = 0; n < VisualPrimaryCount; n++)
+                        binTriangles += chunk.VisualSpatialPrimary[primaryBase + n];
+                    if (binTriangles == 0) continue;
+
+                    ReadPlaneStage(chunk.StageCrossingPlaneAccum,
+                        chunk.StageCrossingPlaneModel, bin,
+                        out uint crossingSamples, out bool crossingCandidate,
+                        out float crossingRms, out float crossingThin);
+                    ReadPlaneStage(chunk.StageRawPlaneAccum,
+                        chunk.StageRawPlaneModel, bin,
+                        out uint rawVertices, out bool rawCandidate,
+                        out float rawRms, out float rawThin);
+                    ReadPlaneStage(chunk.VisualPlaneAccum,
+                        chunk.VisualPlaneModel, bin,
+                        out uint finalVertices, out bool finalCandidate,
+                        out float finalRms, out float finalThin);
+
+                    int category = FirstDeformationCategory(
+                        crossingCandidate, crossingRms,
+                        rawCandidate, rawRms,
+                        finalCandidate, finalRms,
+                        materialResidualVox);
+                    categoryBins[category]++;
+                    categoryTriangles[category] += binTriangles;
+
+                    int3 binCoord = new int3(bin & 3, (bin >> 2) & 3, (bin >> 4) & 3);
+                    int3 voxelMin = chunk.CoreMin + (extent * binCoord) / 4;
+                    int3 voxelMax = chunk.CoreMin + (extent * (binCoord + 1)) / 4;
+                    float3 localMin = ((float3)voxelMin - (float3)volumeCount * 0.5f) * voxelSize;
+                    float3 localMax = ((float3)voxelMax - (float3)volumeCount * 0.5f) * voxelSize;
+
+                    sb.Append(chunk.Coordinate.x).Append(',').Append(chunk.Coordinate.y).Append(',')
+                      .Append(chunk.Coordinate.z).Append(',').Append(chunk.BuiltEpoch).Append(',')
+                      .Append(binCoord.x).Append(',').Append(binCoord.y).Append(',').Append(binCoord.z).Append(',')
+                      .Append(localMin.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMin.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMin.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(localMax.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(binTriangles).Append(',')
+                      .Append(crossingSamples).Append(',').Append(crossingCandidate ? 1 : 0).Append(',')
+                      .Append(crossingRms.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(crossingThin.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(rawVertices).Append(',').Append(rawCandidate ? 1 : 0).Append(',')
+                      .Append(rawRms.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(rawThin.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(finalVertices).Append(',').Append(finalCandidate ? 1 : 0).Append(',')
+                      .Append(finalRms.ToString("F5", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(finalThin.ToString("F6", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(categories[category]).AppendLine();
+                }
+            }
+
+            sb.AppendLine("stage_first_divergence_summary_csv:");
+            sb.AppendLine("stage,bins,triangles");
+            for (int i = 0; i < categories.Length; i++)
+                sb.Append(categories[i]).Append(',').Append(categoryBins[i]).Append(',')
+                  .Append(categoryTriangles[i]).AppendLine();
+            long comparableBins = categoryBins[0] + categoryBins[1] +
+                                  categoryBins[2] + categoryBins[3];
+            long responsibilityBins = comparableBins + categoryBins[4];
+            sb.AppendLine("stage_responsibility_bins=" + responsibilityBins);
+            sb.AppendLine("stage_responsibility_comparable_bins=" + comparableBins);
+            sb.AppendLine("stage_responsibility_not_comparable_bins=" + categoryBins[4]);
+        }
+
+        private static void ReadPlaneStage(
+            uint[] accum, uint[] model, int bin,
+            out uint samples, out bool candidate, out float rmsVox, out float thinRatio)
+        {
+            int accumBase = bin * VisualPlaneAccumStride;
+            int modelBase = bin * VisualPlaneModelStride;
+            samples = accum[accumBase];
+            candidate = model[modelBase] != 0u;
+            rmsVox = model[modelBase + 4] / 1024f;
+            thinRatio = model[modelBase + 5] / 1000000f;
+        }
+
+        private static int FirstDeformationCategory(
+            bool crossingCandidate, float crossingRms,
+            bool rawCandidate, float rawRms,
+            bool finalCandidate, float finalRms,
+            float threshold)
+        {
+            if (!finalCandidate || finalRms < threshold)
+                return 3;
+            if (!rawCandidate)
+                return 4;
+            if (rawRms < threshold)
+                return 2;
+            if (!crossingCandidate)
+                return 4;
+            return crossingRms >= threshold ? 0 : 1;
         }
 
         private void AppendBoundarySeamReport(StringBuilder sb)
         {
             sb.AppendLine("boundary_seam_csv:");
             sb.AppendLine("chunk_a_x,chunk_a_y,chunk_a_z,chunk_b_x,chunk_b_y,chunk_b_z,axis,epoch_a,epoch_b,shared_vertices,only_a,only_b,delta_gt_2mm,delta_gt_5mm,delta_gt_10mm,p95_delta_mm,max_delta_mm,status");
-            if (_config.ChunkSize != 32)
+            if (_config.ChunkSize > VisualBoundaryFaceResolution - 1)
             {
-                sb.AppendLine("boundary_fingerprint_status=skipped_non_32_page");
+                sb.AppendLine("boundary_fingerprint_status=skipped_page_larger_than_64");
                 return;
             }
 
@@ -2786,8 +3238,11 @@ namespace Genesis.RoomScan
                     int gt10 = 0;
                     float maxMm = 0f;
                     var deltas = new List<float>(256);
-                    for (int cell = 0; cell < VisualBoundaryFaceCells; cell++)
+                    int logicalResolution = _config.ChunkSize + 1;
+                    for (int v = 0; v < logicalResolution; v++)
+                    for (int u = 0; u < logicalResolution; u++)
                     {
+                        int cell = u + VisualBoundaryFaceResolution * v;
                         uint packedA = a.BoundaryFingerprint[faceA * VisualBoundaryFaceCells + cell];
                         uint packedB = b.BoundaryFingerprint[faceB * VisualBoundaryFaceCells + cell];
                         bool presentA = (packedA & 0x80000000u) != 0u;
@@ -2825,7 +3280,7 @@ namespace Genesis.RoomScan
                       .Append(status).AppendLine();
                 }
             }
-            sb.AppendLine("boundary_semantics=exact same-global-voxel final vertex fingerprints across adjacent 32^3 pages;presence or position mismatch is a seam candidate, not automatic proof of a visible crack");
+            sb.AppendLine("boundary_semantics=exact same-global-voxel final vertex fingerprints across adjacent pages up to 64^3;presence or position mismatch is a seam candidate, not automatic proof of a visible crack");
         }
 
         private static float3 DecodeBoundaryOffset(uint packed)
@@ -2908,12 +3363,34 @@ namespace Genesis.RoomScan
         public void AppendLocalReplacementCsv(StringBuilder sb, string sessionId)
         {
             if (sb == null) return;
-            sb.AppendLine("session_id,sequence,realtime_s,chunk_x,chunk_y,chunk_z,epoch,initial,accepted,decision,old_vertices,candidate_vertices,old_triangles,candidate_triangles,old_cells,candidate_cells,same_cells,lost_cells,added_cells,suspected_moved_cells,changed_coarse_bins,novel_triangles,skipped_occupied_triangles,skipped_immature_triangles,snapshot_vertices,snapshot_triangles,additive_pass");
+            sb.AppendLine("session_id,sequence,realtime_s,decision_unity_frame,decision_scaled_time,decision_unscaled_time,observed_platform_frame_at_decision,observed_integration_count_at_decision,current_dirty_epoch_at_decision,head_available_at_decision,head_x,head_y,head_z,head_qx,head_qy,head_qz,head_qw,head_pitch_deg,head_yaw_deg,head_roll_deg,chunk_center_world_x,chunk_center_world_y,chunk_center_world_z,head_to_chunk_center_m,angular_deg_per_sec_at_decision,linear_mps_at_decision,queue_to_decision_ms,chunk_x,chunk_y,chunk_z,candidate_epoch,initial,accepted,decision,old_vertices,candidate_vertices,old_triangles,candidate_triangles,old_cells,candidate_cells,same_cells,lost_cells,added_cells,suspected_moved_cells,changed_coarse_bins,novel_triangles,skipped_occupied_triangles,skipped_immature_triangles,snapshot_vertices,snapshot_triangles,additive_pass");
             for (int i = 0; i < _localReplacementEvents.Count; i++)
             {
                 LocalReplacementEvent e = _localReplacementEvents[i];
                 sb.Append(sessionId).Append(',').Append(e.Sequence).Append(',')
                   .Append(e.Realtime.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.UnityFrame).Append(',')
+                  .Append(e.ScaledTime.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.UnscaledTime.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.PlatformFrame).Append(',').Append(e.IntegrationCount).Append(',')
+                  .Append(e.DirtyEpoch).Append(',').Append(e.HeadAvailable ? 1 : 0).Append(',')
+                  .Append(e.HeadPosition.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadPosition.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadPosition.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadRotation.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadRotation.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadRotation.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadRotation.w.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadEuler.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadEuler.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadEuler.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.ChunkCenterWorld.x.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.ChunkCenterWorld.y.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.ChunkCenterWorld.z.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.HeadToChunkCenterM.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.AngularDegPerSec.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.LinearMps.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.QueueToDecisionMs.ToString("R", CultureInfo.InvariantCulture)).Append(',')
                   .Append(e.Chunk.x).Append(',').Append(e.Chunk.y).Append(',').Append(e.Chunk.z).Append(',')
                   .Append(e.Epoch).Append(',').Append(e.Initial ? 1 : 0).Append(',')
                   .Append(e.Accepted ? 1 : 0).Append(',').Append(e.Decision).Append(',')
@@ -2929,6 +3406,42 @@ namespace Genesis.RoomScan
             }
         }
 
+        public void AppendLocalQualityTimelineCsv(StringBuilder sb,
+            string sessionId)
+        {
+            if (sb == null) return;
+            string[] categories =
+            {
+                "tsdf_zero_crossing", "surface_nets_cell_reduction",
+                "post_extract_transform", "no_material_final_deformation",
+                "not_comparable"
+            };
+            sb.AppendLine("session_id,replacement_sequence,chunk_x,chunk_y,chunk_z,candidate_epoch,initial,bin_x,bin_y,bin_z,triangles,crossing_samples,crossing_plane_candidate,crossing_plane_rms_vox,raw_vertices,raw_plane_candidate,raw_plane_rms_vox,final_vertices,final_plane_candidate,final_plane_rms_vox,first_deformation_stage");
+            for (int i = 0; i < _localQualityBinEvents.Count; i++)
+            {
+                LocalQualityBinEvent e = _localQualityBinEvents[i];
+                int3 bin = new int3(e.Bin & 3, (e.Bin >> 2) & 3,
+                    (e.Bin >> 4) & 3);
+                sb.Append(sessionId).Append(',').Append(e.ReplacementSequence).Append(',')
+                  .Append(e.Chunk.x).Append(',').Append(e.Chunk.y).Append(',')
+                  .Append(e.Chunk.z).Append(',').Append(e.Epoch).Append(',')
+                  .Append(e.Initial ? 1 : 0).Append(',')
+                  .Append(bin.x).Append(',').Append(bin.y).Append(',')
+                  .Append(bin.z).Append(',').Append(e.Triangles).Append(',')
+                  .Append(e.CrossingSamples).Append(',')
+                  .Append(e.CrossingCandidate ? 1 : 0).Append(',')
+                  .Append(e.CrossingRmsVox.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.RawVertices).Append(',')
+                  .Append(e.RawCandidate ? 1 : 0).Append(',')
+                  .Append(e.RawRmsVox.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(e.FinalVertices).Append(',')
+                  .Append(e.FinalCandidate ? 1 : 0).Append(',')
+                  .Append(e.FinalRmsVox.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                  .Append(categories[Mathf.Clamp(e.FirstDeformationStage, 0,
+                      categories.Length - 1)]).AppendLine();
+            }
+        }
+
         private Bounds GetPaddedCoreBounds(Chunk chunk)
         {
             Bounds bounds = chunk.Surface.GetCoreBounds(_volume.VoxelSize);
@@ -2938,6 +3451,56 @@ namespace Genesis.RoomScan
             float padding = _volume.VoxelSize * Mathf.Max(2, _config.HaloVoxels + 1);
             bounds.Expand(padding * 2f);
             return bounds;
+        }
+
+        private void QueueChangedProductConstraints()
+        {
+            int count = _volume.DrainProductSurfaceChanges(
+                _productConstraintChanges);
+            if (count <= 0)
+                return;
+
+            // This revision is deliberately separate from DirtyEpoch.  Product
+            // constraints live after TSDF, so changing one must be able to
+            // re-productize an unchanged zero surface at the same TSDF epoch.
+            uint productRevision = ++_productConstraintRevision;
+            if (productRevision == 0u)
+                productRevision = _productConstraintRevision = 1u;
+
+            for (int e = 0; e < count; e++)
+            {
+                Vector4 region = _productConstraintChanges[e];
+                Vector3 localCenter = _parent != null
+                    ? _parent.InverseTransformPoint(new Vector3(
+                        region.x, region.y, region.z))
+                    : new Vector3(region.x, region.y, region.z);
+                float radius = Mathf.Max(region.w, _volume.VoxelSize * 2f);
+                for (int i = 0; i < _chunks.Count; i++)
+                {
+                    Chunk chunk = _chunks[i];
+                    int3 voxels = _volume.VoxelCount;
+                    float voxelSize = _volume.VoxelSize;
+                    float3 min = ((float3)chunk.CoreMin -
+                                  (float3)voxels * 0.5f) * voxelSize;
+                    float3 max = ((float3)chunk.CoreMax -
+                                  (float3)voxels * 0.5f) * voxelSize;
+                    Bounds bounds = new Bounds((Vector3)((min + max) * 0.5f),
+                        (Vector3)(max - min));
+                    if (bounds.SqrDistance(localCenter) > radius * radius)
+                        continue;
+                    chunk.TargetProductRevision = math.max(
+                        chunk.TargetProductRevision, productRevision);
+                    if (chunk.CommitPending)
+                    {
+                        chunk.TargetEpoch = math.max(chunk.TargetEpoch,
+                            math.max(1u, _volume.DirtyEpoch));
+                        chunk.ForceQueueAfterCommit = true;
+                        continue;
+                    }
+                    QueueChunk(chunk.Index, math.max(1u, _volume.DirtyEpoch),
+                        urgent: true, force: true);
+                }
+            }
         }
 
         private static bool DestructiveCandidateConfirmed(Chunk chunk)
@@ -2965,6 +3528,7 @@ namespace Genesis.RoomScan
             }
 
             _readbackPending = true;
+            _finalDrainRequestInFlight = _finalDrainActive;
             _ownerLedgerReady = false;
             _boundaryLedgerReady = false;
             _ledgerRequestFailed = false;
@@ -3016,8 +3580,12 @@ namespace Genesis.RoomScan
                 return;
 
             _readbackPending = false;
+            bool settlesFinalDrain = _finalDrainActive && _finalDrainRequestInFlight;
+            _finalDrainRequestInFlight = false;
             if (_ledgerRequestFailed || _ownerEpochSnapshot == null || _boundaryEpochSnapshot == null)
             {
+                if (_finalDrainActive)
+                    _nextReadbackTime = 0f;
                 if (++_readbackFailures >= 3)
                     Fail("dirty owner/boundary ledger GPU readback failed three times");
                 return;
@@ -3066,6 +3634,8 @@ namespace Genesis.RoomScan
                     chunk.ProcessedEpoch = 0;
                 }
             }
+            if (settlesFinalDrain)
+                _finalDrainLedgerSettled = true;
         }
 
         private void QueueChunk(
@@ -3082,6 +3652,11 @@ namespace Genesis.RoomScan
             if (chunk.CommitPending ||
                 (!force && chunk.ProcessedEpoch >= chunk.TargetEpoch))
                 return;
+            // XR mesh managers prioritize Added before Updated.  An unseen
+            // product block is our Added state: it must not sit behind endless
+            // refreshes of blocks that already own a visible front.
+            if (_config.FoundationAtomicReplacement && !chunk.Built)
+                urgent = true;
             if (chunk.Queued)
             {
                 if (!urgent || chunk.QueuedUrgent)
@@ -3138,7 +3713,9 @@ namespace Genesis.RoomScan
         private void ResetToKnownEmptyVolume()
         {
             _generation++;
+            _qualityGate.Clear();
             _sealCommittedStaticReplayPages = false;
+            EndFinalDrain();
             _readbackPending = false;
             _ownerLedgerReady = false;
             _boundaryLedgerReady = false;
@@ -3193,7 +3770,9 @@ namespace Genesis.RoomScan
         private void ResetForGlobalInvalidation()
         {
             _generation++;
+            _qualityGate.Clear();
             _sealCommittedStaticReplayPages = false;
+            EndFinalDrain();
             _readbackPending = false;
             _ownerLedgerReady = false;
             _boundaryLedgerReady = false;
@@ -3254,6 +3833,7 @@ namespace Genesis.RoomScan
             if (_disposed) return;
             _disposed = true;
             _generation++;
+            EndFinalDrain();
             _volume.Cleared -= OnVolumeCleared;
             _volume.TopologyInvalidated -= OnTopologyInvalidated;
             for (int i = 0; i < _chunks.Count; i++)
@@ -3261,6 +3841,8 @@ namespace Genesis.RoomScan
             _chunks.Clear();
             _dirtyQueue.Clear();
             _urgentQueue.Clear();
+            _qualityGate.Clear();
+            _productizer?.Dispose();
         }
     }
 }

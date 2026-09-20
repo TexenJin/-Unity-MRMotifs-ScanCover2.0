@@ -19,7 +19,9 @@ namespace Genesis.RoomScan
 {
     /// <summary>
     /// “可独立复现本次扫描”会话的总封装器。它只旁路复制生产链已经消费的输入、
-    /// 裁决与结果，不参与深度清洗、枪胶、TSDF 或出网判决。
+    /// 裁决与结果。通常它没有生产权限；裁决准入实验仅复用最终 correspondence
+    /// 的既有回读，发布 stableId 准证及获胜层射线归属描述，仍不生成深度、
+    /// 距离场或网格。
     /// </summary>
     [DisallowMultipleComponent]
     internal sealed class ScanReplaySessionPackage : MonoBehaviour
@@ -27,6 +29,7 @@ namespace Genesis.RoomScan
         internal const string Schema = "scancover.replay_session.v1";
         private const int RecordedEye = DepthCapture.FusionEyeIndex;
         private const int MaxOutstandingFusionFrames = 12;
+        internal const int FinalCourtVerdictCapacity = 262144;
         private const float SystemRoomMeshStartupWaitSeconds = 2f;
         private const float SystemRoomMeshReloadWaitSeconds = 12f;
         private const int SealIdle = 0;
@@ -46,6 +49,11 @@ namespace Genesis.RoomScan
         private string _fusionDirectory = string.Empty;
         private string _fusionManifest = string.Empty;
         private string _probeConversionManifest = string.Empty;
+        private string _runtimeTimelineManifest = string.Empty;
+        private string _integrationDispatchManifest = string.Empty;
+        private readonly StringBuilder _runtimeTimelineBuffer = new StringBuilder(128 * 1024);
+        private readonly StringBuilder _integrationDispatchBuffer = new StringBuilder(64 * 1024);
+        private const int RuntimeBufferFlushChars = 64 * 1024;
         private bool _active;
         private bool _endRequested;
         private bool _depthStreamsComplete;
@@ -62,13 +70,28 @@ namespace Genesis.RoomScan
         private int _depthPairReadbackErrors;
         private int _depthPairWriteErrors;
         private int _artifactRequests;
+        private int _artifactFailures;
         private int _evidenceLineageBuildStarted;
         private int _surfaceFeatureArchiveBuildStarted;
         private int _probeConversionRows;
         private int _probeConversionMissingPreRows;
         private int _probeConversionWriteErrors;
+        private int _runtimeLedgerWriteErrors;
+        private bool _tsdfResponsibilityStarted;
         private VirtualProbeShadowLedger _probeShadowLedger;
         private VirtualProbeShadowLedger _probeFinalBufferLedger;
+        private RuntimeFinalSurfaceCourt _finalSurfaceCourt;
+        private readonly uint[] _finalCourtVerdictTable =
+            new uint[FinalCourtVerdictCapacity];
+        private readonly Vector4[] _finalCourtPlaneTable =
+            new Vector4[FinalCourtVerdictCapacity];
+        private readonly uint[] _finalCourtGenerationTable =
+            new uint[FinalCourtVerdictCapacity];
+        private ComputeBuffer _finalCourtVerdictBuffer;
+        private ComputeBuffer _finalCourtPlaneBuffer;
+        private ComputeBuffer _finalCourtGenerationBuffer;
+        private int _finalCourtUploadedRevision = -1;
+        private int _finalCourtUploadedPrefix = 1;
         private DirectProjectionChallengeShadowLedger _directProjectionShadowLedger;
         private string _startedUtc = string.Empty;
         private string _stoppedUtc = string.Empty;
@@ -79,7 +102,69 @@ namespace Genesis.RoomScan
 
         internal static ScanReplaySessionPackage Active { get; private set; }
         internal static ScanReplaySessionPackage Latest { get; private set; }
+        internal static bool FullOutputLedgerActive =>
+            Active != null ||
+            (Latest != null && Latest._endRequested && !Latest._finalized);
         internal bool IsActive => _active;
+        internal int FinalCourtAdmissionRevision => _finalSurfaceCourt?.Revision ?? -1;
+        internal VirtualProbeShadowAdjudicator.VerdictCounts FinalCourtAdmissionCounts =>
+            _finalSurfaceCourt != null ? _finalSurfaceCourt.GetCounts() : default;
+
+        internal int CopyFinalCourtProductPlanes(Bounds worldBounds,
+            RuntimeFinalSurfaceCourt.ProductPlane[] destination)
+        {
+            return _active && _finalSurfaceCourt != null
+                ? _finalSurfaceCourt.CopyProductPlanes(worldBounds, destination)
+                : 0;
+        }
+
+        internal bool TryGetFinalCourtAdmissionBuffers(out ComputeBuffer verdicts,
+            out ComputeBuffer planes, out ComputeBuffer generations)
+        {
+            // GPU admission is production state. Court testimony may arrive from
+            // an AsyncGPUReadback callback, but ComputeBuffer.SetData must have
+            // one deterministic owner on the production/main thread immediately
+            // before the integrator binds these buffers.
+            UploadFinalCourtAdmissionOnProductionThread();
+            verdicts = _finalCourtVerdictBuffer;
+            planes = _finalCourtPlaneBuffer;
+            generations = _finalCourtGenerationBuffer;
+            return _active && verdicts != null && planes != null &&
+                   generations != null;
+        }
+
+        private void UploadFinalCourtAdmissionOnProductionThread()
+        {
+            if (!_active || _finalSurfaceCourt == null ||
+                _finalCourtVerdictBuffer == null ||
+                _finalCourtPlaneBuffer == null ||
+                _finalCourtGenerationBuffer == null)
+                return;
+            int revision = _finalSurfaceCourt.Revision;
+            if (revision == _finalCourtUploadedRevision) return;
+
+            int usedPrefix = _finalSurfaceCourt.CopyAdmissionTables(
+                _finalCourtVerdictTable, _finalCourtPlaneTable,
+                _finalCourtGenerationTable, _finalCourtUploadedPrefix);
+            int uploadCount = Mathf.Max(_finalCourtUploadedPrefix, usedPrefix);
+            // Publish descriptor and generation first. The permit bit is last,
+            // so an approved verdict can never expose a half-updated plane.
+            _finalCourtPlaneBuffer.SetData(_finalCourtPlaneTable,
+                0, 0, uploadCount);
+            _finalCourtGenerationBuffer.SetData(_finalCourtGenerationTable,
+                0, 0, uploadCount);
+            _finalCourtVerdictBuffer.SetData(_finalCourtVerdictTable,
+                0, 0, uploadCount);
+            _finalCourtUploadedPrefix = usedPrefix;
+            _finalCourtUploadedRevision = revision;
+        }
+
+        internal int DrainFinalCourtInvalidationRegions(Vector4[] destination)
+        {
+            return _active && _finalSurfaceCourt != null
+                ? _finalSurfaceCourt.DrainInvalidationRegions(destination)
+                : 0;
+        }
         internal int OutstandingCount => Volatile.Read(ref _fusionReadbacks) +
                                          Volatile.Read(ref _fusionWrites) +
                                          Volatile.Read(ref _artifactRequests);
@@ -155,6 +240,7 @@ namespace Genesis.RoomScan
                 ? _probeShadowLedger.CopyPaperCorrectionCells(destination)
                 : 0;
         }
+
         internal const string ProbeFollowupGuidanceHudEmpty =
             "采样 总待---- 空证---- 面证---- 过期----\n" +
             "框内 待补---- 命中---- 已收---- 失效----\n" +
@@ -167,7 +253,12 @@ namespace Genesis.RoomScan
             _fusionManifest = Path.Combine(_sessionDirectory, "fusion_inputs", "manifest.csv");
             _probeConversionManifest = Path.Combine(_sessionDirectory, "probe_shadow",
                 "final_buffer", "conversion_frames.csv");
+            string timelineDirectory = Path.Combine(_sessionDirectory, "runtime_timeline");
+            _runtimeTimelineManifest = Path.Combine(timelineDirectory, "frames.csv");
+            _integrationDispatchManifest = Path.Combine(timelineDirectory,
+                "integration_dispatches.csv");
             Directory.CreateDirectory(_fusionDirectory);
+            Directory.CreateDirectory(timelineDirectory);
             Directory.CreateDirectory(Path.Combine(_sessionDirectory, "artifacts"));
             Directory.CreateDirectory(Path.Combine(_sessionDirectory, "system_reference"));
             _probeShadowLedger ??= new VirtualProbeShadowLedger();
@@ -180,6 +271,39 @@ namespace Genesis.RoomScan
                 Path.Combine("probe_shadow", "final_buffer"),
                 "post-candidate-transaction correspondence buffer actually bound to guarded TSDF integration",
                 "final_buffer_shadow_only");
+            _finalSurfaceCourt ??= new RuntimeFinalSurfaceCourt();
+            _finalSurfaceCourt.Begin(Path.Combine(_sessionDirectory,
+                "probe_shadow", "final_buffer"));
+            if (_finalCourtVerdictBuffer == null ||
+                _finalCourtVerdictBuffer.count != FinalCourtVerdictCapacity)
+            {
+                _finalCourtVerdictBuffer?.Release();
+                _finalCourtVerdictBuffer = new ComputeBuffer(
+                    FinalCourtVerdictCapacity, sizeof(uint));
+            }
+            if (_finalCourtPlaneBuffer == null ||
+                _finalCourtPlaneBuffer.count != FinalCourtVerdictCapacity)
+            {
+                _finalCourtPlaneBuffer?.Release();
+                _finalCourtPlaneBuffer = new ComputeBuffer(
+                    FinalCourtVerdictCapacity, sizeof(float) * 4);
+            }
+            if (_finalCourtGenerationBuffer == null ||
+                _finalCourtGenerationBuffer.count != FinalCourtVerdictCapacity)
+            {
+                _finalCourtGenerationBuffer?.Release();
+                _finalCourtGenerationBuffer = new ComputeBuffer(
+                    FinalCourtVerdictCapacity, sizeof(uint));
+            }
+            Array.Clear(_finalCourtVerdictTable, 0, _finalCourtVerdictTable.Length);
+            _finalCourtVerdictBuffer.SetData(_finalCourtVerdictTable);
+            Array.Clear(_finalCourtPlaneTable, 0, _finalCourtPlaneTable.Length);
+            Array.Clear(_finalCourtGenerationTable, 0,
+                _finalCourtGenerationTable.Length);
+            _finalCourtPlaneBuffer.SetData(_finalCourtPlaneTable, 0, 0, 1);
+            _finalCourtGenerationBuffer.SetData(_finalCourtGenerationTable, 0, 0, 1);
+            _finalCourtUploadedRevision = _finalSurfaceCourt.Revision;
+            _finalCourtUploadedPrefix = 1;
             File.WriteAllText(_probeConversionManifest,
                 "gunGelFrame,sourceFrame,preValid,postValid,preRaw,postRaw,preDual,postDual,preStableFound,postStableFound,preResidualPass,postResidualPass,preNormalPass,postNormalPass,preStableMatch,postStableMatch,preStableDual,postStableDual,preUnopposed,postUnopposed,preAuthority,postAuthority,deltaStableFound,deltaStableMatch,deltaAuthority,status\n",
                 new UTF8Encoding(false));
@@ -208,29 +332,49 @@ namespace Genesis.RoomScan
             _probeConversionRows = 0;
             _probeConversionMissingPreRows = 0;
             _probeConversionWriteErrors = 0;
+            _runtimeLedgerWriteErrors = 0;
+            _tsdfResponsibilityStarted = VolumeIntegrator.Instance != null &&
+                                         VolumeIntegrator.Instance.BeginTsdfResponsibilityCapture();
+            _artifactFailures = 0;
             _preProbeStages.Clear();
             _active = true;
             Active = this;
             Latest = this;
 
             File.WriteAllText(_fusionManifest,
-                "sequence,attemptIndex,sourceFrame,unityFrame,scaledTime,unscaledTime,accepted,decision,guarded,gunGelAdmissionActive,gunGelFrame,translationMm,rotationDeg,angularDegPerSec,linearMps,motionQuality,fusionHeadAvailable,fusionHeadX,fusionHeadY,fusionHeadZ,fusionHeadQx,fusionHeadQy,fusionHeadQz,fusionHeadQw,cameraAvailable,depthFile,normalFile,dilatedFile,edgeReasonFile,temporalReasonFile,cameraFile,gunGelObservationsFile,gunGelCorrespondencesFile,metaFile,status\n",
+                "sequence,attemptIndex,sourceFrame,unityFrame,scaledTime,unscaledTime,accepted,decision,guarded,gunGelAdmissionActive,gunGelFrame,translationMm,rotationDeg,angularDegPerSec,linearMps,motionQuality,fusionHeadAvailable,fusionHeadX,fusionHeadY,fusionHeadZ,fusionHeadQx,fusionHeadQy,fusionHeadQz,fusionHeadQw,fusionHeadPitchDeg,fusionHeadYawDeg,fusionHeadRollDeg,fusionEyeAvailable,fusionEyeX,fusionEyeY,fusionEyeZ,fusionEyeForwardX,fusionEyeForwardY,fusionEyeForwardZ,headToFusionEyeMm,cameraAvailable,cameraPitchDeg,cameraYawDeg,cameraRollDeg,depthFile,normalFile,dilatedFile,edgeReasonFile,temporalReasonFile,cameraFile,gunGelObservationsFile,gunGelCorrespondencesFile,metaFile,status\n",
                 new UTF8Encoding(false));
+            File.WriteAllText(_runtimeTimelineManifest,
+                "unityFrame,scaledTime,unscaledTime,deltaMs,fps,headAvailable,headX,headY,headZ,headQx,headQy,headQz,headQw,headPitchDeg,headYawDeg,headRollDeg,platformFrame,angularDegPerSec,linearMps,integrationCount,dirtyEpoch,paperVisible,paperTriangles,paperBuiltChunks,paperTotalChunks,paperQueuedChunks,paperCommitPending,paperQueueToCommitMs,paperDispatchToCallbackMs,fusionOutstanding,fusionDropped,sealPhase\n",
+                new UTF8Encoding(false));
+            File.WriteAllText(_integrationDispatchManifest,
+                "attemptIndex,sourceFrame,integrationCount,dirtyEpoch,unityFrame,scaledTime,unscaledTime,headAvailable,headX,headY,headZ,headQx,headQy,headQz,headQw,headPitchDeg,headYawDeg,headRollDeg,angularDegPerSec,linearMps\n",
+                new UTF8Encoding(false));
+            _runtimeTimelineBuffer.Clear();
+            _integrationDispatchBuffer.Clear();
             File.WriteAllText(Path.Combine(_sessionDirectory, "session_schema.json"),
                 BuildSessionSchemaJson(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(_sessionDirectory, "replay_contract.json"),
                 BuildReplayContractJson(), new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(_sessionDirectory, "full_output_index.json"),
+                BuildFullOutputIndexJson(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(_sessionDirectory, "README.txt"),
                 "ScanCover 独立回放会话\n" +
                 "1. capture_complete.json 不存在时，本会话尚未封口，不得作为确定性样本。\n" +
                 "2. HUD 必须显示‘已封口/安全退出[是]’后才能退出应用；hashing 仍是封口过程。\n" +
                 "3. 先运行 Tools/ScanCoverReplaySession.py 校验全部 SHA-256。\n" +
-                "4. depth_pairs 保存平台前处理前/QRS 后处理后同帧右眼深度。\n" +
+                "4. depth_pairs 保存平台前处理前/QRS 后处理后同帧右眼深度，并给出有效率、距离分布、前后差及 callback→preprocess 位姿差。\n" +
                 "5. fusion_inputs 保存实际接纳帧的深度、法线、膨胀供体、判因纹理、枪胶逐点缓冲及实际 RGB/相机参数；同一观察索引可连接事务前 A 身份与最终 B 身份。\n" +
                 "6. probe_shadow 保存事务前 A 账；final_buffer 保存事务后 B 账；direct45 保存候选不确定足迹对同帧 raw/post 深度的保守复核。生产稳定候选达到旧三票时只进入待退场：0.25度内相反证词互相失效；两张相隔至少1度的支撑取消退场，两张相隔至少1度的全足迹证空才执行删除，冲突或不足均保留。gungel_candidate_audit/candidates.csv 保存仍存活的待退场证词；retirements.csv 为每次真实退场封存当时的支撑/证空帧号、两票夹角与裁决身份；candidate_summary.json 对进入、支撑取消、接班取消、身份重开、证空删除和封包仍待定做守恒对账。旧16帧、8帧幽灵及0.5/1/2度赛道仍只做零权限事后审计。相机位移不超过10毫米且视线变化不超过0.25度的样本只用于估计静止重复稳定性，不代表绝对精度。\n" +
                 "7. artifacts/surface_feature_archive 是按候选世代建立的隔离档案；坐标只作会话内追溯，跨会话只能按连续特征归纳。\n" +
                 "8. production_config 与 coordinate_contract 是回放契约；禁止用默认参数替代。\n" +
-                "9. system_reference/status.json 说明外部系统网格交接状态；旧 Scene 导出的 OBJ 仅作对照，不是生产真值。\n",
+                "9. runtime_timeline/frames.csv 连续记录帧率、头姿、距离位移、深度帧号、融合 epoch、纸皮队列/提交/显示状态；integration_dispatches.csv 将融合 attempt/sourceFrame 精确接到 dirtyEpoch。\n" +
+                "10. artifacts/paper_audit/production_paper_replacements.csv 记录最终生产纸皮每次整块替换时的姿态、距离、融合状态与旧新占用变化；surface ledger 给出平面残差及相邻页接缝；production_paper_occupancy 是不依赖显示档位的正式5cm纸皮占用。\n" +
+                "11. system_reference/status.json 说明外部系统网格交接状态；旧 Scene 导出的 OBJ 仅作对照，不是生产真值。\n" +
+                "12. artifacts/tsdf_responsibility 保存最终 TSDF 与逐体素当前生命周期的出生、最后几何改写、最后支撑改写、最强受阻纠正；integrationCount 可反查到实际 sourceFrame，并把无纸皮格追到 TSDF 前/内、零交叉、拓扑或发布边界。\n" +
+                "13. final_surface_court/frame_gate_summary.csv 记录每帧各拒绝关卡汇总；independent_testimonies.csv 记录真正入档的独立证词；decision_checks.csv 记录每次判决的假设、残差、票份额、滞回和冷却结果。它们不逐像素写日志。\n" +
+                "14. production_paper_quality_timeline.csv 记录每次正式块提交时各4x4x4小区的 crossing/raw/final 平整度，区分入场已凹凸、后续抚平、长期残留和恶化。\n" +
+                "15. 将已封口 session 复制到电脑后运行 Tools/AnalyzeFullOutputLedger.ps1 -SessionDirectory <session>；它会生成 artifacts/responsibility_ledger 四张总账，并联合角度、距离、姿态、运动、候选、裁判、TSDF与纸皮，禁止单因素冒名定罪。\n",
                 new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(_sessionDirectory, "production_config.json"),
                 BuildProductionConfigJson(), new UTF8Encoding(false));
@@ -246,6 +390,7 @@ namespace Genesis.RoomScan
             _endRequested = true;
             Volatile.Write(ref _sealPhase, SealDraining);
             _stoppedUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            FlushRuntimeLedgers();
             if (Active == this) Active = null;
             _probeShadowLedger?.End();
             _directProjectionShadowLedger?.End();
@@ -271,6 +416,18 @@ namespace Genesis.RoomScan
             WriteState("draining");
         }
 
+        private void OnDestroy()
+        {
+            _finalSurfaceCourt?.Dispose();
+            _finalSurfaceCourt = null;
+            _finalCourtVerdictBuffer?.Release();
+            _finalCourtVerdictBuffer = null;
+            _finalCourtPlaneBuffer?.Release();
+            _finalCourtPlaneBuffer = null;
+            _finalCourtGenerationBuffer?.Release();
+            _finalCourtGenerationBuffer = null;
+        }
+
         internal void NotifyDepthStreamsComplete(
             int droppedPairs, int readbackErrors, int writeErrors)
         {
@@ -283,6 +440,8 @@ namespace Genesis.RoomScan
 
         private void Update()
         {
+            if (_active || (_endRequested && !_finalized && _finalizeTask == null))
+                RecordRuntimeFrame();
             if (_finalizeTask != null && _finalizeTask.IsCompleted)
             {
                 Task completed = _finalizeTask;
@@ -301,6 +460,107 @@ namespace Genesis.RoomScan
             }
             if (_endRequested && !_finalized)
                 TryFinalize();
+        }
+
+        internal void RecordIntegrationDispatch(
+            int attemptIndex, int sourceFrame, int integrationCount, uint dirtyEpoch)
+        {
+            if (!_active) return;
+            Camera head = Camera.main;
+            DepthCapture depth = DepthCapture.Instance;
+            Vector3 position = head != null ? head.transform.position : Vector3.zero;
+            Quaternion rotation = head != null ? head.transform.rotation : Quaternion.identity;
+            Vector3 euler = head != null ? head.transform.eulerAngles : Vector3.zero;
+            _integrationDispatchBuffer
+                .Append(attemptIndex).Append(',').Append(sourceFrame).Append(',')
+                .Append(integrationCount).Append(',').Append(dirtyEpoch).Append(',')
+                .Append(Time.frameCount).Append(',').Append(D(Time.timeAsDouble)).Append(',')
+                .Append(D(Time.unscaledTimeAsDouble)).Append(',').Append(head != null ? 1 : 0).Append(',')
+                .Append(F(position.x)).Append(',').Append(F(position.y)).Append(',').Append(F(position.z)).Append(',')
+                .Append(F(rotation.x)).Append(',').Append(F(rotation.y)).Append(',')
+                .Append(F(rotation.z)).Append(',').Append(F(rotation.w)).Append(',')
+                .Append(F(euler.x)).Append(',').Append(F(euler.y)).Append(',').Append(F(euler.z)).Append(',')
+                .Append(F(depth != null ? depth.SmoothedDepthAngularSpeed : 0f)).Append(',')
+                .Append(F(depth != null ? depth.SmoothedDepthLinearSpeed : 0f)).AppendLine();
+            FlushRuntimeLedgersIfNeeded();
+        }
+
+        private void RecordRuntimeFrame()
+        {
+            Camera head = Camera.main;
+            DepthCapture depth = DepthCapture.Instance;
+            VolumeIntegrator volume = VolumeIntegrator.Instance;
+            MeshExtractor mesh = MeshExtractor.Instance;
+            Vector3 position = head != null ? head.transform.position : Vector3.zero;
+            Quaternion rotation = head != null ? head.transform.rotation : Quaternion.identity;
+            Vector3 euler = head != null ? head.transform.eulerAngles : Vector3.zero;
+            float delta = Time.unscaledDeltaTime;
+            _runtimeTimelineBuffer
+                .Append(Time.frameCount).Append(',').Append(D(Time.timeAsDouble)).Append(',')
+                .Append(D(Time.unscaledTimeAsDouble)).Append(',').Append(F(delta * 1000f)).Append(',')
+                .Append(F(delta > 1e-6f ? 1f / delta : 0f)).Append(',')
+                .Append(head != null ? 1 : 0).Append(',')
+                .Append(F(position.x)).Append(',').Append(F(position.y)).Append(',').Append(F(position.z)).Append(',')
+                .Append(F(rotation.x)).Append(',').Append(F(rotation.y)).Append(',')
+                .Append(F(rotation.z)).Append(',').Append(F(rotation.w)).Append(',')
+                .Append(F(euler.x)).Append(',').Append(F(euler.y)).Append(',').Append(F(euler.z)).Append(',')
+                .Append(depth != null ? depth.CurrentPlatformFrame : -1).Append(',')
+                .Append(F(depth != null ? depth.SmoothedDepthAngularSpeed : 0f)).Append(',')
+                .Append(F(depth != null ? depth.SmoothedDepthLinearSpeed : 0f)).Append(',')
+                .Append(volume != null ? volume.IntegrationCount : -1).Append(',')
+                .Append(volume != null ? volume.DirtyEpoch : 0u).Append(',')
+                .Append(mesh != null && mesh.ProductionPaperVisible ? 1 : 0).Append(',')
+                .Append(mesh != null ? mesh.ProductionPaperCommittedTriangleCount : 0).Append(',')
+                .Append(mesh != null ? mesh.ProductionPaperBuiltChunkCount : 0).Append(',')
+                .Append(mesh != null ? mesh.ProductionPaperChunkCount : 0).Append(',')
+                .Append(mesh != null ? mesh.ProductionPaperPendingChunkCount : 0).Append(',')
+                .Append(mesh != null ? mesh.ProductionPaperCommitPendingCount : 0).Append(',')
+                .Append(F(mesh != null ? mesh.ProductionPaperAvgQueueToCommitMs : -1f)).Append(',')
+                .Append(F(mesh != null ? mesh.ProductionPaperAvgDispatchToCallbackMs : -1f)).Append(',')
+                .Append(OutstandingCount).Append(',').Append(DroppedFusionFrames).Append(',')
+                .Append(Volatile.Read(ref _sealPhase)).AppendLine();
+            FlushRuntimeLedgersIfNeeded();
+        }
+
+        private void FlushRuntimeLedgersIfNeeded()
+        {
+            if (_runtimeTimelineBuffer.Length < RuntimeBufferFlushChars &&
+                _integrationDispatchBuffer.Length < RuntimeBufferFlushChars)
+                return;
+            FlushRuntimeLedgers();
+        }
+
+        private void FlushRuntimeLedgers()
+        {
+            lock (_fileLock)
+            {
+                if (_runtimeTimelineBuffer.Length > 0)
+                {
+                    try
+                    {
+                        File.AppendAllText(_runtimeTimelineManifest,
+                            _runtimeTimelineBuffer.ToString(), new UTF8Encoding(false));
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref _runtimeLedgerWriteErrors);
+                    }
+                    _runtimeTimelineBuffer.Clear();
+                }
+                if (_integrationDispatchBuffer.Length > 0)
+                {
+                    try
+                    {
+                        File.AppendAllText(_integrationDispatchManifest,
+                            _integrationDispatchBuffer.ToString(), new UTF8Encoding(false));
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref _runtimeLedgerWriteErrors);
+                    }
+                    _integrationDispatchBuffer.Clear();
+                }
+            }
         }
 
         internal void RecordDecisionOnly(
@@ -489,30 +749,16 @@ namespace Genesis.RoomScan
                             record.Textures.MarkError(role);
                         else
                         {
-                            if (role == "gungel_correspondences" &&
-                                _probeFinalBufferLedger != null &&
-                                record.GunGelAdmissionActive)
+                            if (role == "gungel_correspondences")
                             {
-                                Matrix4x4 projectionInverse = record.ProjectionInverse != null &&
-                                    record.ProjectionInverse.Length > RecordedEye
-                                    ? record.ProjectionInverse[RecordedEye]
-                                    : Matrix4x4.identity;
-                                Matrix4x4 viewInverse = record.ViewInverse != null &&
-                                    record.ViewInverse.Length > RecordedEye
-                                    ? record.ViewInverse[RecordedEye]
-                                    : Matrix4x4.identity;
-                                _probeFinalBufferLedger.Record(record.GunGelFrame,
-                                    record.SourceFrame,
-                                    request.GetData<GunGelEvidenceShadow.Correspondence>(),
-                                    record.GunGelGridX, record.GunGelGridY,
-                                    record.GunGelPixelStride,
-                                    record.Textures.depthDescriptor.width,
-                                    record.Textures.depthDescriptor.height,
-                                    projectionInverse, viewInverse,
-                                    record.AngularSpeed, record.LinearSpeed,
-                                    record.MotionQuality);
-                                RecordProbeConversion(record,
-                                    request.GetData<GunGelEvidenceShadow.Correspondence>());
+                                record.Textures.gunGelCorrespondenceRows =
+                                    request.GetData<GunGelEvidenceShadow.Correspondence>()
+                                        .ToArray();
+                            }
+                            else if (role == "gungel_correspondence_identity")
+                            {
+                                record.Textures.gunGelCorrespondenceIdentityRows =
+                                    request.GetData<Unity.Mathematics.uint4>().ToArray();
                             }
                             record.Textures.SetBytes(role, request.GetData<byte>().ToArray());
                         }
@@ -594,8 +840,54 @@ namespace Genesis.RoomScan
         {
             if (!record.Textures.AllDone || record.CompletionClaimed) return;
             record.CompletionClaimed = true;
+            RecordFinalBufferProbe(record);
             Interlocked.Increment(ref _fusionWrites);
             _ = Task.Run(() => WriteFusionRecord(record));
+        }
+
+        private void RecordFinalBufferProbe(FusionRecord record)
+        {
+            if (_probeFinalBufferLedger == null || !record.GunGelAdmissionActive ||
+                record.Textures.gunGelCorrespondenceRows == null)
+                return;
+            GunGelEvidenceShadow.Correspondence[] rows =
+                record.Textures.gunGelCorrespondenceRows;
+            var nativeRows = new NativeArray<GunGelEvidenceShadow.Correspondence>(
+                rows, Allocator.Temp);
+            try
+            {
+                Matrix4x4 projectionInverse = record.ProjectionInverse != null &&
+                    record.ProjectionInverse.Length > RecordedEye
+                    ? record.ProjectionInverse[RecordedEye]
+                    : Matrix4x4.identity;
+                Matrix4x4 viewInverse = record.ViewInverse != null &&
+                    record.ViewInverse.Length > RecordedEye
+                    ? record.ViewInverse[RecordedEye]
+                    : Matrix4x4.identity;
+                _probeFinalBufferLedger.Record(record.GunGelFrame,
+                    record.SourceFrame, nativeRows,
+                    record.GunGelGridX, record.GunGelGridY,
+                    record.GunGelPixelStride,
+                    record.Textures.depthDescriptor.width,
+                    record.Textures.depthDescriptor.height,
+                    projectionInverse, viewInverse,
+                    record.AngularSpeed, record.LinearSpeed,
+                    record.MotionQuality);
+                if (record.Textures.gunGelCorrespondenceIdentityRows != null)
+                {
+                    _finalSurfaceCourt?.Record(record.GunGelFrame,
+                        record.SourceFrame, record.AttemptIndex, rows,
+                        record.Textures.gunGelCorrespondenceIdentityRows,
+                        viewInverse, record.FusionCorrection,
+                        record.AngularSpeed, record.LinearSpeed,
+                        record.MotionQuality, record.FusionHeadEuler);
+                }
+                RecordProbeConversion(record, nativeRows);
+            }
+            finally
+            {
+                nativeRows.Dispose();
+            }
         }
 
         private void WriteFusionRecord(FusionRecord record)
@@ -709,7 +1001,14 @@ namespace Genesis.RoomScan
                 F(r.FusionHeadPosition.x), F(r.FusionHeadPosition.y),
                 F(r.FusionHeadPosition.z), F(r.FusionHeadRotation.x),
                 F(r.FusionHeadRotation.y), F(r.FusionHeadRotation.z),
-                F(r.FusionHeadRotation.w), r.CameraAvailable ? "1" : "0",
+                F(r.FusionHeadRotation.w), F(r.FusionHeadEuler.x),
+                F(r.FusionHeadEuler.y), F(r.FusionHeadEuler.z),
+                r.FusionEyeAvailable ? "1" : "0",
+                F(r.FusionEyePosition.x), F(r.FusionEyePosition.y),
+                F(r.FusionEyePosition.z), F(r.FusionEyeForward.x),
+                F(r.FusionEyeForward.y), F(r.FusionEyeForward.z),
+                F(r.HeadToFusionEyeMm), r.CameraAvailable ? "1" : "0",
+                F(r.CameraEuler.x), F(r.CameraEuler.y), F(r.CameraEuler.z),
                 depth, normal, dilated, edge, temporal, camera, observations,
                 correspondences, meta, Csv(status)) + "\n";
             lock (_fileLock)
@@ -779,10 +1078,37 @@ namespace Genesis.RoomScan
                             "GunGel audit dependency unavailable", string.Empty);
                     }
 
+                    Interlocked.Increment(ref _artifactRequests);
+                    string responsibilityDestination = Path.Combine(
+                        _sessionDirectory, "artifacts", "tsdf_responsibility");
+                    bool responsibilityRequested = _tsdfResponsibilityStarted &&
+                        volume.RequestTsdfResponsibilityAuditExport(
+                            "独立回放会话停止", responsibilityDestination, path =>
+                            {
+                                try
+                                {
+                                     WriteArtifactStatus("tsdf_responsibility",
+                                         string.IsNullOrEmpty(path) ? "failed" : "copied",
+                                         string.IsNullOrEmpty(path)
+                                             ? volume.LastTsdfResponsibilityExportError
+                                             : string.Empty,
+                                        string.IsNullOrEmpty(path) ? string.Empty :
+                                            "artifacts/tsdf_responsibility");
+                                }
+                                finally { Interlocked.Decrement(ref _artifactRequests); }
+                            });
+                    if (!responsibilityRequested)
+                    {
+                        Interlocked.Decrement(ref _artifactRequests);
+                        WriteArtifactStatus("tsdf_responsibility", "unavailable",
+                            "responsibility capture not started or export already unavailable", string.Empty);
+                    }
+
                 }
                 else
                 {
                     WriteArtifactStatus("gungel_candidate_audit", "unavailable", "VolumeIntegrator missing", string.Empty);
+                    WriteArtifactStatus("tsdf_responsibility", "unavailable", "VolumeIntegrator missing", string.Empty);
                     WriteArtifactStatus("evidence_lineage", "unavailable",
                         "GunGel audit dependency unavailable", string.Empty);
                 }
@@ -847,7 +1173,65 @@ namespace Genesis.RoomScan
             }
             string destination = Path.Combine(_sessionDirectory, "artifacts", destinationName);
             CopyDirectory(source, destination);
-            WriteArtifactStatus(destinationName, "copied", string.Empty,
+            var paperIssues = new List<string>();
+            string paperContract = Path.Combine(destination, "full_output_join_contract.txt");
+            if (destinationName == "paper_audit" && File.Exists(paperContract))
+            {
+                string contract = File.ReadAllText(paperContract);
+                if (contract.Contains("fusion_final_partial_period_flush=failed"))
+                    paperIssues.Add("final fusion counter period readback failed");
+                if (contract.Contains("paper_queue_drain=timeout"))
+                    paperIssues.Add("production paper final drain timed out");
+                if (!contract.Contains("replacement_event_drops=0"))
+                    paperIssues.Add("production paper replacement events were dropped");
+                if (!contract.Contains("quality_timeline_bin_drops=0"))
+                    paperIssues.Add("production paper quality timeline bins were dropped");
+                if (!File.Exists(Path.Combine(destination,
+                        "production_paper_quality_timeline.csv")))
+                    paperIssues.Add("production paper quality timeline is missing");
+                if (contract.Contains("visual_quality_pages=0"))
+                    paperIssues.Add("production paper visual quality pages are missing");
+                string occupancyPath = Path.Combine(destination,
+                    "production_paper_occupancy.r32_uint.bin");
+                string occupancySchemaPath = Path.Combine(destination,
+                    "production_paper_occupancy_schema.json");
+                if (!File.Exists(occupancyPath) || !File.Exists(occupancySchemaPath))
+                {
+                    paperIssues.Add("exact production paper occupancy ledger is missing");
+                }
+                else
+                {
+                    string occupancySchema = File.ReadAllText(occupancySchemaPath);
+                    long productionTriangles = ReadJsonInteger(
+                        occupancySchema, "productionTriangles");
+                    long rasterizedTriangles = ReadJsonInteger(
+                        occupancySchema, "rasterizedTriangles");
+                    long occupiedCells = ReadJsonInteger(
+                        occupancySchema, "occupiedCells");
+                    if (productionTriangles <= 0 ||
+                        rasterizedTriangles != productionTriangles ||
+                        occupiedCells <= 0 || new FileInfo(occupancyPath).Length <= 0)
+                        paperIssues.Add("exact production paper occupancy ledger failed self-check");
+                }
+                string surfaceLedger = Path.Combine(destination,
+                    "production_paper_surface_ledger.txt");
+                if (!File.Exists(surfaceLedger))
+                {
+                    paperIssues.Add("production paper surface ledger is missing");
+                }
+                else
+                {
+                    string surface = File.ReadAllText(surfaceLedger);
+                    if (!surface.Contains("stage_responsibility_spatial_csv:"))
+                        paperIssues.Add("same-epoch surface stage responsibility ledger is missing");
+                    if (surface.Contains("stage_responsibility_comparable_bins=0"))
+                        paperIssues.Add("same-epoch surface stages have no comparable spatial bins");
+                }
+            }
+            bool incompletePaperFlush = paperIssues.Count > 0;
+            WriteArtifactStatus(destinationName,
+                incompletePaperFlush ? "incomplete" : "copied",
+                incompletePaperFlush ? string.Join("; ", paperIssues) : string.Empty,
                 "artifacts/" + destinationName);
             TryBuildEvidenceLineage();
         }
@@ -857,11 +1241,19 @@ namespace Genesis.RoomScan
             string artifacts = Path.Combine(_sessionDirectory, "artifacts");
             string paper = Path.Combine(artifacts, "paper_audit");
             string gunGel = Path.Combine(artifacts, "gungel_candidate_audit");
-            if (!File.Exists(Path.Combine(paper, "paper_hole_cells.csv")) ||
-                !File.Exists(Path.Combine(gunGel, "candidates.csv")) ||
+            if (!File.Exists(Path.Combine(gunGel, "candidates.csv")) ||
                 !File.Exists(Path.Combine(gunGel, "retirements.csv")) ||
                 !File.Exists(Path.Combine(gunGel, "court_waves.csv")))
                 return;
+            if (!File.Exists(Path.Combine(paper, "paper_hole_cells.csv")))
+            {
+                if (File.Exists(Path.Combine(paper,
+                    "production_paper_occupancy_schema.json")))
+                    WriteArtifactStatus("evidence_lineage", "deferred_offline",
+                        "exact blank-paper lineage requires the final TSDF responsibility join",
+                        "artifacts/tsdf_responsibility/paper_hole_responsibility.csv");
+                return;
+            }
             if (Interlocked.CompareExchange(ref _evidenceLineageBuildStarted, 1, 0) != 0)
                 return;
 
@@ -877,6 +1269,22 @@ namespace Genesis.RoomScan
                 WriteArtifactStatus("evidence_lineage", "failed",
                     e.GetType().Name + ": " + e.Message, string.Empty);
             }
+        }
+
+        private static long ReadJsonInteger(string json, string property)
+        {
+            string marker = "\"" + property + "\"";
+            int start = json.IndexOf(marker, StringComparison.Ordinal);
+            if (start < 0) return -1;
+            start = json.IndexOf(':', start + marker.Length);
+            if (start < 0) return -1;
+            start++;
+            while (start < json.Length && char.IsWhiteSpace(json[start])) start++;
+            int end = start;
+            while (end < json.Length && char.IsDigit(json[end])) end++;
+            return end > start && long.TryParse(json.Substring(start, end - start),
+                NumberStyles.None, CultureInfo.InvariantCulture, out long value)
+                ? value : -1;
         }
 
         private IEnumerator ExportSystemRoomMeshAsync()
@@ -1088,7 +1496,9 @@ namespace Genesis.RoomScan
                 return;
             // B 账来自已接纳融合缓冲的异步回读，必须等回读排空后再封账；
             // 否则用户按下停止键时仍在路上的最后几帧会被静默漏掉。
+            FlushRuntimeLedgers();
             _probeFinalBufferLedger?.End();
+            _finalSurfaceCourt?.End();
             _finalizeClean = _depthPairDrops == 0 && _depthPairReadbackErrors == 0 &&
                              _depthPairWriteErrors == 0 && _fusionDropped == 0 &&
                              _fusionReadbackErrors == 0 && _fusionWriteErrors == 0 &&
@@ -1102,7 +1512,10 @@ namespace Genesis.RoomScan
                              (_probeFinalBufferLedger?.WriteErrors ?? 0) == 0 &&
                              (_probeFinalBufferLedger?.AdjudicatorWriteErrors ?? 0) == 0 &&
                              (_probeFinalBufferLedger?.GraduationRaceWriteErrors ?? 0) == 0 &&
-                             _probeConversionWriteErrors == 0;
+                             (_finalSurfaceCourt?.WriteErrors ?? 0) == 0 &&
+                             _probeConversionWriteErrors == 0 &&
+                             _runtimeLedgerWriteErrors == 0 &&
+                             _artifactFailures == 0;
             Volatile.Write(ref _sealPhase, SealHashing);
             Volatile.Write(ref _checksumFilesProcessed, 0);
             Volatile.Write(ref _checksumFilesTotal, 0);
@@ -1190,10 +1603,13 @@ namespace Genesis.RoomScan
                          (_directProjectionShadowLedger?.ReadbackErrors ?? 0) == 0 &&
                          (_directProjectionShadowLedger?.OverflowRecords ?? 0) == 0 &&
                          (_directProjectionShadowLedger?.Frames ?? 0) > 0 &&
-                         (_probeFinalBufferLedger?.WriteErrors ?? 0) == 0 &&
-                         (_probeFinalBufferLedger?.AdjudicatorWriteErrors ?? 0) == 0 &&
-                         (_probeFinalBufferLedger?.GraduationRaceWriteErrors ?? 0) == 0 &&
-                         _probeConversionWriteErrors == 0;
+                          (_probeFinalBufferLedger?.WriteErrors ?? 0) == 0 &&
+                          (_probeFinalBufferLedger?.AdjudicatorWriteErrors ?? 0) == 0 &&
+                          (_probeFinalBufferLedger?.GraduationRaceWriteErrors ?? 0) == 0 &&
+                          (_finalSurfaceCourt?.WriteErrors ?? 0) == 0 &&
+                          _probeConversionWriteErrors == 0 &&
+                         _runtimeLedgerWriteErrors == 0 &&
+                         _artifactFailures == 0;
             string complete = "{\n" +
                               "  \"schema\": \"" + Schema + "\",\n" +
                               "  \"state\": \"" + (clean ? "complete" : "incomplete_with_capture_loss") + "\",\n" +
@@ -1204,6 +1620,8 @@ namespace Genesis.RoomScan
                               "  \"fusionCaptureDrops\": " + _fusionDropped + ",\n" +
                               "  \"fusionReadbackErrors\": " + _fusionReadbackErrors + ",\n" +
                               "  \"fusionWriteErrors\": " + _fusionWriteErrors + ",\n" +
+                              "  \"runtimeLedgerWriteErrors\": " + _runtimeLedgerWriteErrors + ",\n" +
+                              "  \"artifactFailures\": " + _artifactFailures + ",\n" +
                               "  \"probeShadowRows\": " + (_probeShadowLedger?.Rows ?? 0) + ",\n" +
                               "  \"probeShadowWriteErrors\": " + (_probeShadowLedger?.WriteErrors ?? 0) + ",\n" +
                                "  \"probeAdjudicatorFrameRows\": " + (_probeShadowLedger?.AdjudicatorFrameRows ?? 0) + ",\n" +
@@ -1228,8 +1646,9 @@ namespace Genesis.RoomScan
                               "  \"probeFinalBufferWriteErrors\": " + (_probeFinalBufferLedger?.WriteErrors ?? 0) + ",\n" +
                               "  \"probeFinalBufferAdjudicatorFrameRows\": " + (_probeFinalBufferLedger?.AdjudicatorFrameRows ?? 0) + ",\n" +
                               "  \"probeFinalBufferAdjudicatorEventRows\": " + (_probeFinalBufferLedger?.AdjudicatorEventRows ?? 0) + ",\n" +
-                              "  \"probeFinalBufferGraduationWitnessRows\": " + (_probeFinalBufferLedger?.GraduationRaceWitnessEventRows ?? 0) + ",\n" +
-                              "  \"probeConversionRows\": " + _probeConversionRows + ",\n" +
+                               "  \"probeFinalBufferGraduationWitnessRows\": " + (_probeFinalBufferLedger?.GraduationRaceWitnessEventRows ?? 0) + ",\n" +
+                               "  \"finalSurfaceCourtWriteErrors\": " + (_finalSurfaceCourt?.WriteErrors ?? 0) + ",\n" +
+                               "  \"probeConversionRows\": " + _probeConversionRows + ",\n" +
                               "  \"probeConversionMissingPreRows\": " + _probeConversionMissingPreRows + ",\n" +
                               "  \"probeConversionWriteErrors\": " + _probeConversionWriteErrors + ",\n" +
                               "  \"depthPairDrops\": " + _depthPairDrops + ",\n" +
@@ -1255,6 +1674,8 @@ namespace Genesis.RoomScan
                           "  \"fusionCaptureDrops\": " + _fusionDropped + ",\n" +
                           "  \"fusionReadbackErrors\": " + _fusionReadbackErrors + ",\n" +
                           "  \"fusionWriteErrors\": " + _fusionWriteErrors + ",\n" +
+                          "  \"runtimeLedgerWriteErrors\": " + _runtimeLedgerWriteErrors + ",\n" +
+                          "  \"artifactFailures\": " + _artifactFailures + ",\n" +
                           "  \"probeShadowRows\": " + (_probeShadowLedger?.Rows ?? 0) + ",\n" +
                           "  \"probeShadowWriteErrors\": " + (_probeShadowLedger?.WriteErrors ?? 0) + ",\n" +
                            "  \"probeAdjudicatorFrameRows\": " + (_probeShadowLedger?.AdjudicatorFrameRows ?? 0) + ",\n" +
@@ -1279,8 +1700,9 @@ namespace Genesis.RoomScan
                           "  \"probeFinalBufferWriteErrors\": " + (_probeFinalBufferLedger?.WriteErrors ?? 0) + ",\n" +
                           "  \"probeFinalBufferAdjudicatorFrameRows\": " + (_probeFinalBufferLedger?.AdjudicatorFrameRows ?? 0) + ",\n" +
                           "  \"probeFinalBufferAdjudicatorEventRows\": " + (_probeFinalBufferLedger?.AdjudicatorEventRows ?? 0) + ",\n" +
-                          "  \"probeFinalBufferGraduationWitnessRows\": " + (_probeFinalBufferLedger?.GraduationRaceWitnessEventRows ?? 0) + ",\n" +
-                          "  \"probeConversionRows\": " + _probeConversionRows + ",\n" +
+                           "  \"probeFinalBufferGraduationWitnessRows\": " + (_probeFinalBufferLedger?.GraduationRaceWitnessEventRows ?? 0) + ",\n" +
+                           "  \"finalSurfaceCourtWriteErrors\": " + (_finalSurfaceCourt?.WriteErrors ?? 0) + ",\n" +
+                           "  \"probeConversionRows\": " + _probeConversionRows + ",\n" +
                           "  \"probeConversionMissingPreRows\": " + _probeConversionMissingPreRows + ",\n" +
                           "  \"probeConversionWriteErrors\": " + _probeConversionWriteErrors + ",\n" +
                           "  \"depthPairDrops\": " + _depthPairDrops + ",\n" +
@@ -1315,6 +1737,10 @@ namespace Genesis.RoomScan
         {
             try
             {
+                if (string.Equals(status, "failed", StringComparison.Ordinal) ||
+                    string.Equals(status, "unavailable", StringComparison.Ordinal) ||
+                    string.Equals(status, "incomplete", StringComparison.Ordinal))
+                    Interlocked.Increment(ref _artifactFailures);
                 string directory = Path.Combine(_sessionDirectory, "artifacts");
                 Directory.CreateDirectory(directory);
                 string json = "{\n" +
@@ -1336,9 +1762,40 @@ namespace Genesis.RoomScan
                    "  \"depth_pairs\": \"platform pre-QRS and post-QRS depth for every preprocessed source frame\",\n" +
                    "  \"fusion_inputs\": \"exact accepted depth, admission, RGB and camera inputs plus rejected decision events; guarded frames include independent pre-transaction A and final-buffer B identity snapshots\",\n" +
                    "  \"probe_shadow\": \"pre-transaction A ledger, final_buffer post-transaction B ledger, direct45 conservative candidate-footprint raw/post reprojection, a production pending-retirement gate using 0.25-degree same-view invalidation and 1-degree cross-view support/free decisions, plus legacy zero-authority 16-frame, 8-frame ghost and 0.5/1/2-degree audit lanes\",\n" +
-                   "  \"artifacts\": \"GunGel candidate audit, paper audit, their read-only evidence lineage join, surface feature archive and online geometry ledgers\",\n" +
+                   "  \"runtime_timeline\": \"every Unity frame head pose, pitch/yaw/roll, platform depth frame, motion, fusion epoch and committed production-paper queue/draw state; integration_dispatches joins fusion attemptIndex/sourceFrame to dirtyEpoch\",\n" +
+                   "  \"artifacts\": \"GunGel candidate audit, final production-paper replacement/roughness/seam/hole ledgers, per-voxel TSDF geometry/support/block responsibility, their read-only evidence lineage join, surface feature archive and online geometry ledgers\",\n" +
                    "  \"system_reference\": \"handoff status for a separately exported Quest system room mesh; comparison only\",\n" +
                    "  \"completeRule\": \"capture_complete.json exists only after production depth, fusion and online artifacts drain and checksums finish; HUD safeToExit becomes true only after the marker is atomically published; external system mesh is not a seal dependency\"\n" +
+                   "}\n";
+        }
+
+        private static string BuildFullOutputIndexJson()
+        {
+            return "{\n" +
+                   "  \"schema\": \"scancover.full_output_index.v4\",\n" +
+                   "  \"principle\": \"independent stage facts joined after capture; no diagnostic output has production authority\",\n" +
+                   "  \"primaryJoin\": \"depth_pairs.platformFrame = fusion_inputs.sourceFrame = runtime_timeline.integration_dispatches.sourceFrame\",\n" +
+                   "  \"epochJoin\": \"production_paper_replacements.candidate_epoch -> integration_dispatches.dirtyEpoch -> integration_dispatches.sourceFrame; queued paper commits may intentionally lag\",\n" +
+                   "  \"courtJoin\": \"final_surface_court sourceFrame+attemptIndex+stableId -> fusion frame finalIdentity -> TSDF endpoint sourceFrame+attemptIndex; paper site association remains bounded in the declared volume coordinate contract\",\n" +
+                   "  \"paperDecisionContextWarning\": \"observed_platform_frame_at_decision is asynchronous commit-time context and must never be used as candidate provenance\",\n" +
+                   "  \"timeJoin\": \"unityFrame plus unscaledTime; use pose deltas rather than assuming equal callback/preprocess/fusion time\",\n" +
+                   "  \"lanes\": {\n" +
+                   "    \"rawAndProcessedDepth\": \"depth_pairs/manifest.csv and depth_pairs/frames\",\n" +
+                   "    \"fusionAdmissionAndExactInput\": \"fusion_inputs/manifest.csv and fusion_inputs/frames\",\n" +
+                   "    \"continuousPoseMotionDistanceQueue\": \"runtime_timeline/frames.csv\",\n" +
+                   "    \"fusionToExtractionEpoch\": \"runtime_timeline/integration_dispatches.csv\",\n" +
+                   "    \"candidateIdentityAndRetirement\": \"probe_shadow plus artifacts/gungel_candidate_audit\",\n" +
+                   "    \"finalCourtResponsibility\": \"probe_shadow/final_buffer/final_surface_court frame gates, independent testimonies, decision checks and publication events\",\n" +
+                   "    \"committedPaperReplacement\": \"artifacts/paper_audit/production_paper_replacements.csv\",\n" +
+                   "    \"committedPaperQualityTimeline\": \"artifacts/paper_audit/production_paper_quality_timeline.csv records every accepted commit at 4x4x4-bin grain\",\n" +
+                   "    \"sameEpochSurfaceStageResponsibility\": \"artifacts/paper_audit/production_paper_surface_ledger.txt sections stage_responsibility_contract and stage_responsibility_spatial_csv\",\n" +
+                   "    \"committedPaperRoughnessAndSeams\": \"artifacts/paper_audit/production_paper_surface_ledger.txt\",\n" +
+                    "    \"fusionVoxelAndFovPeriods\": \"artifacts/paper_audit/fusion_forensic_ledger.txt, fusion_fov_periods.csv and fusion_all_counters.csv for production/raw-projective lanes\",\n" +
+                    "    \"tsdfTransactionResponsibility\": \"artifacts/tsdf_responsibility joins each final zero-crossing endpoint to current-lifetime seed, last geometry writer, last support writer and strongest blocked correction\",\n" +
+                     "    \"blankPaperResponsibility\": \"artifacts/paper_audit/production_paper_occupancy plus final TSDF responsibility are joined offline to locate missing paper at TSDF support/crossing, extraction/candidate or publication boundaries\"\n" +
+                   "  },\n" +
+                   "  \"antiMaskingRule\": \"attribute the earliest stage where joined records diverge; do not infer one cause from a later mixed surface alone\",\n" +
+                   "  \"stopRule\": \"A stops sampling and drains/seals this ledger without entering frozen replay\"\n" +
                    "}\n";
         }
 
@@ -1523,7 +1980,16 @@ namespace Genesis.RoomScan
             AppendVector3(sb, r.FusionHeadPosition);
             sb.Append(",\"rotationQuaternion\":");
             AppendQuaternion(sb, r.FusionHeadRotation);
+            sb.Append(",\"eulerDegrees\":");
+            AppendVector3(sb, r.FusionHeadEuler);
             sb.Append("},\n")
+                .Append("  \"fusionEyeFromViewInverse\": {\"available\":")
+                .Append(r.FusionEyeAvailable ? "true" : "false")
+                .Append(",\"position\":");
+            AppendVector3(sb, r.FusionEyePosition);
+            sb.Append(",\"forward\":");
+            AppendVector3(sb, r.FusionEyeForward);
+            sb.Append(",\"headToEyeMm\":").Append(F(r.HeadToFusionEyeMm)).Append("},\n")
                 .Append("  \"recordedEyeIndex\": ").Append(RecordedEye).Append(",\n")
                 .Append("  \"status\": \"").Append(Json(status)).Append("\",\n")
                 .Append("  \"textures\": {");
@@ -1539,6 +2005,8 @@ namespace Genesis.RoomScan
             AppendVector3(sb, r.CameraPosition);
             sb.Append(",\"rotationQuaternion\":");
             AppendQuaternion(sb, r.CameraRotation);
+            sb.Append(",\"eulerDegrees\":");
+            AppendVector3(sb, r.CameraEuler);
             sb.Append(",\"focalLength\":"); AppendVector2(sb, r.CameraFocalLength);
             sb.Append(",\"principalPoint\":"); AppendVector2(sb, r.CameraPrincipalPoint);
             sb.Append(",\"sensorResolution\":"); AppendVector2(sb, r.CameraSensorResolution);
@@ -1788,6 +2256,9 @@ namespace Genesis.RoomScan
                 gunGelObservations, gunGelCorrespondences,
                 gunGelPreTransactionCorrespondenceIdentity,
                 gunGelCorrespondenceIdentity;
+            internal GunGelEvidenceShadow.Correspondence[]
+                gunGelCorrespondenceRows;
+            internal Unity.Mathematics.uint4[] gunGelCorrespondenceIdentityRows;
             internal bool depthDone, normalDone, dilatedDone, edgeDone, temporalDone, cameraDone,
                 gunGelObservationsDone, gunGelCorrespondencesDone,
                 gunGelPreTransactionCorrespondenceIdentityDone,
@@ -1891,6 +2362,12 @@ namespace Genesis.RoomScan
             internal readonly Quaternion CameraRotation;
             internal readonly Vector3 FusionHeadPosition;
             internal readonly Quaternion FusionHeadRotation;
+            internal readonly Vector3 FusionHeadEuler;
+            internal readonly bool FusionEyeAvailable;
+            internal readonly Vector3 FusionEyePosition;
+            internal readonly Vector3 FusionEyeForward;
+            internal readonly float HeadToFusionEyeMm;
+            internal readonly Vector3 CameraEuler;
             internal readonly Vector2 CameraFocalLength, CameraPrincipalPoint,
                 CameraSensorResolution, CameraCurrentResolution;
             internal readonly Matrix4x4 FusionCorrection;
@@ -1919,6 +2396,22 @@ namespace Genesis.RoomScan
                     ? fusionHead.transform.position : Vector3.zero;
                 FusionHeadRotation = fusionHead != null
                     ? fusionHead.transform.rotation : Quaternion.identity;
+                FusionHeadEuler = fusionHead != null
+                    ? fusionHead.transform.eulerAngles : Vector3.zero;
+                FusionEyeAvailable = viewInverse != null && viewInverse.Length > RecordedEye;
+                Matrix4x4 fusionEye = FusionEyeAvailable
+                    ? viewInverse[RecordedEye]
+                    : Matrix4x4.identity;
+                FusionEyePosition = FusionEyeAvailable
+                    ? new Vector3(fusionEye.m03, fusionEye.m13, fusionEye.m23)
+                    : Vector3.zero;
+                FusionEyeForward = FusionEyeAvailable
+                    // Depth matrices include ScaleFlipZ; local -Z is the
+                    // physical viewing direction in this exact view inverse.
+                    ? fusionEye.MultiplyVector(Vector3.back).normalized : Vector3.zero;
+                HeadToFusionEyeMm = FusionHeadAvailable && FusionEyeAvailable
+                    ? Vector3.Distance(FusionHeadPosition, FusionEyePosition) * 1000f
+                    : float.NaN;
                 Accepted = accepted; Decision = decision ?? string.Empty; Guarded = guarded;
                 GunGelFrame = gunGelFrame; TranslationMm = translationMm; RotationDeg = rotationDeg;
                 AngularSpeed = angularSpeed; LinearSpeed = linearSpeed; MotionQuality = motionQuality;
@@ -1927,6 +2420,7 @@ namespace Genesis.RoomScan
                 GunGelAdmissionActive = gunGelAdmissionActive;
                 CameraAvailable = cameraAvailable; CameraPosition = cameraPosition;
                 CameraRotation = cameraRotation; CameraFocalLength = cameraFocalLength;
+                CameraEuler = cameraRotation.eulerAngles;
                 CameraPrincipalPoint = cameraPrincipalPoint;
                 CameraSensorResolution = cameraSensorResolution;
                 CameraCurrentResolution = cameraCurrentResolution;

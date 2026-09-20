@@ -5,7 +5,7 @@ namespace Genesis.RoomScan
     /// <summary>
     /// QRS 独立测试链的右手柄输入：
     ///   扳机       = 开始 / 继续采集共享 TSDF
-    ///   A          = 冻结共享 TSDF；即时外壳档中只钉住影子快照，生产继续
+    ///   A          = 冻结共享 TSDF；即时外壳档中切换世界锁定定格，生产继续
     ///   Y          = 在 64³ / 32³ / 16³ 只读回放档之间循环
     ///   B          = 只导出并清空当前档，不清共享 TSDF
     ///   右摇杆按下 = 一键回到真实 TSDF 的生产纸皮观察档；
@@ -17,7 +17,7 @@ namespace Genesis.RoomScan
     ///   左摇杆右+按下 = 32³融合管理块线框开关（青稳/黄热/红双热/洋红已解冻）
     ///   左摇杆左+按下 = 空卷时切换胶冻 / 原冻（与右摇杆左同义，便于实机操作）
     ///   左握把+X = 平台前处理 / QRS 后处理双路逐帧采集开关
-    ///   普通 X     = 裁决海→BB点云→即时外壳→壳纸合流→关
+    ///   普通 X     = 裁决海→BB点云→即时外壳→种子平面→壳纸合流→合流仅纸→关
     /// 每次按键给一下短震动作为反馈。
     /// </summary>
     public class StandaloneScanInput : MonoBehaviour
@@ -54,7 +54,7 @@ namespace Genesis.RoomScan
             if (OVRInput.GetDown(OVRInput.Button.One, controller))
             {
                 scanner.NotifyInput("A键");
-                if (scanner.TryFreezeInstantShellSnapshot())
+                if (scanner.TryToggleInstantShellFreeze())
                 {
                     Pulse();
                 }
@@ -70,11 +70,22 @@ namespace Genesis.RoomScan
                 }
             }
 
-            // B：A/B 模式只导出并清当前档；绝不清共享 TSDF。
+            // B：种面“待清卷”是一次明确的生产换卷事务，优先级高于
+            // HERA/A-B 派生档导出；否则场景常驻 enableFrozenChunkAbExperiment
+            // 会把 B 送进尚未冻结的回放分支并静默返回，HUD 要求按 B 却毫无反应。
+            // 其他时候仍保持原语义：A/B 模式只导出并清当前派生档。
             if (OVRInput.GetDown(OVRInput.Button.Two, controller))
             {
                 scanner.NotifyInput("B键");
-                if (scanner.IsChunkAbExperimentEnabled)
+                bool seedNeedsClear = scanner.DepthCapture != null &&
+                                      scanner.DepthCapture.SeedPlaneAwaitClear;
+                if (seedNeedsClear)
+                {
+                    scanner.NotifyInput("B键：保存旧账并为种面清卷");
+                    scanner.StopAndClearScan();
+                    Pulse(0.5f, 0.5f);
+                }
+                else if (scanner.IsChunkAbExperimentEnabled)
                 {
                     scanner.ExportAndClearActiveChunkAbGear();
                     Pulse(0.5f, 0.5f);
@@ -89,7 +100,7 @@ namespace Genesis.RoomScan
             // 右摇杆：按下=单色/状态着色；**推方向再按下**=性能二分热键（实机：
             // 采集 15-24fps GPU U 91%，冻结满显示 73fps——猪在采集链路 GPU 侧）：
             //   上=实时轨开关（提取+过滤+回读churn）
-            //   左=胶冻/原冻 A/B（只允许尚未开扫的空卷切换）
+            //   左=原冻→胶冻→裁冻准入（只允许尚未开扫的空卷切换；纸皮档不变）
             //   下=融合 20↔10Hz（TSDF 积分量减半）
             if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick, controller))
             {
@@ -163,7 +174,8 @@ namespace Genesis.RoomScan
                 }
                 else
                 {
-                    // 普通 X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳 → 壳纸合流 → 关。
+                    // 普通 X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳 →
+                    // 种子平面 → 壳纸合流 → 合流仅纸 → 关。
                     scanner.ToggleCoverageMarkers();
                     // ToggleCoverageMarkers 内部会写一次提示，因此诊断握值必须放在
                     // 它之后，确保实机截图能看见而不是被“BB反投影”提示覆盖。
@@ -176,7 +188,7 @@ namespace Genesis.RoomScan
             // SetGlobalFloat），对增量 HERA 页同样生效——帧率二分实验专用：
             // 切实体后帧率跳升=线框边缘检测的填充开销是主猪。
             // 左摇杆推上再按下=源头时序滤波开关（盯墙养绿 A/B：同墙同段实时切换，
-            // 关闭侧=pre-时序滤波基线；与右摇杆方向热键同款手势）。
+            // 关闭侧=pre-时序滤波基线；左方向同样循环原冻→胶冻→裁冻）。
             if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick, OVRInput.Controller.LTouch))
             {
                 Vector2 lstick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.LTouch);

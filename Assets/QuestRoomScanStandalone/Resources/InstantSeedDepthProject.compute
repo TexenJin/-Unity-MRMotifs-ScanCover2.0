@@ -1,0 +1,146 @@
+#pragma kernel ProjectSeedPlanes
+
+// Experimental single-volume input adapter. The source was already filtered;
+// only pixels agreeing with a captured world-plane patch are moved. All other
+// depth samples, including zero/abstention, pass through unchanged.
+Texture2DArray<float> _SeedSourceDepth;
+Texture2DArray<float4> _SeedSourceNormal;
+RWTexture2DArray<float> _SeedOutputDepth;
+int2 _SeedImageSize;
+int _SeedPlaneCount;
+float4 _SeedNormalOffset[8]; // normal.xyz, dot(normal, point)
+float4 _SeedAxisUMin[8];     // axisU.xyz, minU
+float4 _SeedAxisVMin[8];     // axisV.xyz, minV
+float4 _SeedMaxUV[8];        // maxU, maxV
+float4x4 _SeedProj[2];
+float4x4 _SeedProjInv[2];
+float4x4 _SeedView[2];
+float4x4 _SeedViewInv[2];
+
+bool ReadWorld(int2 pixel, out float3 world, out float3 normal,
+               out float distance)
+{
+    world = 0.0;
+    normal = 0.0;
+    distance = 0.0;
+    if (pixel.x < 0 || pixel.y < 0 ||
+        pixel.x >= _SeedImageSize.x || pixel.y >= _SeedImageSize.y)
+        return false;
+    float ndc = _SeedSourceDepth.Load(int4(pixel, 1, 0));
+    if (!(ndc > 0.0 && ndc < 1.0)) return false;
+    float4 clip = float4((float2(pixel) + 0.5) /
+        float2(_SeedImageSize) * 2.0 - 1.0, ndc * 2.0 - 1.0, 1.0);
+    float4 viewH = mul(_SeedProjInv[1], clip);
+    if (abs(viewH.w) < 0.00001) return false;
+    float linearDepth = abs(viewH.z / viewH.w);
+    if (!(linearDepth > 0.12 && linearDepth < 8.0)) return false;
+    float4 worldH = mul(_SeedViewInv[1], viewH);
+    if (abs(worldH.w) < 0.00001) return false;
+    world = worldH.xyz / worldH.w;
+    float3 rawNormal = _SeedSourceNormal.Load(int4(pixel, 1, 0)).xyz;
+    if (dot(rawNormal, rawNormal) <= 0.0625) return false;
+    normal = normalize(rawNormal);
+    float3 camera = mul(_SeedViewInv[1], float4(0, 0, 0, 1)).xyz;
+    distance = length(world - camera);
+    return true;
+}
+
+bool Matches(int2 pixel, int planeIndex, out float residual)
+{
+    residual = 1e9;
+    float3 world, normal;
+    float distance;
+    if (!ReadWorld(pixel, world, normal, distance)) return false;
+    float3 planeNormal = _SeedNormalOffset[planeIndex].xyz;
+    if (abs(dot(normal, planeNormal)) < 0.82) return false;
+    float u = dot(world, _SeedAxisUMin[planeIndex].xyz);
+    float v = dot(world, _SeedAxisVMin[planeIndex].xyz);
+    const float footprintMargin = 0.015;
+    if (u < _SeedAxisUMin[planeIndex].w - footprintMargin ||
+        u > _SeedMaxUV[planeIndex].x + footprintMargin ||
+        v < _SeedAxisVMin[planeIndex].w - footprintMargin ||
+        v > _SeedMaxUV[planeIndex].y + footprintMargin)
+        return false;
+    residual = abs(dot(world, planeNormal) - _SeedNormalOffset[planeIndex].w);
+    float limit = clamp(0.006 + distance * 0.003, 0.008, 0.022);
+    return residual <= limit;
+}
+
+[numthreads(8, 8, 1)]
+void ProjectSeedPlanes(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SeedImageSize.x || id.y >= (uint)_SeedImageSize.y ||
+        id.z >= 2u) return;
+    int2 pixel = int2(id.xy);
+    float sourceDepth = _SeedSourceDepth.Load(int4(pixel, (int)id.z, 0));
+    if (id.z != 1u || _SeedPlaneCount == 0 || sourceDepth <= 0.0)
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+
+    int best = -1;
+    float bestResidual = 1e9;
+    [loop] for (int p = 0; p < _SeedPlaneCount; p++)
+    {
+        float residual;
+        if (Matches(pixel, p, residual) && residual < bestResidual)
+        {
+            best = p;
+            bestResidual = residual;
+        }
+    }
+    if (best < 0)
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+
+    // Leave patch borders untouched, just like the CPU preview. This also
+    // prevents a plane from dragging a foreground edge into a background wall.
+    [unroll] for (int dy = -1; dy <= 1; dy++)
+    [unroll] for (int dx = -1; dx <= 1; dx++)
+    {
+        if (dx == 0 && dy == 0) continue;
+        float residual;
+        if (!Matches(pixel + int2(dx, dy), best, residual))
+        {
+            _SeedOutputDepth[id] = sourceDepth;
+            return;
+        }
+    }
+
+    float3 world, normal;
+    float distance;
+    if (!ReadWorld(pixel, world, normal, distance))
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+    float3 camera = mul(_SeedViewInv[1], float4(0, 0, 0, 1)).xyz;
+    float3 ray = normalize(world - camera);
+    float3 planeNormal = _SeedNormalOffset[best].xyz;
+    float denominator = dot(ray, planeNormal);
+    if (abs(denominator) < 0.20)
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+    float rayDistance = (_SeedNormalOffset[best].w -
+        dot(camera, planeNormal)) / denominator;
+    if (rayDistance <= 0.0 || abs(rayDistance - distance) > 0.04)
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+    float4 clip = mul(_SeedProj[1], mul(_SeedView[1],
+        float4(camera + ray * rayDistance, 1.0)));
+    if (abs(clip.w) < 0.00001)
+    {
+        _SeedOutputDepth[id] = sourceDepth;
+        return;
+    }
+    float corrected = clip.z / clip.w * 0.5 + 0.5;
+    _SeedOutputDepth[id] = corrected > 0.0 && corrected < 1.0
+        ? corrected : sourceDepth;
+}

@@ -40,7 +40,11 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("第一阶段纯几何观察：开=所有生产/HERA网格统一白色，绕开置信、冻结和路由着色。仅显示层，不改变融合、提取或页面调度。")]
         private bool geometryTruthView = true;
         [SerializeField, Tooltip("32³融合/冻结管理块运行时线框：淡青=稳定冻结，黄=本窗自由空间票热，红=连续两窗热，洋红=已解冻待复冻。只读显示层。")]
-        private bool showManagementBlockWireOverlay = true;
+        // Production starts clean.  The 32^3 management boxes are a diagnostic
+        // overlay and must be requested explicitly; otherwise a cold start can
+        // already be on the product route while the cyan block cages remain on
+        // top and look like part of the delivered surface.
+        private bool showManagementBlockWireOverlay = false;
 
         [Header("覆盖范围")]
         [SerializeField, Tooltip("头部排除区（QRS 原版防自扫）：开=头周圆柱内永不生成网格（半径在 VolumeIntegrator.exclusionRadius 调）；关=周围近距也能覆盖网格")]
@@ -365,18 +369,30 @@ namespace Genesis.RoomScan
 
         private bool GunGelGuardedFusionEnabled =>
             _volumeIntegrator != null && _volumeIntegrator.GunGelGuardedFusionExperimentEnabled;
+        private bool FinalCourtAdmissionEnabled =>
+            _volumeIntegrator != null && _volumeIntegrator.FinalCourtAdmissionExperimentEnabled;
 
         /// <summary>
-        /// 主对照身份。胶冻/原冻的冻结监督完全相同；胶活/原活仅保留给
-        /// 净室追责，不作为本轮生产 A/B 入口。
+        /// 当前唯一生产身份。GunGel 只保留 stableId 与候选证词；原始健康
+        /// 深度进入唯一 TSDF，裁判平面在提取后的块产品化阶段才有修改权。
         /// </summary>
-        private string CaptureModeLabel => enableGunGelCleanRoomExperiment
-            ? (GunGelGuardedFusionEnabled ? "胶活" : "原活")
-            : (GunGelGuardedFusionEnabled ? "胶冻" : "原冻");
+        private string CaptureModeLabel =>
+            _volumeIntegrator != null && _volumeIntegrator.GunGelIdentityOnlyMode
+            ? "制品"
+            : FinalCourtAdmissionEnabled
+            ? (enableGunGelCleanRoomExperiment ? "裁活" : "裁冻")
+            : enableGunGelCleanRoomExperiment
+                ? (GunGelGuardedFusionEnabled ? "胶活" : "原活")
+                : (GunGelGuardedFusionEnabled ? "胶冻" : "原冻");
 
-        private string CaptureModeToken => enableGunGelCleanRoomExperiment
-            ? (GunGelGuardedFusionEnabled ? "gel_live" : "base_live")
-            : (GunGelGuardedFusionEnabled ? "gel_freeze" : "base_freeze");
+        private string CaptureModeToken =>
+            _volumeIntegrator != null && _volumeIntegrator.GunGelIdentityOnlyMode
+            ? "single_tsdf_productized"
+            : FinalCourtAdmissionEnabled
+            ? (enableGunGelCleanRoomExperiment ? "court_live" : "court_freeze")
+            : enableGunGelCleanRoomExperiment
+                ? (GunGelGuardedFusionEnabled ? "gel_live" : "base_live")
+                : (GunGelGuardedFusionEnabled ? "gel_freeze" : "base_freeze");
 
         private void SyncCaptureModeIdentity()
         {
@@ -583,8 +599,8 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// 空卷时切换胶冻/原冻。两边强制共用同一套旧冻结监督，只改变
-        /// 融合前是否启用枪胶受保护准入；开扫后锁死，必须重启新卷再换。
+        /// 本轮验收锁定裁冻。按键仍保留，但只会重申唯一生产路线；原冻和
+        /// 普通胶冻不能再因 Scene 遗留值或误触重新取得 TSDF 写入权。
         /// </summary>
         public void ToggleGunGelGuardedFusionExperiment()
         {
@@ -602,7 +618,7 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            // 成对实验必须只剩枪胶一个变量：两组都恢复相同的旧冻结监督。
+            // 显示、冻结监督和生产纸皮保持原链；只锁定融合准入来源。
             enableGunGelCleanRoomExperiment = false;
             enableFrozenBlockSupervisor = true;
             ResetFrozenBlockSupervisor();
@@ -626,8 +642,8 @@ namespace Genesis.RoomScan
         private UnityEngine.UI.Text _statusBadgeText;
         private UnityEngine.UI.Text _statusBadgeHeaderText;
         private UnityEngine.UI.Text _statusBadgeRightText;
-        private const float DiagnosticHudWidth = 2280f;
-        private const float DiagnosticHudHeaderHeight = 78f;
+        private const float DiagnosticHudWidth = 2100f;
+        private const float DiagnosticHudHeaderHeight = 104f;
         private const float DiagnosticHudPadding = 24f;
         private GameObject _probeReticleRoot;
         private RectTransform _probeTargetMarkerRect;
@@ -683,6 +699,17 @@ namespace Genesis.RoomScan
             _volumeIntegrator = GetComponent<VolumeIntegrator>();
             _meshExtractor = GetComponent<MeshExtractor>();
             _cameraProvider = GetComponent<PassthroughCameraProvider>();
+            if (_volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled)
+            {
+                // The architecture baseline owns one reconstruction and one
+                // renderer.  Do not let a serialized A/B flag tear it down and
+                // replace it with HERA/freeze acquisition during StartScanning.
+                enableFrozenChunkAbExperiment = false;
+                // V1 still uses a whole-volume stateless Surface Nets readout.
+                // Keep it off the 12 Hz production cadence until the next stage
+                // replaces it with blockwise Marching Cubes/model raycast.
+                meshExtractionHz = Mathf.Min(meshExtractionHz, 4f);
+            }
             SyncCaptureModeIdentity();
             EnsureManagementBlockWireOverlay();
             _volumeIntegrator.Cleared += ResetFrozenBlockSupervisor;
@@ -748,7 +775,10 @@ namespace Genesis.RoomScan
 
             var root = new GameObject("[QRS] Minimal Status Badge");
             root.transform.SetParent(Camera.main.transform, false);
-            root.transform.localPosition = new Vector3(0f, -0.14f, 0.9f);
+            // Keep the compact operator prompt close to the optical centre.
+            // A centred pivot prevents its two-line height from pushing the
+            // whole plate downward as the prompt changes.
+            root.transform.localPosition = new Vector3(0f, -0.05f, 0.9f);
             root.transform.localRotation = Quaternion.identity;
             root.transform.localScale = Vector3.one * 0.00036f;
 
@@ -758,7 +788,7 @@ namespace Genesis.RoomScan
             // This canvas owns the diagnostic text only, not the performance graphs.
             canvas.sortingOrder = 32760;
             var rootRect = root.GetComponent<RectTransform>();
-            rootRect.pivot = new Vector2(0.5f, 1f);
+            rootRect.pivot = new Vector2(0.5f, 0.5f);
             rootRect.sizeDelta = new Vector2(DiagnosticHudWidth, 640f);
 
             Material badgeMaterial = null;
@@ -811,8 +841,8 @@ namespace Genesis.RoomScan
             textObject.transform.SetParent(root, false);
             var text = textObject.AddComponent<UnityEngine.UI.Text>();
             text.font = font;
-            text.fontSize = 26;
-            text.alignment = TextAnchor.UpperLeft;
+            text.fontSize = 30;
+            text.alignment = TextAnchor.UpperCenter;
             text.horizontalOverflow = HorizontalWrapMode.Wrap;
             text.verticalOverflow = VerticalWrapMode.Overflow;
             text.raycastTarget = false;
@@ -1067,9 +1097,13 @@ namespace Genesis.RoomScan
             if (_shellPaperOnlyView)
                 viewState = "合流仅纸";
             else if (_instantDepthShellOverlay != null && _instantDepthShellOverlay.Visible)
-                viewState = _instantDepthShellOverlay.CompositeWithProduction
-                    ? "壳纸合流"
-                    : "即时外壳";
+                viewState = _instantDepthShellOverlay.SeedPreviewVisible
+                    ? "种子平面"
+                    : _instantDepthShellOverlay.DiagnosticFreezeActive
+                    ? "即时壳定格"
+                    : _instantDepthShellOverlay.CompositeWithProduction
+                        ? "壳纸合流"
+                        : "即时外壳";
             else if (_gunGelCourtOverlay != null && _gunGelCourtOverlay.Visible)
                 viewState = "裁决海";
             else if (_depthPointCloudOverlay != null && _depthPointCloudOverlay.Visible)
@@ -1079,7 +1113,14 @@ namespace Genesis.RoomScan
             else
                 viewState = _meshExtractor.RouteValidationLabel;
 
-            string productionAdmission = GunGelGuardedFusionEnabled
+            string productionAdmission =
+                _volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled
+                ? "InfiniTAM V1.3直融"
+                : _volumeIntegrator != null && _volumeIntegrator.GunGelIdentityOnlyMode
+                ? "原深度TSDF→块裁决"
+                : FinalCourtAdmissionEnabled
+                ? "裁判平面"
+                : GunGelGuardedFusionEnabled
                 ? "邻证同面"
                 : "原始旁路";
 
@@ -1123,27 +1164,65 @@ namespace Genesis.RoomScan
                 _coverageOverlay != null ? _coverageOverlay.CoveragePercent : 0f),
                 0, 100);
 
-            // Fixed semantic columns in every view. Visibility must never select diagnostics.
+            // Fixed semantic columns in every standard view. The explicit
+            // court-paper inspection gear uses its compact acceptance panel.
+            string seedState = _depthCapture != null
+                ? _depthCapture.SeedPlaneProductionStatus
+                : "无";
+            string primaryPrompt = BuildPrimaryHudPrompt(viewState, seedState);
+            string baselineProgress = _volumeIntegrator != null &&
+                                      _volumeIntegrator.InfiniTamBaselineEnabled
+                ? $" 顶{(_meshExtractor != null ? _meshExtractor.LastVertexCount : 0)} " +
+                  $"面{(_meshExtractor != null ? _meshExtractor.LastIndexCount / 3 : 0)} " +
+                  $"画{(_meshExtractor != null ? _meshExtractor.LastSubmittedDrawVertexCount : 0)}"
+                : string.Empty;
+            string baselineTicket = _volumeIntegrator != null &&
+                                    _volumeIntegrator.InfiniTamBaselineEnabled
+                ? "\n" + _volumeIntegrator.GetInfiniTamTicketCompact() +
+                  "\n" + _volumeIntegrator.GetInfiniTamModelRaycastCompact() +
+                  "\n" + (_meshExtractor != null
+                      ? _meshExtractor.InfiniTamBlockStatsCompact
+                      : "块前台未就绪")
+                : string.Empty;
             _statusBadgeHeaderText.color = _statusBadgeText.color;
             _statusBadgeRightText.color = _statusBadgeText.color;
+            _statusBadgeHeaderText.fontSize = 50;
+            _statusBadgeHeaderText.fontStyle = FontStyle.Bold;
+            _statusBadgeHeaderText.alignment = TextAnchor.UpperCenter;
             _statusBadgeHeaderText.text =
-                $"状态[{HudFixedSlot(runState, 4)}] 模式[{HudFixedSlot(CaptureModeLabel, 4)}] " +
-                $"视图[{HudFixedSlot(viewState, 8)}]  全档诊断常驻\n" +
-                $"生产准入[{HudFixedSlot(productionAdmission, 6)}] 蒙皮[原生5cm诊断]  " +
-                (_meshExtractor != null ? _meshExtractor.SparseFoundationHudFixed : "蒙皮暂无数据");
-            _statusBadgeText.text =
-                (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.RelayDiagnosticsFixed :
-                    "[接力·整批采样]\n审计未就绪\n[覆盖与冻结]\n暂无数据") +
-                "\n[口径]\n残=均值/峰值(mm)；无样本不算通过\n读/找=本段命中率；齐=命中内对齐率\n后段只验前段对齐样本，非全场覆盖率";
-            _statusBadgeRightText.text =
-                (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.AttributionDiagnosticsFixed :
-                    "[错位归因]\n暂无数据\n[融合写入]\n暂无数据") + "\n[运行与采集]\n" +
-                probeHud + "\n" +
-                $"输入 质{quality:0.00} 角{angular:000}°/s " +
-                $"线{linear:0.00}m/s 帧{fps:000}\n" +
-                $"采集 双采[{HudFixedSlot(pairedState, 2)}] 待{pairedPending:0000} " +
-                $"丢{pairedDropped:0000}/{replayDropped:0000} 视域覆{viewCoverage:000}%\n" +
-                sealHud;
+                $"▶ {primaryPrompt}\n" +
+                $"状态[{runState}] 视图[{viewState}] 种面[{seedState}] " +
+                $"准入[{productionAdmission}]{baselineProgress}{baselineTicket}";
+
+            // The evidence ledger keeps running, but defaults to hidden.  The
+            // headset operator sees only the next action and the few states
+            // needed to verify it; the existing inspector switch can restore
+            // both forensic columns without changing acquisition semantics.
+            _statusBadgeText.gameObject.SetActive(showDetailedRuntimeStatus);
+            _statusBadgeRightText.gameObject.SetActive(showDetailedRuntimeStatus);
+            if (showDetailedRuntimeStatus)
+            {
+                _statusBadgeText.fontSize = 30;
+                _statusBadgeRightText.fontSize = 30;
+                _statusBadgeText.text =
+                    (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.RelayDiagnosticsFixed :
+                        "[接力·整批采样]\n审计未就绪\n[覆盖与冻结]\n暂无数据") +
+                    "\n[口径]\n残=均值/峰值(mm)；无样本不算通过\n读/找=本段命中率；齐=命中内对齐率\n后段只验前段对齐样本，非全场覆盖率";
+                _statusBadgeRightText.text =
+                    (_instantDepthShellOverlay != null ? _instantDepthShellOverlay.AttributionDiagnosticsFixed :
+                        "[错位归因]\n暂无数据\n[融合写入]\n暂无数据") + "\n[运行与采集]\n" +
+                    probeHud + "\n" +
+                    $"输入 质{quality:0.00} 角{angular:000}°/s " +
+                    $"线{linear:0.00}m/s 帧{fps:000}\n" +
+                    $"采集 双采[{HudFixedSlot(pairedState, 2)}] 待{pairedPending:0000} " +
+                    $"丢{pairedDropped:0000}/{replayDropped:0000} 视域覆{viewCoverage:000}%\n" +
+                    sealHud;
+            }
+            else
+            {
+                _statusBadgeText.text = string.Empty;
+                _statusBadgeRightText.text = string.Empty;
+            }
 
             // Grow below the performance graphs, with no paging, scrolling, or view gates.
             var badgeRect = _statusBadgeText.transform.parent as RectTransform;
@@ -1153,10 +1232,70 @@ namespace Genesis.RoomScan
                     _statusBadgeHeaderText.preferredHeight + DiagnosticHudPadding * 2f);
                 _statusBadgeText.rectTransform.offsetMax = new Vector2(-DiagnosticHudPadding, -bodyTop);
                 _statusBadgeRightText.rectTransform.offsetMax = new Vector2(-DiagnosticHudPadding, -bodyTop);
-                float badgeHeight = bodyTop + DiagnosticHudPadding + Mathf.Max(
-                    _statusBadgeText.preferredHeight, _statusBadgeRightText.preferredHeight);
-                badgeRect.sizeDelta = new Vector2(DiagnosticHudWidth, Mathf.Max(640f, badgeHeight));
+                float badgeHeight = showDetailedRuntimeStatus
+                    ? bodyTop + DiagnosticHudPadding + Mathf.Max(
+                        _statusBadgeText.preferredHeight, _statusBadgeRightText.preferredHeight)
+                    : bodyTop + DiagnosticHudPadding;
+                badgeRect.sizeDelta = new Vector2(DiagnosticHudWidth,
+                    Mathf.Max(showDetailedRuntimeStatus ? 640f : 190f, badgeHeight));
             }
+        }
+
+        private string BuildPrimaryHudPrompt(string viewState, string seedState)
+        {
+            if (IsSaveAndClearInProgress)
+                return "请等待：正在保存并清卷";
+
+            if (_depthCapture == null)
+                return "等待深度入口就绪";
+
+            if (_depthCapture.SeedPlaneAwaitClear)
+                return "基底已取好：按 B 保存并清卷";
+
+            if (_instantDepthShellOverlay != null &&
+                _instantDepthShellOverlay.AutomaticSeedCaptureActive)
+                return _instantDepthShellOverlay.AutomaticSeedAttemptCount == 0
+                    ? "自动取融合标尺：请正视一块墙面或天棚"
+                    : $"自动寻找合格基底（第{_instantDepthShellOverlay.AutomaticSeedAttemptCount}次）";
+
+            bool seedPreview = _instantDepthShellOverlay != null &&
+                               _instantDepthShellOverlay.SeedPreviewVisible;
+            if (seedPreview)
+            {
+                string preview = _instantDepthShellOverlay.SeedPreviewStatus ?? string.Empty;
+                if (preview.Contains("拟合中"))
+                    return "保持头部稳定：正在拟合绿色基底";
+                if (preview.Contains("不成板") || preview.Contains("失败") ||
+                    preview.Contains("不可用") || preview.Contains("不符"))
+                    return "本帧未成板：换正视角后按 A 重拍";
+                if (preview.Contains("已送入口"))
+                    return "基底已取好：按 X 进入全流程";
+                return "观察绿色基底；不满意按 A 重拍";
+            }
+
+            if (seedState == "未取样" || seedState == "无" || seedState == "关")
+                return IsScanning
+                    ? "按 X 切到“种子平面”取基底"
+                    : "按扳机开始扫描";
+
+            if (!IsScanning)
+                return HasStarted
+                    ? "按扳机继续基底全流程扫描"
+                    : "按扳机开始基底全流程扫描";
+
+            if (_depthCapture.SeedPlaneProductionReady)
+            {
+                if (seedState.StartsWith("备", StringComparison.Ordinal))
+                    return "保持扫描：等待种面进入生产链";
+                if (_shellPaperOnlyView)
+                    return "正在验收：观察平整度、贴合度和台地";
+                if (_instantDepthShellOverlay != null &&
+                    _instantDepthShellOverlay.CompositeWithProduction)
+                    return "按 X 查看“合流仅纸”";
+                return "种面已入链：按 X 查看壳纸合流";
+            }
+
+            return $"等待种面就绪；当前视图[{viewState}]";
         }
 
         private static string HudFixedSlot(string value, int width)
@@ -1401,7 +1540,7 @@ namespace Genesis.RoomScan
                 _statusBadgeText.color = new Color(0.75f, 0.8f, 0.85f, 1f);
                 _statusBadgeText.text = HasStarted
                     ? $"Ⅱ 采集已暂停·{CaptureModeLabel} · A冻结 / 扳机继续"
-                    : $"○ 待采集·{CaptureModeLabel} · 扳机开始\n摇杆左推+按：切换胶冻/原冻";
+                    : $"○ 待采集·{CaptureModeLabel} · 扳机开始\n融合路线已锁定：裁冻";
                 return;
             }
 
@@ -1815,7 +1954,7 @@ namespace Genesis.RoomScan
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续  A=暂停  B=保存并清空\n" +
-                $"摇杆按=线框 左摇杆左=胶冻/原冻  Y=生产A/候选B" +
+                $"摇杆按=线框 左摇杆左=裁冻锁定  Y=生产A/候选B" +
                 (_hudLastError.Length > 0 ? $"\n<color=#FF6060>错误:{_hudLastError}</color>" : "");
         }
 
@@ -1892,9 +2031,7 @@ namespace Genesis.RoomScan
             // Repeat the idempotent request so a support renderer created after
             // session start still receives the observation alpha contract.
             _meshExtractor?.SetPaperObservationTransparency(probeSessionActive);
-            // The display-level correction quarantine is intentionally dormant.
-            // The last device-visible baseline publishes the native 5 cm paper
-            // directly; do not rebuild or upload a correction hash from Update.
+            // The legacy Reject quarantine stays dormant; keep the hash path disabled.
             Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
 
             // 主 HUD 由自己的稳定时钟刷新，不再依赖网格提取、页面提交或冻结回放
@@ -3663,7 +3800,18 @@ namespace Genesis.RoomScan
 
                 bool resuming = HasStarted;
                 if (!resuming)
+                {
                     _instantDepthShellOverlay?.ResetProductionWitnessLedger();
+                    if (!(_volumeIntegrator != null &&
+                          _volumeIntegrator.InfiniTamBaselineEnabled) &&
+                        _instantDepthShellOverlay != null &&
+                        !_instantDepthShellOverlay.BeginAutomaticSeedCapture())
+                        Logger.Warning("自动基底未启动：种子平面生产入口未启用");
+                    // Establish the paper ledger before camera/depth can publish
+                    // the first candidate.  A/B acquisition uses the same native
+                    // 5 cm paper and must not leave its session id as "未开始".
+                    _meshExtractor.BeginLedgerSession();
+                }
 
                 // 阶段 3：相机 + 深度（此时启动安全）
                 _cameraProvider?.StartCapture();
@@ -3678,8 +3826,6 @@ namespace Genesis.RoomScan
                         ? "独立回放会话已随新空卷自动开始"
                         : "独立回放会话启动失败；本轮扫描仍可继续但不会产出可复现包");
                 }
-                if (!resuming && !enableFrozenChunkAbExperiment)
-                    _meshExtractor.BeginLedgerSession();
                 if (enableFrozenChunkAbExperiment)
                 {
                     if (!resuming) _coverageOverlay?.ResetCoverage();
@@ -3688,7 +3834,11 @@ namespace Genesis.RoomScan
                     bool incremental = enableIncrementalHeraRefine && enableHeraHierarchicalReplay;
                     _coverageOverlay?.SetMarkersVisible(!incremental);
                     if (incremental)
+                    {
                         _meshExtractor.BeginIncrementalHera(abMaxChunksPerTick);
+                        if (!resuming)
+                            _meshExtractor.ShowProductionPaperView();
+                    }
                 }
                 _depthPointCloudOverlay?.SetAcquiring(true);
                 _instantDepthShellOverlay?.SetAcquiring(true);
@@ -3752,7 +3902,17 @@ namespace Genesis.RoomScan
             bool replayPackageFinalizing = _depthCapture != null &&
                                            _depthCapture.PairedFrameCaptureActive;
             if (replayPackageFinalizing)
+            {
                 _depthCapture.TogglePairedFrameCapture();
+                // 完整输出账以“停止接收并排空封包”为 A 键终点。不要再切换到
+                // 冻结/HERA 回放：那会替换当前生产管线状态，令停止瞬间之后的
+                // 队列、纸皮和显示证据混入另一种运行模式。当前已提交纸皮保持
+                // 原样可见，所有在途只由会话封装器排空并校验。
+                _hudStatus = "完整账封口中";
+                RefreshStatusBadge();
+                Logger.Info("A键：完整输出账停止采样并排空封包；未进入冻结回放");
+                return;
+            }
             // 必须在 BeginFrozenHeraReplay 替换增量 32³ 管线之前落账，
             // 否则扫描期的块同步债会被冻结回放状态覆盖。
             string geometrySnapshot = !replayPackageFinalizing && _meshExtractor != null
@@ -3770,8 +3930,6 @@ namespace Genesis.RoomScan
                             Logger.Info($"A键已封存枪胶候选黑匣子: {path}");
                     }))
                 Logger.Warning("A键枪胶候选黑匣子未启动（影子层未就绪或已有导出在途）");
-            if (replayPackageFinalizing)
-                Logger.Info("A键：独立回放会话正在统一封存几何、枪胶与系统房间网格");
             _chunkAbFrozen = true;
             if (enableHeraHierarchicalReplay)
             {
@@ -3919,10 +4077,8 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳独显 → 壳纸合流
-        /// → 合流仅纸 → 关。“合流仅纸”保留同一次生产纸状态，只隐藏
-        /// 即时壳；已经跨视角确认需要纠正的局部同时撤销绘制权，
-        /// 直到两个独立安全支撑视角恢复候选，且纸面真正贴合新目标。
+        /// X：关 → 枪胶裁决海 → BB 反投影 → 即时外壳独显 → 单帧种子平面 → 壳纸合流
+        /// → 合流仅纸 → 关。“合流仅纸”保留同一次生产纸状态，只隐藏即时壳。
         /// 即时外壳只读当前清洗深度，短寿命三角膜不写 TSDF；通过独立视角
         /// 复核的三角仅发布存在证词，供后续原始深度辅助已有 provisional 转正；
         /// 在该档按 A 只钉住诊断快照，生产扫描继续。
@@ -3934,6 +4090,8 @@ namespace Genesis.RoomScan
             bool courtWasVisible = _gunGelCourtOverlay.Visible;
             bool bbWasVisible = _depthPointCloudOverlay.Visible;
             bool shellWasVisible = _instantDepthShellOverlay.Visible;
+            bool seedWasVisible = shellWasVisible &&
+                                  _instantDepthShellOverlay.SeedPreviewVisible;
             bool shellWasComposite = shellWasVisible &&
                                      _instantDepthShellOverlay.CompositeWithProduction;
             bool paperOnlyWasVisible = _shellPaperOnlyView;
@@ -3982,12 +4140,39 @@ namespace Genesis.RoomScan
                 _depthPointCloudOverlay.SetAcquiring(false);
                 _instantDepthShellOverlay.SetVisible(true);
                 _instantDepthShellOverlay.SetAcquiring(IsScanning);
-                NotifyInput("即时外壳：绿=共面救回；独立复核证词仅辅助已有候选转正");
+                NotifyInput("即时外壳中央60%·线框粗格×2：按A定格；壳纸合流保持原样");
             }
-            else if (shellWasVisible && !shellWasComposite)
+            else if (shellWasVisible && !shellWasComposite && !seedWasVisible)
+            {
+                if (_depthCapture != null && _depthCapture.SeedPlaneProductionReady)
+                {
+                    // A staged seed surviving B-clear is already feeding this
+                    // new empty roll. Do not pass through the auto-capture view
+                    // again: that would replace the tested base and demand a
+                    // second clear before the user can even reach the paper.
+                    string route = _meshExtractor != null
+                        ? _meshExtractor.ShowProductionPaperView()
+                        : "无纸皮";
+                    _meshExtractor?.SetCoarseSkinVisible(false);
+                    showManagementBlockWireOverlay = false;
+                    _managementBlockWireOverlay?.SetVisible(false);
+                    _instantDepthShellOverlay.SetCompositeWithProduction(true);
+                    _shellPaperOnlyView = false;
+                    NotifyInput($"基底全流程：{route}；已跳过重复取样，当前纸皮来自种面→GunGel→裁决→TSDF");
+                }
+                else
+                {
+                    // 中央圆先观察原料；取到合格局部面后暂存为生产深度
+                    // 基底。离开预览并从空卷扫描才会写入完整链路。
+                    _instantDepthShellOverlay.SetSeedPreviewVisible(true);
+                    NotifyInput("种子平面：等下一帧定格；绿=局部拟合，橙=原深度；取样后清卷再扫描验纸");
+                }
+            }
+            else if (seedWasVisible)
             {
                 // 不重新 SetVisible，避免切合流时清空刚看到的即时壳。纸皮明确
                 // 回到真实 TSDF 生产档，外壳只作为短寿命前景叠加。
+                _instantDepthShellOverlay.SetSeedPreviewVisible(false);
                 string route = _meshExtractor != null
                     ? _meshExtractor.ShowProductionPaperView()
                     : "无纸皮";
@@ -4001,15 +4186,15 @@ namespace Genesis.RoomScan
             else if (shellWasComposite)
             {
                 // 不离开 X 诊断链：只撤掉即时壳的上屏，保留已打开的
-                // 原生5cm生产纸皮和后台壳采证，不重选、不重启网格来源。
+                // 10cm 大格生产纸皮和后台壳采证，不重选、不重启网格来源。
+                // 其底层证据仍是同一份原生 5cm TSDF。
                 _instantDepthShellOverlay.SetVisible(false);
                 _instantDepthShellOverlay.SetAcquiring(IsScanning);
                 _shellPaperOnlyView = true;
-                NotifyInput("合流仅纸：壳已隐藏，只看同一份原生5cm生产网格");
+                NotifyInput("合流仅纸：壳已隐藏，只看10cm大格纸皮（底层仍是同一5cm TSDF）");
             }
             else if (paperOnlyWasVisible)
             {
-                // 分色观察档已移除；仅纸档后直接退出 X 链。
                 _shellPaperOnlyView = false;
                 _depthPointCloudOverlay.SetVisible(false);
                 _depthPointCloudOverlay.SetAcquiring(false);
@@ -4036,17 +4221,29 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// A 在即时外壳档的专用语义：钉住当前短时膜作世界空间对照，不触碰生产冻结。
+        /// A 在即时外壳档的专用语义：定格/解除当前单层壳作世界空间对照，
+        /// 不触碰生产冻结。
         /// 返回 true 表示本次 A 已被影子层消费。
         /// </summary>
-        public bool TryFreezeInstantShellSnapshot()
+        public bool TryToggleInstantShellFreeze()
         {
             if (_instantDepthShellOverlay == null || !_instantDepthShellOverlay.Visible)
                 return false;
-            bool success = _instantDepthShellOverlay.FreezeDiagnosticSnapshot();
+            if (_instantDepthShellOverlay.SeedPreviewVisible)
+            {
+                bool requested = _instantDepthShellOverlay.RequestSeedPreviewCapture();
+                NotifyInput(requested
+                    ? "种子平面：重取下一帧；新基底须从空卷进入后续链路"
+                    : "种子平面：重取失败，请确认深度正在采集");
+                RefreshStatusBadge();
+                return true;
+            }
+            bool success = _instantDepthShellOverlay.ToggleDiagnosticFreeze(out bool frozen);
             NotifyInput(success
-                ? "即时外壳快照已钉住；生产仍在采集"
-                : "即时外壳快照未就绪；请先扳机采集");
+                ? frozen
+                    ? "即时壳已定格：请横移20-40cm观察视差；后台仍采集"
+                    : "即时壳已解除定格，恢复实时显示"
+                : "即时壳定格未就绪；请先扳机采集");
             RefreshStatusBadge();
             return true;
         }

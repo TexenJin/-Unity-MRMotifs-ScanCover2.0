@@ -1,7 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Text;
+using System.Threading.Tasks;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
@@ -51,6 +54,12 @@ namespace Genesis.RoomScan
         [Tooltip("开=同帧预处理深度先留在三槽流水线：校枪可靠时应用小修正；欠秩、少配、缺证或修正解越界时撤销校正权并以原始位姿进入普通生产门；" +
                  "只有明确快转/快移仍整帧停笔。逐点枪胶同样只拦双证冲突、已有反对票和跨面错配。关=原始生产融合。必须从空 TSDF 开始对比。")]
         [SerializeField] private bool enableGunGelGuardedFusionExperiment = true;
+        [Tooltip("仅保留同帧 GunGel 身份/候选证据；关闭时也不允许退回旧裁判平面改写 TSDF。生产 TSDF 只吃通过前置健康筛查的原始深度。")]
+        [SerializeField] private bool enableGunGelTsdfAdmission = false;
+        [Tooltip("旧实验：把 GunGel 的位姿小修正应用到生产深度。新产品化链默认关闭；GunGel 只负责身份，不改距离或位姿。")]
+        [SerializeField] private bool enableGunGelPoseCorrection = false;
+        [Tooltip("旧的 TSDF 前裁判平面约束。已被 TSDF 后 SurfaceProductizer 取代，默认且启动时强制关闭。")]
+        [SerializeField] private bool enableFinalCourtAdmissionExperiment = false;
         [Tooltip("校枪参与生产融合所需的最少点面对应数。实机健康帧约1500；低于此值说明可见稳定凝胶不足。")]
         [SerializeField, Range(128, 4096)] private int gunGelFusionMinCorrespondences = 800;
         [Tooltip("允许写入 TSDF 的最大校枪平移（毫米）。撞30mm求解上限的帧永远拒绝。")]
@@ -184,6 +193,38 @@ namespace Genesis.RoomScan
         [Tooltip("Only changes inside this normalized zero-crossing band can dirty an already observed surface.")]
         [SerializeField, Range(0.25f, 1f)] private float dirtySurfaceBand = 1f;
 
+        [Header("InfiniTAM architecture baseline")]
+        [SerializeField, Tooltip("独立 InfiniTAM V1.3 行为基线：Quest 世界位姿下直接写入唯一 raw-projective TSDF；模型 raycast 与残差只读旁证。GunGel、裁判、种面标尺、冻结和制品链全部旁路。")]
+        private bool enableInfiniTamBaseline = true;
+        [SerializeField, Tooltip("历史 V1.6-V1.10 实验：让未完整移植的 ICP 跟踪器拥有 TSDF 写入、位姿修正和网格发布权。V1.3 恢复基线必须保持关闭；待完整移植 TAM 金字塔、阻尼回退、质量状态和重定位后才能重新启用。")]
+        private bool enableInfiniTamTrackingAuthority = false;
+        [SerializeField, Min(1), Tooltip("只允许互不重复且处于静止窗口内的 Quest 深度帧建立初始 TSDF；达到该融合帧数后，所有后续帧必须先完成同帧 model-to-frame tracking。")]
+        private int infiniTamTrackingBootstrapFrames = 6;
+        [SerializeField, Range(1, 12), Tooltip("首张种子写入前必须连续出现的稳定、互不重复深度帧数。")]
+        private int infiniTamBootstrapStillFrames = 4;
+        [SerializeField, Range(1f, 45f), Tooltip("InfiniTAM 启动/复核期允许建底的最大角速度（度/秒）。正式建图后仍使用普通运动闸。")]
+        private float infiniTamBootstrapMaxAngularDegPerSec = 15f;
+        [SerializeField, Range(0.01f, 0.5f), Tooltip("InfiniTAM 启动/复核期允许建底的最大线速度（米/秒）。")]
+        private float infiniTamBootstrapMaxLinearMps = 0.08f;
+        [SerializeField, Range(1, 8), Tooltip("初始 TSDF 在连续多少张严格通过跟踪门后才可作为正式模型并显示网格。")]
+        private int infiniTamBootstrapConfirmFrames = 3;
+        [SerializeField, Range(1, 8), Tooltip("尚未转正的初始模型连续跟踪失败多少次后清卷重建，防止坏底图成为永久答案。")]
+        private int infiniTamBootstrapRejectsBeforeReseed = 3;
+        [SerializeField, Range(1, 8), Tooltip("正式模型失跟后，必须连续多少张同帧跟踪重新通过才恢复写入。重锁期保留旧网格但不写 TSDF。")]
+        private int infiniTamRecoveryConfirmFrames = 3;
+        [SerializeField, Min(64), Tooltip("InfiniTAM 同帧跟踪允许融合所需的最少点面对应数。")]
+        private int infiniTamTrackingMinCorrespondences = 256;
+        [SerializeField, Range(3, 6), Tooltip("历史跟踪实验的最低有效秩；V1.3 只读旁证不消费此门槛。")]
+        private int infiniTamTrackingMinRank = 6;
+        [SerializeField, Range(5f, 60f), Tooltip("单帧模型跟踪允许写入 TSDF 的最大平移修正（毫米）。")]
+        private float infiniTamTrackingMaxTranslationMm = 30f;
+        [SerializeField, Range(0.1f, 3f), Tooltip("单帧模型跟踪允许写入 TSDF 的最大旋转修正（度）。")]
+        private float infiniTamTrackingMaxRotationDeg = 1.5f;
+        [SerializeField, Range(0f, 5f), Tooltip("点面平均残差至少改善该毫米数；没有变好就停笔。")]
+        private float infiniTamTrackingMinImprovementMm = 0.5f;
+        [SerializeField, Range(25f, 95f), Tooltip("修正后位于 3cm 内的点面对应比例下限。")]
+        private float infiniTamTrackingMinWithin30Percent = 60f;
+
         [Header("Projective TSDF A/B")]
         [SerializeField, Tooltip("建立一份只读 KinectFusion 式 raw-projective TSDF 影子体。生产体仍使用现有 raw×法向余弦；影子体只用于对照统计和手动切换显示。")]
         private bool enableProjectiveShadow = false;
@@ -206,12 +247,41 @@ namespace Genesis.RoomScan
         private RenderTexture _admissionTraceVolume;
         private RenderTexture _confidenceVolume;
         private RenderTexture _coherenceVolume;
+        // Baseline-only canonical TSDF vote count.  The legacy/product route
+        // receives only a 1x1 descriptor placeholder and never reads or writes it.
+        private RenderTexture _infiniTamVoteWeightVolume;
+        // Baseline-only prediction of the sole TSDF.  The TSDF binding and
+        // prediction textures stay read-only; its exact-frame tracking decision
+        // is consumed only by the quality gate below, before fusion.
+        private InfiniTamModelRaycastAudit _infiniTamModelRaycast;
+        private RenderTexture _tsdfResponsibilityVolume;
+        private RenderTexture _tsdfSupportResponsibilityVolume;
+        private bool _tsdfResponsibilityCaptureEnabled;
+        private bool _tsdfResponsibilityExportPending;
+        internal string LastTsdfResponsibilityExportError { get; private set; } = string.Empty;
 
         /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
+        /// <summary>互斥的 InfiniTAM 风格第一版基线是否拥有生产融合与提面路径。</summary>
+        public bool InfiniTamBaselineEnabled => enableInfiniTamBaseline;
+        /// <summary>
+        /// V1.3 publishes after the sole TSDF has received its first real
+        /// observation. The dormant V1.6+ experiment retains its old tracked
+        /// confirmation boundary only when explicitly re-enabled.
+        /// </summary>
+        public bool InfiniTamMeshPublicationReady => !enableInfiniTamBaseline ||
+            (!enableInfiniTamTrackingAuthority
+                ? IntegrationCount > 0
+                : _infiniTamTrackingInitialised);
+        /// <summary>只读模型预测距离图（米，审计降采样分辨率）；不接生产 shader。</summary>
+        public RenderTexture InfiniTamModelDepth => _infiniTamModelRaycast?.ModelDepth;
+        /// <summary>只读模型预测减当前观测的残差图（毫米）；负值表示模型在前。</summary>
+        public RenderTexture InfiniTamModelResidualMm => _infiniTamModelRaycast?.ModelResidualMm;
         /// <summary>只读 A/B 影子体：使用 raw projective SDF，但不写颜色、不替换生产体。</summary>
         public RenderTexture ProjectiveShadowVolume => _projectiveShadowVolume;
-        public bool ProjectiveShadowEnabled => enableProjectiveShadow && _projectiveShadowVolume != null;
+        public bool ProjectiveShadowEnabled => !enableInfiniTamBaseline &&
+                                               enableProjectiveShadow &&
+                                               _projectiveShadowVolume != null;
         /// <summary>3D RenderTexture (RGBA8_UNorm) storing per-voxel accumulated color.</summary>
         public RenderTexture ColorVolume => _colorVolume;
         /// <summary>Read-only provenance sidecar for dilation admission. Never changes TSDF production decisions.</summary>
@@ -220,6 +290,8 @@ namespace Genesis.RoomScan
         public RenderTexture ConfidenceVolume => _confidenceVolume;
         /// <summary>v2 相干通道：有符号分歧 EMA（0.5=中性）。噪声回中性，纠错/真变化偏两端。只读影子。</summary>
         public RenderTexture CoherenceVolume => _coherenceVolume;
+        /// <summary>Read-only audit sidecar; never sampled by production fusion or extraction.</summary>
+        public RenderTexture TsdfResponsibilityVolume => _tsdfResponsibilityVolume;
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
         public float VoxelDistance => voxelDistance;
@@ -285,9 +357,27 @@ namespace Genesis.RoomScan
         private static readonly int FusionCorrectionID = Shader.PropertyToID("gsFusionCorrection");
         private static readonly int GunGelObservationsID = Shader.PropertyToID("gsGunGelObservations");
         private static readonly int GunGelCorrespondencesID = Shader.PropertyToID("gsGunGelCorrespondences");
+        private static readonly int GunGelCorrespondenceIdentityID =
+            Shader.PropertyToID("gsGunGelCorrespondenceIdentity");
         private static readonly int GunGelObservationGridID = Shader.PropertyToID("gsGunGelObservationGrid");
         private static readonly int GunGelPixelStrideID = Shader.PropertyToID("gsGunGelPixelStride");
         private static readonly int GunGelAdmissionEnableID = Shader.PropertyToID("gsGunGelAdmissionEnable");
+        private static readonly int FinalCourtVerdictsID =
+            Shader.PropertyToID("gsFinalCourtVerdicts");
+        private static readonly int FinalCourtPlanesID =
+            Shader.PropertyToID("gsFinalCourtPlanes");
+        private static readonly int FinalCourtGenerationsID =
+            Shader.PropertyToID("gsFinalCourtGenerations");
+        private static readonly int FinalCourtVerdictCapacityID =
+            Shader.PropertyToID("gsFinalCourtVerdictCapacity");
+        private static readonly int FinalCourtAdmissionEnableID =
+            Shader.PropertyToID("gsFinalCourtAdmissionEnable");
+        private static readonly int GunGelSuccessionInvalidationArgsID =
+            Shader.PropertyToID("gsGunGelSuccessionInvalidationArgs");
+        private static readonly int GunGelSuccessionInvalidationRegionsID =
+            Shader.PropertyToID("gsGunGelSuccessionInvalidationRegions");
+        private static readonly int GunGelSuccessionInvalidationCapacityID =
+            Shader.PropertyToID("gsGunGelSuccessionInvalidationCapacity");
         private static readonly int ShellWitnessEpochsID = Shader.PropertyToID("gsShellWitnessEpochs");
         private static readonly int ShellWitnessCellCountID = Shader.PropertyToID("gsShellWitnessCellCount");
         private static readonly int ShellWitnessStrideID = Shader.PropertyToID("gsShellWitnessStride");
@@ -295,9 +385,27 @@ namespace Genesis.RoomScan
         private static readonly int ShellWitnessMaxAgeID = Shader.PropertyToID("gsShellWitnessMaxAge");
         private static readonly int ShellWitnessEnableID = Shader.PropertyToID("gsShellWitnessEnable");
         private static readonly int UseRawProjectiveSdfID = Shader.PropertyToID("gsUseRawProjectiveSdf");
+        private static readonly int InfiniTamBaselineID = Shader.PropertyToID("gsInfiniTamBaseline");
+        private static readonly int InfiniTamVoteWeightRWID =
+            Shader.PropertyToID("gsInfiniTamVoteWeightRW");
+        private static readonly int InfiniTamTicketStatsID =
+            Shader.PropertyToID("_InfiniTamTicketStats");
+        private static readonly int InfiniTamTicketEnabledID =
+            Shader.PropertyToID("gsInfiniTamTicketEnabled");
         private static readonly int WriteColorID = Shader.PropertyToID("gsWriteColor");
         private static readonly int AdmissionTraceRWID = Shader.PropertyToID("gsAdmissionTraceRW");
         private static readonly int WriteAdmissionTraceID = Shader.PropertyToID("gsWriteAdmissionTrace");
+        private static readonly int TsdfResponsibilityRWID = Shader.PropertyToID("gsTsdfResponsibilityRW");
+        private static readonly int TsdfSupportResponsibilityRWID = Shader.PropertyToID("gsTsdfSupportResponsibilityRW");
+        private static readonly int TsdfResponsibilityAvailableID = Shader.PropertyToID("gsTsdfResponsibilityAvailable");
+        private static readonly int TsdfResponsibilityWriteID = Shader.PropertyToID("gsTsdfResponsibilityWrite");
+        private static readonly int TsdfResponsibilityIntegrationID = Shader.PropertyToID("gsTsdfResponsibilityIntegration");
+        private static readonly int TsdfResponsibilityExportSliceID =
+            Shader.PropertyToID("gsTsdfResponsibilityExportSlice");
+        private static readonly int TsdfSupportResponsibilityExportSliceID =
+            Shader.PropertyToID("gsTsdfSupportResponsibilityExportSlice");
+        private static readonly int TsdfResponsibilityExportZID =
+            Shader.PropertyToID("gsTsdfResponsibilityExportZ");
         private static readonly int ConfidenceRWID = Shader.PropertyToID("gsConfidenceRW");
         private static readonly int CoherenceRWID = Shader.PropertyToID("gsCoherenceRW");
         private static readonly int ConfidenceWriteID = Shader.PropertyToID("gsConfidenceWrite");
@@ -308,6 +416,8 @@ namespace Genesis.RoomScan
         private static readonly int ConfidenceGlobalTexID = Shader.PropertyToID("gsConfidence");
         private static readonly int TemporalReasonAvailableID = Shader.PropertyToID("gsTemporalReasonAvailable");
         private static readonly int BakeSrcAdmissionTraceID = Shader.PropertyToID("gsBakeSrcAdmissionTrace");
+        private static readonly int BakeSrcTsdfResponsibilityID = Shader.PropertyToID("gsBakeSrcTsdfResponsibility");
+        private static readonly int BakeSrcTsdfSupportResponsibilityID = Shader.PropertyToID("gsBakeSrcTsdfSupportResponsibility");
         private static readonly int PruneZOffsetID = Shader.PropertyToID("gsPruneZOffset");
         private static readonly int PruneZCountID = Shader.PropertyToID("gsPruneZCount");
         private static readonly int DirtyChunkEpochsID = Shader.PropertyToID("_DirtyChunkEpochs");
@@ -347,6 +457,8 @@ namespace Genesis.RoomScan
         private int pruneSlicesPerIntegration = 8;
 
         private ComputeKernelHelper _clearKernel;
+        private ComputeKernelHelper _clearInfiniTamVotesKernel;
+        private ComputeKernelHelper _invalidateGunGelSuccessionsKernel;
         private ComputeKernelHelper _integrateKernel;
         private ComputeKernelHelper _pruneKernel;
         private ComputeKernelHelper _freezeKernel;
@@ -403,11 +515,40 @@ namespace Genesis.RoomScan
         /// <summary>低置信中纯噪声（方向横跳，相干闸拦得住的那类）。</summary>
         public int ConfidenceLowNoiseCount { get; private set; }
 
+        // InfiniTAM baseline receipt. This is a throttled observation of the
+        // production write, not another gate or authority path.
+        private const int InfiniTamTicketStatCount = 4;
+        private const float InfiniTamTicketIntervalSeconds = 1f;
+        private static readonly uint[] ZeroInfiniTamTicketStats =
+            new uint[InfiniTamTicketStatCount];
+        private ComputeBuffer _infiniTamTicketStats;
+        private bool _infiniTamTicketReadbackPending;
+        private float _nextInfiniTamTicketTime;
+        private int _infiniTamTicketGeneration;
+        private bool _hasInfiniTamTicket;
+        private uint _infiniTamTicketNew;
+        private uint _infiniTamTicketContinuing;
+        private uint _infiniTamTicketMature;
+        private uint _infiniTamTicketVoteSum;
+        private uint _infiniTamTicketSurfaceSamples;
+        private ulong _infiniTamTicketCumulativeNew;
+        private ulong _infiniTamTicketCumulativeContinuing;
+        private ulong _infiniTamTicketCumulativeMature;
+        private ulong _infiniTamTicketCumulativeVoteSum;
+        private ulong _infiniTamTicketCumulativeSurfaceSamples;
+        private int _infiniTamTicketSampleCount;
+        private int _infiniTamAttemptedFrames;
+        private int _infiniTamFusedFrames;
+
         // 矛盾票普查：诊断"幽灵抹不掉"——反对票到底投没投出、被哪道门禁拦住
         private ComputeBuffer _carveStats;
         private bool _carveStatsReadbackPending;
+        private readonly List<Action<bool>> _carveStatsFlushCallbacks =
+            new List<Action<bool>>(4);
         private ComputeBuffer _projectiveShadowCarveStats;
         private bool _projectiveShadowCarveStatsReadbackPending;
+        private readonly List<Action<bool>> _projectiveShadowFlushCallbacks =
+            new List<Action<bool>>(4);
         // 0..27: existing contradiction/supply/edge ledgers.
         // 28..44: read-only dilation-donor provenance ledger.
         // 45..49: read-only donor-path classification ledger.
@@ -422,6 +563,8 @@ namespace Genesis.RoomScan
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
         public readonly uint[] LastProjectiveShadowCarveStats = new uint[CarveStatsCount];
+        public readonly ulong[] CumulativeProjectiveShadowCarveStats =
+            new ulong[CarveStatsCount];
         public readonly ulong[] CumulativeCarveStats = new ulong[CarveStatsCount];
         private sealed class FovLedgerPeriod
         {
@@ -595,6 +738,55 @@ namespace Genesis.RoomScan
 
         private const int GunGelDeferredSlotCount = 3;
 
+        private sealed class InfiniTamDeferredFrame
+        {
+            public RenderTexture Depth;
+            public RenderTexture Normal;
+            public RenderTexture DilatedDepth;
+            public RenderTexture EdgeReason;
+            public RenderTexture TemporalReason;
+            public Matrix4x4[] View;
+            public Matrix4x4[] Projection;
+            public Matrix4x4[] ViewInverse;
+            public Matrix4x4[] ProjectionInverse;
+            public readonly Vector4[] ExclusionPositions = new Vector4[64];
+            public int ExclusionCount;
+            public int PlatformFrame;
+            public int Generation;
+            public float AngularSpeed;
+            public float LinearSpeed;
+            public float MotionQuality;
+            public bool Pending;
+            public bool Ready;
+            public InfiniTamModelRaycastAudit.TrackingDecision Decision;
+        }
+
+        private readonly InfiniTamDeferredFrame _infiniTamDeferredFrame = new();
+        private enum InfiniTamStartupPhase
+        {
+            AwaitingStillness,
+            Seeding,
+            Verifying,
+            Tracking,
+            TrackingLost
+        }
+
+        private int _infiniTamDeferredGeneration;
+        private int _infiniTamLastQueuedPlatformFrame = -1;
+        private int _infiniTamLastStartupPlatformFrame = -1;
+        private int _infiniTamBootstrapStableFrames;
+        private int _infiniTamBootstrapConfirmedFrames;
+        private int _infiniTamRecoveryConfirmedFrames;
+        private int _infiniTamConsecutiveTrackingRejects;
+        private int _infiniTamBootstrapReseedCount;
+        private bool _infiniTamTrackingInitialised;
+        private InfiniTamStartupPhase _infiniTamStartupPhase =
+            InfiniTamStartupPhase.AwaitingStillness;
+        private int _infiniTamTrackingAccepted;
+        private int _infiniTamTrackingRejected;
+        private int _infiniTamTrackingQueueAbstained;
+        private string _infiniTamLastTrackingDecision = "建模";
+
         private sealed class GunGelDeferredFrame
         {
             public RenderTexture RawDepth;
@@ -620,6 +812,31 @@ namespace Genesis.RoomScan
             public GunGelEvidenceShadow.FrameDecision Decision;
         }
 
+        /// <summary>
+        /// One lightweight, in-memory evidence transfer for the post-TSDF
+        /// product court.  It reads only the correspondence and stable-id
+        /// buffers already produced by GunGel; no depth/color texture or file
+        /// capture is involved.
+        /// </summary>
+        private sealed class ProductCourtReadback
+        {
+            public int Generation;
+            public int GunGelFrame;
+            public int SourceFrame;
+            public int AttemptIndex;
+            public Matrix4x4 ViewInverse;
+            public Matrix4x4 FusionCorrection;
+            public float AngularSpeed;
+            public float LinearSpeed;
+            public float MotionQuality;
+            public Vector3 HeadEuler;
+            public GunGelEvidenceShadow.Correspondence[] Correspondences;
+            public uint4[] Identities;
+            public bool CorrespondencesDone;
+            public bool IdentitiesDone;
+            public bool Failed;
+        }
+
         // 运动闸：角速度镜像自 DepthCapture.SmoothedDepthAngularSpeed（深度帧事件内、
         // 原始 Pose 四元数、真实帧间隔计算），供 HUD 读数与运动闸共用。
         private float _smoothedAngSpeed;
@@ -631,8 +848,22 @@ namespace Genesis.RoomScan
         public float MotionQuality => _motionQuality;
         private float _motionQuality = 1f;
         private GunGelEvidenceShadow _gunGelEvidenceShadow;
+        private readonly RuntimeFinalSurfaceCourt _productSurfaceCourt =
+            new RuntimeFinalSurfaceCourt();
+        private ProductCourtReadback _productCourtReadback;
+        private int _productCourtGeneration;
         private ComputeBuffer _gunGelDummyObservations;
         private ComputeBuffer _gunGelDummyCorrespondences;
+        private ComputeBuffer _gunGelDummyCorrespondenceIdentity;
+        private ComputeBuffer _finalCourtDummyVerdicts;
+        private ComputeBuffer _finalCourtDummyPlanes;
+        private ComputeBuffer _finalCourtDummyGenerations;
+        private const int FinalCourtInvalidationCapacity = 64;
+        private ComputeBuffer _finalCourtInvalidationArgs;
+        private ComputeBuffer _finalCourtInvalidationRegions;
+        private readonly Vector4[] _finalCourtInvalidationStaging =
+            new Vector4[FinalCourtInvalidationCapacity];
+        private readonly uint[] _finalCourtInvalidationCount = new uint[1];
         private bool _gunGelRuntimeFailureReported;
         private readonly GunGelDeferredFrame[] _gunGelDeferredFrames =
             new GunGelDeferredFrame[GunGelDeferredSlotCount];
@@ -648,19 +879,48 @@ namespace Genesis.RoomScan
         private int _replayFusionAttemptIndex;
 
         /// <summary>
-        /// 当前空卷选择是否为枪胶受保护融合。只读暴露给扫描器，用于把
-        /// “胶冻/原冻”身份钉进 HUD 与导出；不参与融合判决。
+        /// 当前唯一生产路线仍依赖枪胶上游。只读暴露给扫描器，用于把
+        /// “裁冻”身份钉进 HUD 与导出；不参与融合判决。
         /// </summary>
         public bool GunGelGuardedFusionExperimentEnabled =>
             enableGunGelGuardedFusionExperiment;
+        public bool FinalCourtAdmissionExperimentEnabled =>
+            enableFinalCourtAdmissionExperiment;
+        public bool GunGelIdentityOnlyMode =>
+            enableGunGelGuardedFusionExperiment &&
+            !enableGunGelTsdfAdmission &&
+            !enableGunGelPoseCorrection &&
+            !enableFinalCourtAdmissionExperiment;
+
+        internal int CopyProductSurfacePlanes(Bounds worldBounds,
+            RuntimeFinalSurfaceCourt.ProductPlane[] destination) =>
+            _productSurfaceCourt.CopyProductPlanes(worldBounds, destination);
+
+        internal int DrainProductSurfaceChanges(Vector4[] destination) =>
+            _productSurfaceCourt.DrainInvalidationRegions(destination);
 
         public string GetGunGelEvidenceShadowCompact()
         {
             if (!enableGunGelEvidenceShadow) return "关";
-            if (_gunGelRuntimeFailureReported) return "已熔断（生产融合正常）";
+            if (_gunGelRuntimeFailureReported)
+                return enableFinalCourtAdmissionExperiment
+                    ? "已熔断（裁冻停笔）"
+                    : "已熔断（生产融合正常）";
             string fusion;
             if (!enableGunGelGuardedFusionExperiment)
                 fusion = "融基线";
+            else if (enableFinalCourtAdmissionExperiment)
+            {
+                ScanReplaySessionPackage session = ScanReplaySessionPackage.Active;
+                VirtualProbeShadowAdjudicator.VerdictCounts counts = session != null
+                    ? session.FinalCourtAdmissionCounts : default;
+                fusion = (_gunGelGuardedFusionRuntimeHalted
+                        ? "裁入熔断停笔 "
+                        : "裁入 ") +
+                         $"待{counts.Hold}准{counts.Accept}弃{counts.Reject}" +
+                         $" 版{(session != null ? session.FinalCourtAdmissionRevision : -1)}" +
+                         $" 队{CountGunGelDeferredFrames()}末{_gunGelLastFusionDecision}";
+            }
             else if (_gunGelGuardedFusionRuntimeHalted)
                 fusion = "融试熔断→基线";
             else
@@ -689,6 +949,425 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Enables the full-output-ledger TSDF transaction sidecar before the first
+        /// integration.  The sidecar is never read by production code.
+        /// </summary>
+        internal bool BeginTsdfResponsibilityCapture()
+        {
+            if (_volume == null || _tsdfResponsibilityVolume == null ||
+                !_tsdfResponsibilityVolume.IsCreated() ||
+                _tsdfSupportResponsibilityVolume == null ||
+                !_tsdfSupportResponsibilityVolume.IsCreated() || IntegrationCount != 0)
+                return false;
+            _tsdfResponsibilityCaptureEnabled = true;
+            compute.SetFloat(TsdfResponsibilityWriteID, 1f);
+            return true;
+        }
+
+        /// <summary>
+        /// One-shot stop-time export. The normalized TSDF is read one Z slice per
+        /// texture request. Integer responsibility textures first copy one slice
+        /// through a structured buffer because Quest/Vulkan rejects their direct
+        /// 3D readback. Each completed lane is persisted before the next begins.
+        /// </summary>
+        internal bool RequestTsdfResponsibilityAuditExport(
+            string reason, string destinationDirectory, Action<string> completed)
+        {
+            if (!_tsdfResponsibilityCaptureEnabled || _volume == null ||
+                _tsdfResponsibilityVolume == null ||
+                _tsdfSupportResponsibilityVolume == null ||
+                string.IsNullOrEmpty(destinationDirectory) ||
+                _tsdfResponsibilityExportPending)
+                return false;
+            _tsdfResponsibilityExportPending = true;
+            LastTsdfResponsibilityExportError = string.Empty;
+            StartCoroutine(ExportTsdfResponsibilitySlabbed(
+                reason ?? string.Empty, destinationDirectory, completed));
+            return true;
+        }
+
+        private IEnumerator ExportTsdfResponsibilitySlabbed(
+            string reason, string destinationDirectory, Action<string> completed)
+        {
+            string failure = string.Empty;
+            var completedResources = new List<string>(3);
+            try { Directory.CreateDirectory(destinationDirectory); }
+            catch (Exception e) { failure = "directory:" + e.Message; }
+
+            if (string.IsNullOrEmpty(failure))
+            {
+                byte[] tsdf = null;
+                yield return ReadTextureSlabs(_volume, 2, "final_tsdf",
+                    data => tsdf = data, error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                    yield return WriteResponsibilityBytes(
+                        Path.Combine(destinationDirectory, "final_tsdf.rg8_snorm.bin"),
+                        tsdf, "final_tsdf", error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                {
+                    completedResources.Add("final_tsdf");
+                    failure = WriteResponsibilityCheckpoint(destinationDirectory,
+                        completedResources, false, string.Empty);
+                }
+            }
+
+            if (string.IsNullOrEmpty(failure))
+            {
+                byte[] responsibility = null;
+                yield return ReadIntegerResponsibilitySlices(
+                    _tsdfResponsibilityVolume, 2,
+                    "geometry_block_responsibility", data => responsibility = data,
+                    error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                    yield return WriteResponsibilityBytes(
+                        Path.Combine(destinationDirectory,
+                            "responsibility.rg32_uint.bin"), responsibility,
+                        "geometry_block_responsibility", error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                {
+                    completedResources.Add("geometry_block_responsibility");
+                    failure = WriteResponsibilityCheckpoint(destinationDirectory,
+                        completedResources, false, string.Empty);
+                }
+            }
+
+            if (string.IsNullOrEmpty(failure))
+            {
+                byte[] support = null;
+                yield return ReadIntegerResponsibilitySlices(
+                    _tsdfSupportResponsibilityVolume, 1,
+                    "support_responsibility", data => support = data,
+                    error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                    yield return WriteResponsibilityBytes(
+                        Path.Combine(destinationDirectory,
+                            "support_responsibility.r32_uint.bin"), support,
+                        "support_responsibility", error => failure = error);
+                if (string.IsNullOrEmpty(failure))
+                {
+                    completedResources.Add("support_responsibility");
+                    failure = WriteResponsibilityCheckpoint(destinationDirectory,
+                        completedResources, false, string.Empty);
+                }
+            }
+
+            if (string.IsNullOrEmpty(failure))
+            {
+                int3 capturedVoxelCount = voxelCount;
+                float capturedVoxelSize = voxelSize;
+                float capturedTruncationDistance = voxelDistance;
+                Task schemaTask = null;
+                try
+                {
+                    schemaTask = Task.Run(() => WriteTsdfResponsibilitySchema(
+                        reason, destinationDirectory, capturedVoxelCount,
+                        capturedVoxelSize, capturedTruncationDistance));
+                }
+                catch (Exception e) { failure = "schema:request:" + e.Message; }
+                if (schemaTask != null)
+                {
+                    while (!schemaTask.IsCompleted) yield return null;
+                    if (schemaTask.IsFaulted)
+                        failure = "schema:write:" +
+                            (schemaTask.Exception?.GetBaseException().Message ?? "unknown");
+                    else if (schemaTask.IsCanceled)
+                        failure = "schema:write:canceled";
+                }
+                if (string.IsNullOrEmpty(failure))
+                    failure = WriteResponsibilityCheckpoint(destinationDirectory,
+                        completedResources, true, string.Empty);
+            }
+
+            LastTsdfResponsibilityExportError = failure;
+            if (!string.IsNullOrEmpty(failure))
+            {
+                try
+                {
+                    Directory.CreateDirectory(destinationDirectory);
+                    File.WriteAllText(Path.Combine(destinationDirectory, "failure.json"),
+                        "{\n  \"schema\": \"scancover.tsdf_responsibility_failure.v1\",\n" +
+                        "  \"issue\": \"" + JsonEscape(failure) + "\",\n" +
+                        "  \"completedResources\": [" +
+                        JoinJsonStrings(completedResources) + "]\n}\n",
+                        new UTF8Encoding(false));
+                    WriteResponsibilityCheckpoint(destinationDirectory,
+                        completedResources, false, failure);
+                }
+                catch { }
+                Logger.Warning("TSDF责任链导出失败：" + failure);
+            }
+
+            _tsdfResponsibilityExportPending = false;
+            try { completed?.Invoke(string.IsNullOrEmpty(failure) ? destinationDirectory : string.Empty); }
+            catch (Exception e) { Logger.Warning("TSDF责任链回调失败：" + e.Message); }
+        }
+
+        private IEnumerator ReadTextureSlabs(RenderTexture texture, int bytesPerVoxel,
+            string label, Action<byte[]> completed, Action<string> failed)
+        {
+            // Quest/Vulkan returns width*height only for this 3D RenderTexture
+            // region overload even when depth > 1.  Keep every request at one
+            // slice; the previous depth=8 assumption produced exactly 1/8 of
+            // the expected bytes and made every otherwise-valid session seal
+            // incomplete.
+            const int slabDepth = 1;
+            int rowBytes = voxelCount.x * voxelCount.y * bytesPerVoxel;
+            byte[] output = new byte[rowBytes * voxelCount.z];
+            for (int z = 0; z < voxelCount.z; z += slabDepth)
+            {
+                int depth = Mathf.Min(slabDepth, voxelCount.z - z);
+                AsyncGPUReadbackRequest request = default;
+                string requestFailure = string.Empty;
+                try
+                {
+                    request = AsyncGPUReadback.Request(texture, 0,
+                        0, voxelCount.x, 0, voxelCount.y, z, depth);
+                }
+                catch (Exception e)
+                {
+                    requestFailure = $"{label}:request:z={z}:depth={depth}:{e.Message}";
+                }
+                if (!string.IsNullOrEmpty(requestFailure))
+                {
+                    failed?.Invoke(requestFailure);
+                    yield break;
+                }
+                while (!request.done) yield return null;
+                if (request.hasError)
+                {
+                    failed?.Invoke($"{label}:gpu:z={z}:depth={depth}");
+                    yield break;
+                }
+                string copyFailure = string.Empty;
+                try
+                {
+                    byte[] slab = request.GetData<byte>().ToArray();
+                    int expected = rowBytes * depth;
+                    if (slab.Length != expected)
+                        copyFailure = $"{label}:length:z={z}:expected={expected}:actual={slab.Length}";
+                    else
+                        Buffer.BlockCopy(slab, 0, output, rowBytes * z, expected);
+                }
+                catch (Exception e)
+                {
+                    copyFailure = $"{label}:copy:z={z}:depth={depth}:{e.Message}";
+                }
+                if (!string.IsNullOrEmpty(copyFailure))
+                {
+                    failed?.Invoke(copyFailure);
+                    yield break;
+                }
+                // Request completion is already the retirement barrier.  Do not
+                // add another unconditional frame for each of the 576 typical
+                // stop-time slices.
+            }
+            completed?.Invoke(output);
+        }
+
+        private IEnumerator ReadIntegerResponsibilitySlices(
+            RenderTexture texture, int uintLanes, string label,
+            Action<byte[]> completed, Action<string> failed)
+        {
+            if (uintLanes != 1 && uintLanes != 2)
+            {
+                failed?.Invoke($"{label}:invalid_uint_lanes:{uintLanes}");
+                yield break;
+            }
+
+            int sliceValues = voxelCount.x * voxelCount.y;
+            int sliceBytes = sliceValues * sizeof(uint) * uintLanes;
+            byte[] output = new byte[sliceBytes * voxelCount.z];
+            ComputeBuffer staging = null;
+            int kernel = -1;
+            string setupFailure = string.Empty;
+            try
+            {
+                staging = new ComputeBuffer(sliceValues,
+                    sizeof(uint) * uintLanes, ComputeBufferType.Structured);
+                kernel = compute.FindKernel(uintLanes == 2
+                    ? "CopyTsdfResponsibilityExportSlice"
+                    : "CopyTsdfSupportResponsibilityExportSlice");
+                compute.SetInts(VoxCountID, voxelCount.x, voxelCount.y, voxelCount.z);
+                compute.SetTexture(kernel,
+                    uintLanes == 2 ? TsdfResponsibilityRWID :
+                        TsdfSupportResponsibilityRWID, texture);
+                compute.SetBuffer(kernel,
+                    uintLanes == 2 ? TsdfResponsibilityExportSliceID :
+                        TsdfSupportResponsibilityExportSliceID, staging);
+            }
+            catch (Exception e)
+            {
+                setupFailure = $"{label}:staging_setup:{e.Message}";
+            }
+            if (!string.IsNullOrEmpty(setupFailure))
+            {
+                staging?.Release();
+                failed?.Invoke(setupFailure);
+                yield break;
+            }
+
+            for (int z = 0; z < voxelCount.z; z++)
+            {
+                string dispatchFailure = string.Empty;
+                try
+                {
+                    compute.SetInt(TsdfResponsibilityExportZID, z);
+                    compute.Dispatch(kernel,
+                        Mathf.CeilToInt(voxelCount.x / 8f),
+                        Mathf.CeilToInt(voxelCount.y / 8f), 1);
+                }
+                catch (Exception e)
+                {
+                    dispatchFailure = $"{label}:staging_dispatch:z={z}:{e.Message}";
+                }
+                if (!string.IsNullOrEmpty(dispatchFailure))
+                {
+                    staging.Release();
+                    failed?.Invoke(dispatchFailure);
+                    yield break;
+                }
+
+                AsyncGPUReadbackRequest request = default;
+                string requestFailure = string.Empty;
+                try { request = AsyncGPUReadback.Request(staging); }
+                catch (Exception e)
+                {
+                    requestFailure = $"{label}:staging_request:z={z}:{e.Message}";
+                }
+                if (!string.IsNullOrEmpty(requestFailure))
+                {
+                    staging.Release();
+                    failed?.Invoke(requestFailure);
+                    yield break;
+                }
+
+                while (!request.done) yield return null;
+                if (request.hasError)
+                {
+                    staging.Release();
+                    failed?.Invoke($"{label}:staging_gpu:z={z}");
+                    yield break;
+                }
+
+                string copyFailure = string.Empty;
+                try
+                {
+                    byte[] slice = request.GetData<byte>().ToArray();
+                    if (slice.Length != sliceBytes)
+                        copyFailure = $"{label}:staging_length:z={z}:expected={sliceBytes}:actual={slice.Length}";
+                    else
+                        Buffer.BlockCopy(slice, 0, output, sliceBytes * z, sliceBytes);
+                }
+                catch (Exception e)
+                {
+                    copyFailure = $"{label}:staging_copy:z={z}:{e.Message}";
+                }
+                if (!string.IsNullOrEmpty(copyFailure))
+                {
+                    staging.Release();
+                    failed?.Invoke(copyFailure);
+                    yield break;
+                }
+            }
+
+            staging.Release();
+            completed?.Invoke(output);
+        }
+
+        private IEnumerator WriteResponsibilityBytes(string path, byte[] data,
+            string label, Action<string> failed)
+        {
+            if (data == null)
+            {
+                failed?.Invoke(label + ":write:null_data");
+                yield break;
+            }
+            Task task = null;
+            string requestFailure = string.Empty;
+            try { task = Task.Run(() => File.WriteAllBytes(path, data)); }
+            catch (Exception e) { requestFailure = label + ":write_request:" + e.Message; }
+            if (!string.IsNullOrEmpty(requestFailure))
+            {
+                failed?.Invoke(requestFailure);
+                yield break;
+            }
+            while (!task.IsCompleted) yield return null;
+            if (task.IsFaulted)
+                failed?.Invoke(label + ":write:" +
+                    (task.Exception?.GetBaseException().Message ?? "unknown"));
+            else if (task.IsCanceled)
+                failed?.Invoke(label + ":write:canceled");
+        }
+
+        private static string WriteResponsibilityCheckpoint(string directory,
+            List<string> completedResources, bool complete, string issue)
+        {
+            try
+            {
+                File.WriteAllText(Path.Combine(directory, "partial_status.json"),
+                    "{\n  \"schema\": \"scancover.tsdf_responsibility_partial.v1\",\n" +
+                    "  \"complete\": " + (complete ? "true" : "false") + ",\n" +
+                    "  \"completedResources\": [" +
+                    JoinJsonStrings(completedResources) + "],\n" +
+                    "  \"issue\": \"" + JsonEscape(issue) + "\"\n}\n",
+                    new UTF8Encoding(false));
+                return string.Empty;
+            }
+            catch (Exception e)
+            {
+                return "checkpoint:write:" + e.Message;
+            }
+        }
+
+        private static string JoinJsonStrings(List<string> values)
+        {
+            if (values == null || values.Count == 0) return string.Empty;
+            var builder = new StringBuilder(values.Count * 32);
+            for (int i = 0; i < values.Count; i++)
+            {
+                if (i > 0) builder.Append(',');
+                builder.Append('"').Append(JsonEscape(values[i])).Append('"');
+            }
+            return builder.ToString();
+        }
+
+        private static void WriteTsdfResponsibilitySchema(string reason,
+            string destinationDirectory,
+            int3 capturedVoxelCount, float capturedVoxelSize,
+            float capturedTruncationDistance)
+        {
+            Directory.CreateDirectory(destinationDirectory);
+            string schema = "{\n" +
+                "  \"schema\": \"scancover.tsdf_responsibility.v3\",\n" +
+                "  \"reason\": \"" + JsonEscape(reason) + "\",\n" +
+                "  \"voxelCount\": [" + capturedVoxelCount.x + "," + capturedVoxelCount.y + "," + capturedVoxelCount.z + "],\n" +
+                "  \"voxelSizeMetres\": " + capturedVoxelSize.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
+                "  \"truncationDistanceMetres\": " + capturedTruncationDistance.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
+                "  \"readback\": \"final TSDF uses single-Z texture requests; integer responsibility lanes use compute-to-structured-buffer staging per Z slice\",\n" +
+                "  \"checkpoint\": \"each completed resource is written immediately and listed in partial_status.json\",\n" +
+                "  \"indexOrder\": \"x-fastest, then y, then z\",\n" +
+                "  \"tsdf\": \"interleaved signed R8 distance and signed R8 weight\",\n" +
+                "  \"responsibilityLaneX\": \"seedIntegration12,lastGeometryIntegration12,lastOperation4,birthFlags4\",\n" +
+                "  \"responsibilityLaneY\": \"strongestBlockIntegration12,blockReason5,signedMagnitude7,lastPreTsdf8\",\n" +
+                "  \"supportResponsibility\": \"integration12,operation4,preWeightSNorm8,postWeightSNorm8\",\n" +
+                "  \"integrationIdRange\": \"1..4094 exact; 4095 means saturated at or beyond integration 4095\",\n" +
+                "  \"operationCodes\": {\"1\":\"seed\",\"2\":\"positive_blend\",\"3\":\"lifetime_reset\"},\n" +
+                "  \"supportOperationCodes\": {\"1\":\"seed\",\"2\":\"positive_growth\",\"3\":\"carve\",\"4\":\"freeze\",\"5\":\"unfreeze\",\"6\":\"reset\"},\n" +
+                "  \"blockReasonCodes\": {\"1\":\"gungel\",\"2\":\"exclusion\",\"3\":\"normal\",\"4\":\"dilation_occlusion\",\"5\":\"truncation_band\",\"6\":\"abstain_neighbour\",\"9\":\"raw_projective_gate\",\"10\":\"dilation_supply\",\"11\":\"fov_motion_authority\",\"12\":\"frozen\",\"13\":\"blend_quantized\",\"14\":\"mature_discount\",\"15\":\"near_distance\",\"16\":\"invalid_depth\",\"17\":\"seed_quality\",\"18\":\"motion_seed\",\"19\":\"behind_camera\",\"20\":\"outside_fov\"},\n" +
+                "  \"join\": \"packed integration ids join runtime_timeline/integration_dispatches.csv integrationCount\",\n" +
+                "  \"authority\": \"diagnostic only; never sampled by production\"\n" +
+                "}\n";
+            File.WriteAllText(Path.Combine(destinationDirectory, "schema.json"),
+                schema, new UTF8Encoding(false));
+        }
+
+        private static string JsonEscape(string value)
+        {
+            return (value ?? string.Empty).Replace("\\", "\\\\")
+                .Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+
+        /// <summary>
         /// A 键请求枪胶裁决层停止收新帧并等待已提交裁决排空。完成后稳定候选
         /// 与锁存浪头保留在原 GPU 缓冲，直到 B 清卷或销毁。
         /// </summary>
@@ -704,16 +1383,30 @@ namespace Genesis.RoomScan
         public string ToggleGunGelGuardedFusionExperiment()
         {
             if (IntegrationCount > 0 || CountGunGelDeferredFrames() > 0)
-                return "枪胶融:需空卷/重启后切";
-            enableGunGelGuardedFusionExperiment = !enableGunGelGuardedFusionExperiment;
+                return "融合模式:需空卷/重启后切";
+            // 新生产制度只有一个 TSDF。GunGel 保持运行以提供 stableId 与
+            // 候选证词，但不得修正位姿、逐点否决 TSDF 或用裁判平面改零面。
+            enableGunGelGuardedFusionExperiment = true;
+            enableGunGelTsdfAdmission = false;
+            enableGunGelPoseCorrection = false;
+            enableFinalCourtAdmissionExperiment = false;
             _gunGelGuardedFusionRuntimeHalted = false;
             _gunGelLastFusionDecision = "预热";
-            return enableGunGelGuardedFusionExperiment ? "枪胶融:实验" : "枪胶融:基线";
+            return "单TSDF+网格后裁决:唯一生产路线";
         }
 
         private void Awake()
         {
             Instance = this;
+            // Scene/Prefab 中遗留的裁冻值不得重新把产品裁判接回 TSDF。
+            // GunGel 流水线只生产同帧身份/候选证据；距离、位姿和唯一 TSDF
+            // 保持原始生产含义，裁判平面只在候选网格产品化阶段消费。
+            enableGunGelGuardedFusionExperiment = !enableInfiniTamBaseline;
+            enableGunGelTsdfAdmission = false;
+            enableGunGelPoseCorrection = false;
+            enableFinalCourtAdmissionExperiment = false;
+            if (!enableInfiniTamBaseline)
+                _productSurfaceCourt.BeginInMemory();
             for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
                 _gunGelDeferredFrames[i] = new GunGelDeferredFrame();
             // GPU resources allocate lazily on the first scan / save / full-load
@@ -746,11 +1439,43 @@ namespace Genesis.RoomScan
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _clearKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _clearKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+
+            _clearInfiniTamVotesKernel = new ComputeKernelHelper(compute,
+                "ClearInfiniTamVotes");
+            _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
+                _infiniTamVoteWeightVolume);
+
+            _invalidateGunGelSuccessionsKernel = new ComputeKernelHelper(compute,
+                "InvalidateGunGelSuccessions");
+            _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
+            _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
+            _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
+                _admissionTraceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
+                _tsdfResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
+                _dirtyBoundaryEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
+                _activePageEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
+                _activePageObservedEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
+                _activePageBoundaryEpochs);
 
             _integrateKernel = new ComputeKernelHelper(compute, "Integrate");
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _integrateKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+            _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
@@ -761,6 +1486,8 @@ namespace Genesis.RoomScan
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _pruneKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
             _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
@@ -769,12 +1496,18 @@ namespace Genesis.RoomScan
 
             _freezeKernel = new ComputeKernelHelper(compute, "FreezeInFrustum");
             _freezeKernel.Set(VolumeRWID, _volume);
+            _freezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
 
             _unfreezeKernel = new ComputeKernelHelper(compute, "UnfreezeInFrustum");
             _unfreezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
 
             _applyFreezeMaskKernel = new ComputeKernelHelper(compute, "ApplyChunkFreezeMask");
             _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
             _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
             _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
 
@@ -815,18 +1548,41 @@ namespace Genesis.RoomScan
             _carveStats.SetData(ZeroCarveStats);
             _integrateKernel.Set(CarveStatsID, _carveStats);
 
+            // Vulkan requires a valid descriptor even when the legacy route
+            // keeps the receipt switch at zero. The buffer is tiny (16 bytes)
+            // and only the isolated baseline writes it.
+            _infiniTamTicketStats = new ComputeBuffer(
+                InfiniTamTicketStatCount, sizeof(uint));
+            _infiniTamTicketStats.SetData(ZeroInfiniTamTicketStats);
+            _integrateKernel.Set(InfiniTamTicketStatsID, _infiniTamTicketStats);
+            compute.SetFloat(InfiniTamTicketEnabledID, 0f);
+
             // Integrate 内核始终声明枪胶 SRV；基线/B 影子虽然关闭准入，Vulkan
-            // 描述符仍需有效绑定。两个 1 元素零缓冲只负责占位，不参与裁决。
+            // 描述符仍需有效绑定。四个 1 元素零缓冲只负责占位，不参与裁决。
             _gunGelDummyObservations = new ComputeBuffer(1, sizeof(float) * 12);
             _gunGelDummyCorrespondences = new ComputeBuffer(1, sizeof(float) * 12);
+            _gunGelDummyCorrespondenceIdentity = new ComputeBuffer(1, sizeof(uint) * 4);
+            _finalCourtDummyVerdicts = new ComputeBuffer(1, sizeof(uint));
+            _finalCourtDummyPlanes = new ComputeBuffer(1, sizeof(float) * 4);
+            _finalCourtDummyGenerations = new ComputeBuffer(1, sizeof(uint));
+            _finalCourtInvalidationArgs = new ComputeBuffer(1, sizeof(uint));
+            _finalCourtInvalidationRegions = new ComputeBuffer(
+                FinalCourtInvalidationCapacity, sizeof(float) * 4);
             _gunGelDummyObservations.SetData(new float[12]);
             _gunGelDummyCorrespondences.SetData(new float[12]);
+            _gunGelDummyCorrespondenceIdentity.SetData(new uint[4]);
+            _finalCourtDummyVerdicts.SetData(new uint[1]);
+            _finalCourtDummyPlanes.SetData(new Vector4[1]);
+            _finalCourtDummyGenerations.SetData(new uint[1]);
+            _finalCourtInvalidationArgs.SetData(new uint[1]);
+            _finalCourtInvalidationRegions.SetData(
+                new Vector4[FinalCourtInvalidationCapacity]);
             _dummyShellWitnessEpochs = new ComputeBuffer(1, sizeof(uint),
                 ComputeBufferType.Structured);
             _dummyShellWitnessEpochs.SetData(new uint[1]);
             _integrateKernel.Set(ShellWitnessEpochsID, _dummyShellWitnessEpochs);
 
-            if (enableProjectiveShadow)
+            if (enableProjectiveShadow && !enableInfiniTamBaseline)
             {
                 _projectiveShadowCarveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
                 _projectiveShadowCarveStats.SetData(ZeroCarveStats);
@@ -840,6 +1596,9 @@ namespace Genesis.RoomScan
         private void OnDestroy()
         {
             ReleaseVolumes();
+            _productCourtGeneration++;
+            _productCourtReadback = null;
+            _productSurfaceCourt.Dispose();
             _coverageCounters?.Release();
             _coverageCounters = null;
             _carveStats?.Release();
@@ -848,10 +1607,26 @@ namespace Genesis.RoomScan
             _projectiveShadowCarveStats = null;
             _confidenceStats?.Release();
             _confidenceStats = null;
+            _infiniTamTicketGeneration++;
+            _infiniTamTicketReadbackPending = false;
+            _infiniTamTicketStats?.Release();
+            _infiniTamTicketStats = null;
             _gunGelDummyObservations?.Release();
             _gunGelDummyObservations = null;
             _gunGelDummyCorrespondences?.Release();
             _gunGelDummyCorrespondences = null;
+            _gunGelDummyCorrespondenceIdentity?.Release();
+            _gunGelDummyCorrespondenceIdentity = null;
+            _finalCourtDummyVerdicts?.Release();
+            _finalCourtDummyVerdicts = null;
+            _finalCourtDummyPlanes?.Release();
+            _finalCourtDummyPlanes = null;
+            _finalCourtDummyGenerations?.Release();
+            _finalCourtDummyGenerations = null;
+            _finalCourtInvalidationArgs?.Release();
+            _finalCourtInvalidationArgs = null;
+            _finalCourtInvalidationRegions?.Release();
+            _finalCourtInvalidationRegions = null;
             _dummyShellWitnessEpochs?.Release();
             _dummyShellWitnessEpochs = null;
             ReleaseFrozenBlockBuffers();
@@ -866,6 +1641,11 @@ namespace Genesis.RoomScan
         /// </summary>
         public void ReleaseVolumes()
         {
+            _tsdfResponsibilityExportPending = false;
+            _infiniTamModelRaycast?.Dispose();
+            _infiniTamModelRaycast = null;
+            ResetInfiniTamDeferredFrame(true);
+            ResetProductSurfaceCourt();
             ResetGunGelDeferredFrames(true);
             _gunGelEvidenceShadow?.Dispose();
             _gunGelEvidenceShadow = null;
@@ -892,7 +1672,16 @@ namespace Genesis.RoomScan
             if (_admissionTraceVolume) { Destroy(_admissionTraceVolume); _admissionTraceVolume = null; }
             if (_confidenceVolume) { Destroy(_confidenceVolume); _confidenceVolume = null; }
             if (_coherenceVolume) { Destroy(_coherenceVolume); _coherenceVolume = null; }
+            if (_infiniTamVoteWeightVolume)
+            {
+                Destroy(_infiniTamVoteWeightVolume);
+                _infiniTamVoteWeightVolume = null;
+            }
+            if (_tsdfResponsibilityVolume) { Destroy(_tsdfResponsibilityVolume); _tsdfResponsibilityVolume = null; }
+            if (_tsdfSupportResponsibilityVolume) { Destroy(_tsdfSupportResponsibilityVolume); _tsdfSupportResponsibilityVolume = null; }
+            _tsdfResponsibilityCaptureEnabled = false;
             IntegrationCount = 0;
+            ResetInfiniTamTicket();
             Logger.Info("VolumeIntegrator: GPU volumes released");
         }
 
@@ -944,6 +1733,7 @@ namespace Genesis.RoomScan
 
         private void EnsureGunGelEvidenceShadow()
         {
+            if (enableInfiniTamBaseline) return;
             if (!enableGunGelEvidenceShadow || _gunGelEvidenceShadow != null) return;
             try
             {
@@ -952,11 +1742,13 @@ namespace Genesis.RoomScan
                     gunGelPixelStride, gunGelCellSize, gunGelReportInterval);
                 Logger.Info($"枪胶 GPU 层已启用：stride={gunGelPixelStride}, " +
                             $"cell={gunGelCellSize:F2}m, K<=3, report={gunGelReportInterval}帧；" +
-                            $"受保护融合={(enableGunGelGuardedFusionExperiment ? "实验" : "基线")}。");
+                            $"融合模式={(enableFinalCourtAdmissionExperiment ? "裁决准入" : enableGunGelGuardedFusionExperiment ? "枪胶实验" : "基线")}。");
             }
             catch (Exception ex)
             {
-                Logger.Warning($"枪胶 GPU 影子初始化失败，生产融合继续：{ex.Message}");
+                Logger.Warning(enableFinalCourtAdmissionExperiment
+                    ? $"枪胶 GPU 层初始化失败，裁决准入将严格停笔：{ex.Message}"
+                    : $"枪胶 GPU 影子初始化失败，生产融合继续：{ex.Message}");
                 _gunGelEvidenceShadow?.Dispose();
                 _gunGelEvidenceShadow = null;
             }
@@ -971,10 +1763,13 @@ namespace Genesis.RoomScan
             }
             catch (Exception ex)
             {
-                // 影子必须可整段拔除：任何平台/驱动/缓冲异常只熔断影子，正式融合继续。
+                // 普通模式可整段拔除影子；裁决准入模式则由 Integrate 严格停笔，
+                // 不能把 runtime failure 偷换成原始生产融合。
                 if (!_gunGelRuntimeFailureReported)
                 {
-                    Logger.Warning($"枪胶 GPU 影子运行失败，已熔断但生产融合继续：{ex.Message}");
+                    Logger.Warning(enableFinalCourtAdmissionExperiment
+                        ? $"枪胶 GPU 层运行失败，裁决准入已熔断并停笔：{ex.Message}"
+                        : $"枪胶 GPU 影子运行失败，已熔断但生产融合继续：{ex.Message}");
                     _gunGelRuntimeFailureReported = true;
                 }
                 _gunGelEvidenceShadow.Dispose();
@@ -1059,6 +1854,252 @@ namespace Genesis.RoomScan
             }
             Graphics.CopyTexture(source, target);
             return target;
+        }
+
+        private void ResetInfiniTamDeferredFrame(bool releaseTextures)
+        {
+            _infiniTamDeferredGeneration++;
+            InfiniTamDeferredFrame frame = _infiniTamDeferredFrame;
+            frame.Pending = false;
+            frame.Ready = false;
+            frame.Generation = _infiniTamDeferredGeneration;
+            frame.Decision = default;
+            _infiniTamLastQueuedPlatformFrame = -1;
+            if (!releaseTextures) return;
+            if (frame.Depth) Destroy(frame.Depth);
+            if (frame.Normal) Destroy(frame.Normal);
+            if (frame.DilatedDepth) Destroy(frame.DilatedDepth);
+            if (frame.EdgeReason) Destroy(frame.EdgeReason);
+            if (frame.TemporalReason) Destroy(frame.TemporalReason);
+            frame.Depth = null;
+            frame.Normal = null;
+            frame.DilatedDepth = null;
+            frame.EdgeReason = null;
+            frame.TemporalReason = null;
+        }
+
+        private void ResetInfiniTamStartupState(bool preserveReseedCount)
+        {
+            int reseedCount = preserveReseedCount
+                ? _infiniTamBootstrapReseedCount : 0;
+            _infiniTamTrackingInitialised = false;
+            _infiniTamStartupPhase = InfiniTamStartupPhase.AwaitingStillness;
+            _infiniTamLastStartupPlatformFrame = -1;
+            _infiniTamBootstrapStableFrames = 0;
+            _infiniTamBootstrapConfirmedFrames = 0;
+            _infiniTamRecoveryConfirmedFrames = 0;
+            _infiniTamConsecutiveTrackingRejects = 0;
+            _infiniTamBootstrapReseedCount = reseedCount;
+        }
+
+        private bool IsInfiniTamBootstrapMotionSafe(float angularSpeed,
+            float linearSpeed)
+        {
+            return angularSpeed <= Mathf.Max(0.1f,
+                       infiniTamBootstrapMaxAngularDegPerSec) &&
+                   linearSpeed <= Mathf.Max(0.001f,
+                       infiniTamBootstrapMaxLinearMps);
+        }
+
+        private string GetInfiniTamStartupPhaseLabel()
+        {
+            if (enableInfiniTamBaseline && !enableInfiniTamTrackingAuthority)
+                return IntegrationCount > 0 ? "V1.3直融" : "待首帧";
+            return _infiniTamStartupPhase switch
+            {
+                InfiniTamStartupPhase.AwaitingStillness =>
+                    $"等稳{_infiniTamBootstrapStableFrames}/" +
+                    Mathf.Max(1, infiniTamBootstrapStillFrames),
+                InfiniTamStartupPhase.Seeding =>
+                    $"建底{IntegrationCount}/" +
+                    Mathf.Max(1, infiniTamTrackingBootstrapFrames),
+                InfiniTamStartupPhase.Verifying =>
+                    $"复核{_infiniTamBootstrapConfirmedFrames}/" +
+                    Mathf.Max(1, infiniTamBootstrapConfirmFrames),
+                InfiniTamStartupPhase.TrackingLost =>
+                    _infiniTamRecoveryConfirmedFrames > 0
+                        ? $"重锁{_infiniTamRecoveryConfirmedFrames}/" +
+                          Mathf.Max(1, infiniTamRecoveryConfirmFrames)
+                        : $"失跟{_infiniTamConsecutiveTrackingRejects}",
+                _ => "正式"
+            };
+        }
+
+        /// <summary>
+        /// A bootstrap map has no user-visible authority. If it repeatedly
+        /// fails the same frame-to-model quality gate that should validate it,
+        /// discard it and acquire a new stable seed. A confirmed map is never
+        /// destroyed here: mature InfiniTAM freezes fusion and waits for
+        /// tracking/relocalisation instead.
+        /// </summary>
+        private bool TryReseedUnconfirmedInfiniTam(string reason)
+        {
+            if (_infiniTamTrackingInitialised ||
+                _infiniTamConsecutiveTrackingRejects <
+                Mathf.Max(1, infiniTamBootstrapRejectsBeforeReseed))
+                return false;
+
+            int reseedCount = _infiniTamBootstrapReseedCount + 1;
+            Logger.Warning("InfiniTAM 启动模型连续复核失败；清除未发布坏底并重新建底：" +
+                           reason);
+            ClearInternal(preserveGunGelEvidence: false);
+            IntegrationCount = 0;
+            _integrationsSinceCoverage = 0;
+            _infiniTamBootstrapReseedCount = reseedCount;
+            _infiniTamLastTrackingDecision = "重建" + reason;
+            return true;
+        }
+
+        private bool QueueInfiniTamTrackedFrame(DepthCapture depth,
+            float angularSpeed, float linearSpeed, float motionQuality)
+        {
+            InfiniTamDeferredFrame frame = _infiniTamDeferredFrame;
+            if (frame.Pending || frame.Ready || depth == null ||
+                depth.DepthTex == null || depth.NormTex == null ||
+                depth.DilatedDepthTex == null || depth.EdgeReasonTex == null ||
+                depth.CurrentPlatformFrame == _infiniTamLastQueuedPlatformFrame)
+                return false;
+
+            int generation = _infiniTamDeferredGeneration;
+            int sourceFrame = depth.CurrentPlatformFrame;
+            try
+            {
+                frame.Depth = EnsureGunGelFrameCopy(frame.Depth, depth.DepthTex,
+                    $"InfiniTamTrackDepth_{sourceFrame}");
+                frame.Normal = EnsureGunGelFrameCopy(frame.Normal, depth.NormTex,
+                    $"InfiniTamTrackNormal_{sourceFrame}");
+                frame.DilatedDepth = EnsureGunGelFrameCopy(frame.DilatedDepth,
+                    depth.DilatedDepthTex, $"InfiniTamTrackDilated_{sourceFrame}");
+                frame.EdgeReason = EnsureGunGelFrameCopy(frame.EdgeReason,
+                    depth.EdgeReasonTex, $"InfiniTamTrackEdge_{sourceFrame}");
+                if (depth.TemporalReasonTex != null)
+                    frame.TemporalReason = EnsureGunGelFrameCopy(
+                        frame.TemporalReason, depth.TemporalReasonTex,
+                        $"InfiniTamTrackTemporal_{sourceFrame}");
+                else if (frame.TemporalReason)
+                {
+                    Destroy(frame.TemporalReason);
+                    frame.TemporalReason = null;
+                }
+                frame.View = (Matrix4x4[])depth.View.Clone();
+                frame.Projection = (Matrix4x4[])depth.Proj.Clone();
+                frame.ViewInverse = (Matrix4x4[])depth.ViewInv.Clone();
+                frame.ProjectionInverse = (Matrix4x4[])depth.ProjInv.Clone();
+                frame.ExclusionCount = Mathf.Min(ExclusionZones.Count, 64);
+                Array.Clear(frame.ExclusionPositions, 0,
+                    frame.ExclusionPositions.Length);
+                for (int i = 0; i < frame.ExclusionCount; i++)
+                    if (ExclusionZones[i] != null)
+                        frame.ExclusionPositions[i] = ExclusionZones[i].position;
+                frame.PlatformFrame = sourceFrame;
+                frame.Generation = generation;
+                frame.AngularSpeed = angularSpeed;
+                frame.LinearSpeed = linearSpeed;
+                frame.MotionQuality = motionQuality;
+                frame.Pending = true;
+                frame.Ready = false;
+                _infiniTamLastQueuedPlatformFrame = sourceFrame;
+                _infiniTamModelRaycast ??= new InfiniTamModelRaycastAudit(8);
+                bool dispatched = _infiniTamModelRaycast.TryDispatchProductionTracking(
+                    frame.Depth, frame.Projection, frame.View,
+                    frame.ProjectionInverse, frame.ViewInverse,
+                    _volume, _infiniTamVoteWeightVolume,
+                    voxelCount, voxelSize, voxelDistance, minMeshWeight,
+                    rejectNearSamples ? minUpdateDist : 0f, maxUpdateDist,
+                    sourceFrame, decision =>
+                    {
+                        if (frame.Generation != _infiniTamDeferredGeneration ||
+                            frame.PlatformFrame != decision.SourceFrame)
+                            return;
+                        frame.Decision = decision;
+                        frame.Pending = false;
+                        frame.Ready = true;
+                    });
+                if (dispatched)
+                {
+                    // One retained source frame is one tracking attempt.  Do not
+                    // count the later Integrate() polls while its async readback
+                    // is pending; otherwise the HUD "stopped" total describes
+                    // scheduler latency rather than rejected observations.
+                    _infiniTamAttemptedFrames++;
+                    _infiniTamLastTrackingDecision = "求解";
+                    return true;
+                }
+                frame.Pending = false;
+                _infiniTamTrackingQueueAbstained++;
+                _infiniTamLastTrackingDecision = "跟踪忙";
+                return false;
+            }
+            catch (Exception e)
+            {
+                frame.Pending = false;
+                frame.Ready = false;
+                _infiniTamTrackingQueueAbstained++;
+                _infiniTamLastTrackingDecision = "留帧失败";
+                Logger.Warning("InfiniTAM 同帧留帧失败；本帧停笔：" + e.Message);
+                return false;
+            }
+        }
+
+        private bool AcceptInfiniTamTrackedFrame(InfiniTamDeferredFrame frame,
+            out string reason)
+        {
+            InfiniTamModelRaycastAudit.TrackingDecision decision = frame.Decision;
+            if (!decision.ReadbackSucceeded) { reason = "回读"; return false; }
+            if (decision.CorrespondenceCount < infiniTamTrackingMinCorrespondences)
+            { reason = "少配"; return false; }
+            // A large planar wall or ceiling is a valid reconstruction target
+            // but point-to-plane ICP cannot independently observe all six pose
+            // axes from one plane. Quest already supplies the retained frame's
+            // world pose; the damped solve leaves unobservable correction axes
+            // at that prior. Require only the three plane-observable axes here,
+            // then let residual support and correction bounds judge the frame.
+            // Requiring rank 6 made bootstrap publication impossible whenever
+            // the user began by looking at an ordinary wall or ceiling.
+            if (decision.EffectiveRank < infiniTamTrackingMinRank)
+            { reason = "欠秩"; return false; }
+            // A per-pass clamp is the ICP trust-region step limiter, not a
+            // frame-level verdict.  The tracker has already re-raycast and
+            // completed its coarse-to-fine passes; judge the accumulated
+            // correction below instead of rejecting any frame that needed a
+            // bounded intermediate step.
+            if (decision.TranslationMm > infiniTamTrackingMaxTranslationMm)
+            { reason = "位大"; return false; }
+            if (decision.RotationDeg > infiniTamTrackingMaxRotationDeg)
+            { reason = "转大"; return false; }
+            // InfiniTAM judges both residual and inlier support. A frame that
+            // arrived already aligned should not be rejected merely because
+            // ICP correctly produced a near-zero update.
+            bool alreadyAligned = decision.MeanBeforeMm <= 15f &&
+                                  decision.Within30BeforePercent >=
+                                  infiniTamTrackingMinWithin30Percent;
+            if (!alreadyAligned &&
+                decision.MeanBeforeMm - decision.MeanAfterMm <
+                infiniTamTrackingMinImprovementMm)
+            { reason = "无益"; return false; }
+            if (decision.Within30AfterPercent <
+                infiniTamTrackingMinWithin30Percent)
+            { reason = "残大"; return false; }
+            reason = "准";
+            return true;
+        }
+
+        private static void ApplyInfiniTamTrackingCorrection(
+            InfiniTamDeferredFrame frame)
+        {
+            Matrix4x4 correction = frame.Decision.Correction;
+            for (int i = 0; i < frame.ViewInverse.Length; i++)
+            {
+                frame.ViewInverse[i] = correction * frame.ViewInverse[i];
+                frame.View[i] = frame.ViewInverse[i].inverse;
+            }
+        }
+
+        private void ReleaseInfiniTamDeferredFrame()
+        {
+            _infiniTamDeferredFrame.Pending = false;
+            _infiniTamDeferredFrame.Ready = false;
+            _infiniTamDeferredFrame.Decision = default;
         }
 
         private bool QueueGunGelGuardedFrame(DepthCapture depth,
@@ -1172,7 +2213,9 @@ namespace Genesis.RoomScan
                 _gunGelLastFusionDecision = "熔断";
                 if (!_gunGelRuntimeFailureReported)
                 {
-                    Logger.Warning($"枪胶受保护融合留帧失败，回到基线融合：{ex.Message}");
+                    Logger.Warning(enableFinalCourtAdmissionExperiment
+                        ? $"枪胶留帧失败，裁决准入已熔断并停笔：{ex.Message}"
+                        : $"枪胶受保护融合留帧失败，回到基线融合：{ex.Message}");
                     _gunGelRuntimeFailureReported = true;
                 }
                 return false;
@@ -1229,15 +2272,151 @@ namespace Genesis.RoomScan
             frame.Ready = false;
         }
 
+        private void QueueProductSurfaceCourtReadback(GunGelDeferredFrame frame,
+            int attemptIndex, Matrix4x4 fusionCorrection)
+        {
+            if (frame == null || _productCourtReadback != null ||
+                !frame.Decision.HasFusionAdmissionBuffers ||
+                frame.Decision.FusionCorrespondences == null ||
+                frame.Decision.FusionCorrespondenceIdentity == null)
+                return;
+
+            int eye = DepthCapture.FusionEyeIndex;
+            Matrix4x4 viewInverse = frame.ViewInverse != null &&
+                frame.ViewInverse.Length > eye
+                ? frame.ViewInverse[eye]
+                : Matrix4x4.identity;
+            Camera head = Camera.main;
+            var pending = new ProductCourtReadback
+            {
+                Generation = _productCourtGeneration,
+                GunGelFrame = frame.FrameIndex,
+                SourceFrame = frame.PlatformFrame,
+                AttemptIndex = attemptIndex,
+                ViewInverse = viewInverse,
+                FusionCorrection = fusionCorrection,
+                AngularSpeed = frame.AngularSpeed,
+                LinearSpeed = frame.LinearSpeed,
+                MotionQuality = frame.MotionQuality,
+                HeadEuler = head != null ? head.transform.eulerAngles : Vector3.zero
+            };
+            _productCourtReadback = pending;
+
+            try
+            {
+                AsyncGPUReadback.Request(frame.Decision.FusionCorrespondences,
+                    request =>
+                    {
+                        try
+                        {
+                            if (request.hasError)
+                                pending.Failed = true;
+                            else
+                                pending.Correspondences = request
+                                    .GetData<GunGelEvidenceShadow.Correspondence>()
+                                    .ToArray();
+                        }
+                        catch
+                        {
+                            pending.Failed = true;
+                        }
+                        finally
+                        {
+                            pending.CorrespondencesDone = true;
+                            TryCompleteProductSurfaceCourtReadback(pending);
+                        }
+                    });
+                AsyncGPUReadback.Request(
+                    frame.Decision.FusionCorrespondenceIdentity, request =>
+                    {
+                        try
+                        {
+                            if (request.hasError)
+                                pending.Failed = true;
+                            else
+                                pending.Identities = request.GetData<uint4>().ToArray();
+                        }
+                        catch
+                        {
+                            pending.Failed = true;
+                        }
+                        finally
+                        {
+                            pending.IdentitiesDone = true;
+                            TryCompleteProductSurfaceCourtReadback(pending);
+                        }
+                    });
+            }
+            catch
+            {
+                pending.Failed = true;
+                pending.CorrespondencesDone = true;
+                pending.IdentitiesDone = true;
+                TryCompleteProductSurfaceCourtReadback(pending);
+            }
+        }
+
+        private void TryCompleteProductSurfaceCourtReadback(
+            ProductCourtReadback pending)
+        {
+            if (pending == null || !pending.CorrespondencesDone ||
+                !pending.IdentitiesDone)
+                return;
+            if (ReferenceEquals(_productCourtReadback, pending))
+                _productCourtReadback = null;
+            if (pending.Failed || pending.Generation != _productCourtGeneration)
+                return;
+
+            _productSurfaceCourt.Record(pending.GunGelFrame,
+                pending.SourceFrame, pending.AttemptIndex,
+                pending.Correspondences, pending.Identities,
+                pending.ViewInverse, pending.FusionCorrection,
+                pending.AngularSpeed, pending.LinearSpeed,
+                pending.MotionQuality, pending.HeadEuler);
+        }
+
+        private void ResetProductSurfaceCourt()
+        {
+            _productCourtGeneration++;
+            _productCourtReadback = null;
+            _productSurfaceCourt.BeginInMemory();
+        }
+
         private void RebindKernelTextures()
         {
             EnsureDirtyChunkBuffer();
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _clearKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _clearKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
+                _infiniTamVoteWeightVolume);
+            _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
+            _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
+            _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
+                _admissionTraceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
+                _tsdfResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
+                _dirtyBoundaryEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
+                _activePageEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
+                _activePageObservedEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
+                _activePageBoundaryEpochs);
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _integrateKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+            _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
             _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
@@ -1247,14 +2426,22 @@ namespace Genesis.RoomScan
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _pruneKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
             _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
             _pruneKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
             _pruneKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
             _freezeKernel.Set(VolumeRWID, _volume);
+            _freezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
             _unfreezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
             _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
             _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
             _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
             _clearVotesKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
@@ -1395,6 +2582,60 @@ namespace Genesis.RoomScan
             ConfigureDirtyTracking(true);
         }
 
+        /// <summary>
+        /// 消费当前候选事务产生的一次性局部拆旧票。候选只指出哪段旧历史已经
+        /// 失去身份。本批正常 Integrate 完成后才清除，避免按旧账本冻结的本批
+        /// 深度立刻把旧轨种回来；下一批只能用新账本认可的全分辨率深度播种。
+        /// </summary>
+        private void InvalidateGunGelSucceededRegions()
+        {
+            if (_gunGelEvidenceShadow == null ||
+                !_gunGelEvidenceShadow.TryGetSuccessionInvalidations(
+                    out GunGelEvidenceShadow.SuccessionInvalidationBuffers invalidations) ||
+                !invalidations.IsValid)
+                return;
+
+            _invalidateGunGelSuccessionsKernel.Set(
+                GunGelSuccessionInvalidationArgsID, invalidations.Args);
+            _invalidateGunGelSuccessionsKernel.Set(
+                GunGelSuccessionInvalidationRegionsID, invalidations.Regions);
+            compute.SetInt(GunGelSuccessionInvalidationCapacityID,
+                invalidations.Capacity);
+            compute.DispatchIndirect(
+                _invalidateGunGelSuccessionsKernel.KernelIndex, invalidations.Args);
+        }
+
+        /// <summary>
+        /// Atomically retires the narrow TSDF neighbourhood of a court
+        /// generation that has been replaced or conclusively revoked. The same
+        /// accepted batch may then repopulate it only where current raw rays
+        /// match the new independently published plane.
+        /// </summary>
+        private void InvalidateFinalCourtReplacements(
+            ScanReplaySessionPackage session)
+        {
+            if (session == null || _finalCourtInvalidationArgs == null ||
+                _finalCourtInvalidationRegions == null)
+                return;
+            int count = session.DrainFinalCourtInvalidationRegions(
+                _finalCourtInvalidationStaging);
+            if (count <= 0) return;
+
+            _finalCourtInvalidationRegions.SetData(
+                _finalCourtInvalidationStaging, 0, 0, count);
+            _finalCourtInvalidationCount[0] = (uint)count;
+            _finalCourtInvalidationArgs.SetData(_finalCourtInvalidationCount);
+            _invalidateGunGelSuccessionsKernel.Set(
+                GunGelSuccessionInvalidationArgsID,
+                _finalCourtInvalidationArgs);
+            _invalidateGunGelSuccessionsKernel.Set(
+                GunGelSuccessionInvalidationRegionsID,
+                _finalCourtInvalidationRegions);
+            compute.SetInt(GunGelSuccessionInvalidationCapacityID, count);
+            compute.Dispatch(_invalidateGunGelSuccessionsKernel.KernelIndex,
+                count, 1, 1);
+        }
+
         public void MarkAllChunksDirty()
         {
             EnsureDirtyChunkBuffer();
@@ -1472,9 +2713,121 @@ namespace Genesis.RoomScan
             ConfidenceLowNoiseCount = (int)data[5];
         }
 
+        private bool PrepareInfiniTamTicketSample()
+        {
+            if (!enableInfiniTamBaseline || _infiniTamTicketStats == null ||
+                _infiniTamTicketReadbackPending ||
+                Time.unscaledTime < _nextInfiniTamTicketTime)
+                return false;
+
+            _infiniTamTicketStats.SetData(ZeroInfiniTamTicketStats);
+            compute.SetFloat(InfiniTamTicketEnabledID, 1f);
+            return true;
+        }
+
+        private void RequestInfiniTamTicketReadback()
+        {
+            if (_infiniTamTicketStats == null) return;
+            _infiniTamTicketReadbackPending = true;
+            _nextInfiniTamTicketTime = Time.unscaledTime +
+                                       InfiniTamTicketIntervalSeconds;
+            int generation = _infiniTamTicketGeneration;
+            AsyncGPUReadback.Request(_infiniTamTicketStats,
+                request => OnInfiniTamTicketReadback(request, generation));
+        }
+
+        private void OnInfiniTamTicketReadback(
+            AsyncGPUReadbackRequest request, int generation)
+        {
+            // A clear/release invalidates the meaning of an outstanding GPU
+            // receipt. Do not let its callback repopulate a fresh session.
+            if (generation != _infiniTamTicketGeneration) return;
+            _infiniTamTicketReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < InfiniTamTicketStatCount) return;
+
+            _infiniTamTicketNew = data[0];
+            _infiniTamTicketContinuing = data[1];
+            _infiniTamTicketMature = data[2];
+            _infiniTamTicketVoteSum = data[3];
+            _infiniTamTicketSurfaceSamples = data[0] + data[1] + data[2];
+            _infiniTamTicketCumulativeNew += data[0];
+            _infiniTamTicketCumulativeContinuing += data[1];
+            _infiniTamTicketCumulativeMature += data[2];
+            _infiniTamTicketCumulativeVoteSum += data[3];
+            _infiniTamTicketCumulativeSurfaceSamples +=
+                (ulong)data[0] + data[1] + data[2];
+            _infiniTamTicketSampleCount++;
+            _hasInfiniTamTicket = true;
+        }
+
+        private void ResetInfiniTamTicket()
+        {
+            _infiniTamTicketGeneration++;
+            _infiniTamTicketReadbackPending = false;
+            _nextInfiniTamTicketTime = 0f;
+            _hasInfiniTamTicket = false;
+            _infiniTamTicketNew = 0;
+            _infiniTamTicketContinuing = 0;
+            _infiniTamTicketMature = 0;
+            _infiniTamTicketVoteSum = 0;
+            _infiniTamTicketSurfaceSamples = 0;
+            _infiniTamTicketCumulativeNew = 0;
+            _infiniTamTicketCumulativeContinuing = 0;
+            _infiniTamTicketCumulativeMature = 0;
+            _infiniTamTicketCumulativeVoteSum = 0;
+            _infiniTamTicketCumulativeSurfaceSamples = 0;
+            _infiniTamTicketSampleCount = 0;
+            _infiniTamAttemptedFrames = 0;
+            _infiniTamFusedFrames = 0;
+            _infiniTamTicketStats?.SetData(ZeroInfiniTamTicketStats);
+            if (compute != null)
+                compute.SetFloat(InfiniTamTicketEnabledID, 0f);
+        }
+
+        public string GetInfiniTamTicketCompact()
+        {
+            if (!enableInfiniTamBaseline) return string.Empty;
+            int stopped = Mathf.Max(0,
+                _infiniTamAttemptedFrames - _infiniTamFusedFrames);
+            if (!_hasInfiniTamTicket || _infiniTamTicketSurfaceSamples == 0)
+                return $"票[统计中] 融{_infiniTamFusedFrames} 停{stopped} " +
+                       $"启[{GetInfiniTamStartupPhaseLabel()}]";
+
+            float averageVotes = (float)_infiniTamTicketVoteSum /
+                                 _infiniTamTicketSurfaceSamples;
+            float singleFrameAuthority = 100f / (averageVotes + 1f);
+            return $"票 新{FormatCarveCount(_infiniTamTicketNew)} " +
+                   $"续{FormatCarveCount(_infiniTamTicketContinuing)} " +
+                   $"熟{FormatCarveCount(_infiniTamTicketMature)} " +
+                   $"均{averageVotes:F1} 权{singleFrameAuthority:F1}% " +
+                   $"融{_infiniTamFusedFrames} 停{stopped} " +
+                   $"启[{GetInfiniTamStartupPhaseLabel()}]";
+        }
+
+        public string GetInfiniTamModelRaycastCompact()
+        {
+            if (!enableInfiniTamBaseline) return string.Empty;
+            string model = _infiniTamModelRaycast?.GetCompact() ?? "模[待启动]";
+            if (!enableInfiniTamTrackingAuthority)
+                return model + "\n旁证[只读] Quest位姿直融 不改姿/不停写";
+            string state = _infiniTamDeferredFrame.Pending ? "求解" :
+                           _infiniTamDeferredFrame.Ready ? "待融" :
+                           _infiniTamLastTrackingDecision;
+            return model + $"\n跟闸 准{_infiniTamTrackingAccepted} " +
+                   $"拒{_infiniTamTrackingRejected} 忙{_infiniTamTrackingQueueAbstained} " +
+                   $"态{state} 重{_infiniTamBootstrapReseedCount}";
+        }
+
         private void RequestCarveStatsReadback()
         {
-            if (_carveStats == null || _carveStatsReadbackPending) return;
+            if (_carveStats == null)
+            {
+                CompleteCarveStatsFlushCallbacks(false);
+                return;
+            }
+            if (_carveStatsReadbackPending) return;
             _carveStatsReadbackPending = true;
             AsyncGPUReadback.Request(_carveStats, OnCarveStatsReadback);
         }
@@ -1482,9 +2835,17 @@ namespace Genesis.RoomScan
         private void OnCarveStatsReadback(AsyncGPUReadbackRequest request)
         {
             _carveStatsReadbackPending = false;
-            if (request.hasError) return;
+            if (request.hasError)
+            {
+                CompleteCarveStatsFlushCallbacks(false);
+                return;
+            }
             var data = request.GetData<uint>();
-            if (data.Length < CarveStatsCount) return;
+            if (data.Length < CarveStatsCount)
+            {
+                CompleteCarveStatsFlushCallbacks(false);
+                return;
+            }
             for (int i = 0; i < CarveStatsCount; i++)
             {
                 LastCarveStats[i] = data[i];
@@ -1504,11 +2865,32 @@ namespace Genesis.RoomScan
             _carveStats.SetData(ZeroCarveStats); // 数据已落袋，清零开新周期
             _lastMotionGatedCount = _motionGatedSinceStats; // 运动闸同节奏结算
             _motionGatedSinceStats = 0;
+            CompleteCarveStatsFlushCallbacks(true);
+        }
+
+        private void CompleteCarveStatsFlushCallbacks(bool success)
+        {
+            if (_carveStatsFlushCallbacks.Count == 0) return;
+            Action<bool>[] callbacks = _carveStatsFlushCallbacks.ToArray();
+            _carveStatsFlushCallbacks.Clear();
+            for (int i = 0; i < callbacks.Length; i++)
+            {
+                try { callbacks[i]?.Invoke(success); }
+                catch (Exception e)
+                {
+                    Logger.Warning("融合终账回调失败：" + e.Message);
+                }
+            }
         }
 
         private void RequestProjectiveShadowCarveStatsReadback()
         {
-            if (_projectiveShadowCarveStats == null || _projectiveShadowCarveStatsReadbackPending) return;
+            if (_projectiveShadowCarveStats == null)
+            {
+                CompleteProjectiveShadowFlushCallbacks(false);
+                return;
+            }
+            if (_projectiveShadowCarveStatsReadbackPending) return;
             _projectiveShadowCarveStatsReadbackPending = true;
             AsyncGPUReadback.Request(_projectiveShadowCarveStats, OnProjectiveShadowCarveStatsReadback);
         }
@@ -1516,12 +2898,40 @@ namespace Genesis.RoomScan
         private void OnProjectiveShadowCarveStatsReadback(AsyncGPUReadbackRequest request)
         {
             _projectiveShadowCarveStatsReadbackPending = false;
-            if (request.hasError) return;
+            if (request.hasError)
+            {
+                CompleteProjectiveShadowFlushCallbacks(false);
+                return;
+            }
             var data = request.GetData<uint>();
-            if (data.Length < CarveStatsCount) return;
-            for (int i = 0; i < CarveStatsCount; i++) LastProjectiveShadowCarveStats[i] = data[i];
+            if (data.Length < CarveStatsCount)
+            {
+                CompleteProjectiveShadowFlushCallbacks(false);
+                return;
+            }
+            for (int i = 0; i < CarveStatsCount; i++)
+            {
+                LastProjectiveShadowCarveStats[i] = data[i];
+                CumulativeProjectiveShadowCarveStats[i] += data[i];
+            }
             HasProjectiveShadowCarveStats = true;
             _projectiveShadowCarveStats.SetData(ZeroCarveStats);
+            CompleteProjectiveShadowFlushCallbacks(true);
+        }
+
+        private void CompleteProjectiveShadowFlushCallbacks(bool success)
+        {
+            if (_projectiveShadowFlushCallbacks.Count == 0) return;
+            Action<bool>[] callbacks = _projectiveShadowFlushCallbacks.ToArray();
+            _projectiveShadowFlushCallbacks.Clear();
+            for (int i = 0; i < callbacks.Length; i++)
+            {
+                try { callbacks[i]?.Invoke(success); }
+                catch (Exception e)
+                {
+                    Logger.Warning("投影影子终账回调失败：" + e.Message);
+                }
+            }
         }
 
         private static string FormatCarveCount(uint v)
@@ -1538,11 +2948,21 @@ namespace Genesis.RoomScan
             if (!HasCarveStats || LastCarveStats.Length < CarveStatsCount) return "融写 统计中";
             uint opportunities = LastCarveStats[180];
             uint accepted = LastCarveStats[192] + LastCarveStats[193] + LastCarveStats[194];
+            uint gunGelRejected = enableFinalCourtAdmissionExperiment
+                ? (opportunities >= LastCarveStats[169]
+                    ? opportunities - LastCarveStats[169] : 0u)
+                : LastCarveStats[181];
             int acceptedPercent = opportunities > 0u
                 ? Mathf.Clamp(Mathf.RoundToInt(accepted * 100f / opportunities), 0, 100)
                 : 0;
-            return $"融写 机{FormatCarveCount(opportunities)} 成{acceptedPercent:000}% " +
-                   $"胶{FormatCarveCount(LastCarveStats[181])} 排{FormatCarveCount(LastCarveStats[182])} " +
+            string court = enableFinalCourtAdmissionExperiment
+                ? $"裁GPU 过{FormatCarveCount(LastCarveStats[169])} " +
+                  $"待/无{FormatCarveCount(LastCarveStats[173])} " +
+                  $"弃/反{FormatCarveCount(LastCarveStats[175])} " +
+                  $"层/配{FormatCarveCount(LastCarveStats[176])}\n"
+                : string.Empty;
+            return court + $"融写 机{FormatCarveCount(opportunities)} 成{acceptedPercent:000}% " +
+                   $"胶{FormatCarveCount(gunGelRejected)} 排{FormatCarveCount(LastCarveStats[182])} " +
                    $"法{FormatCarveCount(LastCarveStats[183])} 胀{FormatCarveCount(LastCarveStats[184])} " +
                    $"带{FormatCarveCount(LastCarveStats[185])}\n" +
                    $"融阻 弃{FormatCarveCount(LastCarveStats[186])} 弱{FormatCarveCount(LastCarveStats[187])} " +
@@ -1671,9 +3091,48 @@ namespace Genesis.RoomScan
         /// The callback folds the GPU period into the cumulative CPU ledger;
         /// this method never stalls the render thread or changes fusion rules.
         /// </summary>
-        public void FlushForensicLedger()
+        public void FlushForensicLedger(Action<bool> completed = null)
         {
+            if (completed != null)
+                _carveStatsFlushCallbacks.Add(completed);
             RequestCarveStatsReadback();
+        }
+
+        /// <summary>
+        /// Flush both the production and raw-projective shadow counter periods.
+        /// The callback runs only after every requested GPU readback settles.
+        /// </summary>
+        public void FlushAllForensicLedgers(Action<bool> completed)
+        {
+            int pending = ProjectiveShadowEnabled ? 2 : 1;
+            bool success = true;
+            void FinishOne(bool ok)
+            {
+                success &= ok;
+                pending--;
+                if (pending == 0) completed?.Invoke(success);
+            }
+
+            FlushForensicLedger(FinishOne);
+            if (ProjectiveShadowEnabled)
+            {
+                _projectiveShadowFlushCallbacks.Add(FinishOne);
+                RequestProjectiveShadowCarveStatsReadback();
+            }
+        }
+
+        public void AppendAllForensicCountersCsv(StringBuilder sb, string session)
+        {
+            if (sb == null) return;
+            sb.AppendLine("session,source,enabled,counter_index,value");
+            for (int i = 0; i < CarveStatsCount; i++)
+            {
+                sb.Append(session).Append(",production,1,").Append(i).Append(',')
+                    .Append(CumulativeCarveStats[i]).AppendLine();
+                sb.Append(session).Append(",raw_projective_shadow,")
+                    .Append(ProjectiveShadowEnabled ? 1 : 0).Append(',').Append(i).Append(',')
+                    .Append(CumulativeProjectiveShadowCarveStats[i]).AppendLine();
+            }
         }
 
         /// <summary>Append the cumulative, read-only integration causal ledger.</summary>
@@ -1681,6 +3140,67 @@ namespace Genesis.RoomScan
         {
             if (sb == null) return;
             static string U(ulong value) => value.ToString(CultureInfo.InvariantCulture);
+
+            int infiniTamStoppedFrames = Mathf.Max(0,
+                _infiniTamAttemptedFrames - _infiniTamFusedFrames);
+            double lastAverageVotes = _infiniTamTicketSurfaceSamples > 0
+                ? (double)_infiniTamTicketVoteSum / _infiniTamTicketSurfaceSamples
+                : 0.0;
+            double lastSingleFrameAuthority = _infiniTamTicketSurfaceSamples > 0
+                ? 100.0 / (lastAverageVotes + 1.0)
+                : 0.0;
+            double cumulativeAverageVotes = _infiniTamTicketCumulativeSurfaceSamples > 0
+                ? (double)_infiniTamTicketCumulativeVoteSum /
+                  _infiniTamTicketCumulativeSurfaceSamples
+                : 0.0;
+            sb.AppendLine();
+            sb.AppendLine("infinitam_baseline_ticket:");
+            sb.AppendLine("scope=sampled_near_zero_surface_writes;diagnostic_only=true;sample_interval_s=1");
+            sb.AppendLine($"enabled={enableInfiniTamBaseline.ToString().ToLowerInvariant()}");
+            sb.AppendLine("active_contract=v1.3_external_quest_pose_direct_fusion_read_only_raycast");
+            sb.AppendLine($"tracking_authority_enabled={enableInfiniTamTrackingAuthority.ToString().ToLowerInvariant()}");
+            sb.AppendLine($"sample_ready={_hasInfiniTamTicket.ToString().ToLowerInvariant()}");
+            sb.AppendLine($"readback_pending={_infiniTamTicketReadbackPending.ToString().ToLowerInvariant()}");
+            sb.AppendLine($"sample_count={_infiniTamTicketSampleCount.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"attempted_frames={_infiniTamAttemptedFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"fused_frames={_infiniTamFusedFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"stopped_frames={infiniTamStoppedFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_new={_infiniTamTicketNew.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_continuing={_infiniTamTicketContinuing.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_mature={_infiniTamTicketMature.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_surface_samples={_infiniTamTicketSurfaceSamples.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_average_votes={lastAverageVotes.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"last_single_frame_authority_percent={lastSingleFrameAuthority.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"cumulative_new={U(_infiniTamTicketCumulativeNew)}");
+            sb.AppendLine($"cumulative_continuing={U(_infiniTamTicketCumulativeContinuing)}");
+            sb.AppendLine($"cumulative_mature={U(_infiniTamTicketCumulativeMature)}");
+            sb.AppendLine($"cumulative_surface_samples={U(_infiniTamTicketCumulativeSurfaceSamples)}");
+            sb.AppendLine($"cumulative_average_votes={cumulativeAverageVotes.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_bootstrap_frames={infiniTamTrackingBootstrapFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_required_still_frames={infiniTamBootstrapStillFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_max_angular_deg_per_s={infiniTamBootstrapMaxAngularDegPerSec.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_max_linear_m_per_s={infiniTamBootstrapMaxLinearMps.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_confirm_frames={infiniTamBootstrapConfirmFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_rejects_before_reseed={infiniTamBootstrapRejectsBeforeReseed.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"recovery_confirm_frames={infiniTamRecoveryConfirmFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_phase={GetInfiniTamStartupPhaseLabel()}");
+            sb.AppendLine($"bootstrap_publication_ready={InfiniTamMeshPublicationReady.ToString().ToLowerInvariant()}");
+            sb.AppendLine($"bootstrap_stable_frames={_infiniTamBootstrapStableFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_confirmed_frames={_infiniTamBootstrapConfirmedFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"recovery_confirmed_frames={_infiniTamRecoveryConfirmedFrames.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_consecutive_rejects={_infiniTamConsecutiveTrackingRejects.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"bootstrap_reseed_count={_infiniTamBootstrapReseedCount.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_min_correspondences={infiniTamTrackingMinCorrespondences.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_min_rank={infiniTamTrackingMinRank.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_max_translation_mm={infiniTamTrackingMaxTranslationMm.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_max_rotation_deg={infiniTamTrackingMaxRotationDeg.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_min_improvement_mm={infiniTamTrackingMinImprovementMm.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_min_within_30mm_percent={infiniTamTrackingMinWithin30Percent.ToString("F3", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_accepted_frames={_infiniTamTrackingAccepted.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_rejected_frames={_infiniTamTrackingRejected.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_queue_abstained={_infiniTamTrackingQueueAbstained.ToString(CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"tracking_last_decision={_infiniTamLastTrackingDecision}");
+            _infiniTamModelRaycast?.AppendReport(sb);
 
             ulong seedSourceSum = CumulativeCarveStats[71] +
                                   CumulativeCarveStats[72] +
@@ -1726,8 +3246,26 @@ namespace Genesis.RoomScan
             sb.AppendLine($"shell_witness_fresh_hits={U(CumulativeCarveStats[178])}");
             sb.AppendLine($"shell_witness_promotions={U(CumulativeCarveStats[179])}");
             sb.AppendLine("relay_fusion_write_lifecycle:");
+            sb.AppendLine("gungel_gpu_admission_status:");
+            sb.AppendLine("note=status8_final_pending_merges_with_4_missing_stable;status9_final_abstain_merges_with_6_opposed;status10_final_layer_mismatch_merges_with_7_spatial_mismatch");
+            sb.AppendLine($"evaluated={U(CumulativeCarveStats[168])}");
+            sb.AppendLine($"passed={U(CumulativeCarveStats[169])}");
+            sb.AppendLine($"invalid_observation={U(CumulativeCarveStats[170])}");
+            sb.AppendLine($"raw_missing={U(CumulativeCarveStats[171])}");
+            sb.AppendLine($"dual_conflict={U(CumulativeCarveStats[172])}");
+            sb.AppendLine($"stable_missing_or_final_pending={U(CumulativeCarveStats[173])}");
+            sb.AppendLine($"stable_dual_immature={U(CumulativeCarveStats[174])}");
+            sb.AppendLine($"opposed_or_final_abstain={U(CumulativeCarveStats[175])}");
+            sb.AppendLine($"spatial_or_final_layer_mismatch={U(CumulativeCarveStats[176])}");
             sb.AppendLine($"opportunities_near_surface={U(CumulativeCarveStats[180])}");
-            sb.AppendLine($"reject_gungel={U(CumulativeCarveStats[181])}");
+            ulong reconciledGunGelReject = enableFinalCourtAdmissionExperiment &&
+                CumulativeCarveStats[180] >= CumulativeCarveStats[169]
+                ? CumulativeCarveStats[180] - CumulativeCarveStats[169]
+                : CumulativeCarveStats[181];
+            sb.AppendLine($"reject_gungel={U(reconciledGunGelReject)}");
+            sb.AppendLine($"reject_gungel_recorded_atomic={U(CumulativeCarveStats[181])}");
+            sb.AppendLine($"reject_gungel_atomic_delta=" +
+                $"{(long)CumulativeCarveStats[181] - (long)reconciledGunGelReject}");
             sb.AppendLine($"reject_exclusion={U(CumulativeCarveStats[182])}");
             sb.AppendLine($"reject_normal={U(CumulativeCarveStats[183])}");
             sb.AppendLine($"reject_dilation={U(CumulativeCarveStats[184])}");
@@ -1949,7 +3487,7 @@ namespace Genesis.RoomScan
             };
             _volume.Create();
 
-            if (enableProjectiveShadow)
+            if (enableProjectiveShadow && !enableInfiniTamBaseline)
             {
                 _projectiveShadowVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, GraphicsFormat.R8G8_SNorm, 0)
                 {
@@ -1973,6 +3511,41 @@ namespace Genesis.RoomScan
                 wrapMode = TextureWrapMode.Clamp
             };
             _colorVolume.Create();
+
+            // The baseline must not reuse the product route's R8G8_SNorm .g
+            // lane as both "may extract" and accumulated observation weight.
+            // Keep a real (0..100) vote count in a baseline-private float volume.
+            // The old route receives a 1x1 placeholder solely because Vulkan
+            // requires every UAV declared by Integrate to have a descriptor.
+            GraphicsFormat infiniTamVoteFormat = SystemInfo.IsFormatSupported(
+                GraphicsFormat.R16_SFloat, FormatUsage.LoadStore)
+                ? GraphicsFormat.R16_SFloat
+                : GraphicsFormat.R32_SFloat;
+            int voteWidth = enableInfiniTamBaseline ? voxelCount.x : 1;
+            int voteHeight = enableInfiniTamBaseline ? voxelCount.y : 1;
+            int voteDepth = enableInfiniTamBaseline ? voxelCount.z : 1;
+            _infiniTamVoteWeightVolume = new RenderTexture(
+                voteWidth, voteHeight, 0, infiniTamVoteFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voteDepth,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = enableInfiniTamBaseline
+                    ? "InfiniTamAccumulationWeight"
+                    : "InfiniTamAccumulationWeightDummy"
+            };
+            _infiniTamVoteWeightVolume.Create();
+            if (enableInfiniTamBaseline)
+            {
+                long voteBytesPerVoxel = infiniTamVoteFormat == GraphicsFormat.R16_SFloat
+                    ? 2L
+                    : 4L;
+                Logger.Info($"InfiniTAM private vote volume: {voxelCount} " +
+                            $"{infiniTamVoteFormat} = " +
+                            $"{(voteBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+            }
 
             GraphicsFormat traceFormat = SystemInfo.IsFormatSupported(GraphicsFormat.R8_UNorm, FormatUsage.LoadStore)
                 ? GraphicsFormat.R8_UNorm
@@ -2015,6 +3588,38 @@ namespace Genesis.RoomScan
                 name = "ConfidenceCoherence"
             };
             _coherenceVolume.Create();
+
+            // Two packed uint lanes are sufficient to connect a final zero-crossing
+            // endpoint to its current-lifetime seed, last sd-moving write and strongest
+            // blocked correction.  This sidecar is write-only diagnostics; production
+            // TSDF, extraction and rendering never sample it.
+            _tsdfResponsibilityVolume = new RenderTexture(
+                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32G32_UInt, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfResponsibility"
+            };
+            _tsdfResponsibilityVolume.Create();
+            Logger.Info($"TSDF responsibility sidecar: {voxelCount} R32G32_UInt = " +
+                        $"{(8L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+
+            _tsdfSupportResponsibilityVolume = new RenderTexture(
+                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32_UInt, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfSupportResponsibility"
+            };
+            _tsdfSupportResponsibilityVolume.Create();
+            Logger.Info($"TSDF support responsibility sidecar: {voxelCount} R32_UInt = " +
+                        $"{(4L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
         }
 
         private void SetShaderConstants()
@@ -2074,8 +3679,14 @@ namespace Genesis.RoomScan
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            compute.SetFloat(InfiniTamBaselineID, 0f);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(TsdfResponsibilityAvailableID,
+                _tsdfResponsibilityVolume != null && _tsdfResponsibilityVolume.IsCreated() ? 1f : 0f);
+            compute.SetFloat(TsdfResponsibilityWriteID,
+                _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
+            compute.SetInt(TsdfResponsibilityIntegrationID, 0);
             compute.SetFloat(ConfidenceWriteID, 1f);
             compute.SetFloat(ConfidenceRateID, confidenceRate);
             compute.SetFloat(ConfidenceMidMaxID, confidenceMidMax);
@@ -2114,6 +3725,17 @@ namespace Genesis.RoomScan
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
             _clearKernel.DispatchFit(_volume);
+            ResetInfiniTamTicket();
+            _infiniTamModelRaycast?.Reset();
+            ResetInfiniTamDeferredFrame(false);
+            if (enableInfiniTamBaseline)
+                ResetInfiniTamStartupState(preserveReseedCount: true);
+            if (enableInfiniTamBaseline && _infiniTamVoteWeightVolume != null)
+            {
+                _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
+                    _infiniTamVoteWeightVolume);
+                _clearInfiniTamVotesKernel.DispatchFit(_infiniTamVoteWeightVolume);
+            }
 
             if (_projectiveShadowVolume != null)
             {
@@ -2138,6 +3760,8 @@ namespace Genesis.RoomScan
             if (_frozenChunkVotes != null) _frozenChunkVotes.SetData(_voteZeros);
             if (_chunkMaturity != null) _chunkMaturity.SetData(_maturityZeros);
             Array.Clear(CumulativeCarveStats, 0, CumulativeCarveStats.Length);
+            Array.Clear(CumulativeProjectiveShadowCarveStats, 0,
+                CumulativeProjectiveShadowCarveStats.Length);
             _fovLedgerPeriods.Clear();
             _fovLedgerPeriodIndex = 0;
             _fovLedgerStartedRealtime = Time.realtimeSinceStartup;
@@ -2147,7 +3771,10 @@ namespace Genesis.RoomScan
             // TSDF，不得把刚养成的枪胶候选同时抹掉，否则会制造第二次冷启动
             // 并再次让欠秩/少配拖住覆盖。
             if (!preserveGunGelEvidence)
+            {
                 _gunGelEvidenceShadow?.Clear();
+                ResetProductSurfaceCourt();
+            }
             ResetGunGelDeferredFrames(false);
             MarkAllChunksDirty();
             Cleared?.Invoke();
@@ -2162,6 +3789,14 @@ namespace Genesis.RoomScan
         {
             IntegrationCount = 0;
             _integrationsSinceCoverage = 0;
+            ResetInfiniTamTicket();
+            _infiniTamModelRaycast?.Reset();
+            ResetInfiniTamDeferredFrame(false);
+            ResetInfiniTamStartupState(preserveReseedCount: false);
+            _infiniTamTrackingAccepted = 0;
+            _infiniTamTrackingRejected = 0;
+            _infiniTamTrackingQueueAbstained = 0;
+            _infiniTamLastTrackingDecision = "建模";
             _gunGelCaptureFrameIndex = 0;
             _gunGelFusionAccepted = 0;
             _gunGelFusionRejected = 0;
@@ -2219,6 +3854,30 @@ namespace Genesis.RoomScan
             };
             dstAdmissionTrace.Create();
 
+            var dstResponsibility = new RenderTexture(
+                vc.x, vc.y, 0, GraphicsFormat.R32G32_UInt, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = vc.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfResponsibility"
+            };
+            dstResponsibility.Create();
+
+            var dstSupportResponsibility = new RenderTexture(
+                vc.x, vc.y, 0, GraphicsFormat.R32_UInt, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = vc.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfSupportResponsibility"
+            };
+            dstSupportResponsibility.Create();
+
             RenderTexture dstProjectiveShadow = null;
             if (_projectiveShadowVolume != null)
             {
@@ -2240,9 +3899,16 @@ namespace Genesis.RoomScan
             compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcTsdf"), _volume);
             compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcColor"), _colorVolume);
             compute.SetTexture(kernel, BakeSrcAdmissionTraceID, _admissionTraceVolume);
+            compute.SetTexture(kernel, BakeSrcTsdfResponsibilityID,
+                _tsdfResponsibilityVolume);
+            compute.SetTexture(kernel, BakeSrcTsdfSupportResponsibilityID,
+                _tsdfSupportResponsibilityVolume);
             compute.SetTexture(kernel, VolumeRWID, dstTsdf);
             compute.SetTexture(kernel, ColorVolumeRWID, dstColor);
             compute.SetTexture(kernel, AdmissionTraceRWID, dstAdmissionTrace);
+            compute.SetTexture(kernel, TsdfResponsibilityRWID, dstResponsibility);
+            compute.SetTexture(kernel, TsdfSupportResponsibilityRWID,
+                dstSupportResponsibility);
             compute.SetMatrix(Shader.PropertyToID("gsBakeInvRelocation"), invRelocation);
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
@@ -2259,9 +3925,11 @@ namespace Genesis.RoomScan
                 compute.SetTexture(kernel, ColorVolumeRWID, dstColor); // write-guarded
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.SetFloat(TsdfResponsibilityAvailableID, 0f);
                 compute.Dispatch(kernel, tx, ty, tz);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
+                compute.SetFloat(TsdfResponsibilityAvailableID, 1f);
             }
             GL.Flush();
 
@@ -2271,10 +3939,14 @@ namespace Genesis.RoomScan
             Destroy(_colorVolume);
             if (_projectiveShadowVolume) Destroy(_projectiveShadowVolume);
             if (_admissionTraceVolume) Destroy(_admissionTraceVolume);
+            if (_tsdfResponsibilityVolume) Destroy(_tsdfResponsibilityVolume);
+            if (_tsdfSupportResponsibilityVolume) Destroy(_tsdfSupportResponsibilityVolume);
             _volume = dstTsdf;
             _colorVolume = dstColor;
             _projectiveShadowVolume = dstProjectiveShadow;
             _admissionTraceVolume = dstAdmissionTrace;
+            _tsdfResponsibilityVolume = dstResponsibility;
+            _tsdfSupportResponsibilityVolume = dstSupportResponsibility;
 
             // Rebind global texture references (used by render shader for freeze tint etc.)
             Shader.SetGlobalTexture(VolumeID, _volume);
@@ -2305,6 +3977,7 @@ namespace Genesis.RoomScan
         public void FreezeInView(Vector3 camPos, Quaternion camRot,
             Vector2 focalLen, Vector2 principalPt, Vector2 sensorRes, Vector2 currentRes)
         {
+            if (enableInfiniTamBaseline) return;
             if (_volume == null || _freezeKernel.Shader == null)
             {
                 Logger.Warning("FreezeInView called before GPU resources allocated; ignored.");
@@ -2317,9 +3990,12 @@ namespace Genesis.RoomScan
             _freezeKernel.DispatchFit(_volume);
             if (_projectiveShadowVolume != null)
             {
+                compute.SetFloat(TsdfResponsibilityWriteID, 0f);
                 _freezeKernel.Set(VolumeRWID, _projectiveShadowVolume);
                 _freezeKernel.DispatchFit(_projectiveShadowVolume);
                 _freezeKernel.Set(VolumeRWID, _volume);
+                compute.SetFloat(TsdfResponsibilityWriteID,
+                    _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
             }
             Logger.Info("FreezeInView dispatched");
         }
@@ -2330,6 +4006,7 @@ namespace Genesis.RoomScan
         public void UnfreezeInView(Vector3 camPos, Quaternion camRot,
             Vector2 focalLen, Vector2 principalPt, Vector2 sensorRes, Vector2 currentRes)
         {
+            if (enableInfiniTamBaseline) return;
             if (_volume == null || _unfreezeKernel.Shader == null)
             {
                 Logger.Warning("UnfreezeInView called before GPU resources allocated; ignored.");
@@ -2341,9 +4018,12 @@ namespace Genesis.RoomScan
             _unfreezeKernel.DispatchFit(_volume);
             if (_projectiveShadowVolume != null)
             {
+                compute.SetFloat(TsdfResponsibilityWriteID, 0f);
                 _unfreezeKernel.Set(VolumeRWID, _projectiveShadowVolume);
                 _unfreezeKernel.DispatchFit(_projectiveShadowVolume);
                 _unfreezeKernel.Set(VolumeRWID, _volume);
+                compute.SetFloat(TsdfResponsibilityWriteID,
+                    _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
             }
             Logger.Info("UnfreezeInView dispatched");
         }
@@ -2366,7 +4046,8 @@ namespace Genesis.RoomScan
         /// <summary>成熟度账（每块 uint4：x=surface体素数 y=其中已冻结），调度器周期回读。</summary>
         public ComputeBuffer ChunkMaturity => _chunkMaturity;
         /// <summary>冻结 API 是否可用（GPU 资源已惰性分配）。</summary>
-        public bool FrozenBlockReady => _volume != null && _frozenChunkVotes != null &&
+        public bool FrozenBlockReady => !enableInfiniTamBaseline &&
+                                        _volume != null && _frozenChunkVotes != null &&
                                         _applyFreezeMaskKernel.Shader != null;
         /// <summary>冻结单元块总数（独立于脏账本网格，frozenChunkSize 边长）。</summary>
         public int FrozenBlockCount => _frozenChunkCount.x * _frozenChunkCount.y * _frozenChunkCount.z;
@@ -2388,9 +4069,12 @@ namespace Genesis.RoomScan
             _applyFreezeMaskKernel.DispatchFit(_volume);
             if (_projectiveShadowVolume != null)
             {
+                compute.SetFloat(TsdfResponsibilityWriteID, 0f);
                 _applyFreezeMaskKernel.Set(VolumeRWID, _projectiveShadowVolume);
                 _applyFreezeMaskKernel.DispatchFit(_projectiveShadowVolume);
                 _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+                compute.SetFloat(TsdfResponsibilityWriteID,
+                    _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
             }
             _clearVotesKernel.DispatchFit(_frozenChunkVotes.count, 1, 1);
             System.Array.Clear(setMask, 0, setMask.Length);
@@ -2537,6 +4221,13 @@ namespace Genesis.RoomScan
         {
             var dc = DepthCapture.Instance;
             if (dc == null || !DepthCapture.DepthAvailable || dc.DepthTex == null) return false;
+            // The observation view still shows raw source geometry. Do not
+            // write those pre-seed frames while it is open. Once a fitted seed
+            // is staged, an existing roll must be cleared before the shared
+            // GunGel -> court -> TSDF path may consume the corrected input.
+            if (!enableInfiniTamBaseline &&
+                (dc.SeedPlanePreviewActive || dc.SeedPlaneAwaitClear ||
+                 !dc.SeedPlaneAppliedToCurrentFrame)) return false;
             // Defensive: with lazy GPU alloc a stray Integrate() before
             // ReallocateVolumes can land here. RoomScanner.StartScanning()
             // always calls ReallocateVolumes first, so this is just a
@@ -2557,8 +4248,12 @@ namespace Genesis.RoomScan
             Matrix4x4[] fusionViewInverse = dc.ViewInv;
             Matrix4x4[] fusionProjectionInverse = dc.ProjInv;
             GunGelDeferredFrame deferredFrame = null;
+            InfiniTamDeferredFrame infiniTamFrame = null;
             bool usingGuardedFrame = false;
+            bool usingInfiniTamTrackedFrame = false;
             bool gunGelCorrectionApplied = false;
+            bool infiniTamCorrectionApplied = false;
+            bool gunGelIdentityAccepted = false;
             string acceptedInputReason = "baseline_accept";
 
             // 运动闸：转头时积分位姿与深度帧存在帧差，写入会切向涂抹成搓衣板褶皱、
@@ -2580,11 +4275,82 @@ namespace Genesis.RoomScan
             _motionQuality = Mathf.Lerp(1f, noiseMotionFloor,
                 Mathf.Clamp01(Mathf.Max(motionAngularRatio, motionLinearRatio)));
 
+            // Restored V1.3 boundary: Quest owns pose and each platform depth
+            // frame may update the sole TSDF at most once. Raycast remains a
+            // read-only witness below; it cannot retain the frame, modify pose,
+            // gate fusion, clear the model or delay mesh publication.
+            if (enableInfiniTamBaseline && !enableInfiniTamTrackingAuthority)
+            {
+                int platformFrame = dc.CurrentPlatformFrame;
+                if (platformFrame >= 0 &&
+                    platformFrame == _infiniTamLastStartupPlatformFrame)
+                    return false;
+                if (platformFrame >= 0)
+                    _infiniTamLastStartupPlatformFrame = platformFrame;
+                acceptedInputReason = "infinitam_v13_external_pose";
+                _infiniTamLastTrackingDecision = "只读旁证";
+            }
+
             bool currentHardGated = motionGateDegPerSec > 0f &&
                                     currentAngularSpeed > motionGateDegPerSec;
-            bool guardedExperimentActive = enableGunGelGuardedFusionExperiment &&
+            bool infiniTamStartupActive = enableInfiniTamBaseline &&
+                                          enableInfiniTamTrackingAuthority &&
+                                          !_infiniTamTrackingInitialised;
+            bool startupNeedsLiveCandidate = infiniTamStartupActive &&
+                (IntegrationCount < Mathf.Max(1,
+                     infiniTamTrackingBootstrapFrames) ||
+                 (!_infiniTamDeferredFrame.Pending &&
+                  !_infiniTamDeferredFrame.Ready));
+            if (startupNeedsLiveCandidate)
+            {
+                // A depth texture can remain current across several Unity
+                // updates. Counting those polls as independent bootstrap
+                // evidence used to fill the seed quota with one frozen frame.
+                if (dc.CurrentPlatformFrame ==
+                    _infiniTamLastStartupPlatformFrame)
+                    return false;
+                _infiniTamLastStartupPlatformFrame = dc.CurrentPlatformFrame;
+
+                if (!IsInfiniTamBootstrapMotionSafe(currentAngularSpeed,
+                        currentLinearSpeed))
+                {
+                    _infiniTamBootstrapStableFrames = 0;
+                    _infiniTamStartupPhase =
+                        InfiniTamStartupPhase.AwaitingStillness;
+                    _infiniTamLastTrackingDecision = "等稳";
+                    _motionGatedSinceStats++;
+                    _pendingCamFrame = null;
+                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                        replayAttemptIndex, dc.CurrentPlatformFrame, false,
+                        "infinitam_bootstrap_motion_hold", false, -1, 0f, 0f,
+                        currentAngularSpeed, currentLinearSpeed, _motionQuality);
+                    return false;
+                }
+
+                _infiniTamBootstrapStableFrames++;
+                if (_infiniTamBootstrapStableFrames <
+                    Mathf.Max(1, infiniTamBootstrapStillFrames))
+                {
+                    _infiniTamStartupPhase =
+                        InfiniTamStartupPhase.AwaitingStillness;
+                    _infiniTamLastTrackingDecision = "等稳";
+                    _pendingCamFrame = null;
+                    return false;
+                }
+
+                if (IntegrationCount < Mathf.Max(1,
+                        infiniTamTrackingBootstrapFrames))
+                {
+                    _infiniTamStartupPhase = InfiniTamStartupPhase.Seeding;
+                    acceptedInputReason = "infinitam_stable_unique_bootstrap";
+                }
+            }
+            bool guardedExperimentActive = !enableInfiniTamBaseline &&
+                                           enableGunGelGuardedFusionExperiment &&
                                            !_gunGelGuardedFusionRuntimeHalted &&
                                            _gunGelEvidenceShadow != null;
+            bool finalCourtAdmissionActive = guardedExperimentActive &&
+                                             enableFinalCourtAdmissionExperiment;
 
             if (!currentHardGated)
             {
@@ -2595,7 +4361,7 @@ namespace Genesis.RoomScan
                         currentLinearSpeed, _motionQuality);
                     _pendingCamFrame = null; // 实验暂不延迟相机色帧，防跨帧贴错色。
                 }
-                else
+                else if (!enableInfiniTamBaseline)
                 {
                     DispatchGunGelEvidenceShadow(dc);
                 }
@@ -2608,7 +4374,115 @@ namespace Genesis.RoomScan
 
             // 受保护实验必须消费“同一帧”的深度、法线、姿态和解算结果。
             // 最老帧尚在回读时宁可短暂停笔，绝不用上一帧校正硬套当前帧。
-            if (guardedExperimentActive && !_gunGelGuardedFusionRuntimeHalted)
+            bool infiniTamTrackingRequired = enableInfiniTamBaseline &&
+                enableInfiniTamTrackingAuthority &&
+                IntegrationCount >= Mathf.Max(1, infiniTamTrackingBootstrapFrames);
+            if (infiniTamTrackingRequired)
+            {
+                if (!_infiniTamTrackingInitialised)
+                    _infiniTamStartupPhase = InfiniTamStartupPhase.Verifying;
+                infiniTamFrame = _infiniTamDeferredFrame;
+                if (infiniTamFrame.Pending) return false;
+                if (!infiniTamFrame.Ready)
+                {
+                    if (currentHardGated)
+                    {
+                        ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                            replayAttemptIndex, dc.CurrentPlatformFrame, false,
+                            "infinitam_motion_gate", false, -1, 0f, 0f,
+                            currentAngularSpeed, currentLinearSpeed, _motionQuality);
+                        return false;
+                    }
+                    QueueInfiniTamTrackedFrame(dc, currentAngularSpeed,
+                        currentLinearSpeed, _motionQuality);
+                    _pendingCamFrame = null;
+                    return false;
+                }
+
+                if (!AcceptInfiniTamTrackedFrame(infiniTamFrame,
+                    out string trackingRejectReason))
+                {
+                    _infiniTamTrackingRejected++;
+                    _infiniTamConsecutiveTrackingRejects++;
+                    _infiniTamBootstrapConfirmedFrames = 0;
+                    _infiniTamRecoveryConfirmedFrames = 0;
+                    _infiniTamStartupPhase = _infiniTamTrackingInitialised
+                        ? InfiniTamStartupPhase.TrackingLost
+                        : InfiniTamStartupPhase.Verifying;
+                    _infiniTamLastTrackingDecision = "拒" + trackingRejectReason;
+                    ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                        replayAttemptIndex, infiniTamFrame.PlatformFrame, false,
+                        "infinitam_tracking_reject:" + trackingRejectReason,
+                        false, -1, infiniTamFrame.Decision.TranslationMm,
+                        infiniTamFrame.Decision.RotationDeg,
+                        infiniTamFrame.AngularSpeed, infiniTamFrame.LinearSpeed,
+                        infiniTamFrame.MotionQuality);
+                    ReleaseInfiniTamDeferredFrame();
+                    TryReseedUnconfirmedInfiniTam(trackingRejectReason);
+                    return false;
+                }
+
+                bool recoveringPublishedModel = _infiniTamTrackingInitialised &&
+                    _infiniTamStartupPhase == InfiniTamStartupPhase.TrackingLost;
+                if (recoveringPublishedModel)
+                {
+                    _infiniTamRecoveryConfirmedFrames++;
+                    _infiniTamConsecutiveTrackingRejects = 0;
+                    if (_infiniTamRecoveryConfirmedFrames <
+                        Mathf.Max(1, infiniTamRecoveryConfirmFrames))
+                    {
+                        _infiniTamLastTrackingDecision = "重锁";
+                        ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                            replayAttemptIndex, infiniTamFrame.PlatformFrame,
+                            false, "infinitam_recovery_probation", false, -1,
+                            infiniTamFrame.Decision.TranslationMm,
+                            infiniTamFrame.Decision.RotationDeg,
+                            infiniTamFrame.AngularSpeed,
+                            infiniTamFrame.LinearSpeed,
+                            infiniTamFrame.MotionQuality);
+                        ReleaseInfiniTamDeferredFrame();
+                        return false;
+                    }
+                }
+
+                ApplyInfiniTamTrackingCorrection(infiniTamFrame);
+                usingInfiniTamTrackedFrame = true;
+                infiniTamCorrectionApplied = true;
+                fusionDepth = infiniTamFrame.Depth;
+                fusionNormal = infiniTamFrame.Normal;
+                fusionDilatedDepth = infiniTamFrame.DilatedDepth;
+                fusionEdgeReason = infiniTamFrame.EdgeReason;
+                fusionTemporalReason = infiniTamFrame.TemporalReason;
+                fusionTemporalReasonAvailable = fusionTemporalReason != null;
+                fusionView = infiniTamFrame.View;
+                fusionProjection = infiniTamFrame.Projection;
+                fusionViewInverse = infiniTamFrame.ViewInverse;
+                fusionProjectionInverse = infiniTamFrame.ProjectionInverse;
+                _smoothedAngSpeed = infiniTamFrame.AngularSpeed;
+                _motionQuality = infiniTamFrame.MotionQuality;
+                acceptedInputReason = "infinitam_tracked_same_frame";
+                _infiniTamTrackingAccepted++;
+                _infiniTamConsecutiveTrackingRejects = 0;
+                _infiniTamRecoveryConfirmedFrames = 0;
+                if (!_infiniTamTrackingInitialised)
+                {
+                    _infiniTamBootstrapConfirmedFrames++;
+                    _infiniTamStartupPhase = InfiniTamStartupPhase.Verifying;
+                    if (_infiniTamBootstrapConfirmedFrames >=
+                        Mathf.Max(1, infiniTamBootstrapConfirmFrames))
+                    {
+                        _infiniTamTrackingInitialised = true;
+                        _infiniTamStartupPhase = InfiniTamStartupPhase.Tracking;
+                        Logger.Info("InfiniTAM 启动模型已通过连续跟踪复核；正式网格现在可以发布。");
+                    }
+                }
+                else
+                {
+                    _infiniTamStartupPhase = InfiniTamStartupPhase.Tracking;
+                }
+                _infiniTamLastTrackingDecision = "准";
+            }
+            else if (guardedExperimentActive && !_gunGelGuardedFusionRuntimeHalted)
             {
                 if (!TryGetOldestResolvedGunGelFrame(out deferredFrame)) return false;
                 if (!AcceptGunGelFrame(deferredFrame, out string rejectReason))
@@ -2643,6 +4517,24 @@ namespace Genesis.RoomScan
                         return false;
                     }
 
+                    // 裁决准入是严格的“无准证不落笔”。欠秩/少配等帧仍送给
+                    // GunGel 建候选，但它们没有最终 correspondence 身份，不能像
+                    // 普通胶冻那样回退为原始 TSDF 写入，否则裁判会被旁路。
+                    if (finalCourtAdmissionActive)
+                    {
+                        ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                            replayAttemptIndex, deferredFrame.PlatformFrame, false,
+                            "final_court_pending:" + rejectReason, true,
+                            deferredFrame.FrameIndex,
+                            deferredFrame.Decision.TranslationMm,
+                            deferredFrame.Decision.RotationDeg,
+                            deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
+                            deferredFrame.MotionQuality);
+                        _gunGelLastFusionDecision = "裁待" + rejectReason;
+                        ReleaseGunGelDeferredFrame(deferredFrame);
+                        return false;
+                    }
+
                     _gunGelFusionRawFallback++;
                     acceptedInputReason = "gungel_raw_fallback:" + rejectReason;
                 }
@@ -2653,19 +4545,44 @@ namespace Genesis.RoomScan
                     // 候选事务失败同样只撤销枪胶修正权。原始延迟帧仍可走普通
                     // TSDF门禁；否则一个旁路账本错误会把整个生产融合一并熔断。
                     _gunGelFusionRejected++;
-                    _gunGelFusionRawFallback++;
                     _gunGelLastFusionDecision = "原事务";
                     _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
                     acceptedInputReason = "gungel_raw_fallback:事务";
+                    if (finalCourtAdmissionActive)
+                    {
+                        ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                            replayAttemptIndex, deferredFrame.PlatformFrame, false,
+                            "final_court_pending:事务", true,
+                            deferredFrame.FrameIndex,
+                            deferredFrame.Decision.TranslationMm,
+                            deferredFrame.Decision.RotationDeg,
+                            deferredFrame.AngularSpeed, deferredFrame.LinearSpeed,
+                            deferredFrame.MotionQuality);
+                        _gunGelLastFusionDecision = "裁待事务";
+                        ReleaseGunGelDeferredFrame(deferredFrame);
+                        return false;
+                    }
+                    _gunGelFusionRawFallback++;
                 }
                 else
                 {
-                    ApplyGunGelCorrection(deferredFrame);
-                    gunGelCorrectionApplied = true;
-                    acceptedInputReason = "gungel_corrected";
+                    gunGelIdentityAccepted =
+                        deferredFrame.Decision.HasFusionAdmissionBuffers;
+                    if (enableGunGelPoseCorrection)
+                    {
+                        ApplyGunGelCorrection(deferredFrame);
+                        gunGelCorrectionApplied = true;
+                        acceptedInputReason = "gungel_identity_pose_corrected";
+                    }
+                    else
+                    {
+                        acceptedInputReason = "gungel_identity_raw_depth";
+                    }
                     _gunGelFusionAccepted++;
-                    _gunGelLastFusionDecision = "校";
-                    _gunGelLastAppliedMm = deferredFrame.Decision.TranslationMm;
+                    _gunGelLastFusionDecision = enableGunGelPoseCorrection
+                        ? "身份+校姿" : "身份";
+                    _gunGelLastAppliedMm = enableGunGelPoseCorrection
+                        ? deferredFrame.Decision.TranslationMm : 0f;
                 }
 
                 // 无论使用校正还是原始位姿，都消费同一张延迟帧，禁止把这一帧的
@@ -2693,17 +4610,39 @@ namespace Genesis.RoomScan
                 return false;
             }
 
+            // 裁决档绝不继承普通胶冻的“旁路账本坏了、生产继续”容错语义。
+            // 如果 GunGel 初始化/运行已熔断，此时没有可核验的 stableId，唯一
+            // 安全结果就是整帧停笔；否则名义上的裁判档会悄悄变成原冻。
+            if (enableFinalCourtAdmissionExperiment &&
+                (!guardedExperimentActive || _gunGelGuardedFusionRuntimeHalted))
+            {
+                ScanReplaySessionPackage.Active?.RecordDecisionOnly(
+                    replayAttemptIndex, dc.CurrentPlatformFrame, false,
+                    "final_court_unavailable", false, -1, 0f, 0f,
+                    currentAngularSpeed, currentLinearSpeed, _motionQuality);
+                _gunGelLastFusionDecision = "裁不可用";
+                return false;
+            }
+
             compute.SetMatrixArray(DepthCapture.ViewID, fusionView);
             compute.SetMatrixArray(DepthCapture.ProjID, fusionProjection);
             compute.SetMatrixArray(DepthCapture.ViewInvID, fusionViewInverse);
             compute.SetMatrixArray(DepthCapture.ProjInvID, fusionProjectionInverse);
             compute.SetMatrix(FusionCorrectionID,
-                gunGelCorrectionApplied
+                infiniTamCorrectionApplied
+                    ? infiniTamFrame.Decision.Correction
+                    : gunGelCorrectionApplied
                     ? deferredFrame.Decision.Correction
                     : Matrix4x4.identity);
 
             int numExclusions;
-            if (usingGuardedFrame)
+            if (usingInfiniTamTrackedFrame)
+            {
+                numExclusions = infiniTamFrame.ExclusionCount;
+                Array.Copy(infiniTamFrame.ExclusionPositions,
+                    _exclusionPositions, _exclusionPositions.Length);
+            }
+            else if (usingGuardedFrame)
             {
                 numExclusions = deferredFrame.ExclusionCount;
                 Array.Copy(deferredFrame.ExclusionPositions, _exclusionPositions,
@@ -2767,8 +4706,10 @@ namespace Genesis.RoomScan
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
 
-            if (!usingGuardedFrame) EnsureCamFrameCopy();
+            if (!usingGuardedFrame && !usingInfiniTamTrackedFrame)
+                EnsureCamFrameCopy();
             bool productionCamAvailable = !usingGuardedFrame &&
+                                          !usingInfiniTamTrackedFrame &&
                                           _pendingCamFrame != null && _camFrameCopy != null;
             if (productionCamAvailable)
             {
@@ -2800,24 +4741,62 @@ namespace Genesis.RoomScan
 
             // 枪胶不再只修整帧位姿：生产 A 直接消费“同一延迟帧”的逐点证据。
             // Correspondence.w 编码稳定候选、平台/预处理双证词与反对票状态；
-            // Integrate 再按当前体素投影像素做局部一致性复核。基线与 B 影子绑定
-            // 零缓冲且关闭开关，确保对照链不被实验准入污染。
-            bool gunGelAdmissionActive = gunGelCorrectionApplied &&
-                                          deferredFrame.Decision.HasFusionAdmissionBuffers;
-            ComputeBuffer gunGelObservations = gunGelAdmissionActive
+            // Integrate 再按当前体素投影像素做局部一致性复核。裁决模式额外读取
+            // 同一 correspondence 的 stableId 准证；当前完整深度像素先做成员
+            // 资格检查，通过后由胜出平面约束生产 sDist。基线与 B 影子绑定零
+            // 缓冲且关闭开关。
+            bool gunGelIdentityAvailable = gunGelIdentityAccepted &&
+                                           deferredFrame != null &&
+                                           deferredFrame.Decision.HasFusionAdmissionBuffers;
+            bool gunGelAdmissionActive = gunGelIdentityAvailable &&
+                                         enableGunGelTsdfAdmission;
+            ComputeBuffer gunGelObservations = gunGelIdentityAvailable
                 ? deferredFrame.Decision.FusionObservations
                 : _gunGelDummyObservations;
-            ComputeBuffer gunGelCorrespondences = gunGelAdmissionActive
+            ComputeBuffer gunGelCorrespondences = gunGelIdentityAvailable
                 ? deferredFrame.Decision.FusionCorrespondences
                 : _gunGelDummyCorrespondences;
+            ComputeBuffer gunGelCorrespondenceIdentity = gunGelIdentityAvailable &&
+                deferredFrame.Decision.FusionCorrespondenceIdentity != null
+                ? deferredFrame.Decision.FusionCorrespondenceIdentity
+                : _gunGelDummyCorrespondenceIdentity;
+            ScanReplaySessionPackage courtSession = ScanReplaySessionPackage.Active;
+            ComputeBuffer finalCourtVerdicts = null;
+            ComputeBuffer finalCourtPlanes = null;
+            ComputeBuffer finalCourtGenerations = null;
+            bool hasFinalCourtVerdicts = courtSession != null &&
+                courtSession.TryGetFinalCourtAdmissionBuffers(
+                    out finalCourtVerdicts, out finalCourtPlanes,
+                    out finalCourtGenerations);
+            if (!hasFinalCourtVerdicts)
+            {
+                finalCourtVerdicts = _finalCourtDummyVerdicts;
+                finalCourtPlanes = _finalCourtDummyPlanes;
+                finalCourtGenerations = _finalCourtDummyGenerations;
+            }
+            // 即使账本意外缺席也保持 court enable=1，让 0 准证严格停笔；绝不因
+            // 诊断会话启动失败而静默旁路回普通 TSDF 写入。
+            bool finalCourtGateActive = finalCourtAdmissionActive &&
+                                        gunGelAdmissionActive;
             _integrateKernel.Set(GunGelObservationsID, gunGelObservations);
             _integrateKernel.Set(GunGelCorrespondencesID, gunGelCorrespondences);
+            _integrateKernel.Set(GunGelCorrespondenceIdentityID,
+                gunGelCorrespondenceIdentity);
+            _integrateKernel.Set(FinalCourtVerdictsID, finalCourtVerdicts);
+            _integrateKernel.Set(FinalCourtPlanesID, finalCourtPlanes);
+            _integrateKernel.Set(FinalCourtGenerationsID,
+                finalCourtGenerations);
             compute.SetInts(GunGelObservationGridID,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridX : 1,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridY : 1);
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridX : 1,
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridY : 1);
             compute.SetInt(GunGelPixelStrideID,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 1);
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionPixelStride : 1);
             compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
+            compute.SetInt(FinalCourtVerdictCapacityID,
+                hasFinalCourtVerdicts
+                    ? ScanReplaySessionPackage.FinalCourtVerdictCapacity : 1);
+            compute.SetFloat(FinalCourtAdmissionEnableID,
+                finalCourtGateActive ? 1f : 0f);
 
             // 旧历史探针的生产证词通路已停权。保留下面的空绑定是为了让
             // compute 参数布局与黑匣子计数保持兼容，但生产 Integrate 永远收到
@@ -2842,11 +4821,17 @@ namespace Genesis.RoomScan
             compute.SetFloat(ShellWitnessEnableID, shellWitnessActive ? 1f : 0f);
 
             // 独立会话记录的是生产 Integrate 此刻真正绑定的完整输入：不仅是深度，
-            // 还包括逐点枪胶准入、实际 RGB 副本及其针孔内外参。记录动作只旁路回读，
-            // 不参与当前帧裁决，也不改变任何 compute 绑定。
+            // 还包括逐点枪胶准入、实际 RGB 副本及其针孔内外参。普通模式只旁路
+            // 记账；裁决档复用最终 correspondence 回读更新“后续帧”的准证表，
+            // 不追写当前帧，也不改变当前已冻结的 compute 绑定。
+            int acceptedSourceFrame = usingInfiniTamTrackedFrame
+                ? infiniTamFrame.PlatformFrame
+                : usingGuardedFrame
+                    ? deferredFrame.PlatformFrame
+                    : dc.CurrentPlatformFrame;
             ScanReplaySessionPackage.Active?.RecordAcceptedInput(
                 replayAttemptIndex,
-                usingGuardedFrame ? deferredFrame.PlatformFrame : dc.CurrentPlatformFrame,
+                acceptedSourceFrame,
                 acceptedInputReason,
                 usingGuardedFrame,
                 usingGuardedFrame ? deferredFrame.FrameIndex : -1,
@@ -2858,49 +4843,127 @@ namespace Genesis.RoomScan
                 fusionDepth, fusionNormal, fusionDilatedDepth,
                 fusionEdgeReason, fusionTemporalReason,
                 fusionProjection, fusionView, fusionProjectionInverse, fusionViewInverse,
-                gunGelAdmissionActive,
-                gunGelAdmissionActive ? gunGelObservations : null,
-                gunGelAdmissionActive ? gunGelCorrespondences : null,
-                gunGelAdmissionActive
+                gunGelIdentityAvailable,
+                gunGelIdentityAvailable ? gunGelObservations : null,
+                gunGelIdentityAvailable ? gunGelCorrespondences : null,
+                gunGelIdentityAvailable
                     ? deferredFrame.Decision.FusionPreTransactionCorrespondenceIdentity
                     : null,
-                gunGelAdmissionActive
+                gunGelIdentityAvailable
                     ? deferredFrame.Decision.FusionCorrespondenceIdentity
                     : null,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridX : 0,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionObservationGridY : 0,
-                gunGelAdmissionActive ? deferredFrame.Decision.FusionPixelStride : 0,
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridX : 0,
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridY : 0,
+                gunGelIdentityAvailable ? deferredFrame.Decision.FusionPixelStride : 0,
                 productionCamAvailable,
                 productionCamAvailable ? _camFrameCopy : null,
                 _pendingCamPos, _pendingCamRot, _pendingFocalLen, _pendingPrincipalPt,
                 _pendingSensorRes, _pendingCurrentRes,
-                gunGelCorrectionApplied
+                infiniTamCorrectionApplied
+                    ? infiniTamFrame.Decision.Correction
+                    : gunGelCorrectionApplied
                     ? deferredFrame.Decision.Correction
                     : Matrix4x4.identity,
                 _exclusionPositions, numExclusions);
 
+            // During bootstrap, render the old model for diagnostics before the
+            // raw-pose frame writes.  After bootstrap this dispatch already ran
+            // against the retained exact frame and its gated correction is now
+            // in fusionView/fusionViewInverse; never dispatch it a second time.
+            if (enableInfiniTamBaseline && !usingInfiniTamTrackedFrame)
+            {
+                _infiniTamModelRaycast ??= new InfiniTamModelRaycastAudit(8);
+                _infiniTamModelRaycast.Dispatch(
+                    fusionDepth, fusionProjection, fusionView,
+                    fusionProjectionInverse, fusionViewInverse,
+                    _volume, _infiniTamVoteWeightVolume,
+                    voxelCount, voxelSize, voxelDistance,
+                    minMeshWeight,
+                    rejectNearSamples ? minUpdateDist : 0f,
+                    maxUpdateDist, acceptedSourceFrame);
+            }
+
+            // The product court is a production service, not a side effect of
+            // pressing A to start a diagnostic session.  Feed it the same
+            // accepted, same-frame GunGel identities now; its verdict can only
+            // constrain the extracted candidate and can never write this TSDF.
+            if (gunGelIdentityAvailable && usingGuardedFrame)
+            {
+                QueueProductSurfaceCourtReadback(deferredFrame,
+                    replayAttemptIndex,
+                    gunGelCorrectionApplied
+                        ? deferredFrame.Decision.Correction
+                        : Matrix4x4.identity);
+            }
+
             // A: production path (projective difference scaled by normal cosine), now
             // guarded per projected voxel by the exact same-frame GunGel evidence above.
+            // Dirty epochs are extraction scheduling metadata only.  Baseline
+            // fusion still writes the same sole TSDF; enabling this ledger lets
+            // its private block front rebuild only regions whose zero crossing
+            // changed instead of repeatedly extracting the full 256³ volume.
             BeginDirtyEpoch();
-            compute.SetFloat(UseRawProjectiveSdfID, 0f);
+            // Replacement is a single-volume transaction: retire the previous
+            // generation before the first batch carrying the new plane writes.
+            // The persistent chunk pipeline continues showing its old front
+            // buffer until a complete replacement extraction is committed.
+            if (finalCourtAdmissionActive)
+                InvalidateFinalCourtReplacements(courtSession);
+            compute.SetFloat(UseRawProjectiveSdfID, enableInfiniTamBaseline ? 1f : 0f);
+            compute.SetFloat(InfiniTamBaselineID, enableInfiniTamBaseline ? 1f : 0f);
+            if (enableInfiniTamBaseline)
+            {
+                // This is a mutually-exclusive reconstruction baseline, not a
+                // third adjudication office.  The sole production volume receives
+                // the raw projective signed distance and the shader exits through
+                // its compact weighted-average path before every GunGel/court/
+                // freeze/product rule.
+                compute.SetFloat(GunGelAdmissionEnableID, 0f);
+                compute.SetFloat(FinalCourtAdmissionEnableID, 0f);
+                compute.SetFloat(ShellWitnessEnableID, 0f);
+            }
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
+            compute.SetFloat(TsdfResponsibilityWriteID,
+                _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
+            compute.SetInt(TsdfResponsibilityIntegrationID,
+                Mathf.Min(IntegrationCount + 1, 4095));
             compute.SetFloat(ConfidenceWriteID, 1f); // 主卷记置信度账
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(CarveStatsID, _carveStats);
+            // Bootstrap observations do not pass through the async tracker, so
+            // count them here at the actual production dispatch.  Tracked
+            // observations were counted once when their exact frame was queued.
+            if (enableInfiniTamBaseline && !usingInfiniTamTrackedFrame)
+                _infiniTamAttemptedFrames++;
+            bool sampledInfiniTamTicket = PrepareInfiniTamTicketSample();
             _integrateKernel.DispatchFit(_frustumVolume.count, 1);
+            compute.SetFloat(InfiniTamTicketEnabledID, 0f);
+            if (enableInfiniTamBaseline)
+            {
+                _infiniTamFusedFrames++;
+            }
+            if (sampledInfiniTamTicket)
+                RequestInfiniTamTicketReadback();
+            // GunGel 自身的候选换轨仍在本批之后拆旧；最终裁判的 generation
+            // 替换已在上方先拆后写，不与这个上游身份事务混为一谈。
+            if (!enableInfiniTamBaseline && gunGelAdmissionActive)
+                InvalidateGunGelSucceededRegions();
 
             // B: read-only KinectFusion-style projective TSDF shadow. It receives the
             // exact same depth, pose, gates, quality and carve settings, but stores the
             // unscaled ray-depth difference. No color/global production state is written.
-            if (_projectiveShadowVolume != null && _projectiveShadowCarveStats != null)
+            if (!enableInfiniTamBaseline &&
+                _projectiveShadowVolume != null && _projectiveShadowCarveStats != null)
             {
                 compute.SetFloat(GunGelAdmissionEnableID, 0f);
+                compute.SetFloat(FinalCourtAdmissionEnableID, 0f);
                 compute.SetFloat(ShellWitnessEnableID, 0f);
                 compute.SetFloat(UseRawProjectiveSdfID, 1f);
                 compute.SetFloat(WriteColorID, 0f);
                 compute.SetFloat(WriteAdmissionTraceID, 0f);
+                compute.SetFloat(TsdfResponsibilityWriteID, 0f);
                 compute.SetFloat(ConfidenceWriteID, 0f); // 影子卷不记置信度账（防 A/B 双跑污染）
                 ConfigureDirtyTracking(false);
                 compute.SetInt(CamAvailableID, 0);
@@ -2911,10 +4974,15 @@ namespace Genesis.RoomScan
 
                 // Restore production bindings so external callers never inherit B state.
                 compute.SetFloat(UseRawProjectiveSdfID, 0f);
+                compute.SetFloat(InfiniTamBaselineID, 0f);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
+                compute.SetFloat(TsdfResponsibilityWriteID,
+                    _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
                 compute.SetFloat(ConfidenceWriteID, 1f);
                 compute.SetFloat(GunGelAdmissionEnableID, gunGelAdmissionActive ? 1f : 0f);
+                compute.SetFloat(FinalCourtAdmissionEnableID,
+                    finalCourtGateActive ? 1f : 0f);
                 compute.SetFloat(ShellWitnessEnableID, shellWitnessActive ? 1f : 0f);
                 ConfigureDirtyTracking(true);
                 compute.SetInt(CamAvailableID, productionCamAvailable ? 1 : 0);
@@ -2923,17 +4991,26 @@ namespace Genesis.RoomScan
             }
 
             IntegrationCount++;
+            // Exact bridge from the accepted fusion row to the dirty epoch that
+            // extraction/replacement later consumes.  This is a dispatch fact,
+            // not a claim that asynchronous GPU work has already completed.
+            ScanReplaySessionPackage.Active?.RecordIntegrationDispatch(
+                replayAttemptIndex, acceptedSourceFrame, IntegrationCount, _dirtyEpoch);
             _pendingCamFrame = null;
             ReleaseGunGelDeferredFrame(deferredFrame);
+            if (usingInfiniTamTrackedFrame)
+                ReleaseInfiniTamDeferredFrame();
 
-            if (warmupIntegrations > 0 && IntegrationCount == warmupIntegrations)
+            if (!enableInfiniTamBaseline && warmupIntegrations > 0 &&
+                IntegrationCount == warmupIntegrations)
             {
                 Logger.Info($"Warmup complete ({warmupIntegrations} frames), clearing volume to discard sensor startup noise");
                 ClearInternal(preserveGunGelEvidence: true);
             }
 
             float t = Time.time;
-            if (!_pruneCycleActive && t - _lastPruneTime >= pruneIntervalSeconds)
+            if (!enableInfiniTamBaseline && !_pruneCycleActive &&
+                t - _lastPruneTime >= pruneIntervalSeconds)
             {
                 _lastPruneTime = t;
                 _nextPruneSlice = 0;
@@ -2943,7 +5020,7 @@ namespace Genesis.RoomScan
             // Pruning used to scan the entire 3D volume in one dispatch.  Keep the
             // exact same voxel rule, but amortize it over integrations to avoid a
             // periodic full-volume GPU spike on Quest.
-            if (_pruneCycleActive)
+            if (!enableInfiniTamBaseline && _pruneCycleActive)
             {
                 int sliceCount = Mathf.Min(Mathf.Max(1, pruneSlicesPerIntegration),
                     voxelCount.z - _nextPruneSlice);
@@ -2954,6 +5031,8 @@ namespace Genesis.RoomScan
                 _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
                 compute.SetFloat(WriteColorID, 1f);
                 compute.SetFloat(WriteAdmissionTraceID, 1f);
+                compute.SetFloat(TsdfResponsibilityWriteID,
+                    _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
                 ConfigureDirtyTracking(true);
                 _pruneKernel.DispatchFit(voxelCount.x, voxelCount.y, sliceCount);
 
@@ -2961,12 +5040,15 @@ namespace Genesis.RoomScan
                 {
                     compute.SetFloat(WriteColorID, 0f);
                     compute.SetFloat(WriteAdmissionTraceID, 0f);
+                    compute.SetFloat(TsdfResponsibilityWriteID, 0f);
                     ConfigureDirtyTracking(false);
                     _pruneKernel.Set(VolumeRWID, _projectiveShadowVolume);
                     _pruneKernel.Set(ColorVolumeRWID, _colorVolume); // write-guarded
                     _pruneKernel.DispatchFit(voxelCount.x, voxelCount.y, sliceCount);
                     compute.SetFloat(WriteColorID, 1f);
                     compute.SetFloat(WriteAdmissionTraceID, 1f);
+                    compute.SetFloat(TsdfResponsibilityWriteID,
+                        _tsdfResponsibilityCaptureEnabled ? 1f : 0f);
                     ConfigureDirtyTracking(true);
                     _pruneKernel.Set(VolumeRWID, _volume);
                 }

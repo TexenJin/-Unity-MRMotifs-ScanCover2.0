@@ -101,10 +101,20 @@ namespace Genesis.RoomScan
         [SerializeField, Min(0.5f), Tooltip("GPU dirty-ledger polling rate. This is a tiny counter readback, not a mesh readback.")]
         private float dirtyLedgerReadbackHz = 5f;
 
+        [Header("InfiniTAM Block Extraction")]
+        [SerializeField, Range(1, 4), Tooltip("Maximum baseline TSDF blocks extracted per mesh tick.")]
+        private int infiniTamBlocksPerTick = 2;
+        [SerializeField, Range(1, 4), Tooltip("Read-only TSDF halo around each baseline extraction block.")]
+        private int infiniTamBlockHaloVoxels = 2;
+        [SerializeField, Min(0.5f), Tooltip("Baseline dirty-block ledger polling rate.")]
+        private float infiniTamDirtyReadbackHz = 5f;
+        [SerializeField, Range(0.02f, 0.24f), Tooltip("Temporary vertex capacity for an active baseline block.")]
+        private float infiniTamBlockVertexBudgetPercent = 0.08f;
+
         [Header("Native 5 cm Diagnostic Foundation Skin")]
-        [SerializeField, Tooltip("诊断期直接发布原生5cm TSDF零交叉，只显示单一5cm拓扑；停用直接10cm粗格，避免把一个细格缺样放大成多个可见缺口。完整块原子替换。")]
+        [SerializeField, Tooltip("制品纸皮：唯一5cm TSDF提取原生候选，经块内裁决、质量门和原子替换后，以保边的10cm级拓扑显示。")]
         private bool enableSparseFoundationSkin = true;
-        [SerializeField, Range(1, 3), Tooltip("每次提取节拍最多重建的原生5cm诊断蒙皮块数。")]
+        [SerializeField, Range(1, 3), Tooltip("每次提取节拍最多重建的制品纸皮块数。")]
         private int sparseFoundationChunksPerTick = 1;
         [SerializeField, Range(0.08f, 0.24f), Tooltip("活动块临时顶点容量；只影响固定工作缓冲上限，不改变TSDF准入。")]
         private float sparseFoundationVertexBudgetPercent = 0.18f;
@@ -133,9 +143,33 @@ namespace Genesis.RoomScan
         public Vector4 DiagnosticRoiRect => diagnosticRoiRect;
         public Vector2 DiagnosticRoiSplitX => diagnosticRoiSplitX;
         public bool IsProductionMeshVisible => renderProductionMesh;
+        public int LastSubmittedDrawVertexCount => IsInfiniTamBaselineActive
+            ? !InfiniTamPublicationReady
+                ? 0
+                : _infiniTamBlocks != null &&
+                  _infiniTamBlocks.InitialBuildComplete
+                    ? (int)Math.Min(int.MaxValue,
+                        _infiniTamBlocks.RecentlySubmittedVertexCount)
+                    : _gpuRenderer != null
+                        ? _gpuRenderer.LastSubmittedVertexCount : 0
+            : _gpuRenderer != null ? _gpuRenderer.LastSubmittedVertexCount : 0;
+        public bool IsInfiniTamBaselineActive =>
+            _volume != null && _volume.InfiniTamBaselineEnabled;
+        private bool InfiniTamPublicationReady =>
+            _volume != null && _volume.InfiniTamMeshPublicationReady;
+        public string InfiniTamBlockStatsCompact => _infiniTamBlocks != null
+            ? _infiniTamBlocks.CompactStats
+            : "块前台待启动";
 
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;
+        // The InfiniTAM baseline extracts into the ordinary whole-volume
+        // working buffers, then atomically publishes an immutable snapshot.
+        // Quest/Vulkan therefore uses the exact CPU-known index count and does
+        // not depend on the legacy five-uint indirect argument layout.
+        private GPUChunkMeshSnapshot _infiniTamFront;
+        private GPUChunkMeshSnapshot _infiniTamBack;
+        private InfiniTamBlockMeshPipeline _infiniTamBlocks;
         private CoarseSkinRenderer _coarseSkin;
         private SupportTruthRenderer _supportTruth;
         private enum RouteValidationView
@@ -356,8 +390,23 @@ namespace Genesis.RoomScan
                 ? 0
                 : (int)Math.Min(int.MaxValue,
                     _sparseFoundationSkin.AcceptedTriangleCount);
+        internal int ProductionPaperBuiltChunkCount =>
+            _sparseFoundationSkin?.BuiltChunkCount ?? 0;
+        internal int ProductionPaperChunkCount =>
+            _sparseFoundationSkin?.ChunkCount ?? 0;
+        internal int ProductionPaperPendingChunkCount =>
+            _sparseFoundationSkin?.PendingChunkCount ?? 0;
+        internal int ProductionPaperCommitPendingCount =>
+            _sparseFoundationSkin?.CommitPendingCount ?? 0;
+        internal float ProductionPaperAvgQueueToCommitMs =>
+            _sparseFoundationSkin?.AvgQueueToCommitMs ?? -1f;
+        internal float ProductionPaperAvgDispatchToCallbackMs =>
+            _sparseFoundationSkin?.AvgDispatchToCallbackMs ?? -1f;
+        internal bool ProductionPaperVisible =>
+            _sparseFoundationSkin != null && _sparseFoundationSkin.IsVisible;
 
         public bool IsInitialized => _gpuSurfaceNets != null || _persistentChunks != null ||
+                                     _infiniTamBlocks != null ||
                                      _sparseFoundationSkin != null ||
                                      _chunkAbReplay != null || _heraReplay != null;
         public bool HasFrozenChunkReplay => _heraReplay != null || _chunkAbReplay != null;
@@ -473,7 +522,7 @@ namespace Genesis.RoomScan
             if (surfaceNetsCompute == null)
                 throw new Exception("[RoomScan] surfaceNetsCompute not assigned on MeshExtractor");
 
-            if (enableGeometryStabilityDiagnostics)
+            if (enableGeometryStabilityDiagnostics && !_volume.InfiniTamBaselineEnabled)
             {
                 _geometryStability = gameObject.GetComponent<GeometryStabilityMonitor>();
                 if (_geometryStability == null)
@@ -506,6 +555,13 @@ namespace Genesis.RoomScan
         /// </summary>
         public void EnsureInitialized()
         {
+            if (_volume == null) _volume = VolumeIntegrator.Instance;
+            if (_volume != null && _volume.InfiniTamBaselineEnabled)
+            {
+                EnsureInfiniTamBaselineResources();
+                return;
+            }
+
             EnsureSupportTruth();
             EnsureCoarseSkin();
             EnsureSparseFoundationSkin();
@@ -555,10 +611,10 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Creates the independent native 5 cm diagnostic foundation consumer.
-        /// It reuses the TSDF evidence and the volume dirty ledger, allocates
-        /// working storage only for observed chunks, and publishes each completed
-        /// chunk as one immutable front. No HERA page identity is shared.
+        /// Creates the productized surface consumer. It extracts native 5 cm
+        /// candidates from the sole TSDF, constrains only approved planar
+        /// interiors, preserves features, then atomically publishes a
+        /// conservative 10 cm-class product. No HERA page identity is shared.
         /// </summary>
         private void EnsureSparseFoundationSkin()
         {
@@ -597,7 +653,7 @@ namespace Genesis.RoomScan
                     transform, gameObject.layer, config, ExtractCurrentVolume);
                 _sparseFoundationSkin.SetDiagnosticColoring(false);
                 _sparseFoundationSkin.SetVisible(false);
-                Logger.Info($"原生5cm诊断蒙皮已就绪：直接显示TSDF零交叉、停用10cm粗格放大；块{_volume.ExtractionChunkSize}³，" +
+                Logger.Info($"制品纸皮已就绪：单TSDF→5cm候选→块裁决→原子提交→保边10cm；块{_volume.ExtractionChunkSize}³，" +
                             $"每拍{sparseFoundationChunksPerTick}块，活动顶点预算" +
                             $"{sparseFoundationVertexBudgetPercent:P0}");
             }
@@ -605,7 +661,7 @@ namespace Genesis.RoomScan
             {
                 _sparseFoundationSkin?.Dispose();
                 _sparseFoundationSkin = null;
-                Logger.Error($"原生5cm诊断蒙皮初始化失败，旧纸皮仍可用：{ex.Message}");
+                Logger.Error($"制品纸皮初始化失败，旧纸皮仍可用：{ex.Message}");
             }
         }
 
@@ -615,6 +671,8 @@ namespace Genesis.RoomScan
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
             DisposeSparseFoundationSkin();
+            DisposeInfiniTamBlockPipeline();
+            DisposeInfiniTamBaselineFronts();
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
         }
@@ -685,12 +743,130 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// V1 InfiniTAM-style baseline extractor.  It intentionally reuses the
+        /// repository's proven GPU Surface Nets kernel only as a stateless
+        /// zero-crossing reader.  No smoothing, temporal candidate history,
+        /// productizer, quality gate, chunk replacement, HERA or 10 cm topology
+        /// owns this route.  A blockwise Marching Cubes extractor is the next
+        /// replaceable stage once this clean reconstruction baseline is measured.
+        /// </summary>
+        private void EnsureInfiniTamBaselineResources()
+        {
+            if (_volume == null || surfaceNetsCompute == null) return;
+
+            // Baseline mode has exactly one renderer.  A serialized visibility
+            // value left behind by the former A/B acquisition must not keep the
+            // only result hidden after the reconstruction route is replaced.
+            renderProductionMesh = true;
+            UseJointDiagnosticDisplay = false;
+
+            EnsureInfiniTamBlockPipeline();
+            if (_infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
+                _infiniTamBlocks.InitialBuildComplete)
+            {
+                _infiniTamBlocks.SetVisible(renderProductionMesh &&
+                                            InfiniTamPublicationReady);
+                if (_gpuRenderer != null)
+                    _gpuRenderer.RenderVisible = false;
+                return;
+            }
+
+            if (_gpuSurfaceNets == null)
+            {
+                _gpuSurfaceNets = new GPUSurfaceNets(surfaceNetsCompute)
+                {
+                    MinMeshWeight = _volume.MinMeshWeight,
+                    SmoothIterations = 0,
+                    SmoothLambda = 0f,
+                    SmoothBeta = 0f,
+                    TemporalAlphaMax = 1f,
+                    TemporalAlphaMin = 1f,
+                    TemporalDecayRate = 0f,
+                    ConvergenceThreshold = 0f,
+                    TemporalDeadzone = 0f,
+                    StrictObservedEdges = false,
+                    CandidateHistoryUpdateEnabled = false,
+                    FoundationTopologyMode = false,
+                    VisualQualityDiagnosticsEnabled = false,
+                    DiagnosticRoiEnabled = false
+                };
+                _gpuSurfaceNets.EnsureBuffers(_volume.VoxelCount,
+                    gpuVertexBudgetPercent);
+            }
+
+            if (_gpuRenderer == null)
+            {
+                _gpuRenderer = gameObject.AddComponent<GPUMeshRenderer>();
+                _gpuRenderer.GpuMeshMaterial = scanMeshMaterial;
+            }
+
+            IGPUMeshBufferSource visibleSource = _infiniTamFront != null
+                ? (IGPUMeshBufferSource)_infiniTamFront
+                : _gpuSurfaceNets;
+            _gpuRenderer.Initialize(visibleSource,
+                _gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
+            _gpuRenderer.SetStrictObservedDisplay(false);
+            _gpuRenderer.SetJointDiagnosticDisplay(false);
+            _gpuRenderer.SetTemporalIllegalCandidateActive(false);
+            // Never reveal a bootstrap TSDF or an old pre-reseed front. The
+            // first visible surface must be copied from a model that has passed
+            // consecutive frame-to-model validation.
+            _gpuRenderer.RenderVisible = renderProductionMesh &&
+                                         InfiniTamPublicationReady &&
+                                         _infiniTamFront != null;
+        }
+
+        private void EnsureInfiniTamBlockPipeline()
+        {
+            if (_infiniTamBlocks != null || _volume == null ||
+                surfaceNetsCompute == null || scanMeshMaterial == null)
+                return;
+
+            try
+            {
+                _infiniTamBlocks = new InfiniTamBlockMeshPipeline(
+                    _volume, surfaceNetsCompute, scanMeshMaterial,
+                    transform, gameObject.layer,
+                    infiniTamBlockHaloVoxels,
+                    infiniTamBlocksPerTick,
+                    infiniTamDirtyReadbackHz,
+                    infiniTamBlockVertexBudgetPercent,
+                    ExtractInfiniTamBlock);
+                _infiniTamBlocks.SetVisible(renderProductionMesh);
+                Logger.Info($"InfiniTAM block extractor ready: " +
+                            $"chunk={_volume.ExtractionChunkSize}³, " +
+                            $"halo={infiniTamBlockHaloVoxels}, " +
+                            $"budget={infiniTamBlocksPerTick}/tick");
+            }
+            catch (Exception ex)
+            {
+                _infiniTamBlocks?.Dispose();
+                _infiniTamBlocks = null;
+                Logger.Error($"InfiniTAM block extractor initialization failed; " +
+                             $"whole-volume fallback remains active: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// The global extractor is now a warm-up/export/failure fallback, not a
         /// permanently resident second production pipeline.  Re-create it only
         /// when one of those transactions actually needs a whole-volume mesh.
         /// </summary>
         private void EnsureLegacyGlobalResources()
         {
+            // ExtractLegacyGlobal also supplies the baseline's proven extraction
+            // and counter-readback transaction.  It must not, however, restore
+            // the former candidate-B renderer policy: baseline indices carry
+            // candidate class 0 because candidate history is intentionally off,
+            // and joint-diagnostic presentation discards every class-0 triangle.
+            // Re-enter the baseline initializer so the immutable front remains
+            // selected and no frame falls back to the legacy indirect source.
+            if (IsInfiniTamBaselineActive)
+            {
+                EnsureInfiniTamBaselineResources();
+                return;
+            }
+
             if (_gpuSurfaceNets == null)
             {
                 _gpuSurfaceNets = CreateConfiguredSurfaceNets();
@@ -727,10 +903,19 @@ namespace Genesis.RoomScan
         public void SetProductionMeshVisible(bool visible)
         {
             renderProductionMesh = visible;
+            bool infiniTamReady = !IsInfiniTamBaselineActive ||
+                                  InfiniTamPublicationReady;
+            bool infiniTamBlocksOwnForeground = IsInfiniTamBaselineActive &&
+                infiniTamReady &&
+                _infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
+                _infiniTamBlocks.InitialBuildComplete;
             bool chunksOwnForeground = _persistentChunks != null &&
                 !_legacyFallbackActive && _persistentChunks.InitialBuildComplete;
             if (_gpuRenderer != null)
-                _gpuRenderer.RenderVisible = visible && !chunksOwnForeground;
+                _gpuRenderer.RenderVisible = visible && !chunksOwnForeground &&
+                    !infiniTamBlocksOwnForeground && infiniTamReady;
+            _infiniTamBlocks?.SetVisible(visible && infiniTamBlocksOwnForeground &&
+                                         infiniTamReady);
             _persistentChunks?.SetVisible(visible && !_legacyFallbackActive);
             // 增量 HERA 父页才是扫描期满屏网格的主体：显示开关必须连它一起切，
             // 否则帧率二分（右摇杆直接按下）只藏了实时轨一小条，判不出光栅化压力。
@@ -785,13 +970,13 @@ namespace Genesis.RoomScan
             _routeValidationView == RouteValidationView.SparseFoundation;
 
         public string SparseFoundationStatsCompact => _sparseFoundationSkin == null
-            ? "原生5cm无"
-            : $"原生5cm 块{_sparseFoundationSkin.BuiltChunkCount}/{_sparseFoundationSkin.ChunkCount} " +
+            ? "制品无"
+            : $"制品10cm 块{_sparseFoundationSkin.BuiltChunkCount}/{_sparseFoundationSkin.ChunkCount} " +
               $"面{_sparseFoundationSkin.AcceptedTriangleCount}";
 
         public string SparseFoundationHudFixed => _sparseFoundationSkin == null
-            ? "原生5cm 块000/000 面0000000"
-            : $"原生5cm 块{Mathf.Clamp(_sparseFoundationSkin.BuiltChunkCount, 0, 999):000}/" +
+            ? "制品10cm 块000/000 面0000000"
+            : $"制品10cm 块{Mathf.Clamp(_sparseFoundationSkin.BuiltChunkCount, 0, 999):000}/" +
               $"{Mathf.Clamp(_sparseFoundationSkin.ChunkCount, 0, 999):000} 面" +
               $"{Math.Min(_sparseFoundationSkin.AcceptedTriangleCount, 9999999L):0000000}";
 
@@ -853,11 +1038,11 @@ namespace Genesis.RoomScan
               _paperOwnedGrid));
 
         public string RouteValidationLabel => !IsRouteValidationActive
-            ? "常规网格"
+            ? (IsInfiniTamBaselineActive ? "InfiniTAM基线" : "常规网格")
             : _routeValidationView == RouteValidationView.SparseFoundation
-                ? "原生5cm诊断"
-                : _routeValidationView == RouteValidationView.PaperFineHybrid
-                ? (_paperOwnedGrid ? "生产纸皮" : "HERA旧网格")
+                ? "制品纸皮10cm"
+            : _routeValidationView == RouteValidationView.PaperFineHybrid
+                ? (_paperOwnedGrid ? "旧纸皮10cm对照" : "HERA旧网格")
                 : _routeValidationView == RouteValidationView.SupportTruth
                 ? (_supportTruthAuditMode ? "支撑圆点" : "纸拓扑独显")
                 : _routeValidationView == RouteValidationView.CoarseSkin
@@ -884,8 +1069,9 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// 一键回到真实生产观察档。这里只选择当前 TSDF 的公共纸拓扑消费者，
-        /// 不创建替代几何，也不改变融合、候选、冻结或提取裁决。
+        /// 一键回到真实生产观察档。底层仍是唯一原生 5 cm TSDF；前景明确
+        /// 选择候选产品化、质量门和原子替换后的保边 10 cm 纸皮。旧 stride-2
+        /// 公共纸拓扑仅留在路线循环中作对照，不能再冒充生产结果。
         /// </summary>
         public string ShowProductionPaperView()
         {
@@ -895,9 +1081,11 @@ namespace Genesis.RoomScan
                 return "常规网格";
             }
 
+            _paperOwnedGrid = false;
+            _supportTruthAuditMode = false;
             _routeValidationView = RouteValidationView.SparseFoundation;
             ApplyRouteValidationVisibility(true);
-            Logger.Info("生产观察档：原生5cm TSDF零交叉单一显示（完整块原子发布，10cm粗格停用）");
+            Logger.Info("生产观察档：单5cm TSDF → 原生候选 → 块裁决/质量门 → 原子提交 → 保边10cm制品");
             return RouteValidationLabel;
         }
 
@@ -1007,9 +1195,9 @@ namespace Genesis.RoomScan
                 _sparseFoundationSkin != null)
             {
                 _routeValidationView = RouteValidationView.SparseFoundation;
-                _paperOwnedGrid = true;
+                _paperOwnedGrid = false;
                 ApplyRouteValidationVisibility(true);
-                Logger.Info("支架路线验证：默认原生5cm诊断蒙皮；右摇杆可循环旧纸皮/支撑圆点/三角粗皮/HERA对照");
+                Logger.Info("支架路线验证：默认制品纸皮10cm；右摇杆可循环旧纸皮/支撑圆点/三角粗皮/HERA对照");
             }
             else
             {
@@ -1321,6 +1509,56 @@ namespace Genesis.RoomScan
         /// </summary>
         public void Extract()
         {
+            if (IsInfiniTamBaselineActive)
+            {
+                EnsureInfiniTamBaselineResources();
+                if (!InfiniTamPublicationReady)
+                {
+                    // Bootstrap and every automatic reseed are private. Drop
+                    // the old immutable front so it cannot reappear when the
+                    // new model later passes validation.
+                    _infiniTamBlocks?.SetVisible(false);
+                    if (_gpuRenderer != null)
+                        _gpuRenderer.RenderVisible = false;
+                    DisposeInfiniTamBaselineFronts();
+                    LastVertexCount = 0;
+                    LastIndexCount = 0;
+                    return;
+                }
+                _infiniTamBlocks?.Tick();
+
+                if (_infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
+                    _infiniTamBlocks.InitialBuildComplete)
+                {
+                    _infiniTamBlocks.SetVisible(renderProductionMesh);
+                    if (_gpuRenderer != null)
+                        _gpuRenderer.RenderVisible = false;
+                    LastVertexCount = (int)Math.Min(int.MaxValue,
+                        _infiniTamBlocks.CommittedVertexCount);
+                    LastIndexCount = (int)Math.Min(int.MaxValue,
+                        _infiniTamBlocks.CommittedIndexCount);
+                    if (!_counterReadbackPending)
+                        ReleaseInfiniTamGlobalFallback();
+                    return;
+                }
+
+                if (_gpuSurfaceNets == null) return;
+
+                // One working extraction stays in flight until its exact
+                // counters have been read and the immutable front is copied.
+                // This prevents a later extraction from changing the buffers
+                // between counter readback and snapshot publication.
+                if (_counterReadbackPending) return;
+                _nextCounterReadbackTime = 0f;
+
+                // Reuse the established counter readback transaction as well as
+                // its draw buffers.  This does not re-enable smoothing/history or
+                // any admission rule; it lets the compact HUD distinguish
+                // integration -> vertices -> indices -> visibility.
+                ExtractLegacyGlobal();
+                return;
+            }
+
             // The native 5 cm diagnostic foundation is an independent consumer of the same dirty
             // TSDF ledger. It keeps progressing even while HERA or the old
             // paper route is hidden for comparison.
@@ -1389,7 +1627,8 @@ namespace Genesis.RoomScan
 
             var counters = _gpuSurfaceNets.CountersBuffer;
             float now = Time.realtimeSinceStartup;
-            bool readbackDue = diagnosticReadbackHz > 0f && now >= _nextCounterReadbackTime;
+            bool readbackDue = IsInfiniTamBaselineActive ||
+                               (diagnosticReadbackHz > 0f && now >= _nextCounterReadbackTime);
             if (counters != null && readbackDue && !_counterReadbackPending)
             {
                 _counterReadbackPending = true;
@@ -1421,6 +1660,8 @@ namespace Genesis.RoomScan
 
                     _lastAppliedReadbackSerial = requestSerial;
                     ApplySnapshot(snapshot);
+                    if (IsInfiniTamBaselineActive)
+                        PublishInfiniTamBaselineFront(snapshot);
                     UpdateTemporalDiagnostic(snapshot);
                     if (_ledgerOpen)
                     {
@@ -1435,6 +1676,65 @@ namespace Genesis.RoomScan
                     }
                 });
             }
+        }
+
+        /// <summary>
+        /// Publishes one completed whole-volume baseline extraction through the
+        /// same direct-draw snapshot contract already used by committed chunks.
+        /// The old front remains visible until the copy of the new front has
+        /// been queued, so an extraction can never expose half-written buffers.
+        /// </summary>
+        private void PublishInfiniTamBaselineFront(uint[] snapshot)
+        {
+            if (_gpuSurfaceNets == null || _gpuRenderer == null ||
+                snapshot == null || snapshot.Length < 2)
+                return;
+
+            int vertexCount = Mathf.Max(0, (int)snapshot[0]);
+            int indexCount = Mathf.Max(0, (int)snapshot[1]);
+            if (vertexCount == 0 || indexCount < 3)
+                return;
+
+            _infiniTamBack ??= new GPUChunkMeshSnapshot();
+            _gpuSurfaceNets.CopyCurrentMeshTo(_infiniTamBack,
+                vertexCount, indexCount);
+
+            GPUChunkMeshSnapshot previousFront = _infiniTamFront;
+            _infiniTamFront = _infiniTamBack;
+            _infiniTamBack = previousFront;
+
+            _gpuRenderer.SetMeshSource(_infiniTamFront);
+            _gpuRenderer.UpdateBounds(
+                _gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
+            _gpuRenderer.RenderVisible = renderProductionMesh &&
+                                         InfiniTamPublicationReady;
+        }
+
+        private void ReleaseInfiniTamGlobalFallback()
+        {
+            if (_gpuSurfaceNets == null)
+                return;
+
+            if (_gpuRenderer != null)
+                _gpuRenderer.RenderVisible = false;
+            _gpuSurfaceNets.Dispose();
+            _gpuSurfaceNets = null;
+            DisposeInfiniTamBaselineFronts();
+            Logger.Info("InfiniTAM block front owns the foreground; released whole-volume fallback buffers.");
+        }
+
+        private void DisposeInfiniTamBaselineFronts()
+        {
+            _infiniTamFront?.Dispose();
+            _infiniTamFront = null;
+            _infiniTamBack?.Dispose();
+            _infiniTamBack = null;
+        }
+
+        private void DisposeInfiniTamBlockPipeline()
+        {
+            _infiniTamBlocks?.Dispose();
+            _infiniTamBlocks = null;
         }
 
         private void ApplySnapshot(uint[] data)
@@ -1526,11 +1826,30 @@ namespace Genesis.RoomScan
                 currentEvidenceAvailable);
         }
 
+        /// <summary>
+        /// The block extractor consumes only the already-fused TSDF.  Passing
+        /// the live shell/depth evidence here would silently rebuild the old
+        /// multi-office route inside extraction and break baseline isolation.
+        /// </summary>
+        private void ExtractInfiniTamBlock(GPUSurfaceNets target)
+        {
+            if (target == null) return;
+            target.Extract(
+                _volume.Volume,
+                _volume.ColorVolume,
+                _volume.AdmissionTraceVolume,
+                _volume.VoxelSize,
+                null,
+                null,
+                false);
+        }
+
         /// <summary>Start one cumulative diagnostic session. Pause/resume is idempotent.</summary>
         public void BeginLedgerSession()
         {
             if (_ledgerOpen) return;
 
+            EnsureSparseFoundationSkin();
             _ledgerSamples.Clear();
             _ledgerStartedUtc = DateTime.UtcNow;
             _ledgerStartedRealtime = Time.realtimeSinceStartup;
@@ -1539,19 +1858,188 @@ namespace Genesis.RoomScan
             _ledgerOpen = true;
             ResetTemporalDiagnosticState();
             _persistentChunks?.ResetLocalReplacementLedger();
+            _sparseFoundationSkin?.ResetLocalReplacementLedger();
+            _sparseFoundationSkin?.SetFullOutputAuditActive(true);
             _geometryStability?.ResetSession();
             Logger.Info($"累计账开始: {_ledgerSessionId}");
         }
 
         /// <summary>
-        /// Export the read-only paper-cell first-break ledger. The renderer owns
-        /// the GPU audit buffer; this method only reconnects the existing replay
-        /// session artifact hook.
+        /// Export exact committed native-5cm paper occupancy plus final drawn-
+        /// surface roughness. This path does not depend on whichever comparison
+        /// renderer happens to be visible.
         /// </summary>
         public bool RequestPaperAuditExport(string reason, Action<string> completed = null)
         {
-            return _supportTruth != null && _supportTruth.IsReady &&
-                _supportTruth.RequestHoleCauseAuditExport(reason, completed);
+            InstantDepthShellOverlay occupancyAudit =
+                GetComponent<InstantDepthShellOverlay>();
+            if (occupancyAudit == null || _sparseFoundationSkin == null)
+                return false;
+
+            StartCoroutine(ExportProductionPaperAuditWhenSettled(
+                reason, occupancyAudit, completed));
+            return true;
+        }
+
+        private IEnumerator ExportProductionPaperAuditWhenSettled(
+            string reason, InstantDepthShellOverlay occupancyAudit,
+            Action<string> completed)
+        {
+            const float drainTimeoutSeconds = 20f;
+            float started = Time.realtimeSinceStartup;
+            _sparseFoundationSkin.BeginFinalDrain();
+            yield return null;
+            while (!_sparseFoundationSkin.FinalDrainComplete &&
+                   !_sparseFoundationSkin.Failed &&
+                   Time.realtimeSinceStartup - started < drainTimeoutSeconds)
+            {
+                // A has already stopped StandaloneRoomScanner.Update(), which is
+                // the normal owner of this Tick.  The seal coroutine must now
+                // advance both the final dirty-ledger readback and every page it
+                // queues, otherwise pending pages can never catch up.
+                _sparseFoundationSkin.Tick();
+                yield return null;
+            }
+
+            bool paperQueueDrained = _sparseFoundationSkin.FinalDrainComplete &&
+                                     !_sparseFoundationSkin.Failed;
+            _sparseFoundationSkin.EndFinalDrain();
+            bool requested = occupancyAudit.RequestProductionPaperOccupancyAuditExport(
+                reason, this, path =>
+            {
+                if (string.IsNullOrEmpty(path))
+                {
+                    _sparseFoundationSkin.SetFullOutputAuditActive(false);
+                    Logger.Error("原生5cm生产纸皮凹凸账导出失败: 纸皮基础账返回空目录");
+                    completed?.Invoke(string.Empty);
+                    return;
+                }
+
+                // The ordinary periodic counter readback clears each completed
+                // period.  Force and await the final partial period here; without
+                // this barrier the A-key ledger silently loses the last seconds.
+                _volume.FlushAllForensicLedgers(flushComplete =>
+                    WriteProductionPaperAuditFiles(
+                        path, reason, paperQueueDrained, flushComplete, completed));
+            });
+            if (!requested)
+            {
+                _sparseFoundationSkin.SetFullOutputAuditActive(false);
+                completed?.Invoke(string.Empty);
+            }
+        }
+
+        private void WriteProductionPaperAuditFiles(
+            string path, string reason, bool paperQueueDrained,
+            bool fusionFlushComplete,
+            Action<string> completed)
+        {
+            string completedPath = path;
+            try
+            {
+                long triangleCount = _sparseFoundationSkin.AcceptedTriangleCount;
+                if (triangleCount <= 0)
+                    throw new InvalidDataException(
+                        "原生5cm生产纸皮没有已提交三角形，拒绝输出零账");
+
+                var ledger = new StringBuilder(32768);
+                ledger.AppendLine("QRS 原生5cm生产纸皮凹凸账");
+                ledger.AppendLine("source=sparse_foundation_committed_fronts");
+                ledger.AppendLine("scope=the exact per-chunk snapshots used by the current production-paper draw path");
+                ledger.AppendLine("read_only=true");
+                ledger.AppendLine("reason=" + (reason ?? string.Empty));
+                ledger.AppendLine("paper_queue_drain=" +
+                    (paperQueueDrained ? "complete" : "timeout"));
+                ledger.AppendLine("fusion_final_partial_period_flush=" +
+                    (fusionFlushComplete ? "complete" : "failed"));
+                ledger.AppendLine("replacement_event_drops=" +
+                    _sparseFoundationSkin.LocalReplacementDroppedEventCount);
+                ledger.AppendLine("quality_timeline_bin_drops=" +
+                    _sparseFoundationSkin.LocalQualityBinDroppedEventCount);
+                ledger.AppendLine("voxel_size_m=" +
+                    _volume.VoxelSize.ToString("R", CultureInfo.InvariantCulture));
+                ledger.AppendLine("paper_triangle_total=" +
+                    triangleCount.ToString(CultureInfo.InvariantCulture));
+                ledger.AppendLine("visual_quality_pages=" +
+                    _sparseFoundationSkin.VisualQualityPageCount.ToString(CultureInfo.InvariantCulture));
+                ledger.AppendLine("roughness_conversion=plane_rms_mm = plane_rms_vox * voxel_size_m * 1000");
+                ledger.AppendLine("location=use local_min/max columns in visual_quality_spatial_csv");
+                ledger.AppendLine("corner_rule=plane_candidate and plane_thin_ratio remain explicit; do not convict normal room corners from RMS alone");
+                _sparseFoundationSkin.AppendSyncDebtSummary(
+                    ledger, "原生5cm生产纸皮");
+                _sparseFoundationSkin.AppendVisualQualityReport(
+                    ledger, "原生5cm生产纸皮");
+                File.WriteAllText(Path.Combine(path,
+                    "production_paper_surface_ledger.txt"),
+                    ledger.ToString(), new UTF8Encoding(false));
+
+                var replacements = new StringBuilder(1024 * 1024);
+                _sparseFoundationSkin.AppendLocalReplacementCsv(
+                    replacements, _ledgerSessionId ?? string.Empty);
+                File.WriteAllText(Path.Combine(path,
+                    "production_paper_replacements.csv"),
+                    replacements.ToString(), new UTF8Encoding(false));
+
+                var qualityTimeline = new StringBuilder(4 * 1024 * 1024);
+                _sparseFoundationSkin.AppendLocalQualityTimelineCsv(
+                    qualityTimeline, _ledgerSessionId ?? string.Empty);
+                File.WriteAllText(Path.Combine(path,
+                    "production_paper_quality_timeline.csv"),
+                    qualityTimeline.ToString(), new UTF8Encoding(false));
+
+                var fusionForensic = new StringBuilder(128 * 1024);
+                _volume.AppendForensicLedgerReport(fusionForensic);
+                File.WriteAllText(Path.Combine(path,
+                    "fusion_forensic_ledger.txt"),
+                    fusionForensic.ToString(), new UTF8Encoding(false));
+
+                var fovSamples = new StringBuilder(512 * 1024);
+                _volume.AppendFovSampleLedgerCsv(
+                    fovSamples, _ledgerSessionId ?? string.Empty);
+                File.WriteAllText(Path.Combine(path,
+                    "fusion_fov_periods.csv"),
+                    fovSamples.ToString(), new UTF8Encoding(false));
+
+                var allFusionCounters = new StringBuilder(64 * 1024);
+                _volume.AppendAllForensicCountersCsv(
+                    allFusionCounters, _ledgerSessionId ?? string.Empty);
+                File.WriteAllText(Path.Combine(path,
+                    "fusion_all_counters.csv"),
+                    allFusionCounters.ToString(), new UTF8Encoding(false));
+
+                File.WriteAllText(Path.Combine(path,
+                    "full_output_join_contract.txt"),
+                    "scope=production paper committed fronts plus fusion ledgers\n" +
+                    "join_primary=depth_pairs.platformFrame = fusion_inputs.sourceFrame = integration_dispatches.sourceFrame\n" +
+                    "join_time=unity_frame + unscaled_time\n" +
+                     "join_paper=production_paper_replacements.candidate_epoch -> integration_dispatches.dirtyEpoch -> integration_dispatches.sourceFrame\n" +
+                     "join_surface_stages=within each committed chunk and built_epoch, compare tsdf_edge_zero_crossings -> raw_surface_nets_cell_representatives -> final_committed_candidate in the same 4x4x4 spatial bin\n" +
+                    "join_quality_timeline=production_paper_quality_timeline.replacement_sequence -> production_paper_replacements.sequence; chunk/bin tracks first publish and later correction\n" +
+                    "decision_observation_warning=observed_platform_frame_at_decision is context at asynchronous commit time, not candidate provenance\n" +
+                    "pose=all head position/quaternion/euler fields are Unity world space\n" +
+                    "paper_queue_drain=" +
+                        (paperQueueDrained ? "complete" : "timeout") + "\n" +
+                    "visual_quality_pages=" +
+                        _sparseFoundationSkin.VisualQualityPageCount + "\n" +
+                    "replacement_event_drops=" +
+                        _sparseFoundationSkin.LocalReplacementDroppedEventCount + "\n" +
+                    "quality_timeline_bin_drops=" +
+                        _sparseFoundationSkin.LocalQualityBinDroppedEventCount + "\n" +
+                    "fusion_final_partial_period_flush=" +
+                        (fusionFlushComplete ? "complete" : "failed") + "\n" +
+                    "authority=read_only; none of these files changes fusion, extraction, replacement, or rendering\n",
+                    new UTF8Encoding(false));
+                Logger.Info("原生5cm生产纸皮凹凸账已追加: " + path);
+            }
+            catch (Exception e)
+            {
+                completedPath = string.Empty;
+                Logger.Error("原生5cm生产纸皮凹凸账导出失败: " +
+                    e.GetType().Name + ": " + e.Message);
+            }
+
+            _sparseFoundationSkin?.SetFullOutputAuditActive(false);
+            completed?.Invoke(completedPath);
         }
 
         public string GetLedgerSessionStatsCompact()
@@ -2221,6 +2709,8 @@ namespace Genesis.RoomScan
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
             DisposeSparseFoundationSkin();
+            DisposeInfiniTamBlockPipeline();
+            DisposeInfiniTamBaselineFronts();
             if (_gpuRenderer != null)
             {
                 _gpuRenderer.RenderVisible = false;
@@ -2244,6 +2734,8 @@ namespace Genesis.RoomScan
             DisposeFrozenChunkReplay();
             DisposePersistentChunks();
             DisposeSparseFoundationSkin();
+            DisposeInfiniTamBlockPipeline();
+            DisposeInfiniTamBaselineFronts();
             if (_gpuRenderer != null)
             {
                 _gpuRenderer.RenderVisible = false;
@@ -2254,7 +2746,10 @@ namespace Genesis.RoomScan
             _gpuSurfaceNets = null;
             _legacySnapshotCaptured = false;
             _legacyFallbackActive = false;
-            Init();
+            if (_volume != null && _volume.InfiniTamBaselineEnabled)
+                EnsureInfiniTamBaselineResources();
+            else
+                Init();
         }
 
         private void DisposePersistentChunks()

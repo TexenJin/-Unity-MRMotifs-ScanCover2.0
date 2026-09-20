@@ -1,0 +1,120 @@
+#pragma kernel ProductizeVertices
+#pragma kernel CopyIndices
+
+struct GPUVertex
+{
+    float3 pos;
+    float3 norm;
+    uint packedColor;
+    uint voxelFlatIdx;
+};
+
+StructuredBuffer<GPUVertex> _InputVertices;
+StructuredBuffer<uint> _InputIndices;
+StructuredBuffer<uint> _InputAdmission;
+RWStructuredBuffer<GPUVertex> _OutputVertices;
+RWStructuredBuffer<uint> _OutputIndices;
+RWStructuredBuffer<uint> _OutputAdmission;
+StructuredBuffer<float4> _ProductPlanes;
+StructuredBuffer<float4> _ProductPlaneCenters;
+// Seed rulers carry exact finite U/V support (extent in w).  Court planes use
+// a negative extent and retain their bounded radial support.
+StructuredBuffer<float4> _ProductPlaneAxesU;
+StructuredBuffer<float4> _ProductPlaneAxesV;
+
+uint _VertexCount;
+uint _IndexCount;
+uint _ProductPlaneCount;
+float4x4 _LocalToWorld;
+float4x4 _WorldToLocal;
+float3 _CoreMin;
+float3 _CoreMax;
+float _EdgeBand;
+float _MaximumProjection;
+float _MinimumNormalDot;
+
+[numthreads(64, 1, 1)]
+void ProductizeVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexIndex = id.x;
+    if (vertexIndex >= _VertexCount)
+        return;
+
+    GPUVertex vertex = _InputVertices[vertexIndex];
+    uint admission = _InputAdmission[vertexIndex];
+    _OutputAdmission[vertexIndex] = admission;
+
+    // Preserve chunk boundaries and mixed/ambiguous evidence.  Product planes
+    // may clean a planar interior but can never round a corner, erase relief or
+    // move a seam independently from its neighbour.
+    uint sourceClass = admission & 7u;
+    uint confirmationClass = (admission >> 3u) & 3u;
+    bool ambiguous = sourceClass == 4u || confirmationClass == 3u;
+    float3 edgeDistance = min(vertex.pos - _CoreMin, _CoreMax - vertex.pos);
+    bool boundary = min(edgeDistance.x, min(edgeDistance.y, edgeDistance.z)) <=
+                    _EdgeBand;
+    if (_ProductPlaneCount == 0u || ambiguous || boundary)
+    {
+        _OutputVertices[vertexIndex] = vertex;
+        return;
+    }
+
+    float3 worldPosition = mul(_LocalToWorld, float4(vertex.pos, 1.0)).xyz;
+    float3 worldNormal = normalize(mul(transpose((float3x3)_WorldToLocal),
+                                       vertex.norm));
+    float bestResidual = 1e9;
+    float3 bestNormal = worldNormal;
+    bool found = false;
+
+    [loop]
+    for (uint i = 0u; i < _ProductPlaneCount; i++)
+    {
+        float4 plane = _ProductPlanes[i];
+        float4 support = _ProductPlaneCenters[i];
+        float4 supportU = _ProductPlaneAxesU[i];
+        float4 supportV = _ProductPlaneAxesV[i];
+        float3 delta = worldPosition - support.xyz;
+        if (supportU.w >= 0.0 && supportV.w >= 0.0)
+        {
+            if (abs(dot(delta, normalize(supportU.xyz))) > supportU.w ||
+                abs(dot(delta, normalize(supportV.xyz))) > supportV.w)
+                continue;
+        }
+        else if (dot(delta, delta) > support.w * support.w)
+        {
+            continue;
+        }
+        float3 normal = normalize(plane.xyz);
+        float alignment = abs(dot(worldNormal, normal));
+        if (alignment < _MinimumNormalDot)
+            continue;
+        if (dot(worldNormal, normal) < 0.0)
+            normal = -normal;
+        float residual = dot(worldPosition, normal) -
+                         (dot(normal, plane.xyz) < 0.0 ? -plane.w : plane.w);
+        float absoluteResidual = abs(residual);
+        if (absoluteResidual > _MaximumProjection ||
+            absoluteResidual >= abs(bestResidual))
+            continue;
+        bestResidual = residual;
+        bestNormal = normal;
+        found = true;
+    }
+
+    if (found)
+    {
+        worldPosition -= bestNormal * bestResidual;
+        vertex.pos = mul(_WorldToLocal, float4(worldPosition, 1.0)).xyz;
+        float3 localNormal = normalize(mul(transpose((float3x3)_LocalToWorld),
+                                           bestNormal));
+        vertex.norm = normalize(lerp(vertex.norm, localNormal, 0.65));
+    }
+    _OutputVertices[vertexIndex] = vertex;
+}
+
+[numthreads(64, 1, 1)]
+void CopyIndices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _IndexCount)
+        _OutputIndices[id.x] = _InputIndices[id.x];
+}

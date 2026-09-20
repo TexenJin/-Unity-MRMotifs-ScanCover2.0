@@ -311,7 +311,18 @@ def local_modal_band(points: np.ndarray, normal: np.ndarray, d: float) -> dict:
 def fit_planes(points: np.ndarray, maximum_planes: int = 5) -> dict:
     if len(points) < 1000:
         return {"inputPoints": int(len(points)), "planes": []}
-    import open3d as o3d
+    try:
+        import open3d as o3d
+    except ModuleNotFoundError:
+        # Depth-pair disagreement is still a complete and useful audit when
+        # the optional point-cloud package is absent from the host runtime.
+        # Do not discard that evidence merely because plane segmentation is
+        # unavailable on this workstation.
+        return {
+            "inputPoints": int(len(points)),
+            "planes": [],
+            "status": "skipped: optional open3d package is unavailable",
+        }
 
     o3d.utility.random.seed(42)
     cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))

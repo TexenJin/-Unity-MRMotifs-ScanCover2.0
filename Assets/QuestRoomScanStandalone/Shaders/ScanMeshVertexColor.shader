@@ -77,6 +77,7 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSMeshStride;
             float _RSGridSpacing;
             float _RSPaperGridMode;
+            float _RSProductGridMode;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
@@ -106,6 +107,22 @@ Shader "Genesis/ScanMeshVertexColor"
                 float3 aa = max(fwidth(family) * max(_RSWireThickness, 0.55), 0.0008);
                 float3 lineCoverage = 1.0 - smoothstep(aa, aa * 1.8, distanceToLine);
                 return max(lineCoverage.x, max(lineCoverage.y, lineCoverage.z));
+            }
+
+            float ProductTriangleGrid(float3 positionWS, float3 normalWS)
+            {
+                float2 p = PaperGridUV(positionWS, normalWS) / 0.10;
+                float3 family = float3(
+                    p.x,
+                    0.5 * p.x + 0.8660254 * p.y,
+                   -0.5 * p.x + 0.8660254 * p.y);
+                float3 distanceToLine = abs(frac(family + 0.5) - 0.5);
+                float3 aa = max(fwidth(family) * max(_RSWireThickness, 0.55),
+                                0.0008);
+                float3 lineCoverage = 1.0 - smoothstep(aa, aa * 1.8,
+                                                       distanceToLine);
+                return max(lineCoverage.x, max(lineCoverage.y,
+                                               lineCoverage.z));
             }
 
             float3 WorldToVoxelUVW(float3 worldPos)
@@ -355,6 +372,16 @@ Shader "Genesis/ScanMeshVertexColor"
             // emits it; retaining this guard keeps old GPU buffers harmless.
             bool diagnosticBoundaryOnly = _RSJointDiagnostic > 0.5 &&
                                           IN.diagnosticClass == 1u;
+            if (_RSProductGridMode > 0.5)
+            {
+                // Geometry remains the complete native 5 cm candidate. Only
+                // the visible ink is a world-anchored 10 cm triangular grid;
+                // unlike index aliasing this cannot tear or stretch topology.
+                float grid = ProductTriangleGrid(IN.positionWS, IN.normalWS);
+                if (grid < 0.08)
+                    discard;
+                return half4(0.95, 0.95, 0.95, saturate(grid));
+            }
             if (_RSPaperGridMode > 0.5)
             {
                 // In the hybrid route HERA contributes only the more precise

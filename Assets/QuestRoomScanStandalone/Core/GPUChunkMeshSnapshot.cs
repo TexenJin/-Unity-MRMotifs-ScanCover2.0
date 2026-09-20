@@ -34,8 +34,11 @@ namespace Genesis.RoomScan
         {
             vertexCapacity = Mathf.Max(1, vertexCapacity);
             indexCapacity = Mathf.Max(1, indexCapacity);
-            if (VertexBuffer == null || VertexBuffer.count != vertexCapacity ||
-                IndexBuffer == null || IndexBuffer.count != indexCapacity)
+            // Immutable fronts are reused as a two-buffer publication ring.
+            // Grow on demand, but do not destroy/reallocate them merely because
+            // the next extraction contains fewer elements.
+            if (VertexBuffer == null || VertexBuffer.count < vertexCapacity ||
+                IndexBuffer == null || IndexBuffer.count < indexCapacity)
             {
                 Dispose();
                 VertexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
