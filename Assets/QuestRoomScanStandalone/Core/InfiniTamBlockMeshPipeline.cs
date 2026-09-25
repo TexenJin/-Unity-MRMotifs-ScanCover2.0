@@ -94,6 +94,21 @@ namespace Genesis.RoomScan
         private float _nextReadbackTime;
 
         private const int MaximumConcurrentCommits = 4;
+        // Isolated A/B switch: keep the authoritative TSDF at 5 cm, but let
+        // the InfiniTAM extractor build one vertex per globally anchored
+        // 2x2x2 cell (10 cm topology).  No shader grid, corner treatment,
+        // smoothing or constrained simplifier participates in this trial.
+        // 09-25 device A/B result: stride-2 topology over a 5 cm TSDF makes
+        // complete triangles and boundary patches toggle as the fine signs
+        // evolve. Keep that experiment wired but dormant. The accepted 10 cm
+        // route instead uses one native 10 cm TSDF and ordinary stride-1
+        // extraction from integration through presentation.
+        internal const bool DirectTenCentimeterExperiment = false;
+        // Isolated native-10 cm crease trial.  This changes only the position
+        // chosen for a stride-1 Surface-Nets vertex when two coherent normal
+        // families prove a real fold.  TSDF integration, topology, publication
+        // and the native 10 cm lattice remain exactly on the accepted baseline.
+        internal const bool NativeTenCentimeterCreaseExperiment = true;
 
         public bool Failed { get; private set; }
         public string FailureReason { get; private set; } = string.Empty;
@@ -298,7 +313,14 @@ namespace Genesis.RoomScan
                 TemporalDeadzone = 0f,
                 StrictObservedEdges = false,
                 CandidateHistoryUpdateEnabled = false,
-                FoundationTopologyMode = false,
+                FoundationTopologyMode = DirectTenCentimeterExperiment,
+                FoundationCellStride = DirectTenCentimeterExperiment ? 2 : 1,
+                FoundationFeatureRecognition = NativeTenCentimeterCreaseExperiment,
+                FoundationNormalClusterDotMin = 0.8660254f,
+                FoundationCornerNormalDotMax = 0.7071068f,
+                FoundationChamferWidthVoxels = 0f,
+                FoundationConstrainedSimplification = false,
+                FoundationVisibleSkirtVoxels = 0,
                 VisualQualityDiagnosticsEnabled = false,
                 DiagnosticRoiEnabled = false
             };

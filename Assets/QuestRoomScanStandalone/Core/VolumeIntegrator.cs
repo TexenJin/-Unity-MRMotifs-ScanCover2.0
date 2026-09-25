@@ -24,9 +24,13 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader compute;
 
         [Header("Volume")]
-        [SerializeField] private int3 voxelCount = new(192, 128, 192);
-        [SerializeField] private float voxelSize = 0.05f;
-        [SerializeField] private float voxelDistance = 0.15f;
+        // Native 10 cm A/B profile.  Halving every lattice dimension preserves
+        // the original 9.6 x 6.4 x 9.6 metre world extent; this is one coarse
+        // TSDF from integration through extraction, not a 5 cm mesh decimator.
+        [SerializeField] private int3 voxelCount = new(96, 64, 96);
+        [SerializeField] private float voxelSize = 0.10f;
+        // Preserve the v1.3 three-voxel truncation band in voxel units.
+        [SerializeField] private float voxelDistance = 0.30f;
         [SerializeField] private float voxelMin = 0.1f;
 
         [Header("Integration")]

@@ -88,6 +88,12 @@ namespace Genesis.RoomScan
         /// </summary>
         public bool FoundationTopologyMode { get; set; }
         public int FoundationCellStride { get; set; } = 1;
+        /// <summary>
+        /// Fits two coherent zero-crossing normal families and places the
+        /// Surface-Nets representative on their shared crease.  This is a
+        /// vertex-placement option and may run on native stride-1 topology;
+        /// it does not require the dormant coarse-foundation topology mode.
+        /// </summary>
         public bool FoundationFeatureRecognition { get; set; }
         public float FoundationNormalClusterDotMin { get; set; } = 0.8660254f;
         public float FoundationCornerNormalDotMax { get; set; } = 0.7071068f;
@@ -735,7 +741,7 @@ namespace Genesis.RoomScan
             _compute.SetInt(ID_FoundationCellStride,
                 FoundationTopologyMode ? Mathf.Max(1, FoundationCellStride) : 1);
             _compute.SetInt(ID_FoundationFeatureRecognition,
-                FoundationTopologyMode && FoundationFeatureRecognition ? 1 : 0);
+                FoundationFeatureRecognition ? 1 : 0);
             _compute.SetFloat(ID_FoundationNormalClusterDotMin,
                 Mathf.Clamp(FoundationNormalClusterDotMin, -1f, 1f));
             _compute.SetFloat(ID_FoundationCornerNormalDotMax,

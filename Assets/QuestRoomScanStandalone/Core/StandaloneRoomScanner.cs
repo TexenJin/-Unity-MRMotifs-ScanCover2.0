@@ -746,9 +746,10 @@ namespace Genesis.RoomScan
                 _instantDepthShellOverlay = gameObject.AddComponent<InstantDepthShellOverlay>();
             _instantDepthShellOverlay.SetVisible(false);
             StartCoroutine(ConfigureCameraForPassthrough());
-            // 主操作 HUD 是采集契约的一部分，始终创建；不再受场景勾选项或
-            // 采集/冻结档位控制。只有相机尚未生成时会等待相机。
-            StartCoroutine(CreateStatusBadgeWhenCameraReady());
+            // V1.3 画面复核默认保持无工程 HUD，避免中央黑底状态牌遮住
+            // 鼓包、孔洞和后续愈合过程。诊断需要时仍可在 Inspector 显式打开。
+            if (showOperatorHud)
+                StartCoroutine(CreateStatusBadgeWhenCameraReady());
             if (showDebugHud)
                 StartCoroutine(CreateHudWhenCameraReady());
             Application.logMessageReceived += OnLogMessage;
@@ -1668,6 +1669,8 @@ namespace Genesis.RoomScan
         // ─────────────────────────────────────────────────────────────
 
         [Header("调试面板")]
+        [SerializeField, Tooltip("显示中央最小操作状态牌。V1.3 画面复核默认关闭；只影响显示，不影响扫描、融合、提取或按键。")]
+        private bool showOperatorHud = false;
         [SerializeField] private bool showDebugHud = false;
         [SerializeField, Tooltip("在面板右上角开一个当前深度实时预览小窗（青=近 绿=中 红=远 暗=无效）。" +
             "用途：盯着幽灵网格时看深度画面里那个斑块还在不在——在=深度自洽幻觉（Meta侧时序锁定）；转头后斑块从预览消失=深度刷新")]

@@ -333,11 +333,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.VolumeIntegrator
   compute: {fileID: 7200000, guid: 6bdf7fc95400b4f52aae8f59e74a4905, type: 3}
   voxelCount:
-    x: 192
-    y: 128
-    z: 192
-  voxelSize: 0.05
-  voxelDistance: 0.15
+    x: 96
+    y: 64
+    z: 96
+  voxelSize: 0.1
+  voxelDistance: 0.3
   voxelMin: 0.1
   depthDisparityThreshold: 0.5
   maxUpdateDist: 5
@@ -442,8 +442,8 @@ MonoBehaviour:
   edgeCrossEyeMarginScale: 0.03
   edgeCrossEyeMinOtherFacing: 0.2
   dilationSteps: 8
-  voxelDistance: 0.2
-  voxelSize: 0.05
+  voxelDistance: 0.3
+  voxelSize: 0.1
 --- !u!4 &170429785
 Transform:
   m_ObjectHideFlags: 0

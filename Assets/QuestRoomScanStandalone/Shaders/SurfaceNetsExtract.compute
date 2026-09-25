@@ -516,7 +516,7 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint confirmedSourceMask = 0u;       // bits 0..2: self/direct/relay seen confirmed
     uint lifecycleRiskMask = 0u;         // bits 0..4: plane/near-abstain/motion(birth-frozen)/retired/fast-promotion
 
-    // Foundation-only feature witnesses. Each group accumulates zero-crossing
+    // Feature-placement witnesses. Each group accumulates zero-crossing
     // positions and their pre-averaging TSDF normals. A third unmatched family
     // makes the cell ambiguous rather than forcing a false corner.
     float3 featureNormalSum0 = float3(0.0, 0.0, 0.0);
@@ -625,8 +625,7 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
                 crossingZZ += (uint)(q.z * q.z);
             }
 
-            if (_FoundationTopologyMode != 0u &&
-                _FoundationFeatureRecognition != 0u &&
+            if (_FoundationFeatureRecognition != 0u &&
                 !emptyA && !emptyB)
             {
                 float3 crossingNormal;
@@ -756,8 +755,7 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     // bisector. That produces one consistent chamfer band instead of letting
     // a noisy mixture pull every corner cell to a different arbitrary point.
     bool foundationCorner = false;
-    if (_FoundationTopologyMode != 0u &&
-        _FoundationFeatureRecognition != 0u &&
+    if (_FoundationFeatureRecognition != 0u &&
         !featureAmbiguous &&
         featureCount0 >= 2u && featureCount1 >= 2u)
     {

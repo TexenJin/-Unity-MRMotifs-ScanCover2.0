@@ -114,8 +114,10 @@ namespace Genesis.RoomScan
 
         [Header("Dilation")]
         [SerializeField] private int dilationSteps = 8;
-        [SerializeField] private float voxelDistance = 0.2f;
-        [SerializeField] private float voxelSize = 0.05f;
+        // Kept aligned with the native 10 cm VolumeIntegrator profile.  The
+        // integrator also reapplies these values when GPU resources are made.
+        [SerializeField] private float voxelDistance = 0.30f;
+        [SerializeField] private float voxelSize = 0.10f;
 
         private readonly Matrix4x4[] _proj = new Matrix4x4[2];
         private readonly Matrix4x4[] _projInv = new Matrix4x4[2];

@@ -786,7 +786,18 @@ namespace Genesis.RoomScan
                     TemporalDeadzone = 0f,
                     StrictObservedEdges = false,
                     CandidateHistoryUpdateEnabled = false,
-                    FoundationTopologyMode = false,
+                    FoundationTopologyMode =
+                        InfiniTamBlockMeshPipeline.DirectTenCentimeterExperiment,
+                    FoundationCellStride =
+                        InfiniTamBlockMeshPipeline.DirectTenCentimeterExperiment
+                            ? 2 : 1,
+                    FoundationFeatureRecognition =
+                        InfiniTamBlockMeshPipeline.NativeTenCentimeterCreaseExperiment,
+                    FoundationNormalClusterDotMin = 0.8660254f,
+                    FoundationCornerNormalDotMax = 0.7071068f,
+                    FoundationChamferWidthVoxels = 0f,
+                    FoundationConstrainedSimplification = false,
+                    FoundationVisibleSkirtVoxels = 0,
                     VisualQualityDiagnosticsEnabled = false,
                     DiagnosticRoiEnabled = false
                 };
@@ -808,6 +819,10 @@ namespace Genesis.RoomScan
             _gpuRenderer.SetStrictObservedDisplay(false);
             _gpuRenderer.SetJointDiagnosticDisplay(false);
             _gpuRenderer.SetTemporalIllegalCandidateActive(false);
+            // Display the one native reconstruction without a painted coarse-
+            // grid substitute. The accepted profile currently uses a native
+            // 10 cm TSDF with stride-1 extraction.
+            _gpuRenderer.SetProductGridDisplay(false);
             // Never reveal a bootstrap TSDF or an old pre-reseed front. The
             // first visible surface must be copied from a model that has passed
             // consecutive frame-to-model validation.

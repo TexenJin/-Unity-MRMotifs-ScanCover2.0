@@ -10,9 +10,12 @@ namespace Genesis.RoomScan
     internal class GPUMeshRenderer : MonoBehaviour
     {
         [SerializeField] private Material gpuMeshMaterial;
+        [SerializeField, Tooltip("线框显示前先用无色深度壳遮住后层网格。只影响显示，不修改 TSDF、顶点或索引。")]
+        private bool occludeRearWireframe = true;
 
         private IGPUMeshBufferSource _meshSource;
         private MaterialPropertyBlock _props;
+        private Material _rearWireOccluderMaterial;
         private bool _ready;
         private Bounds _bounds;
 
@@ -28,6 +31,8 @@ namespace Genesis.RoomScan
         private static readonly int ID_TemporalIllegalActive = Shader.PropertyToID("_RSTemporalIllegalActive");
         private static readonly int ID_HeraReplayActive = Shader.PropertyToID("_RSHeraReplayActive");
         private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
+        private static readonly int ID_Wireframe = Shader.PropertyToID("_RSWireframe");
+        private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
 
         // Display-only A/B colors. They never feed back into extraction or TSDF state.
         private static readonly Color ProductionColor = new Color(1.0f, 0.62f, 0.02f, 0.96f);
@@ -186,7 +191,6 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
             _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
-
             var rp = new RenderParams(gpuMeshMaterial)
             {
                 worldBounds = _bounds,
@@ -196,29 +200,74 @@ namespace Genesis.RoomScan
                 layer = gameObject.layer
             };
 
+            bool lineSurfaceVisible =
+                Shader.GetGlobalFloat(ID_Wireframe) > 0.5f ||
+                Shader.GetGlobalFloat(ID_PaperGridMode) > 0.5f ||
+                _productGridMode;
+            if (occludeRearWireframe && lineSurfaceVisible && EnsureRearWireOccluderMaterial())
+            {
+                // Fill only the depth buffer with the nearest complete triangle
+                // surface.  The passthrough colour remains untouched, while the
+                // following wire pass can no longer reveal displaced sheets and
+                // long triangles behind that nearest surface through every cell.
+                var depthRp = new RenderParams(_rearWireOccluderMaterial)
+                {
+                    worldBounds = _bounds,
+                    matProps = _props,
+                    receiveShadows = false,
+                    shadowCastingMode = ShadowCastingMode.Off,
+                    layer = gameObject.layer
+                };
+                Submit(depthRp, knownDrawVertexCount, argsBuf);
+            }
+
+            Submit(rp, knownDrawVertexCount, argsBuf);
+            LastSubmittedVertexCount = knownDrawVertexCount > 0 ? knownDrawVertexCount : -1;
+            LastSubmittedFrame = Time.frameCount;
+        }
+
+        private bool EnsureRearWireOccluderMaterial()
+        {
+            if (_rearWireOccluderMaterial != null)
+                return true;
+
+            Shader shader = Resources.Load<Shader>("ScanMeshDepthOccluder");
+            if (shader == null)
+                return false;
+
+            _rearWireOccluderMaterial = new Material(shader)
+            {
+                name = "[QRS] Rear Wire Occluder"
+            };
+            return true;
+        }
+
+        private static void Submit(RenderParams rp, int knownDrawVertexCount, GraphicsBuffer argsBuf)
+        {
             if (knownDrawVertexCount > 0)
             {
                 // Immutable chunk/HERA snapshots already completed an async GPU
                 // readback, so their exact index count is authoritative on the
-                // CPU.  Draw them directly instead of reinterpreting the old
+                // CPU. Draw them directly instead of reinterpreting the old
                 // five-uint argument buffer as platform-specific IndirectDrawArgs.
-                // This keeps parent32 visibility independent from Vulkan's
-                // indirect-command layout while preserving the same SV_VertexID
-                // index fetch used by the shader.
                 Graphics.RenderPrimitives(rp, MeshTopology.Triangles, knownDrawVertexCount, 1);
-                LastSubmittedVertexCount = knownDrawVertexCount;
             }
             else
             {
                 Graphics.RenderPrimitivesIndirect(rp, MeshTopology.Triangles, argsBuf, 1);
-                LastSubmittedVertexCount = -1;
             }
-            LastSubmittedFrame = Time.frameCount;
         }
 
         private void OnDisable()
         {
             _ready = false;
+        }
+
+        private void OnDestroy()
+        {
+            if (_rearWireOccluderMaterial != null)
+                Destroy(_rearWireOccluderMaterial);
+            _rearWireOccluderMaterial = null;
         }
 
         private void OnEnable()
