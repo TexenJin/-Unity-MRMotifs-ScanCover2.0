@@ -24,13 +24,11 @@ namespace Genesis.RoomScan
             public int3 MapCount;
             public uint TargetEpoch;
             public uint ProcessedEpoch;
-            public uint CandidateEpoch;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
             public bool Built;
             public bool Queued;
             public bool CommitPending;
-            public float CommitStartedAt;
             public int CommitSerial;
             public int VertexCount;
             public int IndexCount;
@@ -70,17 +68,23 @@ namespace Genesis.RoomScan
         private readonly Transform _parent;
         private readonly int _layer;
         private readonly int _haloVoxels;
-        private readonly int _maxBlocksPerTick;
+        private readonly int _maxBlocksPerBatch;
         private readonly float _dirtyReadbackHz;
         private readonly float _vertexBudgetPercent;
         private readonly Action<GPUSurfaceNets> _extract;
-        private readonly Queue<int> _dirtyQueue = new Queue<int>();
         private readonly List<Block> _blocks = new List<Block>();
 
         private int3 _blockCount;
         private int _generation;
         private int _readbackFailures;
         private int _inFlightCommits;
+        private int _queuedBlockCount;
+        private int _nextBatchSerial;
+        private long _acceptedCommitCount;
+        private long _completedBatchCount;
+        private long _publishedBatchCount;
+        private long _dirtyLedgerApplyCount;
+        private long _staleCandidateDiscardCount;
         private bool _disposed;
         private bool _visible;
         private bool _readbackPending;
@@ -92,8 +96,12 @@ namespace Genesis.RoomScan
         private uint[] _ownerSnapshot;
         private uint[] _boundarySnapshot;
         private float _nextReadbackTime;
+        private MeshBatch _activeBatch;
 
-        private const int MaximumConcurrentCommits = 4;
+        // Mature incremental mesh scheduling has one batch in flight. Dirty
+        // arrivals are idempotent block flags that accumulate for the next
+        // batch; they are never appended as historical jobs.
+        private const float BatchWatchdogSeconds = 10f;
         // Isolated A/B switch: keep the authoritative TSDF at 5 cm, but let
         // the InfiniTAM extractor build one vertex per globally anchored
         // 2x2x2 cell (10 cm topology).  No shader grid, corner treatment,
@@ -115,7 +123,66 @@ namespace Genesis.RoomScan
         public bool InitialBuildComplete { get; private set; }
         public int CommitWatchdogResets { get; private set; }
         public int BlockCount => _blocks.Count;
-        public int PendingCount => _dirtyQueue.Count + _inFlightCommits;
+        public int PendingCount => _queuedBlockCount + _inFlightCommits;
+        public int QueuedCount => _queuedBlockCount;
+        public int InFlightCommitCount => _inFlightCommits;
+        public long AcceptedCommitCount => _acceptedCommitCount;
+        public long CompletedBatchCount => _completedBatchCount;
+        public long PublishedBatchCount => _publishedBatchCount;
+        public bool BatchInFlight => _activeBatch != null;
+        public long DirtyLedgerApplyCount => _dirtyLedgerApplyCount;
+        public long StaleCandidateDiscardCount => _staleCandidateDiscardCount;
+
+        public int OutstandingBlockCount
+        {
+            get
+            {
+                int count = 0;
+                for (int i = 0; i < _blocks.Count; i++)
+                {
+                    Block block = _blocks[i];
+                    if (block.Queued || block.CommitPending ||
+                        block.TargetEpoch > block.ProcessedEpoch)
+                        count++;
+                }
+                return count;
+            }
+        }
+
+        private sealed class BatchItem
+        {
+            public int BlockIndex;
+            public uint CandidateEpoch;
+            public int CommitSerial;
+            public int VertexCount;
+            public int IndexCount;
+            public bool Failed;
+            public bool Completed;
+        }
+
+        private sealed class MeshBatch
+        {
+            public int Serial;
+            public int Generation;
+            public float StartedAt;
+            public int Remaining;
+            public readonly List<BatchItem> Items = new List<BatchItem>();
+        }
+
+        public ulong EpochDebt
+        {
+            get
+            {
+                ulong debt = 0;
+                for (int i = 0; i < _blocks.Count; i++)
+                {
+                    Block block = _blocks[i];
+                    if (block.TargetEpoch > block.ProcessedEpoch)
+                        debt += (ulong)(block.TargetEpoch - block.ProcessedEpoch);
+                }
+                return debt;
+            }
+        }
 
         public int VisibleBlockCount
         {
@@ -171,8 +238,15 @@ namespace Genesis.RoomScan
 
         public string CompactStats => Failed
             ? $"块失败[{FailureReason}]"
-            : $"块{VisibleBlockCount}/{BlockCount} 队{_dirtyQueue.Count} " +
-              $"途{_inFlightCommits} 复{CommitWatchdogResets}";
+            : $"块{VisibleBlockCount}/{BlockCount} 队{_queuedBlockCount} " +
+              $"批途{(_activeBatch != null ? 1 : 0)} " +
+              $"读{_inFlightCommits} 旧{_staleCandidateDiscardCount} 复{CommitWatchdogResets}";
+
+        public void RequestImmediateDirtyLedgerRefresh()
+        {
+            if (!_disposed)
+                _nextReadbackTime = 0f;
+        }
 
         public InfiniTamBlockMeshPipeline(
             VolumeIntegrator volume,
@@ -181,7 +255,7 @@ namespace Genesis.RoomScan
             Transform parent,
             int layer,
             int haloVoxels,
-            int maxBlocksPerTick,
+            int maxBlocksPerBatch,
             float dirtyReadbackHz,
             float vertexBudgetPercent,
             Action<GPUSurfaceNets> extract)
@@ -192,7 +266,7 @@ namespace Genesis.RoomScan
             _parent = parent;
             _layer = layer;
             _haloVoxels = Mathf.Max(1, haloVoxels);
-            _maxBlocksPerTick = Mathf.Max(1, maxBlocksPerTick);
+            _maxBlocksPerBatch = Mathf.Max(1, maxBlocksPerBatch);
             _dirtyReadbackHz = Mathf.Max(0.5f, dirtyReadbackHz);
             _vertexBudgetPercent = Mathf.Clamp(vertexBudgetPercent, 0.01f, 0.5f);
             _extract = extract ?? throw new ArgumentNullException(nameof(extract));
@@ -209,54 +283,12 @@ namespace Genesis.RoomScan
                 return;
 
             RequestDirtyLedgerIfDue();
-            int budget = Mathf.Min(_maxBlocksPerTick,
-                Mathf.Max(0, MaximumConcurrentCommits - _inFlightCommits));
-            while (budget-- > 0 && _dirtyQueue.Count > 0)
-            {
-                int index = _dirtyQueue.Dequeue();
-                Block block = _blocks[index];
-                if (!block.Queued)
-                {
-                    budget++;
-                    continue;
-                }
+            if (_activeBatch == null && _queuedBlockCount > 0)
+                StartNextBatch();
 
-                block.Queued = false;
-                if (block.CommitPending || block.ProcessedEpoch >= block.TargetEpoch)
-                    continue;
-
-                try
-                {
-                    EnsureBlockResources(block);
-                    uint candidateEpoch = block.TargetEpoch;
-                    _extract(block.Surface);
-                    block.CandidateEpoch = candidateEpoch;
-                    block.CommitPending = true;
-                    block.CommitStartedAt = Time.realtimeSinceStartup;
-                    _inFlightCommits++;
-                    int commitSerial = ++block.CommitSerial;
-                    RequestCommit(block, candidateEpoch, commitSerial);
-                }
-                catch (Exception ex)
-                {
-                    Fail($"block {block.Coordinate} extraction failed: {ex.Message}");
-                    return;
-                }
-            }
-
-            for (int i = 0; i < _blocks.Count; i++)
-            {
-                Block block = _blocks[i];
-                if (!block.CommitPending ||
-                    Time.realtimeSinceStartup - block.CommitStartedAt <= 10f)
-                    continue;
-                block.CommitSerial++;
-                block.CommitPending = false;
-                _inFlightCommits = Mathf.Max(0, _inFlightCommits - 1);
-                CommitWatchdogResets++;
-                QueueBlock(block.Index, block.TargetEpoch, true);
-                Logger.Warning($"InfiniTAM block {block.Coordinate} readback timed out; requeued.");
-            }
+            if (_activeBatch != null &&
+                Time.realtimeSinceStartup - _activeBatch.StartedAt > BatchWatchdogSeconds)
+                ResetTimedOutBatch();
 
             TryFinishInitialBuild();
         }
@@ -343,61 +375,171 @@ namespace Genesis.RoomScan
             block.Renderer.RenderVisible = false;
         }
 
-        private void RequestCommit(Block block, uint candidateEpoch, int commitSerial)
+        private void StartNextBatch()
         {
-            int requestGeneration = _generation;
+            var batch = new MeshBatch
+            {
+                Serial = ++_nextBatchSerial,
+                Generation = _generation,
+                StartedAt = Time.realtimeSinceStartup
+            };
+
+            int budget = Mathf.Min(_maxBlocksPerBatch, _queuedBlockCount);
+            while (budget-- > 0)
+            {
+                int index = DequeueNextQueuedBlock();
+                if (index < 0)
+                    break;
+                Block block = _blocks[index];
+                if (block.CommitPending || block.ProcessedEpoch >= block.TargetEpoch)
+                    continue;
+
+                batch.Items.Add(new BatchItem
+                {
+                    BlockIndex = index,
+                    CandidateEpoch = block.TargetEpoch,
+                    CommitSerial = ++block.CommitSerial
+                });
+            }
+
+            if (batch.Items.Count == 0)
+                return;
+
+            batch.Remaining = batch.Items.Count;
+            _activeBatch = batch;
+            for (int i = 0; i < batch.Items.Count; i++)
+            {
+                BatchItem item = batch.Items[i];
+                Block block = _blocks[item.BlockIndex];
+                try
+                {
+                    EnsureBlockResources(block);
+                    _extract(block.Surface);
+                    block.CommitPending = true;
+                    _inFlightCommits++;
+                    RequestBatchItemReadback(batch, item);
+                }
+                catch (Exception ex)
+                {
+                    Fail($"block {block.Coordinate} extraction failed: {ex.Message}");
+                    return;
+                }
+            }
+        }
+
+        private void RequestBatchItemReadback(MeshBatch batch, BatchItem item)
+        {
+            Block block = _blocks[item.BlockIndex];
             AsyncGPUReadback.Request(block.Surface.CountersBuffer, request =>
             {
-                if (_disposed || requestGeneration != _generation ||
-                    commitSerial != block.CommitSerial)
+                if (_disposed || batch != _activeBatch ||
+                    batch.Generation != _generation ||
+                    item.CommitSerial != block.CommitSerial)
                     return;
 
                 block.CommitPending = false;
                 _inFlightCommits = Mathf.Max(0, _inFlightCommits - 1);
                 if (request.hasError)
                 {
-                    QueueBlock(block.Index, candidateEpoch, true);
-                    return;
-                }
-
-                var counters = request.GetData<uint>();
-                int vertices = counters.Length > 0 ? Mathf.Max(0, (int)counters[0]) : 0;
-                int indices = counters.Length > 1 ? Mathf.Max(0, (int)counters[1]) : 0;
-
-                // A later integration owns the block now.  Never publish an
-                // obsolete asynchronous result over the current immutable front.
-                if (candidateEpoch < block.TargetEpoch)
-                {
-                    QueueBlock(block.Index, block.TargetEpoch, true);
-                    return;
-                }
-
-                if (vertices > 0 && indices >= 3)
-                {
-                    block.Back ??= new GPUChunkMeshSnapshot();
-                    block.Surface.CopyCurrentMeshTo(block.Back, vertices, indices);
-                    GPUChunkMeshSnapshot oldFront = block.Front;
-                    block.Front = block.Back;
-                    block.Back = oldFront;
-                    block.Renderer.SetMeshSource(block.Front);
+                    item.Failed = true;
                 }
                 else
                 {
-                    block.Front?.Clear();
+                    var counters = request.GetData<uint>();
+                    item.VertexCount = counters.Length > 0
+                        ? Mathf.Max(0, (int)counters[0]) : 0;
+                    item.IndexCount = counters.Length > 1
+                        ? Mathf.Max(0, (int)counters[1]) : 0;
+
+                    // Populate a private back snapshot, but keep the old front
+                    // visible until every member of this batch is complete.
+                    block.Back ??= new GPUChunkMeshSnapshot();
+                    if (item.VertexCount > 0 && item.IndexCount >= 3)
+                        block.Surface.CopyCurrentMeshTo(block.Back,
+                            item.VertexCount, item.IndexCount);
+                    else
+                        block.Back.Clear();
                 }
 
-                block.VertexCount = vertices;
-                block.IndexCount = indices;
-                block.ProcessedEpoch = candidateEpoch;
-                block.Built = true;
-                ApplyBlockVisibility(block);
-                if (block.TargetEpoch > block.ProcessedEpoch)
-                    QueueBlock(block.Index, block.TargetEpoch, true);
-                else if (!InitialBuildComplete && _dirtyQueue.Count == 0 &&
-                         _inFlightCommits == 0)
-                    _nextReadbackTime = 0f;
-                TryFinishInitialBuild();
+                item.Completed = true;
+                batch.Remaining = Mathf.Max(0, batch.Remaining - 1);
+                if (batch.Remaining == 0)
+                    FinishBatch(batch);
             });
+        }
+
+        private void FinishBatch(MeshBatch batch)
+        {
+            if (_disposed || batch != _activeBatch ||
+                batch.Generation != _generation)
+                return;
+
+            int acceptedInBatch = 0;
+            for (int i = 0; i < batch.Items.Count; i++)
+            {
+                BatchItem item = batch.Items[i];
+                Block block = _blocks[item.BlockIndex];
+                if (item.Failed)
+                {
+                    QueueBlock(block.Index, block.TargetEpoch, true);
+                    continue;
+                }
+
+                // A later fusion epoch supersedes this private back result.
+                // Keep the immutable front and carry one dirty bit forward.
+                if (item.CandidateEpoch < block.TargetEpoch)
+                {
+                    _staleCandidateDiscardCount++;
+                    QueueBlock(block.Index, block.TargetEpoch, true);
+                    continue;
+                }
+
+                GPUChunkMeshSnapshot oldFront = block.Front;
+                block.Front = block.Back;
+                block.Back = oldFront;
+                block.Renderer.SetMeshSource(block.Front);
+                block.VertexCount = item.VertexCount;
+                block.IndexCount = item.IndexCount;
+                block.ProcessedEpoch = item.CandidateEpoch;
+                block.Built = true;
+                _acceptedCommitCount++;
+                acceptedInBatch++;
+            }
+
+            _completedBatchCount++;
+            if (acceptedInBatch > 0)
+                _publishedBatchCount++;
+            _activeBatch = null;
+            if (_queuedBlockCount == 0 && _inFlightCommits == 0)
+                _initialNeedsSettlement = false;
+            ApplyVisibility();
+            if (!InitialBuildComplete && _queuedBlockCount == 0)
+                _nextReadbackTime = 0f;
+            TryFinishInitialBuild();
+        }
+
+        private void ResetTimedOutBatch()
+        {
+            MeshBatch batch = _activeBatch;
+            if (batch == null)
+                return;
+
+            for (int i = 0; i < batch.Items.Count; i++)
+            {
+                BatchItem item = batch.Items[i];
+                Block block = _blocks[item.BlockIndex];
+                if (!item.Completed)
+                {
+                    block.CommitSerial++;
+                    block.CommitPending = false;
+                    _inFlightCommits = Mathf.Max(0, _inFlightCommits - 1);
+                }
+                QueueBlock(block.Index, block.TargetEpoch, true);
+            }
+            _activeBatch = null;
+            CommitWatchdogResets++;
+            Logger.Warning($"InfiniTAM mesh batch {batch.Serial} timed out; " +
+                           "its dirty set was coalesced into the next batch.");
         }
 
         private void RequestDirtyLedgerIfDue()
@@ -471,6 +613,7 @@ namespace Genesis.RoomScan
             }
 
             _readbackFailures = 0;
+            _dirtyLedgerApplyCount++;
             for (int i = 0; i < _blocks.Count; i++)
             {
                 Block block = _blocks[i];
@@ -505,8 +648,8 @@ namespace Genesis.RoomScan
                     block.Built = true;
             }
             _firstLedgerApplied = true;
-            _initialNeedsSettlement = _dirtyQueue.Count > 0 ||
-                _inFlightCommits > 0;
+            _initialNeedsSettlement = _queuedBlockCount > 0 ||
+                _activeBatch != null;
             TryFinishInitialBuild();
         }
 
@@ -514,20 +657,59 @@ namespace Genesis.RoomScan
         {
             Block block = _blocks[index];
             block.TargetEpoch = math.max(block.TargetEpoch, epoch);
-            if (block.CommitPending || (!force && block.ProcessedEpoch >= block.TargetEpoch) ||
-                block.Queued)
+            if ((!force && block.ProcessedEpoch >= block.TargetEpoch) || block.Queued)
                 return;
             block.Queued = true;
             if (!InitialBuildComplete)
                 _initialNeedsSettlement = true;
-            _dirtyQueue.Enqueue(index);
+            _queuedBlockCount++;
+        }
+
+        private int DequeueNextQueuedBlock()
+        {
+            int bestIndex = -1;
+            bool bestVisible = false;
+            uint bestDebt = 0;
+
+            // The baseline currently owns only a handful of room-scale blocks,
+            // so a linear scan is cheaper and more deterministic than maintaining
+            // another heap.  Visible stale fronts go first; within that class the
+            // largest epoch debt wins, then the stable block index breaks ties.
+            for (int i = 0; i < _blocks.Count; i++)
+            {
+                Block block = _blocks[i];
+                if (!block.Queued)
+                    continue;
+                bool visible = block.Built && block.IndexCount > 0;
+                uint debt = block.TargetEpoch > block.ProcessedEpoch
+                    ? block.TargetEpoch - block.ProcessedEpoch : 0u;
+                if (bestIndex >= 0 &&
+                    (visible ? 1 : 0) < (bestVisible ? 1 : 0))
+                    continue;
+                if (bestIndex >= 0 && visible == bestVisible && debt < bestDebt)
+                    continue;
+                if (bestIndex >= 0 && visible == bestVisible && debt == bestDebt &&
+                    i >= bestIndex)
+                    continue;
+
+                bestIndex = i;
+                bestVisible = visible;
+                bestDebt = debt;
+            }
+
+            if (bestIndex >= 0)
+            {
+                _blocks[bestIndex].Queued = false;
+                _queuedBlockCount = Mathf.Max(0, _queuedBlockCount - 1);
+            }
+            return bestIndex;
         }
 
         private void TryFinishInitialBuild()
         {
             if (InitialBuildComplete || !_firstLedgerApplied ||
                 _initialNeedsSettlement || _readbackPending ||
-                _dirtyQueue.Count > 0 || _inFlightCommits > 0)
+                _queuedBlockCount > 0 || _activeBatch != null)
                 return;
             for (int i = 0; i < _blocks.Count; i++)
                 if (!_blocks[i].Built)
@@ -575,8 +757,9 @@ namespace Genesis.RoomScan
             _ledgerFailed = false;
             _ownerSnapshot = null;
             _boundarySnapshot = null;
-            _dirtyQueue.Clear();
+            _queuedBlockCount = 0;
             _inFlightCommits = 0;
+            _activeBatch = null;
             _firstLedgerApplied = knownEmpty;
             _initialNeedsSettlement = !knownEmpty;
             InitialBuildComplete = knownEmpty;
@@ -618,7 +801,8 @@ namespace Genesis.RoomScan
             for (int i = 0; i < _blocks.Count; i++)
                 _blocks[i].Dispose();
             _blocks.Clear();
-            _dirtyQueue.Clear();
+            _queuedBlockCount = 0;
+            _activeBatch = null;
         }
     }
 }

@@ -102,8 +102,8 @@ namespace Genesis.RoomScan
         private float dirtyLedgerReadbackHz = 5f;
 
         [Header("InfiniTAM Block Extraction")]
-        [SerializeField, Range(1, 4), Tooltip("Maximum baseline TSDF blocks extracted per mesh tick.")]
-        private int infiniTamBlocksPerTick = 2;
+        [SerializeField, Range(1, 4), Tooltip("Maximum current dirty TSDF blocks admitted to one atomic mesh batch. The room baseline owns four blocks, so production publishes the whole current dirty set together.")]
+        private int infiniTamBlocksPerBatch = 4;
         [SerializeField, Range(1, 4), Tooltip("Read-only TSDF halo around each baseline extraction block.")]
         private int infiniTamBlockHaloVoxels = 2;
         [SerializeField, Min(0.5f), Tooltip("Baseline dirty-block ledger polling rate.")]
@@ -160,6 +160,47 @@ namespace Genesis.RoomScan
         public string InfiniTamBlockStatsCompact => _infiniTamBlocks != null
             ? _infiniTamBlocks.CompactStats
             : "块前台待启动";
+        public bool InfiniTamTailProbeReady =>
+            IsInfiniTamBaselineActive && _infiniTamBlocks != null &&
+            !_infiniTamBlocks.Failed;
+        public int InfiniTamPendingBlockWork => _infiniTamBlocks?.PendingCount ?? 0;
+        public int InfiniTamOutstandingBlockCount =>
+            _infiniTamBlocks?.OutstandingBlockCount ?? 0;
+        public int InfiniTamQueuedBlockCount => _infiniTamBlocks?.QueuedCount ?? 0;
+        public int InfiniTamInFlightCommitCount =>
+            _infiniTamBlocks?.InFlightCommitCount ?? 0;
+        public ulong InfiniTamEpochDebt => _infiniTamBlocks?.EpochDebt ?? 0ul;
+        public long InfiniTamAcceptedCommitCount =>
+            _infiniTamBlocks?.AcceptedCommitCount ?? 0L;
+        public long InfiniTamCompletedBatchCount =>
+            _infiniTamBlocks?.CompletedBatchCount ?? 0L;
+        public long InfiniTamPublishedBatchCount =>
+            _infiniTamBlocks?.PublishedBatchCount ?? 0L;
+        public bool InfiniTamBatchInFlight =>
+            _infiniTamBlocks?.BatchInFlight ?? false;
+        public long InfiniTamDirtyLedgerApplyCount =>
+            _infiniTamBlocks?.DirtyLedgerApplyCount ?? 0L;
+        public long InfiniTamStaleCandidateDiscardCount =>
+            _infiniTamBlocks?.StaleCandidateDiscardCount ?? 0L;
+        public long InfiniTamCommittedVertexCount =>
+            _infiniTamBlocks?.CommittedVertexCount ?? 0L;
+        public long InfiniTamCommittedIndexCount =>
+            _infiniTamBlocks?.CommittedIndexCount ?? 0L;
+        public int InfiniTamVisibleBlockCount =>
+            _infiniTamBlocks?.VisibleBlockCount ?? 0;
+
+        public void RequestImmediateInfiniTamDirtyLedgerRefresh()
+        {
+            _infiniTamBlocks?.RequestImmediateDirtyLedgerRefresh();
+        }
+
+        public bool PrepareInfiniTamTailProbe()
+        {
+            if (!IsInfiniTamBaselineActive)
+                return false;
+            EnsureInfiniTamBaselineResources();
+            return InfiniTamTailProbeReady;
+        }
 
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;
@@ -511,6 +552,10 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            // One idempotent dirty set, one batch in flight, one publication.
+            // Scene serialization cannot silently restore the old per-block
+            // production queue that caused visible tail after fusion stopped.
+            infiniTamBlocksPerBatch = 4;
         }
 
         private void Start()
@@ -843,7 +888,7 @@ namespace Genesis.RoomScan
                     _volume, surfaceNetsCompute, scanMeshMaterial,
                     transform, gameObject.layer,
                     infiniTamBlockHaloVoxels,
-                    infiniTamBlocksPerTick,
+                    infiniTamBlocksPerBatch,
                     infiniTamDirtyReadbackHz,
                     infiniTamBlockVertexBudgetPercent,
                     ExtractInfiniTamBlock);
@@ -851,7 +896,7 @@ namespace Genesis.RoomScan
                 Logger.Info($"InfiniTAM block extractor ready: " +
                             $"chunk={_volume.ExtractionChunkSize}³, " +
                             $"halo={infiniTamBlockHaloVoxels}, " +
-                            $"budget={infiniTamBlocksPerTick}/tick");
+                            $"batch={infiniTamBlocksPerBatch} blocks");
             }
             catch (Exception ex)
             {

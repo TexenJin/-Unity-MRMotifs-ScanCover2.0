@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -642,6 +645,10 @@ namespace Genesis.RoomScan
         private UnityEngine.UI.Text _statusBadgeText;
         private UnityEngine.UI.Text _statusBadgeHeaderText;
         private UnityEngine.UI.Text _statusBadgeRightText;
+        private GameObject _statusBadgeRoot;
+        private bool _statusBadgeCreationPending;
+        private bool _meshTailSealHudForcedVisible;
+        private string _meshTailSealHudState = "未开始";
         private const float DiagnosticHudWidth = 2100f;
         private const float DiagnosticHudHeaderHeight = 104f;
         private const float DiagnosticHudPadding = 24f;
@@ -679,6 +686,30 @@ namespace Genesis.RoomScan
         private float _lastScannerLog;
         private int _integrateCount;
 
+        // Isolated production-tail validation.  While active, the authoritative
+        // TSDF receives no writes; only the existing InfiniTAM dirty ledger,
+        // extraction queue and immutable-front commits are allowed to drain.
+        private const float MeshTailValidationTimeoutSeconds = 20f;
+        private const int MeshTailValidationStableTicks = 4;
+        private bool _meshTailValidationActive;
+        private float _meshTailValidationStartedAt;
+        private DateTime _meshTailValidationStartedUtc;
+        private int _meshTailValidationStableTicks;
+        private int _meshTailStartIntegrationCount;
+        private uint _meshTailStartDirtyEpoch;
+        private long _meshTailStartLedgerApplyCount;
+        private long _meshTailStartAcceptedCommitCount;
+        private long _meshTailStartCompletedBatchCount;
+        private long _meshTailStartPublishedBatchCount;
+        private long _meshTailStartStaleDiscardCount;
+        private long _meshTailStartVertexCount;
+        private long _meshTailStartIndexCount;
+        private int _meshTailStartVisibleBlocks;
+        private string _meshTailValidationOutputPath = string.Empty;
+        private bool _meshTailReasonLedgerSealRequested;
+        private string _meshTailReasonLedgerSessionDirectory = string.Empty;
+        private readonly StringBuilder _meshTailValidationSamples = new StringBuilder(4096);
+
         private float IntegrationInterval => 1f / Mathf.Max(1f, integrationHz);
         private float MeshInterval => 1f / Mathf.Max(1f, meshExtractionHz);
 
@@ -705,10 +736,10 @@ namespace Genesis.RoomScan
                 // renderer.  Do not let a serialized A/B flag tear it down and
                 // replace it with HERA/freeze acquisition during StartScanning.
                 enableFrozenChunkAbExperiment = false;
-                // V1 still uses a whole-volume stateless Surface Nets readout.
-                // Keep it off the 12 Hz production cadence until the next stage
-                // replaces it with blockwise Marching Cubes/model raycast.
-                meshExtractionHz = Mathf.Min(meshExtractionHz, 4f);
+                // One block at 5 Hz matches the dirty-ledger cadence: the mesh
+                // gets a predictable small slot instead of two-block bursts
+                // after fusion has starved it for 1.5 intervals.
+                meshExtractionHz = 5f;
             }
             SyncCaptureModeIdentity();
             EnsureManagementBlockWireOverlay();
@@ -764,8 +795,24 @@ namespace Genesis.RoomScan
 
         private System.Collections.IEnumerator CreateStatusBadgeWhenCameraReady()
         {
+            if (_statusBadgeRoot != null)
+            {
+                _statusBadgeRoot.SetActive(true);
+                yield break;
+            }
+            if (_statusBadgeCreationPending)
+                yield break;
+            _statusBadgeCreationPending = true;
+
             while (Camera.main == null)
                 yield return null;
+
+            if (_statusBadgeRoot != null)
+            {
+                _statusBadgeRoot.SetActive(true);
+                _statusBadgeCreationPending = false;
+                yield break;
+            }
 
             Font font = null;
             try { font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); } catch { }
@@ -775,6 +822,7 @@ namespace Genesis.RoomScan
             }
 
             var root = new GameObject("[QRS] Minimal Status Badge");
+            _statusBadgeRoot = root;
             root.transform.SetParent(Camera.main.transform, false);
             // Keep the compact operator prompt close to the optical centre.
             // A centred pivot prevents its two-line height from pushing the
@@ -832,7 +880,23 @@ namespace Genesis.RoomScan
                 badgeMaterial, 0f, 0.5f, DiagnosticHudHeaderHeight);
             _statusBadgeRightText = CreateDiagnosticHudText(root.transform, "Attribution", font,
                 badgeMaterial, 0.5f, 1f, DiagnosticHudHeaderHeight);
+            _statusBadgeCreationPending = false;
             RefreshStatusBadge();
+        }
+
+        private void ShowMeshTailSealHud(string tailState)
+        {
+            _meshTailSealHudForcedVisible = true;
+            _meshTailSealHudState = string.IsNullOrEmpty(tailState) ? "处理中" : tailState;
+            if (_statusBadgeRoot != null)
+            {
+                _statusBadgeRoot.SetActive(true);
+                RefreshStatusBadge();
+                return;
+            }
+
+            if (!_statusBadgeCreationPending)
+                StartCoroutine(CreateStatusBadgeWhenCameraReady());
         }
 
         private static UnityEngine.UI.Text CreateDiagnosticHudText(Transform root, string name,
@@ -1190,10 +1254,23 @@ namespace Genesis.RoomScan
             _statusBadgeHeaderText.fontSize = 50;
             _statusBadgeHeaderText.fontStyle = FontStyle.Bold;
             _statusBadgeHeaderText.alignment = TextAnchor.UpperCenter;
-            _statusBadgeHeaderText.text =
-                $"▶ {primaryPrompt}\n" +
-                $"状态[{runState}] 视图[{viewState}] 种面[{seedState}] " +
-                $"准入[{productionAdmission}]{baselineProgress}{baselineTicket}";
+            if (_meshTailSealHudForcedVisible)
+            {
+                string reasonSealHud = _meshTailReasonLedgerSealRequested
+                    ? sealHud
+                    : "封包[无活动账] 校验000% 安全退出[无账]";
+                _statusBadgeHeaderText.text =
+                    "▶ A键：双账封口\n" +
+                    $"原因账　{reasonSealHud}\n" +
+                    $"尾随账　[{_meshTailSealHudState}]";
+            }
+            else
+            {
+                _statusBadgeHeaderText.text =
+                    $"▶ {primaryPrompt}\n" +
+                    $"状态[{runState}] 视图[{viewState}] 种面[{seedState}] " +
+                    $"准入[{productionAdmission}]{baselineProgress}{baselineTicket}";
+            }
 
             // The evidence ledger keeps running, but defaults to hidden.  The
             // headset operator sees only the next action and the few states
@@ -2071,6 +2148,15 @@ namespace Genesis.RoomScan
                 ApplyDisplayMode();
             }
 
+            // Tail validation deliberately bypasses the ordinary fusion branch.
+            // Depth capture may remain alive during the short observation window,
+            // but no frame is allowed to reach VolumeIntegrator.Integrate().
+            if (_meshTailValidationActive)
+            {
+                TickMeshTailValidation();
+                return;
+            }
+
             if (enableFrozenChunkAbExperiment && _chunkAbFrozen)
             {
                 float replayTime = Time.time;
@@ -2169,14 +2255,16 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            // A full 256^3 extraction is substantially heavier than one fusion
-            // pass on Quest. Never stack both on the same frame during normal
-            // operation. If frame rate is already below target, reserve an
-            // extraction-only frame after 1.5 mesh intervals so the visible
-            // mesh keeps advancing instead of starving behind integration.
-            bool meshStarved = meshDue &&
-                               t - _lastMeshTime >= MeshInterval * 1.5f;
-            bool integrateThisFrame = integrationDue && !meshStarved;
+            // Never stack fusion and extraction on the same frame.  The
+            // InfiniTAM route owns a fixed small mesh slot as soon as it is due;
+            // other routes retain the old starvation fallback.  This keeps the
+            // visible front close to the authoritative TSDF without raising the
+            // total block throughput or creating a catch-up burst.
+            bool infiniTamFixedMeshSlot = _volumeIntegrator != null &&
+                                          _volumeIntegrator.InfiniTamBaselineEnabled;
+            bool meshOwnsFrame = meshDue && (infiniTamFixedMeshSlot ||
+                t - _lastMeshTime >= MeshInterval * 1.5f);
+            bool integrateThisFrame = integrationDue && !meshOwnsFrame;
 
             if (integrateThisFrame)
             {
@@ -3763,6 +3851,345 @@ namespace Genesis.RoomScan
         // ─────────────────────────────────────────────────────────────
 
         /// <summary>
+        /// Freeze TSDF production and let only the InfiniTAM block extractor
+        /// drain.  This is a read/observe experiment: it changes no fusion,
+        /// extraction, crease or publication threshold.
+        /// </summary>
+        public bool TryBeginInfiniTamMeshTailValidation()
+        {
+            if (_meshTailValidationActive)
+                return true;
+            if (!IsScanning || _volumeIntegrator == null || _meshExtractor == null ||
+                !_volumeIntegrator.InfiniTamBaselineEnabled)
+                return false;
+
+            // A is the single production endpoint.  Stop the full replay first
+            // so its last accepted depth/fusion rows describe the exact TSDF
+            // that is frozen below.  ScanReplaySessionPackage.End drains and
+            // seals asynchronously, while this method independently drains the
+            // mesh queue; neither path may admit another source frame.
+            _meshTailReasonLedgerSessionDirectory = _depthCapture != null
+                ? _depthCapture.PairedFrameCaptureDirectory
+                : string.Empty;
+            _meshTailReasonLedgerSealRequested = _depthCapture != null &&
+                                                 _depthCapture.PairedFrameCaptureActive;
+            if (_meshTailReasonLedgerSealRequested)
+            {
+                _depthCapture.TogglePairedFrameCapture();
+                Logger.Info("A键：完整原因账已停止采样并开始排空封包：" +
+                            _meshTailReasonLedgerSessionDirectory);
+            }
+            else
+            {
+                Logger.Warning("A键：没有活动的完整原因账；仍继续冻结并检查网格尾随");
+            }
+            ShowMeshTailSealHud("准备排空");
+
+            if (!_meshExtractor.PrepareInfiniTamTailProbe())
+            {
+                _meshTailSealHudState = "未启动：分块网格未就绪";
+                WriteRejectedMeshTailReceipt("infinitam_block_pipeline_not_ready");
+                // A remains a hard production endpoint even when the tail
+                // extractor cannot start: the reason ledger is already sealed,
+                // so accepting more TSDF writes here would split the two books.
+                if (IsScanning)
+                    PauseScanning();
+                NotifyInput(_meshTailReasonLedgerSealRequested
+                    ? "原因账封口中·尾随未启动：分块网格尚未就绪"
+                    : "尾随验证未启动：分块网格尚未就绪");
+                Logger.Warning("网格尾随验证未启动：InfiniTAM 分块提取器尚未就绪");
+                RefreshStatusBadge();
+                return true;
+            }
+
+            _meshTailValidationActive = true;
+            _meshTailSealHudState = "排空中";
+            _meshTailValidationStartedAt = Time.realtimeSinceStartup;
+            _meshTailValidationStartedUtc = DateTime.UtcNow;
+            _meshTailValidationStableTicks = 0;
+            _meshTailStartIntegrationCount = _volumeIntegrator.IntegrationCount;
+            _meshTailStartDirtyEpoch = _volumeIntegrator.DirtyEpoch;
+            _meshTailStartLedgerApplyCount = _meshExtractor.InfiniTamDirtyLedgerApplyCount;
+            _meshTailStartAcceptedCommitCount = _meshExtractor.InfiniTamAcceptedCommitCount;
+            _meshTailStartCompletedBatchCount = _meshExtractor.InfiniTamCompletedBatchCount;
+            _meshTailStartPublishedBatchCount = _meshExtractor.InfiniTamPublishedBatchCount;
+            _meshTailStartStaleDiscardCount =
+                _meshExtractor.InfiniTamStaleCandidateDiscardCount;
+            _meshTailStartVertexCount = _meshExtractor.InfiniTamCommittedVertexCount;
+            _meshTailStartIndexCount = _meshExtractor.InfiniTamCommittedIndexCount;
+            _meshTailStartVisibleBlocks = _meshExtractor.InfiniTamVisibleBlockCount;
+            _meshTailValidationSamples.Clear();
+            _meshTailValidationSamples.AppendLine(
+                "seconds,integration_count,dirty_epoch,ledger_applies,accepted_commits," +
+                "completed_batches,published_batches,batch_in_flight,stale_discards," +
+                "queued,in_flight,outstanding,epoch_debt,visible_blocks,vertices,indices");
+            AppendMeshTailValidationSample(0f);
+
+            // Create the receipt at entry, not only at successful completion.
+            // A missing file therefore means the A route never entered this
+            // experiment; a RUNNING file means it entered but did not seal.
+            _meshTailValidationOutputPath = string.Empty;
+            try
+            {
+                string directory = Path.Combine(Application.persistentDataPath,
+                    "ScanCoverDiagnostics");
+                Directory.CreateDirectory(directory);
+                string stamp = _meshTailValidationStartedUtc.ToString(
+                    "yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+                _meshTailValidationOutputPath = Path.Combine(directory,
+                    $"mesh_tail_{stamp}.txt");
+                var runningReceipt = new StringBuilder(512);
+                runningReceipt.AppendLine("schema=mesh_tail_validation_v4");
+                runningReceipt.AppendLine("state=RUNNING");
+                runningReceipt.AppendLine("authority=diagnostic_only_no_production_threshold_changes");
+                runningReceipt.AppendLine("acceptance=tsdf_frozen_and_drained_and_published_batches_after_freeze_lte_1");
+                runningReceipt.AppendLine($"started_utc={_meshTailValidationStartedUtc:O}");
+                runningReceipt.AppendLine($"integration_count_start={_meshTailStartIntegrationCount}");
+                runningReceipt.AppendLine($"dirty_epoch_start={_meshTailStartDirtyEpoch}");
+                runningReceipt.AppendLine($"completed_batches_start={_meshTailStartCompletedBatchCount}");
+                runningReceipt.AppendLine($"published_batches_start={_meshTailStartPublishedBatchCount}");
+                runningReceipt.AppendLine($"stale_discards_start={_meshTailStartStaleDiscardCount}");
+                runningReceipt.AppendLine($"reason_ledger_seal_requested={_meshTailReasonLedgerSealRequested.ToString().ToLowerInvariant()}");
+                runningReceipt.AppendLine($"reason_ledger_session={_meshTailReasonLedgerSessionDirectory}");
+                runningReceipt.AppendLine($"pipeline_start={_meshExtractor.InfiniTamBlockStatsCompact}");
+                File.WriteAllText(_meshTailValidationOutputPath,
+                    runningReceipt.ToString(), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"网格尾随验证入口小票写入失败: {ex.Message}");
+            }
+
+            // Force the first post-freeze dirty-ledger observation instead of
+            // waiting for the ordinary 5 Hz deadline left by the live scan.
+            _meshExtractor.RequestImmediateInfiniTamDirtyLedgerRefresh();
+            _lastMeshTime = 0f;
+            _hudStatus = _meshTailReasonLedgerSealRequested
+                ? "原因账封口中·TSDF冻结·排空网格尾随"
+                : "无活动原因账·TSDF冻结·排空网格尾随";
+            NotifyInput(_meshTailReasonLedgerSealRequested
+                ? "A键：原因账封口＋尾随排空已开始"
+                : "A键：尾随排空已开始（无活动原因账）");
+            Logger.Info($"网格尾随验证开始: 融合={_meshTailStartIntegrationCount}, " +
+                        $"脏纪元={_meshTailStartDirtyEpoch}, " +
+                        $"提交={_meshTailStartAcceptedCommitCount}, " +
+                        $"发布批={_meshTailStartPublishedBatchCount}, " +
+                        $"{_meshExtractor.InfiniTamBlockStatsCompact}");
+            RefreshStatusBadge();
+            return true;
+        }
+
+        private void TickMeshTailValidation()
+        {
+            if (!_meshTailValidationActive || _meshExtractor == null ||
+                _volumeIntegrator == null)
+                return;
+
+            float now = Time.realtimeSinceStartup;
+            float elapsed = now - _meshTailValidationStartedAt;
+            if (now - _lastMeshTime >= MeshInterval)
+            {
+                _lastMeshTime = now;
+                _meshExtractor.Extract();
+                MeshExtracted?.Invoke();
+                AppendMeshTailValidationSample(elapsed);
+
+                bool fusionFrozen =
+                    _volumeIntegrator.IntegrationCount == _meshTailStartIntegrationCount &&
+                    _volumeIntegrator.DirtyEpoch == _meshTailStartDirtyEpoch;
+                bool ledgerObservedAfterFreeze =
+                    _meshExtractor.InfiniTamDirtyLedgerApplyCount >
+                    _meshTailStartLedgerApplyCount;
+                bool drained = ledgerObservedAfterFreeze &&
+                    _meshExtractor.InfiniTamPendingBlockWork == 0 &&
+                    _meshExtractor.InfiniTamOutstandingBlockCount == 0 &&
+                    _meshExtractor.InfiniTamEpochDebt == 0ul;
+
+                _meshTailValidationStableTicks = fusionFrozen && drained
+                    ? _meshTailValidationStableTicks + 1
+                    : 0;
+
+                if (!fusionFrozen)
+                {
+                    FinishMeshTailValidation("INVALID_TSDF_CHANGED", false);
+                    return;
+                }
+
+                if (elapsed >= 1f &&
+                    _meshTailValidationStableTicks >= MeshTailValidationStableTicks)
+                {
+                    FinishMeshTailValidation("DRAINED", false);
+                    return;
+                }
+            }
+
+            if (elapsed >= MeshTailValidationTimeoutSeconds)
+                FinishMeshTailValidation("TIMEOUT_WITH_BACKLOG", true);
+        }
+
+        private void AppendMeshTailValidationSample(float elapsed)
+        {
+            if (_meshExtractor == null || _volumeIntegrator == null)
+                return;
+            _meshTailValidationSamples
+                .Append(elapsed.ToString("F3", CultureInfo.InvariantCulture)).Append(',')
+                .Append(_volumeIntegrator.IntegrationCount).Append(',')
+                .Append(_volumeIntegrator.DirtyEpoch).Append(',')
+                .Append(_meshExtractor.InfiniTamDirtyLedgerApplyCount).Append(',')
+                .Append(_meshExtractor.InfiniTamAcceptedCommitCount).Append(',')
+                .Append(_meshExtractor.InfiniTamCompletedBatchCount).Append(',')
+                .Append(_meshExtractor.InfiniTamPublishedBatchCount).Append(',')
+                .Append(_meshExtractor.InfiniTamBatchInFlight ? 1 : 0).Append(',')
+                .Append(_meshExtractor.InfiniTamStaleCandidateDiscardCount).Append(',')
+                .Append(_meshExtractor.InfiniTamQueuedBlockCount).Append(',')
+                .Append(_meshExtractor.InfiniTamInFlightCommitCount).Append(',')
+                .Append(_meshExtractor.InfiniTamOutstandingBlockCount).Append(',')
+                .Append(_meshExtractor.InfiniTamEpochDebt).Append(',')
+                .Append(_meshExtractor.InfiniTamVisibleBlockCount).Append(',')
+                .Append(_meshExtractor.InfiniTamCommittedVertexCount).Append(',')
+                .Append(_meshExtractor.InfiniTamCommittedIndexCount).AppendLine();
+        }
+
+        private void FinishMeshTailValidation(string drainState, bool timedOut)
+        {
+            if (!_meshTailValidationActive)
+                return;
+            _meshTailValidationActive = false;
+
+            float elapsed = Time.realtimeSinceStartup - _meshTailValidationStartedAt;
+            AppendMeshTailValidationSample(elapsed);
+            int endIntegrations = _volumeIntegrator != null
+                ? _volumeIntegrator.IntegrationCount : -1;
+            uint endDirtyEpoch = _volumeIntegrator != null
+                ? _volumeIntegrator.DirtyEpoch : 0u;
+            long endCommits = _meshExtractor != null
+                ? _meshExtractor.InfiniTamAcceptedCommitCount : -1L;
+            long endCompletedBatches = _meshExtractor != null
+                ? _meshExtractor.InfiniTamCompletedBatchCount : -1L;
+            long endPublishedBatches = _meshExtractor != null
+                ? _meshExtractor.InfiniTamPublishedBatchCount : -1L;
+            long endStaleDiscards = _meshExtractor != null
+                ? _meshExtractor.InfiniTamStaleCandidateDiscardCount : -1L;
+            long endVertices = _meshExtractor != null
+                ? _meshExtractor.InfiniTamCommittedVertexCount : -1L;
+            long endIndices = _meshExtractor != null
+                ? _meshExtractor.InfiniTamCommittedIndexCount : -1L;
+            int endVisibleBlocks = _meshExtractor != null
+                ? _meshExtractor.InfiniTamVisibleBlockCount : -1;
+            long commitDelta = Math.Max(0L, endCommits - _meshTailStartAcceptedCommitCount);
+            long completedBatchDelta = Math.Max(0L,
+                endCompletedBatches - _meshTailStartCompletedBatchCount);
+            long publishedBatchDelta = Math.Max(0L,
+                endPublishedBatches - _meshTailStartPublishedBatchCount);
+            long staleDiscardDelta = Math.Max(0L,
+                endStaleDiscards - _meshTailStartStaleDiscardCount);
+            bool fusionFrozen = endIntegrations == _meshTailStartIntegrationCount &&
+                                endDirtyEpoch == _meshTailStartDirtyEpoch;
+            string verdict = !fusionFrozen
+                ? "INVALID_TSDF_CHANGED"
+                : timedOut
+                    ? "TAIL_BACKLOG_TIMEOUT"
+                    : publishedBatchDelta == 0
+                        ? "NO_TAIL_OBSERVED_IN_THIS_WINDOW"
+                        : publishedBatchDelta == 1
+                            ? "BOUNDED_SINGLE_BATCH_TAIL"
+                            : "MULTI_BATCH_TAIL";
+
+            string outputPath = string.Empty;
+            try
+            {
+                outputPath = _meshTailValidationOutputPath;
+                if (string.IsNullOrEmpty(outputPath))
+                {
+                    string directory = Path.Combine(Application.persistentDataPath,
+                        "ScanCoverDiagnostics");
+                    Directory.CreateDirectory(directory);
+                    string stamp = _meshTailValidationStartedUtc.ToString(
+                        "yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+                    outputPath = Path.Combine(directory, $"mesh_tail_{stamp}.txt");
+                }
+                var report = new StringBuilder(8192);
+                report.AppendLine("schema=mesh_tail_validation_v4");
+                report.AppendLine("state=SEALED");
+                report.AppendLine("authority=diagnostic_only_no_production_threshold_changes");
+                report.AppendLine("acceptance=tsdf_frozen_and_drained_and_published_batches_after_freeze_lte_1");
+                report.AppendLine($"verdict={verdict}");
+                report.AppendLine($"drain_state={drainState}");
+                report.AppendLine($"elapsed_seconds={elapsed.ToString("F3", CultureInfo.InvariantCulture)}");
+                report.AppendLine($"tsdf_frozen={fusionFrozen.ToString().ToLowerInvariant()}");
+                report.AppendLine($"integration_count={_meshTailStartIntegrationCount}->{endIntegrations}");
+                report.AppendLine($"dirty_epoch={_meshTailStartDirtyEpoch}->{endDirtyEpoch}");
+                report.AppendLine($"accepted_block_commits_after_freeze={commitDelta}");
+                report.AppendLine($"completed_mesh_batches_after_freeze={completedBatchDelta}");
+                report.AppendLine($"published_mesh_batches_after_freeze={publishedBatchDelta}");
+                report.AppendLine($"stale_candidate_discards_after_freeze={staleDiscardDelta}");
+                report.AppendLine($"visible_blocks={_meshTailStartVisibleBlocks}->{endVisibleBlocks}");
+                report.AppendLine($"committed_vertices={_meshTailStartVertexCount}->{endVertices}");
+                report.AppendLine($"committed_indices={_meshTailStartIndexCount}->{endIndices}");
+                report.AppendLine($"reason_ledger_seal_requested={_meshTailReasonLedgerSealRequested.ToString().ToLowerInvariant()}");
+                report.AppendLine($"reason_ledger_session={_meshTailReasonLedgerSessionDirectory}");
+                report.AppendLine($"final_pipeline={_meshExtractor?.InfiniTamBlockStatsCompact ?? "missing"}");
+                report.AppendLine();
+                report.Append(_meshTailValidationSamples);
+                File.WriteAllText(outputPath, report.ToString(), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"网格尾随验证小票写入失败: {ex.Message}");
+            }
+
+            if (IsScanning)
+                PauseScanning();
+            string shortVerdict = !fusionFrozen
+                ? "验证无效：TSDF发生写入"
+                : timedOut
+                    ? $"尾随未排空：提交{commitDelta}块后仍超时"
+                    : publishedBatchDelta == 0
+                        ? "无生产尾随"
+                        : publishedBatchDelta == 1
+                            ? $"尾随受控：仅1批（{commitDelta}块）"
+                            : $"尾随未收束：{publishedBatchDelta}批（{commitDelta}块）";
+            _meshTailSealHudState = !fusionFrozen
+                ? "无效：TSDF发生写入"
+                : timedOut
+                    ? "未排空：超时"
+                    : "已排空";
+            _hudStatus = shortVerdict;
+            NotifyInput(shortVerdict);
+            Logger.Info($"网格尾随验证结束: {shortVerdict}, {elapsed:F2}s, " +
+                        $"小票={outputPath}");
+            RefreshStatusBadge();
+        }
+
+        private void WriteRejectedMeshTailReceipt(string reason)
+        {
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                string directory = Path.Combine(Application.persistentDataPath,
+                    "ScanCoverDiagnostics");
+                Directory.CreateDirectory(directory);
+                string path = Path.Combine(directory,
+                    $"mesh_tail_{now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)}.txt");
+                var receipt = new StringBuilder(384);
+                receipt.AppendLine("schema=mesh_tail_validation_v4");
+                receipt.AppendLine("state=REJECTED");
+                receipt.AppendLine($"reason={reason}");
+                receipt.AppendLine($"created_utc={now:O}");
+                receipt.AppendLine($"is_scanning={IsScanning.ToString().ToLowerInvariant()}");
+                receipt.AppendLine($"infinitam_baseline={(_volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled).ToString().ToLowerInvariant()}");
+                receipt.AppendLine($"reason_ledger_seal_requested={_meshTailReasonLedgerSealRequested.ToString().ToLowerInvariant()}");
+                receipt.AppendLine($"reason_ledger_session={_meshTailReasonLedgerSessionDirectory}");
+                receipt.AppendLine($"pipeline={_meshExtractor?.InfiniTamBlockStatsCompact ?? "missing"}");
+                File.WriteAllText(path, receipt.ToString(), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"网格尾随验证拒绝小票写入失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
         /// 开始（或暂停后继续）深度融合与网格提取。
         /// 保留 QRS 原版的异步分段启动：先提交 GPU 大资源（TSDF ~150MB +
         /// Surface Nets ~480MB），跨帧 yield 两次后再启用透视相机与深度，
@@ -3804,6 +4231,12 @@ namespace Genesis.RoomScan
                 bool resuming = HasStarted;
                 if (!resuming)
                 {
+                    // A-only seal HUD survives long enough for the operator to
+                    // read 安全退出[是], then disappears with the next fresh roll.
+                    _meshTailSealHudForcedVisible = false;
+                    _meshTailSealHudState = "未开始";
+                    if (_statusBadgeRoot != null && !showOperatorHud)
+                        _statusBadgeRoot.SetActive(false);
                     _instantDepthShellOverlay?.ResetProductionWitnessLedger();
                     if (!(_volumeIntegrator != null &&
                           _volumeIntegrator.InfiniTamBaselineEnabled) &&

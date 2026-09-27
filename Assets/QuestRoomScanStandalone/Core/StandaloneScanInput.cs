@@ -5,7 +5,7 @@ namespace Genesis.RoomScan
     /// <summary>
     /// QRS 独立测试链的右手柄输入：
     ///   扳机       = 开始 / 继续采集共享 TSDF
-    ///   A          = 冻结共享 TSDF；即时外壳档中切换世界锁定定格，生产继续
+    ///   A          = InfiniTAM 档封口完整原因账、冻结 TSDF 并排空网格尾随；即时外壳档中切换世界锁定定格
     ///   Y          = 在 64³ / 32³ / 16³ 只读回放档之间循环
     ///   B          = 只导出并清空当前档，不清共享 TSDF
     ///   右摇杆按下 = 一键回到真实 TSDF 的生产纸皮观察档；
@@ -50,13 +50,18 @@ namespace Genesis.RoomScan
                 }
             }
 
-            // A：冻结同一份 TSDF；片状采集标记必须先隐藏。
+            // A：即时壳保持原定格语义；InfiniTAM 生产档先封口完整原因账，
+            // 再冻结 TSDF、排空分块提取/提交队列并写出尾随验证小票。
             if (OVRInput.GetDown(OVRInput.Button.One, controller))
             {
                 scanner.NotifyInput("A键");
                 if (scanner.TryToggleInstantShellFreeze())
                 {
                     Pulse();
+                }
+                else if (scanner.TryBeginInfiniTamMeshTailValidation())
+                {
+                    Pulse(0.5f, 0.5f);
                 }
                 else if (scanner.IsChunkAbExperimentEnabled)
                 {
