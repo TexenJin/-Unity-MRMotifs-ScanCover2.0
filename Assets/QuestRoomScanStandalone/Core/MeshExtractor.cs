@@ -102,8 +102,8 @@ namespace Genesis.RoomScan
         private float dirtyLedgerReadbackHz = 5f;
 
         [Header("InfiniTAM Block Extraction")]
-        [SerializeField, Range(1, 4), Tooltip("Maximum current dirty TSDF blocks admitted to one atomic mesh batch. The room baseline owns four blocks, so production publishes the whole current dirty set together.")]
-        private int infiniTamBlocksPerBatch = 4;
+        [SerializeField, Range(1, 4), Tooltip("Hard GPU work budget per mesh slot. Production admits one dirty TSDF block at a time so extraction cannot submit all four room blocks as one burst.")]
+        private int infiniTamBlocksPerBatch = 1;
         [SerializeField, Range(1, 4), Tooltip("Read-only TSDF halo around each baseline extraction block.")]
         private int infiniTamBlockHaloVoxels = 2;
         [SerializeField, Min(0.5f), Tooltip("Baseline dirty-block ledger polling rate.")]
@@ -211,6 +211,11 @@ namespace Genesis.RoomScan
         private GPUChunkMeshSnapshot _infiniTamFront;
         private GPUChunkMeshSnapshot _infiniTamBack;
         private InfiniTamBlockMeshPipeline _infiniTamBlocks;
+        // The whole-volume path owns exactly one bootstrap extraction slot per
+        // block-front generation.  Once that slot has been issued, live mesh
+        // slots advance only the block pipeline unless it explicitly fails.
+        private bool _infiniTamBootstrapExtractionIssued;
+        private bool _infiniTamBlocksOwnedForeground;
         private CoarseSkinRenderer _coarseSkin;
         private SupportTruthRenderer _supportTruth;
         private enum RouteValidationView
@@ -552,10 +557,10 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
-            // One idempotent dirty set, one batch in flight, one publication.
-            // Scene serialization cannot silently restore the old per-block
-            // production queue that caused visible tail after fusion stopped.
-            infiniTamBlocksPerBatch = 4;
+            // One idempotent dirty set and one block in flight. Scene
+            // serialization cannot silently restore the four-block GPU burst;
+            // newer dirty epochs are coalesced and followed after publication.
+            infiniTamBlocksPerBatch = 1;
         }
 
         private void Start()
@@ -1581,15 +1586,65 @@ namespace Genesis.RoomScan
                     if (_gpuRenderer != null)
                         _gpuRenderer.RenderVisible = false;
                     DisposeInfiniTamBaselineFronts();
+                    _infiniTamBootstrapExtractionIssued = false;
+                    _infiniTamBlocksOwnedForeground = false;
                     LastVertexCount = 0;
                     LastIndexCount = 0;
                     return;
                 }
-                _infiniTamBlocks?.Tick();
 
-                if (_infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
-                    _infiniTamBlocks.InitialBuildComplete)
+                // A topology reset starts a new block-front generation. Give
+                // that generation one fresh whole-volume bootstrap, but never
+                // turn it back into a continuous second extraction pipeline.
+                if (_infiniTamBlocksOwnedForeground &&
+                    _infiniTamBlocks != null &&
+                    !_infiniTamBlocks.InitialBuildComplete)
                 {
+                    _infiniTamBootstrapExtractionIssued = false;
+                    _infiniTamBlocksOwnedForeground = false;
+                }
+
+                if (_infiniTamBlocks == null || _infiniTamBlocks.Failed)
+                {
+                    // Explicit block-pipeline failure is the sole live-scan
+                    // reason to resume continuous whole-volume extraction.
+                    _infiniTamBlocksOwnedForeground = false;
+                    if (_gpuSurfaceNets == null || _counterReadbackPending)
+                        return;
+                    _nextCounterReadbackTime = 0f;
+                    ExtractLegacyGlobal();
+                    return;
+                }
+
+                if (!_infiniTamBootstrapExtractionIssued &&
+                    !_infiniTamBlocks.InitialBuildComplete)
+                {
+                    // Keep the bootstrap and block dispatches in different mesh
+                    // slots. The immutable snapshot remains visible while the
+                    // block front builds, but it is not rebuilt every tick.
+                    if (_gpuSurfaceNets == null || _counterReadbackPending)
+                        return;
+                    _infiniTamBootstrapExtractionIssued = true;
+                    _nextCounterReadbackTime = 0f;
+                    ExtractLegacyGlobal();
+                    return;
+                }
+
+                _infiniTamBlocks.Tick();
+
+                if (_infiniTamBlocks.Failed)
+                {
+                    _infiniTamBlocksOwnedForeground = false;
+                    if (_gpuSurfaceNets == null || _counterReadbackPending)
+                        return;
+                    _nextCounterReadbackTime = 0f;
+                    ExtractLegacyGlobal();
+                    return;
+                }
+
+                if (_infiniTamBlocks.InitialBuildComplete)
+                {
+                    _infiniTamBlocksOwnedForeground = true;
                     _infiniTamBlocks.SetVisible(renderProductionMesh);
                     if (_gpuRenderer != null)
                         _gpuRenderer.RenderVisible = false;
@@ -1602,20 +1657,9 @@ namespace Genesis.RoomScan
                     return;
                 }
 
-                if (_gpuSurfaceNets == null) return;
-
-                // One working extraction stays in flight until its exact
-                // counters have been read and the immutable front is copied.
-                // This prevents a later extraction from changing the buffers
-                // between counter readback and snapshot publication.
-                if (_counterReadbackPending) return;
-                _nextCounterReadbackTime = 0f;
-
-                // Reuse the established counter readback transaction as well as
-                // its draw buffers.  This does not re-enable smoothing/history or
-                // any admission rule; it lets the compact HUD distinguish
-                // integration -> vertices -> indices -> visibility.
-                ExtractLegacyGlobal();
+                // The one bootstrap has already been issued. This mesh slot was
+                // consumed by the block Tick above; do not stack or repeat a
+                // whole-volume dispatch while the block pipeline is healthy.
                 return;
             }
 
@@ -1795,6 +1839,8 @@ namespace Genesis.RoomScan
         {
             _infiniTamBlocks?.Dispose();
             _infiniTamBlocks = null;
+            _infiniTamBootstrapExtractionIssued = false;
+            _infiniTamBlocksOwnedForeground = false;
         }
 
         private void ApplySnapshot(uint[] data)
@@ -2592,6 +2638,8 @@ namespace Genesis.RoomScan
             _ledgerOpen = false;
             _ledgerSamples.Clear();
             _ledgerSessionId = "未开始";
+            _infiniTamBootstrapExtractionIssued = false;
+            _infiniTamBlocksOwnedForeground = false;
             ResetLastSnapshot();
             ResetTemporalDiagnosticState();
             _persistentChunks?.ResetLocalReplacementLedger();

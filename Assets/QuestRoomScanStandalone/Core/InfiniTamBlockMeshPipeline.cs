@@ -92,7 +92,6 @@ namespace Genesis.RoomScan
         private bool _boundaryReady;
         private bool _ledgerFailed;
         private bool _firstLedgerApplied;
-        private bool _initialNeedsSettlement = true;
         private uint[] _ownerSnapshot;
         private uint[] _boundarySnapshot;
         private float _nextReadbackTime;
@@ -485,12 +484,18 @@ namespace Genesis.RoomScan
                     continue;
                 }
 
-                // A later fusion epoch supersedes this private back result.
-                // Keep the immutable front and carry one dirty bit forward.
-                if (item.CandidateEpoch < block.TargetEpoch)
+                // Generation and commit-serial checks above already prevent an
+                // obsolete callback from taking ownership. A candidate is stale
+                // only when this block has already published the same or a newer
+                // epoch. A newer dirty epoch arriving during extraction does not
+                // invalidate useful completed work: publish this bounded-lag
+                // front, then keep one coalesced dirty bit to chase the latest
+                // target on a later mesh slot.
+                if (block.Built && item.CandidateEpoch <= block.ProcessedEpoch)
                 {
                     _staleCandidateDiscardCount++;
-                    QueueBlock(block.Index, block.TargetEpoch, true);
+                    if (block.TargetEpoch > block.ProcessedEpoch)
+                        QueueBlock(block.Index, block.TargetEpoch, true);
                     continue;
                 }
 
@@ -504,14 +509,15 @@ namespace Genesis.RoomScan
                 block.Built = true;
                 _acceptedCommitCount++;
                 acceptedInBatch++;
+
+                if (block.TargetEpoch > block.ProcessedEpoch)
+                    QueueBlock(block.Index, block.TargetEpoch, true);
             }
 
             _completedBatchCount++;
             if (acceptedInBatch > 0)
                 _publishedBatchCount++;
             _activeBatch = null;
-            if (_queuedBlockCount == 0 && _inFlightCommits == 0)
-                _initialNeedsSettlement = false;
             ApplyVisibility();
             if (!InitialBuildComplete && _queuedBlockCount == 0)
                 _nextReadbackTime = 0f;
@@ -648,8 +654,6 @@ namespace Genesis.RoomScan
                     block.Built = true;
             }
             _firstLedgerApplied = true;
-            _initialNeedsSettlement = _queuedBlockCount > 0 ||
-                _activeBatch != null;
             TryFinishInitialBuild();
         }
 
@@ -660,40 +664,43 @@ namespace Genesis.RoomScan
             if ((!force && block.ProcessedEpoch >= block.TargetEpoch) || block.Queued)
                 return;
             block.Queued = true;
-            if (!InitialBuildComplete)
-                _initialNeedsSettlement = true;
             _queuedBlockCount++;
         }
 
         private int DequeueNextQueuedBlock()
         {
             int bestIndex = -1;
-            bool bestVisible = false;
+            int bestPriority = int.MinValue;
             uint bestDebt = 0;
 
             // The baseline currently owns only a handful of room-scale blocks,
             // so a linear scan is cheaper and more deterministic than maintaining
-            // another heap.  Visible stale fronts go first; within that class the
-            // largest epoch debt wins, then the stable block index breaks ties.
+            // another heap. During the first build, blocks without any committed
+            // front go first so takeover cannot expose a partial block set. After
+            // takeover, visibility is deliberately not a priority class: a visible
+            // block that stays hot must not starve a newly observed empty neighbour
+            // at the shared face. All queued blocks then compete by epoch debt, and
+            // the stable block index breaks exact ties.
             for (int i = 0; i < _blocks.Count; i++)
             {
                 Block block = _blocks[i];
                 if (!block.Queued)
                     continue;
-                bool visible = block.Built && block.IndexCount > 0;
+                int priority = !InitialBuildComplete
+                    ? (block.Built ? 0 : 1)
+                    : 0;
                 uint debt = block.TargetEpoch > block.ProcessedEpoch
                     ? block.TargetEpoch - block.ProcessedEpoch : 0u;
-                if (bestIndex >= 0 &&
-                    (visible ? 1 : 0) < (bestVisible ? 1 : 0))
+                if (bestIndex >= 0 && priority < bestPriority)
                     continue;
-                if (bestIndex >= 0 && visible == bestVisible && debt < bestDebt)
+                if (bestIndex >= 0 && priority == bestPriority && debt < bestDebt)
                     continue;
-                if (bestIndex >= 0 && visible == bestVisible && debt == bestDebt &&
+                if (bestIndex >= 0 && priority == bestPriority && debt == bestDebt &&
                     i >= bestIndex)
                     continue;
 
                 bestIndex = i;
-                bestVisible = visible;
+                bestPriority = priority;
                 bestDebt = debt;
             }
 
@@ -707,10 +714,15 @@ namespace Genesis.RoomScan
 
         private void TryFinishInitialBuild()
         {
-            if (InitialBuildComplete || !_firstLedgerApplied ||
-                _initialNeedsSettlement || _readbackPending ||
-                _queuedBlockCount > 0 || _activeBatch != null)
+            if (InitialBuildComplete || !_firstLedgerApplied)
                 return;
+
+            // InitialBuildComplete means that every block has a usable first
+            // front (including a proven-empty front), not that live fusion has
+            // stopped producing dirty debt. Requiring an empty queue/readback
+            // window makes takeover impossible during continuous scanning once
+            // the scheduler intentionally publishes bounded-lag candidates and
+            // immediately queues their latest epochs.
             for (int i = 0; i < _blocks.Count; i++)
                 if (!_blocks[i].Built)
                     return;
@@ -761,7 +773,6 @@ namespace Genesis.RoomScan
             _inFlightCommits = 0;
             _activeBatch = null;
             _firstLedgerApplied = knownEmpty;
-            _initialNeedsSettlement = !knownEmpty;
             InitialBuildComplete = knownEmpty;
             uint epoch = knownEmpty ? _volume.DirtyEpoch : 0u;
             for (int i = 0; i < _blocks.Count; i++)

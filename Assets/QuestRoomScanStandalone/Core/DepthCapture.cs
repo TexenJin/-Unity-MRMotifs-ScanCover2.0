@@ -1356,6 +1356,19 @@ namespace Genesis.RoomScan
         public bool EdgeCleanEnabled => enableDepthEdgeClean;
 
         /// <summary>
+        /// Quest production profile validated on-device: the bilateral pass does
+        /// not buy enough frame time or geometry quality to justify running it,
+        /// while edge cleaning remains the guard against cross-edge bridges.
+        /// This is intentionally separate from the three-state diagnostic cycle
+        /// so scene serialization cannot silently restore the expensive pass.
+        /// </summary>
+        public void ApplyProductionHalfPreprocessing()
+        {
+            enableBilateralFilter = false;
+            enableDepthEdgeClean = true;
+        }
+
+        /// <summary>
         /// 性能二分热键（scanner 转发）：深度预处理三态循环——
         /// 全开 → 半（关双边留缘洗，定位链内主猪/保幽灵桥防护）→ 全关 → 全开。
         /// 两个 pass 都由各自 enable 字段自门控、原位替换 _depthTex，运行时翻转

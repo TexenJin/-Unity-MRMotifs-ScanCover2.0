@@ -24,10 +24,24 @@ namespace Genesis.RoomScan
         public static StandaloneRoomScanner Instance { get; private set; }
 
         [Header("扫描频率")]
-        [SerializeField, Tooltip("TSDF 融合频率=GPU 最大单项负载。30Hz 实机被 ASW 压到 24fps  quarter 档（帧24→融合每帧到期→节拍饿死）；20Hz 泄压保帧率，扫描质量由运动闸兜底。 (scene 20)")]
-        private float integrationHz = 20f;
+        [SerializeField, Tooltip("TSDF 融合频率。Quest InfiniTAM 生产档实机验证 10Hz；网格生长由有界帧预算调度保证，不靠恢复 20Hz 硬顶。")]
+        private float integrationHz = 10f;
         [SerializeField, Range(1f, 15f), Tooltip("完整体积网格提取频率。融合保持高频，网格沿用上次结果直到下一次提取。08-18 帧率手术后 8→12（HERA 节拍 16→24/s），帧率跌破 50 退回 8。")]
         private float meshExtractionHz = 12f;
+
+        [Header("InfiniTAM 帧预算调度")]
+        [SerializeField, Tooltip("开=只在近期帧节拍健康时放行普通融合/提取；超过最长等待仍强制放行一次，防止网格停长。")]
+        private bool enableInfiniTamFrameBudget = true;
+        [SerializeField, Range(55f, 71f), Tooltip("恢复普通重任务前需达到的近期帧率。68fps 给 72Hz 合成器留少量余量。")]
+        private float infiniTamRecoveryFps = 68f;
+        [SerializeField, Range(1, 8), Tooltip("融合/提取后需连续多少个健康帧才放行下一个普通重任务。")]
+        private int infiniTamHealthyFramesBeforeWork = 3;
+        [SerializeField, Range(0.015f, 0.08f), Tooltip("任意两个融合/提取提交之间的最小间隔（秒），防止两者同时到期后连续两帧抢占。")]
+        private float infiniTamHeavyWorkMinSpacingSeconds = 0.035f;
+        [SerializeField, Range(1.5f, 4f), Tooltip("帧压力持续时，融合最多延期几个名义周期后必须放行一次。")]
+        private float infiniTamFusionMaxDelayIntervals = 2.5f;
+        [SerializeField, Range(2f, 6f), Tooltip("帧压力持续时，网格提取最多延期几个名义周期后必须放行一次。")]
+        private float infiniTamMeshMaxDelayIntervals = 3f;
 
         [Header("渲染")]
         [SerializeField, Tooltip("主显示形态：开=线框（QRS Wireframe，重心坐标边缘检测）；关=顶点色实体（QRS Vertex）")]
@@ -683,6 +697,9 @@ namespace Genesis.RoomScan
 
         private float _lastIntegrationTime;
         private float _lastMeshTime;
+        private float _lastInfiniTamHeavyWorkTime = -1000f;
+        private float _infiniTamFrameSecondsEma = 1f / 72f;
+        private int _infiniTamHealthyFrameStreak;
         private float _lastScannerLog;
         private int _integrateCount;
 
@@ -736,6 +753,11 @@ namespace Genesis.RoomScan
                 // renderer.  Do not let a serialized A/B flag tear it down and
                 // replace it with HERA/freeze acquisition during StartScanning.
                 enableFrozenChunkAbExperiment = false;
+                // Device A/B: 20Hz kept FPS in the 50s even with solid rendering;
+                // 10Hz recovered the 72Hz envelope. Lock the production cadence
+                // here so a serialized scene cannot silently restore 20Hz.
+                integrationHz = 10f;
+                _depthCapture?.ApplyProductionHalfPreprocessing();
                 // One block at 5 Hz matches the dirty-ledger cadence: the mesh
                 // gets a predictable small slot instead of two-block bursts
                 // after fusion has starved it for 1.5 intervals.
@@ -2176,6 +2198,7 @@ namespace Genesis.RoomScan
             if (!IsScanning || !DepthCapture.DepthAvailable) return;
 
             float t = Time.time;
+            UpdateInfiniTamFrameBudget();
             TickFrozenBlockSupervisor(t);
             bool directTruthRoute = _meshExtractor != null &&
                                     _meshExtractor.RouteValidationPausesHera;
@@ -2255,20 +2278,58 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            // Never stack fusion and extraction on the same frame.  The
-            // InfiniTAM route owns a fixed small mesh slot as soon as it is due;
-            // other routes retain the old starvation fallback.  This keeps the
-            // visible front close to the authoritative TSDF without raising the
-            // total block throughput or creating a catch-up burst.
+            // Never stack fusion and extraction on the same frame. InfiniTAM
+            // additionally admits ordinary work only after a short run of
+            // healthy rendered frames. Missed frames therefore create idle
+            // recovery space instead of a fusion/mesh catch-up pair on adjacent
+            // frames. Both paths retain a maximum deferral, so overload reduces
+            // cadence without ever turning mesh growth or fusion off.
             bool infiniTamFixedMeshSlot = _volumeIntegrator != null &&
                                           _volumeIntegrator.InfiniTamBaselineEnabled;
-            bool meshOwnsFrame = meshDue && (infiniTamFixedMeshSlot ||
-                t - _lastMeshTime >= MeshInterval * 1.5f);
-            bool integrateThisFrame = integrationDue && !meshOwnsFrame;
+            bool meshOwnsFrame;
+            bool integrateThisFrame;
+            if (infiniTamFixedMeshSlot && enableInfiniTamFrameBudget)
+            {
+                float integrationAge = t - _lastIntegrationTime;
+                float meshAge = t - _lastMeshTime;
+                bool spacingReady = t - _lastInfiniTamHeavyWorkTime >=
+                                    infiniTamHeavyWorkMinSpacingSeconds;
+                bool recoveryReady = _infiniTamHealthyFrameStreak >=
+                                     infiniTamHealthyFramesBeforeWork;
+                bool integrationForced = integrationDue && integrationAge >=
+                    IntegrationInterval * infiniTamFusionMaxDelayIntervals;
+                bool meshForced = meshDue && meshAge >=
+                    MeshInterval * infiniTamMeshMaxDelayIntervals;
+                bool admitHeavyWork = spacingReady &&
+                    (recoveryReady || integrationForced || meshForced);
+
+                meshOwnsFrame = false;
+                integrateThisFrame = false;
+                if (admitHeavyWork && (integrationDue || meshDue))
+                {
+                    float integrationDebt = integrationDue
+                        ? integrationAge / IntegrationInterval : -1f;
+                    float meshDebt = meshDue ? meshAge / MeshInterval : -1f;
+                    // A sole forced path owns this slot so its maximum wait is a
+                    // real bound. Otherwise normalized age keeps the 10Hz fusion
+                    // and 5Hz block slots fair, including when both are forced.
+                    meshOwnsFrame = meshForced != integrationForced
+                        ? meshForced
+                        : meshDue && meshDebt >= integrationDebt;
+                    integrateThisFrame = integrationDue && !meshOwnsFrame;
+                }
+            }
+            else
+            {
+                meshOwnsFrame = meshDue && (infiniTamFixedMeshSlot ||
+                    t - _lastMeshTime >= MeshInterval * 1.5f);
+                integrateThisFrame = integrationDue && !meshOwnsFrame;
+            }
 
             if (integrateThisFrame)
             {
                 _lastIntegrationTime = t;
+                MarkInfiniTamHeavyWork(t, infiniTamFixedMeshSlot);
 
                 ProvideColorFrame();
                 _depthCapture?.PreprocessLatestFrame();
@@ -2280,9 +2341,10 @@ namespace Genesis.RoomScan
                 }
             }
 
-            if (meshDue && !integrateThisFrame)
+            if (meshOwnsFrame)
             {
                 _lastMeshTime = t;
+                MarkInfiniTamHeavyWork(t, infiniTamFixedMeshSlot);
                 _meshExtractor.Extract();
                 MeshExtracted?.Invoke();
             }
@@ -2292,6 +2354,38 @@ namespace Genesis.RoomScan
                 _lastScannerLog = t;
                 Logger.Verbose($"扫描中: 融合次数={_integrateCount}, 深度可用={DepthCapture.DepthAvailable}");
             }
+        }
+
+        private void UpdateInfiniTamFrameBudget()
+        {
+            if (_volumeIntegrator == null ||
+                !_volumeIntegrator.InfiniTamBaselineEnabled ||
+                !enableInfiniTamFrameBudget)
+                return;
+
+            float sample = Mathf.Clamp(Time.unscaledDeltaTime, 1f / 144f, 0.05f);
+            _infiniTamFrameSecondsEma = Mathf.Lerp(
+                _infiniTamFrameSecondsEma, sample, 0.2f);
+            float healthyFrameSeconds = 1f / Mathf.Max(1f, infiniTamRecoveryFps);
+            if (sample <= healthyFrameSeconds &&
+                _infiniTamFrameSecondsEma <= healthyFrameSeconds)
+            {
+                _infiniTamHealthyFrameStreak = Mathf.Min(
+                    _infiniTamHealthyFrameStreak + 1,
+                    infiniTamHealthyFramesBeforeWork);
+            }
+            else
+            {
+                _infiniTamHealthyFrameStreak = 0;
+            }
+        }
+
+        private void MarkInfiniTamHeavyWork(float now, bool infiniTamActive)
+        {
+            if (!infiniTamActive || !enableInfiniTamFrameBudget)
+                return;
+            _lastInfiniTamHeavyWorkTime = now;
+            _infiniTamHealthyFrameStreak = 0;
         }
 
         // ─────────────────────────────────────────────────────────────

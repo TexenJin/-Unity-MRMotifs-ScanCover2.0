@@ -4359,6 +4359,23 @@ namespace Genesis.RoomScan
             if (!currentHardGated)
             {
                 dc.UpdateDilationIfNeeded();
+                // The first device depth frame creates dilation lazily. The
+                // locals above were captured before that creation, so refresh
+                // the complete production input set now. Never submit a compute
+                // dispatch with a null texture: an incomplete cold-start frame
+                // simply abstains and the next platform frame retries.
+                fusionDepth = dc.DepthTex;
+                fusionNormal = dc.NormTex;
+                fusionDilatedDepth = dc.DilatedDepthTex;
+                fusionEdgeReason = dc.EdgeReasonTex;
+                fusionTemporalReason = dc.TemporalReasonTex;
+                fusionTemporalReasonAvailable = fusionTemporalReason != null;
+                if (fusionDepth == null || fusionNormal == null ||
+                    fusionDilatedDepth == null || fusionEdgeReason == null)
+                {
+                    _pendingCamFrame = null;
+                    return false;
+                }
                 if (guardedExperimentActive)
                 {
                     QueueGunGelGuardedFrame(dc, currentAngularSpeed,
