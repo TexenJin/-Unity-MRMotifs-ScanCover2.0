@@ -17,6 +17,10 @@ RWTexture3D<float> gsAdmissionTraceRW;
 // appear without waiting for maturity.  Keeping the real vote count here stops
 // the legacy product route's 8-bit confidence semantics from changing.
 RWTexture3D<float> gsInfiniTamVoteWeightRW;
+// Baseline-private higher-precision TSDF accumulator. The public R8 volume is
+// still the sole extraction/render source; this sidecar only preserves
+// sub-quantum fusion progress until it becomes a real R8 geometry step.
+RWTexture3D<float> gsInfiniTamAccumulatedTsdfRW;
 // Four-counter sampled receipt for the isolated InfiniTAM baseline. It is
 // enabled for at most one integration per second and never participates in a
 // fusion decision: new / continuing / mature / post-write vote sum.
@@ -100,6 +104,7 @@ float gsUseRawProjectiveSdf;
 // InfiniTAM code: it selects the canonical projective TSDF weighted average
 // already expressible by this shader and exits before all product experiments.
 float gsInfiniTamBaseline;
+float gsInfiniTamMaxVoteWeight;
 float gsWriteColor;
 float gsWriteAdmissionTrace;
 int gsPruneZOffset;
@@ -942,6 +947,7 @@ void ClearInfiniTamVotes(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= gsVoxCount)) return;
     gsInfiniTamVoteWeightRW[id] = 0.0;
+    gsInfiniTamAccumulatedTsdfRW[id] = 0.0;
 }
 
 #pragma kernel InvalidateGunGelSuccessions
@@ -1048,6 +1054,15 @@ void MarkInfiniTamDirtyChunk(uint3 coord, float2 before, float2 after)
         InterlockedMax(_DirtyBoundaryEpochs[faceBase + 5u], gsDirtyChunkEpoch);
 }
 
+// Make the dirty decision against the value the R8G8_SNorm volume can really
+// retain. Without explicit quantization, sub-step float movement can wake work
+// that disappears when written, while a one-step stored movement can remain
+// hidden behind the old three-step dirty threshold.
+float QuantizeInfiniTamTsdf(float value)
+{
+    return round(clamp(value, -1.0, 1.0) * 127.0) / 127.0;
+}
+
 // Compact canonical projective TSDF integration for the accepted InfiniTAM
 // baseline. This preserves the exact vote equation, immediate extraction
 // eligibility, colour-volume contract and 64^3 dirty/boundary wake-up used by
@@ -1084,18 +1099,24 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float observedTsdf = clamp(rawProjectiveSdf / gsVoxDist, -1.0, 1.0);
     float2 previous = gsVolumeRW[coord];
     float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
+    float previousAccumulatedTsdf = previousVoteWeight > 0.0
+        ? gsInfiniTamAccumulatedTsdfRW[coord]
+        : previous.x;
     const float observationVoteWeight = 1.0;
-    const float maxVoteWeight = 100.0;
+    float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
     float accumulatedVoteWeight = previousVoteWeight + observationVoteWeight;
     float reconstructedTsdf = previousVoteWeight > 0.0
-        ? (previous.x * previousVoteWeight + observedTsdf * observationVoteWeight) /
+        ? (previousAccumulatedTsdf * previousVoteWeight +
+           observedTsdf * observationVoteWeight) /
           max(accumulatedVoteWeight, 1e-5)
         : observedTsdf;
     float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
     float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
-    float2 reconstructed = float2(reconstructedTsdf, extractionEligibility);
+    float2 reconstructed = float2(
+        QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility);
 
     gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
+    gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
     gsVolumeRW[coord] = reconstructed;
     MarkInfiniTamDirtyChunk(coord, previous, reconstructed);
 
@@ -1232,14 +1253,19 @@ void Integrate(uint id : SV_DispatchThreadID)
         float observedTsdf = clamp(rawProjectiveSdf / gsVoxDist, -1.0, 1.0);
         float2 previous = gsVolumeRW[coord];
         float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
+        float previousAccumulatedTsdf = previousVoteWeight > 0.0
+            ? gsInfiniTamAccumulatedTsdfRW[coord]
+            : previous.x;
         // One accepted sample is one full vote, as in the canonical TSDF
-        // integration equation.  Cap at 100: after maturity a new frame owns
-        // about 1/101 of the zero-surface instead of the former 1/6.
+        // integration equation. Keep a bounded recent-history window: the
+        // former 100-vote cap made sub-decimetre corrections smaller than one
+        // R8 TSDF step and left visible geometry numerically frozen.
         const float observationVoteWeight = 1.0;
-        const float maxVoteWeight = 100.0;
+        float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
         float accumulatedVoteWeight = previousVoteWeight + observationVoteWeight;
         float reconstructedTsdf = previousVoteWeight > 0.0
-            ? (previous.x * previousVoteWeight + observedTsdf * observationVoteWeight) /
+            ? (previousAccumulatedTsdf * previousVoteWeight +
+               observedTsdf * observationVoteWeight) /
               max(accumulatedVoteWeight, 1e-5)
             : observedTsdf;
         float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
@@ -1248,7 +1274,9 @@ void Integrate(uint id : SV_DispatchThreadID)
         float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
 
         gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
-        WriteTrackedTsdf(coord, float2(reconstructedTsdf, extractionEligibility));
+        gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
+        WriteTrackedTsdf(coord, float2(
+            QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility));
         if (gsInfiniTamTicketEnabled > 0.5)
         {
             // Only the band that can explain the visible zero surface belongs
