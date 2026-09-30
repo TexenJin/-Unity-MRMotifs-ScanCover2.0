@@ -50,6 +50,7 @@ Shader "Genesis/ScanMeshTrueLines"
             float _RSConfidenceViz;
             float _RSMeshStride;
             float _RSTrueLineMaxViewDistance;
+            float _RSTrueLineQuadPerimeters;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
@@ -151,13 +152,66 @@ Shader "Genesis/ScanMeshTrueLines"
                 Varyings output = (Varyings)0;
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
 
-                uint triBase = (vertID / 6u) * 3u;
-                uint lineVertex = vertID % 6u;
-                uint sourceCorner = lineVertex == 0u ? 0u :
-                                    lineVertex == 1u ? 1u :
-                                    lineVertex == 2u ? 1u :
-                                    lineVertex == 3u ? 2u :
-                                    lineVertex == 4u ? 2u : 0u;
+                uint triBase;
+                uint sourceIndexPosition;
+                uint diagnosticEdge;
+                if (_RSTrueLineQuadPerimeters > 0.5)
+                {
+                    // InfiniTAM stores one quad as two adjacent triangles. The
+                    // repeated first corner distinguishes the two winding layouts.
+                    // Eight output vertices draw four outside edges; the internal
+                    // split diagonal is no longer submitted twice.
+                    uint quadBase = (vertID / 8u) * 6u;
+                    uint perimeterVertex = vertID % 8u;
+                    uint perimeterEdge = perimeterVertex / 2u;
+                    bool positiveLayout =
+                        (_SurfaceIndices[quadBase] & 0x3FFFFFFFu) ==
+                        (_SurfaceIndices[quadBase + 3u] & 0x3FFFFFFFu);
+                    uint sourceSlot;
+                    if (positiveLayout)
+                    {
+                        sourceSlot = perimeterVertex == 0u ? 0u :
+                                     perimeterVertex == 1u ? 4u :
+                                     perimeterVertex == 2u ? 4u :
+                                     perimeterVertex == 3u ? 5u :
+                                     perimeterVertex == 4u ? 5u :
+                                     perimeterVertex == 5u ? 2u :
+                                     perimeterVertex == 6u ? 2u : 3u;
+                        triBase = perimeterEdge < 2u
+                            ? quadBase + 3u : quadBase;
+                        diagnosticEdge = perimeterEdge == 0u ? 0u :
+                                         perimeterEdge == 1u ? 1u :
+                                         perimeterEdge == 2u ? 1u : 2u;
+                    }
+                    else
+                    {
+                        sourceSlot = perimeterVertex == 0u ? 0u :
+                                     perimeterVertex == 1u ? 1u :
+                                     perimeterVertex == 2u ? 1u :
+                                     perimeterVertex == 3u ? 2u :
+                                     perimeterVertex == 4u ? 2u :
+                                     perimeterVertex == 5u ? 3u :
+                                     perimeterVertex == 6u ? 3u : 4u;
+                        triBase = perimeterEdge < 2u
+                            ? quadBase : quadBase + 3u;
+                        diagnosticEdge = perimeterEdge == 0u ? 0u :
+                                         perimeterEdge == 1u ? 1u :
+                                         perimeterEdge == 2u ? 2u : 0u;
+                    }
+                    sourceIndexPosition = quadBase + sourceSlot;
+                }
+                else
+                {
+                    triBase = (vertID / 6u) * 3u;
+                    uint lineVertex = vertID % 6u;
+                    uint sourceCorner = lineVertex == 0u ? 0u :
+                                        lineVertex == 1u ? 1u :
+                                        lineVertex == 2u ? 1u :
+                                        lineVertex == 3u ? 2u :
+                                        lineVertex == 4u ? 2u : 0u;
+                    sourceIndexPosition = triBase + sourceCorner;
+                    diagnosticEdge = lineVertex / 2u;
+                }
 
                 uint meshStride = (uint)max(_RSMeshStride, 1.0);
                 if (meshStride > 1u)
@@ -180,7 +234,7 @@ Shader "Genesis/ScanMeshTrueLines"
                     }
                 }
 
-                uint encoded = _SurfaceIndices[triBase + sourceCorner];
+                uint encoded = _SurfaceIndices[sourceIndexPosition];
                 uint index = encoded & 0x3FFFFFFFu;
                 float3 positionWS = _SurfaceVerts[index].pos;
                 output.positionWS = positionWS;
@@ -224,7 +278,7 @@ Shader "Genesis/ScanMeshTrueLines"
                 {
                     output.legacyDiagnosticClass = LegacyDiagnosticClass(triBase);
                 }
-                output.edgeIndex = lineVertex / 2u;
+                output.edgeIndex = diagnosticEdge;
                 return output;
             }
 
