@@ -49,6 +49,7 @@ Shader "Genesis/ScanMeshTrueLines"
             float gsConfidenceLowMin;
             float _RSConfidenceViz;
             float _RSMeshStride;
+            float _RSTrueLineMaxViewDistance;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
@@ -184,6 +185,26 @@ Shader "Genesis/ScanMeshTrueLines"
                 float3 positionWS = _SurfaceVerts[index].pos;
                 output.positionWS = positionWS;
                 output.positionHCS = TransformWorldToHClip(positionWS);
+                // Display-only range budget. Each endpoint is pushed through the
+                // far clip plane rather than to an arbitrary screen corner, so a
+                // short line crossing the range boundary is clipped normally and
+                // cannot turn into a long streak. Reconstruction and the immutable
+                // mesh front remain untouched; approaching the surface makes the
+                // exact same line visible again.
+                float maxDistance = _RSTrueLineMaxViewDistance;
+                if (maxDistance > 0.0)
+                {
+                    float3 viewDelta = positionWS - _WorldSpaceCameraPos.xyz;
+                    if (dot(viewDelta, viewDelta) > maxDistance * maxDistance)
+                    {
+                        #if UNITY_REVERSED_Z
+                            output.positionHCS.z = -output.positionHCS.w;
+                        #else
+                            output.positionHCS.z = output.positionHCS.w * 2.0;
+                        #endif
+                        return output;
+                    }
+                }
                 output.legacyDiagnosticClass = 12u;
                 output.diagnosticClass = 2u;
                 output.diagnosticSupportMask = 7u;

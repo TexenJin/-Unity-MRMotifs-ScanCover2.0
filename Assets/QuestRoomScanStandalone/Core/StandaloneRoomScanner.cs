@@ -48,6 +48,8 @@ namespace Genesis.RoomScan
         private bool wireframeMode = true;
         [SerializeField, Range(0.2f, 5f), Tooltip("线框模式的线条粗细倍率（1.0 对齐原 SC 工程细线观感，可按需调）")]
         private float wireThickness = 1.0f;
+        [SerializeField, Range(2.5f, 6f), Tooltip("真线显示的最远距离（米）。只裁掉远处线段的逐帧绘制，不删除网格、TSDF 或提取结果；靠近后会重新显示。")]
+        private float trueLineMaxViewDistance = 4f;
         [SerializeField, Range(1, 6), Tooltip("条带抽稀（顶点侧按体素格丢三角形，任一轴对齐即保留）。08-19 实机判定观感碎、做不出 Meta 粗网，已让世界格线画法取代，默认 1=关闭，仅留作帧率应急杠杆")]
         private int meshDisplayStride = 1;
         [SerializeField, Range(0.1f, 1.0f), Tooltip("纸主三角网的世界空间间距（米）。0.12m 保留旧细网对局部结构的可读性；后续视觉定稿可再放大。")]
@@ -5064,6 +5066,8 @@ namespace Genesis.RoomScan
         private static readonly int TriAvailableID = Shader.PropertyToID("_RSTriAvailable");
         private static readonly int WireframeID = Shader.PropertyToID("_RSWireframe");
         private static readonly int WireThicknessID = Shader.PropertyToID("_RSWireThickness");
+        private static readonly int TrueLineMaxViewDistanceID =
+            Shader.PropertyToID("_RSTrueLineMaxViewDistance");
         private static readonly int MeshStrideID = Shader.PropertyToID("_RSMeshStride");
         private static readonly int GridSpacingID = Shader.PropertyToID("_RSGridSpacing");
         private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
@@ -5226,6 +5230,8 @@ namespace Genesis.RoomScan
         {
             Shader.SetGlobalFloat(WireframeID, wireframeMode ? 1f : 0f);
             Shader.SetGlobalFloat(WireThicknessID, wireThickness);
+            Shader.SetGlobalFloat(TrueLineMaxViewDistanceID,
+                Mathf.Max(0f, trueLineMaxViewDistance));
             Shader.SetGlobalFloat(MeshStrideID, meshDisplayStride);
             Shader.SetGlobalFloat(GridSpacingID, meshGridSpacing);
             Shader.SetGlobalFloat(ConfidenceVizID, confidenceViz ? 1f : 0f);
