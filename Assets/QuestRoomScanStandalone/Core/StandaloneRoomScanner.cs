@@ -2331,12 +2331,28 @@ namespace Genesis.RoomScan
                 _volumeIntegrator.RefreshConfidenceStats();
             }
 
+            bool infiniTamFixedMeshSlot = _volumeIntegrator != null &&
+                                          _volumeIntegrator.InfiniTamBaselineEnabled;
+            // One logical 5 Hz block update is now two explicitly scheduled
+            // GPU steps: extraction, then immutable-front snapshot publication.
+            // Give those steps alternating 10 Hz mid-window slots so the block
+            // update rate stays 5 Hz without letting a readback callback inject
+            // an unbudgeted copy beside fusion.
+            // A failed/unavailable block pipeline falls back to the ordinary
+            // whole-volume 5 Hz route and therefore must not inherit the
+            // doubled two-step work clock.
+            bool infiniTamPhasedBlockWork = infiniTamFixedMeshSlot &&
+                _meshExtractor != null &&
+                _meshExtractor.InfiniTamPhasedBlockWorkActive;
+            float meshWorkInterval = infiniTamPhasedBlockWork
+                ? MeshInterval * 0.5f
+                : MeshInterval;
             bool integrationDue = t - _lastIntegrationTime >= IntegrationInterval;
             bool startupFirstMeshReady = !_infiniTamStartupFirstMeshPending ||
                 (_infiniTamStartupFirstFusionSubmitted &&
                  t >= _infiniTamStartupFirstMeshNotBefore);
             bool meshDue = startupFirstMeshReady &&
-                           t - _lastMeshTime >= MeshInterval;
+                           t - _lastMeshTime >= meshWorkInterval;
 
             // The A/B acquisition phase owns one shared TSDF only.  It never
             // extracts a production mesh; cheap depth-aligned tiles are the
@@ -2403,17 +2419,15 @@ namespace Genesis.RoomScan
             // recovery space instead of a fusion/mesh catch-up pair on adjacent
             // frames. Both paths retain a maximum deferral, so overload reduces
             // cadence without ever turning mesh growth or fusion off.
-            bool infiniTamFixedMeshSlot = _volumeIntegrator != null &&
-                                          _volumeIntegrator.InfiniTamBaselineEnabled;
             bool meshOwnsFrame;
             bool integrateThisFrame;
             if (infiniTamFixedMeshSlot && enableInfiniTamFrameBudget)
             {
                 float integrationAge = t - _lastIntegrationTime;
                 float meshAge = t - _lastMeshTime;
-                // At 10 Hz fusion and 5 Hz extraction their nominal deadlines
-                // meet every 200 ms. A due mesh is admitted only inside the
-                // middle band of the current fusion interval; when it reaches
+                // At 10 Hz fusion, the alternating extraction/publication steps
+                // use the middle of successive fusion intervals. A due mesh
+                // step is admitted only inside that middle band; when it reaches
                 // the late band, the next fusion goes first and opens a fresh
                 // middle slot. Forced work still retains the existing maximum
                 // delay escape hatch, so this phase rule cannot stop growth.
@@ -2432,7 +2446,7 @@ namespace Genesis.RoomScan
                 bool integrationForced = integrationDue && integrationAge >=
                     IntegrationInterval * infiniTamFusionMaxDelayIntervals;
                 bool meshForced = meshDue && meshAge >=
-                    MeshInterval * infiniTamMeshMaxDelayIntervals;
+                    meshWorkInterval * infiniTamMeshMaxDelayIntervals;
                 bool admitHeavyWork = spacingReady &&
                     (recoveryReady || integrationForced || meshForced);
 
@@ -2442,7 +2456,7 @@ namespace Genesis.RoomScan
                 {
                     float integrationDebt = integrationDue
                         ? integrationAge / IntegrationInterval : -1f;
-                    float meshDebt = meshDue ? meshAge / MeshInterval : -1f;
+                    float meshDebt = meshDue ? meshAge / meshWorkInterval : -1f;
                     // A sole forced path owns this slot so its maximum wait is a
                     // real bound. If both have reached their bounds, normalized
                     // age remains the final fairness rule. Ordinary mesh work,
@@ -4236,7 +4250,11 @@ namespace Genesis.RoomScan
 
             float now = Time.realtimeSinceStartup;
             float elapsed = now - _meshTailValidationStartedAt;
-            if (now - _lastMeshTime >= MeshInterval)
+            float meshTailWorkInterval =
+                _meshExtractor.InfiniTamPhasedBlockWorkActive
+                    ? MeshInterval * 0.5f
+                    : MeshInterval;
+            if (now - _lastMeshTime >= meshTailWorkInterval)
             {
                 _lastMeshTime = now;
                 _meshExtractor.Extract();

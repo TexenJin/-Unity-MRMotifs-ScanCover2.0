@@ -163,6 +163,9 @@ namespace Genesis.RoomScan
         public bool InfiniTamTailProbeReady =>
             IsInfiniTamBaselineActive && _infiniTamBlocks != null &&
             !_infiniTamBlocks.Failed;
+        public bool InfiniTamPhasedBlockWorkActive =>
+            IsInfiniTamBaselineActive && _infiniTamBlocks != null &&
+            !_infiniTamBlocks.Failed;
         public int InfiniTamPendingBlockWork => _infiniTamBlocks?.PendingCount ?? 0;
         public int InfiniTamOutstandingBlockCount =>
             _infiniTamBlocks?.OutstandingBlockCount ?? 0;

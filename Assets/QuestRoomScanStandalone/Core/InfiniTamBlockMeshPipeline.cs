@@ -282,10 +282,26 @@ namespace Genesis.RoomScan
                 return;
 
             RequestDirtyLedgerIfDue();
+
+            // Counter readback completion only makes a batch eligible for
+            // publication.  The snapshot copy is GPU work in its own right,
+            // so execute it here on the next scanner-owned mesh-work slot
+            // instead of submitting it from an arbitrary readback callback.
+            // Return after publication: one slot owns either snapshot copy or
+            // the next extraction dispatch, never both.
+            if (_activeBatch != null && _activeBatch.Remaining == 0)
+            {
+                CommitReadyBatch(_activeBatch);
+                TryFinishInitialBuild();
+                return;
+            }
+
             if (_activeBatch == null && _queuedBlockCount > 0)
                 StartNextBatch();
 
-            if (_activeBatch != null &&
+            // A completed batch may deliberately wait for its next scheduled
+            // publication slot.  Only missing readbacks are watchdog failures.
+            if (_activeBatch != null && _activeBatch.Remaining > 0 &&
                 Time.realtimeSinceStartup - _activeBatch.StartedAt > BatchWatchdogSeconds)
                 ResetTimedOutBatch();
 
@@ -450,9 +466,31 @@ namespace Genesis.RoomScan
                         ? Mathf.Max(0, (int)counters[0]) : 0;
                     item.IndexCount = counters.Length > 1
                         ? Mathf.Max(0, (int)counters[1]) : 0;
+                }
 
-                    // Populate a private back snapshot, but keep the old front
-                    // visible until every member of this batch is complete.
+                item.Completed = true;
+                batch.Remaining = Mathf.Max(0, batch.Remaining - 1);
+            });
+        }
+
+        private void CommitReadyBatch(MeshBatch batch)
+        {
+            if (_disposed || batch != _activeBatch || batch.Remaining != 0 ||
+                batch.Generation != _generation)
+                return;
+
+            try
+            {
+                for (int i = 0; i < batch.Items.Count; i++)
+                {
+                    BatchItem item = batch.Items[i];
+                    if (item.Failed)
+                        continue;
+
+                    Block block = _blocks[item.BlockIndex];
+                    // Populate a private back snapshot while the old front
+                    // remains visible.  This dispatch now runs only inside the
+                    // scanner's phased mesh-work budget.
                     block.Back ??= new GPUChunkMeshSnapshot();
                     if (item.VertexCount > 0 && item.IndexCount >= 3)
                         block.Surface.CopyCurrentMeshTo(block.Back,
@@ -460,12 +498,14 @@ namespace Genesis.RoomScan
                     else
                         block.Back.Clear();
                 }
+            }
+            catch (Exception ex)
+            {
+                Fail($"batch {batch.Serial} snapshot publication failed: {ex.Message}");
+                return;
+            }
 
-                item.Completed = true;
-                batch.Remaining = Mathf.Max(0, batch.Remaining - 1);
-                if (batch.Remaining == 0)
-                    FinishBatch(batch);
-            });
+            FinishBatch(batch);
         }
 
         private void FinishBatch(MeshBatch batch)
