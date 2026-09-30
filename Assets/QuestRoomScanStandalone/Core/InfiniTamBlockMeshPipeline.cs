@@ -373,10 +373,6 @@ namespace Genesis.RoomScan
                 // crossing.  Letting it close a face creates the long caps and
                 // scar-like bridges that remain after the real surface heals.
                 StrictObservedEdges = true,
-                // Remove only isolated weak sign islands at extraction time.
-                // This stabilizes planar topology without writing filtered
-                // values back into the canonical InfiniTAM TSDF.
-                PlanarTopologyRepair = true,
                 CandidateHistoryUpdateEnabled = false,
                 FoundationTopologyMode = DirectTenCentimeterExperiment,
                 FoundationCellStride = DirectTenCentimeterExperiment ? 2 : 1,
