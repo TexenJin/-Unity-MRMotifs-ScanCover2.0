@@ -764,9 +764,10 @@ namespace Genesis.RoomScan
             // Every fresh app run starts from the production rendering path;
             // the operator then performs an explicit same-run A/B toggle.
             GPUMeshRenderer.SetRearWireDepthPrepassEnabled(true);
-            // Runtime lock: serialized scene values cannot accidentally revive
-            // the in-headset HUD or diagnostic ROI frame.  The BB depth probe is
-            // always present but starts hidden and is explicitly toggled by X.
+            // This performance A/B build keeps only the compact operator badge
+            // visible so the headset can confirm mesh/prepass/surface state.
+            // The large forensic HUD and ROI frame remain locked off.
+            showOperatorHud = true;
             showDebugHud = false;
             showDiagnosticRoiFrame = false;
             Logger.Level = logLevel;
@@ -826,8 +827,8 @@ namespace Genesis.RoomScan
                 _instantDepthShellOverlay = gameObject.AddComponent<InstantDepthShellOverlay>();
             _instantDepthShellOverlay.SetVisible(false);
             StartCoroutine(ConfigureCameraForPassthrough());
-            // V1.3 画面复核默认保持无工程 HUD，避免中央黑底状态牌遮住
-            // 鼓包、孔洞和后续愈合过程。诊断需要时仍可在 Inspector 显式打开。
+            // Current performance A/B builds keep the compact operator badge
+            // visible; the large diagnostic body remains disabled.
             if (showOperatorHud)
                 StartCoroutine(CreateStatusBadgeWhenCameraReady());
             if (showDebugHud)
@@ -1298,6 +1299,16 @@ namespace Genesis.RoomScan
                       ? _meshExtractor.InfiniTamBlockStatsCompact
                       : "块前台未就绪")
                 : string.Empty;
+            string meshDisplayState = _meshExtractor != null &&
+                                      _meshExtractor.IsAnyMeshVisible
+                ? "开"
+                : "关";
+            string depthPrepassState = GPUMeshRenderer.RearWireDepthPrepassEnabled
+                ? "开"
+                : "关";
+            string surfaceState = wireframeMode ? "线框" : "实体";
+            string renderAbState =
+                $"A/B 网格[{meshDisplayState}] 预绘[{depthPrepassState}] 表面[{surfaceState}]";
             _statusBadgeHeaderText.color = _statusBadgeText.color;
             _statusBadgeRightText.color = _statusBadgeText.color;
             _statusBadgeHeaderText.fontSize = 50;
@@ -1316,6 +1327,7 @@ namespace Genesis.RoomScan
             else
             {
                 _statusBadgeHeaderText.text =
+                    $"{renderAbState}\n" +
                     $"▶ {primaryPrompt}\n" +
                     $"状态[{runState}] 视图[{viewState}] 种面[{seedState}] " +
                     $"准入[{productionAdmission}]{baselineProgress}{baselineTicket}";
@@ -1795,8 +1807,8 @@ namespace Genesis.RoomScan
         // ─────────────────────────────────────────────────────────────
 
         [Header("调试面板")]
-        [SerializeField, Tooltip("显示中央最小操作状态牌。V1.3 画面复核默认关闭；只影响显示，不影响扫描、融合、提取或按键。")]
-        private bool showOperatorHud = false;
+        [SerializeField, Tooltip("显示中央最小操作状态牌。当前性能 A/B 包在运行时固定开启；只影响显示，不影响扫描、融合、提取或按键。")]
+        private bool showOperatorHud = true;
         [SerializeField] private bool showDebugHud = false;
         [SerializeField, Tooltip("在面板右上角开一个当前深度实时预览小窗（青=近 绿=中 红=远 暗=无效）。" +
             "用途：盯着幽灵网格时看深度画面里那个斑块还在不在——在=深度自洽幻觉（Meta侧时序锁定）；转头后斑块从预览消失=深度刷新")]
