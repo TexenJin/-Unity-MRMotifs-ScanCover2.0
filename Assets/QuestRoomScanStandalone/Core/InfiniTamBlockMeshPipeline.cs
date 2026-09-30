@@ -111,11 +111,12 @@ namespace Genesis.RoomScan
         // route instead uses one native 10 cm TSDF and ordinary stride-1
         // extraction from integration through presentation.
         internal const bool DirectTenCentimeterExperiment = false;
-        // Isolated native-10 cm crease trial.  This changes only the position
-        // chosen for a stride-1 Surface-Nets vertex when two coherent normal
-        // families prove a real fold.  TSDF integration, topology, publication
-        // and the native 10 cm lattice remain exactly on the accepted baseline.
-        internal const bool NativeTenCentimeterCreaseExperiment = true;
+        // Isolated native-10 cm crease trial. Device review showed that its
+        // unconstrained corner solve can turn transient normal families into
+        // long scar faces. Keep the implementation available, but return the
+        // production front to the ordinary Surface-Nets crossing mean until a
+        // bounded crease solver can be validated separately.
+        internal const bool NativeTenCentimeterCreaseExperiment = false;
 
         public bool Failed { get; private set; }
         public string FailureReason { get; private set; } = string.Empty;
