@@ -700,6 +700,14 @@ namespace Genesis.RoomScan
         private float _lastInfiniTamHeavyWorkTime = -1000f;
         private float _infiniTamFrameSecondsEma = 1f / 72f;
         private int _infiniTamHealthyFrameStreak;
+        // Fresh-volume startup only. The first whole-volume bootstrap remains
+        // intact, but cannot share the volume bring-up window. Once one real
+        // fusion has been submitted, leave one ordinary mesh interval before
+        // the first extraction; after that extraction this gate is gone for the
+        // rest of the scan and the accepted 10 Hz / 5 Hz scheduler is untouched.
+        private bool _infiniTamStartupFirstMeshPending;
+        private bool _infiniTamStartupFirstFusionSubmitted;
+        private float _infiniTamStartupFirstMeshNotBefore;
         private float _lastScannerLog;
         private int _integrateCount;
 
@@ -2219,7 +2227,11 @@ namespace Genesis.RoomScan
             }
 
             bool integrationDue = t - _lastIntegrationTime >= IntegrationInterval;
-            bool meshDue = t - _lastMeshTime >= MeshInterval;
+            bool startupFirstMeshReady = !_infiniTamStartupFirstMeshPending ||
+                (_infiniTamStartupFirstFusionSubmitted &&
+                 t >= _infiniTamStartupFirstMeshNotBefore);
+            bool meshDue = startupFirstMeshReady &&
+                           t - _lastMeshTime >= MeshInterval;
 
             // The A/B acquisition phase owns one shared TSDF only.  It never
             // extracts a production mesh; cheap depth-aligned tiles are the
@@ -2243,7 +2255,9 @@ namespace Genesis.RoomScan
                 {
                     _lastIntegrationTime = t;
                     ProvideColorFrame();
-                    _depthCapture?.PreprocessLatestFrame();
+                    _depthCapture?.PreprocessLatestFrame(
+                        _volumeIntegrator != null &&
+                        _volumeIntegrator.InfiniTamCompactDepthOnly);
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     bool dispatched = _volumeIntegrator.Integrate();
                     sw.Stop();
@@ -2332,10 +2346,26 @@ namespace Genesis.RoomScan
                 MarkInfiniTamHeavyWork(t, infiniTamFixedMeshSlot);
 
                 ProvideColorFrame();
-                _depthCapture?.PreprocessLatestFrame();
+                _depthCapture?.PreprocessLatestFrame(
+                    _volumeIntegrator != null &&
+                    _volumeIntegrator.InfiniTamCompactDepthOnly);
                 bool dispatched = _volumeIntegrator.Integrate();
                 if (dispatched)
                 {
+                    if (_infiniTamStartupFirstMeshPending &&
+                        !_infiniTamStartupFirstFusionSubmitted)
+                    {
+                        // Anchor the one-shot separation to the first real TSDF
+                        // fusion dispatch, not to wall time before depth became
+                        // available.
+                        // This guarantees that volume bring-up/fusion and the
+                        // whole-volume bootstrap cannot collapse into one GPU
+                        // startup window. Reuse the accepted mesh interval; no
+                        // new production tuning value is introduced.
+                        _infiniTamStartupFirstFusionSubmitted = true;
+                        _infiniTamStartupFirstMeshNotBefore = t + MeshInterval;
+                        _lastMeshTime = t;
+                    }
                     Integrated?.Invoke();
                     _integrateCount++;
                 }
@@ -2346,6 +2376,8 @@ namespace Genesis.RoomScan
                 _lastMeshTime = t;
                 MarkInfiniTamHeavyWork(t, infiniTamFixedMeshSlot);
                 _meshExtractor.Extract();
+                if (_infiniTamStartupFirstMeshPending)
+                    _infiniTamStartupFirstMeshPending = false;
                 MeshExtracted?.Invoke();
             }
 
@@ -4285,8 +4317,9 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// 开始（或暂停后继续）深度融合与网格提取。
-        /// 保留 QRS 原版的异步分段启动：先提交 GPU 大资源（TSDF ~150MB +
-        /// Surface Nets ~480MB），跨帧 yield 两次后再启用透视相机与深度，
+        /// 保留 QRS 原版的异步分段启动：先提交 GPU 体积资源和首提缓冲，
+        /// 跨帧后再启用相机与深度。新空卷的整卷首提还会等待第一帧有效
+        /// 融合及一个既有网格周期；只错开冷启动，不改变后续持续调度。
         /// 避免 PCA 硬件缓冲队列握手与计算调度同帧竞争导致 Vulkan 卡死。
         /// 继续扫描时 ReallocateVolumes / EnsureInitialized 均为幂等 no-op，
         /// 已有体积数据保持不变。
@@ -4302,6 +4335,18 @@ namespace Genesis.RoomScan
             IsScanning = true;
             try
             {
+                bool resuming = HasStarted;
+                bool armInfiniTamStartupMeshGate = !resuming &&
+                    !enableFrozenChunkAbExperiment &&
+                    _volumeIntegrator != null &&
+                    _volumeIntegrator.InfiniTamBaselineEnabled;
+                if (armInfiniTamStartupMeshGate)
+                {
+                    _infiniTamStartupFirstMeshPending = true;
+                    _infiniTamStartupFirstFusionSubmitted = false;
+                    _infiniTamStartupFirstMeshNotBefore = float.PositiveInfinity;
+                }
+
                 // 开扫前最后一次固化身份；后续空卷开关由 HasStarted 锁死。
                 SyncCaptureModeIdentity();
                 // 阶段 1：GPU 体积 bring-up
@@ -4322,7 +4367,6 @@ namespace Genesis.RoomScan
                 _lastMeshTime = t;
                 _cameraAvailable = false;
 
-                bool resuming = HasStarted;
                 if (!resuming)
                 {
                     // A-only seal HUD survives long enough for the operator to
@@ -4347,15 +4391,12 @@ namespace Genesis.RoomScan
                 _cameraProvider?.StartCapture();
                 _depthCapture.StartDepthCapture();
 
-                // 新空卷必须从第一帧开始建独立回放契约；若等扫到一半才手动开，
-                // 离线端缺少初始 TSDF/候选状态，形式上有文件却不能从零复现。
+                // 完整回放会话会逐帧回读原始/处理深度和融合输入，
+                // 属于昂贵诊断，不得再跟随普通生产扫描自动开启。
+                // 需要取证时，操作者必须在空卷、按扣机之前用左握把+X
+                // 显式开启；StartCapture 仍会拒绝中途开账，保持可复现契约。
                 if (!resuming && !_depthCapture.PairedFrameCaptureActive)
-                {
-                    bool replayStarted = _depthCapture.TogglePairedFrameCapture();
-                    Logger.Info(replayStarted
-                        ? "独立回放会话已随新空卷自动开始"
-                        : "独立回放会话启动失败；本轮扫描仍可继续但不会产出可复现包");
-                }
+                    Logger.Info("生产扫描：完整回放采集未自动开启（空卷左握把+X可手动取证）");
                 if (enableFrozenChunkAbExperiment)
                 {
                     if (!resuming) _coverageOverlay?.ResetCoverage();
@@ -4384,6 +4425,12 @@ namespace Genesis.RoomScan
             {
                 // 重置重入保护，允许用户重试
                 IsScanning = false;
+                if (!HasStarted)
+                {
+                    _infiniTamStartupFirstMeshPending = false;
+                    _infiniTamStartupFirstFusionSubmitted = false;
+                    _infiniTamStartupFirstMeshNotBefore = 0f;
+                }
                 _hudStatus = "启动失败";
                 _hudLastError = e.Message;
                 RefreshStatusBadge();
@@ -4591,6 +4638,9 @@ namespace Genesis.RoomScan
             _meshExtractor?.ResetLedgerSessionAfterClear();
             HasStarted = false;
             _integrateCount = 0;
+            _infiniTamStartupFirstMeshPending = false;
+            _infiniTamStartupFirstFusionSubmitted = false;
+            _infiniTamStartupFirstMeshNotBefore = 0f;
 
             _volumeIntegrator.Clear();
             _volumeIntegrator.ResetSessionCounters();

@@ -388,7 +388,9 @@ namespace Genesis.RoomScan
         private ComputeKernelHelper _handMaskKernel;
         private bool _hasHandMaskKernel;
         private ComputeKernelHelper _temporalKernel;
+        private ComputeKernelHelper _temporalCompactKernel;
         private bool _hasTemporalKernel;
+        private bool _hasTemporalCompactKernel;
         private ComputeShader _seedPlaneCompute;
         private int _seedPlaneKernel = -1;
         private RenderTexture _seedPlaneDepthTex;
@@ -788,9 +790,17 @@ namespace Genesis.RoomScan
                 {
                     _temporalKernel = new ComputeKernelHelper(temporalFilterCompute, "TemporalFilter");
                     _hasTemporalKernel = true;
+                    if (temporalFilterCompute.HasKernel("TemporalFilterCompact"))
+                    {
+                        _temporalCompactKernel = new ComputeKernelHelper(
+                            temporalFilterCompute, "TemporalFilterCompact");
+                        _hasTemporalCompactKernel = true;
+                    }
                 }
                 catch (Exception e)
                 {
+                    _hasTemporalKernel = false;
+                    _hasTemporalCompactKernel = false;
                     Logger.Warning("DepthCapture: TemporalFilter 内核初始化失败，源头时序滤波停用：" + e.Message);
                 }
             }
@@ -1138,10 +1148,12 @@ namespace Genesis.RoomScan
         private bool _preprocessDirty;
 
         /// <summary>
-        /// 融合前预处理：手罩 → 源头时序滤波 → 双边滤波 → 边缘清洗 → 全局属性 → 法线 → 标膨胀脏。
+        /// 融合前预处理。旧路线保持完整输入集；InfiniTAM V1.3 只生产
+        /// 真正被 compact kernel 消费的清洗深度，跳过枪胶双证词、法线和
+        /// 九轮膨胀。手罩、时序、双边和缘洗会改写最终深度，必须保留。
         /// 只在 scanner 即将 Integrate 时调用；无新深度帧则空转早退。
         /// </summary>
-        public void PreprocessLatestFrame()
+        public void PreprocessLatestFrame(bool compactInfiniTamDepthOnly = false)
         {
             if (!_preprocessDirty || !DepthAvailable) return;
             _preprocessDirty = false;
@@ -1151,19 +1163,31 @@ namespace Genesis.RoomScan
             // 避免“一只眼刚更新、另一只眼却配当前位姿进入 TSDF”的错层融合。
             _preprocessEye = FusionEyeIndex;
 
-            CapturePlatformDepthWitness();
+            if (!compactInfiniTamDepthOnly)
+                CapturePlatformDepthWitness();
             ApplyHandMask(); // 手部打码必须在时序/双边之前：滤波邻域会把弃权值洇回有效像素
-            ApplyTemporalFilter(); // 数据层第一刀：深度先跨帧稳定再进空间滤波/TSDF
+            ApplyTemporalFilter(compactInfiniTamDepthOnly); // 保留滤波深度，compact 不写旁证账
             ApplyBilateralFilter();
             ApplyDepthEdgeClean();
             SetGlobalShaderProperties();
-            ComputeNormals();
-            // A captured seed is a post-TSDF product ruler.  Activate its
-            // sidecar lifetime here, but never replace _depthTex or _normTex:
-            // GunGel and the sole TSDF must continue to consume the screened
-            // Quest observation itself.
-            ActivateSeedPlaneSidecar();
-            _dilationDirty = true;
+            if (!compactInfiniTamDepthOnly)
+            {
+                ComputeNormals();
+                // A captured seed is a post-TSDF product ruler. Activate its
+                // sidecar lifetime here, but never replace production depth.
+                ActivateSeedPlaneSidecar();
+                _dilationDirty = true;
+            }
+            else
+            {
+                _dilationDirty = false;
+                if (!_loggedCompactInfiniTamPreprocess)
+                {
+                    _loggedCompactInfiniTamPreprocess = true;
+                    Logger.Info("DepthCapture: compact InfiniTAM preprocessing active " +
+                                "(depth cleanup kept; GunGel witness, normals and dilation skipped).");
+                }
+            }
             _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
             DispatchCenterDepthSample();
             LastPreprocessAgeMs = _lastDepthArrivalRealtime > 0f
@@ -1486,7 +1510,10 @@ namespace Genesis.RoomScan
         /// 带外真变化直接全速放行。放在手罩之后、双边之前——弃权 0 穿透且不清洗历史，
         /// 双边邻域也就不会把旧表面/弃权值互相洇染。输出原位替换 _depthTex，下游零改线。
         /// </summary>
-        private void ApplyTemporalFilter()
+        private bool _loggedCompactTemporalFallback;
+        private bool _loggedCompactInfiniTamPreprocess;
+
+        private void ApplyTemporalFilter(bool compactDepthOnly)
         {
             if (!enableTemporalFilter || !_hasTemporalKernel || _depthTex == null)
             {
@@ -1496,8 +1523,17 @@ namespace Genesis.RoomScan
 
             int w = _depthTex.width;
             int h = _depthTex.height;
-            bool recreate = _temporalDepthTex == null || _temporalReasonTex == null ||
-                            _temporalDepthTex.width != w || _temporalDepthTex.height != h;
+            bool useCompactKernel = compactDepthOnly && _hasTemporalCompactKernel;
+            if (compactDepthOnly && !useCompactKernel && !_loggedCompactTemporalFallback)
+            {
+                _loggedCompactTemporalFallback = true;
+                Logger.Warning("DepthCapture: compact temporal kernel unavailable; " +
+                               "falling back to full temporal diagnostics.");
+            }
+            bool needsReasonTexture = !useCompactKernel;
+            bool recreate = _temporalDepthTex == null ||
+                            _temporalDepthTex.width != w || _temporalDepthTex.height != h ||
+                            (needsReasonTexture && _temporalReasonTex == null);
             if (recreate)
             {
                 if (_temporalDepthTex) Destroy(_temporalDepthTex);
@@ -1507,23 +1543,29 @@ namespace Genesis.RoomScan
                 _temporalDepthTex = CreateTemporalDepthTexture(w, h, "DepthTemporalOut");
                 _temporalHistReadTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistRead");
                 _temporalHistWriteTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistWrite");
-                _temporalReasonTex = CreateTemporalReasonTexture(w, h);
+                if (needsReasonTexture)
+                    _temporalReasonTex = CreateTemporalReasonTexture(w, h);
                 _hasTemporalHistory = false;
             }
 
-            if (_temporalStats == null)
+            if (!useCompactKernel && _temporalStats == null)
             {
                 _temporalStats = new ComputeBuffer(2, sizeof(uint));
                 _temporalStats.SetData(ZeroTemporalStats);
             }
 
             var cs = temporalFilterCompute;
-            _temporalKernel.Set(BilSrcDepthID, _depthTex);
-            _temporalKernel.Set(TemporalHistDepthID, _temporalHistReadTex);
-            _temporalKernel.Set(BilDstDepthID, _temporalDepthTex);
-            _temporalKernel.Set(TemporalNextHistDepthID, _temporalHistWriteTex);
-            _temporalKernel.Set(TemporalReasonRWID, _temporalReasonTex);
-            _temporalKernel.Set(TemporalStatsID, _temporalStats);
+            ComputeKernelHelper temporalKernel = useCompactKernel
+                ? _temporalCompactKernel : _temporalKernel;
+            temporalKernel.Set(BilSrcDepthID, _depthTex);
+            temporalKernel.Set(TemporalHistDepthID, _temporalHistReadTex);
+            temporalKernel.Set(BilDstDepthID, _temporalDepthTex);
+            temporalKernel.Set(TemporalNextHistDepthID, _temporalHistWriteTex);
+            if (!useCompactKernel)
+            {
+                temporalKernel.Set(TemporalReasonRWID, _temporalReasonTex);
+                temporalKernel.Set(TemporalStatsID, _temporalStats);
+            }
             cs.SetInt(BilDepthWID, w);
             cs.SetInt(BilDepthHID, h);
             cs.SetMatrixArray(TemporalCurProjID, _proj);
@@ -1541,7 +1583,7 @@ namespace Genesis.RoomScan
             cs.SetFloat(TemporalChangeBaseID, temporalChangeBaseMeters);
             cs.SetFloat(TemporalChangeScaleID, temporalChangeDistanceScale);
 
-            _temporalKernel.DispatchFit(w, h, 2);
+            temporalKernel.DispatchFit(w, h, 2);
 
             _depthTex = _temporalDepthTex;
             (_temporalHistReadTex, _temporalHistWriteTex) = (_temporalHistWriteTex, _temporalHistReadTex);
@@ -1551,12 +1593,15 @@ namespace Genesis.RoomScan
             Array.Copy(_viewInv, _prevTemporalViewInv, 2);
             _hasTemporalHistory = true;
 
-            _temporalSinceStats++;
-            if (_temporalSinceStats >= 15 && !_temporalStatsReadbackPending)
+            if (!useCompactKernel)
             {
-                _temporalSinceStats = 0;
-                _temporalStatsReadbackPending = true;
-                AsyncGPUReadback.Request(_temporalStats, OnTemporalStatsReadback);
+                _temporalSinceStats++;
+                if (_temporalSinceStats >= 15 && !_temporalStatsReadbackPending)
+                {
+                    _temporalSinceStats = 0;
+                    _temporalStatsReadbackPending = true;
+                    AsyncGPUReadback.Request(_temporalStats, OnTemporalStatsReadback);
+                }
             }
         }
 

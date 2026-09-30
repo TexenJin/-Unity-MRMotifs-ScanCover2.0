@@ -5,6 +5,7 @@
 // 本 pass 跑在 SetGlobalShaderProperties 之前，矩阵必须逐内核下发（HandMask 同款教训）。
 
 #pragma kernel TemporalFilter
+#pragma kernel TemporalFilterCompact
 
 Texture2DArray<float>   _SrcDepth;
 Texture2DArray<float>   _HistDepth;
@@ -138,4 +139,68 @@ void TemporalFilter(uint3 id : SV_DispatchThreadID)
     _NextHistDepth[coord] = filteredNdc;
     _TemporalReason[coord] = TEMPORAL_REASON_STABLE;
     InterlockedAdd(_TemporalStats[0], 1u);
+}
+
+// V1.3 consumes the filtered depth but none of the reason/statistics sidecars.
+// Keep the exact same reprojection, change gate and EMA while removing the
+// diagnostic UAV and per-pixel atomics from the production descriptor/workset.
+[numthreads(8, 8, 1)]
+void TemporalFilterCompact(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_DepthW || id.y >= (uint)_DepthH || id.z >= 2) return;
+    uint3 coord = id;
+    uint eye = id.z;
+
+    float cur = _SrcDepth[coord];
+    if (cur <= 0.0)
+    {
+        _DstDepth[coord] = 0.0;
+        _NextHistDepth[coord] = _HasPrev != 0 ? _HistDepth[coord] : 0.0;
+        return;
+    }
+
+    float2 uv = (id.xy + 0.5) / float2(_DepthW, _DepthH);
+    float3 curWorld = CurNdcToWorld(float3(uv, cur), eye);
+
+    if (_HasPrev == 0)
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    float3 prevNdc;
+    if (!WorldToPrevNdc(curWorld, eye, prevNdc))
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    uint2 prevPixel = clamp((uint2)(prevNdc.xy * float2(_DepthW, _DepthH)),
+                            uint2(0, 0), uint2(_DepthW - 1, _DepthH - 1));
+    float hist = _HistDepth[uint3(prevPixel, eye)];
+    if (hist <= 0.0)
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    float3 histWorld = PrevNdcToWorld(float3(prevNdc.xy, hist), eye);
+    float curDist = length(curWorld - _CurViewInv[eye]._m03_m13_m23);
+    float changeLimit = max(_TemporalChangeBase, curDist * _TemporalChangeScale);
+    float worldDelta = length(curWorld - histWorld);
+
+    if (worldDelta > changeLimit)
+    {
+        _DstDepth[coord] = cur;
+        _NextHistDepth[coord] = cur;
+        return;
+    }
+
+    float3 filteredWorld = lerp(histWorld, curWorld, saturate(_TemporalAlpha));
+    float filteredNdc = saturate(WorldToCurNdc(filteredWorld, eye).z);
+    _DstDepth[coord] = filteredNdc;
+    _NextHistDepth[coord] = filteredNdc;
 }
