@@ -196,6 +196,8 @@ namespace Genesis.RoomScan
         [SerializeField, Range(0.002f, 0.25f)] private float dirtyTsdfThreshold = 0.02f;
         [Tooltip("Only changes inside this normalized zero-crossing band can dirty an already observed surface.")]
         [SerializeField, Range(0.25f, 1f)] private float dirtySurfaceBand = 1f;
+        [Tooltip("InfiniTAM block A/B: only topology changes (surface appearance/disappearance or TSDF sign flips) wake extraction. Stable same-cell TSDF convergence keeps the committed front instead of rebuilding a whole block.")]
+        [SerializeField] private bool enableInfiniTamTopologyDirtyGate = true;
 
         [Header("InfiniTAM architecture baseline")]
         [SerializeField, Tooltip("独立 InfiniTAM V1.3 行为基线：Quest 世界位姿下直接写入唯一 raw-projective TSDF；模型 raycast 与残差只读旁证。GunGel、裁判、种面标尺、冻结和制品链全部旁路。")]
@@ -444,6 +446,8 @@ namespace Genesis.RoomScan
         private static readonly int DirtyTsdfThresholdID = Shader.PropertyToID("gsDirtyTsdfThreshold");
         private static readonly int DirtySurfaceBandID = Shader.PropertyToID("gsDirtySurfaceBand");
         private static readonly int DirtyMinWeightID = Shader.PropertyToID("gsDirtyMinWeight");
+        private static readonly int InfiniTamTopologyDirtyGateID =
+            Shader.PropertyToID("gsInfiniTamTopologyDirtyGate");
         private static readonly int ChunkFreezeSetMaskID = Shader.PropertyToID("_ChunkFreezeSetMask");
         private static readonly int ChunkFreezeClearMaskID = Shader.PropertyToID("_ChunkFreezeClearMask");
         private static readonly int FrozenChunkVotesID = Shader.PropertyToID("_FrozenChunkVotes");
@@ -2670,6 +2674,8 @@ namespace Genesis.RoomScan
             compute.SetFloat(DirtyTsdfThresholdID, dirtyTsdfThreshold);
             compute.SetFloat(DirtySurfaceBandID, dirtySurfaceBand);
             compute.SetFloat(DirtyMinWeightID, minMeshWeight);
+            compute.SetInt(InfiniTamTopologyDirtyGateID,
+                enableInfiniTamTopologyDirtyGate ? 1 : 0);
             compute.SetInts(FrozenChunkCountID, _frozenChunkCount.x, _frozenChunkCount.y, _frozenChunkCount.z);
             compute.SetInt(FrozenChunkSizeID, Mathf.Max(8, frozenChunkSize));
             compute.SetFloat(FrozenMatureWeightID, frozenMatureWeight);

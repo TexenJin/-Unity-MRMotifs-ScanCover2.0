@@ -64,6 +64,7 @@ uint gsDirtyBoundaryHalo;
 float gsDirtyTsdfThreshold;
 float gsDirtySurfaceBand;
 float gsDirtyMinWeight;
+uint gsInfiniTamTopologyDirtyGate;
 // ── 逐块可逆冻结 ─────────────────────────────────────────────
 // 冻结单元 = gsFrozenChunkSize 块（默认 32³≈1.6m，独立于脏账本 64³ 提取网格）。
 // weight 翻符号即冻结，提取层 abs(weight) 对符号透明 → 冻结/解冻都不标脏、不重提网格。
@@ -1022,7 +1023,17 @@ void MarkInfiniTamDirtyChunk(uint3 coord, float2 before, float2 after)
                        ((before.x < 0.0) != (after.x < 0.0));
     bool distanceChanged = beforeSurface && afterSurface &&
                            abs(after.x - before.x) >= gsDirtyTsdfThreshold;
-    if (beforeSurface == afterSurface && !signChanged && !distanceChanged) return;
+
+    // Quest block-remesh admission follows the same distinction used by the
+    // LaserTag-style sparse mesher: a topology change must publish promptly,
+    // while stable TSDF convergence inside the same signed cells can keep the
+    // already committed front.  This removes the expensive "one voxel moved,
+    // rebuild 64^3" loop without delaying first growth, disappearance, or a
+    // zero crossing.  The A/B switch preserves the exact previous behaviour.
+    bool topologyChanged = beforeSurface != afterSurface || signChanged;
+    bool stableGeometryChanged = distanceChanged &&
+                                 gsInfiniTamTopologyDirtyGate == 0u;
+    if (!topologyChanged && !stableGeometryChanged) return;
 
     uint3 chunk = min(coord / gsDirtyChunkSize, gsDirtyChunkCount - 1u);
     uint chunkIndex = ChunkIndexFromCoord(coord);
