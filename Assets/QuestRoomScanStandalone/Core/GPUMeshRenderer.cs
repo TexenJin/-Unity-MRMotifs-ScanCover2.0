@@ -71,6 +71,16 @@ namespace Genesis.RoomScan
         private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
         private static readonly int ID_TrueLineQuadPerimeters =
             Shader.PropertyToID("_RSTrueLineQuadPerimeters");
+        private static readonly int ID_TrueLineMaxViewDistance =
+            Shader.PropertyToID("_RSTrueLineMaxViewDistance");
+        private static readonly int ID_DepthPrepassMaxViewDistance =
+            Shader.PropertyToID("_RSDepthPrepassMaxViewDistance");
+
+        // Keep the CPU block rejection conservative for stereo eyes and for
+        // blocks touching the display-range boundary. The depth shader applies
+        // the exact per-vertex range to the surviving boundary blocks.
+        private const float DepthPrepassBoundsCullPadding = 0.15f;
+        private static Camera s_mainCamera;
 
         // Display-only A/B colors. They never feed back into extraction or TSDF state.
         private static readonly Color ProductionColor = new Color(1.0f, 0.62f, 0.02f, 0.96f);
@@ -267,10 +277,17 @@ namespace Genesis.RoomScan
                 ordinaryWireframe &&
                 ((knownDrawVertexCount > 0 &&
                   knownDrawVertexCount <= int.MaxValue / 2) ||
-                 (knownDrawVertexCount < 0 && lineArgsBuf != null)) &&
+                  (knownDrawVertexCount < 0 && lineArgsBuf != null)) &&
                 EnsureTrueLineMaterial();
+            float depthPrepassMaxDistance = useTrueLines
+                ? Mathf.Max(0f, Shader.GetGlobalFloat(ID_TrueLineMaxViewDistance))
+                : 0f;
+            _props.SetFloat(ID_DepthPrepassMaxViewDistance,
+                depthPrepassMaxDistance);
             if (occludeRearWireframe && s_rearWireDepthPrepassEnabled &&
-                lineSurfaceVisible && EnsureRearWireOccluderMaterial())
+                lineSurfaceVisible &&
+                !IsEntirelyOutsideDepthPrepassRange(depthPrepassMaxDistance) &&
+                EnsureRearWireOccluderMaterial())
             {
                 // Fill only the depth buffer with the nearest complete triangle
                 // surface.  The passthrough colour remains untouched, while the
@@ -331,6 +348,22 @@ namespace Genesis.RoomScan
             }
             LastSubmittedVertexCount = knownDrawVertexCount > 0 ? knownDrawVertexCount : -1;
             LastSubmittedFrame = Time.frameCount;
+        }
+
+        private bool IsEntirelyOutsideDepthPrepassRange(float maxDistance)
+        {
+            if (maxDistance <= 0f)
+                return false;
+
+            if (s_mainCamera == null)
+                s_mainCamera = Camera.main;
+            if (s_mainCamera == null)
+                return false;
+
+            float conservativeDistance = maxDistance +
+                                         DepthPrepassBoundsCullPadding;
+            return _bounds.SqrDistance(s_mainCamera.transform.position) >
+                   conservativeDistance * conservativeDistance;
         }
 
         private bool EnsureTrueLineMaterial()
