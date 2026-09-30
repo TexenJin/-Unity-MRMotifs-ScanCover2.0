@@ -839,7 +839,10 @@ namespace Genesis.RoomScan
                     TemporalDecayRate = 0f,
                     ConvergenceThreshold = 0f,
                     TemporalDeadzone = 0f,
-                    StrictObservedEdges = false,
+                    // Keep the warm-up/fallback snapshot on the same topology
+                    // contract as the incremental blocks: unknown TSDF samples
+                    // cannot manufacture a surface edge.
+                    StrictObservedEdges = true,
                     CandidateHistoryUpdateEnabled = false,
                     FoundationTopologyMode =
                         InfiniTamBlockMeshPipeline.DirectTenCentimeterExperiment,
@@ -1725,10 +1728,11 @@ namespace Genesis.RoomScan
 
             _extractCount++;
             _gpuSurfaceNets.MinMeshWeight = _volume.MinMeshWeight;
-            // The live/front pipeline is always production.  Strict extraction
-            // is captured only by the paired save transaction below.
+            // The live/front pipeline is always production. The InfiniTAM
+            // production contract itself now requires observed edge endpoints;
+            // the old route keeps its separate paired strict export below.
             UseStrictObservedExtraction = false;
-            _gpuSurfaceNets.StrictObservedEdges = false;
+            _gpuSurfaceNets.StrictObservedEdges = IsInfiniTamBaselineActive;
             ExtractCurrentVolume(_gpuSurfaceNets);
 
             if (_gpuRenderer != null)
@@ -2532,7 +2536,7 @@ namespace Genesis.RoomScan
                 // visible and will be released below, so a third full extraction
                 // would only add GPU pressure.  Legacy display still needs restore.
                 UseStrictObservedExtraction = false;
-                _gpuSurfaceNets.StrictObservedEdges = false;
+                _gpuSurfaceNets.StrictObservedEdges = IsInfiniTamBaselineActive;
                 if (!releaseAfterCapture)
                     ExtractCurrentVolume();
                 _gpuRenderer?.SetStrictObservedDisplay(false);
@@ -2593,7 +2597,7 @@ namespace Genesis.RoomScan
             try
             {
                 _gpuSurfaceNets.MinMeshWeight = _volume.MinMeshWeight;
-                _gpuSurfaceNets.StrictObservedEdges = strict;
+                _gpuSurfaceNets.StrictObservedEdges = strict || IsInfiniTamBaselineActive;
                 ExtractCurrentVolume();
                 GraphicsBuffer counters = _gpuSurfaceNets.CountersBuffer;
                 if (counters == null)

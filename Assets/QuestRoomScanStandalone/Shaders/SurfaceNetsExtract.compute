@@ -824,7 +824,14 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     InterlockedAdd(_Counters[0], 1, compactIdx);
 
     if (compactIdx >= _MaxVertices)
+    {
+        // This cell was active in the current TSDF but could not obtain a
+        // current vertex slot.  Never leave its previous extraction's map
+        // entry alive: a later face would otherwise connect current vertices
+        // to an unrelated stale vertex and produce a long scar triangle.
+        _CoordVertMap[flatIdx] = -1;
         return;
+    }
 
     if (strictObserved)
         InterlockedAdd(_Counters[5], 1);
@@ -1887,7 +1894,10 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     int b = _CoordVertMap[MapFlatten(cb)];
     int c = _CoordVertMap[MapFlatten(cc)];
     int d = _CoordVertMap[MapFlatten(cd)];
-    if (a < 0 || b < 0 || c < 0 || d < 0) return;
+    if (a < 0 || b < 0 || c < 0 || d < 0 ||
+        a >= (int)_MaxVertices || b >= (int)_MaxVertices ||
+        c >= (int)_MaxVertices || d >= (int)_MaxVertices)
+        return;
 
     uint pa = _VertexAdmissionClass[(uint)a];
     uint pb = _VertexAdmissionClass[(uint)b];

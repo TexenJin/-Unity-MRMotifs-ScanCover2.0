@@ -358,7 +358,10 @@ namespace Genesis.RoomScan
                 TemporalDecayRate = 0f,
                 ConvergenceThreshold = 0f,
                 TemporalDeadzone = 0f,
-                StrictObservedEdges = false,
+                // A missing TSDF endpoint is unknown space, not a zero
+                // crossing.  Letting it close a face creates the long caps and
+                // scar-like bridges that remain after the real surface heals.
+                StrictObservedEdges = true,
                 CandidateHistoryUpdateEnabled = false,
                 FoundationTopologyMode = DirectTenCentimeterExperiment,
                 FoundationCellStride = DirectTenCentimeterExperiment ? 2 : 1,
