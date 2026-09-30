@@ -80,6 +80,12 @@ namespace Genesis.RoomScan
         public float ConvergenceThreshold { get; set; } = 0.005f;
         public float TemporalDeadzone { get; set; } = 0.001f;
         public bool StrictObservedEdges { get; set; }
+        /// <summary>
+        /// Extraction-only repair for isolated weak TSDF sign flips. A sample
+        /// is replaced only when at least five observed axial neighbours agree
+        /// on the opposite sign. The fused volume remains untouched.
+        /// </summary>
+        public bool PlanarTopologyRepair { get; set; }
         public bool CandidateHistoryUpdateEnabled { get; set; } = true;
         /// <summary>
         /// Product topology starts from native 5 cm TSDF crossings. Compatible
@@ -136,6 +142,8 @@ namespace Genesis.RoomScan
         private static readonly int ID_ConvergeThreshold = Shader.PropertyToID("_ConvergeThreshold");
         private static readonly int ID_TemporalDeadzone = Shader.PropertyToID("_TemporalDeadzone");
         private static readonly int ID_StrictObservedEdges = Shader.PropertyToID("_StrictObservedEdges");
+        private static readonly int ID_PlanarTopologyRepair =
+            Shader.PropertyToID("_PlanarTopologyRepair");
         private static readonly int ID_CurrentDepthEvidenceAvailable = Shader.PropertyToID("_CurrentDepthEvidenceAvailable");
         private static readonly int ID_CurrentEdgeEvidenceAvailable = Shader.PropertyToID("_CurrentEdgeEvidenceAvailable");
         private static readonly int ID_DiagnosticRoiEnabled = Shader.PropertyToID("_DiagnosticRoiEnabled");
@@ -870,6 +878,8 @@ namespace Genesis.RoomScan
             _compute.SetFloat(ID_ConvergeThreshold, ConvergenceThreshold);
             _compute.SetFloat(ID_TemporalDeadzone, TemporalDeadzone);
             _compute.SetFloat(ID_StrictObservedEdges, StrictObservedEdges ? 1f : 0f);
+            _compute.SetInt(ID_PlanarTopologyRepair,
+                PlanarTopologyRepair ? 1 : 0);
             _compute.SetFloat(ID_DiagnosticRoiEnabled, DiagnosticRoiEnabled ? 1f : 0f);
             _compute.SetVector(ID_DiagnosticRoiRect, DiagnosticRoiRect);
             _compute.SetVector(ID_DiagnosticRoiSplitX,

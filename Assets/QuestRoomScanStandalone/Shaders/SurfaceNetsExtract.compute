@@ -69,6 +69,7 @@ float  _TemporalDecayRate;
 float  _ConvergeThreshold;
 float  _TemporalDeadzone;
 float  _StrictObservedEdges;
+uint   _PlanarTopologyRepair;
 float  _CurrentDepthEvidenceAvailable;
 float  _CurrentEdgeEvidenceAvailable;
 float  _DiagnosticRoiEnabled;
@@ -211,6 +212,12 @@ static const int3 kCornerOffs[8] =
 };
 static const uint kEdgeA[12] = { 0,1,2,3, 4,5,6,7, 0,1,2,3 };
 static const uint kEdgeB[12] = { 1,2,3,0, 5,6,7,4, 4,5,6,7 };
+static const int3 kAxisNeighbourOffs[6] =
+{
+    int3(-1,0,0), int3(1,0,0),
+    int3(0,-1,0), int3(0,1,0),
+    int3(0,0,-1), int3(0,0,1)
+};
 
 // ──────────────────────────────────────────────────────────────────
 //  Helpers
@@ -273,6 +280,50 @@ bool TrySampleObservedSDF(int3 coord, out float value)
     bool observed = abs(s.y) >= _MinWeight;
     value = observed ? s.x : 0.0;
     return observed;
+}
+
+// Extraction-only topology repair. Surface Nets turns one isolated sign flip
+// into a small closed ring, seen on a flat wall as a rotated diamond and, in a
+// depth slice, as two nearby zero crossings. Correct only a weak centre whose
+// observed axial neighbourhood supplies an overwhelming 5-of-6 opposite-sign
+// vote. A real slope, corner, thin sheet or coherent feature retains same-sign
+// neighbours and therefore passes through unchanged. Nothing is written back
+// to the canonical TSDF.
+float2 SamplePlanarTopologySDF(int3 coord)
+{
+    float2 center = _TsdfVolume[coord];
+    if (_PlanarTopologyRepair == 0u ||
+        abs(center.y) < _MinWeight ||
+        abs(center.x) > 0.45)
+        return center;
+
+    bool centerNegative = center.x < 0.0;
+    uint opposingCount = 0u;
+    float opposingSum = 0.0;
+
+    [unroll]
+    for (uint n = 0u; n < 6u; n++)
+    {
+        int3 neighbourCoord = coord + kAxisNeighbourOffs[n];
+        if (any(neighbourCoord < 0) ||
+            any(neighbourCoord >= (int3)_VoxCount))
+            continue;
+
+        float2 neighbour = _TsdfVolume[neighbourCoord];
+        if (abs(neighbour.y) < _MinWeight || abs(neighbour.x) < 0.02)
+            continue;
+
+        bool neighbourNegative = neighbour.x < 0.0;
+        if (neighbourNegative != centerNegative)
+        {
+            opposingCount++;
+            opposingSum += neighbour.x;
+        }
+    }
+
+    if (opposingCount >= 5u)
+        center.x = opposingSum / (float)opposingCount;
+    return center;
 }
 
 // Local TSDF gradient used only by the foundation feature recognizer. It is
@@ -503,6 +554,19 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     // old source of coarse bridges across holes and unrelated depth layers.
     bool strictObserved = _StrictObservedEdges > 0.5 ||
                           (_FoundationTopologyMode != 0u && cellStride > 1);
+    bool repairPlanarTopology = _PlanarTopologyRepair != 0u &&
+                                strictObserved && cellStride == 1;
+    float2 topologyCornerSamples[8];
+    [unroll]
+    for (uint clearCorner = 0u; clearCorner < 8u; clearCorner++)
+        topologyCornerSamples[clearCorner] = float2(0.0, 0.0);
+    if (repairPlanarTopology)
+    {
+        [unroll]
+        for (uint corner = 0u; corner < 8u; corner++)
+            topologyCornerSamples[corner] = SamplePlanarTopologySDF(
+                coord + kCornerOffs[corner]);
+    }
     bool traceEndpointSeen = false;
     uint firstAdmissionSource = 0u;
     uint firstConfirmationState = 0u;
@@ -534,8 +598,12 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
         int3 cA = coord + kCornerOffs[kEdgeA[e]] * cellStride;
         int3 cB = coord + kCornerOffs[kEdgeB[e]] * cellStride;
 
-        float2 sA = _TsdfVolume[cA];
-        float2 sB = _TsdfVolume[cB];
+        float2 sA = repairPlanarTopology
+            ? topologyCornerSamples[kEdgeA[e]]
+            : _TsdfVolume[cA];
+        float2 sB = repairPlanarTopology
+            ? topologyCornerSamples[kEdgeB[e]]
+            : _TsdfVolume[cB];
 
         // A 10 cm edge is not sampled as one long chord.  Bracket its zero
         // crossing on the two native 5 cm segments so depth remains tied to the
@@ -1829,7 +1897,8 @@ void AuditVisualTriangle(uint index0, uint index1, uint index2, int3 ownerCoord,
     InterlockedAdd(_Counters[VISUAL_TOTAL_INDEX], 1u);
 }
 
-void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
+void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2,
+                 uint axisSlot, float2 strideOneA, float2 strideOneB)
 {
     int topologyStride = _FoundationTopologyMode != 0u
         ? max((int)_FoundationCellStride, 1)
@@ -1844,12 +1913,20 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 
     float va;
     float vb;
+    float2 edgeA = topologyStride == 1
+        ? strideOneA
+        : _TsdfVolume[coord];
+    float2 edgeB = topologyStride == 1
+        ? strideOneB
+        : _TsdfVolume[coord + topologyAxis];
     bool strictTopologyEdge = _StrictObservedEdges > 0.5 ||
                               (_FoundationTopologyMode != 0u && topologyStride > 1);
     if (strictTopologyEdge)
     {
-        bool observedA = TrySampleObservedSDF(coord, va);
-        bool observedB = TrySampleObservedSDF(coord + topologyAxis, vb);
+        bool observedA = abs(edgeA.y) >= _MinWeight;
+        bool observedB = abs(edgeB.y) >= _MinWeight;
+        va = observedA ? edgeA.x : 0.0;
+        vb = observedB ? edgeB.x : 0.0;
         if (!observedA || !observedB)
         {
             InterlockedAdd(_Counters[4], 1);
@@ -1877,8 +1954,10 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     }
     else
     {
-        va = SampleSDF(coord);
-        vb = SampleSDF(coord + topologyAxis);
+        bool emptyA = edgeA.x <= -0.99 || abs(edgeA.y) < _MinWeight;
+        bool emptyB = edgeB.x <= -0.99 || abs(edgeB.y) < _MinWeight;
+        va = emptyA ? 0.0 : edgeA.x;
+        vb = emptyB ? 0.0 : edgeB.x;
     }
     if ((va < 0) == (vb < 0)) return;
 
@@ -2176,6 +2255,14 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
 
+    // Reuse one repaired sample per edge endpoint. The classifier uses the
+    // same helper, so vertex creation and face emission cannot disagree about
+    // whether an isolated sign island exists.
+    float2 centerSample = SamplePlanarTopologySDF(coord);
+    float2 xSample = SamplePlanarTopologySDF(coord + int3(1,0,0));
+    float2 ySample = SamplePlanarTopologySDF(coord + int3(0,1,0));
+    float2 zSample = SamplePlanarTopologySDF(coord + int3(0,0,1));
+
     // Product pages may retain a one-voxel overlap from the read halo.  This is
     // a visible block skirt, not new evidence: both pages sample the same TSDF
     // and neither overlap is ever fed back into fusion or adjudication.
@@ -2184,9 +2271,12 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
     int3 emitMax = min(_CoreMax + skirt, _MapMin + (int3)_MapCount);
     if (any(coord < emitMin) || any(coord >= emitMax)) return;
 
-    TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0), 0u);
-    TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1), 1u);
-    TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0), 2u);
+    TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0),
+                0u, centerSample, xSample);
+    TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1),
+                1u, centerSample, ySample);
+    TryEmitQuad(coord, int3(0,0,1), int3(0,1,0), int3(1,0,0),
+                2u, centerSample, zSample);
 }
 
 // ══════════════════════════════════════════════════════════════════

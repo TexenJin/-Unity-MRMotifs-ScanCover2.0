@@ -843,6 +843,7 @@ namespace Genesis.RoomScan
                     // contract as the incremental blocks: unknown TSDF samples
                     // cannot manufacture a surface edge.
                     StrictObservedEdges = true,
+                    PlanarTopologyRepair = true,
                     CandidateHistoryUpdateEnabled = false,
                     FoundationTopologyMode =
                         InfiniTamBlockMeshPipeline.DirectTenCentimeterExperiment,
