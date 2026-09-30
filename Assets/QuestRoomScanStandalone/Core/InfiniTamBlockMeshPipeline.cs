@@ -400,7 +400,7 @@ namespace Genesis.RoomScan
             block.Renderer.SetJointDiagnosticDisplay(false);
             block.Renderer.SetTemporalIllegalCandidateActive(false);
             block.Renderer.SetProductGridDisplay(false);
-            block.Renderer.SetTrueLineQuadTopology(true);
+            block.Renderer.SetTrueLineQuadPerimeters(true);
             block.Renderer.SetPinkIsolation(true);
             block.Renderer.RenderVisible = false;
         }

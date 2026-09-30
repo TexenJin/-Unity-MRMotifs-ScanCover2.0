@@ -69,8 +69,8 @@ namespace Genesis.RoomScan
         private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
         private static readonly int ID_Wireframe = Shader.PropertyToID("_RSWireframe");
         private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
-        private static readonly int ID_TrueLineQuadTopology =
-            Shader.PropertyToID("_RSTrueLineQuadTopology");
+        private static readonly int ID_TrueLineQuadPerimeters =
+            Shader.PropertyToID("_RSTrueLineQuadPerimeters");
         private static readonly int ID_TrueLineMaxViewDistance =
             Shader.PropertyToID("_RSTrueLineMaxViewDistance");
         private static readonly int ID_DepthPrepassMaxViewDistance =
@@ -94,7 +94,7 @@ namespace Genesis.RoomScan
         private bool _temporalIllegalCandidateActive;
         private bool _heraReplayActive;
         private bool _productGridMode;
-        private bool _trueLineQuadTopology;
+        private bool _trueLineQuadPerimeters;
 
         private bool _renderVisible = true;
 
@@ -182,13 +182,12 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// The compact InfiniTAM front emits each native surface quad as two
-        /// consecutive triangles. Draw the four perimeter edges and their one
-        /// shared diagonal exactly once so the display matches the real
-        /// triangle topology without double-submitting the split edge.
+        /// consecutive triangles. Draw its four perimeter edges without the
+        /// internal split diagonal; immutable mesh data remains unchanged.
         /// </summary>
-        public void SetTrueLineQuadTopology(bool enabled)
+        public void SetTrueLineQuadPerimeters(bool enabled)
         {
-            _trueLineQuadTopology = enabled;
+            _trueLineQuadPerimeters = enabled;
         }
 
         /// <summary>
@@ -252,10 +251,10 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
             _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
-            bool useQuadTopology = _trueLineQuadTopology &&
+            bool useQuadPerimeters = _trueLineQuadPerimeters &&
                 knownDrawVertexCount >= 6 && knownDrawVertexCount % 6 == 0;
-            _props.SetFloat(ID_TrueLineQuadTopology,
-                useQuadTopology ? 1f : 0f);
+            _props.SetFloat(ID_TrueLineQuadPerimeters,
+                useQuadPerimeters ? 1f : 0f);
             var rp = new RenderParams(gpuMeshMaterial)
             {
                 worldBounds = _bounds,
@@ -318,13 +317,13 @@ namespace Genesis.RoomScan
 
                 // Ordinary snapshots expose all three triangle edges. The compact
                 // InfiniTAM front has a stronger contract: every six indices are
-                // one two-triangle group, so ten line vertices cover its four
-                // outside edges and shared diagonal exactly once. Both routes
+                // one quad, so eight line vertices cover its perimeter instead of
+                // twelve vertices drawing the split diagonal twice. Both routes
                 // avoid rasterizing triangle interiors.
                 if (knownDrawVertexCount > 0)
                 {
-                    int lineVertexCount = useQuadTopology
-                        ? knownDrawVertexCount / 6 * 10
+                    int lineVertexCount = useQuadPerimeters
+                        ? knownDrawVertexCount / 6 * 8
                         : knownDrawVertexCount * 2;
                     Graphics.RenderPrimitives(
                         lineRp,

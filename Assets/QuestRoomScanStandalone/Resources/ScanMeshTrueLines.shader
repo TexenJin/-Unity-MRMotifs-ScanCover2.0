@@ -15,10 +15,7 @@ Shader "Genesis/ScanMeshTrueLines"
             Name "TrueMeshLines"
             Tags { "LightMode"="SRPDefaultUnlit" }
 
-            // Shared mesh edges can be submitted by both adjacent faces.
-            // Replacement blending keeps one edge and two coincident edges at
-            // the same brightness; separated double surfaces remain visible.
-            Blend One Zero
+            Blend SrcAlpha OneMinusSrcAlpha
             ZWrite On
             ZTest LEqual
             Cull Off
@@ -53,7 +50,7 @@ Shader "Genesis/ScanMeshTrueLines"
             float _RSConfidenceViz;
             float _RSMeshStride;
             float _RSTrueLineMaxViewDistance;
-            float _RSTrueLineQuadTopology;
+            float _RSTrueLineQuadPerimeters;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
@@ -158,55 +155,48 @@ Shader "Genesis/ScanMeshTrueLines"
                 uint triBase;
                 uint sourceIndexPosition;
                 uint diagnosticEdge;
-                if (_RSTrueLineQuadTopology > 0.5)
+                if (_RSTrueLineQuadPerimeters > 0.5)
                 {
                     // InfiniTAM stores one quad as two adjacent triangles. The
                     // repeated first corner distinguishes the two winding layouts.
-                    // Ten output vertices draw the four outside edges plus the
-                    // real shared diagonal once instead of twice.
-                    uint quadBase = (vertID / 10u) * 6u;
-                    uint topologyVertex = vertID % 10u;
-                    uint topologyEdge = topologyVertex / 2u;
-                    bool diagonalEdge = topologyEdge == 4u;
+                    // Eight output vertices draw four outside edges; the internal
+                    // split diagonal is no longer submitted twice.
+                    uint quadBase = (vertID / 8u) * 6u;
+                    uint perimeterVertex = vertID % 8u;
+                    uint perimeterEdge = perimeterVertex / 2u;
                     bool positiveLayout =
                         (_SurfaceIndices[quadBase] & 0x3FFFFFFFu) ==
                         (_SurfaceIndices[quadBase + 3u] & 0x3FFFFFFFu);
                     uint sourceSlot;
                     if (positiveLayout)
                     {
-                        sourceSlot = topologyVertex == 0u ? 0u :
-                                     topologyVertex == 1u ? 4u :
-                                     topologyVertex == 2u ? 4u :
-                                     topologyVertex == 3u ? 5u :
-                                     topologyVertex == 4u ? 5u :
-                                     topologyVertex == 5u ? 2u :
-                                     topologyVertex == 6u ? 2u :
-                                     topologyVertex == 7u ? 3u :
-                                     topologyVertex == 8u ? 0u : 1u;
-                        triBase = diagonalEdge || topologyEdge >= 2u
-                            ? quadBase : quadBase + 3u;
-                        diagnosticEdge = diagonalEdge ? 0u :
-                                         topologyEdge == 0u ? 0u :
-                                         topologyEdge == 1u ? 1u :
-                                         topologyEdge == 2u ? 1u : 2u;
+                        sourceSlot = perimeterVertex == 0u ? 0u :
+                                     perimeterVertex == 1u ? 4u :
+                                     perimeterVertex == 2u ? 4u :
+                                     perimeterVertex == 3u ? 5u :
+                                     perimeterVertex == 4u ? 5u :
+                                     perimeterVertex == 5u ? 2u :
+                                     perimeterVertex == 6u ? 2u : 3u;
+                        triBase = perimeterEdge < 2u
+                            ? quadBase + 3u : quadBase;
+                        diagnosticEdge = perimeterEdge == 0u ? 0u :
+                                         perimeterEdge == 1u ? 1u :
+                                         perimeterEdge == 2u ? 1u : 2u;
                     }
                     else
                     {
-                        sourceSlot = topologyVertex == 0u ? 0u :
-                                     topologyVertex == 1u ? 1u :
-                                     topologyVertex == 2u ? 1u :
-                                     topologyVertex == 3u ? 2u :
-                                     topologyVertex == 4u ? 2u :
-                                     topologyVertex == 5u ? 3u :
-                                     topologyVertex == 6u ? 3u :
-                                     topologyVertex == 7u ? 4u :
-                                     topologyVertex == 8u ? 0u : 2u;
-                        triBase = diagonalEdge || topologyEdge < 2u
+                        sourceSlot = perimeterVertex == 0u ? 0u :
+                                     perimeterVertex == 1u ? 1u :
+                                     perimeterVertex == 2u ? 1u :
+                                     perimeterVertex == 3u ? 2u :
+                                     perimeterVertex == 4u ? 2u :
+                                     perimeterVertex == 5u ? 3u :
+                                     perimeterVertex == 6u ? 3u : 4u;
+                        triBase = perimeterEdge < 2u
                             ? quadBase : quadBase + 3u;
-                        diagnosticEdge = diagonalEdge ? 2u :
-                                         topologyEdge == 0u ? 0u :
-                                         topologyEdge == 1u ? 1u :
-                                         topologyEdge == 2u ? 2u : 0u;
+                        diagnosticEdge = perimeterEdge == 0u ? 0u :
+                                         perimeterEdge == 1u ? 1u :
+                                         perimeterEdge == 2u ? 2u : 0u;
                     }
                     sourceIndexPosition = quadBase + sourceSlot;
                 }
@@ -323,9 +313,9 @@ Shader "Genesis/ScanMeshTrueLines"
                         ? half3(0.10, 1.0, 0.25)
                         : _RSExtractionColor.rgb;
                 color = _RSGeometryTruthView > 0.5
-                    ? half3(1.0, 1.0, 1.0)
+                    ? half3(0.95, 0.95, 0.95)
                     : ApplyConfidenceViz(color, input.positionWS);
-                return half4(color, 1.0);
+                return half4(color, _RSExtractionColor.a);
             }
             ENDHLSL
         }
