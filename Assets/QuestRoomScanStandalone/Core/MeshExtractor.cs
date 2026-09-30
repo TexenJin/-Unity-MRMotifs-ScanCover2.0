@@ -557,6 +557,12 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            // Production always starts visible, even if an older serialized
+            // scene stored the former acquisition A/B state.  Set this once at
+            // component startup; doing it inside the idempotent resource
+            // initializer would undo the runtime render-only performance toggle
+            // on every 5 Hz extraction slot.
+            renderProductionMesh = true;
             // One idempotent dirty set and one block in flight. Scene
             // serialization cannot silently restore the four-block GPU burst;
             // newer dirty epochs are coalesced and followed after publication.
@@ -804,10 +810,6 @@ namespace Genesis.RoomScan
         {
             if (_volume == null || surfaceNetsCompute == null) return;
 
-            // Baseline mode has exactly one renderer.  A serialized visibility
-            // value left behind by the former A/B acquisition must not keep the
-            // only result hidden after the reconstruction route is replaced.
-            renderProductionMesh = true;
             UseJointDiagnosticDisplay = false;
 
             EnsureInfiniTamBlockPipeline();
