@@ -26,12 +26,19 @@ namespace Genesis.RoomScan
             public uint ProcessedEpoch;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
+            public readonly uint[] LatestBoundaryEpoch = new uint[6];
+            public readonly uint[] RequiredBoundaryEpoch = new uint[6];
             public bool Built;
             public bool Queued;
             public bool CommitPending;
+            public bool HasStagedCandidate;
             public int CommitSerial;
+            public int PublishVisitSerial;
             public int VertexCount;
             public int IndexCount;
+            public uint StagedEpoch;
+            public int StagedVertexCount;
+            public int StagedIndexCount;
             public GameObject GameObject;
             public GPUSurfaceNets Surface;
             public GPUChunkMeshSnapshot Front;
@@ -79,7 +86,9 @@ namespace Genesis.RoomScan
         private int _readbackFailures;
         private int _inFlightCommits;
         private int _queuedBlockCount;
+        private int _stagedBlockCount;
         private int _nextBatchSerial;
+        private int _nextPublishVisitSerial;
         private long _acceptedCommitCount;
         private long _completedBatchCount;
         private long _publishedBatchCount;
@@ -96,6 +105,7 @@ namespace Genesis.RoomScan
         private uint[] _boundarySnapshot;
         private float _nextReadbackTime;
         private MeshBatch _activeBatch;
+        private readonly List<int> _publishComponent = new List<int>();
 
         // Mature incremental mesh scheduling has one batch in flight. Dirty
         // arrivals are idempotent block flags that accumulate for the next
@@ -123,7 +133,7 @@ namespace Genesis.RoomScan
         public bool InitialBuildComplete { get; private set; }
         public int CommitWatchdogResets { get; private set; }
         public int BlockCount => _blocks.Count;
-        public int PendingCount => _queuedBlockCount + _inFlightCommits;
+        public int PendingCount => _queuedBlockCount + _inFlightCommits + _stagedBlockCount;
         public int QueuedCount => _queuedBlockCount;
         public int InFlightCommitCount => _inFlightCommits;
         public long AcceptedCommitCount => _acceptedCommitCount;
@@ -141,7 +151,7 @@ namespace Genesis.RoomScan
                 for (int i = 0; i < _blocks.Count; i++)
                 {
                     Block block = _blocks[i];
-                    if (block.Queued || block.CommitPending ||
+                    if (block.Queued || block.CommitPending || block.HasStagedCandidate ||
                         block.TargetEpoch > block.ProcessedEpoch)
                         count++;
                 }
@@ -411,7 +421,8 @@ namespace Genesis.RoomScan
                 if (index < 0)
                     break;
                 Block block = _blocks[index];
-                if (block.CommitPending || block.ProcessedEpoch >= block.TargetEpoch)
+                if (block.CommitPending || block.HasStagedCandidate ||
+                    block.ProcessedEpoch >= block.TargetEpoch)
                     continue;
 
                 batch.Items.Add(new BatchItem
@@ -518,7 +529,6 @@ namespace Genesis.RoomScan
                 batch.Generation != _generation)
                 return;
 
-            int acceptedInBatch = 0;
             for (int i = 0; i < batch.Items.Count; i++)
             {
                 BatchItem item = batch.Items[i];
@@ -529,13 +539,6 @@ namespace Genesis.RoomScan
                     continue;
                 }
 
-                // Generation and commit-serial checks above already prevent an
-                // obsolete callback from taking ownership. A candidate is stale
-                // only when this block has already published the same or a newer
-                // epoch. A newer dirty epoch arriving during extraction does not
-                // invalidate useful completed work: publish this bounded-lag
-                // front, then keep one coalesced dirty bit to chase the latest
-                // target on a later mesh slot.
                 if (block.Built && item.CandidateEpoch <= block.ProcessedEpoch)
                 {
                     _staleCandidateDiscardCount++;
@@ -544,29 +547,214 @@ namespace Genesis.RoomScan
                     continue;
                 }
 
-                GPUChunkMeshSnapshot oldFront = block.Front;
-                block.Front = block.Back;
-                block.Back = oldFront;
-                block.Renderer.SetMeshSource(block.Front);
-                block.VertexCount = item.VertexCount;
-                block.IndexCount = item.IndexCount;
-                block.ProcessedEpoch = item.CandidateEpoch;
-                block.Built = true;
-                _acceptedCommitCount++;
-                acceptedInBatch++;
-
-                if (block.TargetEpoch > block.ProcessedEpoch)
+                // Interior changes retain bounded-lag publication. A shared
+                // boundary uses a latched requirement: both sides must cover
+                // this round, while newer fusion remains debt for the next
+                // round instead of invalidating useful completed work forever.
+                if (PendingBoundaryRequirement(block) > item.CandidateEpoch)
+                {
+                    _staleCandidateDiscardCount++;
                     QueueBlock(block.Index, block.TargetEpoch, true);
+                    continue;
+                }
+
+                block.HasStagedCandidate = true;
+                block.StagedEpoch = item.CandidateEpoch;
+                block.StagedVertexCount = item.VertexCount;
+                block.StagedIndexCount = item.IndexCount;
+                _stagedBlockCount++;
+                if (block.Queued)
+                {
+                    block.Queued = false;
+                    _queuedBlockCount = Mathf.Max(0, _queuedBlockCount - 1);
+                }
             }
 
             _completedBatchCount++;
-            if (acceptedInBatch > 0)
-                _publishedBatchCount++;
             _activeBatch = null;
+            if (TryPublishReadyStagedComponents() > 0)
+                _publishedBatchCount++;
             ApplyVisibility();
             if (!InitialBuildComplete && _queuedBlockCount == 0)
                 _nextReadbackTime = 0f;
             TryFinishInitialBuild();
+        }
+
+        private uint PendingBoundaryRequirement(Block block)
+        {
+            uint required = 0;
+            for (int face = 0; face < block.RequiredBoundaryEpoch.Length; face++)
+            {
+                uint epoch = block.RequiredBoundaryEpoch[face];
+                if (epoch > block.ProcessedEpoch)
+                    required = math.max(required, epoch);
+            }
+            return required;
+        }
+
+        private void InvalidateStagedCandidate(Block block)
+        {
+            if (!block.HasStagedCandidate)
+                return;
+            block.HasStagedCandidate = false;
+            block.StagedEpoch = 0;
+            block.StagedVertexCount = 0;
+            block.StagedIndexCount = 0;
+            _stagedBlockCount = Mathf.Max(0, _stagedBlockCount - 1);
+            _staleCandidateDiscardCount++;
+        }
+
+        /// <summary>
+        /// Publish every currently ready seam-connected component. Extraction
+        /// and snapshot copies still happened one block per mesh-work slot; this
+        /// method only swaps already prepared fronts before LateUpdate draws.
+        /// </summary>
+        private int TryPublishReadyStagedComponents()
+        {
+            int published = 0;
+            bool madeProgress;
+            do
+            {
+                madeProgress = false;
+                for (int i = 0; i < _blocks.Count; i++)
+                {
+                    if (!_blocks[i].HasStagedCandidate ||
+                        !TryCollectReadyPublishComponent(i))
+                        continue;
+                    published += PublishCollectedComponent();
+                    madeProgress = true;
+                    break;
+                }
+            } while (madeProgress);
+            return published;
+        }
+
+        private bool TryCollectReadyPublishComponent(int startIndex)
+        {
+            Block start = _blocks[startIndex];
+            if (!start.HasStagedCandidate)
+                return false;
+
+            _nextPublishVisitSerial++;
+            if (_nextPublishVisitSerial == 0)
+            {
+                for (int i = 0; i < _blocks.Count; i++)
+                    _blocks[i].PublishVisitSerial = 0;
+                _nextPublishVisitSerial = 1;
+            }
+
+            int visitSerial = _nextPublishVisitSerial;
+            _publishComponent.Clear();
+            _publishComponent.Add(startIndex);
+            start.PublishVisitSerial = visitSerial;
+
+            for (int cursor = 0; cursor < _publishComponent.Count; cursor++)
+            {
+                Block block = _blocks[_publishComponent[cursor]];
+                for (int face = 0; face < FaceNeighbours.Length; face++)
+                {
+                    uint requiredEpoch = block.RequiredBoundaryEpoch[face];
+                    if (requiredEpoch == 0)
+                        continue;
+
+                    int3 neighbourCoordinate = block.Coordinate + FaceNeighbours[face];
+                    if (math.any(neighbourCoordinate < 0) ||
+                        math.any(neighbourCoordinate >= _blockCount))
+                        continue;
+                    Block neighbour = _blocks[Flatten(neighbourCoordinate)];
+                    bool blockReady = block.ProcessedEpoch >= requiredEpoch;
+                    bool neighbourReady = neighbour.ProcessedEpoch >= requiredEpoch;
+                    if (blockReady && neighbourReady)
+                        continue;
+
+                    if (!blockReady && (!block.HasStagedCandidate ||
+                        block.StagedEpoch < requiredEpoch))
+                        return false;
+                    if (!neighbourReady && (!neighbour.HasStagedCandidate ||
+                        neighbour.StagedEpoch < requiredEpoch))
+                        return false;
+
+                    // If the already-ready side also has a newer staged front,
+                    // include it in the same visible swap rather than letting it
+                    // advance alone while its neighbour is still catching up.
+                    if (!neighbour.HasStagedCandidate ||
+                        neighbour.PublishVisitSerial == visitSerial)
+                        continue;
+                    neighbour.PublishVisitSerial = visitSerial;
+                    _publishComponent.Add(neighbour.Index);
+                }
+            }
+            return true;
+        }
+
+        private int PublishCollectedComponent()
+        {
+            int published = 0;
+            for (int i = 0; i < _publishComponent.Count; i++)
+            {
+                Block block = _blocks[_publishComponent[i]];
+                if (!block.HasStagedCandidate)
+                    continue;
+
+                GPUChunkMeshSnapshot oldFront = block.Front;
+                block.Front = block.Back;
+                block.Back = oldFront;
+                block.Renderer.SetMeshSource(block.Front);
+                block.VertexCount = block.StagedVertexCount;
+                block.IndexCount = block.StagedIndexCount;
+                block.ProcessedEpoch = block.StagedEpoch;
+                block.Built = true;
+                block.HasStagedCandidate = false;
+                block.StagedEpoch = 0;
+                block.StagedVertexCount = 0;
+                block.StagedIndexCount = 0;
+                _stagedBlockCount = Mathf.Max(0, _stagedBlockCount - 1);
+                _acceptedCommitCount++;
+                published++;
+            }
+
+            AdvanceSatisfiedBoundaryRequirements();
+
+            // A newer interior or boundary epoch may have arrived while this
+            // component waited. Preserve one coalesced follow-up per block.
+            for (int i = 0; i < _publishComponent.Count; i++)
+            {
+                Block block = _blocks[_publishComponent[i]];
+                if (block.TargetEpoch > block.ProcessedEpoch)
+                    QueueBlock(block.Index, block.TargetEpoch, true);
+            }
+            return published;
+        }
+
+        private void AdvanceSatisfiedBoundaryRequirements()
+        {
+            // Visit each undirected face once (+X,+Y,+Z). Once both published
+            // fronts cover the latched epoch, roll any newer observed epoch
+            // into the next transaction without revoking the completed one.
+            for (int i = 0; i < _blocks.Count; i++)
+            {
+                Block block = _blocks[i];
+                for (int face = 1; face < FaceNeighbours.Length; face += 2)
+                {
+                    int3 neighbourCoordinate = block.Coordinate + FaceNeighbours[face];
+                    if (math.any(neighbourCoordinate < 0) ||
+                        math.any(neighbourCoordinate >= _blockCount))
+                        continue;
+                    Block neighbour = _blocks[Flatten(neighbourCoordinate)];
+                    int oppositeFace = face ^ 1;
+                    uint required = math.max(block.RequiredBoundaryEpoch[face],
+                        neighbour.RequiredBoundaryEpoch[oppositeFace]);
+                    if (required == 0 || block.ProcessedEpoch < required ||
+                        neighbour.ProcessedEpoch < required)
+                        continue;
+                    uint latest = math.max(block.LatestBoundaryEpoch[face],
+                        neighbour.LatestBoundaryEpoch[oppositeFace]);
+                    if (latest <= required)
+                        continue;
+                    block.RequiredBoundaryEpoch[face] = latest;
+                    neighbour.RequiredBoundaryEpoch[oppositeFace] = latest;
+                }
+            }
         }
 
         private void ResetTimedOutBatch()
@@ -685,8 +873,15 @@ namespace Genesis.RoomScan
                     int3 neighbour = block.Coordinate + FaceNeighbours[face];
                     if (math.any(neighbour < 0) || math.any(neighbour >= _blockCount))
                         continue;
-                    QueueBlock(Flatten(neighbour), boundaryEpoch);
+                    RegisterBoundaryPair(block, face,
+                        _blocks[Flatten(neighbour)], boundaryEpoch);
                 }
+            }
+
+            if (TryPublishReadyStagedComponents() > 0)
+            {
+                _publishedBatchCount++;
+                ApplyVisibility();
             }
 
             // Unobserved blocks are already valid empty blocks.  Marking them
@@ -702,10 +897,46 @@ namespace Genesis.RoomScan
             TryFinishInitialBuild();
         }
 
+        private void RegisterBoundaryPair(
+            Block block, int face, Block neighbour, uint epoch)
+        {
+            int oppositeFace = face ^ 1;
+            uint latest = math.max(epoch,
+                math.max(block.LatestBoundaryEpoch[face],
+                    neighbour.LatestBoundaryEpoch[oppositeFace]));
+            block.LatestBoundaryEpoch[face] = latest;
+            neighbour.LatestBoundaryEpoch[oppositeFace] = latest;
+
+            uint required = math.max(block.RequiredBoundaryEpoch[face],
+                neighbour.RequiredBoundaryEpoch[oppositeFace]);
+            if (required == 0 ||
+                (block.ProcessedEpoch >= required &&
+                 neighbour.ProcessedEpoch >= required))
+                required = latest;
+            block.RequiredBoundaryEpoch[face] = required;
+            neighbour.RequiredBoundaryEpoch[oppositeFace] = required;
+
+            // Only the latched round can invalidate a too-old stage. Later
+            // observations stay in LatestBoundaryEpoch for the next round.
+            if (block.HasStagedCandidate && block.StagedEpoch < required)
+                InvalidateStagedCandidate(block);
+            if (neighbour.HasStagedCandidate &&
+                neighbour.StagedEpoch < required)
+                InvalidateStagedCandidate(neighbour);
+
+            QueueBlock(block.Index, latest);
+            QueueBlock(neighbour.Index, latest);
+        }
+
         private void QueueBlock(int index, uint epoch, bool force = false)
         {
             Block block = _blocks[index];
             block.TargetEpoch = math.max(block.TargetEpoch, epoch);
+            // A prepared snapshot cannot be overwritten before its seam group
+            // publishes. Any newer debt remains in TargetEpoch and is queued
+            // immediately after that atomic front swap.
+            if (block.HasStagedCandidate)
+                return;
             if ((!force && block.ProcessedEpoch >= block.TargetEpoch) || block.Queued)
                 return;
             block.Queued = true;
@@ -816,6 +1047,7 @@ namespace Genesis.RoomScan
             _boundarySnapshot = null;
             _queuedBlockCount = 0;
             _inFlightCommits = 0;
+            _stagedBlockCount = 0;
             _activeBatch = null;
             _firstLedgerApplied = knownEmpty;
             InitialBuildComplete = knownEmpty;
@@ -826,13 +1058,19 @@ namespace Genesis.RoomScan
                 block.CommitSerial++;
                 block.CommitPending = false;
                 block.Queued = false;
+                block.HasStagedCandidate = false;
                 block.Built = knownEmpty;
                 block.TargetEpoch = epoch;
                 block.ProcessedEpoch = epoch;
                 block.LastOwnerEpoch = epoch;
                 block.VertexCount = 0;
                 block.IndexCount = 0;
+                block.StagedEpoch = 0;
+                block.StagedVertexCount = 0;
+                block.StagedIndexCount = 0;
                 Array.Clear(block.LastBoundaryEpoch, 0, block.LastBoundaryEpoch.Length);
+                Array.Clear(block.LatestBoundaryEpoch, 0, block.LatestBoundaryEpoch.Length);
+                Array.Clear(block.RequiredBoundaryEpoch, 0, block.RequiredBoundaryEpoch.Length);
                 block.Dispose();
             }
             ApplyVisibility();
@@ -858,6 +1096,7 @@ namespace Genesis.RoomScan
                 _blocks[i].Dispose();
             _blocks.Clear();
             _queuedBlockCount = 0;
+            _stagedBlockCount = 0;
             _activeBatch = null;
         }
     }
