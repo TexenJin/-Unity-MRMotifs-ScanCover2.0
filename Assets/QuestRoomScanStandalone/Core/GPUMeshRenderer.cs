@@ -13,6 +13,12 @@ namespace Genesis.RoomScan
         [SerializeField, Tooltip("线框显示前先用无色深度壳遮住后层网格。只影响显示，不修改 TSDF、顶点或索引。")]
         private bool occludeRearWireframe = true;
 
+        // Display-only A/B gate shared by every live mesh page.  HERA and the
+        // block pipelines create many GPUMeshRenderer instances over time, so
+        // an instance-local runtime switch would leave old/new pages in mixed
+        // states and make the GPU comparison invalid.
+        private static bool s_rearWireDepthPrepassEnabled = true;
+
         private IGPUMeshBufferSource _meshSource;
         private MaterialPropertyBlock _props;
         private Material _rearWireOccluderMaterial;
@@ -21,6 +27,20 @@ namespace Genesis.RoomScan
 
         public int LastSubmittedVertexCount { get; private set; }
         public int LastSubmittedFrame { get; private set; } = -1;
+
+        public static bool RearWireDepthPrepassEnabled =>
+            s_rearWireDepthPrepassEnabled;
+
+        public static void SetRearWireDepthPrepassEnabled(bool enabled)
+        {
+            s_rearWireDepthPrepassEnabled = enabled;
+        }
+
+        public static bool ToggleRearWireDepthPrepass()
+        {
+            s_rearWireDepthPrepassEnabled = !s_rearWireDepthPrepassEnabled;
+            return s_rearWireDepthPrepassEnabled;
+        }
 
         private static readonly int ID_SurfaceVerts = Shader.PropertyToID("_SurfaceVerts");
         private static readonly int ID_SurfaceIndices = Shader.PropertyToID("_SurfaceIndices");
@@ -204,7 +224,8 @@ namespace Genesis.RoomScan
                 Shader.GetGlobalFloat(ID_Wireframe) > 0.5f ||
                 Shader.GetGlobalFloat(ID_PaperGridMode) > 0.5f ||
                 _productGridMode;
-            if (occludeRearWireframe && lineSurfaceVisible && EnsureRearWireOccluderMaterial())
+            if (occludeRearWireframe && s_rearWireDepthPrepassEnabled &&
+                lineSurfaceVisible && EnsureRearWireOccluderMaterial())
             {
                 // Fill only the depth buffer with the nearest complete triangle
                 // surface.  The passthrough colour remains untouched, while the

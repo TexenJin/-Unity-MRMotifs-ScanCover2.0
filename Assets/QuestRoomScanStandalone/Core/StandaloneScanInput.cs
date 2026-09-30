@@ -12,6 +12,7 @@ namespace Genesis.RoomScan
     ///   右握把+右摇杆按下 = 纸皮→支撑真值→三角粗皮→HERA 的诊断视图循环。
     ///   右摇杆方向+按下 = 追责/性能热键：上=实时轨 / 左=胶冻↔原冻（仅空卷） / 下=融合 20↔10Hz / 右=深度预处理(双边+缘洗)
     ///   左摇杆按下 = 支撑真值档切拓扑审计/外皮片实体；纸网合流档切纸主网格/旧真边对照
+    ///   右握把+左摇杆按下 = 只切线框前的整面深度预绘（网格仍显示）
     ///   左摇杆上+按下 = 源头时序滤波开关（盯墙养绿 A/B 热键，HUD 闸行 时开/时关 回显）
     ///   左摇杆下+按下 = 第一阶段纯白几何 / 原状态色切换（仅显示层）
     ///   左摇杆右+按下 = 32³融合管理块线框开关（青稳/黄热/红双热/洋红已解冻）
@@ -189,7 +190,8 @@ namespace Genesis.RoomScan
                 Pulse();
             }
 
-            // 左摇杆按下：线框/实体切换。走全局 shader 开关（ApplyDisplayMode
+            // 左摇杆按下：线框/实体切换。右握把+左摇杆按下：
+            // 只切线框前的整面深度预绘，可见线框与所有后台路径不变。走全局 shader 开关（ApplyDisplayMode
             // SetGlobalFloat），对增量 HERA 页同样生效——帧率二分实验专用：
             // 切实体后帧率跳升=线框边缘检测的填充开销是主猪。
             // 左摇杆推上再按下=源头时序滤波开关（盯墙养绿 A/B：同墙同段实时切换，
@@ -219,8 +221,23 @@ namespace Genesis.RoomScan
                 }
                 else
                 {
-                    scanner.NotifyInput("左摇杆");
-                    scanner.ToggleWireframe();
+                    float rightGrip = OVRInput.Get(
+                        OVRInput.RawAxis1D.RHandTrigger,
+                        OVRInput.Controller.RTouch);
+                    bool rightGripHeld =
+                        OVRInput.Get(OVRInput.RawButton.RHandTrigger,
+                                     OVRInput.Controller.RTouch) ||
+                        rightGrip > 0.35f;
+                    if (rightGripHeld)
+                    {
+                        scanner.NotifyInput($"右握把+左摇杆 握{rightGrip:0.00}");
+                        scanner.ToggleRearWireDepthPrepass();
+                    }
+                    else
+                    {
+                        scanner.NotifyInput("左摇杆");
+                        scanner.ToggleWireframe();
+                    }
                 }
                 Pulse();
             }

@@ -460,6 +460,22 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Display-only GPU A/B switch.  The visible wire pass and the entire
+        /// acquisition/fusion/extraction pipeline stay unchanged; only the
+        /// preceding full-surface depth-only draw is admitted or skipped.
+        /// </summary>
+        public void ToggleRearWireDepthPrepass()
+        {
+            bool enabled = GPUMeshRenderer.ToggleRearWireDepthPrepass();
+            string state = enabled ? "ON" : "OFF";
+            Logger.Info($"QRS rear-wire depth prepass: {state} (mesh remains visible)");
+            NotifyInput(enabled
+                ? "网格深度预绘：开"
+                : "网格深度预绘：关（网格仍显示）");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
         /// 路线验证总闸（右摇杆直接按下）：切"当前真正在画网格的那条路径"。
         /// A/B 实验旗下开机即 PrepareForChunkAbAcquisition，renderProductionMesh 恒
         /// false、满屏网全来自增量 HERA——所以扫描中必须切增量 HERA，切旧字段是空转。
@@ -745,6 +761,9 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            // Every fresh app run starts from the production rendering path;
+            // the operator then performs an explicit same-run A/B toggle.
+            GPUMeshRenderer.SetRearWireDepthPrepassEnabled(true);
             // Runtime lock: serialized scene values cannot accidentally revive
             // the in-headset HUD or diagnostic ROI frame.  The BB depth probe is
             // always present but starts hidden and is explicitly toggled by X.
