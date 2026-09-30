@@ -161,6 +161,7 @@ uint _HeraMatureOnly;
 RWStructuredBuffer<uint>      _Counters;         // [0] = vertex count, [1] = index count
 RWStructuredBuffer<uint>      _DispatchArgs;     // [0,1,2] = indirect dispatch group counts
 RWStructuredBuffer<uint>      _DrawIndirectArgs; // [0..4]  = DrawProceduralIndirect args
+RWStructuredBuffer<uint>      _LineDrawIndirectArgs; // same mesh, 3 triangle edges = indexCount * 2 line vertices
 
 RWStructuredBuffer<float3>    _SmoothPosA;       // [maxVertices] ping-pong smoothing
 RWStructuredBuffer<float3>    _SmoothPosB;       // [maxVertices] ping-pong smoothing
@@ -2190,6 +2191,14 @@ void BuildIndirectArgs(uint3 id : SV_DispatchThreadID)
     _DrawIndirectArgs[2] = 0;            // startIndex
     _DrawIndirectArgs[3] = 0;            // baseVertex
     _DrawIndirectArgs[4] = 0;            // startInstance
+
+    // Display-only derivative of the same authoritative index count.  The
+    // source indices and all extraction/admission decisions remain untouched.
+    _LineDrawIndirectArgs[0] = _Counters[1] * 2u;
+    _LineDrawIndirectArgs[1] = 1;
+    _LineDrawIndirectArgs[2] = 0;
+    _LineDrawIndirectArgs[3] = 0;
+    _LineDrawIndirectArgs[4] = 0;
 }
 
 // Copies only the committed payload into the immutable front-buffer.  The

@@ -18,10 +18,12 @@ namespace Genesis.RoomScan
         // an instance-local runtime switch would leave old/new pages in mixed
         // states and make the GPU comparison invalid.
         private static bool s_rearWireDepthPrepassEnabled = true;
+        private static bool s_trueLinePrimitivesEnabled = true;
 
         private IGPUMeshBufferSource _meshSource;
         private MaterialPropertyBlock _props;
         private Material _rearWireOccluderMaterial;
+        private Material _trueLineMaterial;
         private bool _ready;
         private Bounds _bounds;
 
@@ -30,6 +32,9 @@ namespace Genesis.RoomScan
 
         public static bool RearWireDepthPrepassEnabled =>
             s_rearWireDepthPrepassEnabled;
+
+        public static bool TrueLinePrimitivesEnabled =>
+            s_trueLinePrimitivesEnabled;
 
         public static void SetRearWireDepthPrepassEnabled(bool enabled)
         {
@@ -40,6 +45,17 @@ namespace Genesis.RoomScan
         {
             s_rearWireDepthPrepassEnabled = !s_rearWireDepthPrepassEnabled;
             return s_rearWireDepthPrepassEnabled;
+        }
+
+        public static void SetTrueLinePrimitivesEnabled(bool enabled)
+        {
+            s_trueLinePrimitivesEnabled = enabled;
+        }
+
+        public static bool ToggleTrueLinePrimitives()
+        {
+            s_trueLinePrimitivesEnabled = !s_trueLinePrimitivesEnabled;
+            return s_trueLinePrimitivesEnabled;
         }
 
         private static readonly int ID_SurfaceVerts = Shader.PropertyToID("_SurfaceVerts");
@@ -193,6 +209,7 @@ namespace Genesis.RoomScan
             var idxBuf = _meshSource.IndexBuffer;
             var admissionBuf = _meshSource.VertexAdmissionClassBuffer;
             var argsBuf = _meshSource.DrawIndirectArgs;
+            var lineArgsBuf = _meshSource.LineDrawIndirectArgs;
             int knownDrawVertexCount = _meshSource.KnownDrawVertexCount;
 
             if (vertBuf == null || idxBuf == null || admissionBuf == null ||
@@ -224,6 +241,17 @@ namespace Genesis.RoomScan
                 Shader.GetGlobalFloat(ID_Wireframe) > 0.5f ||
                 Shader.GetGlobalFloat(ID_PaperGridMode) > 0.5f ||
                 _productGridMode;
+            bool ordinaryWireframe =
+                Shader.GetGlobalFloat(ID_Wireframe) > 0.5f &&
+                Shader.GetGlobalFloat(ID_PaperGridMode) <= 0.5f &&
+                !_productGridMode;
+            bool useTrueLines =
+                s_trueLinePrimitivesEnabled &&
+                ordinaryWireframe &&
+                ((knownDrawVertexCount > 0 &&
+                  knownDrawVertexCount <= int.MaxValue / 2) ||
+                 (knownDrawVertexCount < 0 && lineArgsBuf != null)) &&
+                EnsureTrueLineMaterial();
             if (occludeRearWireframe && s_rearWireDepthPrepassEnabled &&
                 lineSurfaceVisible && EnsureRearWireOccluderMaterial())
             {
@@ -242,9 +270,63 @@ namespace Genesis.RoomScan
                 Submit(depthRp, knownDrawVertexCount, argsBuf);
             }
 
-            Submit(rp, knownDrawVertexCount, argsBuf);
+            if (useTrueLines)
+            {
+                var lineRp = new RenderParams(_trueLineMaterial)
+                {
+                    worldBounds = _bounds,
+                    matProps = _props,
+                    receiveShadows = false,
+                    shadowCastingMode = ShadowCastingMode.Off,
+                    layer = gameObject.layer
+                };
+
+                // One indexed triangle becomes three independent line segments:
+                // (0,1), (1,2), (2,0). This increases vertex invocations from
+                // three to six per triangle, but completely removes triangle
+                // interiors from rasterization instead of shading then discarding
+                // them in the fragment stage.
+                if (knownDrawVertexCount > 0)
+                {
+                    Graphics.RenderPrimitives(
+                        lineRp,
+                        MeshTopology.Lines,
+                        knownDrawVertexCount * 2,
+                        1);
+                }
+                else
+                {
+                    Graphics.RenderPrimitivesIndirect(
+                        lineRp,
+                        MeshTopology.Lines,
+                        lineArgsBuf,
+                        1);
+                }
+            }
+            else
+            {
+                // Unknown-count indirect buffers, paper/product grids and the
+                // explicit A/B fallback retain the proven triangle path.
+                Submit(rp, knownDrawVertexCount, argsBuf);
+            }
             LastSubmittedVertexCount = knownDrawVertexCount > 0 ? knownDrawVertexCount : -1;
             LastSubmittedFrame = Time.frameCount;
+        }
+
+        private bool EnsureTrueLineMaterial()
+        {
+            if (_trueLineMaterial != null)
+                return true;
+
+            Shader shader = Resources.Load<Shader>("ScanMeshTrueLines");
+            if (shader == null)
+                return false;
+
+            _trueLineMaterial = new Material(shader)
+            {
+                name = "[QRS] True Mesh Lines"
+            };
+            return true;
         }
 
         private bool EnsureRearWireOccluderMaterial()
@@ -289,6 +371,9 @@ namespace Genesis.RoomScan
             if (_rearWireOccluderMaterial != null)
                 Destroy(_rearWireOccluderMaterial);
             _rearWireOccluderMaterial = null;
+            if (_trueLineMaterial != null)
+                Destroy(_trueLineMaterial);
+            _trueLineMaterial = null;
         }
 
         private void OnEnable()

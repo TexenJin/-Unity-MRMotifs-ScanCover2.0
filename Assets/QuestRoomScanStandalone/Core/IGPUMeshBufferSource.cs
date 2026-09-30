@@ -9,6 +9,7 @@ namespace Genesis.RoomScan
         GraphicsBuffer IndexBuffer { get; }
         GraphicsBuffer VertexAdmissionClassBuffer { get; }
         GraphicsBuffer DrawIndirectArgs { get; }
+        GraphicsBuffer LineDrawIndirectArgs { get; }
 
         /// <summary>
         /// Exact non-indexed draw count when it is already known on the CPU.

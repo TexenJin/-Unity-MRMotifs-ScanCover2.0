@@ -14,6 +14,7 @@ namespace Genesis.RoomScan
         public GraphicsBuffer IndexBuffer { get; private set; }
         public GraphicsBuffer VertexAdmissionClassBuffer { get; private set; }
         public GraphicsBuffer DrawIndirectArgs { get; private set; }
+        public GraphicsBuffer LineDrawIndirectArgs => null;
         public int KnownDrawVertexCount { get; private set; }
 
         public void Prepare(int vertexCount, int indexCount, int vertexStride)

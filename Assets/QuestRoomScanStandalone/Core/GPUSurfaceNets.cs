@@ -44,6 +44,7 @@ namespace Genesis.RoomScan
         private GraphicsBuffer _counters;
         private GraphicsBuffer _dispatchArgs;
         private GraphicsBuffer _drawIndirectArgs;
+        private GraphicsBuffer _lineDrawIndirectArgs;
         private GraphicsBuffer _smoothPosA;
         private GraphicsBuffer _smoothPosB;
         private GraphicsBuffer _candidateHistoryKeys;
@@ -111,6 +112,7 @@ namespace Genesis.RoomScan
         public GraphicsBuffer IndexBuffer => _indices;
         public GraphicsBuffer VertexAdmissionClassBuffer => _vertexAdmissionClass;
         public GraphicsBuffer DrawIndirectArgs => _drawIndirectArgs;
+        public GraphicsBuffer LineDrawIndirectArgs => _lineDrawIndirectArgs;
         public int KnownDrawVertexCount => -1;
         public GraphicsBuffer CountersBuffer => _counters;
 
@@ -147,6 +149,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_Counters = Shader.PropertyToID("_Counters");
         private static readonly int ID_DispatchArgs = Shader.PropertyToID("_DispatchArgs");
         private static readonly int ID_DrawIndirectArgs = Shader.PropertyToID("_DrawIndirectArgs");
+        private static readonly int ID_LineDrawIndirectArgs = Shader.PropertyToID("_LineDrawIndirectArgs");
         private static readonly int ID_SmoothPosA = Shader.PropertyToID("_SmoothPosA");
         private static readonly int ID_SmoothPosB = Shader.PropertyToID("_SmoothPosB");
         private static readonly int ID_TemporalState = Shader.PropertyToID("_TemporalState");
@@ -641,6 +644,7 @@ namespace Genesis.RoomScan
             _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _counterCount, 4);
             _dispatchArgs = new GraphicsBuffer(structuredIndirect, 3, 4);
             _drawIndirectArgs = new GraphicsBuffer(structuredIndirect, 5, 4);
+            _lineDrawIndirectArgs = new GraphicsBuffer(structuredIndirect, 5, 4);
             int smoothCapacity = SmoothIterations > 0 ? _maxVertices : 1;
             _smoothPosA = new GraphicsBuffer(GraphicsBuffer.Target.Structured, smoothCapacity, Float3Stride);
             _smoothPosB = new GraphicsBuffer(GraphicsBuffer.Target.Structured, smoothCapacity, Float3Stride);
@@ -671,7 +675,7 @@ namespace Genesis.RoomScan
                             + (long)_maxVertices * VertexStride
                             + (long)_maxIndices * 4
                             + (long)_maxVertices * 4
-                            + _counterCount * 4 + 3 * 4 + 5 * 4
+                            + _counterCount * 4 + 3 * 4 + 5 * 4 + 5 * 4
                             + (long)smoothCapacity * Float3Stride * 2
                             + (TemporalAlphaMax < 1f ? (long)mapVoxels * 16 : 0L)
                             + (long)_candidateHistoryCapacity * 8;
@@ -934,6 +938,7 @@ namespace Genesis.RoomScan
 
             BindBuffer(_kBuildIndirectArgs, ID_Counters, _counters);
             BindBuffer(_kBuildIndirectArgs, ID_DrawIndirectArgs, _drawIndirectArgs);
+            BindBuffer(_kBuildIndirectArgs, ID_LineDrawIndirectArgs, _lineDrawIndirectArgs);
         }
 
         private void BindBuffer(int kernel, int nameID, GraphicsBuffer buffer)
@@ -950,6 +955,7 @@ namespace Genesis.RoomScan
             _counters?.Release();
             _dispatchArgs?.Release();
             _drawIndirectArgs?.Release();
+            _lineDrawIndirectArgs?.Release();
             _smoothPosA?.Release();
             _smoothPosB?.Release();
             _candidateHistoryKeys?.Release();
@@ -968,6 +974,7 @@ namespace Genesis.RoomScan
             _counters = null;
             _dispatchArgs = null;
             _drawIndirectArgs = null;
+            _lineDrawIndirectArgs = null;
             _smoothPosA = null;
             _smoothPosB = null;
             _candidateHistoryKeys = null;

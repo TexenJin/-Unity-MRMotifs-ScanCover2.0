@@ -476,6 +476,22 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Display-only A/B switch between hardware line primitives and the
+        /// legacy full-triangle fragment-discard wireframe. Reconstruction,
+        /// mesh buffers, HERA ownership and scheduling are unchanged.
+        /// </summary>
+        public void ToggleTrueLinePrimitives()
+        {
+            bool enabled = GPUMeshRenderer.ToggleTrueLinePrimitives();
+            string state = enabled ? "TRUE_LINES" : "PSEUDO_WIRE";
+            Logger.Info($"QRS wire renderer: {state} (mesh data unchanged)");
+            NotifyInput(enabled
+                ? "线法：真线段"
+                : "线法：挖空三角");
+            RefreshStatusBadge();
+        }
+
+        /// <summary>
         /// 路线验证总闸（右摇杆直接按下）：切"当前真正在画网格的那条路径"。
         /// A/B 实验旗下开机即 PrepareForChunkAbAcquisition，renderProductionMesh 恒
         /// false、满屏网全来自增量 HERA——所以扫描中必须切增量 HERA，切旧字段是空转。
@@ -764,6 +780,7 @@ namespace Genesis.RoomScan
             // Every fresh app run starts from the production rendering path;
             // the operator then performs an explicit same-run A/B toggle.
             GPUMeshRenderer.SetRearWireDepthPrepassEnabled(true);
+            GPUMeshRenderer.SetTrueLinePrimitivesEnabled(true);
             // This performance A/B build keeps only the compact operator badge
             // visible so the headset can confirm mesh/prepass/surface state.
             // The large forensic HUD and ROI frame remain locked off.
@@ -1307,8 +1324,12 @@ namespace Genesis.RoomScan
                 ? "开"
                 : "关";
             string surfaceState = wireframeMode ? "线框" : "实体";
+            string wireMethodState = GPUMeshRenderer.TrueLinePrimitivesEnabled
+                ? "真线"
+                : "挖空";
             string renderAbState =
-                $"A/B 网格[{meshDisplayState}] 预绘[{depthPrepassState}] 表面[{surfaceState}]";
+                $"A/B 网格[{meshDisplayState}] 预绘[{depthPrepassState}] " +
+                $"表面[{surfaceState}] 线法[{wireMethodState}]";
             _statusBadgeHeaderText.color = _statusBadgeText.color;
             _statusBadgeRightText.color = _statusBadgeText.color;
             _statusBadgeHeaderText.fontSize = 50;
