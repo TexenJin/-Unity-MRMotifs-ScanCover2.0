@@ -688,6 +688,10 @@ namespace Genesis.RoomScan
         [Header("Persistent Primary Status Badge")]
         [SerializeField, Tooltip("开启后恢复冻结票、置信度、页面债、计时账等完整诊断 HUD；默认隐藏，后台统计不受影响。")]
         private bool showDetailedRuntimeStatus = false;
+        // Current GPU acceptance build: keep the headset plate limited to the
+        // four switches that define the rendering A/B sample. This is runtime
+        // state only; all ledgers and logging continue in the background.
+        private bool _renderAbHudOnly = true;
         private UnityEngine.UI.Text _statusBadgeText;
         private UnityEngine.UI.Text _statusBadgeHeaderText;
         private UnityEngine.UI.Text _statusBadgeRightText;
@@ -1196,7 +1200,13 @@ namespace Genesis.RoomScan
 
         private void RefreshStatusBadge()
         {
-            if (_statusBadgeText == null) return;
+            if (_statusBadgeText == null || _statusBadgeHeaderText == null) return;
+
+            if (_renderAbHudOnly)
+            {
+                RefreshRenderAbHud();
+                return;
+            }
 
             string runState;
             if (IsSaveAndClearInProgress)
@@ -1398,6 +1408,47 @@ namespace Genesis.RoomScan
                     : bodyTop + DiagnosticHudPadding;
                 badgeRect.sizeDelta = new Vector2(DiagnosticHudWidth,
                     Mathf.Max(showDetailedRuntimeStatus ? 640f : 190f, badgeHeight));
+            }
+        }
+
+        private void RefreshRenderAbHud()
+        {
+            string meshState = _meshExtractor != null &&
+                               _meshExtractor.IsAnyMeshVisible
+                ? "开"
+                : "关";
+            string surfaceState = wireframeMode ? "线框" : "实体";
+            string prepassState = GPUMeshRenderer.RearWireDepthPrepassEnabled
+                ? "开"
+                : "关";
+            string lineMethodState = GPUMeshRenderer.TrueLinePrimitivesEnabled
+                ? "真线"
+                : "挖空";
+
+            _statusBadgeHeaderText.gameObject.SetActive(true);
+            _statusBadgeHeaderText.color = new Color(0.92f, 0.98f, 1f, 1f);
+            _statusBadgeHeaderText.fontSize = 54;
+            _statusBadgeHeaderText.fontStyle = FontStyle.Bold;
+            _statusBadgeHeaderText.alignment = TextAnchor.MiddleCenter;
+            _statusBadgeHeaderText.text =
+                $"网格[{meshState}]　表面[{surfaceState}]\n" +
+                $"预绘[{prepassState}]　线法[{lineMethodState}]";
+
+            // Keep the old forensic text objects alive for source compatibility,
+            // but never submit them to the canvas in this acceptance build.
+            _statusBadgeText.text = string.Empty;
+            _statusBadgeRightText.text = string.Empty;
+            _statusBadgeText.gameObject.SetActive(false);
+            _statusBadgeRightText.gameObject.SetActive(false);
+
+            var badgeRect = _statusBadgeHeaderText.transform.parent as RectTransform;
+            if (badgeRect != null)
+            {
+                float height = Mathf.Max(
+                    180f,
+                    _statusBadgeHeaderText.preferredHeight +
+                    DiagnosticHudPadding * 2f);
+                badgeRect.sizeDelta = new Vector2(1500f, height);
             }
         }
 
