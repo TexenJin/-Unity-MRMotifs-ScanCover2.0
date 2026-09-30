@@ -36,7 +36,7 @@ namespace Genesis.RoomScan
         private float infiniTamRecoveryFps = 68f;
         [SerializeField, Range(1, 8), Tooltip("融合/提取后需连续多少个健康帧才放行下一个普通重任务。")]
         private int infiniTamHealthyFramesBeforeWork = 3;
-        [SerializeField, Range(0.015f, 0.08f), Tooltip("任意两个融合/提取提交之间的最小间隔（秒），防止两者同时到期后连续两帧抢占。")]
+        [SerializeField, Range(0.015f, 0.08f), Tooltip("任意两个融合/提取提交之间的最小间隔（秒）；普通提取只在两个融合时点之间的中段放行，避免10Hz融合与5Hz提取前后贴车。")]
         private float infiniTamHeavyWorkMinSpacingSeconds = 0.035f;
         [SerializeField, Range(1.5f, 4f), Tooltip("帧压力持续时，融合最多延期几个名义周期后必须放行一次。")]
         private float infiniTamFusionMaxDelayIntervals = 2.5f;
@@ -2409,8 +2409,22 @@ namespace Genesis.RoomScan
             {
                 float integrationAge = t - _lastIntegrationTime;
                 float meshAge = t - _lastMeshTime;
+                // At 10 Hz fusion and 5 Hz extraction their nominal deadlines
+                // meet every 200 ms. A due mesh is admitted only inside the
+                // middle band of the current fusion interval; when it reaches
+                // the late band, the next fusion goes first and opens a fresh
+                // middle slot. Forced work still retains the existing maximum
+                // delay escape hatch, so this phase rule cannot stop growth.
+                float minimumHeavySeparation =
+                    infiniTamHeavyWorkMinSpacingSeconds;
+                float meshPhaseMargin = Mathf.Min(
+                    minimumHeavySeparation,
+                    IntegrationInterval * 0.45f);
+                bool meshMidWindow = meshDue && !integrationDue &&
+                    integrationAge >= meshPhaseMargin &&
+                    integrationAge <= IntegrationInterval - meshPhaseMargin;
                 bool spacingReady = t - _lastInfiniTamHeavyWorkTime >=
-                                    infiniTamHeavyWorkMinSpacingSeconds;
+                                    minimumHeavySeparation;
                 bool recoveryReady = _infiniTamHealthyFrameStreak >=
                                      infiniTamHealthyFramesBeforeWork;
                 bool integrationForced = integrationDue && integrationAge >=
@@ -2428,11 +2442,15 @@ namespace Genesis.RoomScan
                         ? integrationAge / IntegrationInterval : -1f;
                     float meshDebt = meshDue ? meshAge / MeshInterval : -1f;
                     // A sole forced path owns this slot so its maximum wait is a
-                    // real bound. Otherwise normalized age keeps the 10Hz fusion
-                    // and 5Hz block slots fair, including when both are forced.
+                    // real bound. If both have reached their bounds, normalized
+                    // age remains the final fairness rule. Ordinary mesh work,
+                    // however, only owns the centred phase slot; a shared or late
+                    // deadline belongs to fusion first.
                     meshOwnsFrame = meshForced != integrationForced
                         ? meshForced
-                        : meshDue && meshDebt >= integrationDebt;
+                        : meshForced && integrationForced
+                            ? meshDebt > integrationDebt
+                            : meshMidWindow;
                     integrateThisFrame = integrationDue && !meshOwnsFrame;
                 }
             }
