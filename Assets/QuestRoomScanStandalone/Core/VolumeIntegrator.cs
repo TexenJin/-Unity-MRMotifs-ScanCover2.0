@@ -35,7 +35,8 @@ namespace Genesis.RoomScan
 
         [Header("Integration")]
         [SerializeField] private float depthDisparityThreshold = 0.5f;
-        [SerializeField] private float maxUpdateDist = 5f;
+        [SerializeField, Range(1f, 3f), Tooltip("生产TSDF的最远观测距离（米）。3米外保留既有体积数据，但不再从当前深度帧写入或制造脏块。")]
+        private float maxUpdateDist = 3f;
         [Tooltip("最近更新距离：视锥内距相机小于此值的体素不积分。原 0.5m 会在头周留下覆盖空洞，0.15 贴脸也覆盖（近距深度噪声大，如出现贴脸飞面可调回 0.3）")]
         [SerializeField] private float minUpdateDist = 0.15f;
         [Tooltip("头部排除区半径（仅 StandaloneRoomScanner 开启排除区时生效）。0.6 = QRS 原版（防手入网但头周覆盖空洞大），0.35 = 折中")]
@@ -317,6 +318,20 @@ namespace Genesis.RoomScan
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
         public float VoxelDistance => voxelDistance;
+        // Existing throttled fusion receipt exposed to the A-key tail report.
+        // These are observations only; reading them cannot alter fusion.
+        public bool InfiniTamTicketSampleReady => _hasInfiniTamTicket;
+        public int InfiniTamTicketSampleCount => _infiniTamTicketSampleCount;
+        public int InfiniTamAttemptedFrameCount => _infiniTamAttemptedFrames;
+        public int InfiniTamFusedFrameCount => _infiniTamFusedFrames;
+        public ulong InfiniTamCumulativeNewSurfaceWrites =>
+            _infiniTamTicketCumulativeNew;
+        public ulong InfiniTamCumulativeContinuingSurfaceWrites =>
+            _infiniTamTicketCumulativeContinuing;
+        public ulong InfiniTamCumulativeMatureSurfaceWrites =>
+            _infiniTamTicketCumulativeMature;
+        public ulong InfiniTamCumulativeNearZeroSurfaceWrites =>
+            _infiniTamTicketCumulativeSurfaceSamples;
 
         private static readonly int VolumeRWID = Shader.PropertyToID("gsVolumeRW");
         private static readonly int VolumeID = Shader.PropertyToID("gsVolume");

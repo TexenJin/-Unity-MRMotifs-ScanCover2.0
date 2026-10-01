@@ -44,7 +44,6 @@ Shader "Genesis/ScanMeshDepthOccluder"
             float4 gsVoxCount;
             float _RSMeshStride;
             float _RSJointDiagnostic;
-            float _RSDepthPrepassMaxViewDistance;
 
             struct Varyings
             {
@@ -85,25 +84,6 @@ Shader "Genesis/ScanMeshDepthOccluder"
 
                 float3 positionWS = _SurfaceVerts[index].pos;
                 output.positionHCS = TransformWorldToHClip(positionWS);
-
-                // Ordinary true-line wireframes are display-limited. Match
-                // that same range here so invisible distant surfaces do not
-                // continue paying a full-triangle depth cost. Other mesh modes
-                // pass zero and retain their established unlimited prepass.
-                float maxDistance = _RSDepthPrepassMaxViewDistance;
-                if (maxDistance > 0.0)
-                {
-                    float3 viewDelta = positionWS - _WorldSpaceCameraPos.xyz;
-                    if (dot(viewDelta, viewDelta) > maxDistance * maxDistance)
-                    {
-                        #if UNITY_REVERSED_Z
-                            output.positionHCS.z = -output.positionHCS.w;
-                        #else
-                            output.positionHCS.z = output.positionHCS.w * 2.0;
-                        #endif
-                        return output;
-                    }
-                }
 
                 output.diagnosticClass = encoded >> 30u;
                 return output;

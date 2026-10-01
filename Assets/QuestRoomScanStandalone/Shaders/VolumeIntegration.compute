@@ -1078,6 +1078,15 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float3 voxPos = gsVoxelToWorld(coord);
 
     float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
+    // Acquisition is one head-centred sphere. Using the selected projection
+    // eye here would move the 3 m production boundary by the IPD and admit a
+    // different fringe depending on which eye supplies fusion depth.
+    float3 activeCenter = (gsDepthEyePos(0) + gsDepthEyePos(1)) * 0.5;
+    float voxActiveDistance = length(voxPos - activeCenter);
+    // The active reconstruction radius is a write gate, never a delete gate.
+    // Samples outside it leave the existing TSDF/vote state byte-for-byte
+    // intact and therefore cannot dirty or wake a distant extraction block.
+    if (voxActiveDistance > gsMaxUpdateDist) return;
     float voxEyeDist = length(voxPos - eyePos);
     float3 voxView = mul(gsDepthView[GS_FUSION_EYE], float4(voxPos, 1)).xyz;
     if (voxView.z > -0.05) return;
@@ -1091,6 +1100,9 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC),
                                        GS_FUSION_EYE);
     float depthEyeDist = length(depthPos - eyePos);
+    // A distant measured surface must not use its ray to modify nearer cells;
+    // approaching it later resumes from any previously retained TSDF instead.
+    if (length(depthPos - activeCenter) > gsMaxUpdateDist) return;
     if (depthEyeDist < gsMinUpdateDist) return;
 
     float rawProjectiveSdf = depthEyeDist - voxEyeDist;

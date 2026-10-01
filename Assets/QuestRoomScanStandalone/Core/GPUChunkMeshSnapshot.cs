@@ -1,4 +1,5 @@
 using System;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace Genesis.RoomScan
@@ -13,17 +14,45 @@ namespace Genesis.RoomScan
         public GraphicsBuffer VertexBuffer { get; private set; }
         public GraphicsBuffer IndexBuffer { get; private set; }
         public GraphicsBuffer VertexAdmissionClassBuffer { get; private set; }
+        public GraphicsBuffer CoordinateVertexMapBuffer { get; private set; }
         public GraphicsBuffer DrawIndirectArgs { get; private set; }
         public GraphicsBuffer LineDrawIndirectArgs => null;
+        public int KnownVertexCount { get; private set; }
         public int KnownDrawVertexCount { get; private set; }
+        public bool HasCoordinateVertexMap { get; private set; }
+        public int3 MapMin { get; private set; }
+        public int3 MapCount { get; private set; }
+        public int3 CoreMin { get; private set; }
+        public int3 CoreMax { get; private set; }
 
         public void Prepare(int vertexCount, int indexCount, int vertexStride)
         {
             int actualVertexCount = Mathf.Max(0, vertexCount);
             int actualIndexCount = Mathf.Max(0, indexCount);
             PrepareCapacity(actualVertexCount, actualIndexCount, vertexStride);
+            KnownVertexCount = actualVertexCount;
             KnownDrawVertexCount = actualIndexCount;
+            HasCoordinateVertexMap = false;
             DrawIndirectArgs.SetData(new uint[] { (uint)actualIndexCount, 1, 0, 0, 0 });
+        }
+
+        public void PrepareCoordinateVertexMap(int3 mapMin, int3 mapCount,
+            int3 coreMin, int3 coreMax)
+        {
+            int required = Mathf.Max(1, mapCount.x * mapCount.y * mapCount.z);
+            if (CoordinateVertexMapBuffer == null ||
+                CoordinateVertexMapBuffer.count < required)
+            {
+                CoordinateVertexMapBuffer?.Release();
+                CoordinateVertexMapBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, required, sizeof(int));
+            }
+
+            MapMin = mapMin;
+            MapCount = mapCount;
+            CoreMin = coreMin;
+            CoreMax = coreMax;
+            HasCoordinateVertexMap = true;
         }
 
         /// <summary>
@@ -53,6 +82,8 @@ namespace Genesis.RoomScan
                     5, sizeof(uint));
             }
             KnownDrawVertexCount = 0;
+            KnownVertexCount = 0;
+            HasCoordinateVertexMap = false;
             DrawIndirectArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
         }
 
@@ -76,6 +107,8 @@ namespace Genesis.RoomScan
         public void Clear()
         {
             KnownDrawVertexCount = 0;
+            KnownVertexCount = 0;
+            HasCoordinateVertexMap = false;
             if (DrawIndirectArgs != null)
                 DrawIndirectArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
         }
@@ -85,12 +118,16 @@ namespace Genesis.RoomScan
             VertexBuffer?.Release();
             IndexBuffer?.Release();
             VertexAdmissionClassBuffer?.Release();
+            CoordinateVertexMapBuffer?.Release();
             DrawIndirectArgs?.Release();
             VertexBuffer = null;
             IndexBuffer = null;
             VertexAdmissionClassBuffer = null;
+            CoordinateVertexMapBuffer = null;
             DrawIndirectArgs = null;
+            KnownVertexCount = 0;
             KnownDrawVertexCount = 0;
+            HasCoordinateVertexMap = false;
         }
     }
 }

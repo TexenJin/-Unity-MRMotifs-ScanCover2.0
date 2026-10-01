@@ -146,8 +146,7 @@ namespace Genesis.RoomScan
         public int LastSubmittedDrawVertexCount => IsInfiniTamBaselineActive
             ? !InfiniTamPublicationReady
                 ? 0
-                : _infiniTamBlocks != null &&
-                  _infiniTamBlocks.InitialBuildComplete
+                : InfiniTamBlockPipelineHealthy
                     ? (int)Math.Min(int.MaxValue,
                         _infiniTamBlocks.RecentlySubmittedVertexCount)
                     : _gpuRenderer != null
@@ -157,6 +156,8 @@ namespace Genesis.RoomScan
             _volume != null && _volume.InfiniTamBaselineEnabled;
         private bool InfiniTamPublicationReady =>
             _volume != null && _volume.InfiniTamMeshPublicationReady;
+        private bool InfiniTamBlockPipelineHealthy =>
+            _infiniTamBlocks != null && !_infiniTamBlocks.Failed;
         public string InfiniTamBlockStatsCompact => _infiniTamBlocks != null
             ? _infiniTamBlocks.CompactStats
             : "块前台待启动";
@@ -191,6 +192,26 @@ namespace Genesis.RoomScan
             _infiniTamBlocks?.CommittedIndexCount ?? 0L;
         public int InfiniTamVisibleBlockCount =>
             _infiniTamBlocks?.VisibleBlockCount ?? 0;
+        public long InfiniTamRawReadbackCount =>
+            _infiniTamBlocks?.RawReadbackCount ?? 0L;
+        public long InfiniTamRawReadbackErrorCount =>
+            _infiniTamBlocks?.RawReadbackErrorCount ?? 0L;
+        public long InfiniTamRawVertexCount =>
+            _infiniTamBlocks?.RawVertexCount ?? 0L;
+        public long InfiniTamRawIndexCount =>
+            _infiniTamBlocks?.RawIndexCount ?? 0L;
+        public long InfiniTamRawRejectedUnknownEdgeCount =>
+            _infiniTamBlocks?.RawRejectedUnknownEdgeCount ?? 0L;
+        public long InfiniTamRawCrossingCellWithUnknownEdgesCount =>
+            _infiniTamBlocks?.RawCrossingCellWithUnknownEdgesCount ?? 0L;
+        public long InfiniTamRawRejectedUnknownQuadCount =>
+            _infiniTamBlocks?.RawRejectedUnknownQuadCount ?? 0L;
+        public long InfiniTamRawStrictEmittedCellCount =>
+            _infiniTamBlocks?.RawStrictEmittedCellCount ?? 0L;
+        public long InfiniTamRawZeroVertexReadbackCount =>
+            _infiniTamBlocks?.RawZeroVertexReadbackCount ?? 0L;
+        public long InfiniTamRawVerticesWithoutIndicesReadbackCount =>
+            _infiniTamBlocks?.RawVerticesWithoutIndicesReadbackCount ?? 0L;
 
         public void RequestImmediateInfiniTamDirtyLedgerRefresh()
         {
@@ -214,11 +235,6 @@ namespace Genesis.RoomScan
         private GPUChunkMeshSnapshot _infiniTamFront;
         private GPUChunkMeshSnapshot _infiniTamBack;
         private InfiniTamBlockMeshPipeline _infiniTamBlocks;
-        // The whole-volume path owns exactly one bootstrap extraction slot per
-        // block-front generation.  Once that slot has been issued, live mesh
-        // slots advance only the block pipeline unless it explicitly fails.
-        private bool _infiniTamBootstrapExtractionIssued;
-        private bool _infiniTamBlocksOwnedForeground;
         private CoarseSkinRenderer _coarseSkin;
         private SupportTruthRenderer _supportTruth;
         private enum RouteValidationView
@@ -816,17 +832,11 @@ namespace Genesis.RoomScan
             UseJointDiagnosticDisplay = false;
 
             EnsureInfiniTamBlockPipeline();
-            if (_infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
-                _infiniTamBlocks.InitialBuildComplete)
-            {
-                _infiniTamBlocks.SetVisible(renderProductionMesh &&
-                                            InfiniTamPublicationReady);
-                if (_gpuRenderer != null)
-                    _gpuRenderer.RenderVisible = false;
-                return;
-            }
 
-            if (_gpuSurfaceNets == null)
+            // Healthy startup is block-only. Whole-volume resources now exist
+            // solely as an explicit failure fallback and can no longer become
+            // a temporary foreground before the first block is publishable.
+            if (!InfiniTamBlockPipelineHealthy && _gpuSurfaceNets == null)
             {
                 _gpuSurfaceNets = new GPUSurfaceNets(surfaceNetsCompute)
                 {
@@ -863,30 +873,49 @@ namespace Genesis.RoomScan
                     gpuVertexBudgetPercent);
             }
 
-            if (_gpuRenderer == null)
+            if (_gpuSurfaceNets != null && _gpuRenderer == null)
             {
                 _gpuRenderer = gameObject.AddComponent<GPUMeshRenderer>();
                 _gpuRenderer.GpuMeshMaterial = scanMeshMaterial;
             }
 
-            IGPUMeshBufferSource visibleSource = _infiniTamFront != null
-                ? (IGPUMeshBufferSource)_infiniTamFront
-                : _gpuSurfaceNets;
-            _gpuRenderer.Initialize(visibleSource,
-                _gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
-            _gpuRenderer.SetStrictObservedDisplay(false);
-            _gpuRenderer.SetJointDiagnosticDisplay(false);
-            _gpuRenderer.SetTemporalIllegalCandidateActive(false);
-            // Display the one native reconstruction without a painted coarse-
-            // grid substitute. The accepted profile currently uses a native
-            // 10 cm TSDF with stride-1 extraction.
-            _gpuRenderer.SetProductGridDisplay(false);
-            // Never reveal a bootstrap TSDF or an old pre-reseed front. The
-            // first visible surface must be copied from a model that has passed
-            // consecutive frame-to-model validation.
-            _gpuRenderer.RenderVisible = renderProductionMesh &&
-                                         InfiniTamPublicationReady &&
-                                         _infiniTamFront != null;
+            if (_gpuSurfaceNets != null && _gpuRenderer != null)
+            {
+                IGPUMeshBufferSource visibleSource = _infiniTamFront != null
+                    ? (IGPUMeshBufferSource)_infiniTamFront
+                    : _gpuSurfaceNets;
+                _gpuRenderer.Initialize(visibleSource,
+                    _gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
+                _gpuRenderer.SetStrictObservedDisplay(false);
+                _gpuRenderer.SetJointDiagnosticDisplay(false);
+                _gpuRenderer.SetTemporalIllegalCandidateActive(false);
+                // Display the one native reconstruction without a painted coarse-
+                // grid substitute. The accepted profile currently uses a native
+                // 10 cm TSDF with stride-1 extraction.
+                _gpuRenderer.SetProductGridDisplay(false);
+            }
+
+            ApplyInfiniTamForegroundVisibility();
+        }
+
+        /// <summary>
+        /// The sole foreground selector. A healthy block pipeline may reveal
+        /// each completed block immediately; its renderer still rejects blocks
+        /// without an immutable Front. Whole-volume rendering is failure-only.
+        /// </summary>
+        private void ApplyInfiniTamForegroundVisibility()
+        {
+            bool publicationReady = InfiniTamPublicationReady;
+            bool blocksOwnForeground = publicationReady &&
+                                       InfiniTamBlockPipelineHealthy;
+
+            _infiniTamBlocks?.SetVisible(renderProductionMesh &&
+                                         blocksOwnForeground);
+            if (_gpuRenderer != null)
+                _gpuRenderer.RenderVisible = renderProductionMesh &&
+                                             publicationReady &&
+                                             !blocksOwnForeground &&
+                                             _infiniTamFront != null;
         }
 
         private void EnsureInfiniTamBlockPipeline()
@@ -976,20 +1005,18 @@ namespace Genesis.RoomScan
         public void SetProductionMeshVisible(bool visible)
         {
             renderProductionMesh = visible;
-            bool infiniTamReady = !IsInfiniTamBaselineActive ||
-                                  InfiniTamPublicationReady;
-            bool infiniTamBlocksOwnForeground = IsInfiniTamBaselineActive &&
-                infiniTamReady &&
-                _infiniTamBlocks != null && !_infiniTamBlocks.Failed &&
-                _infiniTamBlocks.InitialBuildComplete;
-            bool chunksOwnForeground = _persistentChunks != null &&
-                !_legacyFallbackActive && _persistentChunks.InitialBuildComplete;
-            if (_gpuRenderer != null)
-                _gpuRenderer.RenderVisible = visible && !chunksOwnForeground &&
-                    !infiniTamBlocksOwnForeground && infiniTamReady;
-            _infiniTamBlocks?.SetVisible(visible && infiniTamBlocksOwnForeground &&
-                                         infiniTamReady);
-            _persistentChunks?.SetVisible(visible && !_legacyFallbackActive);
+            if (IsInfiniTamBaselineActive)
+            {
+                ApplyInfiniTamForegroundVisibility();
+            }
+            else
+            {
+                bool chunksOwnForeground = _persistentChunks != null &&
+                    !_legacyFallbackActive && _persistentChunks.InitialBuildComplete;
+                if (_gpuRenderer != null)
+                    _gpuRenderer.RenderVisible = visible && !chunksOwnForeground;
+                _persistentChunks?.SetVisible(visible && !_legacyFallbackActive);
+            }
             // 增量 HERA 父页才是扫描期满屏网格的主体：显示开关必须连它一起切，
             // 否则帧率二分（右摇杆直接按下）只藏了实时轨一小条，判不出光栅化压力。
             // 只碰增量页；冻结回放档归 A/B 实验自己的显示开关管。
@@ -1584,90 +1611,7 @@ namespace Genesis.RoomScan
         {
             if (IsInfiniTamBaselineActive)
             {
-                EnsureInfiniTamBaselineResources();
-                if (!InfiniTamPublicationReady)
-                {
-                    // Bootstrap and every automatic reseed are private. Drop
-                    // the old immutable front so it cannot reappear when the
-                    // new model later passes validation.
-                    _infiniTamBlocks?.SetVisible(false);
-                    if (_gpuRenderer != null)
-                        _gpuRenderer.RenderVisible = false;
-                    DisposeInfiniTamBaselineFronts();
-                    _infiniTamBootstrapExtractionIssued = false;
-                    _infiniTamBlocksOwnedForeground = false;
-                    LastVertexCount = 0;
-                    LastIndexCount = 0;
-                    return;
-                }
-
-                // A topology reset starts a new block-front generation. Give
-                // that generation one fresh whole-volume bootstrap, but never
-                // turn it back into a continuous second extraction pipeline.
-                if (_infiniTamBlocksOwnedForeground &&
-                    _infiniTamBlocks != null &&
-                    !_infiniTamBlocks.InitialBuildComplete)
-                {
-                    _infiniTamBootstrapExtractionIssued = false;
-                    _infiniTamBlocksOwnedForeground = false;
-                }
-
-                if (_infiniTamBlocks == null || _infiniTamBlocks.Failed)
-                {
-                    // Explicit block-pipeline failure is the sole live-scan
-                    // reason to resume continuous whole-volume extraction.
-                    _infiniTamBlocksOwnedForeground = false;
-                    if (_gpuSurfaceNets == null || _counterReadbackPending)
-                        return;
-                    _nextCounterReadbackTime = 0f;
-                    ExtractLegacyGlobal();
-                    return;
-                }
-
-                if (!_infiniTamBootstrapExtractionIssued &&
-                    !_infiniTamBlocks.InitialBuildComplete)
-                {
-                    // Keep the bootstrap and block dispatches in different mesh
-                    // slots. The immutable snapshot remains visible while the
-                    // block front builds, but it is not rebuilt every tick.
-                    if (_gpuSurfaceNets == null || _counterReadbackPending)
-                        return;
-                    _infiniTamBootstrapExtractionIssued = true;
-                    _nextCounterReadbackTime = 0f;
-                    ExtractLegacyGlobal();
-                    return;
-                }
-
-                _infiniTamBlocks.Tick();
-
-                if (_infiniTamBlocks.Failed)
-                {
-                    _infiniTamBlocksOwnedForeground = false;
-                    if (_gpuSurfaceNets == null || _counterReadbackPending)
-                        return;
-                    _nextCounterReadbackTime = 0f;
-                    ExtractLegacyGlobal();
-                    return;
-                }
-
-                if (_infiniTamBlocks.InitialBuildComplete)
-                {
-                    _infiniTamBlocksOwnedForeground = true;
-                    _infiniTamBlocks.SetVisible(renderProductionMesh);
-                    if (_gpuRenderer != null)
-                        _gpuRenderer.RenderVisible = false;
-                    LastVertexCount = (int)Math.Min(int.MaxValue,
-                        _infiniTamBlocks.CommittedVertexCount);
-                    LastIndexCount = (int)Math.Min(int.MaxValue,
-                        _infiniTamBlocks.CommittedIndexCount);
-                    if (!_counterReadbackPending)
-                        ReleaseInfiniTamGlobalFallback();
-                    return;
-                }
-
-                // The one bootstrap has already been issued. This mesh slot was
-                // consumed by the block Tick above; do not stack or repeat a
-                // whole-volume dispatch while the block pipeline is healthy.
+                TickInfiniTamBaseline();
                 return;
             }
 
@@ -1720,6 +1664,66 @@ namespace Genesis.RoomScan
             }
 
             ExtractLegacyGlobal();
+        }
+
+        /// <summary>
+        /// Healthy InfiniTAM startup is block-only. The block pipeline advances
+        /// on every admitted mesh-work slot and each immutable Front becomes
+        /// independently visible when published. Whole-volume work is reserved
+        /// for an explicit block-pipeline failure.
+        /// </summary>
+        private void TickInfiniTamBaseline()
+        {
+            EnsureInfiniTamBaselineResources();
+            if (!InfiniTamPublicationReady)
+            {
+                ResetInfiniTamFallbackPublication();
+                return;
+            }
+
+            if (!InfiniTamBlockPipelineHealthy)
+            {
+                TickInfiniTamWholeVolumeFailureFallback();
+                ApplyInfiniTamForegroundVisibility();
+                return;
+            }
+
+            _infiniTamBlocks.Tick();
+
+            if (_infiniTamBlocks.Failed)
+            {
+                // Failure may occur inside Tick, after the block-only resource
+                // check above. Create fallback resources only at this point.
+                EnsureInfiniTamBaselineResources();
+                TickInfiniTamWholeVolumeFailureFallback();
+                ApplyInfiniTamForegroundVisibility();
+                return;
+            }
+
+            LastVertexCount = (int)Math.Min(int.MaxValue,
+                _infiniTamBlocks.CommittedVertexCount);
+            LastIndexCount = (int)Math.Min(int.MaxValue,
+                _infiniTamBlocks.CommittedIndexCount);
+
+            ApplyInfiniTamForegroundVisibility();
+        }
+
+        private void TickInfiniTamWholeVolumeFailureFallback()
+        {
+            if (_gpuSurfaceNets == null || _counterReadbackPending)
+                return;
+            _nextCounterReadbackTime = 0f;
+            ExtractLegacyGlobal();
+        }
+
+        private void ResetInfiniTamFallbackPublication()
+        {
+            _infiniTamBlocks?.SetVisible(false);
+            if (_gpuRenderer != null)
+                _gpuRenderer.RenderVisible = false;
+            DisposeInfiniTamBaselineFronts();
+            LastVertexCount = 0;
+            LastIndexCount = 0;
         }
 
         private void ExtractLegacyGlobal()
@@ -1819,21 +1823,7 @@ namespace Genesis.RoomScan
             _gpuRenderer.SetMeshSource(_infiniTamFront);
             _gpuRenderer.UpdateBounds(
                 _gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
-            _gpuRenderer.RenderVisible = renderProductionMesh &&
-                                         InfiniTamPublicationReady;
-        }
-
-        private void ReleaseInfiniTamGlobalFallback()
-        {
-            if (_gpuSurfaceNets == null)
-                return;
-
-            if (_gpuRenderer != null)
-                _gpuRenderer.RenderVisible = false;
-            _gpuSurfaceNets.Dispose();
-            _gpuSurfaceNets = null;
-            DisposeInfiniTamBaselineFronts();
-            Logger.Info("InfiniTAM block front owns the foreground; released whole-volume fallback buffers.");
+            ApplyInfiniTamForegroundVisibility();
         }
 
         private void DisposeInfiniTamBaselineFronts()
@@ -1848,8 +1838,6 @@ namespace Genesis.RoomScan
         {
             _infiniTamBlocks?.Dispose();
             _infiniTamBlocks = null;
-            _infiniTamBootstrapExtractionIssued = false;
-            _infiniTamBlocksOwnedForeground = false;
         }
 
         private void ApplySnapshot(uint[] data)
@@ -1942,20 +1930,31 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// The block extractor consumes only the already-fused TSDF.  Passing
-        /// the live shell/depth evidence here would silently rebuild the old
-        /// multi-office route inside extraction and break baseline isolation.
+        /// The block extractor consumes only the already-fused TSDF. Quest's
+        /// Vulkan backend still requires every texture statically declared by
+        /// ClassifyAndEmit to have a valid descriptor. The former whole-volume
+        /// bootstrap happened to bind these slots before the first block ran;
+        /// block-only startup must perform that binding explicitly instead.
+        /// Evidence availability remains false, so neither texture participates
+        /// in classification and baseline isolation is unchanged.
         /// </summary>
         private void ExtractInfiniTamBlock(GPUSurfaceNets target)
         {
             if (target == null) return;
+            DepthCapture depthCapture = DepthCapture.Instance;
+            Texture descriptorDepth = depthCapture != null
+                ? depthCapture.DepthTex
+                : null;
+            Texture descriptorEdgeReason = depthCapture != null
+                ? depthCapture.EdgeReasonTex
+                : null;
             target.Extract(
                 _volume.Volume,
                 _volume.ColorVolume,
                 _volume.AdmissionTraceVolume,
                 _volume.VoxelSize,
-                null,
-                null,
+                descriptorDepth,
+                descriptorEdgeReason,
                 false);
         }
 
@@ -2647,8 +2646,6 @@ namespace Genesis.RoomScan
             _ledgerOpen = false;
             _ledgerSamples.Clear();
             _ledgerSessionId = "未开始";
-            _infiniTamBootstrapExtractionIssued = false;
-            _infiniTamBlocksOwnedForeground = false;
             ResetLastSnapshot();
             ResetTemporalDiagnosticState();
             _persistentChunks?.ResetLocalReplacementLedger();

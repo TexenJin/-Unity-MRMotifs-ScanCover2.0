@@ -69,18 +69,10 @@ namespace Genesis.RoomScan
         private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
         private static readonly int ID_Wireframe = Shader.PropertyToID("_RSWireframe");
         private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
-        private static readonly int ID_TrueLineQuadPerimeters =
-            Shader.PropertyToID("_RSTrueLineQuadPerimeters");
-        private static readonly int ID_TrueLineMaxViewDistance =
-            Shader.PropertyToID("_RSTrueLineMaxViewDistance");
-        private static readonly int ID_DepthPrepassMaxViewDistance =
-            Shader.PropertyToID("_RSDepthPrepassMaxViewDistance");
-
-        // Keep the CPU block rejection conservative for stereo eyes and for
-        // blocks touching the display-range boundary. The depth shader applies
-        // the exact per-vertex range to the surviving boundary blocks.
-        private const float DepthPrepassBoundsCullPadding = 0.15f;
-        private static Camera s_mainCamera;
+        private static readonly int ID_TrueLineQuadTopology =
+            Shader.PropertyToID("_RSTrueLineQuadTopology");
+        private static readonly int ID_BoundaryUnificationDiagnostic =
+            Shader.PropertyToID("_RSBoundaryUnificationDiagnostic");
 
         // Display-only A/B colors. They never feed back into extraction or TSDF state.
         private static readonly Color ProductionColor = new Color(1.0f, 0.62f, 0.02f, 0.96f);
@@ -94,7 +86,8 @@ namespace Genesis.RoomScan
         private bool _temporalIllegalCandidateActive;
         private bool _heraReplayActive;
         private bool _productGridMode;
-        private bool _trueLineQuadPerimeters;
+        private bool _trueLineQuadTopology;
+        private bool _boundaryUnificationDiagnostic;
 
         private bool _renderVisible = true;
 
@@ -182,12 +175,23 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// The compact InfiniTAM front emits each native surface quad as two
-        /// consecutive triangles. Draw its four perimeter edges without the
-        /// internal split diagonal; immutable mesh data remains unchanged.
+        /// consecutive triangles. Draw the four perimeter edges and their one
+        /// shared diagonal exactly once so the display matches the real
+        /// triangle topology without double-submitting the split edge.
         /// </summary>
-        public void SetTrueLineQuadPerimeters(bool enabled)
+        public void SetTrueLineQuadTopology(bool enabled)
         {
-            _trueLineQuadPerimeters = enabled;
+            _trueLineQuadTopology = enabled;
+        }
+
+        /// <summary>
+        /// Display-only proof for InfiniTAM boundary representative sharing.
+        /// Blue is an interior edge, green is a reconciled boundary edge and
+        /// red is a boundary edge whose halo representative stayed unresolved.
+        /// </summary>
+        public void SetBoundaryUnificationDiagnostic(bool enabled)
+        {
+            _boundaryUnificationDiagnostic = enabled;
         }
 
         /// <summary>
@@ -251,10 +255,12 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
             _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
-            bool useQuadPerimeters = _trueLineQuadPerimeters &&
+            bool useQuadTopology = _trueLineQuadTopology &&
                 knownDrawVertexCount >= 6 && knownDrawVertexCount % 6 == 0;
-            _props.SetFloat(ID_TrueLineQuadPerimeters,
-                useQuadPerimeters ? 1f : 0f);
+            _props.SetFloat(ID_TrueLineQuadTopology,
+                useQuadTopology ? 1f : 0f);
+            _props.SetFloat(ID_BoundaryUnificationDiagnostic,
+                _boundaryUnificationDiagnostic ? 1f : 0f);
             var rp = new RenderParams(gpuMeshMaterial)
             {
                 worldBounds = _bounds,
@@ -279,14 +285,8 @@ namespace Genesis.RoomScan
                   knownDrawVertexCount <= int.MaxValue / 2) ||
                   (knownDrawVertexCount < 0 && lineArgsBuf != null)) &&
                 EnsureTrueLineMaterial();
-            float depthPrepassMaxDistance = useTrueLines
-                ? Mathf.Max(0f, Shader.GetGlobalFloat(ID_TrueLineMaxViewDistance))
-                : 0f;
-            _props.SetFloat(ID_DepthPrepassMaxViewDistance,
-                depthPrepassMaxDistance);
             if (occludeRearWireframe && s_rearWireDepthPrepassEnabled &&
                 lineSurfaceVisible &&
-                !IsEntirelyOutsideDepthPrepassRange(depthPrepassMaxDistance) &&
                 EnsureRearWireOccluderMaterial())
             {
                 // Fill only the depth buffer with the nearest complete triangle
@@ -317,13 +317,13 @@ namespace Genesis.RoomScan
 
                 // Ordinary snapshots expose all three triangle edges. The compact
                 // InfiniTAM front has a stronger contract: every six indices are
-                // one quad, so eight line vertices cover its perimeter instead of
-                // twelve vertices drawing the split diagonal twice. Both routes
+                // one two-triangle group, so ten line vertices cover its four
+                // outside edges and shared diagonal exactly once. Both routes
                 // avoid rasterizing triangle interiors.
                 if (knownDrawVertexCount > 0)
                 {
-                    int lineVertexCount = useQuadPerimeters
-                        ? knownDrawVertexCount / 6 * 8
+                    int lineVertexCount = useQuadTopology
+                        ? knownDrawVertexCount / 6 * 10
                         : knownDrawVertexCount * 2;
                     Graphics.RenderPrimitives(
                         lineRp,
@@ -348,22 +348,6 @@ namespace Genesis.RoomScan
             }
             LastSubmittedVertexCount = knownDrawVertexCount > 0 ? knownDrawVertexCount : -1;
             LastSubmittedFrame = Time.frameCount;
-        }
-
-        private bool IsEntirelyOutsideDepthPrepassRange(float maxDistance)
-        {
-            if (maxDistance <= 0f)
-                return false;
-
-            if (s_mainCamera == null)
-                s_mainCamera = Camera.main;
-            if (s_mainCamera == null)
-                return false;
-
-            float conservativeDistance = maxDistance +
-                                         DepthPrepassBoundsCullPadding;
-            return _bounds.SqrDistance(s_mainCamera.transform.position) >
-                   conservativeDistance * conservativeDistance;
         }
 
         private bool EnsureTrueLineMaterial()

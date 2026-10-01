@@ -48,8 +48,6 @@ namespace Genesis.RoomScan
         private bool wireframeMode = true;
         [SerializeField, Range(0.2f, 5f), Tooltip("线框模式的线条粗细倍率（1.0 对齐原 SC 工程细线观感，可按需调）")]
         private float wireThickness = 1.0f;
-        [SerializeField, Range(2.5f, 6f), Tooltip("真线显示的最远距离（米）。只裁掉远处线段的逐帧绘制，不删除网格、TSDF 或提取结果；靠近后会重新显示。")]
-        private float trueLineMaxViewDistance = 4f;
         [SerializeField, Range(1, 6), Tooltip("条带抽稀（顶点侧按体素格丢三角形，任一轴对齐即保留）。08-19 实机判定观感碎、做不出 Meta 粗网，已让世界格线画法取代，默认 1=关闭，仅留作帧率应急杠杆")]
         private int meshDisplayStride = 1;
         [SerializeField, Range(0.1f, 1.0f), Tooltip("纸主三角网的世界空间间距（米）。0.12m 保留旧细网对局部结构的可读性；后续视觉定稿可再放大。")]
@@ -738,11 +736,10 @@ namespace Genesis.RoomScan
         private float _lastInfiniTamHeavyWorkTime = -1000f;
         private float _infiniTamFrameSecondsEma = 1f / 72f;
         private int _infiniTamHealthyFrameStreak;
-        // Fresh-volume startup only. The first whole-volume bootstrap remains
-        // intact, but cannot share the volume bring-up window. Once one real
-        // fusion has been submitted, leave one ordinary mesh interval before
-        // the first extraction; after that extraction this gate is gone for the
-        // rest of the scan and the accepted 10 Hz / 5 Hz scheduler is untouched.
+        // Fresh-volume startup only. The first block-ledger/extraction slot
+        // cannot share the volume bring-up window. Once one real fusion has
+        // been submitted, leave one ordinary mesh interval before that first
+        // slot; afterwards the accepted 10 Hz / 5 Hz scheduler is untouched.
         private bool _infiniTamStartupFirstMeshPending;
         private bool _infiniTamStartupFirstFusionSubmitted;
         private float _infiniTamStartupFirstMeshNotBefore;
@@ -768,6 +765,24 @@ namespace Genesis.RoomScan
         private long _meshTailStartVertexCount;
         private long _meshTailStartIndexCount;
         private int _meshTailStartVisibleBlocks;
+        private long _meshTailStartRawReadbackCount;
+        private long _meshTailStartRawReadbackErrorCount;
+        private long _meshTailStartRawVertexCount;
+        private long _meshTailStartRawIndexCount;
+        private long _meshTailStartRawRejectedUnknownEdgeCount;
+        private long _meshTailStartRawCrossingCellWithUnknownEdgesCount;
+        private long _meshTailStartRawRejectedUnknownQuadCount;
+        private long _meshTailStartRawStrictEmittedCellCount;
+        private long _meshTailStartRawZeroVertexReadbackCount;
+        private long _meshTailStartRawVerticesWithoutIndicesReadbackCount;
+        private bool _meshTailStartFusionTicketReady;
+        private int _meshTailStartFusionTicketSampleCount;
+        private int _meshTailStartFusionAttemptedFrameCount;
+        private int _meshTailStartFusionFusedFrameCount;
+        private ulong _meshTailStartFusionNewSurfaceWrites;
+        private ulong _meshTailStartFusionContinuingSurfaceWrites;
+        private ulong _meshTailStartFusionMatureSurfaceWrites;
+        private ulong _meshTailStartFusionNearZeroSurfaceWrites;
         private string _meshTailValidationOutputPath = string.Empty;
         private bool _meshTailReasonLedgerSealRequested;
         private string _meshTailReasonLedgerSessionDirectory = string.Empty;
@@ -2347,6 +2362,7 @@ namespace Genesis.RoomScan
             float meshWorkInterval = infiniTamPhasedBlockWork
                 ? MeshInterval * 0.5f
                 : MeshInterval;
+
             bool integrationDue = t - _lastIntegrationTime >= IntegrationInterval;
             bool startupFirstMeshReady = !_infiniTamStartupFirstMeshPending ||
                 (_infiniTamStartupFirstFusionSubmitted &&
@@ -2496,9 +2512,9 @@ namespace Genesis.RoomScan
                         // fusion dispatch, not to wall time before depth became
                         // available.
                         // This guarantees that volume bring-up/fusion and the
-                        // whole-volume bootstrap cannot collapse into one GPU
-                        // startup window. Reuse the accepted mesh interval; no
-                        // new production tuning value is introduced.
+                        // first block-ledger/extraction slot cannot collapse
+                        // into one GPU startup window. Reuse the accepted mesh
+                        // interval; no new production tuning value is introduced.
                         _infiniTamStartupFirstFusionSubmitted = true;
                         _infiniTamStartupFirstMeshNotBefore = t + MeshInterval;
                         _lastMeshTime = t;
@@ -4181,6 +4197,39 @@ namespace Genesis.RoomScan
             _meshTailStartVertexCount = _meshExtractor.InfiniTamCommittedVertexCount;
             _meshTailStartIndexCount = _meshExtractor.InfiniTamCommittedIndexCount;
             _meshTailStartVisibleBlocks = _meshExtractor.InfiniTamVisibleBlockCount;
+            _meshTailStartRawReadbackCount = _meshExtractor.InfiniTamRawReadbackCount;
+            _meshTailStartRawReadbackErrorCount =
+                _meshExtractor.InfiniTamRawReadbackErrorCount;
+            _meshTailStartRawVertexCount = _meshExtractor.InfiniTamRawVertexCount;
+            _meshTailStartRawIndexCount = _meshExtractor.InfiniTamRawIndexCount;
+            _meshTailStartRawRejectedUnknownEdgeCount =
+                _meshExtractor.InfiniTamRawRejectedUnknownEdgeCount;
+            _meshTailStartRawCrossingCellWithUnknownEdgesCount =
+                _meshExtractor.InfiniTamRawCrossingCellWithUnknownEdgesCount;
+            _meshTailStartRawRejectedUnknownQuadCount =
+                _meshExtractor.InfiniTamRawRejectedUnknownQuadCount;
+            _meshTailStartRawStrictEmittedCellCount =
+                _meshExtractor.InfiniTamRawStrictEmittedCellCount;
+            _meshTailStartRawZeroVertexReadbackCount =
+                _meshExtractor.InfiniTamRawZeroVertexReadbackCount;
+            _meshTailStartRawVerticesWithoutIndicesReadbackCount =
+                _meshExtractor.InfiniTamRawVerticesWithoutIndicesReadbackCount;
+            _meshTailStartFusionTicketReady =
+                _volumeIntegrator.InfiniTamTicketSampleReady;
+            _meshTailStartFusionTicketSampleCount =
+                _volumeIntegrator.InfiniTamTicketSampleCount;
+            _meshTailStartFusionAttemptedFrameCount =
+                _volumeIntegrator.InfiniTamAttemptedFrameCount;
+            _meshTailStartFusionFusedFrameCount =
+                _volumeIntegrator.InfiniTamFusedFrameCount;
+            _meshTailStartFusionNewSurfaceWrites =
+                _volumeIntegrator.InfiniTamCumulativeNewSurfaceWrites;
+            _meshTailStartFusionContinuingSurfaceWrites =
+                _volumeIntegrator.InfiniTamCumulativeContinuingSurfaceWrites;
+            _meshTailStartFusionMatureSurfaceWrites =
+                _volumeIntegrator.InfiniTamCumulativeMatureSurfaceWrites;
+            _meshTailStartFusionNearZeroSurfaceWrites =
+                _volumeIntegrator.InfiniTamCumulativeNearZeroSurfaceWrites;
             _meshTailValidationSamples.Clear();
             _meshTailValidationSamples.AppendLine(
                 "seconds,integration_count,dirty_epoch,ledger_applies,accepted_commits," +
@@ -4202,7 +4251,7 @@ namespace Genesis.RoomScan
                 _meshTailValidationOutputPath = Path.Combine(directory,
                     $"mesh_tail_{stamp}.txt");
                 var runningReceipt = new StringBuilder(512);
-                runningReceipt.AppendLine("schema=mesh_tail_validation_v4");
+                runningReceipt.AppendLine("schema=mesh_tail_validation_v6");
                 runningReceipt.AppendLine("state=RUNNING");
                 runningReceipt.AppendLine("authority=diagnostic_only_no_production_threshold_changes");
                 runningReceipt.AppendLine("acceptance=tsdf_frozen_and_drained_and_published_batches_after_freeze_lte_1");
@@ -4212,6 +4261,24 @@ namespace Genesis.RoomScan
                 runningReceipt.AppendLine($"completed_batches_start={_meshTailStartCompletedBatchCount}");
                 runningReceipt.AppendLine($"published_batches_start={_meshTailStartPublishedBatchCount}");
                 runningReceipt.AppendLine($"stale_discards_start={_meshTailStartStaleDiscardCount}");
+                runningReceipt.AppendLine($"raw_readbacks_start={_meshTailStartRawReadbackCount}");
+                runningReceipt.AppendLine($"raw_readback_errors_start={_meshTailStartRawReadbackErrorCount}");
+                runningReceipt.AppendLine($"raw_vertices_start={_meshTailStartRawVertexCount}");
+                runningReceipt.AppendLine($"raw_indices_start={_meshTailStartRawIndexCount}");
+                runningReceipt.AppendLine($"raw_rejected_unknown_edges_start={_meshTailStartRawRejectedUnknownEdgeCount}");
+                runningReceipt.AppendLine($"raw_crossing_cells_with_unknown_edges_start={_meshTailStartRawCrossingCellWithUnknownEdgesCount}");
+                runningReceipt.AppendLine($"raw_rejected_unknown_quads_start={_meshTailStartRawRejectedUnknownQuadCount}");
+                runningReceipt.AppendLine($"raw_strict_emitted_cells_start={_meshTailStartRawStrictEmittedCellCount}");
+                runningReceipt.AppendLine($"raw_zero_vertex_readbacks_start={_meshTailStartRawZeroVertexReadbackCount}");
+                runningReceipt.AppendLine($"raw_vertices_without_indices_readbacks_start={_meshTailStartRawVerticesWithoutIndicesReadbackCount}");
+                runningReceipt.AppendLine($"fusion_ticket_ready_start={_meshTailStartFusionTicketReady.ToString().ToLowerInvariant()}");
+                runningReceipt.AppendLine($"fusion_ticket_samples_start={_meshTailStartFusionTicketSampleCount}");
+                runningReceipt.AppendLine($"fusion_attempted_frames_start={_meshTailStartFusionAttemptedFrameCount}");
+                runningReceipt.AppendLine($"fusion_fused_frames_start={_meshTailStartFusionFusedFrameCount}");
+                runningReceipt.AppendLine($"fusion_new_near_zero_writes_start={_meshTailStartFusionNewSurfaceWrites}");
+                runningReceipt.AppendLine($"fusion_continuing_near_zero_writes_start={_meshTailStartFusionContinuingSurfaceWrites}");
+                runningReceipt.AppendLine($"fusion_mature_near_zero_writes_start={_meshTailStartFusionMatureSurfaceWrites}");
+                runningReceipt.AppendLine($"fusion_near_zero_writes_start={_meshTailStartFusionNearZeroSurfaceWrites}");
                 runningReceipt.AppendLine($"reason_ledger_seal_requested={_meshTailReasonLedgerSealRequested.ToString().ToLowerInvariant()}");
                 runningReceipt.AppendLine($"reason_ledger_session={_meshTailReasonLedgerSessionDirectory}");
                 runningReceipt.AppendLine($"pipeline_start={_meshExtractor.InfiniTamBlockStatsCompact}");
@@ -4343,6 +4410,42 @@ namespace Genesis.RoomScan
                 ? _meshExtractor.InfiniTamCommittedIndexCount : -1L;
             int endVisibleBlocks = _meshExtractor != null
                 ? _meshExtractor.InfiniTamVisibleBlockCount : -1;
+            long endRawReadbacks = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawReadbackCount : -1L;
+            long endRawReadbackErrors = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawReadbackErrorCount : -1L;
+            long endRawVertices = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawVertexCount : -1L;
+            long endRawIndices = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawIndexCount : -1L;
+            long endRawRejectedUnknownEdges = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawRejectedUnknownEdgeCount : -1L;
+            long endRawCrossingCellsWithUnknownEdges = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawCrossingCellWithUnknownEdgesCount : -1L;
+            long endRawRejectedUnknownQuads = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawRejectedUnknownQuadCount : -1L;
+            long endRawStrictEmittedCells = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawStrictEmittedCellCount : -1L;
+            long endRawZeroVertexReadbacks = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawZeroVertexReadbackCount : -1L;
+            long endRawVerticesWithoutIndicesReadbacks = _meshExtractor != null
+                ? _meshExtractor.InfiniTamRawVerticesWithoutIndicesReadbackCount : -1L;
+            bool endFusionTicketReady = _volumeIntegrator != null &&
+                                        _volumeIntegrator.InfiniTamTicketSampleReady;
+            int endFusionTicketSamples = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamTicketSampleCount : -1;
+            int endFusionAttemptedFrames = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamAttemptedFrameCount : -1;
+            int endFusionFusedFrames = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamFusedFrameCount : -1;
+            ulong endFusionNewSurfaceWrites = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamCumulativeNewSurfaceWrites : 0ul;
+            ulong endFusionContinuingSurfaceWrites = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamCumulativeContinuingSurfaceWrites : 0ul;
+            ulong endFusionMatureSurfaceWrites = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamCumulativeMatureSurfaceWrites : 0ul;
+            ulong endFusionNearZeroSurfaceWrites = _volumeIntegrator != null
+                ? _volumeIntegrator.InfiniTamCumulativeNearZeroSurfaceWrites : 0ul;
             long commitDelta = Math.Max(0L, endCommits - _meshTailStartAcceptedCommitCount);
             long completedBatchDelta = Math.Max(0L,
                 endCompletedBatches - _meshTailStartCompletedBatchCount);
@@ -4350,6 +4453,24 @@ namespace Genesis.RoomScan
                 endPublishedBatches - _meshTailStartPublishedBatchCount);
             long staleDiscardDelta = Math.Max(0L,
                 endStaleDiscards - _meshTailStartStaleDiscardCount);
+            string rawExtractionVerdict = endRawReadbacks <= 0
+                ? endRawReadbackErrors > 0
+                    ? "RAW_READBACK_ERRORS_ONLY"
+                    : "NO_RAW_READBACK"
+                : endRawVertices <= 0
+                    ? "NO_RAW_VERTICES"
+                    : endRawIndices < 3
+                        ? "RAW_VERTICES_WITHOUT_INDICES"
+                        : endIndices <= 0
+                            ? "RAW_MESH_NOT_PUBLISHED"
+                            : "RAW_MESH_PUBLISHED";
+            string pipelineBreakVerdict = rawExtractionVerdict != "NO_RAW_VERTICES"
+                ? rawExtractionVerdict
+                : !endFusionTicketReady || endFusionTicketSamples <= 0
+                    ? "FUSION_TICKET_NOT_READY"
+                    : endFusionNearZeroSurfaceWrites == 0ul
+                        ? "FUSION_NO_SAMPLED_NEAR_ZERO_WRITES"
+                        : "FUSION_WRITES_EXIST_EXTRACTION_READS_NO_VERTICES";
             bool fusionFrozen = endIntegrations == _meshTailStartIntegrationCount &&
                                 endDirtyEpoch == _meshTailStartDirtyEpoch;
             string verdict = !fusionFrozen
@@ -4376,7 +4497,7 @@ namespace Genesis.RoomScan
                     outputPath = Path.Combine(directory, $"mesh_tail_{stamp}.txt");
                 }
                 var report = new StringBuilder(8192);
-                report.AppendLine("schema=mesh_tail_validation_v4");
+                report.AppendLine("schema=mesh_tail_validation_v6");
                 report.AppendLine("state=SEALED");
                 report.AppendLine("authority=diagnostic_only_no_production_threshold_changes");
                 report.AppendLine("acceptance=tsdf_frozen_and_drained_and_published_batches_after_freeze_lte_1");
@@ -4393,6 +4514,26 @@ namespace Genesis.RoomScan
                 report.AppendLine($"visible_blocks={_meshTailStartVisibleBlocks}->{endVisibleBlocks}");
                 report.AppendLine($"committed_vertices={_meshTailStartVertexCount}->{endVertices}");
                 report.AppendLine($"committed_indices={_meshTailStartIndexCount}->{endIndices}");
+                report.AppendLine($"raw_readbacks={_meshTailStartRawReadbackCount}->{endRawReadbacks}");
+                report.AppendLine($"raw_readback_errors={_meshTailStartRawReadbackErrorCount}->{endRawReadbackErrors}");
+                report.AppendLine($"raw_vertices={_meshTailStartRawVertexCount}->{endRawVertices}");
+                report.AppendLine($"raw_indices={_meshTailStartRawIndexCount}->{endRawIndices}");
+                report.AppendLine($"raw_rejected_unknown_edges={_meshTailStartRawRejectedUnknownEdgeCount}->{endRawRejectedUnknownEdges}");
+                report.AppendLine($"raw_crossing_cells_with_unknown_edges={_meshTailStartRawCrossingCellWithUnknownEdgesCount}->{endRawCrossingCellsWithUnknownEdges}");
+                report.AppendLine($"raw_rejected_unknown_quads={_meshTailStartRawRejectedUnknownQuadCount}->{endRawRejectedUnknownQuads}");
+                report.AppendLine($"raw_strict_emitted_cells={_meshTailStartRawStrictEmittedCellCount}->{endRawStrictEmittedCells}");
+                report.AppendLine($"raw_zero_vertex_readbacks={_meshTailStartRawZeroVertexReadbackCount}->{endRawZeroVertexReadbacks}");
+                report.AppendLine($"raw_vertices_without_indices_readbacks={_meshTailStartRawVerticesWithoutIndicesReadbackCount}->{endRawVerticesWithoutIndicesReadbacks}");
+                report.AppendLine($"raw_extraction_verdict={rawExtractionVerdict}");
+                report.AppendLine($"fusion_ticket_ready={_meshTailStartFusionTicketReady.ToString().ToLowerInvariant()}->{endFusionTicketReady.ToString().ToLowerInvariant()}");
+                report.AppendLine($"fusion_ticket_samples={_meshTailStartFusionTicketSampleCount}->{endFusionTicketSamples}");
+                report.AppendLine($"fusion_attempted_frames={_meshTailStartFusionAttemptedFrameCount}->{endFusionAttemptedFrames}");
+                report.AppendLine($"fusion_fused_frames={_meshTailStartFusionFusedFrameCount}->{endFusionFusedFrames}");
+                report.AppendLine($"fusion_new_near_zero_writes={_meshTailStartFusionNewSurfaceWrites}->{endFusionNewSurfaceWrites}");
+                report.AppendLine($"fusion_continuing_near_zero_writes={_meshTailStartFusionContinuingSurfaceWrites}->{endFusionContinuingSurfaceWrites}");
+                report.AppendLine($"fusion_mature_near_zero_writes={_meshTailStartFusionMatureSurfaceWrites}->{endFusionMatureSurfaceWrites}");
+                report.AppendLine($"fusion_near_zero_writes={_meshTailStartFusionNearZeroSurfaceWrites}->{endFusionNearZeroSurfaceWrites}");
+                report.AppendLine($"pipeline_break_verdict={pipelineBreakVerdict}");
                 report.AppendLine($"reason_ledger_seal_requested={_meshTailReasonLedgerSealRequested.ToString().ToLowerInvariant()}");
                 report.AppendLine($"reason_ledger_session={_meshTailReasonLedgerSessionDirectory}");
                 report.AppendLine($"final_pipeline={_meshExtractor?.InfiniTamBlockStatsCompact ?? "missing"}");
@@ -4439,7 +4580,7 @@ namespace Genesis.RoomScan
                 string path = Path.Combine(directory,
                     $"mesh_tail_{now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)}.txt");
                 var receipt = new StringBuilder(384);
-                receipt.AppendLine("schema=mesh_tail_validation_v4");
+                receipt.AppendLine("schema=mesh_tail_validation_v6");
                 receipt.AppendLine("state=REJECTED");
                 receipt.AppendLine($"reason={reason}");
                 receipt.AppendLine($"created_utc={now:O}");
@@ -5084,8 +5225,6 @@ namespace Genesis.RoomScan
         private static readonly int TriAvailableID = Shader.PropertyToID("_RSTriAvailable");
         private static readonly int WireframeID = Shader.PropertyToID("_RSWireframe");
         private static readonly int WireThicknessID = Shader.PropertyToID("_RSWireThickness");
-        private static readonly int TrueLineMaxViewDistanceID =
-            Shader.PropertyToID("_RSTrueLineMaxViewDistance");
         private static readonly int MeshStrideID = Shader.PropertyToID("_RSMeshStride");
         private static readonly int GridSpacingID = Shader.PropertyToID("_RSGridSpacing");
         private static readonly int PaperGridModeID = Shader.PropertyToID("_RSPaperGridMode");
@@ -5248,8 +5387,6 @@ namespace Genesis.RoomScan
         {
             Shader.SetGlobalFloat(WireframeID, wireframeMode ? 1f : 0f);
             Shader.SetGlobalFloat(WireThicknessID, wireThickness);
-            Shader.SetGlobalFloat(TrueLineMaxViewDistanceID,
-                Mathf.Max(0f, trueLineMaxViewDistance));
             Shader.SetGlobalFloat(MeshStrideID, meshDisplayStride);
             Shader.SetGlobalFloat(GridSpacingID, meshGridSpacing);
             Shader.SetGlobalFloat(ConfidenceVizID, confidenceViz ? 1f : 0f);

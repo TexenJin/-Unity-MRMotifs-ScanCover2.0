@@ -26,6 +26,7 @@ namespace Genesis.RoomScan
         private readonly int _kInitTemporal;
         private readonly int _kClearCandidateHistory;
         private readonly int _kCopyMeshSnapshot;
+        private readonly int _kCopyCoordinateVertexMap;
         private readonly int _kCopyAdditiveMergePayload;
         private readonly int _kAppendNovelMatureTriangles;
         private readonly int _kBuildAdditiveMergeArgs;
@@ -103,6 +104,15 @@ namespace Genesis.RoomScan
         public float FoundationSimplifyNormalDotMin { get; set; } = 0.9659258f;
         public float FoundationSimplifyPlaneResidualVoxels { get; set; } = 0.2f;
         public int FoundationVisibleSkirtVoxels { get; set; }
+        /// <summary>
+        /// Keeps two nearby, near-parallel zero-crossing sheets from being
+        /// averaged into one Surface-Nets representative. This changes only
+        /// extraction; it never writes back to the TSDF volume.
+        /// </summary>
+        public bool LayerSeparationEnabled { get; set; }
+        public float LayerSeparationNormalDotMin { get; set; } = 0.9063078f;
+        public float LayerSeparationDistanceVoxels { get; set; } = 0.45f;
+        public bool GlobalCellOwnershipEnabled { get; set; }
         public bool VisualQualityDiagnosticsEnabled { get; set; }
         public bool DiagnosticRoiEnabled { get; set; } = true;
         public Vector4 DiagnosticRoiRect { get; set; } = new Vector4(0.2f, 0.25f, 0.8f, 0.75f);
@@ -169,6 +179,10 @@ namespace Genesis.RoomScan
         private static readonly int ID_FoundationSimplifyNormalDotMin = Shader.PropertyToID("_FoundationSimplifyNormalDotMin");
         private static readonly int ID_FoundationSimplifyPlaneResidualVoxels = Shader.PropertyToID("_FoundationSimplifyPlaneResidualVoxels");
         private static readonly int ID_FoundationVisibleSkirtVoxels = Shader.PropertyToID("_FoundationVisibleSkirtVoxels");
+        private static readonly int ID_LayerSeparationEnabled = Shader.PropertyToID("_LayerSeparationEnabled");
+        private static readonly int ID_LayerSeparationNormalDotMin = Shader.PropertyToID("_LayerSeparationNormalDotMin");
+        private static readonly int ID_LayerSeparationDistanceVoxels = Shader.PropertyToID("_LayerSeparationDistanceVoxels");
+        private static readonly int ID_GlobalCellOwnershipEnabled = Shader.PropertyToID("_GlobalCellOwnershipEnabled");
         private static readonly int ID_VisualQualityEnabled = Shader.PropertyToID("_VisualQualityEnabled");
         private static readonly int ID_CounterCount = Shader.PropertyToID("_CounterCount");
         private static readonly int ID_StageResponsibilityBase = Shader.PropertyToID("_StageResponsibilityBase");
@@ -176,8 +190,11 @@ namespace Genesis.RoomScan
         private static readonly int ID_SnapshotVertices = Shader.PropertyToID("_SnapshotVertices");
         private static readonly int ID_SnapshotIndices = Shader.PropertyToID("_SnapshotIndices");
         private static readonly int ID_SnapshotAdmissionClass = Shader.PropertyToID("_SnapshotAdmissionClass");
+        private static readonly int ID_SnapshotCoordVertMap = Shader.PropertyToID("_SnapshotCoordVertMap");
         private static readonly int ID_SnapshotVertexCount = Shader.PropertyToID("_SnapshotVertexCount");
         private static readonly int ID_SnapshotIndexCount = Shader.PropertyToID("_SnapshotIndexCount");
+        private static readonly int ID_SnapshotCoordMapCount = Shader.PropertyToID("_SnapshotCoordMapCount");
+        private static readonly int ID_SnapshotMarkBoundaryVertices = Shader.PropertyToID("_SnapshotMarkBoundaryVertices");
         private static readonly int ID_PreviousVertices = Shader.PropertyToID("_PreviousVertices");
         private static readonly int ID_PreviousIndices = Shader.PropertyToID("_PreviousIndices");
         private static readonly int ID_PreviousAdmissionClass = Shader.PropertyToID("_PreviousAdmissionClass");
@@ -272,6 +289,7 @@ namespace Genesis.RoomScan
             _kInitTemporal = compute.FindKernel("InitTemporal");
             _kClearCandidateHistory = compute.FindKernel("ClearCandidateHistory");
             _kCopyMeshSnapshot = compute.FindKernel("CopyMeshSnapshot");
+            _kCopyCoordinateVertexMap = compute.FindKernel("CopyCoordinateVertexMap");
             _kCopyAdditiveMergePayload = compute.FindKernel("CopyAdditiveMergePayload");
             _kAppendNovelMatureTriangles = compute.FindKernel("AppendNovelMatureTriangles");
             _kBuildAdditiveMergeArgs = compute.FindKernel("BuildAdditiveMergeArgs");
@@ -376,7 +394,8 @@ namespace Genesis.RoomScan
             }
         }
 
-        public void CopyCurrentMeshTo(GPUChunkMeshSnapshot snapshot, int vertexCount, int indexCount)
+        public void CopyCurrentMeshTo(GPUChunkMeshSnapshot snapshot, int vertexCount,
+            int indexCount, bool includeCoordinateVertexMap = false)
         {
             if (snapshot == null) throw new ArgumentNullException(nameof(snapshot));
             vertexCount = Mathf.Clamp(vertexCount, 0, _maxVertices);
@@ -391,9 +410,27 @@ namespace Genesis.RoomScan
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotAdmissionClass, snapshot.VertexAdmissionClassBuffer);
             _compute.SetInt(ID_SnapshotVertexCount, vertexCount);
             _compute.SetInt(ID_SnapshotIndexCount, indexCount);
+            _compute.SetInt(ID_SnapshotMarkBoundaryVertices,
+                includeCoordinateVertexMap ? 1 : 0);
+            _compute.SetInts(ID_CoreMin, _coreMin.x, _coreMin.y, _coreMin.z);
+            _compute.SetInts(ID_CoreMax, _coreMax.x, _coreMax.y, _coreMax.z);
             int count = Mathf.Max(vertexCount, indexCount);
             if (count > 0)
                 _compute.Dispatch(_kCopyMeshSnapshot, CeilDiv(count, 64), 1, 1);
+
+            if (!includeCoordinateVertexMap)
+                return;
+
+            snapshot.PrepareCoordinateVertexMap(_mapMin, _mapCount,
+                _coreMin, _coreMax);
+            _compute.SetBuffer(_kCopyCoordinateVertexMap, ID_CoordVertMap,
+                _coordVertMap);
+            _compute.SetBuffer(_kCopyCoordinateVertexMap, ID_SnapshotCoordVertMap,
+                snapshot.CoordinateVertexMapBuffer);
+            _compute.SetInt(ID_SnapshotCoordMapCount, _mapVoxels);
+            if (_mapVoxels > 0)
+                _compute.Dispatch(_kCopyCoordinateVertexMap,
+                    CeilDiv(_mapVoxels, 64), 1, 1);
         }
 
         public HeraFilterOperation BeginHeraCleanFilter(
@@ -760,6 +797,14 @@ namespace Genesis.RoomScan
                 Mathf.Max(0f, FoundationSimplifyPlaneResidualVoxels));
             _compute.SetInt(ID_FoundationVisibleSkirtVoxels,
                 FoundationTopologyMode ? Mathf.Clamp(FoundationVisibleSkirtVoxels, 0, 1) : 0);
+            _compute.SetInt(ID_LayerSeparationEnabled,
+                LayerSeparationEnabled ? 1 : 0);
+            _compute.SetFloat(ID_LayerSeparationNormalDotMin,
+                Mathf.Clamp(LayerSeparationNormalDotMin, 0f, 1f));
+            _compute.SetFloat(ID_LayerSeparationDistanceVoxels,
+                Mathf.Max(0.05f, LayerSeparationDistanceVoxels));
+            _compute.SetInt(ID_GlobalCellOwnershipEnabled,
+                GlobalCellOwnershipEnabled ? 1 : 0);
             _compute.SetInt(ID_VisualQualityEnabled, VisualQualityDiagnosticsEnabled ? 1 : 0);
 
             _compute.SetTexture(_kClassifyAndEmit, ID_TsdfVolume, tsdfVolume);

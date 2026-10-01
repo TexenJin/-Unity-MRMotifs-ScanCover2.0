@@ -15,8 +15,14 @@ Shader "Genesis/ScanMeshTrueLines"
             Name "TrueMeshLines"
             Tags { "LightMode"="SRPDefaultUnlit" }
 
-            Blend SrcAlpha OneMinusSrcAlpha
-            ZWrite On
+            // Replacement blending keeps a shared edge and two coincident
+            // submissions equally bright. Separated double surfaces remain
+            // visible instead of being hidden by additive-looking alpha.
+            Blend One Zero
+            // The sealed triangle prepass already owns the nearest depth.
+            // Writing it again from one-pixel lines only lets later line draws
+            // fight each other at grazing angles.
+            ZWrite Off
             ZTest LEqual
             Cull Off
 
@@ -49,13 +55,13 @@ Shader "Genesis/ScanMeshTrueLines"
             float gsConfidenceLowMin;
             float _RSConfidenceViz;
             float _RSMeshStride;
-            float _RSTrueLineMaxViewDistance;
-            float _RSTrueLineQuadPerimeters;
+            float _RSTrueLineQuadTopology;
             float _RSGeometryTruthView;
             float4 _RSExtractionColor;
             float _RSJointDiagnostic;
             float _RSSuppressPink;
             float _RSHeraReplayActive;
+            float _RSBoundaryUnificationDiagnostic;
 
             struct Varyings
             {
@@ -65,8 +71,28 @@ Shader "Genesis/ScanMeshTrueLines"
                 nointerpolation uint legacyDiagnosticClass : TEXCOORD2;
                 nointerpolation uint diagnosticSupportMask : TEXCOORD3;
                 nointerpolation uint edgeIndex : TEXCOORD4;
+                nointerpolation uint boundaryLineClass : TEXCOORD5;
                 UNITY_VERTEX_OUTPUT_STEREO
             };
+
+            uint BoundaryLineClass(uint sourceIndexPosition0,
+                                   uint sourceIndexPosition1)
+            {
+                uint state0 = _VertexAdmissionClass[
+                    _SurfaceIndices[sourceIndexPosition0] & 0x3FFFFFFFu];
+                uint state1 = _VertexAdmissionClass[
+                    _SurfaceIndices[sourceIndexPosition1] & 0x3FFFFFFFu];
+                bool boundary0 = (state0 & (1u << 27u)) != 0u;
+                bool boundary1 = (state1 & (1u << 27u)) != 0u;
+                if (!boundary0 && !boundary1)
+                    return 0u;
+
+                bool unresolved0 = boundary0 &&
+                    (state0 & (1u << 28u)) == 0u;
+                bool unresolved1 = boundary1 &&
+                    (state1 & (1u << 28u)) == 0u;
+                return unresolved0 || unresolved1 ? 2u : 1u;
+            }
 
             uint LegacyDiagnosticClass(uint triBase)
             {
@@ -154,49 +180,78 @@ Shader "Genesis/ScanMeshTrueLines"
 
                 uint triBase;
                 uint sourceIndexPosition;
+                uint boundarySourceIndexPosition0;
+                uint boundarySourceIndexPosition1;
                 uint diagnosticEdge;
-                if (_RSTrueLineQuadPerimeters > 0.5)
+                if (_RSTrueLineQuadTopology > 0.5)
                 {
                     // InfiniTAM stores one quad as two adjacent triangles. The
                     // repeated first corner distinguishes the two winding layouts.
-                    // Eight output vertices draw four outside edges; the internal
-                    // split diagonal is no longer submitted twice.
-                    uint quadBase = (vertID / 8u) * 6u;
-                    uint perimeterVertex = vertID % 8u;
-                    uint perimeterEdge = perimeterVertex / 2u;
+                    // Ten output vertices draw the four outside edges plus the
+                    // real shared diagonal once instead of twice.
+                    uint quadBase = (vertID / 10u) * 6u;
+                    uint topologyVertex = vertID % 10u;
+                    uint topologyEdge = topologyVertex / 2u;
+                    bool diagonalEdge = topologyEdge == 4u;
                     bool positiveLayout =
                         (_SurfaceIndices[quadBase] & 0x3FFFFFFFu) ==
                         (_SurfaceIndices[quadBase + 3u] & 0x3FFFFFFFu);
                     uint sourceSlot;
                     if (positiveLayout)
                     {
-                        sourceSlot = perimeterVertex == 0u ? 0u :
-                                     perimeterVertex == 1u ? 4u :
-                                     perimeterVertex == 2u ? 4u :
-                                     perimeterVertex == 3u ? 5u :
-                                     perimeterVertex == 4u ? 5u :
-                                     perimeterVertex == 5u ? 2u :
-                                     perimeterVertex == 6u ? 2u : 3u;
-                        triBase = perimeterEdge < 2u
-                            ? quadBase + 3u : quadBase;
-                        diagnosticEdge = perimeterEdge == 0u ? 0u :
-                                         perimeterEdge == 1u ? 1u :
-                                         perimeterEdge == 2u ? 1u : 2u;
+                        sourceSlot = topologyVertex == 0u ? 0u :
+                                     topologyVertex == 1u ? 4u :
+                                     topologyVertex == 2u ? 4u :
+                                     topologyVertex == 3u ? 5u :
+                                     topologyVertex == 4u ? 5u :
+                                     topologyVertex == 5u ? 2u :
+                                     topologyVertex == 6u ? 2u :
+                                     topologyVertex == 7u ? 3u :
+                                     topologyVertex == 8u ? 0u : 1u;
+                        triBase = diagonalEdge || topologyEdge >= 2u
+                            ? quadBase : quadBase + 3u;
+                        diagnosticEdge = diagonalEdge ? 0u :
+                                         topologyEdge == 0u ? 0u :
+                                         topologyEdge == 1u ? 1u :
+                                         topologyEdge == 2u ? 1u : 2u;
+                        uint boundarySlot0 = topologyEdge == 0u ? 0u :
+                                             topologyEdge == 1u ? 4u :
+                                             topologyEdge == 2u ? 5u :
+                                             topologyEdge == 3u ? 2u : 0u;
+                        uint boundarySlot1 = topologyEdge == 0u ? 4u :
+                                             topologyEdge == 1u ? 5u :
+                                             topologyEdge == 2u ? 2u :
+                                             topologyEdge == 3u ? 3u : 1u;
+                        boundarySourceIndexPosition0 = quadBase + boundarySlot0;
+                        boundarySourceIndexPosition1 = quadBase + boundarySlot1;
                     }
                     else
                     {
-                        sourceSlot = perimeterVertex == 0u ? 0u :
-                                     perimeterVertex == 1u ? 1u :
-                                     perimeterVertex == 2u ? 1u :
-                                     perimeterVertex == 3u ? 2u :
-                                     perimeterVertex == 4u ? 2u :
-                                     perimeterVertex == 5u ? 3u :
-                                     perimeterVertex == 6u ? 3u : 4u;
-                        triBase = perimeterEdge < 2u
+                        sourceSlot = topologyVertex == 0u ? 0u :
+                                     topologyVertex == 1u ? 1u :
+                                     topologyVertex == 2u ? 1u :
+                                     topologyVertex == 3u ? 2u :
+                                     topologyVertex == 4u ? 2u :
+                                     topologyVertex == 5u ? 3u :
+                                     topologyVertex == 6u ? 3u :
+                                     topologyVertex == 7u ? 4u :
+                                     topologyVertex == 8u ? 0u : 2u;
+                        triBase = diagonalEdge || topologyEdge < 2u
                             ? quadBase : quadBase + 3u;
-                        diagnosticEdge = perimeterEdge == 0u ? 0u :
-                                         perimeterEdge == 1u ? 1u :
-                                         perimeterEdge == 2u ? 2u : 0u;
+                        diagnosticEdge = diagonalEdge ? 2u :
+                                         topologyEdge == 0u ? 0u :
+                                         topologyEdge == 1u ? 1u :
+                                         topologyEdge == 2u ? 2u : 0u;
+                        uint boundarySlot0 = topologyEdge == 0u ? 0u :
+                                             topologyEdge == 1u ? 1u :
+                                             topologyEdge == 2u ? 2u :
+                                             topologyEdge == 3u ? 3u : 0u;
+                        uint boundarySlot1 = topologyEdge == 0u ? 1u :
+                                             topologyEdge == 1u ? 2u :
+                                             topologyEdge == 2u ? 3u :
+                                             topologyEdge == 3u ? 4u : 2u;
+                        boundarySourceIndexPosition0 = quadBase + boundarySlot0;
+                        boundarySourceIndexPosition1 = quadBase + boundarySlot1;
                     }
                     sourceIndexPosition = quadBase + sourceSlot;
                 }
@@ -211,7 +266,17 @@ Shader "Genesis/ScanMeshTrueLines"
                                         lineVertex == 4u ? 2u : 0u;
                     sourceIndexPosition = triBase + sourceCorner;
                     diagnosticEdge = lineVertex / 2u;
+                    uint edge = lineVertex / 2u;
+                    boundarySourceIndexPosition0 = triBase +
+                        (edge == 0u ? 0u : edge == 1u ? 1u : 2u);
+                    boundarySourceIndexPosition1 = triBase +
+                        (edge == 0u ? 1u : edge == 1u ? 2u : 0u);
                 }
+
+                output.boundaryLineClass = _RSBoundaryUnificationDiagnostic > 0.5
+                    ? BoundaryLineClass(boundarySourceIndexPosition0,
+                                        boundarySourceIndexPosition1)
+                    : 0u;
 
                 uint meshStride = (uint)max(_RSMeshStride, 1.0);
                 if (meshStride > 1u)
@@ -239,25 +304,19 @@ Shader "Genesis/ScanMeshTrueLines"
                 float3 positionWS = _SurfaceVerts[index].pos;
                 output.positionWS = positionWS;
                 output.positionHCS = TransformWorldToHClip(positionWS);
-                // Display-only range budget. Each endpoint is pushed through the
-                // far clip plane rather than to an arbitrary screen corner, so a
-                // short line crossing the range boundary is clipped normally and
-                // cannot turn into a long streak. Reconstruction and the immutable
-                // mesh front remain untouched; approaching the surface makes the
-                // exact same line visible again.
-                float maxDistance = _RSTrueLineMaxViewDistance;
-                if (maxDistance > 0.0)
+                float3 viewDelta = positionWS - _WorldSpaceCameraPos.xyz;
+                float viewDistanceSq = dot(viewDelta, viewDelta);
+                // Keep the visible line just 0.75 mm in front of its own
+                // depth-only shell. Moving along the eye ray changes depth but
+                // not screen position, so it removes angle-dependent self-
+                // occlusion without widening or reshaping the mesh. Genuine
+                // rear sheets remain far behind this sub-millimetre allowance.
+                if (viewDistanceSq > 1e-8)
                 {
-                    float3 viewDelta = positionWS - _WorldSpaceCameraPos.xyz;
-                    if (dot(viewDelta, viewDelta) > maxDistance * maxDistance)
-                    {
-                        #if UNITY_REVERSED_Z
-                            output.positionHCS.z = -output.positionHCS.w;
-                        #else
-                            output.positionHCS.z = output.positionHCS.w * 2.0;
-                        #endif
-                        return output;
-                    }
+                    const float lineDepthBiasMeters = 0.00075;
+                    float3 biasedPositionWS = positionWS - viewDelta *
+                        (lineDepthBiasMeters * rsqrt(viewDistanceSq));
+                    output.positionHCS = TransformWorldToHClip(biasedPositionWS);
                 }
                 output.legacyDiagnosticClass = 12u;
                 output.diagnosticClass = 2u;
@@ -274,7 +333,8 @@ Shader "Genesis/ScanMeshTrueLines"
                     // exclusively by the joint diagnostic view.
                     output.diagnosticClass = _SurfaceIndices[triBase] >> 30u;
                 }
-                else if (_RSSuppressPink > 0.5)
+                else if (_RSSuppressPink > 0.5 &&
+                         _RSBoundaryUnificationDiagnostic < 0.5)
                 {
                     output.legacyDiagnosticClass = LegacyDiagnosticClass(triBase);
                 }
@@ -287,6 +347,7 @@ Shader "Genesis/ScanMeshTrueLines"
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
 
                 if (_RSHeraReplayActive < 0.5 && _RSJointDiagnostic < 0.5 &&
+                    _RSBoundaryUnificationDiagnostic < 0.5 &&
                     _RSSuppressPink > 0.5 && input.legacyDiagnosticClass == 5u)
                     discard;
 
@@ -312,10 +373,21 @@ Shader "Genesis/ScanMeshTrueLines"
                     : _RSJointDiagnostic > 0.5
                         ? half3(0.10, 1.0, 0.25)
                         : _RSExtractionColor.rgb;
-                color = _RSGeometryTruthView > 0.5
-                    ? half3(0.95, 0.95, 0.95)
-                    : ApplyConfidenceViz(color, input.positionWS);
-                return half4(color, _RSExtractionColor.a);
+                if (_RSBoundaryUnificationDiagnostic > 0.5)
+                {
+                    color = input.boundaryLineClass == 2u
+                        ? half3(1.0, 0.04, 0.08)
+                        : input.boundaryLineClass == 1u
+                            ? half3(0.05, 1.0, 0.20)
+                            : half3(0.20, 0.55, 1.0);
+                }
+                else
+                {
+                    color = _RSGeometryTruthView > 0.5
+                        ? half3(1.0, 1.0, 1.0)
+                        : ApplyConfidenceViz(color, input.positionWS);
+                }
+                return half4(color, 1.0);
             }
             ENDHLSL
         }

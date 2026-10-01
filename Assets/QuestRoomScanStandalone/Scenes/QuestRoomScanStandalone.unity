@@ -340,7 +340,7 @@ MonoBehaviour:
   voxelDistance: 0.3
   voxelMin: 0.1
   depthDisparityThreshold: 0.5
-  maxUpdateDist: 5
+  maxUpdateDist: 3
   minUpdateDist: 0.15
   exclusionRadius: 0.35
   maxFrustumPositions: 1000000

@@ -27,6 +27,8 @@
 #pragma kernel InitTemporal
 #pragma kernel ClearCandidateHistory
 #pragma kernel CopyMeshSnapshot
+#pragma kernel CopyCoordinateVertexMap
+#pragma kernel CanonicalizeBoundarySnapshot
 #pragma kernel CopyAdditiveMergePayload
 #pragma kernel AppendNovelMatureTriangles
 #pragma kernel BuildAdditiveMergeArgs
@@ -88,6 +90,10 @@ uint   _FoundationSimplifyEnabled;
 float  _FoundationSimplifyNormalDotMin;
 float  _FoundationSimplifyPlaneResidualVoxels;
 uint   _FoundationVisibleSkirtVoxels;
+uint   _LayerSeparationEnabled;
+float  _LayerSeparationNormalDotMin;
+float  _LayerSeparationDistanceVoxels;
+uint   _GlobalCellOwnershipEnabled;
 uint   _VisualQualityEnabled;
 uint   _CounterCount;
 uint   _StageResponsibilityBase;
@@ -117,8 +123,32 @@ RWStructuredBuffer<uint>      _VertexAdmissionClass;
 RWStructuredBuffer<GPUVertex> _SnapshotVertices;
 RWStructuredBuffer<uint>      _SnapshotIndices;
 RWStructuredBuffer<uint>      _SnapshotAdmissionClass;
+RWStructuredBuffer<int>       _SnapshotCoordVertMap;
 uint _SnapshotVertexCount;
 uint _SnapshotIndexCount;
+uint _SnapshotCoordMapCount;
+uint _SnapshotMarkBoundaryVertices;
+
+// Display-only proof bits for the boundary representative hand-off. They live
+// above the production admission/lifecycle payload and never participate in
+// extraction, topology or publication decisions.
+static const uint kBoundaryCandidateBit = 1u << 27u;
+static const uint kBoundaryCanonicalBit = 1u << 28u;
+
+StructuredBuffer<GPUVertex> _BoundaryOwnerVertices;
+StructuredBuffer<uint> _BoundaryOwnerAdmissionClass;
+StructuredBuffer<int> _BoundaryOwnerCoordVertMap;
+RWStructuredBuffer<GPUVertex> _BoundaryTargetVertices;
+RWStructuredBuffer<uint> _BoundaryTargetAdmissionClass;
+StructuredBuffer<int> _BoundaryTargetCoordVertMap;
+int3 _BoundaryOwnerMapMin;
+uint3 _BoundaryOwnerMapCount;
+int3 _BoundaryTargetMapMin;
+uint3 _BoundaryTargetMapCount;
+int3 _BoundaryCopyMin;
+uint3 _BoundaryCopyCount;
+uint _BoundaryOwnerVertexCount;
+uint _BoundaryTargetVertexCount;
 
 // Conservative partial-publish path.  A spatially destructive candidate is
 // never allowed to rewrite the accepted front buffer.  It may only append
@@ -263,6 +293,20 @@ int MapFlatten(int3 c)
     int3 local = c - _MapMin;
     return local.x + local.y * (int)_MapCount.x +
            local.z * (int)_MapCount.x * (int)_MapCount.y;
+}
+
+bool OwnsGlobalCell(int3 coord)
+{
+    return all(coord >= _CoreMin) && all(coord < _CoreMax);
+}
+
+float3 CanonicalLayerNormal(float3 normal)
+{
+    float3 magnitude = abs(normal);
+    float signValue = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z
+        ? normal.x
+        : (magnitude.y >= magnitude.z ? normal.y : normal.z);
+    return signValue < 0.0 ? -normal : normal;
 }
 
 bool TrySampleObservedSDF(int3 coord, out float value)
@@ -528,6 +572,43 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     uint featureCount1 = 0u;
     bool featureAmbiguous = false;
 
+    // Optional two-sheet resolver. A genuine corner has divergent normals and
+    // remains on the ordinary Surface-Nets path. Only near-parallel crossing
+    // families separated along their common normal are treated as two depth
+    // layers, so a flat wall/floor cannot be averaged into a false middle band.
+    float3 layerReferenceNormal = float3(0.0, 0.0, 0.0);
+    float3 layerPositionSum0 = float3(0.0, 0.0, 0.0);
+    float3 layerPositionSum1 = float3(0.0, 0.0, 0.0);
+    float3 layerNormalSum0 = float3(0.0, 0.0, 0.0);
+    float3 layerNormalSum1 = float3(0.0, 0.0, 0.0);
+    float layerOffsetSum0 = 0.0;
+    float layerOffsetSum1 = 0.0;
+    float layerSupport0 = 0.0;
+    float layerSupport1 = 0.0;
+    uint layerCount0 = 0u;
+    uint layerCount1 = 0u;
+    bool layerReferenceReady = false;
+    bool layerSplitEligible = _LayerSeparationEnabled != 0u;
+    bool layerThirdFamily = false;
+    float layerCornerSdf[8];
+    if (_LayerSeparationEnabled != 0u)
+    {
+        // The product route is native stride-1. Cache its eight corner samples
+        // once, then derive a trilinear gradient for every crossing without
+        // adding seven texture reads per crossing.
+        if (cellStride != 1)
+            layerSplitEligible = false;
+        [unroll]
+        for (uint layerCorner = 0u; layerCorner < 8u; layerCorner++)
+        {
+            float cornerValue;
+            bool cornerObserved = TrySampleObservedSDF(
+                coord + kCornerOffs[layerCorner], cornerValue);
+            layerCornerSdf[layerCorner] = cornerValue;
+            layerSplitEligible = layerSplitEligible && cornerObserved;
+        }
+    }
+
     [unroll]
     for (uint e = 0; e < 12; e++)
     {
@@ -612,6 +693,121 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             float3 crossingPosition = (float3)cA + t * (float3)(cB - cA);
             posCoord += crossingPosition;
             numCrossings++;
+
+            if (_LayerSeparationEnabled != 0u)
+            {
+                float3 localCrossing = saturate(crossingPosition - (float3)coord);
+                float dx0 = lerp(layerCornerSdf[1] - layerCornerSdf[0],
+                                 layerCornerSdf[5] - layerCornerSdf[4],
+                                 localCrossing.y);
+                float dx1 = lerp(layerCornerSdf[2] - layerCornerSdf[3],
+                                 layerCornerSdf[6] - layerCornerSdf[7],
+                                 localCrossing.y);
+                float dy0 = lerp(layerCornerSdf[4] - layerCornerSdf[0],
+                                 layerCornerSdf[5] - layerCornerSdf[1],
+                                 localCrossing.x);
+                float dy1 = lerp(layerCornerSdf[7] - layerCornerSdf[3],
+                                 layerCornerSdf[6] - layerCornerSdf[2],
+                                 localCrossing.x);
+                float dz0 = lerp(layerCornerSdf[3] - layerCornerSdf[0],
+                                 layerCornerSdf[2] - layerCornerSdf[1],
+                                 localCrossing.x);
+                float dz1 = lerp(layerCornerSdf[7] - layerCornerSdf[4],
+                                 layerCornerSdf[6] - layerCornerSdf[5],
+                                 localCrossing.x);
+                float3 crossingGradient = float3(
+                    lerp(dx0, dx1, localCrossing.z),
+                    lerp(dy0, dy1, localCrossing.z),
+                    lerp(dz0, dz1, localCrossing.y));
+                float gradientLengthSq = dot(crossingGradient, crossingGradient);
+                if (!layerSplitEligible || gradientLengthSq <= 1e-6)
+                {
+                    // Missing gradient evidence must never invent a layer
+                    // split. Fall back to the unchanged SN average.
+                    layerSplitEligible = false;
+                }
+                else
+                {
+                    float3 crossingLayerNormal = crossingGradient *
+                        rsqrt(gradientLengthSq);
+                    crossingLayerNormal = CanonicalLayerNormal(crossingLayerNormal);
+                    if (!layerReferenceReady)
+                    {
+                        layerReferenceNormal = crossingLayerNormal;
+                        layerReferenceReady = true;
+                    }
+
+                    float normalAlignment = dot(crossingLayerNormal,
+                                                layerReferenceNormal);
+                    if (normalAlignment < _LayerSeparationNormalDotMin)
+                    {
+                        // Differing normal families describe a corner or
+                        // curvature, not two parallel sheets.
+                        layerSplitEligible = false;
+                    }
+                    else
+                    {
+                        float layerOffset = dot(crossingPosition,
+                                                layerReferenceNormal);
+                        float crossingSupport = min(abs(sA.y), abs(sB.y));
+                        if (layerCount0 == 0u)
+                        {
+                            layerPositionSum0 = crossingPosition;
+                            layerNormalSum0 = crossingLayerNormal;
+                            layerOffsetSum0 = layerOffset;
+                            layerSupport0 = crossingSupport;
+                            layerCount0 = 1u;
+                        }
+                        else
+                        {
+                            float meanOffset0 = layerOffsetSum0 / (float)layerCount0;
+                            float distance0 = abs(layerOffset - meanOffset0);
+                            if (distance0 <= _LayerSeparationDistanceVoxels)
+                            {
+                                layerPositionSum0 += crossingPosition;
+                                layerNormalSum0 += crossingLayerNormal;
+                                layerOffsetSum0 += layerOffset;
+                                layerSupport0 += crossingSupport;
+                                layerCount0++;
+                            }
+                            else if (layerCount1 == 0u)
+                            {
+                                layerPositionSum1 = crossingPosition;
+                                layerNormalSum1 = crossingLayerNormal;
+                                layerOffsetSum1 = layerOffset;
+                                layerSupport1 = crossingSupport;
+                                layerCount1 = 1u;
+                            }
+                            else
+                            {
+                                float meanOffset1 = layerOffsetSum1 / (float)layerCount1;
+                                float distance1 = abs(layerOffset - meanOffset1);
+                                if (min(distance0, distance1) >
+                                    _LayerSeparationDistanceVoxels)
+                                {
+                                    layerThirdFamily = true;
+                                }
+                                else if (distance0 <= distance1)
+                                {
+                                    layerPositionSum0 += crossingPosition;
+                                    layerNormalSum0 += crossingLayerNormal;
+                                    layerOffsetSum0 += layerOffset;
+                                    layerSupport0 += crossingSupport;
+                                    layerCount0++;
+                                }
+                                else
+                                {
+                                    layerPositionSum1 += crossingPosition;
+                                    layerNormalSum1 += crossingLayerNormal;
+                                    layerOffsetSum1 += layerOffset;
+                                    layerSupport1 += crossingSupport;
+                                    layerCount1++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (stageResponsibilityCell)
             {
                 int3 q = (int3)round(clamp(
@@ -719,6 +915,45 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     {
         _CoordVertMap[flatIdx] = -1;
         return;
+    }
+
+    if (_LayerSeparationEnabled != 0u && layerSplitEligible &&
+        layerReferenceReady && layerCount0 > 0u && layerCount1 > 0u)
+    {
+        float meanOffset0 = layerOffsetSum0 / (float)layerCount0;
+        float meanOffset1 = layerOffsetSum1 / (float)layerCount1;
+        bool separated = abs(meanOffset0 - meanOffset1) >
+                         _LayerSeparationDistanceVoxels;
+        if (separated)
+        {
+            // Three distinct parallel sheets cannot be resolved safely inside
+            // one cell. A temporary hole is preferable to a false bridge.
+            if (layerThirdFamily)
+            {
+                _CoordVertMap[flatIdx] = -1;
+                return;
+            }
+
+            // Stronger observation support wins. Crossing count is the first
+            // tie-break, then accumulated TSDF weight. The final canonical
+            // offset tie-break is global and deterministic, so neighbouring
+            // blocks cannot choose opposite sheets merely from dispatch order.
+            bool chooseLayer1 = layerCount1 > layerCount0 ||
+                (layerCount1 == layerCount0 && layerSupport1 > layerSupport0 + 1e-5) ||
+                (layerCount1 == layerCount0 &&
+                 abs(layerSupport1 - layerSupport0) <= 1e-5 &&
+                 meanOffset1 < meanOffset0);
+            uint selectedCount = chooseLayer1 ? layerCount1 : layerCount0;
+            if (selectedCount < 3u)
+            {
+                _CoordVertMap[flatIdx] = -1;
+                return;
+            }
+
+            posCoord = chooseLayer1 ? layerPositionSum1 : layerPositionSum0;
+            gradDir = chooseLayer1 ? layerNormalSum1 : layerNormalSum0;
+            numCrossings = selectedCount;
+        }
     }
 
     posCoord /= (float)numCrossings;
@@ -1831,6 +2066,11 @@ void AuditVisualTriangle(uint index0, uint index1, uint index2, int3 ownerCoord,
 
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
+    // Halo cells are read-only witnesses. Every global cell has exactly one
+    // core owner, and only that owner may publish its quad.
+    if (_GlobalCellOwnershipEnabled != 0u && !OwnsGlobalCell(coord))
+        return;
+
     int topologyStride = _FoundationTopologyMode != 0u
         ? max((int)_FoundationCellStride, 1)
         : 1;
@@ -1898,6 +2138,53 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
         a >= (int)_MaxVertices || b >= (int)_MaxVertices ||
         c >= (int)_MaxVertices || d >= (int)_MaxVertices)
         return;
+
+    if (_LayerSeparationEnabled != 0u)
+    {
+        float3 normalA = normalize(_Vertices[(uint)a].norm);
+        float3 normalB = normalize(_Vertices[(uint)b].norm);
+        float3 normalC = normalize(_Vertices[(uint)c].norm);
+        float3 normalD = normalize(_Vertices[(uint)d].norm);
+        float alignmentB = abs(dot(normalA, normalB));
+        float alignmentC = abs(dot(normalA, normalC));
+        float alignmentD = abs(dot(normalA, normalD));
+
+        // Only judge sheet continuity when all four representatives describe
+        // one nearly planar family. Corners and real curvature keep the
+        // ordinary Surface-Nets connection rule.
+        if (alignmentB >= _LayerSeparationNormalDotMin &&
+            alignmentC >= _LayerSeparationNormalDotMin &&
+            alignmentD >= _LayerSeparationNormalDotMin)
+        {
+            normalB = dot(normalA, normalB) < 0.0 ? -normalB : normalB;
+            normalC = dot(normalA, normalC) < 0.0 ? -normalC : normalC;
+            normalD = dot(normalA, normalD) < 0.0 ? -normalD : normalD;
+            float3 sharedNormal = normalize(normalA + normalB + normalC + normalD);
+            float offsetA = dot(_Vertices[(uint)a].pos, sharedNormal);
+            float offsetB = dot(_Vertices[(uint)b].pos, sharedNormal);
+            float offsetC = dot(_Vertices[(uint)c].pos, sharedNormal);
+            float offsetD = dot(_Vertices[(uint)d].pos, sharedNormal);
+            float minOffset = min(min(offsetA, offsetB), min(offsetC, offsetD));
+            float maxOffset = max(max(offsetA, offsetB), max(offsetC, offsetD));
+            float layerDistanceMeters =
+                _LayerSeparationDistanceVoxels * _VoxSize;
+            if (maxOffset - minOffset > layerDistanceMeters)
+                return;
+
+            // The sign-changing TSDF edge owns this quad. It must cross the
+            // same plane selected by the four representatives; otherwise the
+            // edge belongs to the discarded parallel sheet and would recreate
+            // the very bridge the per-cell resolver removed.
+            float edgeT = va / (va - vb);
+            float3 edgeCrossingWorld = VoxelCoordToWorld(
+                (float3)coord + edgeT * (float3)topologyAxis);
+            float representativeOffset =
+                0.25 * (offsetA + offsetB + offsetC + offsetD);
+            if (abs(dot(edgeCrossingWorld, sharedNormal) -
+                    representativeOffset) > layerDistanceMeters)
+                return;
+        }
+    }
 
     uint pa = _VertexAdmissionClass[(uint)a];
     uint pb = _VertexAdmissionClass[(uint)b];
@@ -2176,13 +2463,21 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
 
-    // Product pages may retain a one-voxel overlap from the read halo.  This is
-    // a visible block skirt, not new evidence: both pages sample the same TSDF
-    // and neither overlap is ever fed back into fusion or adjudication.
-    int skirt = (int)min(_FoundationVisibleSkirtVoxels, 1u);
-    int3 emitMin = max(_CoreMin - skirt, _MapMin);
-    int3 emitMax = min(_CoreMax + skirt, _MapMin + (int3)_MapCount);
-    if (any(coord < emitMin) || any(coord >= emitMax)) return;
+    if (_GlobalCellOwnershipEnabled != 0u)
+    {
+        // A halo may reproduce the owner's representative for local
+        // connectivity, but it must never publish topology.
+        if (!OwnsGlobalCell(coord)) return;
+    }
+    else
+    {
+        // Preserve the legacy/fallback skirt contract outside the InfiniTAM
+        // product route.
+        int skirt = (int)min(_FoundationVisibleSkirtVoxels, 1u);
+        int3 emitMin = max(_CoreMin - skirt, _MapMin);
+        int3 emitMax = min(_CoreMax + skirt, _MapMin + (int3)_MapCount);
+        if (any(coord < emitMin) || any(coord >= emitMax)) return;
+    }
 
     TryEmitQuad(coord, int3(1,0,0), int3(0,0,1), int3(0,1,0), 0u);
     TryEmitQuad(coord, int3(0,1,0), int3(1,0,0), int3(0,0,1), 1u);
@@ -2219,11 +2514,72 @@ void CopyMeshSnapshot(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < _SnapshotVertexCount)
     {
-        _SnapshotVertices[id.x] = _Vertices[id.x];
-        _SnapshotAdmissionClass[id.x] = _VertexAdmissionClass[id.x];
+        GPUVertex vertex = _Vertices[id.x];
+        _SnapshotVertices[id.x] = vertex;
+        uint snapshotClass = _VertexAdmissionClass[id.x] &
+                             ~(kBoundaryCandidateBit | kBoundaryCanonicalBit);
+        if (_SnapshotMarkBoundaryVertices != 0u)
+        {
+            int3 coord = Unflatten((int)vertex.voxelFlatIdx);
+            bool haloDuplicate = any(coord < _CoreMin) || any(coord >= _CoreMax);
+            if (haloDuplicate)
+                snapshotClass |= kBoundaryCandidateBit;
+        }
+        _SnapshotAdmissionClass[id.x] = snapshotClass;
     }
     if (id.x < _SnapshotIndexCount)
         _SnapshotIndices[id.x] = _Indices[id.x];
+}
+
+[numthreads(64, 1, 1)]
+void CopyCoordinateVertexMap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _SnapshotCoordMapCount)
+        _SnapshotCoordVertMap[id.x] = _CoordVertMap[id.x];
+}
+
+int BoundaryMapFlatten(int3 coord, int3 mapMin, uint3 mapCount)
+{
+    int3 local = coord - mapMin;
+    return local.x + local.y * (int)mapCount.x +
+           local.z * (int)mapCount.x * (int)mapCount.y;
+}
+
+// Copies the canonical owner's already-extracted representative into the
+// publishing candidate's halo duplicate. Core vertices are never overwritten:
+// each global cell still has exactly one positional authority.
+[numthreads(64, 1, 1)]
+void CanonicalizeBoundarySnapshot(uint3 id : SV_DispatchThreadID)
+{
+    uint copyCount = _BoundaryCopyCount.x * _BoundaryCopyCount.y *
+                     _BoundaryCopyCount.z;
+    if (id.x >= copyCount || copyCount == 0u)
+        return;
+
+    uint slice = _BoundaryCopyCount.x * _BoundaryCopyCount.y;
+    uint z = id.x / slice;
+    uint rem = id.x - z * slice;
+    uint y = rem / _BoundaryCopyCount.x;
+    uint x = rem - y * _BoundaryCopyCount.x;
+    int3 coord = _BoundaryCopyMin + int3((int)x, (int)y, (int)z);
+
+    int ownerMapIndex = BoundaryMapFlatten(coord,
+        _BoundaryOwnerMapMin, _BoundaryOwnerMapCount);
+    int targetMapIndex = BoundaryMapFlatten(coord,
+        _BoundaryTargetMapMin, _BoundaryTargetMapCount);
+    int ownerVertex = _BoundaryOwnerCoordVertMap[ownerMapIndex];
+    int targetVertex = _BoundaryTargetCoordVertMap[targetMapIndex];
+    if (ownerVertex < 0 || targetVertex < 0 ||
+        (uint)ownerVertex >= _BoundaryOwnerVertexCount ||
+        (uint)targetVertex >= _BoundaryTargetVertexCount)
+        return;
+
+    _BoundaryTargetVertices[targetVertex] =
+        _BoundaryOwnerVertices[ownerVertex];
+    uint ownerClass = _BoundaryOwnerAdmissionClass[ownerVertex] &
+                      ~(kBoundaryCandidateBit | kBoundaryCanonicalBit);
+    _BoundaryTargetAdmissionClass[targetVertex] = ownerClass |
+        kBoundaryCandidateBit | kBoundaryCanonicalBit;
 }
 
 // Copies the immutable accepted mesh and the current candidate into disjoint

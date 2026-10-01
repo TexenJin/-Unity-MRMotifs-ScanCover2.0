@@ -22,6 +22,8 @@ namespace Genesis.RoomScan
             public int3 CoreMax;
             public int3 MapMin;
             public int3 MapCount;
+            public Bounds ActivityBounds;
+            public bool Active = true;
             public uint TargetEpoch;
             public uint ProcessedEpoch;
             public uint LastOwnerEpoch;
@@ -79,7 +81,38 @@ namespace Genesis.RoomScan
         private readonly float _dirtyReadbackHz;
         private readonly float _vertexBudgetPercent;
         private readonly Action<GPUSurfaceNets> _extract;
+        private readonly int _canonicalizeBoundaryKernel;
         private readonly List<Block> _blocks = new List<Block>();
+        private readonly List<int> _reactivatedBlocks = new List<int>();
+
+        private static readonly int ID_BoundaryOwnerVertices =
+            Shader.PropertyToID("_BoundaryOwnerVertices");
+        private static readonly int ID_BoundaryOwnerAdmissionClass =
+            Shader.PropertyToID("_BoundaryOwnerAdmissionClass");
+        private static readonly int ID_BoundaryOwnerCoordVertMap =
+            Shader.PropertyToID("_BoundaryOwnerCoordVertMap");
+        private static readonly int ID_BoundaryTargetVertices =
+            Shader.PropertyToID("_BoundaryTargetVertices");
+        private static readonly int ID_BoundaryTargetAdmissionClass =
+            Shader.PropertyToID("_BoundaryTargetAdmissionClass");
+        private static readonly int ID_BoundaryTargetCoordVertMap =
+            Shader.PropertyToID("_BoundaryTargetCoordVertMap");
+        private static readonly int ID_BoundaryOwnerMapMin =
+            Shader.PropertyToID("_BoundaryOwnerMapMin");
+        private static readonly int ID_BoundaryOwnerMapCount =
+            Shader.PropertyToID("_BoundaryOwnerMapCount");
+        private static readonly int ID_BoundaryTargetMapMin =
+            Shader.PropertyToID("_BoundaryTargetMapMin");
+        private static readonly int ID_BoundaryTargetMapCount =
+            Shader.PropertyToID("_BoundaryTargetMapCount");
+        private static readonly int ID_BoundaryCopyMin =
+            Shader.PropertyToID("_BoundaryCopyMin");
+        private static readonly int ID_BoundaryCopyCount =
+            Shader.PropertyToID("_BoundaryCopyCount");
+        private static readonly int ID_BoundaryOwnerVertexCount =
+            Shader.PropertyToID("_BoundaryOwnerVertexCount");
+        private static readonly int ID_BoundaryTargetVertexCount =
+            Shader.PropertyToID("_BoundaryTargetVertexCount");
 
         private int3 _blockCount;
         private int _generation;
@@ -89,11 +122,27 @@ namespace Genesis.RoomScan
         private int _stagedBlockCount;
         private int _nextBatchSerial;
         private int _nextPublishVisitSerial;
+        private int _initialBoundaryCanonicalizationCursor;
         private long _acceptedCommitCount;
         private long _completedBatchCount;
         private long _publishedBatchCount;
         private long _dirtyLedgerApplyCount;
         private long _staleCandidateDiscardCount;
+        // Read-only extraction receipt. These values are accumulated directly
+        // from the GPU counter buffer before an empty candidate can be cleared
+        // by publication, so a zero front can be separated into "no vertices"
+        // and "vertices but no publishable triangles" without changing any
+        // production admission, topology or scheduling decision.
+        private long _rawReadbackCount;
+        private long _rawReadbackErrorCount;
+        private long _rawVertexCount;
+        private long _rawIndexCount;
+        private long _rawRejectedUnknownEdgeCount;
+        private long _rawCrossingCellWithUnknownEdgesCount;
+        private long _rawRejectedUnknownQuadCount;
+        private long _rawStrictEmittedCellCount;
+        private long _rawZeroVertexReadbackCount;
+        private long _rawVerticesWithoutIndicesReadbackCount;
         private bool _disposed;
         private bool _visible;
         private bool _readbackPending;
@@ -111,6 +160,12 @@ namespace Genesis.RoomScan
         // arrivals are idempotent block flags that accumulate for the next
         // batch; they are never appended as historical jobs.
         private const float BatchWatchdogSeconds = 10f;
+        // New TSDF writes and extraction debt stop at 3 m. Published fronts
+        // remain resident and visible outside the active band; the slightly
+        // wider exit radius prevents ordinary head motion from repeatedly
+        // enqueueing/dequeueing work at the exact production boundary.
+        private const float ActiveEnterDistanceMeters = 3f;
+        private const float ActiveExitDistanceMeters = 3.2f;
         // Isolated A/B switch: keep the authoritative TSDF at 5 cm, but let
         // the InfiniTAM extractor build one vertex per globally anchored
         // 2x2x2 cell (10 cm topology).  No shader grid, corner treatment,
@@ -142,6 +197,18 @@ namespace Genesis.RoomScan
         public bool BatchInFlight => _activeBatch != null;
         public long DirtyLedgerApplyCount => _dirtyLedgerApplyCount;
         public long StaleCandidateDiscardCount => _staleCandidateDiscardCount;
+        public long RawReadbackCount => _rawReadbackCount;
+        public long RawReadbackErrorCount => _rawReadbackErrorCount;
+        public long RawVertexCount => _rawVertexCount;
+        public long RawIndexCount => _rawIndexCount;
+        public long RawRejectedUnknownEdgeCount => _rawRejectedUnknownEdgeCount;
+        public long RawCrossingCellWithUnknownEdgesCount =>
+            _rawCrossingCellWithUnknownEdgesCount;
+        public long RawRejectedUnknownQuadCount => _rawRejectedUnknownQuadCount;
+        public long RawStrictEmittedCellCount => _rawStrictEmittedCellCount;
+        public long RawZeroVertexReadbackCount => _rawZeroVertexReadbackCount;
+        public long RawVerticesWithoutIndicesReadbackCount =>
+            _rawVerticesWithoutIndicesReadbackCount;
 
         public int OutstandingBlockCount
         {
@@ -151,8 +218,9 @@ namespace Genesis.RoomScan
                 for (int i = 0; i < _blocks.Count; i++)
                 {
                     Block block = _blocks[i];
-                    if (block.Queued || block.CommitPending || block.HasStagedCandidate ||
-                        block.TargetEpoch > block.ProcessedEpoch)
+                    if (block.Active &&
+                        (block.Queued || block.CommitPending || block.HasStagedCandidate ||
+                         block.TargetEpoch > block.ProcessedEpoch))
                         count++;
                 }
                 return count;
@@ -187,7 +255,7 @@ namespace Genesis.RoomScan
                 for (int i = 0; i < _blocks.Count; i++)
                 {
                     Block block = _blocks[i];
-                    if (block.TargetEpoch > block.ProcessedEpoch)
+                    if (block.Active && block.TargetEpoch > block.ProcessedEpoch)
                         debt += (ulong)(block.TargetEpoch - block.ProcessedEpoch);
                 }
                 return debt;
@@ -200,7 +268,8 @@ namespace Genesis.RoomScan
             {
                 int count = 0;
                 for (int i = 0; i < _blocks.Count; i++)
-                    if (_blocks[i].Built && _blocks[i].IndexCount > 0)
+                    if (_blocks[i].Built && _blocks[i].Front != null &&
+                        _blocks[i].IndexCount > 0)
                         count++;
                 return count;
             }
@@ -280,6 +349,8 @@ namespace Genesis.RoomScan
             _dirtyReadbackHz = Mathf.Max(0.5f, dirtyReadbackHz);
             _vertexBudgetPercent = Mathf.Clamp(vertexBudgetPercent, 0.01f, 0.5f);
             _extract = extract ?? throw new ArgumentNullException(nameof(extract));
+            _canonicalizeBoundaryKernel =
+                _compute.FindKernel("CanonicalizeBoundarySnapshot");
 
             _volume.SetDirtyBoundaryHalo(_haloVoxels);
             BuildLayout();
@@ -292,6 +363,7 @@ namespace Genesis.RoomScan
             if (_disposed || Failed)
                 return;
 
+            UpdateActiveBlocks();
             RequestDirtyLedgerIfDue();
 
             // Counter readback completion only makes a batch eligible for
@@ -303,6 +375,12 @@ namespace Genesis.RoomScan
             if (_activeBatch != null && _activeBatch.Remaining == 0)
             {
                 CommitReadyBatch(_activeBatch);
+                return;
+            }
+
+            if (!InitialBuildComplete && _firstLedgerApplied &&
+                AllBlocksHaveInitialFront())
+            {
                 TryFinishInitialBuild();
                 return;
             }
@@ -325,6 +403,102 @@ namespace Genesis.RoomScan
             ApplyVisibility();
         }
 
+        private void UpdateActiveBlocks()
+        {
+            Camera activityCamera = Camera.main;
+            if (activityCamera == null)
+                return;
+
+            Vector3 cameraPosition = activityCamera.transform.position;
+            bool visibilityChanged = false;
+            _reactivatedBlocks.Clear();
+            for (int i = 0; i < _blocks.Count; i++)
+            {
+                Block block = _blocks[i];
+                float limit = block.Active
+                    ? ActiveExitDistanceMeters
+                    : ActiveEnterDistanceMeters;
+                bool active = block.ActivityBounds.SqrDistance(cameraPosition) <=
+                              limit * limit;
+                if (active == block.Active)
+                    continue;
+
+                block.Active = active;
+                visibilityChanged = true;
+                if (active)
+                {
+                    _reactivatedBlocks.Add(i);
+                    continue;
+                }
+
+                if (block.Queued)
+                {
+                    block.Queued = false;
+                    _queuedBlockCount = Mathf.Max(0, _queuedBlockCount - 1);
+                }
+                DeferInactiveBoundaryRequirements(block);
+            }
+
+            // Perform reactivation after every block has its new state so a
+            // face is latched only when both sides are inside the active band.
+            for (int i = 0; i < _reactivatedBlocks.Count; i++)
+            {
+                Block block = _blocks[_reactivatedBlocks[i]];
+                if (block.TargetEpoch > block.ProcessedEpoch)
+                    QueueBlock(block.Index, block.TargetEpoch, true);
+                RelatchActiveBoundaryRequirements(block);
+            }
+
+            if (visibilityChanged)
+                ApplyVisibility();
+        }
+
+        private void DeferInactiveBoundaryRequirements(Block block)
+        {
+            for (int face = 0; face < FaceNeighbours.Length; face++)
+            {
+                int3 neighbourCoordinate = block.Coordinate + FaceNeighbours[face];
+                if (math.any(neighbourCoordinate < 0) ||
+                    math.any(neighbourCoordinate >= _blockCount))
+                    continue;
+
+                Block neighbour = _blocks[Flatten(neighbourCoordinate)];
+                int oppositeFace = face ^ 1;
+                uint latest = math.max(
+                    math.max(block.LatestBoundaryEpoch[face],
+                        neighbour.LatestBoundaryEpoch[oppositeFace]),
+                    math.max(block.RequiredBoundaryEpoch[face],
+                        neighbour.RequiredBoundaryEpoch[oppositeFace]));
+                block.LatestBoundaryEpoch[face] = latest;
+                neighbour.LatestBoundaryEpoch[oppositeFace] = latest;
+                block.RequiredBoundaryEpoch[face] = 0;
+                neighbour.RequiredBoundaryEpoch[oppositeFace] = 0;
+            }
+        }
+
+        private void RelatchActiveBoundaryRequirements(Block block)
+        {
+            for (int face = 0; face < FaceNeighbours.Length; face++)
+            {
+                int3 neighbourCoordinate = block.Coordinate + FaceNeighbours[face];
+                if (math.any(neighbourCoordinate < 0) ||
+                    math.any(neighbourCoordinate >= _blockCount))
+                    continue;
+
+                Block neighbour = _blocks[Flatten(neighbourCoordinate)];
+                if (!neighbour.Active)
+                    continue;
+                int oppositeFace = face ^ 1;
+                uint latest = math.max(block.LatestBoundaryEpoch[face],
+                    neighbour.LatestBoundaryEpoch[oppositeFace]);
+                if (latest == 0 ||
+                    (block.ProcessedEpoch >= latest &&
+                     neighbour.ProcessedEpoch >= latest))
+                    continue;
+                RegisterBoundaryPair(block, face, neighbour, latest);
+            }
+        }
+
         private void BuildLayout()
         {
             int chunkSize = _volume.ExtractionChunkSize;
@@ -341,6 +515,10 @@ namespace Genesis.RoomScan
                 int3 coreMax = math.min(coreMin + chunkSize, voxels - 1);
                 int3 mapMin = math.max(coreMin - _haloVoxels, 0);
                 int3 mapMax = math.min(coreMax + _haloVoxels + 1, voxels);
+                float3 boundsMin = ((float3)mapMin - (float3)voxels * 0.5f) *
+                                   _volume.VoxelSize;
+                float3 boundsMax = ((float3)mapMax - (float3)voxels * 0.5f) *
+                                   _volume.VoxelSize;
                 _blocks.Add(new Block
                 {
                     Index = Flatten(coordinate),
@@ -348,7 +526,10 @@ namespace Genesis.RoomScan
                     CoreMin = coreMin,
                     CoreMax = coreMax,
                     MapMin = mapMin,
-                    MapCount = mapMax - mapMin
+                    MapCount = mapMax - mapMin,
+                    ActivityBounds = new Bounds(
+                        (Vector3)((boundsMin + boundsMax) * 0.5f),
+                        (Vector3)(boundsMax - boundsMin))
                 });
             }
         }
@@ -382,6 +563,17 @@ namespace Genesis.RoomScan
                 FoundationChamferWidthVoxels = 0f,
                 FoundationConstrainedSimplification = false,
                 FoundationVisibleSkirtVoxels = 0,
+                // Keep the independently published block route on the proven
+                // a2cf0bec extraction contract. The experimental two-sheet
+                // resolver and the second, shader-side ownership gate were not
+                // independently validated without the global bootstrap mesh.
+                // CoreMin/CoreMax already give every emitted face one block
+                // owner; boundary representative canonicalisation remains a
+                // separate post-extraction operation.
+                LayerSeparationEnabled = false,
+                LayerSeparationNormalDotMin = 0.9063078f,
+                LayerSeparationDistanceVoxels = 0.45f,
+                GlobalCellOwnershipEnabled = false,
                 VisualQualityDiagnosticsEnabled = false,
                 DiagnosticRoiEnabled = false
             };
@@ -400,7 +592,8 @@ namespace Genesis.RoomScan
             block.Renderer.SetJointDiagnosticDisplay(false);
             block.Renderer.SetTemporalIllegalCandidateActive(false);
             block.Renderer.SetProductGridDisplay(false);
-            block.Renderer.SetTrueLineQuadPerimeters(true);
+            block.Renderer.SetTrueLineQuadTopology(true);
+            block.Renderer.SetBoundaryUnificationDiagnostic(true);
             block.Renderer.SetPinkIsolation(true);
             block.Renderer.RenderVisible = false;
         }
@@ -473,6 +666,7 @@ namespace Genesis.RoomScan
                 if (request.hasError)
                 {
                     item.Failed = true;
+                    _rawReadbackErrorCount++;
                 }
                 else
                 {
@@ -481,6 +675,22 @@ namespace Genesis.RoomScan
                         ? Mathf.Max(0, (int)counters[0]) : 0;
                     item.IndexCount = counters.Length > 1
                         ? Mathf.Max(0, (int)counters[1]) : 0;
+
+                    _rawReadbackCount++;
+                    _rawVertexCount += item.VertexCount;
+                    _rawIndexCount += item.IndexCount;
+                    if (counters.Length > 2)
+                        _rawRejectedUnknownEdgeCount += counters[2];
+                    if (counters.Length > 3)
+                        _rawCrossingCellWithUnknownEdgesCount += counters[3];
+                    if (counters.Length > 4)
+                        _rawRejectedUnknownQuadCount += counters[4];
+                    if (counters.Length > 5)
+                        _rawStrictEmittedCellCount += counters[5];
+                    if (item.VertexCount == 0)
+                        _rawZeroVertexReadbackCount++;
+                    else if (item.IndexCount < 3)
+                        _rawVerticesWithoutIndicesReadbackCount++;
                 }
 
                 item.Completed = true;
@@ -509,7 +719,8 @@ namespace Genesis.RoomScan
                     block.Back ??= new GPUChunkMeshSnapshot();
                     if (item.VertexCount > 0 && item.IndexCount >= 3)
                         block.Surface.CopyCurrentMeshTo(block.Back,
-                            item.VertexCount, item.IndexCount);
+                            item.VertexCount, item.IndexCount,
+                            includeCoordinateVertexMap: true);
                     else
                         block.Back.Clear();
                 }
@@ -621,6 +832,7 @@ namespace Genesis.RoomScan
                     if (!_blocks[i].HasStagedCandidate ||
                         !TryCollectReadyPublishComponent(i))
                         continue;
+                    CanonicalizeCollectedComponentBoundaries();
                     published += PublishCollectedComponent();
                     madeProgress = true;
                     break;
@@ -672,7 +884,22 @@ namespace Genesis.RoomScan
                         return false;
                     if (!neighbourReady && (!neighbour.HasStagedCandidate ||
                         neighbour.StagedEpoch < requiredEpoch))
+                    {
+                        // Cold start may publish the first immutable block
+                        // before an unbuilt neighbour has its own Front. The
+                        // boundary requirement remains latched, so that
+                        // neighbour is still extracted; when it publishes,
+                        // CanonicalizeTargetHalo copies the already-visible
+                        // owner's representative into its halo. This shortens
+                        // first-blue latency without relaxing steady-state
+                        // atomic seam updates between two established fronts.
+                        bool neighbourHasNoInitialFront =
+                            !InitialBuildComplete && !neighbour.Built &&
+                            neighbour.Front == null;
+                        if (neighbourHasNoInitialFront)
+                            continue;
                         return false;
+                    }
 
                     // If the already-ready side also has a newer staged front,
                     // include it in the same visible swap rather than letting it
@@ -685,6 +912,120 @@ namespace Genesis.RoomScan
                 }
             }
             return true;
+        }
+
+        private void CanonicalizeCollectedComponentBoundaries()
+        {
+            if (_publishComponent.Count == 0)
+                return;
+
+            int visitSerial = _blocks[_publishComponent[0]].PublishVisitSerial;
+            for (int i = 0; i < _publishComponent.Count; i++)
+            {
+                Block target = _blocks[_publishComponent[i]];
+                if (!target.HasStagedCandidate || target.Back == null)
+                    continue;
+                CanonicalizeTargetHalo(target, target.Back, visitSerial,
+                    useStagedComponentSources: true);
+            }
+        }
+
+        private void CanonicalizeTargetHalo(Block target,
+            GPUChunkMeshSnapshot targetSnapshot, int visitSerial,
+            bool useStagedComponentSources)
+        {
+            if (!CanCanonicalize(targetSnapshot))
+                return;
+
+            // A boundary quad can reference face, edge or corner halo cells.
+            // Visit all 26 neighbouring owner blocks, not only the six faces.
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0 && dz == 0)
+                    continue;
+                int3 ownerCoordinate = target.Coordinate + new int3(dx, dy, dz);
+                if (math.any(ownerCoordinate < 0) ||
+                    math.any(ownerCoordinate >= _blockCount))
+                    continue;
+
+                Block owner = _blocks[Flatten(ownerCoordinate)];
+                GPUChunkMeshSnapshot ownerSnapshot =
+                    useStagedComponentSources && owner.HasStagedCandidate &&
+                    owner.PublishVisitSerial == visitSerial
+                        ? owner.Back
+                        : owner.Front;
+                if (!CanCanonicalize(ownerSnapshot))
+                    continue;
+
+                DispatchBoundaryCanonicalization(owner, ownerSnapshot,
+                    targetSnapshot);
+            }
+        }
+
+        private static bool CanCanonicalize(GPUChunkMeshSnapshot snapshot)
+        {
+            return snapshot != null && snapshot.HasCoordinateVertexMap &&
+                   snapshot.KnownVertexCount > 0 &&
+                   snapshot.VertexBuffer != null &&
+                   snapshot.VertexAdmissionClassBuffer != null &&
+                   snapshot.CoordinateVertexMapBuffer != null;
+        }
+
+        private void DispatchBoundaryCanonicalization(Block owner,
+            GPUChunkMeshSnapshot ownerSnapshot,
+            GPUChunkMeshSnapshot targetSnapshot)
+        {
+            int3 ownerMapMax = ownerSnapshot.MapMin + ownerSnapshot.MapCount;
+            int3 targetMapMax = targetSnapshot.MapMin + targetSnapshot.MapCount;
+            int3 copyMin = math.max(owner.CoreMin,
+                math.max(ownerSnapshot.MapMin, targetSnapshot.MapMin));
+            int3 copyMax = math.min(owner.CoreMax,
+                math.min(ownerMapMax, targetMapMax));
+            int3 copyCount = math.max(copyMax - copyMin, 0);
+            int total = copyCount.x * copyCount.y * copyCount.z;
+            if (total <= 0)
+                return;
+
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryOwnerVertices, ownerSnapshot.VertexBuffer);
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryOwnerAdmissionClass,
+                ownerSnapshot.VertexAdmissionClassBuffer);
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryOwnerCoordVertMap,
+                ownerSnapshot.CoordinateVertexMapBuffer);
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryTargetVertices, targetSnapshot.VertexBuffer);
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryTargetAdmissionClass,
+                targetSnapshot.VertexAdmissionClassBuffer);
+            _compute.SetBuffer(_canonicalizeBoundaryKernel,
+                ID_BoundaryTargetCoordVertMap,
+                targetSnapshot.CoordinateVertexMapBuffer);
+            _compute.SetInts(ID_BoundaryOwnerMapMin,
+                ownerSnapshot.MapMin.x, ownerSnapshot.MapMin.y,
+                ownerSnapshot.MapMin.z);
+            _compute.SetInts(ID_BoundaryOwnerMapCount,
+                ownerSnapshot.MapCount.x, ownerSnapshot.MapCount.y,
+                ownerSnapshot.MapCount.z);
+            _compute.SetInts(ID_BoundaryTargetMapMin,
+                targetSnapshot.MapMin.x, targetSnapshot.MapMin.y,
+                targetSnapshot.MapMin.z);
+            _compute.SetInts(ID_BoundaryTargetMapCount,
+                targetSnapshot.MapCount.x, targetSnapshot.MapCount.y,
+                targetSnapshot.MapCount.z);
+            _compute.SetInts(ID_BoundaryCopyMin,
+                copyMin.x, copyMin.y, copyMin.z);
+            _compute.SetInts(ID_BoundaryCopyCount,
+                copyCount.x, copyCount.y, copyCount.z);
+            _compute.SetInt(ID_BoundaryOwnerVertexCount,
+                ownerSnapshot.KnownVertexCount);
+            _compute.SetInt(ID_BoundaryTargetVertexCount,
+                targetSnapshot.KnownVertexCount);
+            _compute.Dispatch(_canonicalizeBoundaryKernel,
+                (total + 63) / 64, 1, 1);
         }
 
         private int PublishCollectedComponent()
@@ -741,6 +1082,8 @@ namespace Genesis.RoomScan
                         math.any(neighbourCoordinate >= _blockCount))
                         continue;
                     Block neighbour = _blocks[Flatten(neighbourCoordinate)];
+                    if (!block.Active || !neighbour.Active)
+                        continue;
                     int oppositeFace = face ^ 1;
                     uint required = math.max(block.RequiredBoundaryEpoch[face],
                         neighbour.RequiredBoundaryEpoch[oppositeFace]);
@@ -878,23 +1221,18 @@ namespace Genesis.RoomScan
                 }
             }
 
-            if (TryPublishReadyStagedComponents() > 0)
-            {
-                _publishedBatchCount++;
-                ApplyVisibility();
-            }
-
             // Unobserved blocks are already valid empty blocks.  Marking them
             // complete prevents an expensive full-volume empty proof at takeover.
             for (int i = 0; i < _blocks.Count; i++)
             {
                 Block block = _blocks[i];
-                if (block.LastOwnerEpoch == 0 && block.TargetEpoch == 0 &&
-                    !block.Queued && !block.CommitPending && !block.Built)
+                if ((!block.Active ||
+                     (block.LastOwnerEpoch == 0 && block.TargetEpoch == 0)) &&
+                    !block.Queued && !block.CommitPending &&
+                    !block.HasStagedCandidate && !block.Built)
                     block.Built = true;
             }
             _firstLedgerApplied = true;
-            TryFinishInitialBuild();
         }
 
         private void RegisterBoundaryPair(
@@ -906,6 +1244,12 @@ namespace Genesis.RoomScan
                     neighbour.LatestBoundaryEpoch[oppositeFace]));
             block.LatestBoundaryEpoch[face] = latest;
             neighbour.LatestBoundaryEpoch[oppositeFace] = latest;
+
+            // Keep the newest seam epoch as deferred debt, but do not let a
+            // block outside the active band hold an inside block in an atomic
+            // publish group. Reactivation re-latches this exact epoch.
+            if (!block.Active || !neighbour.Active)
+                return;
 
             uint required = math.max(block.RequiredBoundaryEpoch[face],
                 neighbour.RequiredBoundaryEpoch[oppositeFace]);
@@ -932,6 +1276,8 @@ namespace Genesis.RoomScan
         {
             Block block = _blocks[index];
             block.TargetEpoch = math.max(block.TargetEpoch, epoch);
+            if (!block.Active)
+                return;
             // A prepared snapshot cannot be overwritten before its seam group
             // publishes. Any newer debt remains in TargetEpoch and is queued
             // immediately after that atomic front swap.
@@ -962,6 +1308,12 @@ namespace Genesis.RoomScan
                 Block block = _blocks[i];
                 if (!block.Queued)
                     continue;
+                if (!block.Active)
+                {
+                    block.Queued = false;
+                    _queuedBlockCount = Mathf.Max(0, _queuedBlockCount - 1);
+                    continue;
+                }
                 int priority = !InitialBuildComplete
                     ? (block.Built ? 0 : 1)
                     : 0;
@@ -999,12 +1351,32 @@ namespace Genesis.RoomScan
             // window makes takeover impossible during continuous scanning once
             // the scheduler intentionally publishes bounded-lag candidates and
             // immediately queues their latest epochs.
-            for (int i = 0; i < _blocks.Count; i++)
-                if (!_blocks[i].Built)
-                    return;
+            if (!AllBlocksHaveInitialFront())
+                return;
+
+            // Early first fronts were prepared while their neighbours were
+            // still queued. Reconcile one hidden front per mesh-work visit;
+            // the final all-block pass therefore cannot become a new GPU
+            // startup spike.
+            if (_initialBoundaryCanonicalizationCursor < _blocks.Count)
+            {
+                Block target = _blocks[_initialBoundaryCanonicalizationCursor++];
+                if (target.Built && target.Front != null)
+                    CanonicalizeTargetHalo(target, target.Front, 0,
+                        useStagedComponentSources: false);
+                return;
+            }
             InitialBuildComplete = true;
             ApplyVisibility();
             Logger.Info($"InfiniTAM block front ready: blocks={_blocks.Count}, visible={VisibleBlockCount}");
+        }
+
+        private bool AllBlocksHaveInitialFront()
+        {
+            for (int i = 0; i < _blocks.Count; i++)
+                if (!_blocks[i].Built)
+                    return false;
+            return true;
         }
 
         private int Flatten(int3 coordinate)
@@ -1022,8 +1394,12 @@ namespace Genesis.RoomScan
         private void ApplyBlockVisibility(Block block)
         {
             if (block.Renderer != null)
-                block.Renderer.RenderVisible = _visible && InitialBuildComplete &&
-                    !Failed && block.Built && block.Front != null && block.IndexCount > 0;
+                // Publication is atomic per seam-connected component. Once a
+                // block owns an immutable Front it can be shown immediately;
+                // InitialBuildComplete remains a bookkeeping milestone, not a
+                // global display gate for all four blocks.
+                block.Renderer.RenderVisible = _visible && !Failed &&
+                    block.Built && block.Front != null && block.IndexCount > 0;
         }
 
         private void OnVolumeCleared()
@@ -1049,6 +1425,7 @@ namespace Genesis.RoomScan
             _inFlightCommits = 0;
             _stagedBlockCount = 0;
             _activeBatch = null;
+            _initialBoundaryCanonicalizationCursor = 0;
             _firstLedgerApplied = knownEmpty;
             InitialBuildComplete = knownEmpty;
             uint epoch = knownEmpty ? _volume.DirtyEpoch : 0u;
