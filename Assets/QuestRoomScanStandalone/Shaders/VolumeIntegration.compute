@@ -17,9 +17,6 @@ RWTexture3D<float> gsAdmissionTraceRW;
 // appear without waiting for maturity.  Keeping the real vote count here stops
 // the legacy product route's 8-bit confidence semantics from changing.
 RWTexture3D<float> gsInfiniTamVoteWeightRW;
-// Baseline-private higher-precision TSDF accumulator. The public R8 volume is
-// still the sole extraction/render source; this sidecar only preserves
-// sub-quantum fusion progress until it becomes a real R8 geometry step.
 RWTexture3D<float> gsInfiniTamAccumulatedTsdfRW;
 // Four-counter sampled receipt for the isolated InfiniTAM baseline. It is
 // enabled for at most one integration per second and never participates in a
@@ -105,6 +102,10 @@ float gsUseRawProjectiveSdf;
 // already expressible by this shader and exits before all product experiments.
 float gsInfiniTamBaseline;
 float gsInfiniTamMaxVoteWeight;
+float gsInfiniTamCorrectionVoteWeight;
+float gsInfiniTamContradictionThreshold;
+int gsInfiniTamContradictionConfirmations;
+float gsInfiniTamSelectiveHistoryRelease;
 float gsWriteColor;
 float gsWriteAdmissionTrace;
 int gsPruneZOffset;
@@ -905,7 +906,6 @@ void CopyTsdfSupportResponsibilityExportSlice(uint3 id : SV_DispatchThreadID)
 }
 
 #pragma kernel Clear
-#pragma kernel ClearInfiniTamVolume
 #pragma kernel ClearInfiniTamVotes
 
 [numthreads(4, 4, 4)]
@@ -926,20 +926,6 @@ void Clear(uint3 id : SV_DispatchThreadID)
         gsConfidenceRW[id] = 0.0; // 清卷=清账：旧分歧 EMA 不得跨会话残留
         gsCoherenceRW[id] = 0.5;  // 相干回中性
     }
-}
-
-// The InfiniTAM production route does not own either responsibility sidecar.
-// Keep its clear operation separate so a new scan can still initialise the
-// extraction/diagnostic textures without recreating those large integer UAVs.
-[numthreads(4, 4, 4)]
-void ClearInfiniTamVolume(uint3 id : SV_DispatchThreadID)
-{
-    if (any(id >= gsVoxCount)) return;
-    gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
-    gsColorVolumeRW[id] = float4(0, 0, 0, 0);
-    gsAdmissionTraceRW[id] = 0.0;
-    gsConfidenceRW[id] = 0.0;
-    gsCoherenceRW[id] = 0.5;
 }
 
 [numthreads(4, 4, 4)]
@@ -1010,12 +996,9 @@ void Prune(uint3 id : SV_DispatchThreadID)
 
 #pragma kernel IntegrateInfiniTam
 
-// The production InfiniTAM route owns the 64^3 block extractor. It does not
-// run HERA, GunGel, freeze supervision or the responsibility sidecars, so its
-// fusion pass only has to wake the two ledgers consumed by that extractor.
-// Keeping this helper separate from MarkDirtyChunk is intentional: referencing
-// the three HERA page ledgers would put those dormant UAVs back into the Vulkan
-// descriptor set of this compact kernel.
+// The compact InfiniTAM route only wakes the persistent 64^3 extraction
+// ledgers. Keeping it separate avoids pulling dormant product/HERA UAVs into
+// the Vulkan descriptor set of this production kernel.
 void MarkInfiniTamDirtyChunk(uint3 coord, float2 before, float2 after)
 {
     if (gsTrackDirtyChunks == 0 || gsDirtyChunkSize == 0) return;
@@ -1054,20 +1037,86 @@ void MarkInfiniTamDirtyChunk(uint3 coord, float2 before, float2 after)
         InterlockedMax(_DirtyBoundaryEpochs[faceBase + 5u], gsDirtyChunkEpoch);
 }
 
-// Make the dirty decision against the value the R8G8_SNorm volume can really
-// retain. Without explicit quantization, sub-step float movement can wake work
-// that disappears when written, while a one-step stored movement can remain
-// hidden behind the old three-step dirty threshold.
 float QuantizeInfiniTamTsdf(float value)
 {
     return round(clamp(value, -1.0, 1.0) * 127.0) / 127.0;
 }
 
-// Compact canonical projective TSDF integration for the accepted InfiniTAM
-// baseline. This preserves the exact vote equation, immediate extraction
-// eligibility, colour-volume contract and 64^3 dirty/boundary wake-up used by
-// the validated v2.8 path. It deliberately omits every production system that
-// the baseline disables before dispatch.
+// Return x = retained history weight, y = repair event:
+// 0 none, 1 entered, 2 continued, 3 exited/reversed, 4 paused.
+float2 InfiniTamSelectHistoryWeight(uint3 coord,
+                                    float previousTsdf,
+                                    float observedTsdf,
+                                    float previousVoteWeight,
+                                    float maxVoteWeight,
+                                    bool reliableRepairEvidence)
+{
+    // A/B isolation: retain the compact 16-vote high-precision history while
+    // disabling only the abrupt 2-confirmation -> 5-vote local release.
+    if (gsInfiniTamSelectiveHistoryRelease < 0.5)
+    {
+        gsCoherenceRW[coord] = 0.5;
+        return float2(previousVoteWeight, 0.0);
+    }
+
+    int confirmations = clamp(gsInfiniTamContradictionConfirmations, 2, 4);
+    float correctionWeight = clamp(gsInfiniTamCorrectionVoteWeight,
+                                   1.0, maxVoteWeight);
+    float matureWeight = max(maxVoteWeight * 0.5, correctionWeight + 1.0);
+    float delta = observedTsdf - previousTsdf;
+    bool localContradiction = abs(previousTsdf) <= 0.5 &&
+                              abs(delta) >= gsInfiniTamContradictionThreshold;
+    float encoded = gsCoherenceRW[coord];
+    bool negativeRepairActive = encoded <= 0.125;
+    bool positiveRepairActive = encoded >= 0.875;
+    bool repairActive = negativeRepairActive || positiveRepairActive;
+    int direction = delta >= 0.0 ? 1 : -1;
+
+    if (repairActive)
+    {
+        int repairDirection = positiveRepairActive ? 1 : -1;
+        if (!reliableRepairEvidence)
+            return float2(previousVoteWeight, 4.0);
+
+        if (!localContradiction || direction != repairDirection)
+        {
+            if (localContradiction)
+                gsCoherenceRW[coord] = saturate(0.5 +
+                    (float)direction / (2.0 * confirmations));
+            else
+                gsCoherenceRW[coord] = 0.5;
+            return float2(previousVoteWeight, 3.0);
+        }
+
+        gsCoherenceRW[coord] = repairDirection > 0 ? 1.0 : 0.0;
+        return float2(min(previousVoteWeight, correctionWeight), 2.0);
+    }
+
+    bool strongContradiction = previousVoteWeight >= matureWeight &&
+                               localContradiction;
+    if (!strongContradiction || !reliableRepairEvidence)
+    {
+        gsCoherenceRW[coord] = 0.5;
+        return float2(previousVoteWeight, 0.0);
+    }
+
+    int streak = (int)round((encoded - 0.5) * (2.0 * confirmations));
+    if (streak * direction > 0)
+        streak = direction * min(abs(streak) + 1, confirmations);
+    else
+        streak = direction;
+
+    if (abs(streak) >= confirmations)
+    {
+        gsCoherenceRW[coord] = direction > 0 ? 1.0 : 0.0;
+        return float2(min(previousVoteWeight, correctionWeight), 1.0);
+    }
+
+    gsCoherenceRW[coord] = saturate(0.5 +
+        (float)streak / (2.0 * confirmations));
+    return float2(previousVoteWeight, 0.0);
+}
+
 [numthreads(64, 1, 1)]
 void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
 {
@@ -1078,15 +1127,8 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float3 voxPos = gsVoxelToWorld(coord);
 
     float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
-    // Acquisition is one head-centred sphere. Using the selected projection
-    // eye here would move the 3 m production boundary by the IPD and admit a
-    // different fringe depending on which eye supplies fusion depth.
     float3 activeCenter = (gsDepthEyePos(0) + gsDepthEyePos(1)) * 0.5;
-    float voxActiveDistance = length(voxPos - activeCenter);
-    // The active reconstruction radius is a write gate, never a delete gate.
-    // Samples outside it leave the existing TSDF/vote state byte-for-byte
-    // intact and therefore cannot dirty or wake a distant extraction block.
-    if (voxActiveDistance > gsMaxUpdateDist) return;
+    if (length(voxPos - activeCenter) > gsMaxUpdateDist) return;
     float voxEyeDist = length(voxPos - eyePos);
     float3 voxView = mul(gsDepthView[GS_FUSION_EYE], float4(voxPos, 1)).xyz;
     if (voxView.z > -0.05) return;
@@ -1100,9 +1142,11 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC),
                                        GS_FUSION_EYE);
     float depthEyeDist = length(depthPos - eyePos);
-    // A distant measured surface must not use its ray to modify nearer cells;
-    // approaching it later resumes from any previously retained TSDF instead.
-    if (length(depthPos - activeCenter) > gsMaxUpdateDist) return;
+    // Range ownership belongs to the voxel being updated, not to the remote
+    // depth endpoint.  A ray that hits beyond the scan radius still proves
+    // free space inside the radius; rejecting the whole ray starves silhouette
+    // cells at open-space cliffs and leaves a persistent notch.  The voxel
+    // range guard above still prevents any TSDF or mesh birth past the limit.
     if (depthEyeDist < gsMinUpdateDist) return;
 
     float rawProjectiveSdf = depthEyeDist - voxEyeDist;
@@ -1114,12 +1158,55 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float previousAccumulatedTsdf = previousVoteWeight > 0.0
         ? gsInfiniTamAccumulatedTsdfRW[coord]
         : previous.x;
-    const float observationVoteWeight = 1.0;
     float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
-    float accumulatedVoteWeight = previousVoteWeight + observationVoteWeight;
-    float reconstructedTsdf = previousVoteWeight > 0.0
-        ? (previousAccumulatedTsdf * previousVoteWeight +
-           observedTsdf * observationVoteWeight) /
+
+    bool repairFacingNeeded = previousVoteWeight > 0.0 &&
+                              abs(previousAccumulatedTsdf) <= 0.5 &&
+                              abs(observedTsdf - previousAccumulatedTsdf) >=
+                                  gsInfiniTamContradictionThreshold;
+    bool reliableRepairEvidence = false;
+    if (repairFacingNeeded && voxEyeDist > 1e-5)
+    {
+        float2 texel2 = 2.0 / max(float2(gsDepthTexSize), float2(1.0, 1.0));
+        float2 uvH = voxNDC.xy + float2(texel2.x, 0.0);
+        float2 uvV = voxNDC.xy + float2(0.0, texel2.y);
+        float depthHNdc = gsDepthSample(uvH, GS_FUSION_EYE);
+        float depthVNdc = gsDepthSample(uvV, GS_FUSION_EYE);
+        if (depthHNdc > 0.0 && depthVNdc > 0.0)
+        {
+            float3 depthPosH = gsDepthNDCtoWorld(
+                float3(uvH, depthHNdc), GS_FUSION_EYE);
+            float3 depthPosV = gsDepthNDCtoWorld(
+                float3(uvV, depthVNdc), GS_FUSION_EYE);
+            float3 hDeriv = depthPosH - depthPos;
+            float3 vDeriv = depthPosV - depthPos;
+            float3 normalCross = cross(hDeriv, vDeriv);
+            float crossLength = length(normalCross);
+            float hRangeDelta = abs(length(depthPosH - eyePos) - depthEyeDist);
+            float vRangeDelta = abs(length(depthPosV - eyePos) - depthEyeDist);
+            if (crossLength > 1e-6 && hRangeDelta <= gsVoxDist &&
+                vRangeDelta <= gsVoxDist)
+            {
+                float3 depthNorm = mul((float3x3)gsFusionCorrection,
+                                       -normalCross / crossLength);
+                float normDot = -dot(voxPos - eyePos, depthNorm) / voxEyeDist;
+                reliableRepairEvidence = normDot >= 0.60;
+            }
+        }
+    }
+
+    float2 historySelection = previousVoteWeight > 0.0
+        ? InfiniTamSelectHistoryWeight(coord, previousAccumulatedTsdf,
+                                       observedTsdf, previousVoteWeight,
+                                       maxVoteWeight, reliableRepairEvidence)
+        : float2(0.0, 0.0);
+    float retainedVoteWeight = historySelection.x;
+    if (previousVoteWeight <= 0.0)
+        gsCoherenceRW[coord] = 0.5;
+
+    float accumulatedVoteWeight = retainedVoteWeight + 1.0;
+    float reconstructedTsdf = retainedVoteWeight > 0.0
+        ? (previousAccumulatedTsdf * retainedVoteWeight + observedTsdf) /
           max(accumulatedVoteWeight, 1e-5)
         : observedTsdf;
     float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
@@ -1165,6 +1252,13 @@ void Integrate(uint id : SV_DispatchThreadID)
     float3 voxPos = gsVoxelToWorld(coord);
 
     float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
+    // Range ownership is head-centred even though projective fusion still uses
+    // the selected depth eye. This removes a left/right boundary discrepancy
+    // without averaging, dilating or otherwise changing depth observations.
+    float3 headPos = 0.5 * (gsDepthEyePos(0) + gsDepthEyePos(1));
+    float voxHeadDist = length(voxPos - headPos);
+    if (voxHeadDist >= gsMaxUpdateDist)
+        return; // stop new writes only; existing TSDF/fronts remain resident
     float3 eyeToVox = voxPos - eyePos;
     float voxEyeDist = length(eyeToVox);
 
@@ -1265,19 +1359,14 @@ void Integrate(uint id : SV_DispatchThreadID)
         float observedTsdf = clamp(rawProjectiveSdf / gsVoxDist, -1.0, 1.0);
         float2 previous = gsVolumeRW[coord];
         float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
-        float previousAccumulatedTsdf = previousVoteWeight > 0.0
-            ? gsInfiniTamAccumulatedTsdfRW[coord]
-            : previous.x;
         // One accepted sample is one full vote, as in the canonical TSDF
-        // integration equation. Keep a bounded recent-history window: the
-        // former 100-vote cap made sub-decimetre corrections smaller than one
-        // R8 TSDF step and left visible geometry numerically frozen.
+        // integration equation.  Cap at 100: after maturity a new frame owns
+        // about 1/101 of the zero-surface instead of the former 1/6.
         const float observationVoteWeight = 1.0;
-        float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
+        const float maxVoteWeight = 100.0;
         float accumulatedVoteWeight = previousVoteWeight + observationVoteWeight;
         float reconstructedTsdf = previousVoteWeight > 0.0
-            ? (previousAccumulatedTsdf * previousVoteWeight +
-               observedTsdf * observationVoteWeight) /
+            ? (previous.x * previousVoteWeight + observedTsdf * observationVoteWeight) /
               max(accumulatedVoteWeight, 1e-5)
             : observedTsdf;
         float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
@@ -1286,9 +1375,7 @@ void Integrate(uint id : SV_DispatchThreadID)
         float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
 
         gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
-        gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
-        WriteTrackedTsdf(coord, float2(
-            QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility));
+        WriteTrackedTsdf(coord, float2(reconstructedTsdf, extractionEligibility));
         if (gsInfiniTamTicketEnabled > 0.5)
         {
             // Only the band that can explain the visible zero surface belongs
@@ -1478,7 +1565,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     // 同样保底 1 个 R8G8_SNorm 量化步长防吞票）
     if (!valid && exclCarve && contradictedCensus && fovCanChallengeCensus)
     {
-        float exDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float exDistF = saturate(1.0 - voxHeadDist / gsMaxUpdateDist);
         float exAngF = saturate(normDot);
         float exQ2 = exDistF * exDistF * exAngF * exAngF;
         float exStep = max(exQ2 * gsCarveGain, 1.0 / 127.0);
@@ -1500,7 +1587,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     if (!valid && dilationBypass && oldCensus.y > 0.001 &&
         fovCanChallengeCensus && sDistNorm > oldCensus.x + nrMargin)
     {
-        float byDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float byDistF = saturate(1.0 - voxHeadDist / gsMaxUpdateDist);
         float byAngF = saturate(normDot);
         float byQ2 = byDistF * byDistF * byAngF * byAngF;
         float byStep = max(byQ2 * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
@@ -1521,7 +1608,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
     if (!valid && normalBypass && oldCensus.y > 0.001 &&
         fovCanChallengeCensus && sDistNorm > oldCensus.x + nrMargin)
     {
-        float nrDistF = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+        float nrDistF = saturate(1.0 - voxHeadDist / gsMaxUpdateDist);
         float nrStep = max(nrDistF * nrDistF * gsCarveGain * gsCarveBypassBoost, 1.0 / 127.0);
         if (fovLedgerNearSurface)
         {
@@ -1555,7 +1642,7 @@ bool valid = withinBand & outsideExclusions & validSurfaceNormal & unoccludedByD
         return;
     }
 
-    float distFactor = pow(saturate(1.0 - voxEyeDist / gsMaxUpdateDist), gsNoiseDistExp);
+    float distFactor = pow(saturate(1.0 - voxHeadDist / gsMaxUpdateDist), gsNoiseDistExp);
     // 救援降级③：救援样本不再享受 0.5 角度地板。混合斜坡是多帧一致的系统性伪造品，
     // 给它角度地板等于让最不可信的掠射观测以正视待遇播种/增长。救援只豁免法线闸
     // 准入（上方 validSurfaceNormal），质量分必须按真实入射角诚实计算——掠射就是

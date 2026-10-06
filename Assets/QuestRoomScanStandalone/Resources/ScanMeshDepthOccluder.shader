@@ -18,10 +18,6 @@ Shader "Genesis/ScanMeshDepthOccluder"
             ColorMask 0
             ZWrite On
             ZTest LEqual
-            // The colour wire pass draws the exact same front surface one
-            // queue later.  A one-unit rear depth bias keeps this invisible
-            // shell behind its own wire, while remaining far in front of the
-            // genuinely displaced sheets it is meant to hide.
             Offset 0, 1
             Cull Off
 
@@ -44,6 +40,7 @@ Shader "Genesis/ScanMeshDepthOccluder"
             float4 gsVoxCount;
             float _RSMeshStride;
             float _RSJointDiagnostic;
+            float _RSDepthPrepassMaxViewDistance;
 
             struct Varyings
             {
@@ -84,6 +81,21 @@ Shader "Genesis/ScanMeshDepthOccluder"
 
                 float3 positionWS = _SurfaceVerts[index].pos;
                 output.positionHCS = TransformWorldToHClip(positionWS);
+
+                float maxDistance = _RSDepthPrepassMaxViewDistance;
+                if (maxDistance > 0.0)
+                {
+                    float3 viewDelta = positionWS - _WorldSpaceCameraPos.xyz;
+                    if (dot(viewDelta, viewDelta) > maxDistance * maxDistance)
+                    {
+                        #if UNITY_REVERSED_Z
+                            output.positionHCS.z = -output.positionHCS.w;
+                        #else
+                            output.positionHCS.z = output.positionHCS.w * 2.0;
+                        #endif
+                        return output;
+                    }
+                }
 
                 output.diagnosticClass = encoded >> 30u;
                 return output;

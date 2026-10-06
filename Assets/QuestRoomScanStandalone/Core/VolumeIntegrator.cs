@@ -24,24 +24,22 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader compute;
 
         [Header("Volume")]
-        // Native 10 cm A/B profile.  Halving every lattice dimension preserves
-        // the original 9.6 x 6.4 x 9.6 metre world extent; this is one coarse
-        // TSDF from integration through extraction, not a 5 cm mesh decimator.
         [SerializeField] private int3 voxelCount = new(96, 64, 96);
         [SerializeField] private float voxelSize = 0.10f;
-        // Preserve the v1.3 three-voxel truncation band in voxel units.
         [SerializeField] private float voxelDistance = 0.30f;
         [SerializeField] private float voxelMin = 0.1f;
 
         [Header("Integration")]
         [SerializeField] private float depthDisparityThreshold = 0.5f;
-        [SerializeField, Range(1f, 3f), Tooltip("生产TSDF的最远观测距离（米）。3米外保留既有体积数据，但不再从当前深度帧写入或制造脏块。")]
-        private float maxUpdateDist = 3f;
+        [SerializeField, Range(1f, 4f), Tooltip("生产TSDF的最远观测距离（米）。3.5米外保留既有体积数据，但不再从当前深度帧写入或制造脏块。")]
+        private float maxUpdateDist = 3.5f;
         [Tooltip("最近更新距离：视锥内距相机小于此值的体素不积分。原 0.5m 会在头周留下覆盖空洞，0.15 贴脸也覆盖（近距深度噪声大，如出现贴脸飞面可调回 0.3）")]
         [SerializeField] private float minUpdateDist = 0.15f;
         [Tooltip("头部排除区半径（仅 StandaloneRoomScanner 开启排除区时生效）。0.6 = QRS 原版（防手入网但头周覆盖空洞大），0.35 = 折中")]
         [SerializeField, Range(0.1f, 1f)] private float exclusionRadius = 0.35f;
         [SerializeField] private int maxFrustumPositions = 1000000;
+        [SerializeField, Range(0.5f, 1f), Tooltip("生产融合使用的中央视野宽高比例。0.85 表示只在深度视野中央 85% 宽、85% 高内生成或更新 TSDF；视野外已有体积与网格保持驻留和显示。")]
+        private float integrationViewportScale = 0.85f;
         [SerializeField, Tooltip("在不增加每帧样本数的前提下，让视锥采样格逐帧走完8个半体素相位。只改变哪些世界体素获得同一套已准入深度证据；不放宽深度、法线、边缘、运动或枪胶门禁。用于消除相机格与世界5cm格对齐造成的漏写、弱权重和八邻域缺样。")]
         private bool enableFrustumPhaseCoverage = true;
 
@@ -201,11 +199,17 @@ namespace Genesis.RoomScan
         [Header("InfiniTAM architecture baseline")]
         [SerializeField, Tooltip("独立 InfiniTAM V1.3 行为基线：Quest 世界位姿下直接写入唯一 raw-projective TSDF；模型 raycast 与残差只读旁证。GunGel、裁判、种面标尺、冻结和制品链全部旁路。")]
         private bool enableInfiniTamBaseline = true;
-        // The Quest baseline fuses at 10 Hz. Twenty-four retained votes give
-        // stable multi-frame averaging while allowing a changed surface to
-        // settle over seconds instead of the tens-of-seconds tail produced by
-        // the former 100-vote history on an 8-bit TSDF.
-        private const float InfiniTamMaxVoteWeight = 24f;
+        [SerializeField, Tooltip("临时 A/B：启用专用高精度 InfiniTAM 历史内核；不影响距离、视野、发布或背面遮挡。")]
+        private bool enableCompactInfiniTamHistory = true;
+        [SerializeField, Tooltip("临时 A/B：连续两次可靠反证后把当前体素历史降到 5 票。当前开启，与 16 票全局历史组成 16/2/5 实验。")]
+        private bool enableInfiniTamSelectiveHistoryRelease = true;
+        // 16/2/5 A/B: ordinary surfaces retain a compact 16-vote history.
+        // Two reliable, same-direction contradictions at least half a voxel
+        // apart release only that voxel's retained history to five votes.
+        private const float InfiniTamMaxVoteWeight = 16f;
+        private const float InfiniTamCorrectionVoteWeight = 5f;
+        private const int InfiniTamContradictionConfirmations = 2;
+        private const float InfiniTamContradictionDistanceVoxels = 0.5f;
         private const float InfiniTamDirtyWakeThreshold = 0.5f / 127f;
         [SerializeField, Tooltip("历史 V1.6-V1.10 实验：让未完整移植的 ICP 跟踪器拥有 TSDF 写入、位姿修正和网格发布权。V1.3 恢复基线必须保持关闭；待完整移植 TAM 金字塔、阻尼回退、质量状态和重定位后才能重新启用。")]
         private bool enableInfiniTamTrackingAuthority = false;
@@ -261,10 +265,9 @@ namespace Genesis.RoomScan
         // Baseline-only canonical TSDF vote count.  The legacy/product route
         // receives only a 1x1 descriptor placeholder and never reads or writes it.
         private RenderTexture _infiniTamVoteWeightVolume;
-        // Higher-precision running TSDF paired with the vote count above. The
-        // public production volume stays R8G8_SNorm for extraction/persistence;
-        // this sidecar prevents sub-step corrections from being rounded away
-        // before they can accumulate into a real stored geometry change.
+        // High-precision private TSDF accumulator. The public production volume
+        // remains R8G8_SNorm; this sidecar lets sub-step corrections accumulate
+        // instead of being rounded away on every accepted frame.
         private RenderTexture _infiniTamAccumulatedTsdfVolume;
         // Baseline-only prediction of the sole TSDF.  The TSDF binding and
         // prediction textures stay read-only; its exact-frame tracking decision
@@ -280,13 +283,6 @@ namespace Genesis.RoomScan
         public RenderTexture Volume => _volume;
         /// <summary>互斥的 InfiniTAM 风格第一版基线是否拥有生产融合与提面路径。</summary>
         public bool InfiniTamBaselineEnabled => enableInfiniTamBaseline;
-        /// <summary>
-        /// V1.3 production consumes only the cleaned depth texture plus the
-        /// Quest pose. The dormant tracking experiment still needs normals,
-        /// dilation and edge evidence and therefore must keep the full input set.
-        /// </summary>
-        public bool InfiniTamCompactDepthOnly => enableInfiniTamBaseline &&
-                                                 !enableInfiniTamTrackingAuthority;
         /// <summary>
         /// V1.3 publishes after the sole TSDF has received its first real
         /// observation. The dormant V1.6+ experiment retains its old tracked
@@ -318,20 +314,6 @@ namespace Genesis.RoomScan
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
         public float VoxelDistance => voxelDistance;
-        // Existing throttled fusion receipt exposed to the A-key tail report.
-        // These are observations only; reading them cannot alter fusion.
-        public bool InfiniTamTicketSampleReady => _hasInfiniTamTicket;
-        public int InfiniTamTicketSampleCount => _infiniTamTicketSampleCount;
-        public int InfiniTamAttemptedFrameCount => _infiniTamAttemptedFrames;
-        public int InfiniTamFusedFrameCount => _infiniTamFusedFrames;
-        public ulong InfiniTamCumulativeNewSurfaceWrites =>
-            _infiniTamTicketCumulativeNew;
-        public ulong InfiniTamCumulativeContinuingSurfaceWrites =>
-            _infiniTamTicketCumulativeContinuing;
-        public ulong InfiniTamCumulativeMatureSurfaceWrites =>
-            _infiniTamTicketCumulativeMature;
-        public ulong InfiniTamCumulativeNearZeroSurfaceWrites =>
-            _infiniTamTicketCumulativeSurfaceSamples;
 
         private static readonly int VolumeRWID = Shader.PropertyToID("gsVolumeRW");
         private static readonly int VolumeID = Shader.PropertyToID("gsVolume");
@@ -425,6 +407,14 @@ namespace Genesis.RoomScan
         private static readonly int InfiniTamBaselineID = Shader.PropertyToID("gsInfiniTamBaseline");
         private static readonly int InfiniTamMaxVoteWeightID =
             Shader.PropertyToID("gsInfiniTamMaxVoteWeight");
+        private static readonly int InfiniTamCorrectionVoteWeightID =
+            Shader.PropertyToID("gsInfiniTamCorrectionVoteWeight");
+        private static readonly int InfiniTamContradictionThresholdID =
+            Shader.PropertyToID("gsInfiniTamContradictionThreshold");
+        private static readonly int InfiniTamContradictionConfirmationsID =
+            Shader.PropertyToID("gsInfiniTamContradictionConfirmations");
+        private static readonly int InfiniTamSelectiveHistoryReleaseID =
+            Shader.PropertyToID("gsInfiniTamSelectiveHistoryRelease");
         private static readonly int InfiniTamVoteWeightRWID =
             Shader.PropertyToID("gsInfiniTamVoteWeightRW");
         private static readonly int InfiniTamAccumulatedTsdfRWID =
@@ -1476,18 +1466,12 @@ namespace Genesis.RoomScan
         /// </summary>
         private void InitKernels()
         {
-            _clearKernel = new ComputeKernelHelper(compute,
-                enableInfiniTamBaseline ? "ClearInfiniTamVolume" : "Clear");
+            _clearKernel = new ComputeKernelHelper(compute, "Clear");
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-            if (!enableInfiniTamBaseline)
-            {
-                _clearKernel.Set(TsdfResponsibilityRWID,
-                    _tsdfResponsibilityVolume);
-                _clearKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-            }
+            _clearKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _clearKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
 
             _clearInfiniTamVotesKernel = new ComputeKernelHelper(compute,
                 "ClearInfiniTamVotes");
@@ -1496,36 +1480,34 @@ namespace Genesis.RoomScan
             _clearInfiniTamVotesKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
 
-            if (!enableInfiniTamBaseline)
-            {
-                _invalidateGunGelSuccessionsKernel = new ComputeKernelHelper(compute,
-                    "InvalidateGunGelSuccessions");
-                _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
-                _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
-                _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
-                    _admissionTraceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
-                    _tsdfResponsibilityVolume);
-                _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
-                    _dirtyBoundaryEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
-                    _activePageEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
-                    _activePageObservedEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
-                    _activePageBoundaryEpochs);
-            }
+            _invalidateGunGelSuccessionsKernel = new ComputeKernelHelper(compute,
+                "InvalidateGunGelSuccessions");
+            _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
+            _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
+            _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
+                _admissionTraceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
+                _tsdfResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
+                _dirtyBoundaryEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
+                _activePageEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
+                _activePageObservedEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
+                _activePageBoundaryEpochs);
 
+            bool useCompactInfiniTamKernel =
+                enableInfiniTamBaseline && enableCompactInfiniTamHistory;
             _integrateKernel = new ComputeKernelHelper(compute,
-                enableInfiniTamBaseline ? "IntegrateInfiniTam" : "Integrate");
-            if (enableInfiniTamBaseline)
-                Logger.Info("VolumeIntegrator: compact InfiniTAM fusion active " +
-                            "(7 UAV, depth-only input, no camera RGB blit).");
+                useCompactInfiniTamKernel
+                    ? "IntegrateInfiniTam"
+                    : "Integrate");
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
             _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
@@ -1533,7 +1515,7 @@ namespace Genesis.RoomScan
                 _infiniTamAccumulatedTsdfVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
-            if (!enableInfiniTamBaseline)
+            if (!useCompactInfiniTamKernel)
             {
                 _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
                 _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
@@ -1544,59 +1526,48 @@ namespace Genesis.RoomScan
                     _activePageObservedEpochs);
                 _integrateKernel.Set(ActivePageBoundaryEpochsID,
                     _activePageBoundaryEpochs);
-
-                _pruneKernel = new ComputeKernelHelper(compute, "Prune");
-                _pruneKernel.Set(VolumeRWID, _volume);
-                _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
-                _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-                _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
-                _pruneKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
-                _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
-                _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
-                _pruneKernel.Set(ActivePageObservedEpochsID,
-                    _activePageObservedEpochs);
-                _pruneKernel.Set(ActivePageBoundaryEpochsID,
-                    _activePageBoundaryEpochs);
             }
 
-            if (!enableInfiniTamBaseline)
+            _pruneKernel = new ComputeKernelHelper(compute, "Prune");
+            _pruneKernel.Set(VolumeRWID, _volume);
+            _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _pruneKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+            _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _pruneKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _pruneKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
+
+            _freezeKernel = new ComputeKernelHelper(compute, "FreezeInFrustum");
+            _freezeKernel.Set(VolumeRWID, _volume);
+            _freezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+
+            _unfreezeKernel = new ComputeKernelHelper(compute, "UnfreezeInFrustum");
+            _unfreezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+
+            _applyFreezeMaskKernel = new ComputeKernelHelper(compute, "ApplyChunkFreezeMask");
+            _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
+            _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+
+            _clearVotesKernel = new ComputeKernelHelper(compute, "ClearFrozenChunkVotes");
+            _clearVotesKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+
+            _maturityKernel = new ComputeKernelHelper(compute, "CountChunkMaturity");
+            _maturityKernel.Set(VolumeRWID, _volume);
+            _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+            _maturityKernel.Set(ConfidenceRWID, _confidenceVolume); // 资格门：普查同拍低置信账（w 槽）
+
+            if (!useCompactInfiniTamKernel)
             {
-                _freezeKernel = new ComputeKernelHelper(compute,
-                    "FreezeInFrustum");
-                _freezeKernel.Set(VolumeRWID, _volume);
-                _freezeKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-
-                _unfreezeKernel = new ComputeKernelHelper(compute,
-                    "UnfreezeInFrustum");
-                _unfreezeKernel.Set(VolumeRWID, _volume);
-                _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-
-                _applyFreezeMaskKernel = new ComputeKernelHelper(compute,
-                    "ApplyChunkFreezeMask");
-                _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
-                _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID,
-                    _chunkFreezeSetMask);
-                _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID,
-                    _chunkFreezeClearMask);
-
-                _clearVotesKernel = new ComputeKernelHelper(compute,
-                    "ClearFrozenChunkVotes");
-                _clearVotesKernel.Set(ChunkFreezeClearMaskID,
-                    _chunkFreezeClearMask);
-                _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
-
-                _maturityKernel = new ComputeKernelHelper(compute,
-                    "CountChunkMaturity");
-                _maturityKernel.Set(VolumeRWID, _volume);
-                _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
-                _maturityKernel.Set(ConfidenceRWID, _confidenceVolume);
-
                 _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
                 _integrateKernel.Set(FrozenChunkBitsID, _frozenChunkBits);
             }
@@ -1610,11 +1581,8 @@ namespace Genesis.RoomScan
             // 置信度通道 v1：分歧 EMA 体绑进 Integrate（写）与 Clear（清零），
             // CountConfidence 内核只读它做三档普查。缓冲建后先清零——新缓冲首帧
             // 按垃圾计数写会 GPU 挂死（粗皮缓冲同款老陷阱）。
-            if (!enableInfiniTamBaseline)
-            {
-                _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
-                _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
-            }
+            _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
             _clearKernel.Set(ConfidenceRWID, _confidenceVolume);
             _clearKernel.Set(CoherenceRWID, _coherenceVolume);
             _confidenceKernel = new ComputeKernelHelper(compute, "CountConfidence");
@@ -1627,8 +1595,7 @@ namespace Genesis.RoomScan
 
             _carveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
             _carveStats.SetData(ZeroCarveStats);
-            if (!enableInfiniTamBaseline)
-                _integrateKernel.Set(CarveStatsID, _carveStats);
+            _integrateKernel.Set(CarveStatsID, _carveStats);
 
             // Vulkan requires a valid descriptor even when the legacy route
             // keeps the receipt switch at zero. The buffer is tiny (16 bytes)
@@ -1662,8 +1629,7 @@ namespace Genesis.RoomScan
             _dummyShellWitnessEpochs = new ComputeBuffer(1, sizeof(uint),
                 ComputeBufferType.Structured);
             _dummyShellWitnessEpochs.SetData(new uint[1]);
-            if (!enableInfiniTamBaseline)
-                _integrateKernel.Set(ShellWitnessEpochsID, _dummyShellWitnessEpochs);
+            _integrateKernel.Set(ShellWitnessEpochsID, _dummyShellWitnessEpochs);
 
             if (enableProjectiveShadow && !enableInfiniTamBaseline)
             {
@@ -2476,104 +2442,78 @@ namespace Genesis.RoomScan
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-            if (!enableInfiniTamBaseline)
-            {
-                _clearKernel.Set(TsdfResponsibilityRWID,
-                    _tsdfResponsibilityVolume);
-                _clearKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-            }
+            _clearKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _clearKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
             _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
                 _infiniTamVoteWeightVolume);
             _clearInfiniTamVotesKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
-            if (!enableInfiniTamBaseline)
-            {
-                _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
-                _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
-                _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
-                    _admissionTraceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
-                    _tsdfResponsibilityVolume);
-                _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
-                _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID,
-                    _dirtyChunkEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
-                    _dirtyBoundaryEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
-                    _activePageEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
-                    _activePageObservedEpochs);
-                _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
-                    _activePageBoundaryEpochs);
-            }
+            _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
+            _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
+            _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
+                _admissionTraceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfResponsibilityRWID,
+                _tsdfResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _invalidateGunGelSuccessionsKernel.Set(ConfidenceRWID, _confidenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(CoherenceRWID, _coherenceVolume);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(DirtyBoundaryEpochsID,
+                _dirtyBoundaryEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageEpochsID,
+                _activePageEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageObservedEpochsID,
+                _activePageObservedEpochs);
+            _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
+                _activePageBoundaryEpochs);
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _integrateKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
             _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
             _integrateKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
+            _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
-            if (!enableInfiniTamBaseline)
-            {
-                _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-                _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
-                _integrateKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
-                _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
-                _integrateKernel.Set(ActivePageObservedEpochsID,
-                    _activePageObservedEpochs);
-                _integrateKernel.Set(ActivePageBoundaryEpochsID,
-                    _activePageBoundaryEpochs);
-                _pruneKernel.Set(VolumeRWID, _volume);
-                _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
-                _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-                _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
-                _pruneKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
-                _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
-                _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
-                _pruneKernel.Set(ActivePageObservedEpochsID,
-                    _activePageObservedEpochs);
-                _pruneKernel.Set(ActivePageBoundaryEpochsID,
-                    _activePageBoundaryEpochs);
-            }
-            if (!enableInfiniTamBaseline)
-            {
-                _freezeKernel.Set(VolumeRWID, _volume);
-                _freezeKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _unfreezeKernel.Set(VolumeRWID, _volume);
-                _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
-                _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
-                _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID,
-                    _chunkFreezeSetMask);
-                _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID,
-                    _chunkFreezeClearMask);
-                _clearVotesKernel.Set(ChunkFreezeClearMaskID,
-                    _chunkFreezeClearMask);
-                _clearVotesKernel.Set(FrozenChunkVotesID,
-                    _frozenChunkVotes);
-                _maturityKernel.Set(VolumeRWID, _volume);
-                _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
-                _maturityKernel.Set(ConfidenceRWID, _confidenceVolume);
-                _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
-                _integrateKernel.Set(FrozenChunkBitsID, _frozenChunkBits);
-            }
+            _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _integrateKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _integrateKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
+            _pruneKernel.Set(VolumeRWID, _volume);
+            _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+            _pruneKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _pruneKernel.Set(TsdfSupportResponsibilityRWID, _tsdfSupportResponsibilityVolume);
+            _pruneKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
+            _pruneKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            _pruneKernel.Set(ActivePageEpochsID, _activePageEpochs);
+            _pruneKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
+            _pruneKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
+            _freezeKernel.Set(VolumeRWID, _volume);
+            _freezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _unfreezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _applyFreezeMaskKernel.Set(VolumeRWID, _volume);
+            _applyFreezeMaskKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
+            _applyFreezeMaskKernel.Set(ChunkFreezeSetMaskID, _chunkFreezeSetMask);
+            _applyFreezeMaskKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(ChunkFreezeClearMaskID, _chunkFreezeClearMask);
+            _clearVotesKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+            _maturityKernel.Set(VolumeRWID, _volume);
+            _maturityKernel.Set(ChunkMaturityID, _chunkMaturity);
+            _maturityKernel.Set(ConfidenceRWID, _confidenceVolume); // 资格门：普查同拍低置信账（w 槽）
+            _integrateKernel.Set(FrozenChunkVotesID, _frozenChunkVotes);
+            _integrateKernel.Set(FrozenChunkBitsID, _frozenChunkBits);
             _coverageKernel.Set(VolumeRWID, _volume);
             compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
             _clearKernel.Set(ConfidenceRWID, _confidenceVolume);
             _clearKernel.Set(CoherenceRWID, _coherenceVolume);
-            if (!enableInfiniTamBaseline)
-                _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
+            _integrateKernel.Set(CoherenceRWID, _coherenceVolume);
             _confidenceKernel.Set(VolumeRWID, _volume);
             _confidenceKernel.Set(ConfidenceRWID, _confidenceVolume);
             _confidenceKernel.Set(CoherenceRWID, _coherenceVolume);
@@ -2588,44 +2528,6 @@ namespace Genesis.RoomScan
                 Mathf.CeilToInt(voxelCount.z / (float)chunkSize));
             int requiredCount = required.x * required.y * required.z;
             int boundaryCount = Mathf.Max(1, requiredCount * 6);
-            if (enableInfiniTamBaseline)
-            {
-                if (_dirtyChunkEpochs != null &&
-                    _dirtyChunkEpochs.count == Mathf.Max(1, requiredCount) &&
-                    _dirtyBoundaryEpochs != null &&
-                    _dirtyBoundaryEpochs.count == boundaryCount &&
-                    _activePageEpochs == null &&
-                    _activePageObservedEpochs == null &&
-                    _activePageBoundaryEpochs == null &&
-                    _frozenChunkVotes == null)
-                {
-                    _dirtyChunkCount = required;
-                    _frozenChunkCount = int3.zero;
-                    return;
-                }
-
-                _dirtyChunkEpochs?.Release();
-                _dirtyBoundaryEpochs?.Release();
-                _activePageEpochs?.Release();
-                _activePageEpochs = null;
-                _activePageObservedEpochs?.Release();
-                _activePageObservedEpochs = null;
-                _activePageBoundaryEpochs?.Release();
-                _activePageBoundaryEpochs = null;
-                ReleaseFrozenBlockBuffers();
-
-                _dirtyChunkEpochs = new ComputeBuffer(
-                    Mathf.Max(1, requiredCount), sizeof(uint));
-                _dirtyBoundaryEpochs = new ComputeBuffer(
-                    boundaryCount, sizeof(uint));
-                _dirtyChunkEpochs.SetData(
-                    new uint[Mathf.Max(1, requiredCount)]);
-                _dirtyBoundaryEpochs.SetData(new uint[boundaryCount]);
-                _dirtyChunkCount = required;
-                _frozenChunkCount = int3.zero;
-                return;
-            }
-
             int fChunkSize = Mathf.Max(8, frozenChunkSize);
             int3 frozenRequired = new int3(
                 Mathf.CeilToInt(voxelCount.x / (float)fChunkSize),
@@ -2703,6 +2605,20 @@ namespace Genesis.RoomScan
                 compute.SetInt(DirtyBoundaryHaloID, _dirtyBoundaryHaloVoxels);
         }
 
+        private void ConfigureCompactInfiniTamHistory()
+        {
+            compute.SetFloat(InfiniTamMaxVoteWeightID, InfiniTamMaxVoteWeight);
+            compute.SetFloat(InfiniTamCorrectionVoteWeightID,
+                InfiniTamCorrectionVoteWeight);
+            compute.SetFloat(InfiniTamContradictionThresholdID,
+                Mathf.Clamp(InfiniTamContradictionDistanceVoxels * voxelSize /
+                            Mathf.Max(voxelDistance, 1e-5f), 1f / 127f, 1f));
+            compute.SetInt(InfiniTamContradictionConfirmationsID,
+                InfiniTamContradictionConfirmations);
+            compute.SetFloat(InfiniTamSelectiveHistoryReleaseID,
+                enableInfiniTamSelectiveHistoryRelease ? 1f : 0f);
+        }
+
         private void ConfigureDirtyTracking(bool enabled)
         {
             compute.SetInts(DirtyChunkCountID, _dirtyChunkCount.x, _dirtyChunkCount.y, _dirtyChunkCount.z);
@@ -2710,13 +2626,10 @@ namespace Genesis.RoomScan
             compute.SetInt(TrackDirtyChunksID, enabled && _dirtyChunkEpochs != null ? 1 : 0);
             compute.SetInt(DirtyChunkEpochID, unchecked((int)_dirtyEpoch));
             compute.SetInt(DirtyBoundaryHaloID, _dirtyBoundaryHaloVoxels);
-            // Baseline TSDF is R8G8_SNorm. Compare against half one stored
-            // distance step so every real one-step geometry move wakes its
-            // block; the ordinary product route retains its tuned threshold.
-            float effectiveDirtyThreshold = enableInfiniTamBaseline
+            compute.SetFloat(DirtyTsdfThresholdID,
+                enableInfiniTamBaseline && enableCompactInfiniTamHistory
                 ? Mathf.Min(dirtyTsdfThreshold, InfiniTamDirtyWakeThreshold)
-                : dirtyTsdfThreshold;
-            compute.SetFloat(DirtyTsdfThresholdID, effectiveDirtyThreshold);
+                : dirtyTsdfThreshold);
             compute.SetFloat(DirtySurfaceBandID, dirtySurfaceBand);
             compute.SetFloat(DirtyMinWeightID, minMeshWeight);
             compute.SetInts(FrozenChunkCountID, _frozenChunkCount.x, _frozenChunkCount.y, _frozenChunkCount.z);
@@ -3676,8 +3589,7 @@ namespace Genesis.RoomScan
 
             // The baseline must not reuse the product route's R8G8_SNorm .g
             // lane as both "may extract" and accumulated observation weight.
-            // Keep the bounded fusion-history vote count in a
-            // baseline-private float volume.
+            // Keep a real (0..100) vote count in a baseline-private float volume.
             // The old route receives a 1x1 placeholder solely because Vulkan
             // requires every UAV declared by Integrate to have a descriptor.
             GraphicsFormat infiniTamVoteFormat = SystemInfo.IsFormatSupported(
@@ -3765,49 +3677,37 @@ namespace Genesis.RoomScan
             };
             _coherenceVolume.Create();
 
-            if (!enableInfiniTamBaseline)
+            // Two packed uint lanes are sufficient to connect a final zero-crossing
+            // endpoint to its current-lifetime seed, last sd-moving write and strongest
+            // blocked correction.  This sidecar is write-only diagnostics; production
+            // TSDF, extraction and rendering never sample it.
+            _tsdfResponsibilityVolume = new RenderTexture(
+                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32G32_UInt, 0)
             {
-                // Two packed uint lanes are sufficient to connect a final
-                // zero-crossing endpoint to its current-lifetime seed, last
-                // sd-moving write and strongest blocked correction. These
-                // diagnostics belong only to the legacy product route.
-                _tsdfResponsibilityVolume = new RenderTexture(
-                    voxelCount.x, voxelCount.y, 0,
-                    GraphicsFormat.R32G32_UInt, 0)
-                {
-                    dimension = TextureDimension.Tex3D,
-                    volumeDepth = voxelCount.z,
-                    enableRandomWrite = true,
-                    filterMode = FilterMode.Point,
-                    wrapMode = TextureWrapMode.Clamp,
-                    name = "TsdfResponsibility"
-                };
-                _tsdfResponsibilityVolume.Create();
-                Logger.Info($"TSDF responsibility sidecar: {voxelCount} " +
-                            $"R32G32_UInt = " +
-                            $"{(8L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfResponsibility"
+            };
+            _tsdfResponsibilityVolume.Create();
+            Logger.Info($"TSDF responsibility sidecar: {voxelCount} R32G32_UInt = " +
+                        $"{(8L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
 
-                _tsdfSupportResponsibilityVolume = new RenderTexture(
-                    voxelCount.x, voxelCount.y, 0,
-                    GraphicsFormat.R32_UInt, 0)
-                {
-                    dimension = TextureDimension.Tex3D,
-                    volumeDepth = voxelCount.z,
-                    enableRandomWrite = true,
-                    filterMode = FilterMode.Point,
-                    wrapMode = TextureWrapMode.Clamp,
-                    name = "TsdfSupportResponsibility"
-                };
-                _tsdfSupportResponsibilityVolume.Create();
-                Logger.Info($"TSDF support responsibility sidecar: " +
-                            $"{voxelCount} R32_UInt = " +
-                            $"{(4L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
-            }
-            else
+            _tsdfSupportResponsibilityVolume = new RenderTexture(
+                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32_UInt, 0)
             {
-                Logger.Info("InfiniTAM compact resources: skipped legacy " +
-                            "responsibility sidecars and freeze/page ledgers.");
-            }
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voxelCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = "TsdfSupportResponsibility"
+            };
+            _tsdfSupportResponsibilityVolume.Create();
+            Logger.Info($"TSDF support responsibility sidecar: {voxelCount} R32_UInt = " +
+                        $"{(4L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
         }
 
         private void SetShaderConstants()
@@ -3868,8 +3768,7 @@ namespace Genesis.RoomScan
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
             compute.SetFloat(UseRawProjectiveSdfID, 0f);
             compute.SetFloat(InfiniTamBaselineID, 0f);
-            compute.SetFloat(InfiniTamMaxVoteWeightID,
-                InfiniTamMaxVoteWeight);
+            ConfigureCompactInfiniTamHistory();
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
             compute.SetFloat(TsdfResponsibilityAvailableID,
@@ -3924,8 +3823,6 @@ namespace Genesis.RoomScan
             {
                 _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
                     _infiniTamVoteWeightVolume);
-                _clearInfiniTamVotesKernel.Set(InfiniTamAccumulatedTsdfRWID,
-                    _infiniTamAccumulatedTsdfVolume);
                 _clearInfiniTamVotesKernel.DispatchFit(_infiniTamVoteWeightVolume);
             }
 
@@ -4011,16 +3908,6 @@ namespace Genesis.RoomScan
         {
             if (_volume == null || _colorVolume == null || compute == null)
                 return;
-            // The active V1.3 baseline fuses directly in Quest world pose and
-            // never relocates its volume. The legacy relocation kernel also
-            // owns responsibility sidecars, so it must not recreate that
-            // dormant route behind the compact baseline's back.
-            if (enableInfiniTamBaseline)
-            {
-                Logger.Warning("BakeRelocation ignored: compact InfiniTAM " +
-                               "uses direct Quest-world fusion.");
-                return;
-            }
 
             Matrix4x4 invRelocation = relocationMatrix.inverse;
             int3 vc = voxelCount;
@@ -4377,6 +4264,19 @@ namespace Genesis.RoomScan
             float ts = frustum.top / frustum.zNear;
             float bs = frustum.bottom / frustum.zNear;
 
+            // Crop around the real optical centre so asymmetric per-eye
+            // projections retain their alignment. This limits only new TSDF
+            // writes; already integrated volume data remains resident.
+            float viewportScale = Mathf.Clamp(integrationViewportScale, 0.5f, 1f);
+            float xCenter = (ls + rs) * 0.5f;
+            float yCenter = (bs + ts) * 0.5f;
+            float xHalf = (rs - ls) * 0.5f * viewportScale;
+            float yHalf = (ts - bs) * 0.5f * viewportScale;
+            ls = xCenter - xHalf;
+            rs = xCenter + xHalf;
+            bs = yCenter - yHalf;
+            ts = yCenter + yHalf;
+
             float step = voxelSize;
             bool capped = false;
 
@@ -4406,7 +4306,9 @@ namespace Genesis.RoomScan
 
             if (positions.Count == 0) return;
 
-            Logger.Info($"Frustum volume: {positions.Count} positions ({positions.Count * 12 / 1024}KB)");
+            Logger.Info($"Frustum volume: {positions.Count} positions " +
+                        $"({positions.Count * 12 / 1024}KB), " +
+                        $"central viewport={viewportScale:P0}");
 
             _frustumVolume?.Release();
             _frustumVolume = new ComputeBuffer(positions.Count, sizeof(float) * 3);
@@ -4556,23 +4458,20 @@ namespace Genesis.RoomScan
 
             if (!currentHardGated)
             {
-                bool compactDepthOnly = InfiniTamCompactDepthOnly;
-                if (!compactDepthOnly)
-                    dc.UpdateDilationIfNeeded();
-                // The legacy/tracked routes create dilation lazily. Refresh the
-                // complete input set after that creation. V1.3's compact kernel
-                // samples only fusionDepth, so do not make unused side textures
-                // a cold-start dependency or dispatch their producers.
+                dc.UpdateDilationIfNeeded();
+                // The first platform depth frame creates several preprocessing
+                // textures lazily. Refresh the complete input set after that
+                // creation; never dispatch compute with a stale null binding.
+                // An incomplete cold-start frame abstains and retries on the
+                // next platform frame without altering the TSDF.
                 fusionDepth = dc.DepthTex;
                 fusionNormal = dc.NormTex;
                 fusionDilatedDepth = dc.DilatedDepthTex;
                 fusionEdgeReason = dc.EdgeReasonTex;
                 fusionTemporalReason = dc.TemporalReasonTex;
                 fusionTemporalReasonAvailable = fusionTemporalReason != null;
-                bool missingFullInput = !compactDepthOnly &&
-                    (fusionNormal == null || fusionDilatedDepth == null ||
-                     fusionEdgeReason == null);
-                if (fusionDepth == null || missingFullInput)
+                if (fusionDepth == null || fusionNormal == null ||
+                    fusionDilatedDepth == null || fusionEdgeReason == null)
                 {
                     _pendingCamFrame = null;
                     return false;
@@ -4887,8 +4786,6 @@ namespace Genesis.RoomScan
             compute.SetFloat(StabilityID, stability);
             compute.SetFloat(WeightGrowthID, weightGrowth);
             compute.SetFloat(MaxWeightID, maxWeight);
-            compute.SetFloat(InfiniTamMaxVoteWeightID,
-                InfiniTamMaxVoteWeight);
             compute.SetFloat(CarveGainID, carveGain);
             compute.SetFloat(MinUpdateDistID, rejectNearSamples ? minUpdateDist : 0f);
             compute.SetFloat(CarveInsideExclusionID, carveInsideExclusion ? 1f : 0f);
@@ -4930,56 +4827,38 @@ namespace Genesis.RoomScan
             compute.SetFloat(FrozenVoteQualityMinID, frozenVoteQualityMin);
             compute.SetFloat(FrozenVoteMarginID, frozenVoteMargin);
 
-            // The InfiniTAM product is geometry-only and writes the established
-            // white colour contract directly in its compact kernel. Do not blit
-            // a passthrough RGB frame that no baseline shader invocation reads.
-            bool productionCamAvailable = false;
-            if (!enableInfiniTamBaseline)
+            if (!usingGuardedFrame && !usingInfiniTamTrackedFrame)
+                EnsureCamFrameCopy();
+            bool productionCamAvailable = !usingGuardedFrame &&
+                                          !usingInfiniTamTrackedFrame &&
+                                          _pendingCamFrame != null && _camFrameCopy != null;
+            if (productionCamAvailable)
             {
-                if (!usingGuardedFrame && !usingInfiniTamTrackedFrame)
-                    EnsureCamFrameCopy();
-                productionCamAvailable = !usingGuardedFrame &&
-                                         !usingInfiniTamTrackedFrame &&
-                                         _pendingCamFrame != null &&
-                                         _camFrameCopy != null;
-                if (productionCamAvailable)
-                {
-                    compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID,
-                        _camFrameCopy);
-                    compute.SetInt(CamAvailableID, 1);
-                    compute.SetVector(CamPosID, _pendingCamPos);
-                    compute.SetMatrix(CamInvRotID,
-                        Matrix4x4.Rotate(Quaternion.Inverse(_pendingCamRot)));
-                    compute.SetVector(CamFocalLenID, _pendingFocalLen);
-                    compute.SetVector(CamPrincipalPtID, _pendingPrincipalPt);
-                    compute.SetVector(CamSensorResID, _pendingSensorRes);
-                    compute.SetVector(CamCurrentResID, _pendingCurrentRes);
-                    compute.SetFloat(CamExposureID, cameraExposure);
-                }
-                else
-                {
-                    compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID,
-                        _dummyCamTex);
-                    compute.SetInt(CamAvailableID, 0);
-                }
+                compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID, _camFrameCopy);
+                compute.SetInt(CamAvailableID, 1);
+                compute.SetVector(CamPosID, _pendingCamPos);
+                compute.SetMatrix(CamInvRotID, Matrix4x4.Rotate(Quaternion.Inverse(_pendingCamRot)));
+                compute.SetVector(CamFocalLenID, _pendingFocalLen);
+                compute.SetVector(CamPrincipalPtID, _pendingPrincipalPt);
+                compute.SetVector(CamSensorResID, _pendingSensorRes);
+                compute.SetVector(CamCurrentResID, _pendingCurrentRes);
+                compute.SetFloat(CamExposureID, cameraExposure);
+            }
+            else
+            {
+                compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID, _dummyCamTex);
+                compute.SetInt(CamAvailableID, 0);
             }
 
             _integrateKernel.Set(DepthCapture.DepthTexID, fusionDepth);
+            _integrateKernel.Set(DepthCapture.NormTexID, fusionNormal);
+            _integrateKernel.Set(DepthCapture.DilatedDepthTexID, fusionDilatedDepth);
+            _integrateKernel.Set(DepthCapture.EdgeReasonTexID, fusionEdgeReason);
             Texture temporalReason = fusionTemporalReason != null
                 ? fusionTemporalReason
                 : fusionEdgeReason; // texture binding must remain valid even when the diagnostic is unavailable
-            if (!enableInfiniTamBaseline)
-            {
-                _integrateKernel.Set(DepthCapture.NormTexID, fusionNormal);
-                _integrateKernel.Set(DepthCapture.DilatedDepthTexID,
-                    fusionDilatedDepth);
-                _integrateKernel.Set(DepthCapture.EdgeReasonTexID,
-                    fusionEdgeReason);
-                _integrateKernel.Set(DepthCapture.TemporalReasonTexID,
-                    temporalReason);
-                compute.SetInt(TemporalReasonAvailableID,
-                    fusionTemporalReasonAvailable ? 1 : 0);
-            }
+            _integrateKernel.Set(DepthCapture.TemporalReasonTexID, temporalReason);
+            compute.SetInt(TemporalReasonAvailableID, fusionTemporalReasonAvailable ? 1 : 0);
 
             // 枪胶不再只修整帧位姿：生产 A 直接消费“同一延迟帧”的逐点证据。
             // Correspondence.w 编码稳定候选、平台/预处理双证词与反对票状态；
@@ -5020,18 +4899,14 @@ namespace Genesis.RoomScan
             // 诊断会话启动失败而静默旁路回普通 TSDF 写入。
             bool finalCourtGateActive = finalCourtAdmissionActive &&
                                         gunGelAdmissionActive;
-            if (!enableInfiniTamBaseline)
-            {
-                _integrateKernel.Set(GunGelObservationsID, gunGelObservations);
-                _integrateKernel.Set(GunGelCorrespondencesID,
-                    gunGelCorrespondences);
-                _integrateKernel.Set(GunGelCorrespondenceIdentityID,
-                    gunGelCorrespondenceIdentity);
-                _integrateKernel.Set(FinalCourtVerdictsID, finalCourtVerdicts);
-                _integrateKernel.Set(FinalCourtPlanesID, finalCourtPlanes);
-                _integrateKernel.Set(FinalCourtGenerationsID,
-                    finalCourtGenerations);
-            }
+            _integrateKernel.Set(GunGelObservationsID, gunGelObservations);
+            _integrateKernel.Set(GunGelCorrespondencesID, gunGelCorrespondences);
+            _integrateKernel.Set(GunGelCorrespondenceIdentityID,
+                gunGelCorrespondenceIdentity);
+            _integrateKernel.Set(FinalCourtVerdictsID, finalCourtVerdicts);
+            _integrateKernel.Set(FinalCourtPlanesID, finalCourtPlanes);
+            _integrateKernel.Set(FinalCourtGenerationsID,
+                finalCourtGenerations);
             compute.SetInts(GunGelObservationGridID,
                 gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridX : 1,
                 gunGelIdentityAvailable ? deferredFrame.Decision.FusionObservationGridY : 1);
@@ -5053,9 +4928,8 @@ namespace Genesis.RoomScan
             uint shellWitnessEpoch = 0u;
             uint shellWitnessMaxAge = 0u;
             bool shellWitnessActive = false;
-            if (!enableInfiniTamBaseline)
-                _integrateKernel.Set(ShellWitnessEpochsID,
-                    shellWitnessActive ? shellWitnessEpochs : _dummyShellWitnessEpochs);
+            _integrateKernel.Set(ShellWitnessEpochsID,
+                shellWitnessActive ? shellWitnessEpochs : _dummyShellWitnessEpochs);
             compute.SetInts(ShellWitnessCellCountID,
                 shellWitnessActive ? shellWitnessCellCount.x : 1,
                 shellWitnessActive ? shellWitnessCellCount.y : 1,
@@ -5158,6 +5032,7 @@ namespace Genesis.RoomScan
                 InvalidateFinalCourtReplacements(courtSession);
             compute.SetFloat(UseRawProjectiveSdfID, enableInfiniTamBaseline ? 1f : 0f);
             compute.SetFloat(InfiniTamBaselineID, enableInfiniTamBaseline ? 1f : 0f);
+            ConfigureCompactInfiniTamHistory();
             if (enableInfiniTamBaseline)
             {
                 // This is a mutually-exclusive reconstruction baseline, not a
@@ -5178,8 +5053,7 @@ namespace Genesis.RoomScan
             compute.SetFloat(ConfidenceWriteID, 1f); // 主卷记置信度账
             _integrateKernel.Set(VolumeRWID, _volume);
             _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
-            if (!enableInfiniTamBaseline)
-                _integrateKernel.Set(CarveStatsID, _carveStats);
+            _integrateKernel.Set(CarveStatsID, _carveStats);
             // Bootstrap observations do not pass through the async tracker, so
             // count them here at the actual production dispatch.  Tracked
             // observations were counted once when their exact frame was queued.

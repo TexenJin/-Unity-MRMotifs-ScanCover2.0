@@ -12,51 +12,17 @@ namespace Genesis.RoomScan
         [SerializeField] private Material gpuMeshMaterial;
         [SerializeField, Tooltip("线框显示前先用无色深度壳遮住后层网格。只影响显示，不修改 TSDF、顶点或索引。")]
         private bool occludeRearWireframe = true;
-
-        // Display-only A/B gate shared by every live mesh page.  HERA and the
-        // block pipelines create many GPUMeshRenderer instances over time, so
-        // an instance-local runtime switch would leave old/new pages in mixed
-        // states and make the GPU comparison invalid.
-        private static bool s_rearWireDepthPrepassEnabled = true;
-        private static bool s_trueLinePrimitivesEnabled = true;
+        [SerializeField, Min(0f), Tooltip("背面遮挡预写的显示距离。0=不限；默认 4 米，与线框观察范围一致。")]
+        private float rearWireOccluderMaxViewDistance = 4f;
 
         private IGPUMeshBufferSource _meshSource;
         private MaterialPropertyBlock _props;
         private Material _rearWireOccluderMaterial;
-        private Material _trueLineMaterial;
         private bool _ready;
         private Bounds _bounds;
 
         public int LastSubmittedVertexCount { get; private set; }
         public int LastSubmittedFrame { get; private set; } = -1;
-
-        public static bool RearWireDepthPrepassEnabled =>
-            s_rearWireDepthPrepassEnabled;
-
-        public static bool TrueLinePrimitivesEnabled =>
-            s_trueLinePrimitivesEnabled;
-
-        public static void SetRearWireDepthPrepassEnabled(bool enabled)
-        {
-            s_rearWireDepthPrepassEnabled = enabled;
-        }
-
-        public static bool ToggleRearWireDepthPrepass()
-        {
-            s_rearWireDepthPrepassEnabled = !s_rearWireDepthPrepassEnabled;
-            return s_rearWireDepthPrepassEnabled;
-        }
-
-        public static void SetTrueLinePrimitivesEnabled(bool enabled)
-        {
-            s_trueLinePrimitivesEnabled = enabled;
-        }
-
-        public static bool ToggleTrueLinePrimitives()
-        {
-            s_trueLinePrimitivesEnabled = !s_trueLinePrimitivesEnabled;
-            return s_trueLinePrimitivesEnabled;
-        }
 
         private static readonly int ID_SurfaceVerts = Shader.PropertyToID("_SurfaceVerts");
         private static readonly int ID_SurfaceIndices = Shader.PropertyToID("_SurfaceIndices");
@@ -69,10 +35,10 @@ namespace Genesis.RoomScan
         private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
         private static readonly int ID_Wireframe = Shader.PropertyToID("_RSWireframe");
         private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
-        private static readonly int ID_TrueLineQuadTopology =
-            Shader.PropertyToID("_RSTrueLineQuadTopology");
-        private static readonly int ID_BoundaryUnificationDiagnostic =
-            Shader.PropertyToID("_RSBoundaryUnificationDiagnostic");
+        private static readonly int ID_DepthPrepassMaxViewDistance =
+            Shader.PropertyToID("_RSDepthPrepassMaxViewDistance");
+        private const float DepthPrepassBoundsCullPadding = 0.15f;
+        private static Camera s_mainCamera;
 
         // Display-only A/B colors. They never feed back into extraction or TSDF state.
         private static readonly Color ProductionColor = new Color(1.0f, 0.62f, 0.02f, 0.96f);
@@ -86,8 +52,6 @@ namespace Genesis.RoomScan
         private bool _temporalIllegalCandidateActive;
         private bool _heraReplayActive;
         private bool _productGridMode;
-        private bool _trueLineQuadTopology;
-        private bool _boundaryUnificationDiagnostic;
 
         private bool _renderVisible = true;
 
@@ -174,27 +138,6 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// The compact InfiniTAM front emits each native surface quad as two
-        /// consecutive triangles. Draw the four perimeter edges and their one
-        /// shared diagonal exactly once so the display matches the real
-        /// triangle topology without double-submitting the split edge.
-        /// </summary>
-        public void SetTrueLineQuadTopology(bool enabled)
-        {
-            _trueLineQuadTopology = enabled;
-        }
-
-        /// <summary>
-        /// Display-only proof for InfiniTAM boundary representative sharing.
-        /// Blue is an interior edge, green is a reconciled boundary edge and
-        /// red is a boundary edge whose halo representative stayed unresolved.
-        /// </summary>
-        public void SetBoundaryUnificationDiagnostic(bool enabled)
-        {
-            _boundaryUnificationDiagnostic = enabled;
-        }
-
-        /// <summary>
         /// Display-only quarantine for confirmation-only mixed triangles.
         /// The TSDF, admission trace and cumulative ledger remain untouched.
         /// </summary>
@@ -236,7 +179,6 @@ namespace Genesis.RoomScan
             var idxBuf = _meshSource.IndexBuffer;
             var admissionBuf = _meshSource.VertexAdmissionClassBuffer;
             var argsBuf = _meshSource.DrawIndirectArgs;
-            var lineArgsBuf = _meshSource.LineDrawIndirectArgs;
             int knownDrawVertexCount = _meshSource.KnownDrawVertexCount;
 
             if (vertBuf == null || idxBuf == null || admissionBuf == null ||
@@ -255,12 +197,9 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
             _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
-            bool useQuadTopology = _trueLineQuadTopology &&
-                knownDrawVertexCount >= 6 && knownDrawVertexCount % 6 == 0;
-            _props.SetFloat(ID_TrueLineQuadTopology,
-                useQuadTopology ? 1f : 0f);
-            _props.SetFloat(ID_BoundaryUnificationDiagnostic,
-                _boundaryUnificationDiagnostic ? 1f : 0f);
+            _props.SetFloat(ID_DepthPrepassMaxViewDistance,
+                rearWireOccluderMaxViewDistance);
+
             var rp = new RenderParams(gpuMeshMaterial)
             {
                 worldBounds = _bounds,
@@ -274,25 +213,10 @@ namespace Genesis.RoomScan
                 Shader.GetGlobalFloat(ID_Wireframe) > 0.5f ||
                 Shader.GetGlobalFloat(ID_PaperGridMode) > 0.5f ||
                 _productGridMode;
-            bool ordinaryWireframe =
-                Shader.GetGlobalFloat(ID_Wireframe) > 0.5f &&
-                Shader.GetGlobalFloat(ID_PaperGridMode) <= 0.5f &&
-                !_productGridMode;
-            bool useTrueLines =
-                s_trueLinePrimitivesEnabled &&
-                ordinaryWireframe &&
-                ((knownDrawVertexCount > 0 &&
-                  knownDrawVertexCount <= int.MaxValue / 2) ||
-                  (knownDrawVertexCount < 0 && lineArgsBuf != null)) &&
-                EnsureTrueLineMaterial();
-            if (occludeRearWireframe && s_rearWireDepthPrepassEnabled &&
-                lineSurfaceVisible &&
+            if (occludeRearWireframe && lineSurfaceVisible &&
+                !IsEntirelyOutsideDepthPrepassRange(rearWireOccluderMaxViewDistance) &&
                 EnsureRearWireOccluderMaterial())
             {
-                // Fill only the depth buffer with the nearest complete triangle
-                // surface.  The passthrough colour remains untouched, while the
-                // following wire pass can no longer reveal displaced sheets and
-                // long triangles behind that nearest surface through every cell.
                 var depthRp = new RenderParams(_rearWireOccluderMaterial)
                 {
                     worldBounds = _bounds,
@@ -304,66 +228,26 @@ namespace Genesis.RoomScan
                 Submit(depthRp, knownDrawVertexCount, argsBuf);
             }
 
-            if (useTrueLines)
-            {
-                var lineRp = new RenderParams(_trueLineMaterial)
-                {
-                    worldBounds = _bounds,
-                    matProps = _props,
-                    receiveShadows = false,
-                    shadowCastingMode = ShadowCastingMode.Off,
-                    layer = gameObject.layer
-                };
-
-                // Ordinary snapshots expose all three triangle edges. The compact
-                // InfiniTAM front has a stronger contract: every six indices are
-                // one two-triangle group, so ten line vertices cover its four
-                // outside edges and shared diagonal exactly once. Both routes
-                // avoid rasterizing triangle interiors.
-                if (knownDrawVertexCount > 0)
-                {
-                    int lineVertexCount = useQuadTopology
-                        ? knownDrawVertexCount / 6 * 10
-                        : knownDrawVertexCount * 2;
-                    Graphics.RenderPrimitives(
-                        lineRp,
-                        MeshTopology.Lines,
-                        lineVertexCount,
-                        1);
-                }
-                else
-                {
-                    Graphics.RenderPrimitivesIndirect(
-                        lineRp,
-                        MeshTopology.Lines,
-                        lineArgsBuf,
-                        1);
-                }
-            }
-            else
-            {
-                // Unknown-count indirect buffers, paper/product grids and the
-                // explicit A/B fallback retain the proven triangle path.
-                Submit(rp, knownDrawVertexCount, argsBuf);
-            }
-            LastSubmittedVertexCount = knownDrawVertexCount > 0 ? knownDrawVertexCount : -1;
+            Submit(rp, knownDrawVertexCount, argsBuf);
+            LastSubmittedVertexCount = knownDrawVertexCount > 0
+                ? knownDrawVertexCount
+                : -1;
             LastSubmittedFrame = Time.frameCount;
         }
 
-        private bool EnsureTrueLineMaterial()
+        private bool IsEntirelyOutsideDepthPrepassRange(float maxDistance)
         {
-            if (_trueLineMaterial != null)
-                return true;
-
-            Shader shader = Resources.Load<Shader>("ScanMeshTrueLines");
-            if (shader == null)
+            if (maxDistance <= 0f)
                 return false;
 
-            _trueLineMaterial = new Material(shader)
-            {
-                name = "[QRS] True Mesh Lines"
-            };
-            return true;
+            if (s_mainCamera == null)
+                s_mainCamera = Camera.main;
+            if (s_mainCamera == null)
+                return false;
+
+            float conservativeDistance = maxDistance + DepthPrepassBoundsCullPadding;
+            return _bounds.SqrDistance(s_mainCamera.transform.position) >
+                   conservativeDistance * conservativeDistance;
         }
 
         private bool EnsureRearWireOccluderMaterial()
@@ -382,14 +266,18 @@ namespace Genesis.RoomScan
             return true;
         }
 
-        private static void Submit(RenderParams rp, int knownDrawVertexCount, GraphicsBuffer argsBuf)
+        private static void Submit(RenderParams rp, int knownDrawVertexCount,
+            GraphicsBuffer argsBuf)
         {
             if (knownDrawVertexCount > 0)
             {
                 // Immutable chunk/HERA snapshots already completed an async GPU
                 // readback, so their exact index count is authoritative on the
-                // CPU. Draw them directly instead of reinterpreting the old
+                // CPU.  Draw them directly instead of reinterpreting the old
                 // five-uint argument buffer as platform-specific IndirectDrawArgs.
+                // This keeps parent32 visibility independent from Vulkan's
+                // indirect-command layout while preserving the same SV_VertexID
+                // index fetch used by the shader.
                 Graphics.RenderPrimitives(rp, MeshTopology.Triangles, knownDrawVertexCount, 1);
             }
             else
@@ -408,9 +296,6 @@ namespace Genesis.RoomScan
             if (_rearWireOccluderMaterial != null)
                 Destroy(_rearWireOccluderMaterial);
             _rearWireOccluderMaterial = null;
-            if (_trueLineMaterial != null)
-                Destroy(_trueLineMaterial);
-            _trueLineMaterial = null;
         }
 
         private void OnEnable()
