@@ -339,6 +339,7 @@ def build(session: Path, output: Path) -> dict[str, object]:
 
     timeline: list[dict[str, object]] = []
     lineage: list[dict[str, object]] = []
+    cause_classification: list[dict[str, object]] = []
     factor_records: list[dict[str, object]] = []
     blocker_totals: Counter[str] = Counter()
     for stage in stage_rows:
@@ -380,6 +381,13 @@ def build(session: Path, output: Path) -> dict[str, object]:
         site_matches: list[dict[str, str]] = []
         source_preprocess: list[float] = []
         source_sdf: list[float] = []
+        source_platform_sdf: list[float] = []
+        source_processed_sdf: list[float] = []
+        source_fusion_sdf: list[float] = []
+        source_fusion_processed_delta: list[float] = []
+        last_geometry_platform_sdf: list[float] = []
+        last_geometry_processed_sdf: list[float] = []
+        last_geometry_fusion_sdf: list[float] = []
         incidences: list[float] = []
         ranges: list[float] = []
         source_items = samples or [{}]
@@ -393,9 +401,24 @@ def build(session: Path, output: Path) -> dict[str, object]:
                 incidences.append(number(testimony.get("incidenceAbs")))
                 ranges.append(number(testimony.get("rangeM")))
             preprocess = number(sample.get("processedMinusRawMm"))
-            projective_sdf = number(sample.get("rawProjectiveSdfMm"))
+            projective_sdf = number(sample.get(
+                "fusionProjectiveSdfMm", sample.get("rawProjectiveSdfMm")))
+            platform_sdf = number(sample.get("platformProjectiveSdfMm"))
+            processed_sdf = number(sample.get("processedProjectiveSdfMm"))
+            fusion_depth = number(sample.get("fusionDepthM"))
+            processed_depth = number(sample.get("processedDepthM"))
             source_preprocess.append(abs(preprocess))
             source_sdf.append(abs(projective_sdf))
+            source_platform_sdf.append(abs(platform_sdf))
+            source_processed_sdf.append(abs(processed_sdf))
+            source_fusion_sdf.append(abs(projective_sdf))
+            if finite(fusion_depth) and finite(processed_depth):
+                source_fusion_processed_delta.append(
+                    abs(fusion_depth - processed_depth) * 1000.0)
+            if sample.get("role") == "last_geometry":
+                last_geometry_platform_sdf.append(abs(platform_sdf))
+                last_geometry_processed_sdf.append(abs(processed_sdf))
+                last_geometry_fusion_sdf.append(abs(projective_sdf))
             row: dict[str, object] = {
                 "siteId": identifier,
                 "chunkX": address[0], "chunkY": address[1], "chunkZ": address[2],
@@ -424,6 +447,10 @@ def build(session: Path, output: Path) -> dict[str, object]:
                 "processedDepthM": sample.get("processedDepthM", ""),
                 "processedMinusRawMm": sample.get("processedMinusRawMm", ""),
                 "rawProjectiveSdfMm": sample.get("rawProjectiveSdfMm", ""),
+                "fusionProjectiveSdfMm": sample.get(
+                    "fusionProjectiveSdfMm", sample.get("rawProjectiveSdfMm", "")),
+                "platformProjectiveSdfMm": sample.get("platformProjectiveSdfMm", ""),
+                "processedProjectiveSdfMm": sample.get("processedProjectiveSdfMm", ""),
                 "angularDegPerSec": sample.get("angularDegPerSec", ""),
                 "linearMps": sample.get("linearMps", ""),
                 "headPitchDeg": sample.get("headPitchDeg", ""),
@@ -502,6 +529,125 @@ def build(session: Path, output: Path) -> dict[str, object]:
             "no_material_final_deformation": "no_material_deformation_detected",
             "not_comparable": "unresolved_not_comparable",
         }.get(first_stage, first_stage)
+
+        # Classify the earliest internally observable cause of a deformed site.
+        # This is deliberately a ledger judgement, not a production gate.  The
+        # platform witness is already Meta's environment depth, so the tool may
+        # distinguish "before QRS" from "inside QRS" but must not claim a
+        # physical sensor fault without an external ground-truth surface.
+        preprocess_p95 = percentile(source_preprocess, 0.95)
+        binding_p95 = percentile(source_fusion_processed_delta, 0.95)
+        platform_basis = (last_geometry_platform_sdf or source_platform_sdf)
+        processed_basis = (last_geometry_processed_sdf or source_processed_sdf)
+        fusion_basis = (last_geometry_fusion_sdf or source_fusion_sdf)
+        platform_sdf_p50 = percentile(platform_basis, 0.50)
+        processed_sdf_p50 = percentile(processed_basis, 0.50)
+        fusion_sdf_p50 = percentile(fusion_basis, 0.50)
+        platform_sdf_p95 = percentile(platform_basis, 0.95)
+        processed_sdf_p95 = percentile(processed_basis, 0.95)
+        final_weights = [abs(number(item.get("finalWeight"))) for item in endpoints]
+        last_to_final = [abs(number(item.get("lastToFinalMm"))) for item in endpoints]
+        blocked_deltas = [abs(number(item.get("strongestBlockDeltaMm")))
+                          for item in endpoints
+                          if integer(item.get("strongestBlockIntegration"), 0) > 0]
+        blocked_fraction = (blocked_endpoints / len(endpoints)) if endpoints else math.nan
+        block_delta_p95 = percentile(blocked_deltas, 0.95)
+        last_to_final_p95 = percentile(last_to_final, 0.95)
+        final_weight_p50 = percentile(final_weights, 0.50)
+        surface_support_limit_mm = max(10.0, voxel_size * 250.0)
+        preprocess_shift_limit_mm = max(5.0, voxel_size * 50.0)
+        binding_limit_mm = 2.0
+
+        primary_cause = "UNRESOLVED_INSUFFICIENT_EVIDENCE"
+        cause_detail = "required stage-linked depth or TSDF samples are missing"
+        if first_stage in ("surface_nets_cell_reduction", "post_extract_transform"):
+            primary_cause = "POST_TSDF_EXTRACTION_OR_TRANSFORM"
+            cause_detail = "TSDF crossing stayed flatter than the extracted or transformed paper"
+        elif first_stage == "no_material_final_deformation":
+            primary_cause = "NO_MATERIAL_DEFORMATION_DETECTED"
+            cause_detail = "the final comparable paper did not retain a material deformation"
+        elif first_stage == "not_comparable":
+            primary_cause = "UNRESOLVED_NOT_PLANE_COMPARABLE"
+            cause_detail = "the local site cannot yet be compared to a stable plane"
+        elif first_stage == "tsdf_zero_crossing":
+            if binding_p95 is not None and binding_p95 >= binding_limit_mm:
+                primary_cause = "FUSION_INPUT_BINDING_OR_POSE_MISMATCH"
+                cause_detail = (
+                    "the depth sampled by fusion differs from the paired post-QRS depth "
+                    "at the same projected site")
+            elif (preprocess_p95 is not None and
+                  preprocess_p95 >= preprocess_shift_limit_mm and
+                  platform_sdf_p50 is not None and processed_sdf_p50 is not None and
+                  processed_sdf_p50 + preprocess_shift_limit_mm <= platform_sdf_p50):
+                primary_cause = "QRS_PREPROCESSING_MOVED_DEPTH_TOWARD_BAD_SURFACE"
+                cause_detail = (
+                    "post-QRS depth moved materially closer to the deformed zero surface "
+                    "than the platform witness")
+            elif (blocked_fraction == blocked_fraction and blocked_fraction >= 0.20 and
+                  block_delta_p95 is not None and
+                  block_delta_p95 >= preprocess_shift_limit_mm):
+                primary_cause = "TSDF_CORRECTION_BLOCKED_OR_UNDERWEIGHTED"
+                cause_detail = (
+                    "later observations contradicted the stored zero surface but a TSDF "
+                    "gate or weight policy retained it")
+            elif (platform_sdf_p50 is not None and
+                  platform_sdf_p50 <= surface_support_limit_mm and
+                  processed_sdf_p50 is not None and
+                  processed_sdf_p50 <= surface_support_limit_mm):
+                primary_cause = "UPSTREAM_PLATFORM_DEPTH_OR_POSE_SUPPORTED_DEFORMATION"
+                cause_detail = (
+                    "pre-QRS and post-QRS observations both support the already deformed "
+                    "site; this ledger cannot split Meta depth from pose/calibration")
+            elif (processed_sdf_p50 is not None and
+                  processed_sdf_p50 > surface_support_limit_mm):
+                primary_cause = "TSDF_HISTORY_RETENTION_OR_CROSS_SURFACE_MIXING"
+                cause_detail = (
+                    "the post-QRS observations do not support the final deformed crossing, "
+                    "so the divergence is retained or mixed inside TSDF history")
+            elif (last_to_final_p95 is not None and
+                  last_to_final_p95 >= preprocess_shift_limit_mm):
+                primary_cause = "TSDF_HISTORY_CHANGED_AFTER_LAST_ATTRIBUTED_WRITE"
+                cause_detail = (
+                    "the final TSDF moved materially beyond the last attributable geometry write")
+
+        evidence_count = len([value for value in (
+            preprocess_p95, binding_p95, platform_sdf_p50, processed_sdf_p50,
+            fusion_sdf_p50, final_weight_p50) if value is not None])
+        cause_confidence = ("high" if len(endpoints) >= 4 and len(samples) >= 6 and
+                            evidence_count >= 4 else
+                            "medium" if len(endpoints) >= 2 and len(samples) >= 2 and
+                            evidence_count >= 2 else "low")
+        cause_classification.append({
+            "siteId": identifier,
+            "chunkX": address[0], "chunkY": address[1], "chunkZ": address[2],
+            "binX": address[3], "binY": address[4], "binZ": address[5],
+            "localMinX": stage.get("local_min_x_m", ""),
+            "localMinY": stage.get("local_min_y_m", ""),
+            "localMinZ": stage.get("local_min_z_m", ""),
+            "localMaxX": stage.get("local_max_x_m", ""),
+            "localMaxY": stage.get("local_max_y_m", ""),
+            "localMaxZ": stage.get("local_max_z_m", ""),
+            "firstDeformationStage": first_stage,
+            "primaryCause": primary_cause,
+            "confidence": cause_confidence,
+            "causeDetail": cause_detail,
+            "sourceSamples": len(samples),
+            "endpointSamples": len(endpoints),
+            "platformToProcessedAbsP95Mm": preprocess_p95,
+            "processedToFusionAbsP95Mm": binding_p95,
+            "platformSurfaceResidualP50Mm": platform_sdf_p50,
+            "platformSurfaceResidualP95Mm": platform_sdf_p95,
+            "processedSurfaceResidualP50Mm": processed_sdf_p50,
+            "processedSurfaceResidualP95Mm": processed_sdf_p95,
+            "fusionSurfaceResidualP50Mm": fusion_sdf_p50,
+            "blockedCorrectionFraction": blocked_fraction,
+            "blockedCorrectionDeltaP95Mm": block_delta_p95,
+            "lastAttributedWriteToFinalP95Mm": last_to_final_p95,
+            "finalWeightP50": final_weight_p50,
+            "surfaceSupportLimitMm": surface_support_limit_mm,
+            "preprocessShiftLimitMm": preprocess_shift_limit_mm,
+            "truthBoundary": "platform_pre_qrs_is_not_sensor_raw_or_physical_ground_truth",
+        })
         amplifiers: list[str] = []
         if blocked_endpoints:
             amplifiers.append("blocked_later_tsdf_correction")
@@ -542,6 +688,8 @@ def build(session: Path, output: Path) -> dict[str, object]:
             "sourceSampleCount": len(samples),
             "rawToProcessedAbsP95Mm": percentile(source_preprocess, 0.95),
             "rawProjectiveSdfAbsP95Mm": percentile(source_sdf, 0.95),
+            "primaryCause": primary_cause,
+            "causeConfidence": cause_confidence,
             "courtMatchedTestimonies": len(site_matches),
             "courtStableIds": len(by_stable),
             "courtWithinStableLayerSpreadP95Mm": testimony_spread_p95,
@@ -607,7 +755,8 @@ def build(session: Path, output: Path) -> dict[str, object]:
         "lastPublishedPlaneCandidate", "lastPublishedRmsMm",
         "sourceFrame", "integrationCount", "tsdfRole", "attemptIndex", "dirtyEpoch",
         "fusionDepthM", "platformRawDepthM", "processedDepthM", "processedMinusRawMm",
-        "rawProjectiveSdfMm", "angularDegPerSec", "linearMps", "headPitchDeg",
+        "rawProjectiveSdfMm", "fusionProjectiveSdfMm", "platformProjectiveSdfMm",
+        "processedProjectiveSdfMm", "angularDegPerSec", "linearMps", "headPitchDeg",
         "headYawDeg", "headRollDeg", "motionQuality", "courtSpatialJoin",
         "gunGelSampleIndex", "gunGelCandidateIndex", "gunGelStableId",
         "gunGelDualSupportFrames", "gunGelOppositionVotes", "gunGelEvidenceFlags",
@@ -618,12 +767,14 @@ def build(session: Path, output: Path) -> dict[str, object]:
     ]
     lineage_fields = list(lineage[0].keys()) if lineage else ["siteId"]
     factor_fields = list(factor_output[0].keys()) if factor_output else ["factor", "bucket"]
+    cause_fields = list(cause_classification[0].keys()) if cause_classification else ["siteId"]
     trace_fields = sorted({field for item in trace for field in item},
                           key=lambda name: (name != "rowType", name)) or ["rowType"]
     write_csv(output / "surface_site_timeline.csv", timeline, timeline_fields)
     write_csv(output / "court_decision_trace.csv", trace, trace_fields)
     write_csv(output / "roughness_lineage.csv", lineage, lineage_fields)
     write_csv(output / "factor_responsibility.csv", factor_output, factor_fields)
+    write_csv(output / "cause_classification.csv", cause_classification, cause_fields)
 
     missing = []
     for name, present in (
@@ -662,6 +813,9 @@ def build(session: Path, output: Path) -> dict[str, object]:
         "qualityTimelineRows": len(quality_rows),
         "motionConfirmQualityMin": motion_confirm_quality_min,
         "blockedCorrectionTotals": dict(sorted(blocker_totals.items())),
+        "causeClassificationCounts": dict(sorted(Counter(
+            str(item.get("primaryCause", "UNRESOLVED_INSUFFICIENT_EVIDENCE"))
+            for item in cause_classification).items())),
         "missingLanes": missing,
         "completeForNewCapture": len(missing) == 0,
         "outputs": {
@@ -669,10 +823,12 @@ def build(session: Path, output: Path) -> dict[str, object]:
             "courtTrace": "court_decision_trace.csv",
             "roughnessLineage": "roughness_lineage.csv",
             "factorResponsibility": "factor_responsibility.csv",
+            "causeClassification": "cause_classification.csv",
         },
         "convictionRule": "name earliest internally observed material divergence; keep later retention, blocking and amplification separate",
         "angleRule": "incidence, range, pitch and motion are joint factors; no single-factor conviction without cross-bucket separation",
         "truthBoundary": "platform pre-QRS depth is the earliest accessible depth, not sensor raw or an external physical surface reference",
+        "causeClassificationRule": "compare the same projected site across platform witness, post-QRS depth, fusion input, TSDF responsibility and final crossing; report the earliest supported internal divergence",
         "productionEffect": "none",
     }
     (output / "responsibility_summary.json").write_text(

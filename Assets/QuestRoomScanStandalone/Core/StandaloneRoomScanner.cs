@@ -12,8 +12,8 @@ namespace Genesis.RoomScan
     /// 砍掉：持久化、锚点、纹理精炼、三平面、关键帧、GSplat、房间理解、调试菜单。
     ///
     /// 所有兄弟组件挂在同一个 GameObject 上自动解析。
-    /// 输入由 <see cref="StandaloneScanInput"/> 处理：扳机采集，A 冻结共享
-    /// TSDF，Y 切 64/32/16，B 仅导出并清当前档，右摇杆切显示。
+    /// 输入由 <see cref="StandaloneScanInput"/> 处理：扳机采集/继续，A 冻结
+    /// 或继续，X 只在原始网格与同批成因剖面之间切换，B 保存并清空。
     /// </summary>
     [RequireComponent(typeof(DepthCapture), typeof(VolumeIntegrator), typeof(MeshExtractor))]
     public class StandaloneRoomScanner : MonoBehaviour
@@ -592,14 +592,11 @@ namespace Genesis.RoomScan
             RefreshStatusBadge();
         }
 
-        /// <summary>左摇杆右+按：32³融合管理块线框只读层。</summary>
-        public void ToggleManagementBlockWireOverlay()
+        /// <summary>旧管理块显示已退役；两档操作面不再暴露该入口。</summary>
+        private void DisableLegacyManagementBlockWireOverlay()
         {
-            showManagementBlockWireOverlay = !showManagementBlockWireOverlay;
+            showManagementBlockWireOverlay = false;
             EnsureManagementBlockWireOverlay();
-            _managementBlockWireOverlay?.SetVisible(showManagementBlockWireOverlay);
-            NotifyInput(showManagementBlockWireOverlay ? "32块框:开" : "32块框:关");
-            RefreshStatusBadge();
         }
 
         /// <summary>
@@ -646,9 +643,11 @@ namespace Genesis.RoomScan
         private UnityEngine.UI.Text _statusBadgeText;
         private UnityEngine.UI.Text _statusBadgeHeaderText;
         private UnityEngine.UI.Text _statusBadgeRightText;
-        private const float DiagnosticHudWidth = 2100f;
-        private const float DiagnosticHudHeaderHeight = 104f;
-        private const float DiagnosticHudPadding = 24f;
+        private const float DiagnosticHudWidth = 1040f;
+        private const float DiagnosticHudHeaderHeight = 58f;
+        private const float DiagnosticHudPadding = 14f;
+        private int _meshLayerEvidenceMode;
+        private bool _operatorFrozen;
         private GameObject _probeReticleRoot;
         private RectTransform _probeTargetMarkerRect;
         private UnityEngine.UI.Text _probeReticleLabel;
@@ -717,7 +716,7 @@ namespace Genesis.RoomScan
                 meshExtractionHz = 5f;
             }
             SyncCaptureModeIdentity();
-            EnsureManagementBlockWireOverlay();
+            DisableLegacyManagementBlockWireOverlay();
             _volumeIntegrator.Cleared += ResetFrozenBlockSupervisor;
             SetSafeShaderDefaults();
         }
@@ -732,25 +731,37 @@ namespace Genesis.RoomScan
             }
 
             if (enableHeadExclusion) SetupHeadExclusion();
+            _coverageOverlay = GetComponent<ObservationCoverageOverlay>();
             if (enableFrozenChunkAbExperiment)
             {
-                _coverageOverlay = GetComponent<ObservationCoverageOverlay>();
                 if (_coverageOverlay == null)
                     _coverageOverlay = gameObject.AddComponent<ObservationCoverageOverlay>();
                 _meshExtractor.PrepareForChunkAbAcquisition();
             }
+            else if (_coverageOverlay != null)
+            {
+                _coverageOverlay.SetMarkersVisible(false);
+                _coverageOverlay.SetAcquiring(false);
+                _coverageOverlay.enabled = false;
+            }
             _depthPointCloudOverlay = GetComponent<DepthPointCloudOverlay>();
-            if (_depthPointCloudOverlay == null)
-                _depthPointCloudOverlay = gameObject.AddComponent<DepthPointCloudOverlay>();
-            _depthPointCloudOverlay.SetVisible(false);
+            if (_depthPointCloudOverlay != null)
+            {
+                _depthPointCloudOverlay.SetVisible(false);
+                _depthPointCloudOverlay.enabled = false;
+            }
             _gunGelCourtOverlay = GetComponent<GunGelCourtOverlay>();
-            if (_gunGelCourtOverlay == null)
-                _gunGelCourtOverlay = gameObject.AddComponent<GunGelCourtOverlay>();
-            _gunGelCourtOverlay.SetVisible(false);
+            if (_gunGelCourtOverlay != null)
+            {
+                _gunGelCourtOverlay.SetVisible(false);
+                _gunGelCourtOverlay.enabled = false;
+            }
             _instantDepthShellOverlay = GetComponent<InstantDepthShellOverlay>();
-            if (_instantDepthShellOverlay == null)
-                _instantDepthShellOverlay = gameObject.AddComponent<InstantDepthShellOverlay>();
-            _instantDepthShellOverlay.SetVisible(false);
+            if (_instantDepthShellOverlay != null)
+            {
+                _instantDepthShellOverlay.SetVisible(false);
+                _instantDepthShellOverlay.enabled = false;
+            }
             StartCoroutine(ConfigureCameraForPassthrough());
             // 主操作 HUD 是采集契约的一部分，始终创建；不再受场景勾选项或
             // 采集/冻结档位控制。只有相机尚未生成时会等待相机。
@@ -781,12 +792,18 @@ namespace Genesis.RoomScan
 
             var root = new GameObject("[QRS] Minimal Status Badge");
             root.transform.SetParent(Camera.main.transform, false);
-            // Keep the compact operator prompt close to the optical centre.
-            // A centred pivot prevents its two-line height from pushing the
-            // whole plate downward as the prompt changes.
-            root.transform.localPosition = new Vector3(0f, -0.05f, 0.9f);
+            // Keep the badge horizontally centred and move it only modestly
+            // downward. This leaves the exact gaze centre clear while keeping
+            // the entire HUD comfortably inside the captured Quest view.
+            const float badgeDistance = 0.9f;
+            float halfHeight = Mathf.Tan(Camera.main.fieldOfView * 0.5f *
+                Mathf.Deg2Rad) * badgeDistance;
+            root.transform.localPosition = new Vector3(
+                0f, -0.32f * halfHeight, badgeDistance);
             root.transform.localRotation = Quaternion.identity;
-            root.transform.localScale = Vector3.one * 0.00036f;
+            // Large enough to read in Quest recording, but wholly inside the
+            // lower-centre band rather than the exact geometry inspection point.
+            root.transform.localScale = Vector3.one * 0.00026f;
 
             var canvas = root.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.WorldSpace;
@@ -795,7 +812,7 @@ namespace Genesis.RoomScan
             canvas.sortingOrder = 32760;
             var rootRect = root.GetComponent<RectTransform>();
             rootRect.pivot = new Vector2(0.5f, 0.5f);
-            rootRect.sizeDelta = new Vector2(DiagnosticHudWidth, 640f);
+            rootRect.sizeDelta = new Vector2(DiagnosticHudWidth, 230f);
 
             Material badgeMaterial = null;
             Material badgeBackgroundMaterial = null;
@@ -1070,6 +1087,8 @@ namespace Genesis.RoomScan
 
         private void RefreshStatusBadge()
         {
+            if (RefreshCompactOperatorHud())
+                return;
             if (_statusBadgeText == null) return;
 
             string runState;
@@ -1245,6 +1264,61 @@ namespace Genesis.RoomScan
                 badgeRect.sizeDelta = new Vector2(DiagnosticHudWidth,
                     Mathf.Max(showDetailedRuntimeStatus ? 640f : 190f, badgeHeight));
             }
+        }
+
+        private bool RefreshCompactOperatorHud()
+        {
+            if (_statusBadgeHeaderText == null || _statusBadgeText == null ||
+                _statusBadgeRightText == null)
+                return false;
+
+            string runState = IsSaveAndClearInProgress ? "保存" :
+                              _operatorFrozen ? "冻结" :
+                              IsScanning ? "采集" :
+                              HasStarted ? "暂停" : "待机";
+            string viewState = _meshLayerEvidenceMode switch
+            {
+                1 => "成因关系",
+                2 => "TSDF来源格",
+                3 => "TSDF推手箭头",
+                _ => "原始网格"
+            };
+            Color color = IsSaveAndClearInProgress
+                ? new Color(1f, 0.78f, 0.2f, 1f)
+                : _operatorFrozen
+                    ? new Color(0.25f, 0.95f, 1f, 1f)
+                    : IsScanning
+                        ? new Color(0.25f, 1f, 0.45f, 1f)
+                        : new Color(0.78f, 0.82f, 0.88f, 1f);
+
+            ScanReplaySessionPackage replayPackage = ScanReplaySessionPackage.Active ??
+                                                     ScanReplaySessionPackage.Latest;
+            string sealLine = replayPackage != null
+                ? replayPackage.SealHudCompact
+                : "封包:未开始 读0/写0/附0 帧0 校验0% 安全退出:否";
+            string saveLine = IsSaveAndClearInProgress
+                ? "B事务:停止采样 → 排空 → 导账 → 哈希 → 清卷"
+                : "扳机采集  A冻结/继续  X切换剖面  B封存并清卷";
+
+            _statusBadgeHeaderText.gameObject.SetActive(true);
+            _statusBadgeHeaderText.color = color;
+            _statusBadgeHeaderText.fontSize = 32;
+            _statusBadgeHeaderText.fontStyle = FontStyle.Bold;
+            _statusBadgeHeaderText.alignment = TextAnchor.MiddleLeft;
+            _statusBadgeHeaderText.text = _meshLayerEvidenceMode switch
+            {
+                1 => $"{runState}｜{viewState}｜{_hudStatus}\n黄交点 → 青SN均值｜白=同批网格\n{sealLine}\n{saveLine}",
+                2 => $"{runState}｜{viewState}｜{_hudStatus}\n粉/绿TSDF端点 → 黄交点｜蓝格=10cm单元\n{sealLine}\n{saveLine}",
+                3 => $"{runState}｜{viewState}｜{_hudStatus}\n洋红A/青B → 黄交点｜同色圈=主责端\n{sealLine}\n{saveLine}",
+                _ => $"{runState}｜{viewState}｜{_hudStatus}\n{sealLine}\n{saveLine}"
+            };
+            _statusBadgeText.gameObject.SetActive(false);
+            _statusBadgeRightText.gameObject.SetActive(false);
+
+            if (_statusBadgeHeaderText.transform.parent is RectTransform root)
+                root.sizeDelta = new Vector2(DiagnosticHudWidth,
+                    _meshLayerEvidenceMode > 0 ? 310f : 235f);
+            return true;
         }
 
         private string BuildPrimaryHudPrompt(string viewState, string seedState)
@@ -2092,6 +2166,11 @@ namespace Genesis.RoomScan
 
             if (!IsScanning || !DepthCapture.DepthAvailable) return;
 
+            // A is an observation freeze, not a camera/depth restart. Keep the
+            // providers alive but stop every production mutation and scheduler
+            // while HUD/display controls remain responsive above this point.
+            if (_operatorFrozen) return;
+
             float t = Time.time;
             TickFrozenBlockSupervisor(t);
             bool directTruthRoute = _meshExtractor != null &&
@@ -2794,15 +2873,22 @@ namespace Genesis.RoomScan
 
         private void EnsureManagementBlockWireOverlay()
         {
+            // The two-mode baseline must not silently instantiate a third
+            // visual layer. If an older scene serialized one, retire it.
             if (_managementBlockWireOverlay == null)
-                _managementBlockWireOverlay = GetComponent<FrozenBlockWireOverlay>() ??
-                                              gameObject.AddComponent<FrozenBlockWireOverlay>();
-            _managementBlockWireOverlay.SetVisible(showManagementBlockWireOverlay);
+                _managementBlockWireOverlay = GetComponent<FrozenBlockWireOverlay>();
+            if (_managementBlockWireOverlay == null)
+                return;
+            showManagementBlockWireOverlay = false;
+            _managementBlockWireOverlay.SetVisible(false);
+            _managementBlockWireOverlay.enabled = false;
         }
 
         private void RefreshManagementBlockWireOverlay()
         {
             EnsureManagementBlockWireOverlay();
+            if (_managementBlockWireOverlay == null)
+                return;
             if (_volumeIntegrator == null || !_volumeIntegrator.FrozenBlockReady)
             {
                 _managementBlockWireOverlay.Clear();
@@ -3832,6 +3918,8 @@ namespace Genesis.RoomScan
                 _cameraAvailable = false;
 
                 bool resuming = HasStarted;
+                _operatorFrozen = false;
+                _meshExtractor?.SetLayerObservationFrozen(false);
                 if (!resuming)
                 {
                     _instantDepthShellOverlay?.ResetProductionWitnessLedger();
@@ -3910,6 +3998,85 @@ namespace Genesis.RoomScan
             _hudStatus = "已暂停";
             RefreshStatusBadge();
             ScanStopped?.Invoke();
+        }
+
+        /// <summary>
+        /// A-key observation freeze. It leaves the providers alive, but stops
+        /// TSDF writes, extraction and publication while retaining the current
+        /// Front and its immutable same-candidate layer evidence. Pressing A
+        /// again resumes the same volume without restarting camera/depth.
+        /// </summary>
+        public void ToggleOperatorFreeze()
+        {
+            if (IsSaveAndClearInProgress)
+                return;
+
+            if (IsScanning)
+            {
+                if (!_operatorFrozen)
+                {
+                    _operatorFrozen = true;
+                    _depthPointCloudOverlay?.SetAcquiring(false);
+                    _instantDepthShellOverlay?.SetAcquiring(false);
+                    _meshExtractor?.SetLayerObservationFrozen(true);
+                    _hudStatus = "观察冻结";
+                    NotifyInput("已冻结：网格与同批黄青证据保持可观察");
+                }
+                else
+                {
+                    _operatorFrozen = false;
+                    _meshExtractor?.SetLayerObservationFrozen(false);
+                    _depthPointCloudOverlay?.SetAcquiring(true);
+                    _instantDepthShellOverlay?.SetAcquiring(true);
+                    float resumeTime = Time.time;
+                    _lastIntegrationTime = resumeTime;
+                    _lastMeshTime = resumeTime;
+                    _lastConfidenceStatsTime = resumeTime;
+                    _hudStatus = "扫描中(观察恢复)";
+                    NotifyInput("继续采集：未重启深度设备");
+                }
+                RefreshStatusBadge();
+                return;
+            }
+
+            if (HasStarted)
+            {
+                _operatorFrozen = false;
+                _meshExtractor?.SetLayerObservationFrozen(false);
+                NotifyInput("继续采集");
+                RefreshStatusBadge();
+                _ = StartScanningAsync();
+                return;
+            }
+
+            NotifyInput("尚未开始：先按扳机");
+        }
+
+        /// <summary>
+        /// X-key four-state display switch. All evidence modes use only data
+        /// captured by the exact ClassifyAndEmit call that produced each
+        /// published block; legacy point-cloud/shell/court display gears are
+        /// forcibly hidden and no longer reachable from the controller.
+        /// </summary>
+        public void ToggleMeshLayerEvidenceView()
+        {
+            _meshLayerEvidenceMode = (_meshLayerEvidenceMode + 1) % 4;
+            _shellPaperOnlyView = false;
+            _coverageOverlay?.SetMarkersVisible(false);
+            _depthPointCloudOverlay?.SetVisible(false);
+            _gunGelCourtOverlay?.SetVisible(false);
+            _instantDepthShellOverlay?.SetVisible(false);
+            _managementBlockWireOverlay?.SetVisible(false);
+            _meshExtractor?.SetProductionMeshVisible(_meshLayerEvidenceMode < 2);
+            _meshExtractor?.SetLayerEvidenceMode(_meshLayerEvidenceMode);
+            NotifyInput(_meshLayerEvidenceMode switch
+            {
+                1 => "成因关系：白网格 / 黄零交叉 → 青SN均值",
+                2 => "TSDF来源格：正负端点 → 黄零交叉 / 10cm单元（无白网格）",
+                3 => "TSDF权责：洋红A / 青B → 黄零交叉；同色圈标主责端",
+                _ => "原始网格"
+            });
+            RefreshStatusBadge();
         }
 
         /// <summary>
@@ -4070,7 +4237,14 @@ namespace Genesis.RoomScan
             IsSaveAndClearInProgress = true;
             bool wasActive = IsScanning || HasStarted;
             PauseScanning();
-            _hudStatus = "正在保存";
+            // Stop the replay recorder before touching either ledger or volume.
+            // Keep the exact package reference: Latest may change on a later run,
+            // but this B transaction must await the package that owns these writes.
+            ScanReplaySessionPackage replayPackage =
+                _depthCapture != null
+                    ? _depthCapture.StopReplayCaptureForSeal()
+                    : ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
+            _hudStatus = "B封存：导出累计账";
             RefreshStatusBadge();
 
             string ledgerPath = "";
@@ -4089,10 +4263,47 @@ namespace Genesis.RoomScan
                 yield break;
             }
 
+            // A scan without its owning replay package has no way to prove that
+            // depth/fusion/artifact callbacks are finished. Never clear the only
+            // surviving TSDF merely because the mesh ledger happened to export.
+            if (wasActive && replayPackage == null)
+            {
+                _hudStatus = "封包未建立，未清卷";
+                Logger.Error("B键找不到本轮回放封包：已保留TSDF/网格，禁止无收据清卷");
+                IsSaveAndClearInProgress = false;
+                RefreshStatusBadge();
+                yield break;
+            }
+
+            if (replayPackage != null)
+            {
+                _hudStatus = "B封存：等待排空/校验（禁止退出）";
+                RefreshStatusBadge();
+                while (!replayPackage.IsSafelySealed && !replayPackage.HasSealFailed)
+                {
+                    // Refresh independently of mesh cadence so the operator sees
+                    // draining/outstanding/hash progress throughout the B wait.
+                    RefreshStatusBadge();
+                    yield return null;
+                }
+
+                if (replayPackage.HasSealFailed)
+                {
+                    _hudStatus = "封包失败，未清卷";
+                    Logger.Error("B键封包失败：" + replayPackage.FinalizeIssue +
+                                 "；TSDF/网格仍保留，可导出后重试");
+                    IsSaveAndClearInProgress = false;
+                    RefreshStatusBadge();
+                    yield break;
+                }
+            }
+
             // Invalidate outstanding GPU readbacks before touching the volume;
             // otherwise an old callback can repopulate a freshly cleared HUD.
             _meshExtractor?.ResetLedgerSessionAfterClear();
             HasStarted = false;
+            _operatorFrozen = false;
+            _meshExtractor?.SetLayerObservationFrozen(false);
             _integrateCount = 0;
 
             _volumeIntegrator.Clear();
@@ -4104,7 +4315,9 @@ namespace Genesis.RoomScan
 
             if (wasActive)
                 Logger.Info($"已保存并清空 — 账簿={ledgerPath}；扳机开始全新扫描");
-            _hudStatus = ledgerPath.Length > 0 ? "已保存并清空" : "已清空(账簿为空)";
+            _hudStatus = replayPackage != null
+                ? "封包已封口，已安全清卷"
+                : ledgerPath.Length > 0 ? "已保存并清空" : "已清空(账簿为空)";
             IsSaveAndClearInProgress = false;
             RefreshStatusBadge();
         }
@@ -4116,7 +4329,7 @@ namespace Genesis.RoomScan
         /// 复核的三角仅发布存在证词，供后续原始深度辅助已有 provisional 转正；
         /// 在该档按 A 只钉住诊断快照，生产扫描继续。
         /// </summary>
-        public void ToggleCoverageMarkers()
+        private void ToggleLegacyCoverageMarkers()
         {
             if (_depthPointCloudOverlay == null || _gunGelCourtOverlay == null ||
                 _instantDepthShellOverlay == null) return;

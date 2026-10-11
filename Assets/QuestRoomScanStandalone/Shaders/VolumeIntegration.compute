@@ -18,6 +18,29 @@ RWTexture3D<float> gsAdmissionTraceRW;
 // the legacy product route's 8-bit confidence semantics from changing.
 RWTexture3D<float> gsInfiniTamVoteWeightRW;
 RWTexture3D<float> gsInfiniTamAccumulatedTsdfRW;
+// Per-voxel repair witness. Low 8 bits store the first opposing observation's
+// view direction (octahedral 4+4 bit encoding); bits 8..10 store how long the
+// same view has remained consistent. While coherence is neutral the same exact
+// layout belongs to the sub-threshold micro-view bucket; a non-neutral
+// coherence value means it belongs to the strong-repair gate. It grants no
+// TSDF weight by itself.
+RWTexture3D<float> gsInfiniTamViewTicketRW;
+// Mean observation held by the neutral micro-view bucket. Repeated frames from
+// one view update this private representative only; production TSDF receives
+// one representative when either a stable same-view batch qualifies or an
+// independent view arrives.
+RWTexture3D<float> gsInfiniTamMicroViewMeanRW;
+// One accepted compact-InfiniTAM integration may touch a world voxel only
+// once. Camera-local frustum samples can collapse onto the same snapped world
+// voxel after pose rotation; this claim sidecar makes those aliases one vote,
+// rather than several racing read/modify/write operations in the same frame.
+// Bits 31..8 contain a 24-bit frame epoch and bits 7..0 contain the winning
+// observation quantized from [-1,+1]. The latter is diagnostic-only: it lets
+// the cumulative ledger distinguish harmless duplicate aliases from aliases
+// that disagree by at least half a world voxel.
+RWStructuredBuffer<uint> _InfiniTamWriteEpochs;
+uint gsInfiniTamWriteEpoch;
+uint gsFrustumVolumeCount;
 // Four-counter sampled receipt for the isolated InfiniTAM baseline. It is
 // enabled for at most one integration per second and never participates in a
 // fusion decision: new / continuing / mature / post-write vote sum.
@@ -32,10 +55,11 @@ float gsInfiniTamTicketEnabled;
 RWTexture3D<uint2> gsTsdfResponsibilityRW;
 RWTexture3D<uint> gsTsdfSupportResponsibilityRW;
 // Stop-time export bridge. Quest/Vulkan rejects AsyncGPUReadback directly on
-// the integer 3D textures above, while structured-buffer readback is already
-// proven by the production paper ledger. One compute dispatch copies exactly
-// one Z slice into these diagnostic-only staging buffers.
-RWStructuredBuffer<uint2> gsTsdfResponsibilityExportSlice;
+// the integer 3D textures above. The complete volume is packed into uint words
+// first, then sealed with one synchronous stop-time read. This deliberately
+// avoids hundreds of per-slice AsyncGPUReadback requests, which can remain
+// pending forever on Quest/Vulkan after capture has stopped.
+RWStructuredBuffer<uint> gsTsdfResponsibilityExportSlice;
 RWStructuredBuffer<uint> gsTsdfSupportResponsibilityExportSlice;
 uint gsTsdfResponsibilityExportZ;
 float gsTsdfResponsibilityAvailable;
@@ -81,7 +105,7 @@ uint gsFrozenChunkSize;        // 冻结块边长（体素）；0=冻结系统�
 float gsFrozenMatureWeight;    // 逐体素冻结资格/成熟度普查下限；冻结同时不得低于可读权重。
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
-RWStructuredBuffer<uint> _CarveStats; // 0..92既有；93..167 FOV；168..176枪胶；177..179旧壳证词；180..197写入生命周期；198弱冻恢复（重叠账）
+RWStructuredBuffer<uint> _CarveStats; // 0..198既有；199..202 InfiniTAM 同帧体素票侦察账（只读）
 // ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
 // 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
 // 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
@@ -105,6 +129,8 @@ float gsInfiniTamMaxVoteWeight;
 float gsInfiniTamCorrectionVoteWeight;
 float gsInfiniTamContradictionThreshold;
 int gsInfiniTamContradictionConfirmations;
+float gsInfiniTamIndependentViewCos;
+int gsInfiniTamSameViewSlowConfirmations;
 float gsInfiniTamSelectiveHistoryRelease;
 float gsWriteColor;
 float gsWriteAdmissionTrace;
@@ -648,6 +674,52 @@ void RecordTsdfSupportMutation(uint3 coord, float beforeWeight,
         (EncodeResponsibilitySNorm8(afterWeight) << 24u);
 }
 
+// Compact InfiniTAM responsibility ledger. The one-frame-one-vote claim buffer
+// retains the previous accepted observation for this voxel, so a new frame can
+// record the actual cross-frame push before replacing that claim. This is the
+// missing temporal witness: same-frame aliases have already returned above.
+// lane y uses reason 21 and stores the strongest previous->current observation
+// delta in the current voxel lifetime; its upper byte is the previous observed
+// TSDF, not a synthetic mesh vertex. The support lane is compact-route-specific:
+// strongest prior observation integration[0..11], positive-push count[12..21],
+// negative-push count[22..31].
+void RecordInfiniTamCrossFrameObservation(uint3 coord, uint previousClaim,
+                                          float observedTsdf)
+{
+    if (gsTsdfResponsibilityWrite < 0.5) return;
+    uint previousEpoch = previousClaim >> 8u;
+    if (previousEpoch == 0u) return;
+
+    uint previousByte = previousClaim & 0xffu;
+    float previousObserved = ((float)previousByte / 255.0) * 2.0 - 1.0;
+    float delta = clamp(observedTsdf - previousObserved, -1.0, 1.0);
+    uint magnitude = (uint)round(abs(delta) * 63.0);
+    if (magnitude == 0u) return;
+
+    uint integration = min(gsTsdfResponsibilityIntegration, 4095u);
+    uint2 packed = gsTsdfResponsibilityRW[coord];
+    uint oldMagnitude = (packed.y >> 17u) & 0x3fu;
+    bool strongestUpdated = (packed.y & 0xfffu) == 0u || magnitude >= oldMagnitude;
+    if (strongestUpdated)
+    {
+        uint signedMagnitude = magnitude | (delta < 0.0 ? 0x40u : 0u);
+        packed.y = integration | (21u << 12u) |
+                   (signedMagnitude << 17u) | (previousByte << 24u);
+        gsTsdfResponsibilityRW[coord] = packed;
+    }
+
+    uint directions = gsTsdfSupportResponsibilityRW[coord];
+    uint strongestPriorIntegration = directions & 0xfffu;
+    uint positive = (directions >> 12u) & 0x3ffu;
+    uint negative = (directions >> 22u) & 0x3ffu;
+    if (strongestUpdated)
+        strongestPriorIntegration = min(previousEpoch, 4095u);
+    if (delta > 0.0) positive = min(positive + 1u, 1023u);
+    else negative = min(negative + 1u, 1023u);
+    gsTsdfSupportResponsibilityRW[coord] = strongestPriorIntegration |
+        (positive << 12u) | (negative << 22u);
+}
+
 // 置信度通道更新（只读影子，不影响任何生产决策）：
 // 观测分歧进 EMA；速率乘质量 q——低质掠射/远距观测少说话，防噪声把账刷花。
 void ConfidenceObserve(uint3 coord, float oldSd, float newSd, float q)
@@ -890,9 +962,12 @@ void CopyTsdfResponsibilityExportSlice(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= gsVoxCount.x || id.y >= gsVoxCount.y ||
         gsTsdfResponsibilityExportZ >= gsVoxCount.z) return;
-    uint flat = id.x + gsVoxCount.x * id.y;
-    gsTsdfResponsibilityExportSlice[flat] =
-        gsTsdfResponsibilityRW[uint3(id.xy, gsTsdfResponsibilityExportZ)];
+    uint flat = id.x + gsVoxCount.x *
+        (id.y + gsVoxCount.y * gsTsdfResponsibilityExportZ);
+    uint2 value = gsTsdfResponsibilityRW[
+        uint3(id.xy, gsTsdfResponsibilityExportZ)];
+    gsTsdfResponsibilityExportSlice[flat * 2u] = value.x;
+    gsTsdfResponsibilityExportSlice[flat * 2u + 1u] = value.y;
 }
 
 [numthreads(8, 8, 1)]
@@ -900,7 +975,8 @@ void CopyTsdfSupportResponsibilityExportSlice(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= gsVoxCount.x || id.y >= gsVoxCount.y ||
         gsTsdfResponsibilityExportZ >= gsVoxCount.z) return;
-    uint flat = id.x + gsVoxCount.x * id.y;
+    uint flat = id.x + gsVoxCount.x *
+        (id.y + gsVoxCount.y * gsTsdfResponsibilityExportZ);
     gsTsdfSupportResponsibilityExportSlice[flat] =
         gsTsdfSupportResponsibilityRW[uint3(id.xy, gsTsdfResponsibilityExportZ)];
 }
@@ -934,6 +1010,10 @@ void ClearInfiniTamVotes(uint3 id : SV_DispatchThreadID)
     if (any(id >= gsVoxCount)) return;
     gsInfiniTamVoteWeightRW[id] = 0.0;
     gsInfiniTamAccumulatedTsdfRW[id] = 0.0;
+    gsInfiniTamViewTicketRW[id] = 0.0;
+    gsInfiniTamMicroViewMeanRW[id] = 0.0;
+    uint flat = id.x + gsVoxCount.x * (id.y + gsVoxCount.y * id.z);
+    _InfiniTamWriteEpochs[flat] = 0u;
 }
 
 #pragma kernel InvalidateGunGelSuccessions
@@ -1042,20 +1122,173 @@ float QuantizeInfiniTamTsdf(float value)
     return round(clamp(value, -1.0, 1.0) * 127.0) / 127.0;
 }
 
+uint EncodeInfiniTamViewDirection8(float3 direction)
+{
+    float3 n = normalize(direction);
+    float invL1 = 1.0 / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    float2 p = n.xz * invL1;
+    if (n.y < 0.0)
+        p = (1.0 - abs(p.yx)) * sign(p);
+    uint2 q = (uint2)round(saturate(p * 0.5 + 0.5) * 15.0);
+    return (q.x & 15u) | ((q.y & 15u) << 4u);
+}
+
+float3 DecodeInfiniTamViewDirection8(uint code)
+{
+    float2 p = float2(code & 15u, (code >> 4u) & 15u) / 15.0 * 2.0 - 1.0;
+    float3 n = float3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (n.y < 0.0)
+    {
+        float2 oldXZ = n.xz;
+        n.xz = (1.0 - abs(oldXZ.yx)) * sign(oldXZ);
+    }
+    return normalize(n);
+}
+
+void StoreInfiniTamViewTicket(uint3 coord, uint viewCode, uint sameViewAge)
+{
+    uint packed = (viewCode & 255u) | ((min(sameViewAge, 7u) & 7u) << 8u);
+    gsInfiniTamViewTicketRW[coord] = (float)packed;
+}
+
+// Return x = observation to integrate, y = micro-view event:
+// 0 not handled here, 1 bucket collecting/cooling / production quarantined,
+// 2 independent view arrived / commit the previous bucket mean exactly once,
+// 3 one same-view evidence batch stabilized / commit its mean exactly once.
+// The helper owns the shared view ticket only while coherence is neutral.
+float2 InfiniTamSelectMicroViewObservation(uint3 coord,
+                                          float previousTsdf,
+                                          float observedTsdf,
+                                          float previousVoteWeight,
+                                          uint currentViewCode)
+{
+    float coherence = gsCoherenceRW[coord];
+    bool neutralCoherence = abs(coherence - 0.5) < 0.125;
+    bool smallNearSurfaceChange = previousVoteWeight > 0.0 &&
+        abs(previousTsdf) <= 0.5 &&
+        abs(observedTsdf - previousTsdf) < gsInfiniTamContradictionThreshold;
+
+    if (!neutralCoherence || !smallNearSurfaceChange)
+    {
+        // A neutral ticket can only be a micro-view bucket. Strong-repair
+        // tickets are preserved because their coherence is non-neutral.
+        if (neutralCoherence)
+        {
+            gsInfiniTamViewTicketRW[coord] = 0.0;
+            gsInfiniTamMicroViewMeanRW[coord] = 0.0;
+        }
+        return float2(observedTsdf, 0.0);
+    }
+
+    uint packed = (uint)round(max(gsInfiniTamViewTicketRW[coord], 0.0));
+    uint sampleCount = (packed >> 8u) & 7u;
+    if (sampleCount == 0u)
+    {
+        StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+        gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+        return float2(observedTsdf, 1.0);
+    }
+
+    uint bucketViewCode = packed & 255u;
+    float viewDot = dot(DecodeInfiniTamViewDirection8(bucketViewCode),
+                        DecodeInfiniTamViewDirection8(currentViewCode));
+
+    // Counts 5..7 are a closed post-publication cooldown, not evidence. It
+    // prevents a successful same-view batch from turning into the old open
+    // every-frame slow path. A genuinely new view starts a fresh bucket; the
+    // same view must finish cooling before it can collect another batch.
+    if (sampleCount >= 5u)
+    {
+        if (viewDot <= gsInfiniTamIndependentViewCos)
+        {
+            StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+            gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+        }
+        else if (sampleCount > 5u)
+        {
+            StoreInfiniTamViewTicket(coord, bucketViewCode, sampleCount - 1u);
+        }
+        else
+        {
+            gsInfiniTamViewTicketRW[coord] = 0.0;
+            gsInfiniTamMicroViewMeanRW[coord] = 0.0;
+        }
+        return float2(observedTsdf, 1.0);
+    }
+
+    if (viewDot > gsInfiniTamIndependentViewCos)
+    {
+        float previousMean = gsInfiniTamMicroViewMeanRW[coord];
+        float meanDelta = previousMean - previousTsdf;
+        float observationDelta = observedTsdf - previousTsdf;
+        // Four consecutive samples must agree in direction and stay within a
+        // quarter of the strong half-voxel gate (<=1.25cm at the current 20cm
+        // truncation band). A disagreement restarts the batch instead of
+        // averaging two competing surface positions into a false compromise.
+        float stableBand = max(1.0 / 127.0,
+            min(gsInfiniTamContradictionThreshold * 0.25, 0.0625));
+        bool sameDirection = meanDelta * observationDelta >= 0.0;
+        bool stableSample = sameDirection &&
+                            abs(observedTsdf - previousMean) <= stableBand;
+        if (!stableSample)
+        {
+            StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+            gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+            return float2(observedTsdf, 1.0);
+        }
+
+        uint nextCount = min(sampleCount + 1u, 4u);
+        float nextMean = (previousMean * (float)sampleCount + observedTsdf) /
+                         max((float)nextCount, 1.0);
+        StoreInfiniTamViewTicket(coord, bucketViewCode, nextCount);
+        gsInfiniTamMicroViewMeanRW[coord] = nextMean;
+
+        if (nextCount >= 4u)
+        {
+            // Ignore a stable batch that merely repeats the current surface
+            // inside a 5mm noise floor. Meaningful stable evidence publishes
+            // once, then both cases enter the same closed cooldown.
+            float minimumPublishOffset = max(2.0 / 127.0,
+                min(gsInfiniTamContradictionThreshold * 0.10, 0.025));
+            StoreInfiniTamViewTicket(coord, bucketViewCode, 7u);
+            gsInfiniTamMicroViewMeanRW[coord] = 0.0;
+            if (abs(nextMean - previousTsdf) >= minimumPublishOffset)
+                return float2(nextMean, 3.0);
+        }
+        return float2(observedTsdf, 1.0);
+    }
+
+    float representative = gsInfiniTamMicroViewMeanRW[coord];
+    StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+    gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+    return float2(representative, 2.0);
+}
+
 // Return x = retained history weight, y = repair event:
-// 0 none, 1 entered, 2 continued, 3 exited/reversed, 4 paused.
+// 0 normal, 1 independent-view confirmed, 2 active same-direction correction,
+// 3 exited, 4 paused/unreliable, 5 reversed/pending, 6 pending same-view,
+// 7 long-lived same-view slow admission (without 16 -> 5 history release).
+// Events 4..6 are deliberately non-admitting.  The compact 16/2/5 history
+// used to change only the strength of the old history; the current opposing
+// frame was still averaged into the TSDF even while its repair ticket was
+// paused or waiting for confirmation.  That made adjacent frames/views pull
+// the same mature voxel in turn.  The caller now uses these events as the
+// missing admission decision while newborn and low-history voxels keep the
+// original InfiniTAM averaging path.
 float2 InfiniTamSelectHistoryWeight(uint3 coord,
                                     float previousTsdf,
                                     float observedTsdf,
                                     float previousVoteWeight,
                                     float maxVoteWeight,
-                                    bool reliableRepairEvidence)
+                                    bool reliableRepairEvidence,
+                                    uint currentViewCode)
 {
     // A/B isolation: retain the compact 16-vote high-precision history while
     // disabling only the abrupt 2-confirmation -> 5-vote local release.
     if (gsInfiniTamSelectiveHistoryRelease < 0.5)
     {
         gsCoherenceRW[coord] = 0.5;
+        gsInfiniTamViewTicketRW[coord] = 0.0;
         return float2(previousVoteWeight, 0.0);
     }
 
@@ -1075,55 +1308,98 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
     if (repairActive)
     {
         int repairDirection = positiveRepairActive ? 1 : -1;
-        if (!reliableRepairEvidence)
-            return float2(previousVoteWeight, 4.0);
-
-        if (!localContradiction || direction != repairDirection)
+        if (!localContradiction)
         {
-            if (localContradiction)
-                gsCoherenceRW[coord] = saturate(0.5 +
-                    (float)direction / (2.0 * confirmations));
-            else
-                gsCoherenceRW[coord] = 0.5;
+            gsCoherenceRW[coord] = 0.5;
+            gsInfiniTamViewTicketRW[coord] = 0.0;
             return float2(previousVoteWeight, 3.0);
         }
 
+        if (!reliableRepairEvidence)
+            return float2(previousVoteWeight, 4.0);
+
+        if (direction != repairDirection)
+        {
+            // The opposite observation does not undo an active correction in
+            // one frame. It starts a fresh one-view ticket of its own.
+            gsCoherenceRW[coord] = saturate(0.5 +
+                (float)direction / (2.0 * confirmations));
+            StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+            return float2(previousVoteWeight, 5.0);
+        }
+
         gsCoherenceRW[coord] = repairDirection > 0 ? 1.0 : 0.0;
+        StoreInfiniTamViewTicket(coord, currentViewCode, 0u);
         return float2(min(previousVoteWeight, correctionWeight), 2.0);
     }
 
     bool strongContradiction = previousVoteWeight >= matureWeight &&
                                localContradiction;
-    if (!strongContradiction || !reliableRepairEvidence)
+    if (!strongContradiction)
     {
         gsCoherenceRW[coord] = 0.5;
+        gsInfiniTamViewTicketRW[coord] = 0.0;
         return float2(previousVoteWeight, 0.0);
     }
 
-    int streak = (int)round((encoded - 0.5) * (2.0 * confirmations));
-    if (streak * direction > 0)
-        streak = direction * min(abs(streak) + 1, confirmations);
-    else
-        streak = direction;
-
-    if (abs(streak) >= confirmations)
+    if (!reliableRepairEvidence)
     {
+        // A large but poorly supported new-view observation is evidence of a
+        // dispute, not yet evidence that the stable surface moved.  Preserve
+        // both the TSDF and any already accumulated same-direction ticket.
+        return float2(previousVoteWeight, 4.0);
+    }
+
+    bool pendingTicket = abs(encoded - 0.5) >= 0.125;
+    int pendingDirection = encoded >= 0.5 ? 1 : -1;
+    if (!pendingTicket || pendingDirection != direction)
+    {
+        gsCoherenceRW[coord] = saturate(0.5 +
+            (float)direction / (2.0 * confirmations));
+        StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+        return float2(previousVoteWeight, pendingTicket ? 5.0 : 6.0);
+    }
+
+    uint packedTicket = (uint)round(max(gsInfiniTamViewTicketRW[coord], 0.0));
+    uint firstViewCode = packedTicket & 255u;
+    uint sameViewAge = (packedTicket >> 8u) & 7u;
+    float viewDot = dot(DecodeInfiniTamViewDirection8(firstViewCode),
+                        DecodeInfiniTamViewDirection8(currentViewCode));
+    if (viewDot <= gsInfiniTamIndependentViewCos)
+    {
+        // Only a geometrically independent observer position buys the second
+        // ticket and the fast 16 -> 5 history release.
         gsCoherenceRW[coord] = direction > 0 ? 1.0 : 0.0;
+        StoreInfiniTamViewTicket(coord, currentViewCode, 0u);
         return float2(min(previousVoteWeight, correctionWeight), 1.0);
     }
 
+    // Repeated frames from the same observer position refresh one witness; they
+    // never become a second view. A positive slow-confirmation setting retains
+    // the former slow path for controlled experiments. Production verification
+    // currently sends zero, so same-view persistence remains quarantined.
+    sameViewAge = min(sameViewAge + 1u, 7u);
+    StoreInfiniTamViewTicket(coord, firstViewCode, sameViewAge);
     gsCoherenceRW[coord] = saturate(0.5 +
-        (float)streak / (2.0 * confirmations));
-    return float2(previousVoteWeight, 0.0);
+        (float)direction / (2.0 * confirmations));
+    if (gsInfiniTamSameViewSlowConfirmations > 0 &&
+        sameViewAge >= (uint)max(gsInfiniTamSameViewSlowConfirmations, 2))
+        return float2(previousVoteWeight, 7.0);
+    return float2(previousVoteWeight, 6.0);
 }
 
 [numthreads(64, 1, 1)]
 void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
 {
+    // DispatchFit rounds up to a 64-thread group. Never let padded threads read
+    // beyond the real frustum sample buffer or acquire an unrelated voxel.
+    if (id >= gsFrustumVolumeCount) return;
+
     float3 vLocalPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
     float3 vWorldPos = mul(gsDepthViewInv[GS_FUSION_EYE],
                            float4(vLocalPos, 1)).xyz;
     uint3 coord = gsWorldToVoxel(vWorldPos);
+    if (any(coord >= gsVoxCount)) return;
     float3 voxPos = gsVoxelToWorld(coord);
 
     float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
@@ -1153,6 +1429,45 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     if (rawProjectiveSdf < -gsVoxDist) return;
 
     float observedTsdf = clamp(rawProjectiveSdf / gsVoxDist, -1.0, 1.0);
+
+    // Several camera-local lattice samples may snap to this same world voxel.
+    // Exactly one valid sample owns the voxel for this accepted frame. Claiming
+    // here (after all depth/range gates) prevents an invalid alias from starving
+    // a valid one, while still making the following TSDF update race-free.
+    // The four counters are observation-only:
+    //   199 valid attempts, 200 first claims, 201 duplicates,
+    //   202 duplicates disagreeing with the first claim by >= half a voxel.
+    uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
+    InterlockedAdd(_CarveStats[199], 1u);
+    uint frameEpoch = gsInfiniTamWriteEpoch & 0x00ffffffu;
+    uint observationByte = (uint)round(saturate(observedTsdf * 0.5 + 0.5) * 255.0);
+    uint packedClaim = (frameEpoch << 8) | observationByte;
+    uint observedClaim = _InfiniTamWriteEpochs[flat];
+    uint observedEpoch = observedClaim >> 8;
+    if (observedEpoch == frameEpoch)
+    {
+        InterlockedAdd(_CarveStats[201], 1u);
+        float firstTsdf = ((float)(observedClaim & 0xffu) / 255.0) * 2.0 - 1.0;
+        if (abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
+            InterlockedAdd(_CarveStats[202], 1u);
+        return;
+    }
+    uint originalClaim;
+    InterlockedCompareExchange(_InfiniTamWriteEpochs[flat], observedClaim,
+                               packedClaim, originalClaim);
+    if (originalClaim != observedClaim)
+    {
+        // The only writer that can win between the load and this CAS is another
+        // valid alias from the same dispatch/frame.
+        InterlockedAdd(_CarveStats[201], 1u);
+        float firstTsdf = ((float)(originalClaim & 0xffu) / 255.0) * 2.0 - 1.0;
+        if ((originalClaim >> 8) == frameEpoch &&
+            abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
+            InterlockedAdd(_CarveStats[202], 1u);
+        return;
+    }
+    InterlockedAdd(_CarveStats[200], 1u);
+
     float2 previous = gsVolumeRW[coord];
     float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
     float previousAccumulatedTsdf = previousVoteWeight > 0.0
@@ -1195,25 +1510,71 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
         }
     }
 
-    float2 historySelection = previousVoteWeight > 0.0
-        ? InfiniTamSelectHistoryWeight(coord, previousAccumulatedTsdf,
-                                       observedTsdf, previousVoteWeight,
-                                       maxVoteWeight, reliableRepairEvidence)
-        : float2(0.0, 0.0);
+    uint currentViewCode = EncodeInfiniTamViewDirection8(activeCenter - voxPos);
+    float2 microSelection = previousVoteWeight > 0.0
+        ? InfiniTamSelectMicroViewObservation(coord, previousAccumulatedTsdf,
+                                              observedTsdf, previousVoteWeight,
+                                              currentViewCode)
+        : float2(observedTsdf, 0.0);
+    float integrationObservedTsdf = microSelection.x;
+
+    // A same-view micro bucket changes no production TSDF, vote weight or dirty
+    // state. The raw observation remains visible to the responsibility ledger.
+    if (microSelection.y == 1.0)
+    {
+        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
+        return;
+    }
+
+    // An independent view or a fully qualified same-view batch commits one
+    // representative. Do not run the strong-repair selector here: its normal
+    // path clears the shared neutral ticket that belongs to the next bucket or
+    // to the post-publication cooldown.
+    bool microPublish = microSelection.y == 2.0 || microSelection.y == 3.0;
+    float2 historySelection = microPublish
+        ? float2(previousVoteWeight, 0.0)
+        : (previousVoteWeight > 0.0
+            ? InfiniTamSelectHistoryWeight(coord, previousAccumulatedTsdf,
+                                           integrationObservedTsdf,
+                                           previousVoteWeight, maxVoteWeight,
+                                           reliableRepairEvidence,
+                                           currentViewCode)
+            : float2(0.0, 0.0));
     float retainedVoteWeight = historySelection.x;
     if (previousVoteWeight <= 0.0)
+    {
         gsCoherenceRW[coord] = 0.5;
+        gsInfiniTamViewTicketRW[coord] = 0.0;
+        gsInfiniTamMicroViewMeanRW[coord] = 0.0;
+    }
+
+    // A protected voxel is not changed by a lone, reversed, unreliable or
+    // still-unconfirmed same-view contradiction. The one-frame claim above
+    // still consumes duplicate aliases from this dispatch and the responsibility
+    // ledger still sees the incoming disagreement. Event 7 is disabled by the
+    // verification configuration.
+    bool quarantineObservation = historySelection.y >= 4.0 &&
+                                 historySelection.y <= 6.0;
+    if (quarantineObservation)
+    {
+        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
+        return;
+    }
 
     float accumulatedVoteWeight = retainedVoteWeight + 1.0;
     float reconstructedTsdf = retainedVoteWeight > 0.0
-        ? (previousAccumulatedTsdf * retainedVoteWeight + observedTsdf) /
+        ? (previousAccumulatedTsdf * retainedVoteWeight + integrationObservedTsdf) /
           max(accumulatedVoteWeight, 1e-5)
-        : observedTsdf;
+        : integrationObservedTsdf;
     float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
     float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
     float2 reconstructed = float2(
         QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility);
 
+    RecordTsdfGeometryMutation(coord, previous, reconstructed,
+                               previousVoteWeight <= 0.0 ? 1u : 2u, 0u);
+    if (previousVoteWeight > 0.0)
+        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
     gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
     gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
     gsVolumeRW[coord] = reconstructed;

@@ -168,13 +168,20 @@ namespace Genesis.RoomScan
         internal int OutstandingCount => Volatile.Read(ref _fusionReadbacks) +
                                          Volatile.Read(ref _fusionWrites) +
                                          Volatile.Read(ref _artifactRequests);
+        internal int OutstandingFusionReadbacks => Volatile.Read(ref _fusionReadbacks);
+        internal int OutstandingFusionWrites => Volatile.Read(ref _fusionWrites);
+        internal int OutstandingArtifactRequests => Volatile.Read(ref _artifactRequests);
         internal int DroppedFusionFrames => Volatile.Read(ref _fusionDropped);
+        internal bool HasSealFailed => Volatile.Read(ref _sealPhase) == SealFailed;
+        internal string FinalizeIssue => _finalizeIssue ?? string.Empty;
+        internal int FusionRecordCount => Volatile.Read(ref _fusionSequence);
         internal bool IsSafelySealed
         {
             get
             {
                 int phase = Volatile.Read(ref _sealPhase);
-                return phase == SealComplete || phase == SealIncomplete;
+                return (phase == SealComplete || phase == SealIncomplete) &&
+                       _finalized && _finalizeTask == null && OutstandingCount == 0;
             }
         }
         internal string SealHudFixed
@@ -198,7 +205,36 @@ namespace Genesis.RoomScan
                     SealFailed => "封口失败",
                     _ => "未开始"
                 };
-                return $"封包[{label.PadRight(4, ' ')}] 校验{percent:000}% 安全退出[{(IsSafelySealed ? "是" : "否")}]";
+                return $"封包[{label.PadRight(4, ' ')}] " +
+                       $"读{OutstandingFusionReadbacks:00}/写{OutstandingFusionWrites:00}/附件{OutstandingArtifactRequests:00} " +
+                       $"校验{percent:000}% 安全退出[{(IsSafelySealed ? "是" : "否")}]";
+            }
+        }
+
+        internal string SealHudCompact
+        {
+            get
+            {
+                int phase = Volatile.Read(ref _sealPhase);
+                int total = Mathf.Max(0, Volatile.Read(ref _checksumFilesTotal));
+                int processed = Mathf.Clamp(Volatile.Read(ref _checksumFilesProcessed), 0,
+                    Mathf.Max(0, total));
+                int percent = phase == SealComplete || phase == SealIncomplete
+                    ? 100
+                    : total > 0 ? Mathf.Clamp(Mathf.RoundToInt(100f * processed / total), 0, 99) : 0;
+                string label = phase switch
+                {
+                    SealCapturing => "采集中",
+                    SealDraining => "排空中",
+                    SealHashing => "校验中",
+                    SealComplete => "已封口",
+                    SealIncomplete => "有损封口",
+                    SealFailed => "失败",
+                    _ => "未开始"
+                };
+                return $"封包:{label} 读{OutstandingFusionReadbacks}/写{OutstandingFusionWrites}/附{OutstandingArtifactRequests} " +
+                       $"帧{FusionRecordCount} 校验{percent}% " +
+                       $"安全退出:{(IsSafelySealed ? "是" : "否")}";
             }
         }
         internal string ProbeFollowupGuidanceCompact => _probeShadowLedger != null
@@ -371,7 +407,7 @@ namespace Genesis.RoomScan
                 "9. runtime_timeline/frames.csv 连续记录帧率、头姿、距离位移、深度帧号、融合 epoch、纸皮队列/提交/显示状态；integration_dispatches.csv 将融合 attempt/sourceFrame 精确接到 dirtyEpoch。\n" +
                 "10. artifacts/paper_audit/production_paper_replacements.csv 记录最终生产纸皮每次整块替换时的姿态、距离、融合状态与旧新占用变化；surface ledger 给出平面残差及相邻页接缝；production_paper_occupancy 是不依赖显示档位的正式5cm纸皮占用。\n" +
                 "11. system_reference/status.json 说明外部系统网格交接状态；旧 Scene 导出的 OBJ 仅作对照，不是生产真值。\n" +
-                "12. artifacts/tsdf_responsibility 保存最终 TSDF 与逐体素当前生命周期的出生、最后几何改写、最后支撑改写、最强受阻纠正；integrationCount 可反查到实际 sourceFrame，并把无纸皮格追到 TSDF 前/内、零交叉、拓扑或发布边界。\n" +
+                "12. artifacts/tsdf_responsibility 保存最终 TSDF 与逐体素当前生命周期的出生、最后几何改写；紧凑 InfiniTAM 路线另输出 cross_frame_push_pull_summary.json 与 worst.csv，记录同一体素被相邻有效观测向正/负两侧推动的次数和最强两次融合编号。integrationCount 可反查实际 sourceFrame；这些均为只读旁路。\n" +
                 "13. final_surface_court/frame_gate_summary.csv 记录每帧各拒绝关卡汇总；independent_testimonies.csv 记录真正入档的独立证词；decision_checks.csv 记录每次判决的假设、残差、票份额、滞回和冷却结果。它们不逐像素写日志。\n" +
                 "14. production_paper_quality_timeline.csv 记录每次正式块提交时各4x4x4小区的 crossing/raw/final 平整度，区分入场已凹凸、后续抚平、长期残留和恶化。\n" +
                 "15. 将已封口 session 复制到电脑后运行 Tools/AnalyzeFullOutputLedger.ps1 -SessionDirectory <session>；它会生成 artifacts/responsibility_ledger 四张总账，并联合角度、距离、姿态、运动、候选、裁判、TSDF与纸皮，禁止单因素冒名定罪。\n",
@@ -435,11 +471,27 @@ namespace Genesis.RoomScan
             _depthPairReadbackErrors = Mathf.Max(0, readbackErrors);
             _depthPairWriteErrors = Mathf.Max(0, writeErrors);
             _depthStreamsComplete = true;
+            // The previous status snapshot could remain at depthStreamsComplete=false
+            // even though the recorder had drained. Refresh it before hashing starts
+            // so on-device evidence reflects the actual current phase.
+            WriteState("draining");
             TryFinalize();
         }
 
         private void Update()
         {
+            // Begin() normally runs immediately after the volume allocation, but
+            // Quest can finish creating the diagnostic UAV one frame later. Give
+            // the read-only ledger that short window again while the volume is
+            // still empty; once integration starts, BeginTsdfResponsibilityCapture
+            // deliberately refuses to attach to a partial scan.
+            if (_active && !_tsdfResponsibilityStarted &&
+                VolumeIntegrator.Instance != null &&
+                VolumeIntegrator.Instance.IntegrationCount == 0)
+            {
+                _tsdfResponsibilityStarted =
+                    VolumeIntegrator.Instance.BeginTsdfResponsibilityCapture();
+            }
             if (_active || (_endRequested && !_finalized && _finalizeTask == null))
                 RecordRuntimeFrame();
             if (_finalizeTask != null && _finalizeTask.IsCompleted)
@@ -457,6 +509,14 @@ namespace Genesis.RoomScan
                     Logger.Info((_finalizeClean ? "独立回放会话已封口：" : "独立回放会话已排空但存在采集损失：") +
                                 _sessionDirectory);
                 }
+                // The worker writes its terminal state before Update retires
+                // _finalizeTask, so IsSafelySealed is necessarily false in that
+                // first snapshot. Rewrite the excluded status file once task
+                // ownership is retired; the checksum manifest itself is not
+                // affected because session_status.json is deliberately excluded.
+                WriteState(completed.IsFaulted
+                    ? "finalize_failed:" + completed.Exception?.GetBaseException().GetType().Name
+                    : (_finalizeClean ? "complete" : "incomplete_with_capture_loss"), 0);
             }
             if (_endRequested && !_finalized)
                 TryFinalize();
@@ -1791,7 +1851,7 @@ namespace Genesis.RoomScan
                    "    \"sameEpochSurfaceStageResponsibility\": \"artifacts/paper_audit/production_paper_surface_ledger.txt sections stage_responsibility_contract and stage_responsibility_spatial_csv\",\n" +
                    "    \"committedPaperRoughnessAndSeams\": \"artifacts/paper_audit/production_paper_surface_ledger.txt\",\n" +
                     "    \"fusionVoxelAndFovPeriods\": \"artifacts/paper_audit/fusion_forensic_ledger.txt, fusion_fov_periods.csv and fusion_all_counters.csv for production/raw-projective lanes\",\n" +
-                    "    \"tsdfTransactionResponsibility\": \"artifacts/tsdf_responsibility joins each final zero-crossing endpoint to current-lifetime seed, last geometry writer, last support writer and strongest blocked correction\",\n" +
+                    "    \"tsdfTransactionResponsibility\": \"artifacts/tsdf_responsibility joins each final zero-crossing endpoint to current-lifetime seed and last geometry writer; compact InfiniTAM adds per-voxel cross-frame positive/negative push counts plus the strongest current/prior integration pair in cross_frame_push_pull_summary.json and cross_frame_push_pull_worst.csv\",\n" +
                      "    \"blankPaperResponsibility\": \"artifacts/paper_audit/production_paper_occupancy plus final TSDF responsibility are joined offline to locate missing paper at TSDF support/crossing, extraction/candidate or publication boundaries\"\n" +
                    "  },\n" +
                    "  \"antiMaskingRule\": \"attribute the earliest stage where joined records diverge; do not infer one cause from a later mixed surface alone\",\n" +

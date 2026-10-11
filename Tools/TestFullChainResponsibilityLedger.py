@@ -46,15 +46,18 @@ def main() -> int:
         tsdf.mkdir(parents=True)
         (tsdf / "schema.json").write_text(json.dumps({"voxelSizeMetres": .05}), encoding="utf-8")
         write_csv(tsdf / "endpoint_responsibility.csv",
-                  ["binIndex", "strongestBlockIntegration"], [[0, 4]])
+                  ["binIndex", "strongestBlockIntegration", "strongestBlockDeltaMm",
+                   "finalWeight", "lastToFinalMm"], [[0, 4, 12, .5, 1]])
         sample_fields = ["binIndex", "sourceFrame", "attemptIndex", "integrationCount",
                          "role", "dirtyEpoch", "u", "v", "fusionDepthM",
                          "platformRawDepthM", "processedDepthM", "processedMinusRawMm",
-                         "rawProjectiveSdfMm", "angularDegPerSec", "linearMps",
+                         "rawProjectiveSdfMm", "fusionProjectiveSdfMm",
+                         "platformProjectiveSdfMm", "processedProjectiveSdfMm",
+                         "angularDegPerSec", "linearMps",
                          "headPitchDeg", "headYawDeg", "headRollDeg", "motionQuality"]
         write_csv(tsdf / "endpoint_source_samples.csv", sample_fields,
                   [[0, 11, 2, 4, "last_geometry", 7, .5, .5, 1.0, 1.01, 1.0,
-                    -10, 12, 3, .01, 5, 10, 1, .95]])
+                    -10, 2, 2, 20, 2, 3, .01, 5, 10, 1, .95]])
 
         frames = session / "fusion_inputs" / "frames"
         frames.mkdir(parents=True)
@@ -99,10 +102,14 @@ def main() -> int:
                                        "roughness_lineage.csv").open(encoding="utf-8-sig")))
         timeline = list(csv.DictReader((session / "artifacts" / "responsibility_ledger" /
                                         "surface_site_timeline.csv").open(encoding="utf-8-sig")))
+        causes = list(csv.DictReader((session / "artifacts" / "responsibility_ledger" /
+                                      "cause_classification.csv").open(encoding="utf-8-sig")))
         assert lineage[0]["correctionOutcome"] == "flattened", lineage[0]
         assert lineage[0]["blockedCorrectionEndpoints"] == "1", lineage[0]
         assert timeline[0]["gunGelStableId"] == "17", timeline[0]
         assert timeline[0]["courtSpatialJoin"] == "same_source_stable_id_and_bounded", timeline[0]
+        assert causes[0]["primaryCause"] == \
+            "QRS_PREPROCESSING_MOVED_DEPTH_TOWARD_BAD_SURFACE", causes[0]
     print("PASS: full-chain responsibility ledger joins first publish, court, TSDF and later correction.")
     return 0
 

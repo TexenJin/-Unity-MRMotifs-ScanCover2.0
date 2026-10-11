@@ -20,10 +20,13 @@ BLOCKS = {
     10: "dilation_supply", 11: "fov_motion_authority", 12: "frozen",
     13: "blend_quantized", 14: "mature_discount", 15: "near_distance",
     16: "invalid_depth", 17: "seed_quality", 18: "motion_seed",
-    19: "behind_camera", 20: "outside_fov",
+    19: "behind_camera", 20: "outside_fov", 21: "max_update_distance",
+    22: "infinitam_repair_evidence", 23: "infinitam_confirmation_pending",
+    24: "infinitam_repair_reversed", 25: "infinitam_history_blend",
 }
 SUPPORT_OPS = {0: "none", 1: "seed", 2: "positive_growth", 3: "carve",
-               4: "freeze", 5: "unfreeze", 6: "reset"}
+               4: "freeze", 5: "unfreeze", 6: "reset",
+               7: "infinitam_history_release"}
 
 
 def rows(path: Path):
@@ -248,7 +251,12 @@ def ndc_to_linear(ndc, projection):
 
 def project_sample(session, fusion_row, pair_row, world, cache):
     result = {"u": "", "v": "", "fusionDepthM": "", "platformRawDepthM": "",
-              "processedDepthM": "", "processedMinusRawMm": "", "rawProjectiveSdfMm": ""}
+              "processedDepthM": "", "processedMinusRawMm": "",
+              # rawProjectiveSdfMm is retained for backward compatibility.  Older
+              # ledgers used that name for the depth texture actually consumed by
+              # fusion, not for the pre-QRS platform witness.
+              "rawProjectiveSdfMm": "", "fusionProjectiveSdfMm": "",
+              "platformProjectiveSdfMm": "", "processedProjectiveSdfMm": ""}
     if not fusion_row:
         return result
     meta_path = resolve_frame_file(session, "fusion_inputs", fusion_row.get("metaFile", ""))
@@ -265,6 +273,12 @@ def project_sample(session, fusion_row, pair_row, world, cache):
         u = clip[0] / clip[3] * 0.5 + 0.5
         v = clip[1] / clip[3] * 0.5 + 0.5
         result["u"], result["v"] = f"{u:.6f}", f"{v:.6f}"
+        camera_point = mat_vec(view, [world[0], world[1], world[2], 1.0])
+        camera_w = camera_point[3] if abs(camera_point[3]) > 1e-9 else 1.0
+        camera_xyz = [camera_point[i] / camera_w for i in range(3)]
+        camera_depth = abs(camera_xyz[2])
+        ray_scale = (math.sqrt(sum(component * component for component in camera_xyz)) /
+                     max(camera_depth, 1e-9))
         depth_meta = meta["textures"]["depth"]
         depth_path = resolve_frame_file(session, "fusion_inputs", fusion_row.get("depthFile", ""))
         fusion_ndc = sample_depth(cache.get(depth_path), int(depth_meta["width"]),
@@ -273,13 +287,9 @@ def project_sample(session, fusion_row, pair_row, world, cache):
         fusion_m = ndc_to_linear(fusion_ndc, projection)
         if fusion_m is not None:
             result["fusionDepthM"] = f"{fusion_m:.6f}"
-            camera_point = mat_vec(view, [world[0], world[1], world[2], 1.0])
-            camera_w = camera_point[3] if abs(camera_point[3]) > 1e-9 else 1.0
-            camera_xyz = [camera_point[i] / camera_w for i in range(3)]
-            camera_depth = abs(camera_xyz[2])
-            ray_scale = (math.sqrt(sum(component * component for component in camera_xyz)) /
-                         max(camera_depth, 1e-9))
-            result["rawProjectiveSdfMm"] = f"{(fusion_m - camera_depth) * ray_scale * 1000.0:.3f}"
+            fusion_sdf_mm = (fusion_m - camera_depth) * ray_scale * 1000.0
+            result["rawProjectiveSdfMm"] = f"{fusion_sdf_mm:.3f}"
+            result["fusionProjectiveSdfMm"] = f"{fusion_sdf_mm:.3f}"
         if pair_row:
             pw, ph = int(pair_row["width"]), int(pair_row["height"])
             raw_path = resolve_frame_file(session, "depth_pairs", pair_row.get("rawFile", ""))
@@ -288,8 +298,12 @@ def project_sample(session, fusion_row, pair_row, world, cache):
             post_m = ndc_to_linear(sample_f32(cache.get(post_path), pw, ph, u, v), projection)
             if raw_m is not None:
                 result["platformRawDepthM"] = f"{raw_m:.6f}"
+                result["platformProjectiveSdfMm"] = \
+                    f"{(raw_m - camera_depth) * ray_scale * 1000.0:.3f}"
             if post_m is not None:
                 result["processedDepthM"] = f"{post_m:.6f}"
+                result["processedProjectiveSdfMm"] = \
+                    f"{(post_m - camera_depth) * ray_scale * 1000.0:.3f}"
             if raw_m is not None and post_m is not None:
                 result["processedMinusRawMm"] = f"{(post_m - raw_m) * 1000.0:.3f}"
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -402,7 +416,9 @@ def main():
                      "sourceFrame", "attemptIndex", "dirtyEpoch", "angularDegPerSec", "linearMps",
                      "headPitchDeg", "headYawDeg", "headRollDeg", "motionQuality", "u", "v",
                      "fusionDepthM", "platformRawDepthM", "processedDepthM",
-                     "processedMinusRawMm", "rawProjectiveSdfMm"]
+                     "processedMinusRawMm", "rawProjectiveSdfMm",
+                     "fusionProjectiveSdfMm", "platformProjectiveSdfMm",
+                     "processedProjectiveSdfMm"]
     events, samples, bin_summaries = [], [], []
     cache = ByteCache()
 
@@ -534,7 +550,9 @@ def main():
                           "integrationCount", "attemptIndex", "dirtyEpoch", "angularDegPerSec",
                           "linearMps", "headPitchDeg", "headYawDeg", "headRollDeg", "motionQuality",
                           "u", "v", "fusionDepthM", "platformRawDepthM", "processedDepthM",
-                          "processedMinusRawMm", "rawProjectiveSdfMm"]
+                          "processedMinusRawMm", "rawProjectiveSdfMm",
+                          "fusionProjectiveSdfMm", "platformProjectiveSdfMm",
+                          "processedProjectiveSdfMm"]
     extraction_boundary = {
         "mature_crossing_without_paper": "after_tsdf_before_committed_paper",
         "mature_crossing_near_paper_edge": "paper_boundary_context",

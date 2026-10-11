@@ -25,6 +25,8 @@
 #pragma kernel GenerateIndices
 #pragma kernel BuildIndirectArgs
 #pragma kernel InitTemporal
+#pragma kernel InitTsdfPushHistory
+#pragma kernel CommitTsdfPushHistory
 #pragma kernel ClearCandidateHistory
 #pragma kernel CopyMeshSnapshot
 #pragma kernel CopyAdditiveMergePayload
@@ -110,6 +112,23 @@ struct GPUVertex
 RWStructuredBuffer<int>       _CoordVertMap;     // [totalVoxels] flat idx -> compact vert idx (-1 = none)
 RWStructuredBuffer<GPUVertex> _Vertices;         // [maxVertices] compact vertex output
 RWStructuredBuffer<uint>      _Indices;          // [maxIndices]  triangle index output
+// Read-only provenance captured in the very same ClassifyAndEmit invocation
+// that creates the production vertex. xyz pack the twelve edge interpolation
+// parameters as 8-bit values (four per uint). w bits 0..11 are the exact
+// crossing mask; bits 12..23 record whether endpoint A of that production edge
+// was negative (endpoint B is necessarily the opposite sign). This is enough
+// to reconstruct the true causal pair above every displayed yellow crossing
+// without re-reading a later TSDF. _LayerRawSurfaceNets stores the full-
+// precision pre-processing mean.
+// Neither buffer participates in placement, topology or publication gates.
+RWStructuredBuffer<uint4>     _LayerCrossingEvidence;
+// One display-only byte per production crossing stores a six-bit
+// |valA-valB| magnitude in [0,2] plus a two-bit temporal pusher class
+// (none/A/B/both). Together with packed t and endpoint-A sign above, this
+// reconstructs the signed TSDF pair and identifies which endpoint change
+// dominated the yellow crossing's motion. It never feeds extraction.
+RWStructuredBuffer<uint3>     _LayerCrossingSpan;
+RWStructuredBuffer<float3>    _LayerRawSurfaceNets;
 // Packed read-only settlement classes per emitted cell:
 // bits 0..2 = settled admission source (0=untracked, 1=self, 2=direct, 3=relay, 4=mixed)
 // bits 3..4 = settled real confirmation (0=untracked, 1=pending, 2=confirmed, 3=mixed)
@@ -117,6 +136,9 @@ RWStructuredBuffer<uint>      _VertexAdmissionClass;
 RWStructuredBuffer<GPUVertex> _SnapshotVertices;
 RWStructuredBuffer<uint>      _SnapshotIndices;
 RWStructuredBuffer<uint>      _SnapshotAdmissionClass;
+RWStructuredBuffer<uint4>     _SnapshotLayerCrossingEvidence;
+RWStructuredBuffer<uint3>     _SnapshotLayerCrossingSpan;
+RWStructuredBuffer<float3>    _SnapshotLayerRawSurfaceNets;
 uint _SnapshotVertexCount;
 uint _SnapshotIndexCount;
 
@@ -168,6 +190,11 @@ RWStructuredBuffer<uint>      _CandidateHistoryKeys;
 RWStructuredBuffer<uint>      _CandidateHistoryStates;
 
 RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, w = age (-1 = uninit)
+// Read-only diagnostic history for attributing yellow-crossing motion to its
+// two TSDF endpoints. ClassifyAndEmit only reads it; a separate kernel commits
+// the current TSDF afterwards, so one dispatch cannot contaminate itself.
+// Value 2 is the unobserved/uninitialized sentinel.
+RWTexture3D<float>            _TsdfPushHistory;
 
 // Read-only visual-quality ledger.  It classifies the final mesh and retains
 // same-epoch plane fits for TSDF edge crossings and raw Surface-Nets vertices.
@@ -255,6 +282,57 @@ bool InsideMap(int3 c)
 {
     int3 local = c - _MapMin;
     return all(local >= 0) && all(local < (int3)_MapCount);
+}
+
+// Attributes motion of the current zero crossing to endpoint A, endpoint B,
+// both, or neither. The comparison is only valid when the same physical edge
+// was observed with a sign crossing in the previous extraction. A first-order
+// decomposition of t = A / (A - B) gives each endpoint's signed contribution;
+// the common denominator cancels for the dominance comparison.
+uint ClassifyTsdfPush(int3 cA, int3 cB, float valA, float valB, float currentT)
+{
+    if (!InsideMap(cA) || !InsideMap(cB))
+        return 0u;
+
+    float prevA = _TsdfPushHistory[cA - _MapMin];
+    float prevB = _TsdfPushHistory[cB - _MapMin];
+    if (prevA > 1.25 || prevB > 1.25 ||
+        ((prevA < 0.0) == (prevB < 0.0)))
+        return 0u;
+
+    float prevDenominator = prevA - prevB;
+    if (abs(prevDenominator) < 1e-5)
+        return 0u;
+
+    float previousT = saturate(prevA / prevDenominator);
+    // Ignore sub-quantum movement: the displayed crossing itself is packed to
+    // 8 bits, so a smaller change cannot be read honestly from this overlay.
+    if (abs(currentT - previousT) < (1.0 / 255.0))
+        return 0u;
+
+    float midA = 0.5 * (prevA + valA);
+    float midB = 0.5 * (prevB + valB);
+    float deltaA = valA - prevA;
+    float deltaB = valB - prevB;
+    float contributionA = -midB * deltaA;
+    float contributionB =  midA * deltaB;
+    float magnitudeA = abs(contributionA);
+    float magnitudeB = abs(contributionB);
+    float strongest = max(magnitudeA, magnitudeB);
+    if (strongest < 1e-5)
+        return 0u;
+
+    // Opposed contributions are a tug-of-war, not shared responsibility for
+    // the final crossing motion. Attribute the net displacement to the side
+    // that wins. Class 3 is reserved for two comparable contributions that
+    // actually push the crossing in the same direction.
+    if (contributionA * contributionB <= 0.0)
+        return magnitudeA >= magnitudeB ? 1u : 2u;
+    if (magnitudeA > magnitudeB * 1.20)
+        return 1u;
+    if (magnitudeB > magnitudeA * 1.20)
+        return 2u;
+    return 3u;
 }
 
 int MapFlatten(int3 c)
@@ -495,6 +573,10 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             ((float3)responsibilityMin + (float3)responsibilityMax);
     }
     uint rejectedUnknownEdges = 0;
+    uint3 layerCrossingT = uint3(0u, 0u, 0u);
+    uint3 layerCrossingSpan = uint3(0u, 0u, 0u);
+    uint layerCrossingMask = 0u;
+    uint layerCrossingNegativeAMask = 0u;
     bool foundationMultipleCrossings = false;
     bool anyObservedEndpoint = false;
     // Uniform 10 cm foundation cells are allowed to use only real, formally
@@ -609,6 +691,37 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
             if (emptyA || emptyB) numBadCrossings++;
             float t = valA / change;
             float3 crossingPosition = (float3)cA + t * (float3)(cB - cA);
+            // Capture the exact edge membership used by production and a
+            // display-only quantization of its interpolation parameter. The
+            // worst-case position error is edgeLength / 510 (0.196 mm on the
+            // active 10 cm baseline), far below the depth sensor noise floor.
+            // The full-precision arithmetic mean is stored separately below.
+            uint packedT = (uint)round(saturate(t) * 255.0);
+            // Low six bits retain display span; high two bits identify the
+            // temporal pusher: 0 none/unknown, 1 A, 2 B, 3 both.
+            uint pushClass = ClassifyTsdfPush(cA, cB, valA, valB, t);
+            uint packedSpan =
+                (uint)round(saturate(abs(change) * 0.5) * 63.0) |
+                (pushClass << 6u);
+            uint shift = (e & 3u) * 8u;
+            if (e < 4u)
+            {
+                layerCrossingT.x |= packedT << shift;
+                layerCrossingSpan.x |= packedSpan << shift;
+            }
+            else if (e < 8u)
+            {
+                layerCrossingT.y |= packedT << shift;
+                layerCrossingSpan.y |= packedSpan << shift;
+            }
+            else
+            {
+                layerCrossingT.z |= packedT << shift;
+                layerCrossingSpan.z |= packedSpan << shift;
+            }
+            layerCrossingMask |= 1u << e;
+            if (valA < 0.0)
+                layerCrossingNegativeAMask |= 1u << e;
             posCoord += crossingPosition;
             numCrossings++;
             if (stageResponsibilityCell)
@@ -965,6 +1078,10 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     v.voxelFlatIdx = (uint)Flatten(coord);
 
     _Vertices[compactIdx]     = v;
+    _LayerCrossingEvidence[compactIdx] = uint4(layerCrossingT,
+        layerCrossingMask | (layerCrossingNegativeAMask << 12u));
+    _LayerCrossingSpan[compactIdx] = layerCrossingSpan;
+    _LayerRawSurfaceNets[compactIdx] = rawSurfaceNetsPosition;
     _CoordVertMap[flatIdx]    = (int)compactIdx;
 }
 
@@ -2204,6 +2321,9 @@ void CopyMeshSnapshot(uint3 id : SV_DispatchThreadID)
     {
         _SnapshotVertices[id.x] = _Vertices[id.x];
         _SnapshotAdmissionClass[id.x] = _VertexAdmissionClass[id.x];
+        _SnapshotLayerCrossingEvidence[id.x] = _LayerCrossingEvidence[id.x];
+        _SnapshotLayerCrossingSpan[id.x] = _LayerCrossingSpan[id.x];
+        _SnapshotLayerRawSurfaceNets[id.x] = _LayerRawSurfaceNets[id.x];
     }
     if (id.x < _SnapshotIndexCount)
         _SnapshotIndices[id.x] = _Indices[id.x];
@@ -2542,4 +2662,24 @@ void InitTemporal(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)_MapCount)) return;
     _TemporalState[id] = float4(0, 0, 0, -1);
+}
+
+// Diagnostic-only TSDF endpoint history. It is deliberately initialized and
+// committed in separate dispatches: ClassifyAndEmit sees one coherent previous
+// extraction, never values written earlier by a neighbouring thread this frame.
+[numthreads(4, 4, 4)]
+void InitTsdfPushHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_MapCount)) return;
+    _TsdfPushHistory[id] = 2.0;
+}
+
+[numthreads(4, 4, 4)]
+void CommitTsdfPushHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_MapCount)) return;
+    float2 sample = _TsdfVolume[_MapMin + (int3)id];
+    _TsdfPushHistory[id] = abs(sample.y) >= _MinWeight
+        ? sample.x
+        : 2.0;
 }

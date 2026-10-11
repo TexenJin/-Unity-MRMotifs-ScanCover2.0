@@ -24,6 +24,8 @@ namespace Genesis.RoomScan
         private readonly int _kGenerateIndices;
         private readonly int _kBuildIndirectArgs;
         private readonly int _kInitTemporal;
+        private readonly int _kInitTsdfPushHistory;
+        private readonly int _kCommitTsdfPushHistory;
         private readonly int _kClearCandidateHistory;
         private readonly int _kCopyMeshSnapshot;
         private readonly int _kCopyAdditiveMergePayload;
@@ -41,6 +43,9 @@ namespace Genesis.RoomScan
         private GraphicsBuffer _vertices;
         private GraphicsBuffer _indices;
         private GraphicsBuffer _vertexAdmissionClass;
+        private GraphicsBuffer _layerCrossingEvidence;
+        private GraphicsBuffer _layerCrossingSpan;
+        private GraphicsBuffer _layerRawSurfaceNets;
         private GraphicsBuffer _counters;
         private GraphicsBuffer _dispatchArgs;
         private GraphicsBuffer _drawIndirectArgs;
@@ -53,6 +58,10 @@ namespace Genesis.RoomScan
 
         // Temporal state as 3D texture (avoids 128MB structured buffer limit on Quest)
         private RenderTexture _temporalState;
+        // One prior TSDF scalar per regional lattice point. This is diagnostic
+        // history only: extraction reads it to attribute crossing motion, then
+        // a separate kernel commits the current TSDF after vertex emission.
+        private RenderTexture _tsdfPushHistory;
 
         // Sizing
         private int3 _voxCount;
@@ -66,6 +75,7 @@ namespace Genesis.RoomScan
         private int _maxIndices;
         private int _candidateHistoryCapacity;
         private bool _temporalInitialized;
+        private bool _tsdfPushHistoryInitialized;
         private bool _candidateHistoryInitialized;
         private uint _candidateExtractionEpoch;
 
@@ -138,12 +148,16 @@ namespace Genesis.RoomScan
         private static readonly int ID_Vertices = Shader.PropertyToID("_Vertices");
         private static readonly int ID_Indices = Shader.PropertyToID("_Indices");
         private static readonly int ID_VertexAdmissionClass = Shader.PropertyToID("_VertexAdmissionClass");
+        private static readonly int ID_LayerCrossingEvidence = Shader.PropertyToID("_LayerCrossingEvidence");
+        private static readonly int ID_LayerCrossingSpan = Shader.PropertyToID("_LayerCrossingSpan");
+        private static readonly int ID_LayerRawSurfaceNets = Shader.PropertyToID("_LayerRawSurfaceNets");
         private static readonly int ID_Counters = Shader.PropertyToID("_Counters");
         private static readonly int ID_DispatchArgs = Shader.PropertyToID("_DispatchArgs");
         private static readonly int ID_DrawIndirectArgs = Shader.PropertyToID("_DrawIndirectArgs");
         private static readonly int ID_SmoothPosA = Shader.PropertyToID("_SmoothPosA");
         private static readonly int ID_SmoothPosB = Shader.PropertyToID("_SmoothPosB");
         private static readonly int ID_TemporalState = Shader.PropertyToID("_TemporalState");
+        private static readonly int ID_TsdfPushHistory = Shader.PropertyToID("_TsdfPushHistory");
         private static readonly int ID_CandidateHistoryKeys = Shader.PropertyToID("_CandidateHistoryKeys");
         private static readonly int ID_CandidateHistoryStates = Shader.PropertyToID("_CandidateHistoryStates");
         private static readonly int ID_CandidateExtractionEpoch = Shader.PropertyToID("_CandidateExtractionEpoch");
@@ -167,6 +181,9 @@ namespace Genesis.RoomScan
         private static readonly int ID_SnapshotVertices = Shader.PropertyToID("_SnapshotVertices");
         private static readonly int ID_SnapshotIndices = Shader.PropertyToID("_SnapshotIndices");
         private static readonly int ID_SnapshotAdmissionClass = Shader.PropertyToID("_SnapshotAdmissionClass");
+        private static readonly int ID_SnapshotLayerCrossingEvidence = Shader.PropertyToID("_SnapshotLayerCrossingEvidence");
+        private static readonly int ID_SnapshotLayerCrossingSpan = Shader.PropertyToID("_SnapshotLayerCrossingSpan");
+        private static readonly int ID_SnapshotLayerRawSurfaceNets = Shader.PropertyToID("_SnapshotLayerRawSurfaceNets");
         private static readonly int ID_SnapshotVertexCount = Shader.PropertyToID("_SnapshotVertexCount");
         private static readonly int ID_SnapshotIndexCount = Shader.PropertyToID("_SnapshotIndexCount");
         private static readonly int ID_PreviousVertices = Shader.PropertyToID("_PreviousVertices");
@@ -261,6 +278,8 @@ namespace Genesis.RoomScan
             _kGenerateIndices = compute.FindKernel("GenerateIndices");
             _kBuildIndirectArgs = compute.FindKernel("BuildIndirectArgs");
             _kInitTemporal = compute.FindKernel("InitTemporal");
+            _kInitTsdfPushHistory = compute.FindKernel("InitTsdfPushHistory");
+            _kCommitTsdfPushHistory = compute.FindKernel("CommitTsdfPushHistory");
             _kClearCandidateHistory = compute.FindKernel("ClearCandidateHistory");
             _kCopyMeshSnapshot = compute.FindKernel("CopyMeshSnapshot");
             _kCopyAdditiveMergePayload = compute.FindKernel("CopyAdditiveMergePayload");
@@ -377,9 +396,15 @@ namespace Genesis.RoomScan
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_Vertices, _vertices);
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_Indices, _indices);
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_VertexAdmissionClass, _vertexAdmissionClass);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_LayerCrossingEvidence, _layerCrossingEvidence);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_LayerCrossingSpan, _layerCrossingSpan);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_LayerRawSurfaceNets, _layerRawSurfaceNets);
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotVertices, snapshot.VertexBuffer);
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotIndices, snapshot.IndexBuffer);
             _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotAdmissionClass, snapshot.VertexAdmissionClassBuffer);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotLayerCrossingEvidence, snapshot.LayerCrossingEvidenceBuffer);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotLayerCrossingSpan, snapshot.LayerCrossingSpanBuffer);
+            _compute.SetBuffer(_kCopyMeshSnapshot, ID_SnapshotLayerRawSurfaceNets, snapshot.LayerRawSurfaceNetsBuffer);
             _compute.SetInt(ID_SnapshotVertexCount, vertexCount);
             _compute.SetInt(ID_SnapshotIndexCount, indexCount);
             int count = Mathf.Max(vertexCount, indexCount);
@@ -632,6 +657,9 @@ namespace Genesis.RoomScan
             _vertices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, VertexStride);
             _indices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxIndices, 4);
             _vertexAdmissionClass = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, 4);
+            _layerCrossingEvidence = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, 16);
+            _layerCrossingSpan = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, 12);
+            _layerRawSurfaceNets = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _maxVertices, Float3Stride);
             _counters = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _counterCount, 4);
             _dispatchArgs = new GraphicsBuffer(structuredIndirect, 3, 4);
             _drawIndirectArgs = new GraphicsBuffer(structuredIndirect, 5, 4);
@@ -657,7 +685,19 @@ namespace Genesis.RoomScan
                 _temporalState.Create();
             }
 
+            _tsdfPushHistory = new RenderTexture(mapCount.x, mapCount.y, 0,
+                GraphicsFormat.R16_SFloat)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = mapCount.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            _tsdfPushHistory.Create();
+
             _temporalInitialized = false;
+            _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
 
@@ -665,9 +705,11 @@ namespace Genesis.RoomScan
                             + (long)_maxVertices * VertexStride
                             + (long)_maxIndices * 4
                             + (long)_maxVertices * 4
+                            + (long)_maxVertices * (16 + 12 + Float3Stride)
                             + _counterCount * 4 + 3 * 4 + 5 * 4
                             + (long)smoothCapacity * Float3Stride * 2
                             + (TemporalAlphaMax < 1f ? (long)mapVoxels * 16 : 0L)
+                            + (long)mapVoxels * 2
                             + (long)_candidateHistoryCapacity * 8;
             Logger.Info($"[GPUSurfaceNets] Allocated buffers: vox={voxCount}, map={mapMin}+{mapCount}, core={coreMin}..{coreMax}, " +
                       $"maxVerts={_maxVertices}, maxIdx={_maxIndices}, " +
@@ -687,6 +729,20 @@ namespace Genesis.RoomScan
             _temporalInitialized = true;
         }
 
+        private void InitTsdfPushHistory()
+        {
+            if (_tsdfPushHistoryInitialized || _tsdfPushHistory == null)
+                return;
+
+            _compute.SetTexture(_kInitTsdfPushHistory, ID_TsdfPushHistory,
+                _tsdfPushHistory);
+            SetRegionParams();
+            _compute.Dispatch(_kInitTsdfPushHistory,
+                CeilDiv(_mapCount.x, 4), CeilDiv(_mapCount.y, 4),
+                CeilDiv(_mapCount.z, 4));
+            _tsdfPushHistoryInitialized = true;
+        }
+
         /// <summary>
         /// Mark temporal history dirty without reallocating the large Surface Nets buffers.
         /// The next Extract reinitializes the temporal texture before consuming a different TSDF source.
@@ -694,6 +750,7 @@ namespace Genesis.RoomScan
         public void ResetTemporalState()
         {
             _temporalInitialized = false;
+            _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
         }
@@ -712,6 +769,8 @@ namespace Genesis.RoomScan
 
             if (!_temporalInitialized && TemporalAlphaMax < 1f)
                 InitTemporalState();
+            if (!_tsdfPushHistoryInitialized)
+                InitTsdfPushHistory();
 
             SetGlobalParams(voxelSize);
             BindAllBuffers();
@@ -753,6 +812,8 @@ namespace Genesis.RoomScan
             _compute.SetInt(ID_VisualQualityEnabled, VisualQualityDiagnosticsEnabled ? 1 : 0);
 
             _compute.SetTexture(_kClassifyAndEmit, ID_TsdfVolume, tsdfVolume);
+            _compute.SetTexture(_kClassifyAndEmit, ID_TsdfPushHistory,
+                _tsdfPushHistory);
             _compute.SetTexture(_kClassifyAndEmit, ID_ColorVolume, colorVolume);
             _compute.SetTexture(_kClassifyAndEmit, ID_AdmissionTraceVolume, admissionTraceVolume);
             bool hasDepth = currentDepthEvidenceAvailable && currentDepthTexture != null;
@@ -775,6 +836,14 @@ namespace Genesis.RoomScan
             int gy = CeilDiv(_mapCount.y, 4);
             int gz = CeilDiv(_mapCount.z, 4);
             _compute.Dispatch(_kClassifyAndEmit, gx, gy, gz);
+
+            // Preserve one coherent prior extraction for the next pusher
+            // comparison. This must run after every ClassifyAndEmit dispatch.
+            _compute.SetTexture(_kCommitTsdfPushHistory, ID_TsdfVolume,
+                tsdfVolume);
+            _compute.SetTexture(_kCommitTsdfPushHistory, ID_TsdfPushHistory,
+                _tsdfPushHistory);
+            _compute.Dispatch(_kCommitTsdfPushHistory, gx, gy, gz);
 
             // 2b. Depth-faithful adaptive reduction. The native 5 cm vertices
             // already exist; this stage only aliases geometrically compatible
@@ -889,6 +958,9 @@ namespace Genesis.RoomScan
             BindBuffer(_kClassifyAndEmit, ID_CoordVertMap, _coordVertMap);
             BindBuffer(_kClassifyAndEmit, ID_Vertices, _vertices);
             BindBuffer(_kClassifyAndEmit, ID_VertexAdmissionClass, _vertexAdmissionClass);
+            BindBuffer(_kClassifyAndEmit, ID_LayerCrossingEvidence, _layerCrossingEvidence);
+            BindBuffer(_kClassifyAndEmit, ID_LayerCrossingSpan, _layerCrossingSpan);
+            BindBuffer(_kClassifyAndEmit, ID_LayerRawSurfaceNets, _layerRawSurfaceNets);
             BindBuffer(_kClassifyAndEmit, ID_Counters, _counters);
 
             BindBuffer(_kBuildFoundationClusters, ID_CoordVertMap, _coordVertMap);
@@ -941,6 +1013,9 @@ namespace Genesis.RoomScan
             _vertices?.Release();
             _indices?.Release();
             _vertexAdmissionClass?.Release();
+            _layerCrossingEvidence?.Release();
+            _layerCrossingSpan?.Release();
+            _layerRawSurfaceNets?.Release();
             _counters?.Release();
             _dispatchArgs?.Release();
             _drawIndirectArgs?.Release();
@@ -954,11 +1029,19 @@ namespace Genesis.RoomScan
                 _temporalState.Release();
                 UnityEngine.Object.Destroy(_temporalState);
             }
+            if (_tsdfPushHistory != null)
+            {
+                _tsdfPushHistory.Release();
+                UnityEngine.Object.Destroy(_tsdfPushHistory);
+            }
 
             _coordVertMap = null;
             _vertices = null;
             _indices = null;
             _vertexAdmissionClass = null;
+            _layerCrossingEvidence = null;
+            _layerCrossingSpan = null;
+            _layerRawSurfaceNets = null;
             _counters = null;
             _dispatchArgs = null;
             _drawIndirectArgs = null;
@@ -967,11 +1050,13 @@ namespace Genesis.RoomScan
             _candidateHistoryKeys = null;
             _candidateHistoryStates = null;
             _temporalState = null;
+            _tsdfPushHistory = null;
 
             _totalVoxels = 0;
             _mapVoxels = 0;
             _candidateHistoryCapacity = 0;
             _temporalInitialized = false;
+            _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
         }

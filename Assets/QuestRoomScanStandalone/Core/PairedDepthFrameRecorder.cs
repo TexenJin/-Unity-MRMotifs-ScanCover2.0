@@ -64,10 +64,21 @@ namespace Genesis.RoomScan
         public int DroppedFusionFrameCount => _sessionPackage != null
             ? _sessionPackage.DroppedFusionFrames
             : 0;
+        internal ScanReplaySessionPackage SessionPackage => _sessionPackage;
 
         public bool StartCapture()
         {
             if (_isCapturing) return true;
+            // A recorder owns exactly one replay package until that package has
+            // drained and written its completion marker. Reusing this component
+            // earlier used to redirect the old depth-drain callback into the new
+            // package, leaving the old package stuck forever at "draining".
+            if (LocalOutstandingPairCount > 0 ||
+                (_sessionPackage != null && !_sessionPackage.IsSafelySealed))
+            {
+                Logger.Warning("上一独立回放封包尚未安全封口；拒绝覆盖其深度排空归属。");
+                return false;
+            }
             VolumeIntegrator volume = VolumeIntegrator.Instance;
             if (volume != null && volume.IntegrationCount > 0)
             {
@@ -130,6 +141,18 @@ namespace Genesis.RoomScan
             WriteStatusFile("stopped");
             Logger.Info($"双路深度采集停止：帧对={_pairSequence}，丢={_droppedPairs}，" +
                         $"回读错={_readbackErrors}，待写={OutstandingPairCount}，目录={_sessionDirectory}");
+        }
+
+        /// <summary>
+        /// B-key transaction entry. Returns the exact package that owns the
+        /// pending depth callbacks so the caller can await that package rather
+        /// than whichever package happens to be globally latest later.
+        /// </summary>
+        internal ScanReplaySessionPackage StopAndGetPackageForSeal()
+        {
+            ScanReplaySessionPackage package = _sessionPackage;
+            if (_isCapturing) StopCapture();
+            return package;
         }
 
         public void StagePlatformFrame(
@@ -418,6 +441,12 @@ namespace Genesis.RoomScan
                               "writeErrors=" + _writeErrors + "\n" +
                               "outstandingDepthPairs=" + LocalOutstandingPairCount + "\n" +
                               "outstandingSessionWork=" + OutstandingPairCount + "\n" +
+                              "outstandingFusionReadbacks=" +
+                              (_sessionPackage != null ? _sessionPackage.OutstandingFusionReadbacks : 0) + "\n" +
+                              "outstandingFusionWrites=" +
+                              (_sessionPackage != null ? _sessionPackage.OutstandingFusionWrites : 0) + "\n" +
+                              "outstandingArtifacts=" +
+                              (_sessionPackage != null ? _sessionPackage.OutstandingArtifactRequests : 0) + "\n" +
                               "droppedFusionFrames=" + DroppedFusionFrameCount + "\n";
                 lock (_manifestLock)
                     File.WriteAllText(Path.Combine(_sessionDirectory, "status.txt"), text, new UTF8Encoding(false));

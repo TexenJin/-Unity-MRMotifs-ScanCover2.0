@@ -337,7 +337,7 @@ MonoBehaviour:
     y: 64
     z: 96
   voxelSize: 0.1
-  voxelDistance: 0.3
+  voxelDistance: 0.2
   voxelMin: 0.1
   depthDisparityThreshold: 0.5
   maxUpdateDist: 3.5
@@ -443,7 +443,7 @@ MonoBehaviour:
   edgeCrossEyeMarginScale: 0.03
   edgeCrossEyeMinOtherFacing: 0.2
   dilationSteps: 8
-  voxelDistance: 0.3
+  voxelDistance: 0.2
   voxelSize: 0.1
 --- !u!4 &170429785
 Transform:

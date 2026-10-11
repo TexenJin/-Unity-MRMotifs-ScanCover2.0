@@ -173,6 +173,7 @@ namespace Genesis.RoomScan
         private GPUChunkMeshSnapshot _infiniTamFront;
         private GPUChunkMeshSnapshot _infiniTamBack;
         private InfiniTamBlockMeshPipeline _infiniTamBlocks;
+        private int _layerEvidenceMode;
         private CoarseSkinRenderer _coarseSkin;
         private SupportTruthRenderer _supportTruth;
         private enum RouteValidationView
@@ -759,10 +760,12 @@ namespace Genesis.RoomScan
         {
             if (_volume == null || surfaceNetsCompute == null) return;
 
-            // Baseline mode has exactly one renderer.  A serialized visibility
-            // value left behind by the former A/B acquisition must not keep the
-            // only result hidden after the reconstruction route is replaced.
-            renderProductionMesh = true;
+            // Visibility is an operator presentation state.  In particular,
+            // evidence mode 2 intentionally hides the production mesh while
+            // leaving the immutable TSDF-source evidence visible.  Do not
+            // force the renderer back on from this repeatedly-called resource
+            // maintenance path; the field default and SetProductionMeshVisible
+            // own that state.
             UseJointDiagnosticDisplay = false;
 
             EnsureInfiniTamBlockPipeline();
@@ -838,6 +841,7 @@ namespace Genesis.RoomScan
                     infiniTamBlockVertexBudgetPercent,
                     ExtractInfiniTamBlock);
                 _infiniTamBlocks.SetVisible(renderProductionMesh);
+                _infiniTamBlocks.SetLayerEvidenceMode(_layerEvidenceMode);
                 Logger.Info($"InfiniTAM block extractor ready: " +
                             $"chunk={_volume.ExtractionChunkSize}³, " +
                             $"halo={infiniTamBlockHaloVoxels}, " +
@@ -929,6 +933,24 @@ namespace Genesis.RoomScan
                 _heraReplay.SetVisible(visible);
 
             Logger.Info($"QRS mesh rendering: {(visible ? "ON" : "OFF (backend-only)")}");
+        }
+
+        /// <summary>
+        /// Same-candidate read-only extraction provenance: accepted TSDF edge
+        /// crossings and their full-precision Surface Nets mean. This is not a
+        /// live TSDF re-sampling overlay.
+        /// </summary>
+        public int LayerEvidenceMode => _layerEvidenceMode;
+
+        public void SetLayerEvidenceMode(int mode)
+        {
+            _layerEvidenceMode = Mathf.Clamp(mode, 0, 3);
+            _infiniTamBlocks?.SetLayerEvidenceMode(_layerEvidenceMode);
+        }
+
+        public void SetLayerObservationFrozen(bool frozen)
+        {
+            _infiniTamBlocks?.SetPresentationFrozen(frozen);
         }
 
         public bool ToggleProductionMeshVisible()

@@ -13,7 +13,11 @@ namespace Genesis.RoomScan
         public GraphicsBuffer VertexBuffer { get; private set; }
         public GraphicsBuffer IndexBuffer { get; private set; }
         public GraphicsBuffer VertexAdmissionClassBuffer { get; private set; }
+        public GraphicsBuffer LayerCrossingEvidenceBuffer { get; private set; }
+        public GraphicsBuffer LayerCrossingSpanBuffer { get; private set; }
+        public GraphicsBuffer LayerRawSurfaceNetsBuffer { get; private set; }
         public GraphicsBuffer DrawIndirectArgs { get; private set; }
+        public int KnownVertexCount { get; private set; }
         public int KnownDrawVertexCount { get; private set; }
 
         public void Prepare(int vertexCount, int indexCount, int vertexStride)
@@ -21,6 +25,7 @@ namespace Genesis.RoomScan
             int actualVertexCount = Mathf.Max(0, vertexCount);
             int actualIndexCount = Mathf.Max(0, indexCount);
             PrepareCapacity(actualVertexCount, actualIndexCount, vertexStride);
+            KnownVertexCount = actualVertexCount;
             KnownDrawVertexCount = actualIndexCount;
             DrawIndirectArgs.SetData(new uint[] { (uint)actualIndexCount, 1, 0, 0, 0 });
         }
@@ -38,7 +43,10 @@ namespace Genesis.RoomScan
             // Grow on demand, but do not destroy/reallocate them merely because
             // the next extraction contains fewer elements.
             if (VertexBuffer == null || VertexBuffer.count < vertexCapacity ||
-                IndexBuffer == null || IndexBuffer.count < indexCapacity)
+                IndexBuffer == null || IndexBuffer.count < indexCapacity ||
+                LayerCrossingEvidenceBuffer == null ||
+                LayerCrossingSpanBuffer == null ||
+                LayerRawSurfaceNetsBuffer == null)
             {
                 Dispose();
                 VertexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
@@ -47,10 +55,17 @@ namespace Genesis.RoomScan
                     indexCapacity, sizeof(uint));
                 VertexAdmissionClassBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
                     vertexCapacity, sizeof(uint));
+                LayerCrossingEvidenceBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
+                    vertexCapacity, sizeof(uint) * 4);
+                LayerCrossingSpanBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
+                    vertexCapacity, sizeof(uint) * 3);
+                LayerRawSurfaceNetsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured,
+                    vertexCapacity, sizeof(float) * 3);
                 DrawIndirectArgs = new GraphicsBuffer(
                     GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.IndirectArguments,
                     5, sizeof(uint));
             }
+            KnownVertexCount = 0;
             KnownDrawVertexCount = 0;
             DrawIndirectArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
         }
@@ -74,6 +89,7 @@ namespace Genesis.RoomScan
 
         public void Clear()
         {
+            KnownVertexCount = 0;
             KnownDrawVertexCount = 0;
             if (DrawIndirectArgs != null)
                 DrawIndirectArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
@@ -84,11 +100,18 @@ namespace Genesis.RoomScan
             VertexBuffer?.Release();
             IndexBuffer?.Release();
             VertexAdmissionClassBuffer?.Release();
+            LayerCrossingEvidenceBuffer?.Release();
+            LayerCrossingSpanBuffer?.Release();
+            LayerRawSurfaceNetsBuffer?.Release();
             DrawIndirectArgs?.Release();
             VertexBuffer = null;
             IndexBuffer = null;
             VertexAdmissionClassBuffer = null;
+            LayerCrossingEvidenceBuffer = null;
+            LayerCrossingSpanBuffer = null;
+            LayerRawSurfaceNetsBuffer = null;
             DrawIndirectArgs = null;
+            KnownVertexCount = 0;
             KnownDrawVertexCount = 0;
         }
     }

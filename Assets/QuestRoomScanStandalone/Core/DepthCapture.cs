@@ -693,6 +693,15 @@ namespace Genesis.RoomScan
             return _pairedFrameRecorder.StartCapture();
         }
 
+        /// <summary>Stops new replay input and returns the package that must finish sealing.</summary>
+        internal ScanReplaySessionPackage StopReplayCaptureForSeal()
+        {
+            if (_pairedFrameRecorder == null)
+                return ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
+            return _pairedFrameRecorder.StopAndGetPackageForSeal() ??
+                   ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
+        }
+
         /// <summary>
         /// Provide an RGB texture as edge guide for bilateral depth filtering.
         /// Call each frame from RoomScanner with the passthrough camera frame.

@@ -35,12 +35,21 @@ $surface = Read-Source 'Assets/QuestRoomScanStandalone/Core/GPUSurfaceNets.cs'
 $shader = Read-Source 'Assets/QuestRoomScanStandalone/Shaders/SurfaceNetsExtract.compute'
 $integrationShader = Read-Source 'Assets/QuestRoomScanStandalone/Shaders/VolumeIntegration.compute'
 $scanner = Read-Source 'Assets/QuestRoomScanStandalone/Core/StandaloneRoomScanner.cs'
+$scanInput = Read-Source 'Assets/QuestRoomScanStandalone/Core/StandaloneScanInput.cs'
 $instantShell = Read-Source 'Assets/QuestRoomScanStandalone/Core/InstantDepthShellOverlay.cs'
 $instantShellCompute = Read-Source 'Assets/QuestRoomScanStandalone/Resources/InstantShellReview.compute'
 $analyzer = Read-Source 'Tools/AnalyzeFullOutputLedger.ps1'
 $responsibilityAnalyzer = Read-Source 'Tools/AnalyzeTsdfResponsibility.py'
 $court = Read-Source 'Assets/QuestRoomScanStandalone/Core/RuntimeFinalSurfaceCourt.cs'
 $fullChain = Read-Source 'Tools/BuildScanCoverResponsibilityLedger.py'
+$infiniTamStart = $integrationShader.IndexOf('void IntegrateInfiniTam', [StringComparison]::Ordinal)
+$ordinaryIntegrateStart = $integrationShader.IndexOf('#pragma kernel Integrate', $infiniTamStart,
+    [StringComparison]::Ordinal)
+if ($infiniTamStart -lt 0 -or $ordinaryIntegrateStart -le $infiniTamStart) {
+    throw 'FAIL compact InfiniTAM kernel boundary is missing'
+}
+$infiniTamShader = $integrationShader.Substring($infiniTamStart,
+    $ordinaryIntegrateStart - $infiniTamStart)
 
 if (31089 -ne (3691 + 6 * 65 * 65 + 2048)) {
     throw 'FAIL expanded visual counter arithmetic'
@@ -105,6 +114,9 @@ Assert-Contains $integrationShader 'gsTsdfResponsibilityRW' 'fusion owns a diagn
 Assert-Contains $integrationShader 'RecordTsdfGeometryMutation' 'zero-surface-moving writes retain their before/after identity'
 Assert-Contains $integrationShader 'RecordTsdfBlockedCorrection' 'strongest blocked correction is retained separately'
 Assert-Contains $integrationShader 'RecordTsdfSupportMutation' 'weight growth carve freeze and reset retain independent responsibility'
+Assert-Contains $infiniTamShader 'RecordTsdfGeometryMutation' 'compact InfiniTAM production writes are connected to geometry responsibility'
+Assert-Contains $infiniTamShader 'RecordTsdfSupportMutation' 'compact InfiniTAM vote history is connected to support responsibility'
+Assert-Contains $infiniTamShader 'RecordTsdfBlockedCorrection' 'compact InfiniTAM retained contradictions are connected to blocker responsibility'
 Assert-Contains $volume 'BeginTsdfResponsibilityCapture' 'responsibility capture starts before first integration'
 Assert-Contains $volume 'final_tsdf.rg8_snorm.bin' 'stop-time export includes the final TSDF'
 Assert-Contains $volume 'responsibility.rg32_uint.bin' 'stop-time export includes packed transaction provenance'
@@ -120,6 +132,9 @@ Assert-Before $volume '"responsibility.rg32_uint.bin"' '"support_responsibility"
 Assert-Contains $session 'tsdf_responsibility' 'full session seals the TSDF responsibility artifact'
 Assert-Contains $responsibilityAnalyzer 'endpoint_responsibility.csv' 'offline audit emits endpoint transaction responsibility'
 Assert-Contains $responsibilityAnalyzer 'endpoint_source_samples.csv' 'offline audit reprojects exact source depth samples'
+Assert-Contains $responsibilityAnalyzer 'platformProjectiveSdfMm' 'offline audit measures the pre-QRS witness against the same TSDF endpoint'
+Assert-Contains $responsibilityAnalyzer 'processedProjectiveSdfMm' 'offline audit measures post-QRS depth against the same TSDF endpoint'
+Assert-Contains $responsibilityAnalyzer 'fusionProjectiveSdfMm' 'offline audit measures the actual fusion input against the same TSDF endpoint'
 Assert-Contains $responsibilityAnalyzer 'paper_hole_responsibility.csv' 'offline audit joins blank paper cells to TSDF and publication causes'
 Assert-Contains $responsibilityAnalyzer 'paper_hole_source_samples.csv' 'blank cells reproject their responsible source frames through raw and processed depth'
 Assert-Contains $responsibilityAnalyzer 'production_paper_occupancy.r32_uint.bin' 'blank audit consumes exact committed native-5cm paper occupancy'
@@ -166,13 +181,30 @@ if ($newScanStart -lt 0 -or $ledgerStart -lt 0 -or $depthStart -lt 0 -or $ledger
 }
 Write-Host 'PASS paper ledger starts before depth capture on every new scan'
 
-$captureStop = $scanner.IndexOf('if (replayPackageFinalizing)', [StringComparison]::Ordinal)
-$freezeWrite = $scanner.IndexOf('_chunkAbFrozen = true;', $captureStop, [StringComparison]::Ordinal)
-$earlyReturn = $scanner.IndexOf('return;', $captureStop, [StringComparison]::Ordinal)
-if ($captureStop -lt 0 -or $earlyReturn -lt 0 -or $freezeWrite -lt 0 -or $earlyReturn -ge $freezeWrite) {
-    throw 'FAIL A-key ledger stop must return before frozen replay state'
+$finishHelper = $scanner.IndexOf('public bool TryFinishScanAndSealReplay()', [StringComparison]::Ordinal)
+$freezeMethod = $scanner.IndexOf('public void FreezeChunkAbTsdf()', [StringComparison]::Ordinal)
+$freezeCallsFinish = $scanner.IndexOf('if (TryFinishScanAndSealReplay())', $freezeMethod, [StringComparison]::Ordinal)
+$freezeWrite = $scanner.IndexOf('_chunkAbFrozen = true;', $freezeMethod, [StringComparison]::Ordinal)
+if ($finishHelper -lt 0 -or $freezeMethod -lt 0 -or $freezeCallsFinish -lt 0 -or
+    $freezeWrite -lt 0 -or $freezeCallsFinish -ge $freezeWrite) {
+    throw 'FAIL active ledger must finish before frozen replay state'
 }
-Write-Host 'PASS A-key ledger stop does not enter frozen replay'
+Write-Host 'PASS active ledger finishes before frozen replay'
+
+$inputLedgerFinish = $scanInput.IndexOf('scanner.TryFinishScanAndSealReplay()', [StringComparison]::Ordinal)
+$inputOverlayAction = $scanInput.IndexOf('scanner.TryToggleInstantShellFreeze()', [StringComparison]::Ordinal)
+if ($inputLedgerFinish -lt 0 -or $inputOverlayAction -lt 0 -or $inputLedgerFinish -ge $inputOverlayAction) {
+    throw 'FAIL A-key ledger finish must precede observation-mode actions'
+}
+Write-Host 'PASS A-key ledger finish has highest input priority'
+
+Assert-Contains $scanner '$"{sealHud}\n"' 'safe-exit state is always present in the main HUD header'
+$sealHeader = $scanner.IndexOf('$"{sealHud}\n"', [StringComparison]::Ordinal)
+$detailVisibility = $scanner.IndexOf('_statusBadgeText.gameObject.SetActive(showDetailedRuntimeStatus);', [StringComparison]::Ordinal)
+if ($sealHeader -lt 0 -or $detailVisibility -lt 0 -or $sealHeader -ge $detailVisibility) {
+    throw 'FAIL safe-exit state must be rendered outside the optional detail columns'
+}
+Write-Host 'PASS safe-exit state cannot be hidden by compact HUD mode'
 
 Assert-Contains $session '_runtimeLedgerWriteErrors == 0' 'runtime-ledger loss makes seal incomplete'
 Assert-Contains $session '(_finalSurfaceCourt?.WriteErrors ?? 0) == 0' 'final-court ledger loss makes seal incomplete'
@@ -196,6 +228,11 @@ Assert-Contains $fullChain 'blockedByMotionAuthority' 'joined ledger splits moti
 Assert-Contains $fullChain 'blockedByFovAuthority' 'joined ledger retains the independent FOV blocker count'
 Assert-Contains $fullChain 'roughness_lineage.csv' 'joined ledger exports first culprit and later amplifiers'
 Assert-Contains $fullChain 'factor_responsibility.csv' 'joined ledger compares all suspect factors together'
+Assert-Contains $fullChain 'cause_classification.csv' 'joined ledger exports one cause classification row per spatial site'
+Assert-Contains $fullChain 'QRS_PREPROCESSING_MOVED_DEPTH_TOWARD_BAD_SURFACE' 'joined ledger can convict a harmful preprocessing shift'
+Assert-Contains $fullChain 'TSDF_CORRECTION_BLOCKED_OR_UNDERWEIGHTED' 'joined ledger can convict retained contradictory TSDF history'
+Assert-Contains $fullChain 'UPSTREAM_PLATFORM_DEPTH_OR_POSE_SUPPORTED_DEFORMATION' 'joined ledger preserves the platform-depth versus pose truth boundary'
+Assert-Contains $fullChain 'POST_TSDF_EXTRACTION_OR_TRANSFORM' 'joined ledger separates post-TSDF mesh deformation'
 Assert-Contains $fullChain 'incidence_x_range' 'joined ledger separates angle from distance confounding'
 Assert-Contains $fullChain 'incidence_x_motion' 'joined ledger separates angle from motion confounding'
 

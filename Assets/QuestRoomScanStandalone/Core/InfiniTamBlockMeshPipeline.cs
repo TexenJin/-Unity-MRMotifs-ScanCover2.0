@@ -31,6 +31,10 @@ namespace Genesis.RoomScan
             public bool Queued;
             public bool CommitPending;
             public bool ReadyToPublish;
+            // A candidate already ready or still in flight when the operator
+            // freezes presentation must not replace/clear the visible Front on
+            // resume. It is discarded and freshly extracted instead.
+            public bool DiscardAfterPresentationFreeze;
             public float CommitStartedAt;
             public int CommitSerial;
             public int PendingVertexCount;
@@ -42,11 +46,14 @@ namespace Genesis.RoomScan
             public GPUChunkMeshSnapshot Front;
             public GPUChunkMeshSnapshot Back;
             public GPUMeshRenderer Renderer;
+            public MeshLayerEvidenceRenderer LayerEvidenceRenderer;
 
             public void Dispose()
             {
                 if (Renderer != null)
                     Renderer.RenderVisible = false;
+                if (LayerEvidenceRenderer != null)
+                    LayerEvidenceRenderer.SetMode(0);
                 Front?.Dispose();
                 Back?.Dispose();
                 Surface?.Dispose();
@@ -57,6 +64,7 @@ namespace Genesis.RoomScan
                     UnityEngine.Object.Destroy(GameObject);
                 GameObject = null;
                 Renderer = null;
+                LayerEvidenceRenderer = null;
             }
         }
 
@@ -79,6 +87,8 @@ namespace Genesis.RoomScan
         private readonly Action<GPUSurfaceNets> _extract;
         private readonly Queue<int> _dirtyQueue = new Queue<int>();
         private readonly List<Block> _blocks = new List<Block>();
+        private readonly Material _layerEvidencePointMaterial;
+        private readonly Material _layerEvidenceRelationMaterial;
 
         private int3 _blockCount;
         private int _generation;
@@ -86,6 +96,8 @@ namespace Genesis.RoomScan
         private int _inFlightCommits;
         private bool _disposed;
         private bool _visible;
+        private int _layerEvidenceMode;
+        private bool _presentationFrozen;
         private bool _readbackPending;
         private bool _ownerReady;
         private bool _boundaryReady;
@@ -194,6 +206,24 @@ namespace Genesis.RoomScan
             _vertexBudgetPercent = Mathf.Clamp(vertexBudgetPercent, 0.01f, 0.5f);
             _extract = extract ?? throw new ArgumentNullException(nameof(extract));
 
+            Shader layerEvidenceShader = Resources.Load<Shader>("MeshLayerEvidence");
+            if (layerEvidenceShader != null)
+                _layerEvidencePointMaterial = new Material(layerEvidenceShader)
+                {
+                    name = "QRS Same-Candidate Mesh Layer Evidence"
+                };
+            else
+                Logger.Warning("MeshLayerEvidence shader missing; causal profile view is unavailable.");
+
+            Shader layerRelationShader = Resources.Load<Shader>("MeshLayerRelations");
+            if (layerRelationShader != null)
+                _layerEvidenceRelationMaterial = new Material(layerRelationShader)
+                {
+                    name = "QRS Same-Candidate Mesh Layer Relations"
+                };
+            else
+                Logger.Warning("MeshLayerRelations shader missing; causal links and emitting-cell outlines are unavailable.");
+
             _volume.SetDirtyBoundaryHalo(_haloVoxels);
             BuildLayout();
             _volume.Cleared += OnVolumeCleared;
@@ -203,6 +233,12 @@ namespace Genesis.RoomScan
         public void Tick()
         {
             if (_disposed || Failed)
+                return;
+
+            // A-key is a literal visual freeze: do not let a completed async
+            // readback swap a newer Front after the operator has frozen the
+            // scene. Pending work resumes without loss on unfreeze.
+            if (_presentationFrozen)
                 return;
 
             RequestDirtyLedgerIfDue();
@@ -215,6 +251,11 @@ namespace Genesis.RoomScan
             {
                 if (!_blocks[i].ReadyToPublish)
                     continue;
+                if (_blocks[i].DiscardAfterPresentationFreeze)
+                {
+                    DiscardFrozenCandidateAndRequeue(_blocks[i]);
+                    return;
+                }
                 PublishReadyBlock(_blocks[i]);
                 TryFinishInitialBuild();
                 return;
@@ -277,6 +318,41 @@ namespace Genesis.RoomScan
         {
             _visible = visible;
             ApplyVisibility();
+        }
+
+        public int LayerEvidenceMode => _layerEvidenceMode;
+
+        public void SetLayerEvidenceMode(int mode)
+        {
+            _layerEvidenceMode = Mathf.Clamp(mode, 0, 3);
+            ApplyVisibility();
+        }
+
+        public void SetPresentationFrozen(bool frozen)
+        {
+            if (_presentationFrozen == frozen)
+                return;
+            _presentationFrozen = frozen;
+            if (frozen)
+            {
+                for (int i = 0; i < _blocks.Count; i++)
+                {
+                    Block block = _blocks[i];
+                    if (block.CommitPending || block.ReadyToPublish)
+                        block.DiscardAfterPresentationFreeze = true;
+                }
+                return;
+            }
+
+            // Completed candidates are private Back data. Throwing them away
+            // cannot affect the published Front. Pending callbacks retain the
+            // flag and are discarded by Tick after they become ready.
+            for (int i = 0; i < _blocks.Count; i++)
+            {
+                Block block = _blocks[i];
+                if (block.ReadyToPublish && block.DiscardAfterPresentationFreeze)
+                    DiscardFrozenCandidateAndRequeue(block);
+            }
         }
 
         private void BuildLayout()
@@ -346,6 +422,16 @@ namespace Genesis.RoomScan
             block.Renderer.SetProductGridDisplay(false);
             block.Renderer.SetPinkIsolation(true);
             block.Renderer.RenderVisible = false;
+            if (_layerEvidencePointMaterial != null)
+            {
+                block.LayerEvidenceRenderer =
+                    block.GameObject.AddComponent<MeshLayerEvidenceRenderer>();
+                block.LayerEvidenceRenderer.Initialize(_layerEvidencePointMaterial,
+                    _layerEvidenceRelationMaterial,
+                    block.Surface.GetCoreBounds(_volume.VoxelSize),
+                    _volume.VoxelCount, _volume.VoxelSize);
+                block.LayerEvidenceRenderer.SetMode(0);
+            }
         }
 
         private void RequestCommit(Block block, uint candidateEpoch, int commitSerial)
@@ -361,6 +447,7 @@ namespace Genesis.RoomScan
                 _inFlightCommits = Mathf.Max(0, _inFlightCommits - 1);
                 if (request.hasError)
                 {
+                    block.DiscardAfterPresentationFreeze = false;
                     QueueBlock(block.Index, candidateEpoch, true);
                     return;
                 }
@@ -375,6 +462,7 @@ namespace Genesis.RoomScan
                 // candidate already superseded by a published Front is stale.
                 if (block.Built && candidateEpoch <= block.ProcessedEpoch)
                 {
+                    block.DiscardAfterPresentationFreeze = false;
                     if (block.TargetEpoch > block.ProcessedEpoch)
                         QueueBlock(block.Index, block.TargetEpoch, true);
                     return;
@@ -405,6 +493,7 @@ namespace Genesis.RoomScan
                     block.Front = block.Back;
                     block.Back = oldFront;
                     block.Renderer.SetMeshSource(block.Front);
+                    block.LayerEvidenceRenderer?.SetSource(block.Front);
                 }
                 else
                 {
@@ -418,6 +507,7 @@ namespace Genesis.RoomScan
             }
 
             block.ReadyToPublish = false;
+            block.DiscardAfterPresentationFreeze = false;
             block.PendingVertexCount = 0;
             block.PendingIndexCount = 0;
             block.VertexCount = vertices;
@@ -430,6 +520,24 @@ namespace Genesis.RoomScan
             else if (!InitialBuildComplete && _dirtyQueue.Count == 0 &&
                      _inFlightCommits == 0)
                 _nextReadbackTime = 0f;
+        }
+
+        private void DiscardFrozenCandidateAndRequeue(Block block)
+        {
+            if (block == null || !block.ReadyToPublish)
+                return;
+
+            uint retryEpoch = math.max(block.TargetEpoch, block.CandidateEpoch);
+            block.ReadyToPublish = false;
+            block.DiscardAfterPresentationFreeze = false;
+            block.PendingVertexCount = 0;
+            block.PendingIndexCount = 0;
+            // Never invent a dirty epoch merely to force work: doing so could
+            // advance ProcessedEpoch past the volume ledger and hide a later
+            // real update. A stale/equal candidate is simply discarded while
+            // the already published Front remains visible.
+            if (retryEpoch > block.ProcessedEpoch)
+                QueueBlock(block.Index, retryEpoch, true);
         }
 
         private void RequestDirtyLedgerIfDue()
@@ -582,9 +690,14 @@ namespace Genesis.RoomScan
 
         private void ApplyBlockVisibility(Block block)
         {
+            bool blockReady = InitialBuildComplete &&
+                !Failed && block.Built && block.Front != null && block.IndexCount > 0;
             if (block.Renderer != null)
-                block.Renderer.RenderVisible = _visible && InitialBuildComplete &&
-                    !Failed && block.Built && block.Front != null && block.IndexCount > 0;
+                block.Renderer.RenderVisible = blockReady && _visible;
+            if (block.LayerEvidenceRenderer != null)
+                block.LayerEvidenceRenderer.SetMode(blockReady
+                    ? _layerEvidenceMode
+                    : 0);
         }
 
         private void OnVolumeCleared()
@@ -617,6 +730,7 @@ namespace Genesis.RoomScan
                 block.CommitSerial++;
                 block.CommitPending = false;
                 block.ReadyToPublish = false;
+                block.DiscardAfterPresentationFreeze = false;
                 block.Queued = false;
                 block.PendingVertexCount = 0;
                 block.PendingIndexCount = 0;
@@ -652,6 +766,10 @@ namespace Genesis.RoomScan
                 _blocks[i].Dispose();
             _blocks.Clear();
             _dirtyQueue.Clear();
+            if (_layerEvidencePointMaterial != null)
+                UnityEngine.Object.Destroy(_layerEvidencePointMaterial);
+            if (_layerEvidenceRelationMaterial != null)
+                UnityEngine.Object.Destroy(_layerEvidenceRelationMaterial);
         }
     }
 }

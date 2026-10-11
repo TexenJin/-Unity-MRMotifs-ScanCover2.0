@@ -406,8 +406,9 @@ if (Test-Path -LiteralPath $joinedResponsibilitySummary -PathType Leaf) {
     $sb.AppendLine("quality_timeline_rows=$($joined.qualityTimelineRows)") | Out-Null
     $sb.AppendLine("motion_confirm_quality_min=$($joined.motionConfirmQualityMin)") | Out-Null
     $sb.AppendLine("blocked_correction_totals=$($joined.blockedCorrectionTotals | ConvertTo-Json -Compress)") | Out-Null
+    $sb.AppendLine("cause_classification_counts=$($joined.causeClassificationCounts | ConvertTo-Json -Compress)") | Out-Null
     $sb.AppendLine("missing_lanes=$([string]::Join('|', @($joined.missingLanes)))") | Out-Null
-    $sb.AppendLine('detail=artifacts/responsibility_ledger/surface_site_timeline.csv, court_decision_trace.csv, roughness_lineage.csv and factor_responsibility.csv') | Out-Null
+    $sb.AppendLine('detail=artifacts/responsibility_ledger/cause_classification.csv, surface_site_timeline.csv, court_decision_trace.csv, roughness_lineage.csv and factor_responsibility.csv') | Out-Null
     $sb.AppendLine() | Out-Null
 }
 

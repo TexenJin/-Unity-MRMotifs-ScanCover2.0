@@ -26,7 +26,7 @@ namespace Genesis.RoomScan
         [Header("Volume")]
         [SerializeField] private int3 voxelCount = new(96, 64, 96);
         [SerializeField] private float voxelSize = 0.10f;
-        [SerializeField] private float voxelDistance = 0.30f;
+        [SerializeField] private float voxelDistance = 0.20f;
         [SerializeField] private float voxelMin = 0.1f;
 
         [Header("Integration")]
@@ -201,15 +201,20 @@ namespace Genesis.RoomScan
         private bool enableInfiniTamBaseline = true;
         [SerializeField, Tooltip("临时 A/B：启用专用高精度 InfiniTAM 历史内核；不影响距离、视野、发布或背面遮挡。")]
         private bool enableCompactInfiniTamHistory = true;
-        [SerializeField, Tooltip("临时 A/B：连续两次可靠反证后把当前体素历史降到 5 票。当前开启，与 16 票全局历史组成 16/2/5 实验。")]
+        [SerializeField, Tooltip("临时 A/B：强反证仍按两个独立视角触发 16→5；小于半体素的普通变化按视角收集私有均值。新视角可发布上一桶；同一视角需四份方向一致、低波动证据才单次发布，随后冷却并重新取证。")]
         private bool enableInfiniTamSelectiveHistoryRelease = true;
         // 16/2/5 A/B: ordinary surfaces retain a compact 16-vote history.
-        // Two reliable, same-direction contradictions at least half a voxel
-        // apart release only that voxel's retained history to five votes.
+        // Two reliable, same-direction contradictions from independent observer
+        // positions release only that voxel's retained history to five votes.
         private const float InfiniTamMaxVoteWeight = 16f;
         private const float InfiniTamCorrectionVoteWeight = 5f;
         private const int InfiniTamContradictionConfirmations = 2;
         private const float InfiniTamContradictionDistanceVoxels = 0.5f;
+        private const float InfiniTamIndependentViewDegrees = 12f;
+        // 0 = verification build: the old pre-confirmation same-view slow path
+        // remains disabled. Sub-threshold ordinary updates are handled by the
+        // independent micro-view bucket instead of this strong-repair counter.
+        private const int InfiniTamSameViewSlowConfirmations = 0;
         private const float InfiniTamDirtyWakeThreshold = 0.5f / 127f;
         [SerializeField, Tooltip("历史 V1.6-V1.10 实验：让未完整移植的 ICP 跟踪器拥有 TSDF 写入、位姿修正和网格发布权。V1.3 恢复基线必须保持关闭；待完整移植 TAM 金字塔、阻尼回退、质量状态和重定位后才能重新启用。")]
         private bool enableInfiniTamTrackingAuthority = false;
@@ -262,6 +267,13 @@ namespace Genesis.RoomScan
         private RenderTexture _admissionTraceVolume;
         private RenderTexture _confidenceVolume;
         private RenderTexture _coherenceVolume;
+        // Baseline-only per-voxel view witness for selective history repair.
+        // It stores the first opposing/micro-bucket view and same-view sample
+        // count, not TSDF. Coherence distinguishes the two mutually exclusive uses.
+        private RenderTexture _infiniTamViewTicketVolume;
+        // Neutral micro-view bucket mean. Same-view sub-threshold observations
+        // update this sidecar instead of moving the production TSDF every frame.
+        private RenderTexture _infiniTamMicroViewMeanVolume;
         // Baseline-only canonical TSDF vote count.  The legacy/product route
         // receives only a 1x1 descriptor placeholder and never reads or writes it.
         private RenderTexture _infiniTamVoteWeightVolume;
@@ -269,6 +281,13 @@ namespace Genesis.RoomScan
         // remains R8G8_SNorm; this sidecar lets sub-step corrections accumulate
         // instead of being rounded away on every accepted frame.
         private RenderTexture _infiniTamAccumulatedTsdfVolume;
+        // Per-world-voxel frame ownership for compact InfiniTAM. Camera-local
+        // frustum samples can alias after rotation/snapping. The GPU packs a
+        // 24-bit epoch plus the first accepted TSDF sample into this claim so
+        // the read-only ledger can classify duplicate aliases without changing
+        // the one-frame/one-vote production decision.
+        private ComputeBuffer _infiniTamWriteEpochs;
+        private uint _infiniTamWriteEpoch;
         // Baseline-only prediction of the sole TSDF.  The TSDF binding and
         // prediction textures stay read-only; its exact-frame tracking decision
         // is consumed only by the quality gate below, before fusion.
@@ -324,6 +343,7 @@ namespace Genesis.RoomScan
         private static readonly int VoxMinID = Shader.PropertyToID("gsVoxMin");
         private static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
         private static readonly int FrustumVolumeID = Shader.PropertyToID("gsFrustumVolume");
+        private static readonly int FrustumVolumeCountID = Shader.PropertyToID("gsFrustumVolumeCount");
         private static readonly int FrustumPhaseOffsetID = Shader.PropertyToID("gsFrustumPhaseOffset");
         private static readonly int DepthDispThreshID = Shader.PropertyToID("gsDepthDispThresh");
         private static readonly int NumExclusionsID = Shader.PropertyToID("gsNumExclusions");
@@ -413,12 +433,24 @@ namespace Genesis.RoomScan
             Shader.PropertyToID("gsInfiniTamContradictionThreshold");
         private static readonly int InfiniTamContradictionConfirmationsID =
             Shader.PropertyToID("gsInfiniTamContradictionConfirmations");
+        private static readonly int InfiniTamIndependentViewCosID =
+            Shader.PropertyToID("gsInfiniTamIndependentViewCos");
+        private static readonly int InfiniTamSameViewSlowConfirmationsID =
+            Shader.PropertyToID("gsInfiniTamSameViewSlowConfirmations");
         private static readonly int InfiniTamSelectiveHistoryReleaseID =
             Shader.PropertyToID("gsInfiniTamSelectiveHistoryRelease");
         private static readonly int InfiniTamVoteWeightRWID =
             Shader.PropertyToID("gsInfiniTamVoteWeightRW");
         private static readonly int InfiniTamAccumulatedTsdfRWID =
             Shader.PropertyToID("gsInfiniTamAccumulatedTsdfRW");
+        private static readonly int InfiniTamViewTicketRWID =
+            Shader.PropertyToID("gsInfiniTamViewTicketRW");
+        private static readonly int InfiniTamMicroViewMeanRWID =
+            Shader.PropertyToID("gsInfiniTamMicroViewMeanRW");
+        private static readonly int InfiniTamWriteEpochsID =
+            Shader.PropertyToID("_InfiniTamWriteEpochs");
+        private static readonly int InfiniTamWriteEpochID =
+            Shader.PropertyToID("gsInfiniTamWriteEpoch");
         private static readonly int InfiniTamTicketStatsID =
             Shader.PropertyToID("_InfiniTamTicketStats");
         private static readonly int InfiniTamTicketEnabledID =
@@ -589,7 +621,7 @@ namespace Genesis.RoomScan
         // 68..70: provisional seeds, promotions and formal-surface demotions.
         // 71..89: read-only lifecycle forensics: seed source/risk, promotion
         // mechanism, promotion-time risk and immutable birth source.
-        private const int CarveStatsCount = 199; // 180..197=写入生命周期；198=未成熟冻结恢复（重叠账）
+        private const int CarveStatsCount = 203; // 199..202=InfiniTAM 同帧体素票侦察账（只读）
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
@@ -1022,6 +1054,8 @@ namespace Genesis.RoomScan
         {
             string failure = string.Empty;
             var completedResources = new List<string>(3);
+            byte[] responsibilityBytes = null;
+            byte[] supportBytes = null;
             try { Directory.CreateDirectory(destinationDirectory); }
             catch (Exception e) { failure = "directory:" + e.Message; }
 
@@ -1044,15 +1078,14 @@ namespace Genesis.RoomScan
 
             if (string.IsNullOrEmpty(failure))
             {
-                byte[] responsibility = null;
                 yield return ReadIntegerResponsibilitySlices(
                     _tsdfResponsibilityVolume, 2,
-                    "geometry_block_responsibility", data => responsibility = data,
+                    "geometry_block_responsibility", data => responsibilityBytes = data,
                     error => failure = error);
                 if (string.IsNullOrEmpty(failure))
                     yield return WriteResponsibilityBytes(
                         Path.Combine(destinationDirectory,
-                            "responsibility.rg32_uint.bin"), responsibility,
+                            "responsibility.rg32_uint.bin"), responsibilityBytes,
                         "geometry_block_responsibility", error => failure = error);
                 if (string.IsNullOrEmpty(failure))
                 {
@@ -1064,15 +1097,14 @@ namespace Genesis.RoomScan
 
             if (string.IsNullOrEmpty(failure))
             {
-                byte[] support = null;
                 yield return ReadIntegerResponsibilitySlices(
                     _tsdfSupportResponsibilityVolume, 1,
-                    "support_responsibility", data => support = data,
+                    "support_responsibility", data => supportBytes = data,
                     error => failure = error);
                 if (string.IsNullOrEmpty(failure))
                     yield return WriteResponsibilityBytes(
                         Path.Combine(destinationDirectory,
-                            "support_responsibility.r32_uint.bin"), support,
+                            "support_responsibility.r32_uint.bin"), supportBytes,
                         "support_responsibility", error => failure = error);
                 if (string.IsNullOrEmpty(failure))
                 {
@@ -1087,12 +1119,21 @@ namespace Genesis.RoomScan
                 int3 capturedVoxelCount = voxelCount;
                 float capturedVoxelSize = voxelSize;
                 float capturedTruncationDistance = voxelDistance;
+                bool compactCrossFrameLedger = enableInfiniTamBaseline &&
+                                               enableCompactInfiniTamHistory;
                 Task schemaTask = null;
                 try
                 {
-                    schemaTask = Task.Run(() => WriteTsdfResponsibilitySchema(
-                        reason, destinationDirectory, capturedVoxelCount,
-                        capturedVoxelSize, capturedTruncationDistance));
+                    schemaTask = Task.Run(() =>
+                    {
+                        WriteTsdfResponsibilitySchema(
+                            reason, destinationDirectory, capturedVoxelCount,
+                            capturedVoxelSize, capturedTruncationDistance,
+                            compactCrossFrameLedger);
+                        WriteCrossFramePushPullSummary(destinationDirectory,
+                            responsibilityBytes, supportBytes, capturedVoxelCount,
+                            capturedTruncationDistance);
+                    });
                 }
                 catch (Exception e) { failure = "schema:request:" + e.Message; }
                 if (schemaTask != null)
@@ -1103,6 +1144,12 @@ namespace Genesis.RoomScan
                             (schemaTask.Exception?.GetBaseException().Message ?? "unknown");
                     else if (schemaTask.IsCanceled)
                         failure = "schema:write:canceled";
+                    else
+                    {
+                        completedResources.Add("schema");
+                        completedResources.Add("cross_frame_push_pull_summary");
+                        completedResources.Add("cross_frame_push_pull_worst");
+                    }
                 }
                 if (string.IsNullOrEmpty(failure))
                     failure = WriteResponsibilityCheckpoint(destinationDirectory,
@@ -1205,16 +1252,20 @@ namespace Genesis.RoomScan
                 yield break;
             }
 
-            int sliceValues = voxelCount.x * voxelCount.y;
-            int sliceBytes = sliceValues * sizeof(uint) * uintLanes;
-            byte[] output = new byte[sliceBytes * voxelCount.z];
+            int voxelValues = voxelCount.x * voxelCount.y * voxelCount.z;
+            int wordCount = voxelValues * uintLanes;
+            uint[] words = new uint[wordCount];
             ComputeBuffer staging = null;
             int kernel = -1;
             string setupFailure = string.Empty;
             try
             {
-                staging = new ComputeBuffer(sliceValues,
-                    sizeof(uint) * uintLanes, ComputeBufferType.Structured);
+                // A uint-word buffer lets both R32_UINT and RG32_UINT exports use
+                // the same Quest-safe GetData path. This is stop-time-only: one
+                // full-volume GPU fence is preferable to a permanently pending
+                // per-slice AsyncGPUReadback transaction.
+                staging = new ComputeBuffer(wordCount,
+                    sizeof(uint), ComputeBufferType.Structured);
                 kernel = compute.FindKernel(uintLanes == 2
                     ? "CopyTsdfResponsibilityExportSlice"
                     : "CopyTsdfSupportResponsibilityExportSlice");
@@ -1237,71 +1288,45 @@ namespace Genesis.RoomScan
                 yield break;
             }
 
-            for (int z = 0; z < voxelCount.z; z++)
+            string dispatchFailure = string.Empty;
+            try
             {
-                string dispatchFailure = string.Empty;
-                try
+                for (int z = 0; z < voxelCount.z; z++)
                 {
                     compute.SetInt(TsdfResponsibilityExportZID, z);
                     compute.Dispatch(kernel,
                         Mathf.CeilToInt(voxelCount.x / 8f),
                         Mathf.CeilToInt(voxelCount.y / 8f), 1);
                 }
-                catch (Exception e)
-                {
-                    dispatchFailure = $"{label}:staging_dispatch:z={z}:{e.Message}";
-                }
-                if (!string.IsNullOrEmpty(dispatchFailure))
-                {
-                    staging.Release();
-                    failed?.Invoke(dispatchFailure);
-                    yield break;
-                }
+            }
+            catch (Exception e)
+            {
+                dispatchFailure = $"{label}:staging_dispatch:{e.Message}";
+            }
+            if (!string.IsNullOrEmpty(dispatchFailure))
+            {
+                staging.Release();
+                failed?.Invoke(dispatchFailure);
+                yield break;
+            }
 
-                AsyncGPUReadbackRequest request = default;
-                string requestFailure = string.Empty;
-                try { request = AsyncGPUReadback.Request(staging); }
-                catch (Exception e)
-                {
-                    requestFailure = $"{label}:staging_request:z={z}:{e.Message}";
-                }
-                if (!string.IsNullOrEmpty(requestFailure))
-                {
-                    staging.Release();
-                    failed?.Invoke(requestFailure);
-                    yield break;
-                }
+            // Let the queued slice copies reach the graphics queue before the
+            // single synchronous retirement barrier below.
+            yield return null;
 
-                while (!request.done) yield return null;
-                if (request.hasError)
-                {
-                    staging.Release();
-                    failed?.Invoke($"{label}:staging_gpu:z={z}");
-                    yield break;
-                }
-
-                string copyFailure = string.Empty;
-                try
-                {
-                    byte[] slice = request.GetData<byte>().ToArray();
-                    if (slice.Length != sliceBytes)
-                        copyFailure = $"{label}:staging_length:z={z}:expected={sliceBytes}:actual={slice.Length}";
-                    else
-                        Buffer.BlockCopy(slice, 0, output, sliceBytes * z, sliceBytes);
-                }
-                catch (Exception e)
-                {
-                    copyFailure = $"{label}:staging_copy:z={z}:{e.Message}";
-                }
-                if (!string.IsNullOrEmpty(copyFailure))
-                {
-                    staging.Release();
-                    failed?.Invoke(copyFailure);
-                    yield break;
-                }
+            string copyFailure = string.Empty;
+            try { staging.GetData(words); }
+            catch (Exception e) { copyFailure = $"{label}:staging_get_data:{e.Message}"; }
+            if (!string.IsNullOrEmpty(copyFailure))
+            {
+                staging.Release();
+                failed?.Invoke(copyFailure);
+                yield break;
             }
 
             staging.Release();
+            byte[] output = new byte[wordCount * sizeof(uint)];
+            Buffer.BlockCopy(words, 0, output, 0, output.Length);
             completed?.Invoke(output);
         }
 
@@ -1365,11 +1390,11 @@ namespace Genesis.RoomScan
         private static void WriteTsdfResponsibilitySchema(string reason,
             string destinationDirectory,
             int3 capturedVoxelCount, float capturedVoxelSize,
-            float capturedTruncationDistance)
+            float capturedTruncationDistance, bool compactCrossFrameLedger)
         {
             Directory.CreateDirectory(destinationDirectory);
             string schema = "{\n" +
-                "  \"schema\": \"scancover.tsdf_responsibility.v3\",\n" +
+                "  \"schema\": \"scancover.tsdf_responsibility.v4\",\n" +
                 "  \"reason\": \"" + JsonEscape(reason) + "\",\n" +
                 "  \"voxelCount\": [" + capturedVoxelCount.x + "," + capturedVoxelCount.y + "," + capturedVoxelCount.z + "],\n" +
                 "  \"voxelSizeMetres\": " + capturedVoxelSize.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
@@ -1379,17 +1404,125 @@ namespace Genesis.RoomScan
                 "  \"indexOrder\": \"x-fastest, then y, then z\",\n" +
                 "  \"tsdf\": \"interleaved signed R8 distance and signed R8 weight\",\n" +
                 "  \"responsibilityLaneX\": \"seedIntegration12,lastGeometryIntegration12,lastOperation4,birthFlags4\",\n" +
-                "  \"responsibilityLaneY\": \"strongestBlockIntegration12,blockReason5,signedMagnitude7,lastPreTsdf8\",\n" +
-                "  \"supportResponsibility\": \"integration12,operation4,preWeightSNorm8,postWeightSNorm8\",\n" +
+                "  \"responsibilityLaneY\": \"strongestWitnessIntegration12,witnessReason5,signedMagnitude7,priorValueSNorm8\",\n" +
+                "  \"supportResponsibility\": \"" + (compactCrossFrameLedger
+                    ? "compact InfiniTAM: strongestPriorObservationIntegration12,positivePushCount10,negativePushCount10; each direction count saturates at 1023"
+                    : "integration12,operation4,preWeightSNorm8,postWeightSNorm8") + "\",\n" +
                 "  \"integrationIdRange\": \"1..4094 exact; 4095 means saturated at or beyond integration 4095\",\n" +
                 "  \"operationCodes\": {\"1\":\"seed\",\"2\":\"positive_blend\",\"3\":\"lifetime_reset\"},\n" +
                 "  \"supportOperationCodes\": {\"1\":\"seed\",\"2\":\"positive_growth\",\"3\":\"carve\",\"4\":\"freeze\",\"5\":\"unfreeze\",\"6\":\"reset\"},\n" +
-                "  \"blockReasonCodes\": {\"1\":\"gungel\",\"2\":\"exclusion\",\"3\":\"normal\",\"4\":\"dilation_occlusion\",\"5\":\"truncation_band\",\"6\":\"abstain_neighbour\",\"9\":\"raw_projective_gate\",\"10\":\"dilation_supply\",\"11\":\"fov_motion_authority\",\"12\":\"frozen\",\"13\":\"blend_quantized\",\"14\":\"mature_discount\",\"15\":\"near_distance\",\"16\":\"invalid_depth\",\"17\":\"seed_quality\",\"18\":\"motion_seed\",\"19\":\"behind_camera\",\"20\":\"outside_fov\"},\n" +
+                "  \"witnessReasonCodes\": {\"1\":\"gungel\",\"2\":\"exclusion\",\"3\":\"normal\",\"4\":\"dilation_occlusion\",\"5\":\"truncation_band\",\"6\":\"abstain_neighbour\",\"9\":\"raw_projective_gate\",\"10\":\"dilation_supply\",\"11\":\"fov_motion_authority\",\"12\":\"frozen\",\"13\":\"blend_quantized\",\"14\":\"mature_discount\",\"15\":\"near_distance\",\"16\":\"invalid_depth\",\"17\":\"seed_quality\",\"18\":\"motion_seed\",\"19\":\"behind_camera\",\"20\":\"outside_fov\",\"21\":\"accepted_cross_frame_observation_push\"},\n" +
                 "  \"join\": \"packed integration ids join runtime_timeline/integration_dispatches.csv integrationCount\",\n" +
+                "  \"crossFrameDerivedFiles\": \"cross_frame_push_pull_summary.json and cross_frame_push_pull_worst.csv; reason 21 is after same-frame aliases were removed\",\n" +
                 "  \"authority\": \"diagnostic only; never sampled by production\"\n" +
                 "}\n";
             File.WriteAllText(Path.Combine(destinationDirectory, "schema.json"),
                 schema, new UTF8Encoding(false));
+        }
+
+        private static void WriteCrossFramePushPullSummary(string directory,
+            byte[] responsibility, byte[] support, int3 count,
+            float truncationDistance)
+        {
+            if (responsibility == null || support == null) return;
+            int voxelTotal = count.x * count.y * count.z;
+            if (responsibility.Length < voxelTotal * 8 || support.Length < voxelTotal * 4)
+                throw new InvalidDataException("cross-frame responsibility byte count mismatch");
+
+            const int reasonCrossFrame = 21;
+            const int maxRows = 4096;
+            long positivePushes = 0;
+            long negativePushes = 0;
+            int witnessVoxels = 0;
+            int oscillatingVoxels = 0;
+            int[] magnitudeHistogram = new int[64];
+            for (int i = 0; i < voxelTotal; i++)
+            {
+                uint laneY = ReadUInt32LittleEndian(responsibility, i * 8 + 4);
+                if (((laneY >> 12) & 0x1fu) != reasonCrossFrame) continue;
+                int magnitude = (int)((laneY >> 17) & 0x3fu);
+                magnitudeHistogram[magnitude]++;
+                witnessVoxels++;
+                uint directions = ReadUInt32LittleEndian(support, i * 4);
+                uint positive = (directions >> 12) & 0x3ffu;
+                uint negative = (directions >> 22) & 0x3ffu;
+                positivePushes += positive;
+                negativePushes += negative;
+                if (positive > 0 && negative > 0) oscillatingVoxels++;
+            }
+
+            int cutoff = 63;
+            int rowsAbove = 0;
+            while (cutoff > 0 && rowsAbove + magnitudeHistogram[cutoff] <= maxRows)
+            {
+                rowsAbove += magnitudeHistogram[cutoff];
+                cutoff--;
+            }
+            if (witnessVoxels <= maxRows) cutoff = 0;
+
+            var csv = new StringBuilder(Mathf.Min(maxRows + 1, witnessVoxels + 1) * 96);
+            csv.AppendLine("x,y,z,strongestCurrentIntegration,strongestPriorIntegration,direction,deltaNormalized,deltaMetres,previousObservation,lastGeometryIntegration,lastOperation,positivePushes,negativePushes");
+            int written = 0;
+            for (int i = 0; i < voxelTotal && written < maxRows; i++)
+            {
+                int offset = i * 8;
+                uint laneX = ReadUInt32LittleEndian(responsibility, offset);
+                uint laneY = ReadUInt32LittleEndian(responsibility, offset + 4);
+                if (((laneY >> 12) & 0x1fu) != reasonCrossFrame) continue;
+                int magnitude = (int)((laneY >> 17) & 0x3fu);
+                if (magnitude < cutoff) continue;
+                bool negative = ((laneY >> 17) & 0x40u) != 0;
+                float delta = magnitude / 63f * (negative ? -1f : 1f);
+                float previousObservation = (((laneY >> 24) & 0xffu) / 255f) * 2f - 1f;
+                uint directions = ReadUInt32LittleEndian(support, i * 4);
+                int x = i % count.x;
+                int yz = i / count.x;
+                int y = yz % count.y;
+                int z = yz / count.y;
+                csv.Append(x).Append(',').Append(y).Append(',').Append(z).Append(',')
+                    .Append(laneY & 0xfffu).Append(',')
+                    .Append(directions & 0xfffu).Append(',')
+                    .Append(negative ? "negative" : "positive").Append(',')
+                    .Append(delta.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                    .Append((delta * truncationDistance).ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(previousObservation.ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                    .Append((laneX >> 12) & 0xfffu).Append(',')
+                    .Append((laneX >> 24) & 0xfu).Append(',')
+                    .Append((directions >> 12) & 0x3ffu).Append(',')
+                    .Append((directions >> 22) & 0x3ffu).AppendLine();
+                written++;
+            }
+            File.WriteAllText(Path.Combine(directory, "cross_frame_push_pull_worst.csv"),
+                csv.ToString(), new UTF8Encoding(false));
+
+            var histogram = new StringBuilder(256);
+            histogram.Append('[');
+            for (int i = 0; i < magnitudeHistogram.Length; i++)
+            {
+                if (i > 0) histogram.Append(',');
+                histogram.Append(magnitudeHistogram[i]);
+            }
+            histogram.Append(']');
+            string json = "{\n" +
+                "  \"schema\": \"scancover.cross_frame_push_pull.v1\",\n" +
+                "  \"authority\": \"read-only accepted one-frame-one-vote observations; no mesh-derived points\",\n" +
+                "  \"witnessVoxels\": " + witnessVoxels + ",\n" +
+                "  \"oscillatingVoxels\": " + oscillatingVoxels + ",\n" +
+                "  \"positivePushes\": " + positivePushes + ",\n" +
+                "  \"negativePushes\": " + negativePushes + ",\n" +
+                "  \"magnitudeHistogram0To63\": " + histogram + ",\n" +
+                "  \"csvRows\": " + written + ",\n" +
+                "  \"csvCutoffMagnitude\": " + cutoff + ",\n" +
+                "  \"sourceFrameJoin\": \"strongestCurrentIntegration/strongestPriorIntegration -> integration_dispatches.csv integrationCount\"\n" +
+                "}\n";
+            File.WriteAllText(Path.Combine(directory, "cross_frame_push_pull_summary.json"),
+                json, new UTF8Encoding(false));
+        }
+
+        private static uint ReadUInt32LittleEndian(byte[] data, int offset)
+        {
+            return (uint)(data[offset] | data[offset + 1] << 8 |
+                          data[offset + 2] << 16 | data[offset + 3] << 24);
         }
 
         private static string JsonEscape(string value)
@@ -1479,6 +1612,12 @@ namespace Genesis.RoomScan
                 _infiniTamVoteWeightVolume);
             _clearInfiniTamVotesKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamViewTicketRWID,
+                _infiniTamViewTicketVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamMicroViewMeanRWID,
+                _infiniTamMicroViewMeanVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamWriteEpochsID,
+                _infiniTamWriteEpochs);
 
             _invalidateGunGelSuccessionsKernel = new ComputeKernelHelper(compute,
                 "InvalidateGunGelSuccessions");
@@ -1513,14 +1652,22 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
             _integrateKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
+            _integrateKernel.Set(InfiniTamViewTicketRWID,
+                _infiniTamViewTicketVolume);
+            _integrateKernel.Set(InfiniTamMicroViewMeanRWID,
+                _infiniTamMicroViewMeanVolume);
+            _integrateKernel.Set(InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
+            // The compact baseline now writes the read-only cross-frame
+            // responsibility sidecar as well. Bind these UAVs on both routes;
+            // gsTsdfResponsibilityWrite remains the sole diagnostic write gate.
+            _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+            _integrateKernel.Set(TsdfSupportResponsibilityRWID,
+                _tsdfSupportResponsibilityVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
             if (!useCompactInfiniTamKernel)
             {
                 _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-                _integrateKernel.Set(TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
-                _integrateKernel.Set(TsdfSupportResponsibilityRWID,
-                    _tsdfSupportResponsibilityVolume);
                 _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
                 _integrateKernel.Set(ActivePageObservedEpochsID,
                     _activePageObservedEpochs);
@@ -1701,6 +1848,9 @@ namespace Genesis.RoomScan
             _frustumVolume?.Release();
             _frustumVolume = null;
             _frustumReady = false;
+            _infiniTamWriteEpochs?.Release();
+            _infiniTamWriteEpochs = null;
+            _infiniTamWriteEpoch = 0u;
             _dirtyChunkEpochs?.Release();
             _dirtyChunkEpochs = null;
             _dirtyBoundaryEpochs?.Release();
@@ -1721,6 +1871,16 @@ namespace Genesis.RoomScan
             if (_admissionTraceVolume) { Destroy(_admissionTraceVolume); _admissionTraceVolume = null; }
             if (_confidenceVolume) { Destroy(_confidenceVolume); _confidenceVolume = null; }
             if (_coherenceVolume) { Destroy(_coherenceVolume); _coherenceVolume = null; }
+            if (_infiniTamViewTicketVolume)
+            {
+                Destroy(_infiniTamViewTicketVolume);
+                _infiniTamViewTicketVolume = null;
+            }
+            if (_infiniTamMicroViewMeanVolume)
+            {
+                Destroy(_infiniTamMicroViewMeanVolume);
+                _infiniTamMicroViewMeanVolume = null;
+            }
             if (_infiniTamVoteWeightVolume)
             {
                 Destroy(_infiniTamVoteWeightVolume);
@@ -2448,6 +2608,12 @@ namespace Genesis.RoomScan
                 _infiniTamVoteWeightVolume);
             _clearInfiniTamVotesKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamViewTicketRWID,
+                _infiniTamViewTicketVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamMicroViewMeanRWID,
+                _infiniTamMicroViewMeanVolume);
+            _clearInfiniTamVotesKernel.Set(InfiniTamWriteEpochsID,
+                _infiniTamWriteEpochs);
             _invalidateGunGelSuccessionsKernel.Set(VolumeRWID, _volume);
             _invalidateGunGelSuccessionsKernel.Set(ColorVolumeRWID, _colorVolume);
             _invalidateGunGelSuccessionsKernel.Set(AdmissionTraceRWID,
@@ -2475,6 +2641,11 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
             _integrateKernel.Set(InfiniTamAccumulatedTsdfRWID,
                 _infiniTamAccumulatedTsdfVolume);
+            _integrateKernel.Set(InfiniTamViewTicketRWID,
+                _infiniTamViewTicketVolume);
+            _integrateKernel.Set(InfiniTamMicroViewMeanRWID,
+                _infiniTamMicroViewMeanVolume);
+            _integrateKernel.Set(InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
             _integrateKernel.Set(ConfidenceRWID, _confidenceVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
@@ -2615,6 +2786,10 @@ namespace Genesis.RoomScan
                             Mathf.Max(voxelDistance, 1e-5f), 1f / 127f, 1f));
             compute.SetInt(InfiniTamContradictionConfirmationsID,
                 InfiniTamContradictionConfirmations);
+            compute.SetFloat(InfiniTamIndependentViewCosID,
+                Mathf.Cos(InfiniTamIndependentViewDegrees * Mathf.Deg2Rad));
+            compute.SetInt(InfiniTamSameViewSlowConfirmationsID,
+                InfiniTamSameViewSlowConfirmations);
             compute.SetFloat(InfiniTamSelectiveHistoryReleaseID,
                 enableInfiniTamSelectiveHistoryRelease ? 1f : 0f);
         }
@@ -3277,6 +3452,28 @@ namespace Genesis.RoomScan
             sb.AppendLine($"tracking_last_decision={_infiniTamLastTrackingDecision}");
             _infiniTamModelRaycast?.AppendReport(sb);
 
+            ulong sameFrameAttempts = CumulativeCarveStats[199];
+            ulong sameFrameFirstClaims = CumulativeCarveStats[200];
+            ulong sameFrameDuplicates = CumulativeCarveStats[201];
+            ulong sameFrameContradictoryDuplicates = CumulativeCarveStats[202];
+            double duplicateRate = sameFrameAttempts > 0
+                ? 100.0 * sameFrameDuplicates / sameFrameAttempts
+                : 0.0;
+            double contradictoryDuplicateRate = sameFrameDuplicates > 0
+                ? 100.0 * sameFrameContradictoryDuplicates / sameFrameDuplicates
+                : 0.0;
+            sb.AppendLine();
+            sb.AppendLine("infinitam_same_frame_voxel_vote_probe:");
+            sb.AppendLine("scope=cumulative_valid_compact_integration_aliases;diagnostic_only=true;changes_fusion=false");
+            sb.AppendLine("contradiction_definition=absolute_first_vs_duplicate_sdf_difference_gte_half_world_voxel");
+            sb.AppendLine($"valid_attempts={U(sameFrameAttempts)}");
+            sb.AppendLine($"first_claims={U(sameFrameFirstClaims)}");
+            sb.AppendLine($"duplicate_aliases={U(sameFrameDuplicates)}");
+            sb.AppendLine($"contradictory_duplicate_aliases={U(sameFrameContradictoryDuplicates)}");
+            sb.AppendLine($"attempt_reconcile_delta={(long)sameFrameAttempts - (long)sameFrameFirstClaims - (long)sameFrameDuplicates}");
+            sb.AppendLine($"duplicate_rate_percent={duplicateRate.ToString("F6", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"contradictory_share_of_duplicates_percent={contradictoryDuplicateRate.ToString("F6", CultureInfo.InvariantCulture)}");
+
             ulong seedSourceSum = CumulativeCarveStats[71] +
                                   CumulativeCarveStats[72] +
                                   CumulativeCarveStats[73];
@@ -3625,6 +3822,38 @@ namespace Genesis.RoomScan
                     : "InfiniTamAccumulatedTsdfDummy"
             };
             _infiniTamAccumulatedTsdfVolume.Create();
+            _infiniTamViewTicketVolume = new RenderTexture(
+                voteWidth, voteHeight, 0, infiniTamVoteFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voteDepth,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = enableInfiniTamBaseline
+                    ? "InfiniTamViewTicket"
+                    : "InfiniTamViewTicketDummy"
+            };
+            _infiniTamViewTicketVolume.Create();
+            _infiniTamMicroViewMeanVolume = new RenderTexture(
+                voteWidth, voteHeight, 0, infiniTamVoteFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = voteDepth,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = enableInfiniTamBaseline
+                    ? "InfiniTamMicroViewMean"
+                    : "InfiniTamMicroViewMeanDummy"
+            };
+            _infiniTamMicroViewMeanVolume.Create();
+            int writeEpochCount = enableInfiniTamBaseline
+                ? voxelCount.x * voxelCount.y * voxelCount.z
+                : 1;
+            _infiniTamWriteEpochs = new ComputeBuffer(
+                writeEpochCount, sizeof(uint), ComputeBufferType.Structured);
+            _infiniTamWriteEpoch = 0u;
             if (enableInfiniTamBaseline)
             {
                 long voteBytesPerVoxel = infiniTamVoteFormat == GraphicsFormat.R16_SFloat
@@ -3632,7 +3861,9 @@ namespace Genesis.RoomScan
                     : 4L;
                 Logger.Info($"InfiniTAM private fusion sidecars: {voxelCount} " +
                             $"{infiniTamVoteFormat} = " +
-                            $"{(2L * voteBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+                            $"{(4L * voteBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB; " +
+                            $"one-frame ownership = " +
+                            $"{(4L * writeEpochCount) / (1024 * 1024)}MB");
             }
 
             GraphicsFormat traceFormat = SystemInfo.IsFormatSupported(GraphicsFormat.R8_UNorm, FormatUsage.LoadStore)
@@ -3821,6 +4052,7 @@ namespace Genesis.RoomScan
                 ResetInfiniTamStartupState(preserveReseedCount: true);
             if (enableInfiniTamBaseline && _infiniTamVoteWeightVolume != null)
             {
+                _infiniTamWriteEpoch = 0u;
                 _clearInfiniTamVotesKernel.Set(InfiniTamVoteWeightRWID,
                     _infiniTamVoteWeightVolume);
                 _clearInfiniTamVotesKernel.DispatchFit(_infiniTamVoteWeightVolume);
@@ -4314,6 +4546,7 @@ namespace Genesis.RoomScan
             _frustumVolume = new ComputeBuffer(positions.Count, sizeof(float) * 3);
             _frustumVolume.SetData(positions);
             _integrateKernel.Set(FrustumVolumeID, _frustumVolume);
+            compute.SetInt(FrustumVolumeCountID, positions.Count);
             _frustumReady = true;
         }
 
@@ -5060,6 +5293,17 @@ namespace Genesis.RoomScan
             if (enableInfiniTamBaseline && !usingInfiniTamTrackedFrame)
                 _infiniTamAttemptedFrames++;
             bool sampledInfiniTamTicket = PrepareInfiniTamTicketSample();
+            compute.SetInt(FrustumVolumeCountID, _frustumVolume.count);
+            if (enableInfiniTamBaseline && enableCompactInfiniTamHistory)
+            {
+                // The GPU packs the epoch into 24 bits and reserves zero for a
+                // freshly cleared claim buffer. A normal Quest scan cannot reach
+                // the 16.7M-frame wrap boundary; scan clear resets both together.
+                unchecked { _infiniTamWriteEpoch = (_infiniTamWriteEpoch + 1u) & 0x00ffffffu; }
+                if (_infiniTamWriteEpoch == 0u) _infiniTamWriteEpoch = 1u;
+                compute.SetInt(InfiniTamWriteEpochID,
+                    unchecked((int)_infiniTamWriteEpoch));
+            }
             _integrateKernel.DispatchFit(_frustumVolume.count, 1);
             compute.SetFloat(InfiniTamTicketEnabledID, 0f);
             if (enableInfiniTamBaseline)

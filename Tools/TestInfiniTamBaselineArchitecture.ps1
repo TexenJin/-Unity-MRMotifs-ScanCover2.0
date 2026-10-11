@@ -81,8 +81,14 @@ Assert-Contains $shader '_InfiniTamTicketStats\[2\]' `
     'the receipt counts mature writes separately'
 Assert-Contains $shader 'extractionEligibility = max\(gsFormalSurfaceWeight \+ 1\.0 / 127\.0, 0\.1\)' `
     'one accepted baseline observation crosses the mesh confidence threshold'
-Assert-Contains $shader 'WriteTrackedTsdf\(coord, float2\(reconstructedTsdf, extractionEligibility\)\);[\s\S]*?gsColorVolumeRW\[coord\][\s\S]*?return;\s+\}\s+bool fovLedgerNearSurface' `
+Assert-Contains $shader 'WriteTrackedTsdf\(coord, reconstructed\);[\s\S]*?gsColorVolumeRW\[coord\][\s\S]*?return;\s+\}\s+bool fovLedgerNearSurface' `
     'baseline exits before experimental admission and correction rules'
+Assert-Contains $shader 'void IntegrateInfiniTam[\s\S]*?RecordTsdfGeometryMutation\(coord, previous, reconstructed' `
+    'compact InfiniTAM writes retain seed and last geometry responsibility'
+Assert-Contains $shader 'void IntegrateInfiniTam[\s\S]*?RecordTsdfSupportMutation\(coord, previousSupport, reconstructedSupport' `
+    'compact InfiniTAM writes retain normalized vote-support responsibility'
+Assert-Contains $shader 'compact history selector[\s\S]*?RecordTsdfBlockedCorrection' `
+    'compact InfiniTAM records why contradictory observations did not release history'
 
 Assert-Contains $mesh 'if \(_volume != null && _volume\.InfiniTamBaselineEnabled\)\s+\{\s+EnsureInfiniTamBaselineResources\(\);\s+return;' `
     'baseline initialization bypasses support/coarse/product/chunk pipelines'
