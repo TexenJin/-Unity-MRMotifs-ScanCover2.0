@@ -662,6 +662,8 @@ namespace Genesis.RoomScan
 
         /// <summary>正在融合（未暂停）。</summary>
         public bool IsScanning { get; private set; }
+        /// <summary>A 键观察定格：采集会话仍在，但所有网格生产链停止变更。</summary>
+        public bool IsOperatorFrozen => _operatorFrozen;
         /// <summary>本次运行期间曾经开始过扫描（暂停后为 true，清空后归 false）。</summary>
         public bool HasStarted { get; private set; }
         public bool IsSaveAndClearInProgress { get; private set; }
@@ -702,18 +704,26 @@ namespace Genesis.RoomScan
             _volumeIntegrator = GetComponent<VolumeIntegrator>();
             _meshExtractor = GetComponent<MeshExtractor>();
             _cameraProvider = GetComponent<PassthroughCameraProvider>();
-            if (_volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled)
+            if (_volumeIntegrator != null &&
+                (_volumeIntegrator.QrsReferenceBaselineEnabled ||
+                 _volumeIntegrator.InfiniTamBaselineEnabled))
             {
-                // The architecture baseline owns one reconstruction and one
-                // renderer.  Do not let a serialized A/B flag tear it down and
-                // replace it with HERA/freeze acquisition during StartScanning.
+                // A reconstruction baseline owns one fusion path, one extractor
+                // and one renderer. A serialized A/B flag must not tear it down
+                // and replace it with HERA/freeze acquisition during startup.
                 enableFrozenChunkAbExperiment = false;
-                // The safe scheduler profile keeps fusion responsive and gives
-                // one small block step a predictable 5 Hz logical cadence.
-                // Scene serialization cannot silently restore the old 20 Hz /
-                // multi-block burst profile.
-                integrationHz = 10f;
-                meshExtractionHz = 5f;
+                if (_volumeIntegrator.QrsReferenceBaselineEnabled)
+                {
+                    // Match QRS: full-volume integration and extraction may run
+                    // together at its serialized 30 Hz cadence.
+                    integrationHz = 30f;
+                    meshExtractionHz = 30f;
+                }
+                else
+                {
+                    integrationHz = 10f;
+                    meshExtractionHz = 5f;
+                }
             }
             SyncCaptureModeIdentity();
             DisableLegacyManagementBlockWireOverlay();
@@ -1139,7 +1149,9 @@ namespace Genesis.RoomScan
                 viewState = _meshExtractor.RouteValidationLabel;
 
             string productionAdmission =
-                _volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled
+                _volumeIntegrator != null && _volumeIntegrator.QrsReferenceBaselineEnabled
+                ? "QRS原始TSDF直融"
+                : _volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled
                 ? "InfiniTAM V1.3直融"
                 : _volumeIntegrator != null && _volumeIntegrator.GunGelIdentityOnlyMode
                 ? "原深度TSDF→块裁决"
@@ -2030,11 +2042,12 @@ namespace Genesis.RoomScan
                 $"累计账:{(_meshExtractor != null ? _meshExtractor.GetLedgerSessionStatsCompact() : "无")}\n" +
                 $"局部替换:{(_meshExtractor != null ? _meshExtractor.GetLocalReplacementStatsCompact() : "无")}\n" +
                 $"框内三栏:{(_meshExtractor != null ? _meshExtractor.GetDiagnosticRoiStatsCompact() : "无")}\n" +
+                $"{(LocalFineTsdfExperiment.Instance != null ? LocalFineTsdfExperiment.Instance.StatusCompact : "5cm框:未创建")}\n" +
                 $"提取:生产  严格:{(_meshExtractor != null ? _meshExtractor.GetStrictObservedStatsCompact() : "无")}\n" +
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续  A=暂停  B=保存并清空\n" +
-                $"摇杆按=线框 左摇杆左=裁冻锁定  Y=生产A/候选B" +
+                $"盯住目标=5cm框自动贴面 右摇杆按=锁定/取消  X=证据层" +
                 (_hudLastError.Length > 0 ? $"\n<color=#FF6060>错误:{_hudLastError}</color>" : "");
         }
 
@@ -2172,6 +2185,34 @@ namespace Genesis.RoomScan
             if (_operatorFrozen) return;
 
             float t = Time.time;
+            if (_volumeIntegrator != null &&
+                _volumeIntegrator.QrsReferenceBaselineEnabled)
+            {
+                // The QRS reference lane is deliberately self-contained. Do
+                // not run freeze supervision, page requeues, plane management,
+                // confidence census or any later ScanCover maintenance beside it.
+                if (t - _lastIntegrationTime >= IntegrationInterval)
+                {
+                    _lastIntegrationTime = t;
+                    ProvideColorFrame();
+                    _depthCapture?.PreprocessLatestFrame();
+                    bool dispatched = _volumeIntegrator.Integrate();
+                    if (dispatched)
+                    {
+                        Integrated?.Invoke();
+                        _integrateCount++;
+                    }
+
+                    if (t - _lastMeshTime >= MeshInterval)
+                    {
+                        _lastMeshTime = t;
+                        _meshExtractor.Extract();
+                        MeshExtracted?.Invoke();
+                    }
+                }
+                return;
+            }
+
             TickFrozenBlockSupervisor(t);
             bool directTruthRoute = _meshExtractor != null &&
                                     _meshExtractor.RouteValidationPausesHera;
@@ -3920,7 +3961,9 @@ namespace Genesis.RoomScan
                 bool resuming = HasStarted;
                 _operatorFrozen = false;
                 _meshExtractor?.SetLayerObservationFrozen(false);
-                if (!resuming)
+                if (!resuming &&
+                    !(_volumeIntegrator != null &&
+                      _volumeIntegrator.QrsReferenceBaselineEnabled))
                 {
                     _instantDepthShellOverlay?.ResetProductionWitnessLedger();
                     if (!(_volumeIntegrator != null &&
@@ -3940,7 +3983,10 @@ namespace Genesis.RoomScan
 
                 // 新空卷必须从第一帧开始建独立回放契约；若等扫到一半才手动开，
                 // 离线端缺少初始 TSDF/候选状态，形式上有文件却不能从零复现。
-                if (!resuming && !_depthCapture.PairedFrameCaptureActive)
+                if (!resuming &&
+                    !(_volumeIntegrator != null &&
+                      _volumeIntegrator.QrsReferenceBaselineEnabled) &&
+                    !_depthCapture.PairedFrameCaptureActive)
                 {
                     bool replayStarted = _depthCapture.TogglePairedFrameCapture();
                     Logger.Info(replayStarted
@@ -4073,7 +4119,7 @@ namespace Genesis.RoomScan
             {
                 1 => "成因关系：白网格 / 黄零交叉 → 青SN均值",
                 2 => "TSDF来源格：正负端点 → 黄零交叉 / 10cm单元（无白网格）",
-                3 => "TSDF权责：洋红A / 青B → 黄零交叉；同色圈标主责端",
+                3 => "TSDF权责：箭头端点→零交叉；黄=单方向，洋红=跨方向混合",
                 _ => "原始网格"
             });
             RefreshStatusBadge();

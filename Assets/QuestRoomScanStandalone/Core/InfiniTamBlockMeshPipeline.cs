@@ -391,6 +391,8 @@ namespace Genesis.RoomScan
             block.Surface = new GPUSurfaceNets(_compute)
             {
                 MinMeshWeight = _volume.MinMeshWeight,
+                // Clean v3.1 baseline: no post-extraction smoothing. The local
+                // 5 cm experiment must be the only geometry variable in its ROI.
                 SmoothIterations = 0,
                 SmoothLambda = 0f,
                 SmoothBeta = 0f,

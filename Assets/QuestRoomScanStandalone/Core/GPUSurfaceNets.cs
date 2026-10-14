@@ -27,6 +27,7 @@ namespace Genesis.RoomScan
         private readonly int _kInitTsdfPushHistory;
         private readonly int _kCommitTsdfPushHistory;
         private readonly int _kClearCandidateHistory;
+        private readonly int _kClearFoundationHistory;
         private readonly int _kCopyMeshSnapshot;
         private readonly int _kCopyAdditiveMergePayload;
         private readonly int _kAppendNovelMatureTriangles;
@@ -55,6 +56,10 @@ namespace Genesis.RoomScan
         private RenderTexture _lastTsdfVolume;
         private bool _heraRescueWarningLogged;
         private GraphicsBuffer _candidateHistoryStates;
+        private GraphicsBuffer _foundationParentHistoryPositions;
+        private GraphicsBuffer _foundationParentHistoryNormals;
+        private GraphicsBuffer _foundationParentHistoryStates;
+        private GraphicsBuffer _foundationEdgeHistoryStates;
 
         // Temporal state as 3D texture (avoids 128MB structured buffer limit on Quest)
         private RenderTexture _temporalState;
@@ -77,6 +82,7 @@ namespace Genesis.RoomScan
         private bool _temporalInitialized;
         private bool _tsdfPushHistoryInitialized;
         private bool _candidateHistoryInitialized;
+        private bool _foundationHistoryInitialized;
         private uint _candidateExtractionEpoch;
 
         public float MinMeshWeight { get; set; } = 0.08f;
@@ -103,6 +109,26 @@ namespace Genesis.RoomScan
         public float FoundationCornerNormalDotMax { get; set; } = 0.7071068f;
         public float FoundationChamferWidthVoxels { get; set; }
         public bool FoundationConstrainedSimplification { get; set; }
+        /// <summary>
+        /// Keep native 5 cm cells for zero-crossing placement, but publish
+        /// indices only on the planar 2x2x2 parent lattice.  This is deliberately
+        /// separate from FoundationCellStride: the latter changes the sampling
+        /// lattice itself, while this mode changes only the topology consumer.
+        /// </summary>
+        public bool FoundationParentTopologyFromFineEvidence { get; set; }
+        /// <summary>
+        /// Preserve the identity of the 10 cm parent output across extractions.
+        /// Native 5 cm evidence remains geometry authority; this history only
+        /// prevents representative, edge and diagonal identity from being
+        /// re-decided by every small TSDF fluctuation.
+        /// </summary>
+        public bool FoundationParentStabilityEnabled { get; set; }
+        public float FoundationParentPositionAlpha { get; set; } = 0.35f;
+        public float FoundationParentPositionDeadzoneVoxels { get; set; } = 0.05f;
+        public float FoundationParentReplacementDistanceVoxels { get; set; } = 0.75f;
+        public int FoundationParentReplacementConfirmations { get; set; } = 3;
+        public int FoundationEdgeBirthConfirmations { get; set; } = 2;
+        public int FoundationEdgeRetireConfirmations { get; set; } = 3;
         public float FoundationSimplifyNormalDotMin { get; set; } = 0.9659258f;
         public float FoundationSimplifyPlaneResidualVoxels { get; set; } = 0.2f;
         public int FoundationVisibleSkirtVoxels { get; set; }
@@ -110,6 +136,12 @@ namespace Genesis.RoomScan
         public bool DiagnosticRoiEnabled { get; set; } = true;
         public Vector4 DiagnosticRoiRect { get; set; } = new Vector4(0.2f, 0.25f, 0.8f, 0.75f);
         public Vector2 DiagnosticRoiSplitX { get; set; } = new Vector2(0.44f, 0.56f);
+        /// <summary>
+        /// World-space center of this TSDF lattice. Production remains at zero;
+        /// the bounded 5 cm experiment uses this to place its independent local
+        /// volume without changing the global reconstruction coordinate system.
+        /// </summary>
+        public Vector3 VolumeOrigin { get; set; } = Vector3.zero;
 
         public GraphicsBuffer VertexBuffer => _vertices;
         public GraphicsBuffer IndexBuffer => _indices;
@@ -127,6 +159,7 @@ namespace Genesis.RoomScan
         private static readonly int ID_CoreMin = Shader.PropertyToID("_CoreMin");
         private static readonly int ID_CoreMax = Shader.PropertyToID("_CoreMax");
         private static readonly int ID_VoxSize = Shader.PropertyToID("_VoxSize");
+        private static readonly int ID_VolumeOrigin = Shader.PropertyToID("_VolumeOrigin");
         private static readonly int ID_MinWeight = Shader.PropertyToID("_MinWeight");
         private static readonly int ID_TotalVoxels = Shader.PropertyToID("_TotalVoxels");
         private static readonly int ID_MaxVertices = Shader.PropertyToID("_MaxVertices");
@@ -171,6 +204,32 @@ namespace Genesis.RoomScan
         private static readonly int ID_FoundationCornerNormalDotMax = Shader.PropertyToID("_FoundationCornerNormalDotMax");
         private static readonly int ID_FoundationChamferWidthVoxels = Shader.PropertyToID("_FoundationChamferWidthVoxels");
         private static readonly int ID_FoundationSimplifyEnabled = Shader.PropertyToID("_FoundationSimplifyEnabled");
+        private static readonly int ID_FoundationParentTopologyFromFineEvidence =
+            Shader.PropertyToID("_FoundationParentTopologyFromFineEvidence");
+        private static readonly int ID_FoundationParentStabilityEnabled =
+            Shader.PropertyToID("_FoundationParentStabilityEnabled");
+        private static readonly int ID_FoundationParentPositionAlpha =
+            Shader.PropertyToID("_FoundationParentPositionAlpha");
+        private static readonly int ID_FoundationParentPositionDeadzoneVoxels =
+            Shader.PropertyToID("_FoundationParentPositionDeadzoneVoxels");
+        private static readonly int ID_FoundationParentReplacementDistanceVoxels =
+            Shader.PropertyToID("_FoundationParentReplacementDistanceVoxels");
+        private static readonly int ID_FoundationParentReplacementConfirmations =
+            Shader.PropertyToID("_FoundationParentReplacementConfirmations");
+        private static readonly int ID_FoundationEdgeBirthConfirmations =
+            Shader.PropertyToID("_FoundationEdgeBirthConfirmations");
+        private static readonly int ID_FoundationEdgeRetireConfirmations =
+            Shader.PropertyToID("_FoundationEdgeRetireConfirmations");
+        private static readonly int ID_FoundationHistoryCapacity =
+            Shader.PropertyToID("_FoundationHistoryCapacity");
+        private static readonly int ID_FoundationParentHistoryPositions =
+            Shader.PropertyToID("_FoundationParentHistoryPositions");
+        private static readonly int ID_FoundationParentHistoryNormals =
+            Shader.PropertyToID("_FoundationParentHistoryNormals");
+        private static readonly int ID_FoundationParentHistoryStates =
+            Shader.PropertyToID("_FoundationParentHistoryStates");
+        private static readonly int ID_FoundationEdgeHistoryStates =
+            Shader.PropertyToID("_FoundationEdgeHistoryStates");
         private static readonly int ID_FoundationSimplifyNormalDotMin = Shader.PropertyToID("_FoundationSimplifyNormalDotMin");
         private static readonly int ID_FoundationSimplifyPlaneResidualVoxels = Shader.PropertyToID("_FoundationSimplifyPlaneResidualVoxels");
         private static readonly int ID_FoundationVisibleSkirtVoxels = Shader.PropertyToID("_FoundationVisibleSkirtVoxels");
@@ -281,6 +340,7 @@ namespace Genesis.RoomScan
             _kInitTsdfPushHistory = compute.FindKernel("InitTsdfPushHistory");
             _kCommitTsdfPushHistory = compute.FindKernel("CommitTsdfPushHistory");
             _kClearCandidateHistory = compute.FindKernel("ClearCandidateHistory");
+            _kClearFoundationHistory = compute.FindKernel("ClearFoundationHistory");
             _kCopyMeshSnapshot = compute.FindKernel("CopyMeshSnapshot");
             _kCopyAdditiveMergePayload = compute.FindKernel("CopyAdditiveMergePayload");
             _kAppendNovelMatureTriangles = compute.FindKernel("AppendNovelMatureTriangles");
@@ -668,6 +728,15 @@ namespace Genesis.RoomScan
             _smoothPosB = new GraphicsBuffer(GraphicsBuffer.Target.Structured, smoothCapacity, Float3Stride);
             _candidateHistoryKeys = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _candidateHistoryCapacity, 4);
             _candidateHistoryStates = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _candidateHistoryCapacity, 4);
+            int foundationHistoryCapacity = FoundationParentTopologyFromFineEvidence ? mapVoxels : 1;
+            _foundationParentHistoryPositions = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, foundationHistoryCapacity, 16);
+            _foundationParentHistoryNormals = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, foundationHistoryCapacity, 16);
+            _foundationParentHistoryStates = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, foundationHistoryCapacity, 4);
+            _foundationEdgeHistoryStates = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, foundationHistoryCapacity * 3, 4);
 
             if (TemporalAlphaMax < 1f)
             {
@@ -699,6 +768,7 @@ namespace Genesis.RoomScan
             _temporalInitialized = false;
             _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
+            _foundationHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
 
             long totalBytes = (long)mapVoxels * 4
@@ -710,7 +780,8 @@ namespace Genesis.RoomScan
                             + (long)smoothCapacity * Float3Stride * 2
                             + (TemporalAlphaMax < 1f ? (long)mapVoxels * 16 : 0L)
                             + (long)mapVoxels * 2
-                            + (long)_candidateHistoryCapacity * 8;
+                            + (long)_candidateHistoryCapacity * 8
+                            + (long)foundationHistoryCapacity * (16 + 16 + 4 + 3 * 4);
             Logger.Info($"[GPUSurfaceNets] Allocated buffers: vox={voxCount}, map={mapMin}+{mapCount}, core={coreMin}..{coreMax}, " +
                       $"maxVerts={_maxVertices}, maxIdx={_maxIndices}, " +
                       $"totalGPU={totalBytes / (1024 * 1024)}MB");
@@ -752,6 +823,7 @@ namespace Genesis.RoomScan
             _temporalInitialized = false;
             _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
+            _foundationHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
         }
 
@@ -775,6 +847,17 @@ namespace Genesis.RoomScan
             SetGlobalParams(voxelSize);
             BindAllBuffers();
             _lastTsdfVolume = tsdfVolume;
+
+            bool stableFoundation = FoundationTopologyMode &&
+                FoundationConstrainedSimplification &&
+                FoundationParentTopologyFromFineEvidence &&
+                FoundationParentStabilityEnabled;
+            if (stableFoundation && !_foundationHistoryInitialized)
+            {
+                _compute.Dispatch(_kClearFoundationHistory,
+                    CeilDiv(_mapVoxels, 256), 1, 1);
+                _foundationHistoryInitialized = true;
+            }
 
             if (!_candidateHistoryInitialized)
             {
@@ -803,6 +886,23 @@ namespace Genesis.RoomScan
                 Mathf.Max(0f, FoundationChamferWidthVoxels));
             _compute.SetInt(ID_FoundationSimplifyEnabled,
                 FoundationTopologyMode && FoundationConstrainedSimplification ? 1 : 0);
+            _compute.SetInt(ID_FoundationParentTopologyFromFineEvidence,
+                FoundationTopologyMode && FoundationConstrainedSimplification &&
+                FoundationParentTopologyFromFineEvidence ? 1 : 0);
+            _compute.SetInt(ID_FoundationParentStabilityEnabled,
+                stableFoundation ? 1 : 0);
+            _compute.SetFloat(ID_FoundationParentPositionAlpha,
+                Mathf.Clamp01(FoundationParentPositionAlpha));
+            _compute.SetFloat(ID_FoundationParentPositionDeadzoneVoxels,
+                Mathf.Max(0f, FoundationParentPositionDeadzoneVoxels));
+            _compute.SetFloat(ID_FoundationParentReplacementDistanceVoxels,
+                Mathf.Max(0.05f, FoundationParentReplacementDistanceVoxels));
+            _compute.SetInt(ID_FoundationParentReplacementConfirmations,
+                Mathf.Clamp(FoundationParentReplacementConfirmations, 1, 15));
+            _compute.SetInt(ID_FoundationEdgeBirthConfirmations,
+                Mathf.Clamp(FoundationEdgeBirthConfirmations, 1, 3));
+            _compute.SetInt(ID_FoundationEdgeRetireConfirmations,
+                Mathf.Clamp(FoundationEdgeRetireConfirmations, 1, 3));
             _compute.SetFloat(ID_FoundationSimplifyNormalDotMin,
                 Mathf.Clamp(FoundationSimplifyNormalDotMin, -1f, 1f));
             _compute.SetFloat(ID_FoundationSimplifyPlaneResidualVoxels,
@@ -903,14 +1003,15 @@ namespace Genesis.RoomScan
         public Bounds GetVolumeBounds(float voxelSize)
         {
             float3 halfExtent = (float3)_voxCount * voxelSize * 0.5f;
-            return new Bounds(Vector3.zero, (Vector3)(halfExtent * 2));
+            return new Bounds(VolumeOrigin, (Vector3)(halfExtent * 2));
         }
 
         public Bounds GetCoreBounds(float voxelSize)
         {
             float3 min = ((float3)_coreMin - (float3)_voxCount * 0.5f) * voxelSize;
             float3 max = ((float3)_coreMax - (float3)_voxCount * 0.5f) * voxelSize;
-            return new Bounds((Vector3)((min + max) * 0.5f), (Vector3)(max - min));
+            return new Bounds(VolumeOrigin + (Vector3)((min + max) * 0.5f),
+                (Vector3)(max - min));
         }
 
         private void SetGlobalParams(float voxelSize)
@@ -918,6 +1019,7 @@ namespace Genesis.RoomScan
             _compute.SetInts(ID_VoxCount, _voxCount.x, _voxCount.y, _voxCount.z);
             SetRegionParams();
             _compute.SetFloat(ID_VoxSize, voxelSize);
+            _compute.SetVector(ID_VolumeOrigin, VolumeOrigin);
             _compute.SetFloat(ID_MinWeight, MinMeshWeight);
             _compute.SetInt(ID_TotalVoxels, _totalVoxels);
             _compute.SetInt(ID_MaxVertices, _maxVertices);
@@ -944,6 +1046,8 @@ namespace Genesis.RoomScan
             _compute.SetInts(ID_CoreMax, _coreMax.x, _coreMax.y, _coreMax.z);
             _compute.SetInt(ID_CandidateHistoryCapacity, _candidateHistoryCapacity);
             _compute.SetInt(ID_CandidateHistoryMask, _candidateHistoryCapacity - 1);
+            _compute.SetInt(ID_FoundationHistoryCapacity,
+                FoundationParentTopologyFromFineEvidence ? _mapVoxels : 1);
             _compute.SetInt(ID_CounterCount, _counterCount);
             _compute.SetInt(ID_StageResponsibilityBase, _stageResponsibilityBase);
             _compute.SetInt(ID_StageResponsibilityEnabled, _stageResponsibilityEnabled ? 1 : 0);
@@ -954,6 +1058,10 @@ namespace Genesis.RoomScan
             BindBuffer(_kClearCounters, ID_Counters, _counters);
             BindBuffer(_kClearCandidateHistory, ID_CandidateHistoryKeys, _candidateHistoryKeys);
             BindBuffer(_kClearCandidateHistory, ID_CandidateHistoryStates, _candidateHistoryStates);
+            BindBuffer(_kClearFoundationHistory, ID_FoundationParentHistoryPositions, _foundationParentHistoryPositions);
+            BindBuffer(_kClearFoundationHistory, ID_FoundationParentHistoryNormals, _foundationParentHistoryNormals);
+            BindBuffer(_kClearFoundationHistory, ID_FoundationParentHistoryStates, _foundationParentHistoryStates);
+            BindBuffer(_kClearFoundationHistory, ID_FoundationEdgeHistoryStates, _foundationEdgeHistoryStates);
 
             BindBuffer(_kClassifyAndEmit, ID_CoordVertMap, _coordVertMap);
             BindBuffer(_kClassifyAndEmit, ID_Vertices, _vertices);
@@ -965,6 +1073,11 @@ namespace Genesis.RoomScan
 
             BindBuffer(_kBuildFoundationClusters, ID_CoordVertMap, _coordVertMap);
             BindBuffer(_kBuildFoundationClusters, ID_Vertices, _vertices);
+            BindBuffer(_kBuildFoundationClusters, ID_VertexAdmissionClass, _vertexAdmissionClass);
+            BindBuffer(_kBuildFoundationClusters, ID_Counters, _counters);
+            BindBuffer(_kBuildFoundationClusters, ID_FoundationParentHistoryPositions, _foundationParentHistoryPositions);
+            BindBuffer(_kBuildFoundationClusters, ID_FoundationParentHistoryNormals, _foundationParentHistoryNormals);
+            BindBuffer(_kBuildFoundationClusters, ID_FoundationParentHistoryStates, _foundationParentHistoryStates);
 
             BindBuffer(_kBuildVertexDispatchArgs, ID_Counters, _counters);
             BindBuffer(_kBuildVertexDispatchArgs, ID_DispatchArgs, _dispatchArgs);
@@ -997,6 +1110,7 @@ namespace Genesis.RoomScan
             BindBuffer(_kGenerateIndices, ID_Counters, _counters);
             BindBuffer(_kGenerateIndices, ID_CandidateHistoryKeys, _candidateHistoryKeys);
             BindBuffer(_kGenerateIndices, ID_CandidateHistoryStates, _candidateHistoryStates);
+            BindBuffer(_kGenerateIndices, ID_FoundationEdgeHistoryStates, _foundationEdgeHistoryStates);
 
             BindBuffer(_kBuildIndirectArgs, ID_Counters, _counters);
             BindBuffer(_kBuildIndirectArgs, ID_DrawIndirectArgs, _drawIndirectArgs);
@@ -1023,6 +1137,10 @@ namespace Genesis.RoomScan
             _smoothPosB?.Release();
             _candidateHistoryKeys?.Release();
             _candidateHistoryStates?.Release();
+            _foundationParentHistoryPositions?.Release();
+            _foundationParentHistoryNormals?.Release();
+            _foundationParentHistoryStates?.Release();
+            _foundationEdgeHistoryStates?.Release();
 
             if (_temporalState != null)
             {
@@ -1049,6 +1167,10 @@ namespace Genesis.RoomScan
             _smoothPosB = null;
             _candidateHistoryKeys = null;
             _candidateHistoryStates = null;
+            _foundationParentHistoryPositions = null;
+            _foundationParentHistoryNormals = null;
+            _foundationParentHistoryStates = null;
+            _foundationEdgeHistoryStates = null;
             _temporalState = null;
             _tsdfPushHistory = null;
 
@@ -1058,6 +1180,7 @@ namespace Genesis.RoomScan
             _temporalInitialized = false;
             _tsdfPushHistoryInitialized = false;
             _candidateHistoryInitialized = false;
+            _foundationHistoryInitialized = false;
             _candidateExtractionEpoch = 0;
         }
 

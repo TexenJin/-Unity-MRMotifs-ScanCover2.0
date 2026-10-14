@@ -28,6 +28,7 @@
 #pragma kernel InitTsdfPushHistory
 #pragma kernel CommitTsdfPushHistory
 #pragma kernel ClearCandidateHistory
+#pragma kernel ClearFoundationHistory
 #pragma kernel CopyMeshSnapshot
 #pragma kernel CopyAdditiveMergePayload
 #pragma kernel AppendNovelMatureTriangles
@@ -58,6 +59,7 @@ uint3  _MapCount;
 int3   _CoreMin;
 int3   _CoreMax;
 float  _VoxSize;
+float3 _VolumeOrigin;
 float  _MinWeight;
 uint   _TotalVoxels;
 uint   _MaxVertices;
@@ -87,6 +89,15 @@ float  _FoundationNormalClusterDotMin;
 float  _FoundationCornerNormalDotMax;
 float  _FoundationChamferWidthVoxels;
 uint   _FoundationSimplifyEnabled;
+uint   _FoundationParentTopologyFromFineEvidence;
+uint   _FoundationParentStabilityEnabled;
+float  _FoundationParentPositionAlpha;
+float  _FoundationParentPositionDeadzoneVoxels;
+float  _FoundationParentReplacementDistanceVoxels;
+uint   _FoundationParentReplacementConfirmations;
+uint   _FoundationEdgeBirthConfirmations;
+uint   _FoundationEdgeRetireConfirmations;
+uint   _FoundationHistoryCapacity;
 float  _FoundationSimplifyNormalDotMin;
 float  _FoundationSimplifyPlaneResidualVoxels;
 uint   _FoundationVisibleSkirtVoxels;
@@ -188,6 +199,10 @@ RWStructuredBuffer<float3>    _SmoothPosA;       // [maxVertices] ping-pong smoo
 RWStructuredBuffer<float3>    _SmoothPosB;       // [maxVertices] ping-pong smoothing
 RWStructuredBuffer<uint>      _CandidateHistoryKeys;
 RWStructuredBuffer<uint>      _CandidateHistoryStates;
+RWStructuredBuffer<float4>    _FoundationParentHistoryPositions;
+RWStructuredBuffer<float4>    _FoundationParentHistoryNormals;
+RWStructuredBuffer<uint>      _FoundationParentHistoryStates;
+RWStructuredBuffer<uint>      _FoundationEdgeHistoryStates;
 
 RWTexture3D<float4>           _TemporalState;    // 3D texture: xyz = prev pos, w = age (-1 = uninit)
 // Read-only diagnostic history for attributing yellow-crossing motion to its
@@ -259,7 +274,8 @@ int3 Unflatten(int idx)
 
 float3 VoxelCoordToWorld(float3 c)
 {
-    return (c + 0.5 - (float3)_VoxCount / 2.0) * _VoxSize;
+    return _VolumeOrigin +
+           (c + 0.5 - (float3)_VoxCount / 2.0) * _VoxSize;
 }
 
 uint PackColor(float4 c)
@@ -505,6 +521,19 @@ void ClearCandidateHistory(uint3 id : SV_DispatchThreadID)
     _CandidateHistoryStates[id.x] = 0u;
 }
 
+[numthreads(256, 1, 1)]
+void ClearFoundationHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _FoundationHistoryCapacity) return;
+    _FoundationParentHistoryPositions[id.x] = float4(0.0, 0.0, 0.0, 0.0);
+    _FoundationParentHistoryNormals[id.x] = float4(0.0, 0.0, 0.0, 0.0);
+    _FoundationParentHistoryStates[id.x] = 0u;
+    uint edgeBase = id.x * 3u;
+    _FoundationEdgeHistoryStates[edgeBase + 0u] = 0u;
+    _FoundationEdgeHistoryStates[edgeBase + 1u] = 0u;
+    _FoundationEdgeHistoryStates[edgeBase + 2u] = 0u;
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  Kernel 1 : ClassifyAndEmit
 //  3D dispatch: ceil(VoxCount / 4) per axis
@@ -523,7 +552,8 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     // coordinates remain explicit holes in the regional lookup map, while
     // adjacent coarse cells still share one vertex. Never create a dense mesh
     // and discard alternating triangles: that would break connectivity.
-    int cellStride = _FoundationTopologyMode != 0u
+    int cellStride = _FoundationTopologyMode != 0u &&
+                     _FoundationParentTopologyFromFineEvidence == 0u
         ? max((int)_FoundationCellStride, 1)
         : 1;
     int3 coarseRemainder = coord - (coord / cellStride) * cellStride;
@@ -738,9 +768,13 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
                 crossingZZ += (uint)(q.z * q.z);
             }
 
-            if (_FoundationTopologyMode != 0u &&
-                _FoundationFeatureRecognition != 0u &&
-                !emptyA && !emptyB)
+            // Always collect the existing local-gradient families for the
+            // read-only layer evidence. Geometry still consumes them only
+            // when _FoundationFeatureRecognition is explicitly enabled
+            // below. This lets the v3.1 mesh stay byte-for-byte authoritative
+            // while the overlay distinguishes a single drifting sheet from
+            // several surface directions being averaged into one SN vertex.
+            if (_FoundationTopologyMode != 0u && !emptyA && !emptyB)
             {
                 float3 crossingNormal;
                 if (TryFoundationGradient(crossingPosition, crossingNormal))
@@ -1078,8 +1112,14 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     v.voxelFlatIdx = (uint)Flatten(coord);
 
     _Vertices[compactIdx]     = v;
+    // Bit 24 is diagnostic-only. It says this one emitted Surface-Nets cell
+    // contains more than one well-separated local normal family (or a third
+    // unmatched family). It never gates extraction or changes placement.
+    bool layerCrossDirectionMixed =
+        (featureCount0 >= 2u && featureCount1 >= 2u) || featureAmbiguous;
     _LayerCrossingEvidence[compactIdx] = uint4(layerCrossingT,
-        layerCrossingMask | (layerCrossingNegativeAMask << 12u));
+        layerCrossingMask | (layerCrossingNegativeAMask << 12u) |
+        (layerCrossDirectionMixed ? (1u << 24u) : 0u));
     _LayerCrossingSpan[compactIdx] = layerCrossingSpan;
     _LayerRawSurfaceNets[compactIdx] = rawSurfaceNetsPosition;
     _CoordVertMap[flatIdx]    = (int)compactIdx;
@@ -1107,12 +1147,12 @@ void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
     if (any(clusterMax >= (int3)_VoxCount) ||
         !InsideMap(anchor) || !InsideMap(clusterMax))
         return;
+    uint historyIndex = (uint)MapFlatten(anchor);
 
     float3 positionSum = float3(0.0, 0.0, 0.0);
     float3 normalSum = float3(0.0, 0.0, 0.0);
-    int3 activeMin = int3(1, 1, 1);
-    int3 activeMax = int3(0, 0, 0);
     uint activeCount = 0u;
+    int firstValidIndex = -1;
 
     [unroll]
     for (uint i = 0u; i < 8u; i++)
@@ -1127,37 +1167,76 @@ void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
         GPUVertex vertex = _Vertices[(uint)vertexIndex];
         float normalLengthSq = dot(vertex.norm, vertex.norm);
         if (normalLengthSq <= 0.25)
-            return;
+            continue;
 
         positionSum += vertex.pos;
         normalSum += vertex.norm * rsqrt(normalLengthSq);
-        activeMin = min(activeMin, offset);
-        activeMax = max(activeMax, offset);
+        if (firstValidIndex < 0)
+            firstValidIndex = vertexIndex;
         activeCount++;
     }
 
-    // Four witnesses spanning two tangential axes describe a surface patch.
-    // Smaller/linear sets are usually a hole rim, thin feature or page fringe.
-    if (activeCount < 4u)
+    // A plane can cut a fixed XYZ 2x2x2 parent close to a corner and leave only
+    // one to three active fine cells.  Witness count is therefore not surface
+    // existence authority.  One real fine crossing is enough to give the
+    // parent a depth-faithful fallback; confidence below decides only whether
+    // the representative may be tangentially centred.
+    if (activeCount == 0u)
+    {
+        if (_FoundationParentStabilityEnabled != 0u)
+        {
+            uint missingState = _FoundationParentHistoryStates[historyIndex];
+            bool historyValid = (missingState & 8u) != 0u;
+            float4 previousPosition = _FoundationParentHistoryPositions[historyIndex];
+            float4 previousNormal = _FoundationParentHistoryNormals[historyIndex];
+            if (historyValid && previousPosition.w > 0.5 &&
+                dot(previousNormal.xyz, previousNormal.xyz) > 0.25)
+            {
+                uint missingCount = min(((missingState >> 4u) & 15u) + 1u, 15u);
+                if (missingCount < _FoundationParentReplacementConfirmations)
+                {
+                    uint compactIndex;
+                    InterlockedAdd(_Counters[0], 1u, compactIndex);
+                    if (compactIndex < _MaxVertices)
+                    {
+                        GPUVertex carrier;
+                        carrier.pos = previousPosition.xyz;
+                        carrier.norm = normalize(previousNormal.xyz);
+                        carrier.packedColor = asuint(previousNormal.w);
+                        carrier.voxelFlatIdx = (uint)Flatten(anchor);
+                        _Vertices[compactIndex] = carrier;
+                        _VertexAdmissionClass[compactIndex] = 0u;
+                        _CoordVertMap[MapFlatten(anchor)] = (int)compactIndex;
+                        _FoundationParentHistoryStates[historyIndex] =
+                            (missingState & ~(15u << 4u)) | (missingCount << 4u);
+                    }
+                    return;
+                }
+
+                // Sustained absence retires the parent. A transient dropout
+                // can no longer tear the topology, but stale geometry is not
+                // allowed to live indefinitely without native 5 cm support.
+                _FoundationParentHistoryPositions[historyIndex] =
+                    float4(0.0, 0.0, 0.0, 0.0);
+                _FoundationParentHistoryNormals[historyIndex] =
+                    float4(0.0, 0.0, 0.0, 0.0);
+                _FoundationParentHistoryStates[historyIndex] = 0u;
+            }
+        }
         return;
-    int3 activeSpan = activeMax - activeMin;
-    uint varyingAxes = (activeSpan.x > 0 ? 1u : 0u) +
-                       (activeSpan.y > 0 ? 1u : 0u) +
-                       (activeSpan.z > 0 ? 1u : 0u);
-    if (varyingAxes < 2u)
-        return;
+    }
 
     float normalSumLength = length(normalSum);
     float normalCoherence = normalSumLength / (float)activeCount;
-    if (normalCoherence < _FoundationSimplifyNormalDotMin || normalSumLength <= 1e-5)
-        return;
-
-    float3 averageNormal = normalSum / normalSumLength;
+    float3 averageNormal = normalSumLength > 1e-5
+        ? normalSum / normalSumLength
+        : normalize(_Vertices[(uint)firstValidIndex].norm);
     float3 averagePosition = positionSum / (float)activeCount;
     float maxPlaneResidual = 0.0;
     float minNormalDot = 1.0;
     float bestDistanceSq = 1e30;
     int representativeIndex = -1;
+    uint representativeOrdinal = 0u;
 
     [unroll]
     for (uint j = 0u; j < 8u; j++)
@@ -1170,7 +1249,10 @@ void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
             continue;
 
         GPUVertex vertex = _Vertices[(uint)vertexIndex];
-        float3 vertexNormal = normalize(vertex.norm);
+        float vertexNormalLengthSq = dot(vertex.norm, vertex.norm);
+        if (vertexNormalLengthSq <= 0.25)
+            continue;
+        float3 vertexNormal = vertex.norm * rsqrt(vertexNormalLengthSq);
         minNormalDot = min(minNormalDot, dot(vertexNormal, averageNormal));
         maxPlaneResidual = max(maxPlaneResidual,
             abs(dot(vertex.pos - averagePosition, averageNormal)));
@@ -1180,22 +1262,130 @@ void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
         {
             bestDistanceSq = centerDistanceSq;
             representativeIndex = vertexIndex;
+            representativeOrdinal = j;
         }
     }
 
     float residualLimit = _FoundationSimplifyPlaneResidualVoxels * _VoxSize;
-    if (representativeIndex < 0 ||
-        minNormalDot < _FoundationSimplifyNormalDotMin ||
-        maxPlaneResidual > residualLimit)
+    if (representativeIndex < 0)
         return;
 
-    // Tangentially centre the representative while preserving the normal
-    // depth of an existing fine vertex. This cannot drift to the midpoint of
-    // two layers because the residual test above rejects such a cluster.
+    uint parentState = _FoundationParentStabilityEnabled != 0u
+        ? _FoundationParentHistoryStates[historyIndex]
+        : 0u;
+    bool parentHistoryValid = (parentState & 8u) != 0u;
+    bool stableChildAvailable = false;
+    if (parentHistoryValid)
+    {
+        uint stableOrdinal = parentState & 7u;
+        int3 stableOffset = int3((int)(stableOrdinal & 1u),
+                                 (int)((stableOrdinal >> 1u) & 1u),
+                                 (int)((stableOrdinal >> 2u) & 1u));
+        int stableIndex = _CoordVertMap[MapFlatten(anchor + stableOffset)];
+        if (stableIndex >= 0)
+        {
+            float stableNormalLengthSq = dot(_Vertices[(uint)stableIndex].norm,
+                                             _Vertices[(uint)stableIndex].norm);
+            if (stableNormalLengthSq > 0.25)
+            {
+                representativeIndex = stableIndex;
+                representativeOrdinal = stableOrdinal;
+                stableChildAvailable = true;
+            }
+        }
+    }
+
+    bool planarCluster = normalCoherence >= _FoundationSimplifyNormalDotMin &&
+                         minNormalDot >= _FoundationSimplifyNormalDotMin &&
+                         maxPlaneResidual <= residualLimit;
+
+    // A confident planar group may be tangentially centred while preserving
+    // the normal depth of an existing fine vertex.  An uncertain group still
+    // owns one parent vertex, but keeps the original fine position and normal.
+    // This separates completeness from smoothing authority: low confidence can
+    // no longer punch four amplified holes into the surrounding coarse mesh.
     GPUVertex representative = _Vertices[(uint)representativeIndex];
-    float signedDepthDelta = dot(averagePosition - representative.pos, averageNormal);
-    representative.pos = averagePosition - averageNormal * signedDepthDelta;
-    representative.norm = averageNormal;
+    if (planarCluster)
+    {
+        float signedDepthDelta = dot(averagePosition - representative.pos, averageNormal);
+        representative.pos = averagePosition - averageNormal * signedDepthDelta;
+        representative.norm = averageNormal;
+    }
+
+    if (_FoundationParentStabilityEnabled != 0u)
+    {
+        float4 previousPosition = _FoundationParentHistoryPositions[historyIndex];
+        float4 previousNormal = _FoundationParentHistoryNormals[historyIndex];
+        uint replacementCount = (parentState >> 4u) & 15u;
+
+        if (parentHistoryValid && previousPosition.w > 0.5 &&
+            dot(previousNormal.xyz, previousNormal.xyz) > 0.25)
+        {
+            float3 historyNormal = normalize(previousNormal.xyz);
+            float3 candidateNormal = normalize(representative.norm);
+            float3 delta = representative.pos - previousPosition.xyz;
+            float replacementDistance =
+                _FoundationParentReplacementDistanceVoxels * _VoxSize;
+            bool sameSupport = stableChildAvailable &&
+                dot(historyNormal, candidateNormal) >= 0.9 &&
+                abs(dot(delta, historyNormal)) <= replacementDistance &&
+                length(delta) <= replacementDistance * 2.0;
+
+            if (sameSupport)
+            {
+                replacementCount = 0u;
+                float deadzone = _FoundationParentPositionDeadzoneVoxels * _VoxSize;
+                if (length(delta) <= deadzone)
+                {
+                    representative.pos = previousPosition.xyz;
+                    representative.norm = historyNormal;
+                }
+                else
+                {
+                    representative.pos = lerp(previousPosition.xyz,
+                        representative.pos, _FoundationParentPositionAlpha);
+                    representative.norm = normalize(lerp(historyNormal,
+                        candidateNormal, _FoundationParentPositionAlpha));
+                }
+            }
+            else
+            {
+                replacementCount = min(replacementCount + 1u, 15u);
+                if (replacementCount < _FoundationParentReplacementConfirmations)
+                {
+                    // The current native vertex is only a carrier for the
+                    // already-published parent identity during the grace window.
+                    // Nothing here writes back to the TSDF or fine evidence.
+                    representative.pos = previousPosition.xyz;
+                    representative.norm = historyNormal;
+                }
+                else
+                {
+                    replacementCount = 0u;
+                    parentState = (parentState & ~7u) | representativeOrdinal;
+                }
+            }
+        }
+        else
+        {
+            replacementCount = 0u;
+            parentState = representativeOrdinal | 8u;
+        }
+
+        parentState = (parentState & ~(15u << 4u)) |
+                      (replacementCount << 4u) | 8u;
+        _FoundationParentHistoryPositions[historyIndex] =
+            float4(representative.pos, 1.0);
+        _FoundationParentHistoryNormals[historyIndex] =
+            float4(normalize(representative.norm), asfloat(representative.packedColor));
+        _FoundationParentHistoryStates[historyIndex] = parentState;
+    }
+    // Parent topology must have a stable lattice owner even when the native
+    // representative came from another child of this 2x2x2 group.  Geometry
+    // remains the depth-faithful fine representative; only its topology owner
+    // becomes the globally anchored 10 cm parent cell.
+    if (_FoundationParentTopologyFromFineEvidence != 0u)
+        representative.voxelFlatIdx = (uint)Flatten(anchor);
     _Vertices[(uint)representativeIndex] = representative;
 
     [unroll]
@@ -1208,6 +1398,12 @@ void BuildFoundationClusters(uint3 id : SV_DispatchThreadID)
         if (_CoordVertMap[flatIndex] >= 0)
             _CoordVertMap[flatIndex] = representativeIndex;
     }
+
+    // The parent anchor itself can be inactive on the fine lattice.  Coarse
+    // connectivity addresses parent anchors, so always publish this verified
+    // cluster representative at the anchor after the child aliases are set.
+    if (_FoundationParentTopologyFromFineEvidence != 0u)
+        _CoordVertMap[MapFlatten(anchor)] = representativeIndex;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1940,11 +2136,82 @@ void AuditVisualTriangle(uint index0, uint index1, uint index2, int3 ownerCoord,
     InterlockedAdd(_Counters[VISUAL_TOTAL_INDEX], 1u);
 }
 
+bool ResolveStableFoundationEdge(uint historyIndex, bool currentCrossing,
+                                 bool currentNegativeA, out bool negativeA)
+{
+    uint state = _FoundationEdgeHistoryStates[historyIndex];
+    bool published = (state & 1u) != 0u;
+    bool publishedNegativeA = (state & 2u) != 0u;
+    uint contradictionCount = (state >> 2u) & 3u;
+    bool pending = (state & 16u) != 0u;
+    bool pendingNegativeA = (state & 32u) != 0u;
+    uint pendingCount = (state >> 6u) & 3u;
+
+    if (!published)
+    {
+        if (!currentCrossing)
+        {
+            _FoundationEdgeHistoryStates[historyIndex] = 0u;
+            negativeA = false;
+            return false;
+        }
+
+        if (pending && pendingNegativeA == currentNegativeA)
+            pendingCount = min(pendingCount + 1u, 3u);
+        else
+        {
+            pending = true;
+            pendingNegativeA = currentNegativeA;
+            pendingCount = 1u;
+        }
+
+        if (pendingCount >= _FoundationEdgeBirthConfirmations)
+        {
+            negativeA = currentNegativeA;
+            _FoundationEdgeHistoryStates[historyIndex] =
+                1u | (currentNegativeA ? 2u : 0u);
+            return true;
+        }
+
+        _FoundationEdgeHistoryStates[historyIndex] = 16u |
+            (pendingNegativeA ? 32u : 0u) | (pendingCount << 6u);
+        negativeA = currentNegativeA;
+        return false;
+    }
+
+    if (currentCrossing && currentNegativeA == publishedNegativeA)
+    {
+        contradictionCount = 0u;
+    }
+    else
+    {
+        contradictionCount = min(contradictionCount + 1u, 3u);
+        if (contradictionCount >= _FoundationEdgeRetireConfirmations)
+        {
+            if (!currentCrossing)
+            {
+                _FoundationEdgeHistoryStates[historyIndex] = 0u;
+                negativeA = false;
+                return false;
+            }
+            publishedNegativeA = currentNegativeA;
+            contradictionCount = 0u;
+        }
+    }
+
+    _FoundationEdgeHistoryStates[historyIndex] = 1u |
+        (publishedNegativeA ? 2u : 0u) | (contradictionCount << 2u);
+    negativeA = publishedNegativeA;
+    return true;
+}
+
 void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
 {
-    int topologyStride = _FoundationTopologyMode != 0u
+    int topologyStride = _FoundationParentTopologyFromFineEvidence != 0u
+        ? 2
+        : (_FoundationTopologyMode != 0u
         ? max((int)_FoundationCellStride, 1)
-        : 1;
+        : 1);
     int3 topologyAxis = axis * topologyStride;
     int3 topologyD1 = d1 * topologyStride;
     int3 topologyD2 = d2 * topologyStride;
@@ -1953,8 +2220,11 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     if (any(coord - topologyD2 < 0)) return;
     if (any(coord + topologyAxis >= (int3)_VoxCount)) return;
 
-    float va;
-    float vb;
+    float va = 1.0;
+    float vb = 1.0;
+    bool currentCrossing = false;
+    bool currentNegativeA = false;
+    bool missingObservedSupport = false;
     bool strictTopologyEdge = _StrictObservedEdges > 0.5 ||
                               (_FoundationTopologyMode != 0u && topologyStride > 1);
     if (strictTopologyEdge)
@@ -1962,36 +2232,53 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
         bool observedA = TrySampleObservedSDF(coord, va);
         bool observedB = TrySampleObservedSDF(coord + topologyAxis, vb);
         if (!observedA || !observedB)
-        {
-            InterlockedAdd(_Counters[4], 1);
-            return;
-        }
+            missingObservedSupport = true;
 
         // Match the vertex classifier: a visible 10 cm edge is backed by all
         // three native 5 cm samples and exactly one fine zero crossing. Missing
         // support is a hole; two crossings are multiple layers, not one edge.
-        if (_FoundationTopologyMode != 0u && topologyStride == 2)
+        if (!missingObservedSupport &&
+            _FoundationTopologyMode != 0u && topologyStride == 2)
         {
             float vm;
             bool observedMid = TrySampleObservedSDF(coord + axis, vm);
             if (!observedMid)
+                missingObservedSupport = true;
+            else
             {
-                InterlockedAdd(_Counters[4], 1);
-                return;
+                bool crossesFirst = (va < 0.0) != (vm < 0.0);
+                bool crossesSecond = (vm < 0.0) != (vb < 0.0);
+                currentCrossing = crossesFirst != crossesSecond;
             }
-
-            bool crossesFirst = (va < 0.0) != (vm < 0.0);
-            bool crossesSecond = (vm < 0.0) != (vb < 0.0);
-            if (crossesFirst == crossesSecond)
-                return;
         }
+        else if (!missingObservedSupport)
+            currentCrossing = (va < 0.0) != (vb < 0.0);
     }
     else
     {
         va = SampleSDF(coord);
         vb = SampleSDF(coord + topologyAxis);
+        currentCrossing = (va < 0.0) != (vb < 0.0);
     }
-    if ((va < 0) == (vb < 0)) return;
+    if (missingObservedSupport)
+        InterlockedAdd(_Counters[4], 1);
+    currentNegativeA = va < 0.0;
+
+    bool stableParentTopology = _FoundationParentTopologyFromFineEvidence != 0u &&
+                                _FoundationParentStabilityEnabled != 0u;
+    if (stableParentTopology)
+    {
+        uint edgeHistoryIndex = (uint)MapFlatten(coord) * 3u + axisSlot;
+        bool publishedNegativeA;
+        if (!ResolveStableFoundationEdge(edgeHistoryIndex,
+                currentCrossing && !missingObservedSupport,
+                currentNegativeA, publishedNegativeA))
+            return;
+        va = publishedNegativeA ? -1.0 : 1.0;
+        vb = -va;
+    }
+    else if (!currentCrossing || missingObservedSupport)
+        return;
 
     // A chunk may inspect the halo but must never dereference a neighbour
     // outside its regional coordinate map.
@@ -2035,22 +2322,28 @@ void TryEmitQuad(int3 coord, int3 axis, int3 d1, int3 d2, uint axisSlot)
     // per-triangle candidate archive or diagnostic colours.
     if (_FoundationTopologyMode != 0u)
     {
-        float3 posA = _Vertices[(uint)a].pos;
-        float3 posB = _Vertices[(uint)b].pos;
-        float3 posC = _Vertices[(uint)c].pos;
-        float3 posD = _Vertices[(uint)d].pos;
-        float diagAC = dot(posA - posC, posA - posC);
-        float diagBD = dot(posB - posD, posB - posD);
-        // A planar coarse cell normally has two almost-equal diagonals. Always
-        // choosing AC in that tie creates a directional comb across the whole
-        // wall. Alternate only near-equal ties using global coarse-cell parity;
-        // a materially shorter diagonal still wins to suppress needle faces.
-        float diagonalTolerance = max(diagAC, diagBD) * 0.05;
-        bool nearTie = abs(diagAC - diagBD) <= diagonalTolerance;
         uint coarseParity = (uint)(coord.x / topologyStride +
                                    coord.y / topologyStride +
                                    coord.z / topologyStride) + axisSlot;
-        bool useAC = nearTie ? ((coarseParity & 1u) == 0u) : (diagAC < diagBD);
+        bool useAC;
+        if (stableParentTopology)
+        {
+            // Topology identity is global-lattice parity, never a live
+            // geometry measurement. Vertex motion can no longer flip a quad.
+            useAC = (coarseParity & 1u) == 0u;
+        }
+        else
+        {
+            float3 posA = _Vertices[(uint)a].pos;
+            float3 posB = _Vertices[(uint)b].pos;
+            float3 posC = _Vertices[(uint)c].pos;
+            float3 posD = _Vertices[(uint)d].pos;
+            float diagAC = dot(posA - posC, posA - posC);
+            float diagBD = dot(posB - posD, posB - posD);
+            float diagonalTolerance = max(diagAC, diagBD) * 0.05;
+            bool nearTie = abs(diagAC - diagBD) <= diagonalTolerance;
+            useAC = nearTie ? ((coarseParity & 1u) == 0u) : (diagAC < diagBD);
+        }
         const uint foundationClass = 2u;
         uint3 triangle0;
         uint3 triangle1;
@@ -2283,6 +2576,19 @@ void GenerateIndices(uint3 id : SV_DispatchThreadID)
     if (id.x >= vertCount) return;
 
     int3 coord = Unflatten((int)_Vertices[id.x].voxelFlatIdx);
+
+    if (_FoundationParentTopologyFromFineEvidence != 0u)
+    {
+        // Only the one verified representative registered at each even parent
+        // anchor may emit faces.  All native 5 cm vertices remain available as
+        // evidence, but can no longer leak their fine connectivity into output.
+        const int parentStride = 2;
+        int3 parentRemainder = coord - (coord / parentStride) * parentStride;
+        if (any(parentRemainder != int3(0, 0, 0)) || !InsideMap(coord))
+            return;
+        if (_CoordVertMap[MapFlatten(coord)] != (int)id.x)
+            return;
+    }
 
     // Product pages may retain a one-voxel overlap from the read halo.  This is
     // a visible block skirt, not new evidence: both pages sample the same TSDF

@@ -21,6 +21,7 @@ namespace Genesis.RoomScan
     public class DepthCapture : MonoBehaviour
     {
         public const int FusionEyeIndex = 1;
+        public const int QrsReferenceEyeIndex = 0;
         public static DepthCapture Instance { get; private set; }
 
         [SerializeField] private ComputeShader depthNormalCompute;
@@ -310,6 +311,12 @@ namespace Genesis.RoomScan
         /// <summary>最近一次中心深度中位数（米，生产右眼线性化）；&lt;0 = 尚无有效样本。</summary>
         public float LastCenterDepthMeters { get; private set; } = -1f;
 
+        /// <summary>中心深度回读完成序号；每次成功或失败的回读都会推进一次。</summary>
+        public int CenterDepthSampleRevision { get; private set; }
+
+        /// <summary>最近一次回读是否确实得到足量有效中心深度样本。</summary>
+        public bool LastCenterDepthSampleValid { get; private set; }
+
         /// <summary>深度帧尺寸（B1 平面拟合影子内核 dispatch 用）；无深度帧时为 0。</summary>
         public int DepthWidth => _depthTex != null ? _depthTex.width : 0;
         public int DepthHeight => _depthTex != null ? _depthTex.height : 0;
@@ -342,6 +349,8 @@ namespace Genesis.RoomScan
         private void OnCenterDepthReadback(AsyncGPUReadbackRequest request)
         {
             _centerDepthPending = false;
+            CenterDepthSampleRevision++;
+            LastCenterDepthSampleValid = false;
             if (request.hasError) return;
             var data = request.GetData<float>();
             if (data.Length < 8) return;
@@ -360,6 +369,7 @@ namespace Genesis.RoomScan
             if (_centerSamples.Count < 4) return; // 样本太少=中心正好在缝/弃权区，沿用上次
             _centerSamples.Sort();
             LastCenterDepthMeters = _centerSamples[_centerSamples.Count / 2];
+            LastCenterDepthSampleValid = true;
         }
         private readonly List<float> _centerSamples = new List<float>(64);
 
@@ -381,6 +391,15 @@ namespace Genesis.RoomScan
         private ComputeKernelHelper _dilateStepKernel;
         private ComputeKernelHelper _bilateralKernel;
         private bool _hasBilateralKernel;
+        private ComputeShader _qrsReferenceDepthNormalCompute;
+        private ComputeShader _qrsReferenceDepthDilationCompute;
+        private ComputeShader _qrsReferenceBilateralCompute;
+        private ComputeKernelHelper _qrsReferenceNormKernel;
+        private ComputeKernelHelper _qrsReferenceInitDilateKernel;
+        private ComputeKernelHelper _qrsReferenceDilateStepKernel;
+        private ComputeKernelHelper _qrsReferenceBilateralKernel;
+        private bool _hasQrsReferencePreprocess;
+        private bool _loggedQrsReferencePreprocessUnavailable;
         private ComputeKernelHelper _edgeCleanKernel;
         private bool _hasEdgeCleanKernel;
         private ComputeKernelHelper _handMaskKernel;
@@ -532,6 +551,13 @@ namespace Genesis.RoomScan
         private Texture _depthTex;
         /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
         public Texture DepthTex => _depthTex;
+        // Current calibrated depth-camera transforms. The bounded 5 cm A/B
+        // experiment consumes the same source frame directly instead of
+        // resampling the global 10 cm TSDF.
+        internal Matrix4x4[] DepthProjectionMatrices => _proj;
+        internal Matrix4x4[] DepthProjectionInverseMatrices => _projInv;
+        internal Matrix4x4[] DepthViewMatrices => _view;
+        internal Matrix4x4[] DepthViewInverseMatrices => _viewInv;
 
         private ComputeShader _platformWitnessCopyShader;
         private int _platformWitnessCopyKernel = -1;
@@ -760,6 +786,7 @@ namespace Genesis.RoomScan
                 _bilateralKernel = new ComputeKernelHelper(bilateralFilterCompute, "BilateralFilter");
                 _hasBilateralKernel = true;
             }
+            InitializeQrsReferencePreprocess();
             if (depthEdgeCleanCompute != null)
             {
                 _edgeCleanKernel = new ComputeKernelHelper(depthEdgeCleanCompute, "DepthEdgeClean");
@@ -815,6 +842,53 @@ namespace Genesis.RoomScan
             CheckPermissionAndEnable();
 
             _started = true;
+        }
+
+        /// <summary>
+        /// Loads a private copy of QRS' original depth preprocessing shaders.
+        /// Keeping these resources separate is deliberate: the production
+        /// ScanCover shaders have acquired different filtering, provenance and
+        /// eye-selection rules and therefore cannot serve as a QRS reference.
+        /// </summary>
+        private void InitializeQrsReferencePreprocess()
+        {
+            if (VolumeIntegrator.Instance == null ||
+                !VolumeIntegrator.Instance.QrsReferenceBaselineEnabled)
+                return;
+
+            _qrsReferenceDepthNormalCompute =
+                Resources.Load<ComputeShader>("QrsReference/QrsReferenceDepthNormals");
+            _qrsReferenceDepthDilationCompute =
+                Resources.Load<ComputeShader>("QrsReference/QrsReferenceDepthDilation");
+            _qrsReferenceBilateralCompute =
+                Resources.Load<ComputeShader>("QrsReference/QrsReferenceBilateralDepthFilter");
+
+            if (_qrsReferenceDepthNormalCompute == null ||
+                _qrsReferenceDepthDilationCompute == null ||
+                _qrsReferenceBilateralCompute == null)
+            {
+                Logger.Error("QRS reference preprocess unavailable: one or more exact-copy shaders are missing");
+                return;
+            }
+
+            try
+            {
+                _qrsReferenceNormKernel = new ComputeKernelHelper(
+                    _qrsReferenceDepthNormalCompute, "DepthNorm");
+                _qrsReferenceInitDilateKernel = new ComputeKernelHelper(
+                    _qrsReferenceDepthDilationCompute, "InitDepthDilation");
+                _qrsReferenceDilateStepKernel = new ComputeKernelHelper(
+                    _qrsReferenceDepthDilationCompute, "DilateDepthStep");
+                _qrsReferenceBilateralKernel = new ComputeKernelHelper(
+                    _qrsReferenceBilateralCompute, "BilateralFilter");
+                _hasQrsReferencePreprocess = true;
+                Logger.Info("QRS reference preprocess: exact bilateral/normals/dilation lane active (eye 0)");
+            }
+            catch (Exception e)
+            {
+                _hasQrsReferencePreprocess = false;
+                Logger.Error("QRS reference preprocess kernel initialization failed: " + e.Message);
+            }
         }
 
         /// <summary>
@@ -1043,6 +1117,9 @@ namespace Genesis.RoomScan
             _centerDepthSamplesBuffer = null;
             _centerDepthRequested = false;
             _centerDepthPending = false;
+            LastCenterDepthMeters = -1f;
+            LastCenterDepthSampleValid = false;
+            CenterDepthSampleRevision++;
             _dilatedDepth = null;
             Logger.Info("DepthCapture: GPU resources released");
         }
@@ -1133,6 +1210,18 @@ namespace Genesis.RoomScan
                 }
             }
 
+            if (VolumeIntegrator.Instance != null &&
+                VolumeIntegrator.Instance.QrsReferenceBaselineEnabled)
+            {
+                // QRS preprocesses every arriving depth frame before the
+                // scanner's integration clock consumes it.  Keep this timing
+                // inside the frame callback so the reference lane does not
+                // inherit ScanCover's JIT/latest-frame scheduling.
+                if (PreprocessQrsReferenceFrame())
+                    Updated?.Invoke();
+                return;
+            }
+
             // JIT 化（08-18 实机：预处理链 30Hz 全速跑吃掉 24→72 帧的差价）：
             // 深度帧到达只记账不加工；双边/缘洗/法线挪到 PreprocessLatestFrame
             // 由 scanner 在每次融合前调用——加工节拍=融合节拍（20Hz），
@@ -1150,6 +1239,13 @@ namespace Genesis.RoomScan
         /// </summary>
         public void PreprocessLatestFrame()
         {
+            // The QRS lane already performed its exact preprocessing in
+            // OnDepthFrame.  Reprocessing the filtered texture here would
+            // apply the bilateral filter twice and no longer match QRS.
+            if (VolumeIntegrator.Instance != null &&
+                VolumeIntegrator.Instance.QrsReferenceBaselineEnabled)
+                return;
+
             if (!_preprocessDirty || !DepthAvailable) return;
             _preprocessDirty = false;
 
@@ -1178,6 +1274,170 @@ namespace Genesis.RoomScan
                               0f, 999f)
                 : 0f;
             Preprocessed?.Invoke();
+        }
+
+        /// <summary>
+        /// QRS reference timing: preprocess every depth frame at arrival, using
+        /// the original two-eye NDC bilateral filter and original normal pass.
+        /// Returns false rather than falling back to ScanCover preprocessing;
+        /// a mixed lane would no longer be a valid QRS comparison.
+        /// </summary>
+        private bool PreprocessQrsReferenceFrame()
+        {
+            if (!_hasQrsReferencePreprocess || _depthTex == null)
+            {
+                if (!_loggedQrsReferencePreprocessUnavailable)
+                {
+                    _loggedQrsReferencePreprocessUnavailable = true;
+                    Logger.Error("QRS reference frame rejected: exact preprocessing lane is unavailable");
+                }
+                return false;
+            }
+
+            _preprocessDirty = false;
+            _preprocessEye = QrsReferenceEyeIndex;
+
+            ApplyQrsReferenceBilateralFilter();
+            SetGlobalShaderProperties();
+            ComputeQrsReferenceNormals();
+            _dilationDirty = true;
+
+            // This recorder is observation-only.  Capture the same eye that
+            // QRS integrates, without changing any production texture.
+            _pairedFrameRecorder?.CapturePreprocessedFrame(
+                _depthTex, _frameCount, QrsReferenceEyeIndex);
+            LastPreprocessAgeMs = _lastDepthArrivalRealtime > 0f
+                ? Mathf.Clamp((Time.realtimeSinceStartup - _lastDepthArrivalRealtime) * 1000f,
+                              0f, 999f)
+                : 0f;
+            Preprocessed?.Invoke();
+            return true;
+        }
+
+        private void ApplyQrsReferenceBilateralFilter()
+        {
+            // Match QRS exactly: if filtering is disabled or no RGB guide has
+            // arrived yet, retain the raw platform depth for this frame.
+            if (!enableBilateralFilter || _rgbGuide == null || _depthTex == null)
+            {
+                if (!_loggedBilateralSkip && enableBilateralFilter && _rgbGuide == null)
+                {
+                    _loggedBilateralSkip = true;
+                    Logger.Info("QRS bilateral depth filter skipped — no RGB guide");
+                }
+                return;
+            }
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+            if (_filteredDepthTex == null ||
+                _filteredDepthTex.width != w ||
+                _filteredDepthTex.height != h)
+            {
+                if (_filteredDepthTex) Destroy(_filteredDepthTex);
+                _filteredDepthTex = new RenderTexture(
+                    w, h, 0, GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _filteredDepthTex.Create();
+            }
+
+            _qrsReferenceBilateralKernel.Set(BilSrcDepthID, _depthTex);
+            _qrsReferenceBilateralKernel.Set(BilRGBGuideID, _rgbGuide);
+            _qrsReferenceBilateralKernel.Set(BilDstDepthID, _filteredDepthTex);
+            _qrsReferenceBilateralCompute.SetInt(BilDepthWID, w);
+            _qrsReferenceBilateralCompute.SetInt(BilDepthHID, h);
+            _qrsReferenceBilateralCompute.SetFloat(BilSigmaSpatialID, sigmaSpatial);
+            _qrsReferenceBilateralCompute.SetFloat(BilSigmaColorID, sigmaColor);
+            _qrsReferenceBilateralCompute.SetFloat(BilSigmaDepthID, sigmaDepth);
+            _qrsReferenceBilateralCompute.SetInt(BilFilterRadiusID, filterRadius);
+
+            // QRS processes both slices in one dispatch.
+            _qrsReferenceBilateralKernel.DispatchFit(w, h, 2);
+            _depthTex = _filteredDepthTex;
+        }
+
+        private void ComputeQrsReferenceNormals()
+        {
+            if (_normTex == null ||
+                _normTex.width != _depthTex.width ||
+                _normTex.height != _depthTex.height)
+            {
+                if (_normTex) Destroy(_normTex);
+                _normTex = new RenderTexture(
+                    _depthTex.width, _depthTex.height, 0,
+                    GraphicsFormat.R8G8B8A8_SNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    useMipMap = false,
+                    enableRandomWrite = true
+                };
+            }
+
+            _qrsReferenceNormKernel.Set(DepthTexID, _depthTex);
+            _qrsReferenceNormKernel.Set(NormTexRWID, _normTex);
+            _qrsReferenceNormKernel.DispatchFit(_normTex);
+            Shader.SetGlobalTexture(NormTexID, _normTex);
+        }
+
+        private void ComputeQrsReferenceDilation()
+        {
+            if (!_hasQrsReferencePreprocess || _depthTex == null)
+                return;
+
+            if (_dilationA == null ||
+                _dilationA.width != _depthTex.width ||
+                _dilationA.height != _depthTex.height)
+            {
+                if (_dilationA) Destroy(_dilationA);
+                if (_dilationB) Destroy(_dilationB);
+
+                var desc = new RenderTextureDescriptor
+                {
+                    width = _depthTex.width,
+                    height = _depthTex.height,
+                    volumeDepth = 1,
+                    dimension = TextureDimension.Tex2D,
+                    autoGenerateMips = false,
+                    enableRandomWrite = true,
+                    graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat,
+                    msaaSamples = 1
+                };
+                _dilationA = new RenderTexture(desc);
+                _dilationB = new RenderTexture(desc);
+            }
+
+            _qrsReferenceDepthDilationCompute.SetFloat(VoxDistID, voxelDistance);
+            _qrsReferenceDepthDilationCompute.SetFloat(VoxSizeShaderID, voxelSize);
+
+            _qrsReferenceInitDilateKernel.Set(DepthTexID, _depthTex);
+            _qrsReferenceInitDilateKernel.Set(DilateSrcID, _dilationA);
+            _qrsReferenceInitDilateKernel.Set(DilateDestID, _dilationB);
+            _qrsReferenceInitDilateKernel.DispatchFit(
+                _dilationA.width, _dilationA.height);
+
+            int stepSize = _dilationMaxStep;
+            for (int i = 0; i < dilationSteps; i++)
+            {
+                _qrsReferenceDilateStepKernel.Set(DilateSrcID, _dilationA);
+                _qrsReferenceDilateStepKernel.Set(DilateDestID, _dilationB);
+                _qrsReferenceDepthDilationCompute.SetInt(
+                    DilateStepSizeID, stepSize);
+                _qrsReferenceDilateStepKernel.DispatchFit(
+                    _dilationA.width, _dilationA.height);
+
+                stepSize /= 2;
+                (_dilationA, _dilationB) = (_dilationB, _dilationA);
+            }
+
+            _dilatedDepth = _dilationA;
+            Shader.SetGlobalTexture(DilatedDepthTexID, _dilatedDepth);
         }
 
         private void CapturePlatformDepthWitness()
@@ -1240,7 +1500,11 @@ namespace Genesis.RoomScan
         public void UpdateDilationIfNeeded()
         {
             if (!_dilationDirty || !DepthAvailable) return;
-            ComputeDilation();
+            if (VolumeIntegrator.Instance != null &&
+                VolumeIntegrator.Instance.QrsReferenceBaselineEnabled)
+                ComputeQrsReferenceDilation();
+            else
+                ComputeDilation();
             _dilationDirty = false;
         }
 

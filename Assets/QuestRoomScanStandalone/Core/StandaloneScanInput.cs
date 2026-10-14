@@ -19,6 +19,18 @@ namespace Genesis.RoomScan
             StandaloneRoomScanner scanner = StandaloneRoomScanner.Instance;
             if (scanner == null) return;
 
+            LocalFineTsdfExperiment fineExperiment =
+                LocalFineTsdfExperiment.Instance;
+            if (fineExperiment != null)
+            {
+                if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick,
+                        controller))
+                {
+                    scanner.NotifyInput(fineExperiment.ToggleLock());
+                    Pulse(0.42f, 0.10f);
+                }
+            }
+
             float trigger = OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger,
                 controller);
             bool triggerDown = trigger > 0.75f && _previousTrigger <= 0.75f;
@@ -44,6 +56,7 @@ namespace Genesis.RoomScan
                 scanner.NotifyInput("B键");
                 if (scanner.IsScanning || scanner.HasStarted)
                     scanner.StopAndClearScan();
+                fineExperiment?.ResetForNewScan();
                 Pulse(0.5f, 0.5f);
             }
 

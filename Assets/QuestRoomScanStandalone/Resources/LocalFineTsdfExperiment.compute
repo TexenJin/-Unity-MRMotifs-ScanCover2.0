@@ -1,0 +1,467 @@
+// Bounded native 5 cm TSDF used only for the manual ROI A/B experiment.
+// It consumes the current calibrated depth frame directly and never reads,
+// writes, upsamples or otherwise changes the production 10 cm volume.
+//
+// This experiment deliberately reuses the production compact-history rules:
+// one dense voxel writer per frame, private same-view micro batches, 12 degree
+// independent-view tickets, half-voxel strong contradiction, 16/2/5 history
+// release and edge-coherent publication. It does not simplify to 10 cm here.
+
+#pragma kernel ClearFineVolume
+#pragma kernel ClearFineCandidates
+#pragma kernel IntegrateFineVolume
+#pragma kernel EvaluateFineEdgeCoherence
+#pragma kernel CommitFineEdgeCoherence
+
+#include "../Shaders/DepthKit.hlsl"
+
+RWTexture3D<float2> _FineTsdfRW;
+RWTexture3D<float4> _FineHistoryRW;
+RWTexture3D<float> _FineCoherenceRW;
+RWTexture3D<float2> _FineCandidateRW;
+RWTexture3D<float4> _FineColorRW;
+RWTexture3D<float> _FineTraceRW;
+
+uint3 _FineVoxCount;
+float3 _FineCenter;
+float _FineVoxSize;
+float _FineTruncation;
+float _FineMinDepth;
+float _FineMaxDepth;
+float _FineContradictionThreshold;
+float _FineIndependentViewCos;
+
+static const float kFineMaxVotes = 16.0;
+static const float kFineCorrectionVotes = 5.0;
+static const uint kFineStrongConfirmations = 2u;
+
+float FineQuantizeTsdf(float value)
+{
+    return round(clamp(value, -1.0, 1.0) * 127.0) / 127.0;
+}
+
+uint EncodeFineViewDirection8(float3 direction)
+{
+    float3 n = normalize(direction);
+    float invL1 = 1.0 / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    float2 p = n.xz * invL1;
+    if (n.y < 0.0)
+        p = (1.0 - abs(p.yx)) * sign(p);
+    uint2 q = (uint2)round(saturate(p * 0.5 + 0.5) * 15.0);
+    return (q.x & 15u) | ((q.y & 15u) << 4u);
+}
+
+float3 DecodeFineViewDirection8(uint code)
+{
+    float2 p = float2(code & 15u, (code >> 4u) & 15u) /
+               15.0 * 2.0 - 1.0;
+    float3 n = float3(p.x, 1.0 - abs(p.x) - abs(p.y), p.y);
+    if (n.y < 0.0)
+    {
+        float2 oldXZ = n.xz;
+        n.xz = (1.0 - abs(oldXZ.yx)) * sign(oldXZ);
+    }
+    return normalize(n);
+}
+
+void FineStoreViewTicket(inout float4 history, uint viewCode, uint age)
+{
+    history.z = (float)((viewCode & 255u) | ((min(age, 7u) & 7u) << 8u));
+}
+
+// Return x = representative observation, y = event:
+// 0 normal path, 1 private bucket/cooldown, 2 independent-view publication,
+// 3 stable same-view batch publication.
+float2 FineSelectMicroView(float previousTsdf, float observedTsdf,
+                           float previousVotes, uint currentViewCode,
+                           inout float4 history, inout float coherence)
+{
+    bool neutralCoherence = abs(coherence - 0.5) < 0.125;
+    bool smallNearSurfaceChange = previousVotes > 0.0 &&
+        abs(previousTsdf) <= 0.5 &&
+        abs(observedTsdf - previousTsdf) < _FineContradictionThreshold;
+
+    if (!neutralCoherence || !smallNearSurfaceChange)
+    {
+        if (neutralCoherence)
+        {
+            history.z = 0.0;
+            history.w = 0.0;
+        }
+        return float2(observedTsdf, 0.0);
+    }
+
+    uint packed = (uint)round(max(history.z, 0.0));
+    uint sampleCount = (packed >> 8u) & 7u;
+    if (sampleCount == 0u)
+    {
+        FineStoreViewTicket(history, currentViewCode, 1u);
+        history.w = observedTsdf;
+        return float2(observedTsdf, 1.0);
+    }
+
+    uint bucketViewCode = packed & 255u;
+    float viewDot = dot(DecodeFineViewDirection8(bucketViewCode),
+                        DecodeFineViewDirection8(currentViewCode));
+
+    // Counts 5..7 are a closed post-publication cooldown. Repeated frames
+    // from the publishing view cannot reopen an every-frame slow update.
+    if (sampleCount >= 5u)
+    {
+        if (viewDot <= _FineIndependentViewCos)
+        {
+            FineStoreViewTicket(history, currentViewCode, 1u);
+            history.w = observedTsdf;
+        }
+        else if (sampleCount > 5u)
+        {
+            FineStoreViewTicket(history, bucketViewCode, sampleCount - 1u);
+        }
+        else
+        {
+            history.z = 0.0;
+            history.w = 0.0;
+        }
+        return float2(observedTsdf, 1.0);
+    }
+
+    if (viewDot > _FineIndependentViewCos)
+    {
+        float previousMean = history.w;
+        float meanDelta = previousMean - previousTsdf;
+        float observationDelta = observedTsdf - previousTsdf;
+        float stableBand = max(1.0 / 127.0,
+            min(_FineContradictionThreshold * 0.25, 0.0625));
+        bool stableSample = meanDelta * observationDelta >= 0.0 &&
+                            abs(observedTsdf - previousMean) <= stableBand;
+        if (!stableSample)
+        {
+            FineStoreViewTicket(history, currentViewCode, 1u);
+            history.w = observedTsdf;
+            return float2(observedTsdf, 1.0);
+        }
+
+        uint nextCount = min(sampleCount + 1u, 4u);
+        float nextMean = (previousMean * (float)sampleCount + observedTsdf) /
+                         max((float)nextCount, 1.0);
+        FineStoreViewTicket(history, bucketViewCode, nextCount);
+        history.w = nextMean;
+        if (nextCount >= 4u)
+        {
+            float minimumPublishOffset = max(2.0 / 127.0,
+                min(_FineContradictionThreshold * 0.10, 0.025));
+            FineStoreViewTicket(history, bucketViewCode, 7u);
+            history.w = 0.0;
+            if (abs(nextMean - previousTsdf) >= minimumPublishOffset)
+                return float2(nextMean, 3.0);
+        }
+        return float2(observedTsdf, 1.0);
+    }
+
+    float representative = history.w;
+    FineStoreViewTicket(history, currentViewCode, 1u);
+    history.w = observedTsdf;
+    return float2(representative, 2.0);
+}
+
+// Return x = retained history votes, y = repair event. Events 4..6 quarantine
+// the incoming observation. Repeated frames from one view never buy the
+// second strong-repair confirmation.
+float2 FineSelectHistory(float previousTsdf, float observedTsdf,
+                         float previousVotes, bool reliableEvidence,
+                         uint currentViewCode, inout float4 history,
+                         inout float coherence)
+{
+    float matureVotes = max(kFineMaxVotes * 0.5,
+                            kFineCorrectionVotes + 1.0);
+    float delta = observedTsdf - previousTsdf;
+    bool localContradiction = abs(previousTsdf) <= 0.5 &&
+                              abs(delta) >= _FineContradictionThreshold;
+    bool negativeRepair = coherence <= 0.125;
+    bool positiveRepair = coherence >= 0.875;
+    bool repairActive = negativeRepair || positiveRepair;
+    int direction = delta >= 0.0 ? 1 : -1;
+
+    if (repairActive)
+    {
+        int repairDirection = positiveRepair ? 1 : -1;
+        if (!localContradiction)
+        {
+            coherence = 0.5;
+            history.z = 0.0;
+            return float2(previousVotes, 3.0);
+        }
+        if (!reliableEvidence)
+            return float2(previousVotes, 4.0);
+        if (direction != repairDirection)
+        {
+            coherence = saturate(0.5 +
+                (float)direction / (2.0 * (float)kFineStrongConfirmations));
+            FineStoreViewTicket(history, currentViewCode, 1u);
+            return float2(previousVotes, 5.0);
+        }
+        coherence = repairDirection > 0 ? 1.0 : 0.0;
+        FineStoreViewTicket(history, currentViewCode, 0u);
+        return float2(min(previousVotes, kFineCorrectionVotes), 2.0);
+    }
+
+    bool strongContradiction = previousVotes >= matureVotes &&
+                               localContradiction;
+    if (!strongContradiction)
+    {
+        coherence = 0.5;
+        history.z = 0.0;
+        return float2(previousVotes, 0.0);
+    }
+    if (!reliableEvidence)
+        return float2(previousVotes, 4.0);
+
+    bool pendingTicket = abs(coherence - 0.5) >= 0.125;
+    int pendingDirection = coherence >= 0.5 ? 1 : -1;
+    if (!pendingTicket || pendingDirection != direction)
+    {
+        coherence = saturate(0.5 +
+            (float)direction / (2.0 * (float)kFineStrongConfirmations));
+        FineStoreViewTicket(history, currentViewCode, 1u);
+        return float2(previousVotes, pendingTicket ? 5.0 : 6.0);
+    }
+
+    uint packed = (uint)round(max(history.z, 0.0));
+    uint firstViewCode = packed & 255u;
+    float viewDot = dot(DecodeFineViewDirection8(firstViewCode),
+                        DecodeFineViewDirection8(currentViewCode));
+    if (viewDot <= _FineIndependentViewCos)
+    {
+        coherence = direction > 0 ? 1.0 : 0.0;
+        FineStoreViewTicket(history, currentViewCode, 0u);
+        return float2(min(previousVotes, kFineCorrectionVotes), 1.0);
+    }
+
+    uint sameViewAge = min(((packed >> 8u) & 7u) + 1u, 7u);
+    FineStoreViewTicket(history, firstViewCode, sameViewAge);
+    coherence = saturate(0.5 +
+        (float)direction / (2.0 * (float)kFineStrongConfirmations));
+    return float2(previousVotes, 6.0);
+}
+
+bool FineReliableRepairEvidence(float2 uv, float3 depthPos,
+                                float3 eyePos, float3 voxelPos)
+{
+    float2 texel2 = 2.0 / max(float2(gsDepthTexSize), float2(1.0, 1.0));
+    float2 uvH = uv + float2(texel2.x, 0.0);
+    float2 uvV = uv + float2(0.0, texel2.y);
+    float depthHNdc = gsDepthSample(uvH, GS_FUSION_EYE);
+    float depthVNdc = gsDepthSample(uvV, GS_FUSION_EYE);
+    if (depthHNdc <= 0.0 || depthVNdc <= 0.0) return false;
+
+    float3 depthPosH = gsDepthNDCtoWorld(float3(uvH, depthHNdc),
+                                         GS_FUSION_EYE);
+    float3 depthPosV = gsDepthNDCtoWorld(float3(uvV, depthVNdc),
+                                         GS_FUSION_EYE);
+    float3 hDeriv = depthPosH - depthPos;
+    float3 vDeriv = depthPosV - depthPos;
+    float3 normalCross = cross(hDeriv, vDeriv);
+    float crossLength = length(normalCross);
+    float depthDistance = length(depthPos - eyePos);
+    float hDelta = abs(length(depthPosH - eyePos) - depthDistance);
+    float vDelta = abs(length(depthPosV - eyePos) - depthDistance);
+    float voxelDistance = length(voxelPos - eyePos);
+    if (crossLength <= 1e-6 || hDelta > _FineTruncation ||
+        vDelta > _FineTruncation || voxelDistance <= 1e-5)
+        return false;
+
+    float3 depthNormal = -normalCross / crossLength;
+    float facing = -dot(voxelPos - eyePos, depthNormal) / voxelDistance;
+    return facing >= 0.60;
+}
+
+void FineCommitObservation(uint3 id, float observedTsdf,
+                           float retainedVotes, inout float4 history)
+{
+    float previousTsdf = history.x;
+    float accumulatedVotes = retainedVotes + 1.0;
+    float reconstructedTsdf = retainedVotes > 0.0
+        ? (previousTsdf * retainedVotes + observedTsdf) /
+          max(accumulatedVotes, 1e-5)
+        : observedTsdf;
+    float storedVotes = min(accumulatedVotes, kFineMaxVotes);
+    history.x = reconstructedTsdf;
+    history.y = storedVotes;
+    _FineHistoryRW[id] = history;
+    _FineTsdfRW[id] = float2(FineQuantizeTsdf(reconstructedTsdf),
+                             storedVotes / kFineMaxVotes);
+}
+
+[numthreads(4, 4, 4)]
+void ClearFineVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _FineVoxCount)) return;
+    _FineTsdfRW[id] = float2(-1.0, 0.0);
+    _FineHistoryRW[id] = float4(-1.0, 0.0, 0.0, 0.0);
+    _FineCoherenceRW[id] = 0.5;
+    _FineCandidateRW[id] = float2(0.0, 0.0);
+    _FineColorRW[id] = float4(1.0, 1.0, 1.0, 1.0);
+    _FineTraceRW[id] = 0.0;
+}
+
+[numthreads(4, 4, 4)]
+void ClearFineCandidates(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _FineVoxCount)) return;
+    _FineCandidateRW[id] = float2(0.0, 0.0);
+}
+
+[numthreads(4, 4, 4)]
+void IntegrateFineVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _FineVoxCount)) return;
+
+    float3 local = ((float3)id + 0.5 - (float3)_FineVoxCount * 0.5) *
+                   _FineVoxSize;
+    float3 worldPos = _FineCenter + local;
+    float3 viewPos = mul(gsDepthView[GS_FUSION_EYE],
+                         float4(worldPos, 1.0)).xyz;
+    if (viewPos.z > -0.05) return;
+
+    float3 ndc = gsDepthWorldToNDC(worldPos, GS_FUSION_EYE);
+    if (ndc.x < 0.01 || ndc.x > 0.99 ||
+        ndc.y < 0.01 || ndc.y > 0.99)
+        return;
+
+    float depthNdc = gsDepthSample(ndc.xy, GS_FUSION_EYE);
+    if (depthNdc <= 0.0) return;
+
+    float3 eyePos = gsDepthEyePos(GS_FUSION_EYE);
+    float3 measuredWorld = gsDepthNDCtoWorld(
+        float3(ndc.xy, depthNdc), GS_FUSION_EYE);
+    float measuredDistance = length(measuredWorld - eyePos);
+    if (measuredDistance < _FineMinDepth ||
+        measuredDistance > _FineMaxDepth)
+        return;
+
+    float voxelDistance = length(worldPos - eyePos);
+    float projectiveSdf = measuredDistance - voxelDistance;
+    if (projectiveSdf < -_FineTruncation) return;
+
+    float observed = clamp(projectiveSdf / _FineTruncation, -1.0, 1.0);
+    float4 history = _FineHistoryRW[id];
+    float previousVotes = max(history.y, 0.0);
+    float previousTsdf = previousVotes > 0.0 ? history.x : observed;
+    float coherence = _FineCoherenceRW[id];
+    uint currentViewCode = EncodeFineViewDirection8(eyePos - worldPos);
+
+    float2 micro = previousVotes > 0.0
+        ? FineSelectMicroView(previousTsdf, observed, previousVotes,
+                              currentViewCode, history, coherence)
+        : float2(observed, 0.0);
+
+    if (micro.y == 1.0)
+    {
+        _FineHistoryRW[id] = history;
+        _FineCoherenceRW[id] = coherence;
+        return;
+    }
+
+    // Mature small changes are staged. They may move or remove a published
+    // zero crossing only when another endpoint from this same depth frame
+    // supplies a coherent partner.
+    if (micro.y == 2.0 || micro.y == 3.0)
+    {
+        _FineCandidateRW[id] = float2(micro.x, 1.0);
+        _FineHistoryRW[id] = history;
+        _FineCoherenceRW[id] = coherence;
+        return;
+    }
+
+    bool repairFacingNeeded = previousVotes > 0.0 &&
+        abs(previousTsdf) <= 0.5 &&
+        abs(observed - previousTsdf) >= _FineContradictionThreshold;
+    bool reliableEvidence = !repairFacingNeeded ||
+        FineReliableRepairEvidence(ndc.xy, measuredWorld, eyePos, worldPos);
+    float2 selectedHistory = previousVotes > 0.0
+        ? FineSelectHistory(previousTsdf, observed, previousVotes,
+                            reliableEvidence, currentViewCode,
+                            history, coherence)
+        : float2(0.0, 0.0);
+
+    _FineCoherenceRW[id] = coherence;
+    if (selectedHistory.y >= 4.0 && selectedHistory.y <= 6.0)
+    {
+        _FineHistoryRW[id] = history;
+        return;
+    }
+
+    FineCommitObservation(id, observed, selectedHistory.x, history);
+}
+
+[numthreads(4, 4, 4)]
+void EvaluateFineEdgeCoherence(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _FineVoxCount)) return;
+    float2 candidateRecord = _FineCandidateRW[id];
+    if (candidateRecord.y < 0.5) return;
+
+    float candidate = candidateRecord.x;
+    float2 currentSample = _FineTsdfRW[id];
+    int3 center = (int3)id;
+    bool coherentPartner = false;
+
+    [unroll]
+    for (uint axisSide = 0u; axisSide < 6u; axisSide++)
+    {
+        int3 offset = int3(0, 0, 0);
+        if (axisSide == 0u) offset.x = -1;
+        else if (axisSide == 1u) offset.x = 1;
+        else if (axisSide == 2u) offset.y = -1;
+        else if (axisSide == 3u) offset.y = 1;
+        else if (axisSide == 4u) offset.z = -1;
+        else offset.z = 1;
+
+        int3 neighbourSigned = center + offset;
+        if (any(neighbourSigned < int3(0, 0, 0)) ||
+            any(neighbourSigned >= (int3)_FineVoxCount))
+            continue;
+
+        uint3 neighbour = (uint3)neighbourSigned;
+        float2 neighbourRecord = _FineCandidateRW[neighbour];
+        if (neighbourRecord.y < 0.5) continue;
+        float neighbourCandidate = neighbourRecord.x;
+        bool candidateCrossing =
+            (candidate <= 0.0 && neighbourCandidate >= 0.0) ||
+            (candidate >= 0.0 && neighbourCandidate <= 0.0);
+
+        float2 neighbourCurrent = _FineTsdfRW[neighbour];
+        bool publishedCrossing = currentSample.y > 0.0 &&
+            neighbourCurrent.y > 0.0 &&
+            ((currentSample.x <= 0.0 && neighbourCurrent.x >= 0.0) ||
+             (currentSample.x >= 0.0 && neighbourCurrent.x <= 0.0));
+        const float extinctionMargin = 2.0 / 127.0;
+        bool coherentExtinction = publishedCrossing &&
+            ((candidate > extinctionMargin &&
+              neighbourCandidate > extinctionMargin) ||
+             (candidate < -extinctionMargin &&
+              neighbourCandidate < -extinctionMargin));
+
+        if (candidateCrossing || coherentExtinction)
+        {
+            coherentPartner = true;
+            break;
+        }
+    }
+
+    if (coherentPartner)
+        _FineCandidateRW[id] = float2(candidate, 2.0);
+}
+
+[numthreads(4, 4, 4)]
+void CommitFineEdgeCoherence(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _FineVoxCount)) return;
+    float2 candidateRecord = _FineCandidateRW[id];
+    if (candidateRecord.y < 1.5) return;
+
+    float4 history = _FineHistoryRW[id];
+    float previousVotes = max(history.y, 0.0);
+    if (previousVotes <= 0.0) return;
+    FineCommitObservation(id, candidateRecord.x, previousVotes, history);
+}

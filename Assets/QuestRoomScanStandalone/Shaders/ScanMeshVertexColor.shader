@@ -1,6 +1,13 @@
 Shader "Genesis/ScanMeshVertexColor"
 {
-    Properties { }
+    Properties
+    {
+        // Per-material render-state controls. Production materials retain the
+        // historical defaults; bounded comparison overlays may opt out of the
+        // shared depth buffer without changing their geometry.
+        [HideInInspector] _RSMeshZWrite ("Mesh ZWrite", Float) = 1
+        [HideInInspector] _RSMeshZTest  ("Mesh ZTest", Float) = 4
+    }
     SubShader
     {
         Tags { "RenderType"="Transparent" "RenderPipeline"="UniversalPipeline" "Queue"="Transparent+40" }
@@ -15,8 +22,8 @@ Shader "Genesis/ScanMeshVertexColor"
             // 实体模式重叠层被深度剔除=视觉变"实"，诊断可读性不变。
             // 点云(Transparent)/覆盖片(+20)队列更浅先画且不写深度，互不影响。
             Blend SrcAlpha OneMinusSrcAlpha
-            ZWrite On
-            ZTest LEqual
+            ZWrite [_RSMeshZWrite]
+            ZTest [_RSMeshZTest]
             // The reconstructed room shell is viewed from its interior.  Do
             // not make triangle winding a visibility/admission rule: ceiling
             // triangles can legitimately be wound away from the headset.
@@ -84,6 +91,7 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSSuppressPink;
             float _RSTemporalIllegalActive;
             float _RSHeraReplayActive;
+            float _RSComparisonOverlay;
 
             #define DEPTH_TOLERANCE 0.015
 
@@ -309,7 +317,7 @@ Shader "Genesis/ScanMeshVertexColor"
                 // 做不出 Meta 几何级粗网），默认回 1=关闭，仅留作帧率应急杠杆；
                 // 观感修复改由片元级世界格线画法承担（见 frag 线框分支）。
                 uint meshStride = (uint)max(_RSMeshStride, 1.0);
-                if (meshStride > 1u)
+                if (meshStride > 1u && _RSComparisonOverlay < 0.5)
                 {
                     uint anchorFlat = _SurfaceVerts[_SurfaceIndices[(vertID / 3u) * 3u] & 0x3FFFFFFFu].voxelFlatIdx;
                     uint3 vc3 = (uint3)gsVoxCount.xyz;
@@ -449,11 +457,16 @@ Shader "Genesis/ScanMeshVertexColor"
                         : _RSExtractionColor.rgb;
                 // 第一阶段纯几何观察：统一白线，明确绕开置信色、冻结色和
                 // HERA 路由色。它只改变最终片元，不改变任何数据或提取决策。
-                lineColor = _RSGeometryTruthView > 0.5
+                lineColor = _RSComparisonOverlay > 0.5
+                    ? _RSExtractionColor.rgb
+                    : _RSGeometryTruthView > 0.5
                     ? float3(0.95, 0.95, 0.95)
                     : ApplyConfidenceViz(lineColor, IN.positionWS);
                 return half4(lineColor, _RSExtractionColor.a);
             }
+
+                if (_RSComparisonOverlay > 0.5)
+                    return half4(_RSExtractionColor.rgb, _RSExtractionColor.a);
 
                 if (_RSGeometryTruthView > 0.5)
                     return half4(0.82, 0.82, 0.82, 1.0);

@@ -34,8 +34,9 @@ RWTexture3D<float> gsInfiniTamMicroViewMeanRW;
 // once. Camera-local frustum samples can collapse onto the same snapped world
 // voxel after pose rotation; this claim sidecar makes those aliases one vote,
 // rather than several racing read/modify/write operations in the same frame.
-// Bits 31..8 contain a 24-bit frame epoch and bits 7..0 contain the winning
-// observation quantized from [-1,+1]. The latter is diagnostic-only: it lets
+// Bits 29..8 contain a 22-bit frame epoch; bits 31..30 are the frame-local
+// edge-publication transaction; bits 7..0 contain the winning observation
+// quantized from [-1,+1]. The latter is diagnostic-only: it lets
 // the cumulative ledger distinguish harmless duplicate aliases from aliases
 // that disagree by at least half a world voxel.
 RWStructuredBuffer<uint> _InfiniTamWriteEpochs;
@@ -105,7 +106,7 @@ uint gsFrozenChunkSize;        // 冻结块边长（体素）；0=冻结系统�
 float gsFrozenMatureWeight;    // 逐体素冻结资格/成熟度普查下限；冻结同时不得低于可读权重。
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
-RWStructuredBuffer<uint> _CarveStats; // 0..198既有；199..202 InfiniTAM 同帧体素票侦察账（只读）
+RWStructuredBuffer<uint> _CarveStats; // 0..198既有；199..202同帧票；203..205零交叉一致发布 staged/approved/committed
 // ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
 // 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
 // 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
@@ -132,6 +133,14 @@ int gsInfiniTamContradictionConfirmations;
 float gsInfiniTamIndependentViewCos;
 int gsInfiniTamSameViewSlowConfirmations;
 float gsInfiniTamSelectiveHistoryRelease;
+// Experimental zero-crossing publication transaction.  The integration pass
+// may stage a mature micro-view result, but only a second read-only pass may
+// approve it after finding a matching endpoint staged by the same accepted
+// depth dispatch.  A pair may either retain/move a zero crossing, or jointly
+// extinguish an existing crossing by becoming clearly same-sign.  A third
+// pass commits approved voxels.  No thread writes a neighbour and Surface
+// Nets/topology remain untouched.
+float gsInfiniTamEdgeCoherentPublication;
 float gsWriteColor;
 float gsWriteAdmissionTrace;
 int gsPruneZOffset;
@@ -687,7 +696,9 @@ void RecordInfiniTamCrossFrameObservation(uint3 coord, uint previousClaim,
                                           float observedTsdf)
 {
     if (gsTsdfResponsibilityWrite < 0.5) return;
-    uint previousEpoch = previousClaim >> 8u;
+    // The top two bits may carry the frame-local edge-coherence transaction.
+    // They are not part of provenance.
+    uint previousEpoch = (previousClaim >> 8u) & 0x003fffffu;
     if (previousEpoch == 0u) return;
 
     uint previousByte = previousClaim & 0xffu;
@@ -982,6 +993,15 @@ void CopyTsdfSupportResponsibilityExportSlice(uint3 id : SV_DispatchThreadID)
 }
 
 #pragma kernel Clear
+#pragma kernel ClearQrsReference
+
+[numthreads(4, 4, 4)]
+void ClearQrsReference(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= gsVoxCount)) return;
+    gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
+    gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+}
 #pragma kernel ClearInfiniTamVotes
 
 [numthreads(4, 4, 4)]
@@ -1053,6 +1073,19 @@ void InvalidateGunGelSuccessions(uint3 groupId : SV_GroupID,
 }
 
 #pragma kernel Prune
+#pragma kernel PruneQrsReference
+
+[numthreads(4, 4, 4)]
+void PruneQrsReference(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= gsVoxCount)) return;
+    float2 val = gsVolumeRW[id];
+    if (val.y > 0 && val.y < PRUNE_WEIGHT)
+    {
+        gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
+        gsColorVolumeRW[id] = float4(0, 0, 0, 0);
+    }
+}
 
 [numthreads(4, 4, 4)]
 void Prune(uint3 id : SV_DispatchThreadID)
@@ -1075,6 +1108,29 @@ void Prune(uint3 id : SV_DispatchThreadID)
 }
 
 #pragma kernel IntegrateInfiniTam
+#pragma kernel EvaluateInfiniTamEdgeCoherence
+#pragma kernel CommitInfiniTamEdgeCoherence
+
+// _InfiniTamWriteEpochs doubles as the one-frame transaction ledger.  Compact
+// fusion epochs use 22 bits (more than four million accepted frames per scan),
+// leaving two high bits for staged/approved state.  The low byte always keeps
+// the raw observation for the responsibility ledger; the existing private
+// micro-view mean sidecar holds the staged representative.  Status is
+// frame-local and is overwritten by the next claim.
+static const uint kInfiniTamClaimPayloadMask = 0x000000ffu;
+static const uint kInfiniTamClaimEpochMask = 0x003fffffu;
+static const uint kInfiniTamCandidateApproved = 0x40000000u;
+static const uint kInfiniTamCandidateStaged = 0x80000000u;
+
+uint InfiniTamClaimEpoch(uint packed)
+{
+    return (packed >> 8u) & kInfiniTamClaimEpochMask;
+}
+
+float DecodeInfiniTamClaimTsdf(uint packed)
+{
+    return ((float)(packed & kInfiniTamClaimPayloadMask) / 255.0) * 2.0 - 1.0;
+}
 
 // The compact InfiniTAM route only wakes the persistent 64^3 extraction
 // ledgers. Keeping it separate avoids pulling dormant product/HERA UAVs into
@@ -1439,15 +1495,15 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     //   202 duplicates disagreeing with the first claim by >= half a voxel.
     uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
     InterlockedAdd(_CarveStats[199], 1u);
-    uint frameEpoch = gsInfiniTamWriteEpoch & 0x00ffffffu;
+    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
     uint observationByte = (uint)round(saturate(observedTsdf * 0.5 + 0.5) * 255.0);
     uint packedClaim = (frameEpoch << 8) | observationByte;
     uint observedClaim = _InfiniTamWriteEpochs[flat];
-    uint observedEpoch = observedClaim >> 8;
+    uint observedEpoch = InfiniTamClaimEpoch(observedClaim);
     if (observedEpoch == frameEpoch)
     {
         InterlockedAdd(_CarveStats[201], 1u);
-        float firstTsdf = ((float)(observedClaim & 0xffu) / 255.0) * 2.0 - 1.0;
+        float firstTsdf = DecodeInfiniTamClaimTsdf(observedClaim);
         if (abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
             InterlockedAdd(_CarveStats[202], 1u);
         return;
@@ -1460,8 +1516,8 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
         // The only writer that can win between the load and this CAS is another
         // valid alias from the same dispatch/frame.
         InterlockedAdd(_CarveStats[201], 1u);
-        float firstTsdf = ((float)(originalClaim & 0xffu) / 255.0) * 2.0 - 1.0;
-        if ((originalClaim >> 8) == frameEpoch &&
+        float firstTsdf = DecodeInfiniTamClaimTsdf(originalClaim);
+        if (InfiniTamClaimEpoch(originalClaim) == frameEpoch &&
             abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
             InterlockedAdd(_CarveStats[202], 1u);
         return;
@@ -1531,6 +1587,26 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     // path clears the shared neutral ticket that belongs to the next bucket or
     // to the post-publication cooldown.
     bool microPublish = microSelection.y == 2.0 || microSelection.y == 3.0;
+
+    // Mature sub-threshold changes are the path implicated by the endpoint
+    // responsibility ledger.  Stage their representative instead of letting
+    // each endpoint publish independently.  Evaluation/commit run as separate
+    // dispatches, so every endpoint sees a complete immutable candidate set.
+    // Births and strong 16/2/5 corrections remain on the established path.
+    if (microPublish && gsInfiniTamEdgeCoherentPublication > 0.5)
+    {
+        // Preserve the claim's low-byte raw observation for the responsibility
+        // ledger.  The already allocated private mean sidecar temporarily owns
+        // the staged representative; no extra 3D texture is introduced.
+        gsInfiniTamMicroViewMeanRW[coord] = microSelection.x;
+        uint ignored;
+        InterlockedOr(_InfiniTamWriteEpochs[flat],
+                      kInfiniTamCandidateStaged, ignored);
+        InterlockedAdd(_CarveStats[203], 1u);
+        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
+        return;
+    }
+
     float2 historySelection = microPublish
         ? float2(previousVoteWeight, 0.0)
         : (previousVoteWeight > 0.0
@@ -1594,6 +1670,292 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
 
     if (gsWriteColor > 0.5 && abs(rawProjectiveSdf) <= gsVoxDist)
         gsColorVolumeRW[coord] = float4(1.0, 1.0, 1.0, 1.0);
+}
+
+// Phase 2 of the mature micro-view transaction.  A candidate may replace its
+// published endpoint only when another endpoint of the same physical
+// zero-crossing was staged in this exact accepted-depth dispatch.  Opposite
+// candidate signs retain/move the crossing.  If the published pair currently
+// crosses zero, two clear same-sign candidates may instead extinguish it.
+// This symmetric deletion path prevents a stale surface patch from shrinking
+// forever without disappearing.  This pass marks only the current voxel's
+// claim; it never writes the partner.
+[numthreads(64, 1, 1)]
+void EvaluateInfiniTamEdgeCoherence(uint id : SV_DispatchThreadID)
+{
+    if (id >= gsFrustumVolumeCount) return;
+
+    float3 localPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
+    float3 worldPos = mul(gsDepthViewInv[GS_FUSION_EYE],
+                          float4(localPos, 1.0)).xyz;
+    uint3 coord = gsWorldToVoxel(worldPos);
+    if (any(coord >= gsVoxCount)) return;
+
+    uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
+    uint claim = _InfiniTamWriteEpochs[flat];
+    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
+    if (InfiniTamClaimEpoch(claim) != frameEpoch ||
+        (claim & kInfiniTamCandidateStaged) == 0u)
+        return;
+
+    float candidate = gsInfiniTamMicroViewMeanRW[coord];
+    float2 currentSample = gsVolumeRW[coord];
+    int3 center = (int3)coord;
+
+    bool coherentPartner = false;
+    [unroll]
+    for (uint axisSide = 0u; axisSide < 6u; axisSide++)
+    {
+        int3 offset = int3(0, 0, 0);
+        if (axisSide == 0u) offset.x = -1;
+        else if (axisSide == 1u) offset.x = 1;
+        else if (axisSide == 2u) offset.y = -1;
+        else if (axisSide == 3u) offset.y = 1;
+        else if (axisSide == 4u) offset.z = -1;
+        else offset.z = 1;
+        int3 neighbourSigned = center + offset;
+        if (any(neighbourSigned < int3(0, 0, 0)) ||
+            any(neighbourSigned >= (int3)gsVoxCount))
+            continue;
+
+        uint3 neighbour = (uint3)neighbourSigned;
+        uint neighbourFlat = neighbour.x + gsVoxCount.x *
+            (neighbour.y + gsVoxCount.y * neighbour.z);
+        uint neighbourClaim = _InfiniTamWriteEpochs[neighbourFlat];
+        if (InfiniTamClaimEpoch(neighbourClaim) != frameEpoch ||
+            (neighbourClaim & kInfiniTamCandidateStaged) == 0u)
+            continue;
+
+        float neighbourCandidate =
+            gsInfiniTamMicroViewMeanRW[neighbour];
+        bool candidateCrossing =
+            (candidate <= 0.0 && neighbourCandidate >= 0.0) ||
+            (candidate >= 0.0 && neighbourCandidate <= 0.0);
+
+        // Deletion is deliberately stricter than movement: both published
+        // endpoints must already be observed and form a real crossing, both
+        // replacement candidates must come from this dispatch, and both must
+        // land clearly on the same side.  The small dead band avoids erasing a
+        // surface merely because quantized candidates hover around zero.
+        float2 neighbourCurrentSample = gsVolumeRW[neighbour];
+        bool publishedCrossing =
+            currentSample.y > 0.0 && neighbourCurrentSample.y > 0.0 &&
+            ((currentSample.x <= 0.0 && neighbourCurrentSample.x >= 0.0) ||
+             (currentSample.x >= 0.0 && neighbourCurrentSample.x <= 0.0));
+        const float extinctionSignMargin = 2.0 / 127.0;
+        bool coherentExtinction = publishedCrossing &&
+            ((candidate > extinctionSignMargin &&
+              neighbourCandidate > extinctionSignMargin) ||
+             (candidate < -extinctionSignMargin &&
+              neighbourCandidate < -extinctionSignMargin));
+
+        if (candidateCrossing || coherentExtinction)
+        {
+            coherentPartner = true;
+            break;
+        }
+    }
+
+    if (coherentPartner)
+    {
+        uint previousStatus;
+        InterlockedOr(_InfiniTamWriteEpochs[flat],
+                      kInfiniTamCandidateApproved, previousStatus);
+        if ((previousStatus & kInfiniTamCandidateApproved) == 0u)
+            InterlockedAdd(_CarveStats[204], 1u);
+    }
+}
+
+// Phase 3. Duplicate camera-lattice aliases may map back to the same voxel;
+// the compare/exchange consumes approval exactly once.  The retained history
+// is changed only for this voxel, and dirty publication is raised only after
+// the coherent transaction has actually committed.
+[numthreads(64, 1, 1)]
+void CommitInfiniTamEdgeCoherence(uint id : SV_DispatchThreadID)
+{
+    if (id >= gsFrustumVolumeCount) return;
+
+    float3 localPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
+    float3 worldPos = mul(gsDepthViewInv[GS_FUSION_EYE],
+                          float4(localPos, 1.0)).xyz;
+    uint3 coord = gsWorldToVoxel(worldPos);
+    if (any(coord >= gsVoxCount)) return;
+
+    uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
+    uint claim = _InfiniTamWriteEpochs[flat];
+    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
+    uint required = kInfiniTamCandidateStaged | kInfiniTamCandidateApproved;
+    if (InfiniTamClaimEpoch(claim) != frameEpoch ||
+        (claim & required) != required)
+        return;
+
+    uint consumedClaim = claim & ~required;
+    uint originalClaim;
+    InterlockedCompareExchange(_InfiniTamWriteEpochs[flat], claim,
+                               consumedClaim, originalClaim);
+    if (originalClaim != claim) return;
+    InterlockedAdd(_CarveStats[205], 1u);
+
+    float integrationObservedTsdf = gsInfiniTamMicroViewMeanRW[coord];
+    float2 previous = gsVolumeRW[coord];
+    float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
+    if (previousVoteWeight <= 0.0) return;
+
+    float previousAccumulatedTsdf = gsInfiniTamAccumulatedTsdfRW[coord];
+    float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
+    float accumulatedVoteWeight = previousVoteWeight + 1.0;
+    float reconstructedTsdf =
+        (previousAccumulatedTsdf * previousVoteWeight +
+         integrationObservedTsdf) / max(accumulatedVoteWeight, 1e-5);
+    float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
+    float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
+    float2 reconstructed = float2(
+        QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility);
+
+    RecordTsdfGeometryMutation(coord, previous, reconstructed, 2u, 0u);
+    gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
+    gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
+    gsVolumeRW[coord] = reconstructed;
+    MarkInfiniTamDirtyChunk(coord, previous, reconstructed);
+
+    if (gsInfiniTamTicketEnabled > 0.5 && abs(integrationObservedTsdf) <= 0.5)
+    {
+        if (previousVoteWeight < maxVoteWeight - 0.5)
+            InterlockedAdd(_InfiniTamTicketStats[1], 1u);
+        else
+            InterlockedAdd(_InfiniTamTicketStats[2], 1u);
+        InterlockedAdd(_InfiniTamTicketStats[3],
+                       (uint)round(reconstructedVoteWeight));
+    }
+
+    if (gsWriteColor > 0.5 && abs(integrationObservedTsdf) <= 1.0)
+        gsColorVolumeRW[coord] = float4(1.0, 1.0, 1.0, 1.0);
+}
+
+#pragma kernel IntegrateQrsReference
+
+// QRS reference lane.  This is intentionally kept as a small, self-contained
+// copy of the original QRS integration decision so later ScanCover rules cannot
+// silently leak into the reference baseline.  QRS used eye 0 consistently for
+// its frustum, fusion projection and jump-flood dilation.
+static const int QRS_REFERENCE_EYE = 0;
+[numthreads(64, 1, 1)]
+void IntegrateQrsReference(uint id : SV_DispatchThreadID)
+{
+    float3 vLocalPos = gsFrustumVolume[id];
+    float3 vWorldPos = mul(gsDepthViewInv[QRS_REFERENCE_EYE], float4(vLocalPos, 1)).xyz;
+    uint3 coord = gsWorldToVoxel(vWorldPos);
+    float3 voxPos = gsVoxelToWorld(coord);
+
+    float3 eyePos = gsDepthEyePos(QRS_REFERENCE_EYE);
+    float3 eyeToVox = voxPos - eyePos;
+    float voxEyeDist = length(eyeToVox);
+
+    float3 voxView = mul(gsDepthView[QRS_REFERENCE_EYE], float4(voxPos, 1)).xyz;
+    if (voxView.z > -0.05) return;
+
+    float3 voxNDC = gsDepthWorldToNDC(voxPos, QRS_REFERENCE_EYE);
+    if (voxNDC.x < 0.01 || voxNDC.x > 0.99 ||
+        voxNDC.y < 0.01 || voxNDC.y > 0.99)
+        return;
+
+    float depthNDC = gsDepthSample(voxNDC.xy, QRS_REFERENCE_EYE);
+    float3 depthNorm = gsDepthNormalSample(voxNDC.xy, QRS_REFERENCE_EYE).xyz;
+    float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC),
+                                       QRS_REFERENCE_EYE);
+
+    float3 eyeToDepth = depthPos - eyePos;
+    float depthEyeDist = length(eyeToDepth);
+    float normDot = -dot(eyeToVox, depthNorm) / voxEyeDist;
+
+    float sDist = depthEyeDist - voxEyeDist;
+    sDist *= saturate(normDot);
+
+    bool empty = sDist >= 1.0;
+    float sDistNorm = min(sDist / gsVoxDist, 1.0);
+    bool withinBand = sDistNorm >= -gsVoxMin / gsVoxSize;
+
+    float dilatedDepthNDC = gsSampleDilatedDepth(voxNDC.xy);
+    float dilatedDepthLinear = gsDepthNDCToLinear(dilatedDepthNDC, QRS_REFERENCE_EYE);
+    float depthLinear = gsDepthNDCToLinear(depthNDC, QRS_REFERENCE_EYE);
+    bool acceptableDepthDisparity =
+        depthLinear < dilatedDepthLinear + gsDepthDispThresh;
+    bool unoccludedByDilation =
+        abs(voxView.z) < dilatedDepthLinear || acceptableDepthDisparity;
+    bool validSurfaceNormal = empty || normDot > MIN_DOT;
+
+    bool outsideExclusions = true;
+    for (int p = 0; p < gsNumExclusions; p++)
+    {
+        float3 exclusionHead = gsExclusionHeads[p];
+        float2 diff = vWorldPos.xz - exclusionHead.xz;
+        // Original QRS body cylinder: radius 0.6 m, +0.25/-1.7 m.
+        if (dot(diff, diff) < 0.36 &&
+            vWorldPos.y < exclusionHead.y + 0.25 &&
+            vWorldPos.y > exclusionHead.y - 1.7)
+            outsideExclusions = false;
+    }
+
+    bool valid = withinBand & outsideExclusions &
+                 validSurfaceNormal & unoccludedByDilation;
+    if (!valid) return;
+
+    float distFactor = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
+    float angleFactor = saturate(normDot);
+    float quality = distFactor * angleFactor;
+    float q2 = quality * quality;
+
+    float2 old = gsVolumeRW[coord];
+    if (old.y < 0) return;
+    float oldVal = old.x;
+    float weight = max(old.y, 0.0);
+    bool wasEmpty = weight < 0.001;
+
+    if (wasEmpty)
+    {
+        if (quality >= MIN_QUALITY_SEED)
+        {
+            gsVolumeRW[coord] = float2(sDistNorm, 0.10);
+            if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
+            {
+                float2 uv = ProjectToCameraUV(voxPos);
+                if (uv.x > 0.02 && uv.x < 0.98 &&
+                    uv.y > 0.02 && uv.y < 0.98)
+                {
+                    float4 camColor =
+                        gsCamRGB.SampleLevel(gsBilinearClampSampler, uv, 0);
+                    float3 boosted = saturate(camColor.rgb * gsCamExposure);
+                    gsColorVolumeRW[coord] =
+                        float4(boosted, quality * 0.1);
+                }
+            }
+        }
+        return;
+    }
+
+    float blend = q2 * gsBlendRate / (1.0 + weight * gsStability);
+    blend = clamp(blend, 0.0, 0.7);
+    if (blend < 0.005) return;
+
+    float newTsdf = lerp(oldVal, sDistNorm, blend);
+    float newWeight = min(weight + q2 * gsWeightGrowth, gsMaxWeight);
+    gsVolumeRW[coord] = float2(newTsdf, newWeight);
+
+    if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
+    {
+        float2 uv = ProjectToCameraUV(voxPos);
+        if (uv.x > 0.02 && uv.x < 0.98 && uv.y > 0.02 && uv.y < 0.98)
+        {
+            float4 camColor = gsCamRGB.SampleLevel(gsBilinearClampSampler, uv, 0);
+            float3 boosted = saturate(camColor.rgb * gsCamExposure);
+            float4 oldColor = gsColorVolumeRW[coord];
+            float colorBlend = quality * 0.3;
+            float3 rgb = oldColor.a < 0.01
+                ? boosted : lerp(oldColor.rgb, boosted, colorBlend);
+            float newAlpha = min(oldColor.a + quality * 0.05, 1.0);
+            gsColorVolumeRW[coord] = float4(rgb, newAlpha);
+        }
+    }
 }
 
 #pragma kernel Integrate

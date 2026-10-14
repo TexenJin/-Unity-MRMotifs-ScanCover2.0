@@ -24,17 +24,17 @@ namespace Genesis.RoomScan
         [SerializeField] private ComputeShader compute;
 
         [Header("Volume")]
-        [SerializeField] private int3 voxelCount = new(96, 64, 96);
-        [SerializeField] private float voxelSize = 0.10f;
-        [SerializeField] private float voxelDistance = 0.20f;
+        [SerializeField] private int3 voxelCount = new(256, 256, 256);
+        [SerializeField] private float voxelSize = 0.05f;
+        [SerializeField] private float voxelDistance = 0.15f;
         [SerializeField] private float voxelMin = 0.1f;
 
         [Header("Integration")]
         [SerializeField] private float depthDisparityThreshold = 0.5f;
         [SerializeField, Range(1f, 4f), Tooltip("生产TSDF的最远观测距离（米）。3.5米外保留既有体积数据，但不再从当前深度帧写入或制造脏块。")]
-        private float maxUpdateDist = 3.5f;
+        private float maxUpdateDist = 5f;
         [Tooltip("最近更新距离：视锥内距相机小于此值的体素不积分。原 0.5m 会在头周留下覆盖空洞，0.15 贴脸也覆盖（近距深度噪声大，如出现贴脸飞面可调回 0.3）")]
-        [SerializeField] private float minUpdateDist = 0.15f;
+        [SerializeField] private float minUpdateDist = 0.5f;
         [Tooltip("头部排除区半径（仅 StandaloneRoomScanner 开启排除区时生效）。0.6 = QRS 原版（防手入网但头周覆盖空洞大），0.35 = 折中")]
         [SerializeField, Range(0.1f, 1f)] private float exclusionRadius = 0.35f;
         [SerializeField] private int maxFrustumPositions = 1000000;
@@ -90,8 +90,8 @@ namespace Genesis.RoomScan
         [Tooltip("近距采样闸：测量距离 < minUpdateDist 的深度样本整票作废（挡胸口/手臂近距观测对身前幽灵的反向加固），与视锥体素闸语义对齐。 (default true)")]
         [SerializeField] private bool rejectNearSamples = true;
         [Tooltip("膨胀闸不对称：被近表面膨胀足迹罩住的体素只拦写（播种/增长）不拦抹——当帧原始深度确实看穿时矛盾扣减绕行。" +
-                 "治缝隙区（柜边↔侧墙）幽灵一旦种入永不收反对票、假桥只长不消。关=恢复遮挡闸双向封锁。 (default true)")]
-        [SerializeField] private bool carveBypassDilation = true;
+                 "治缝隙区（柜边↔侧墙）幽灵一旦种入永不收反对票、假桥只长不消。关=恢复遮挡闸双向封锁。 (default false，窄墙护栏单变量验证)")]
+        [SerializeField] private bool carveBypassDilation = false;
         [Tooltip("法线闸不对称：掠射观测只拦写不拦抹——'射线沿途为空'的证据与表面朝向无关。" +
                  "治斜视时矛盾票被法线闸全拦（普查法拦暴涨）、桥只有正视能消。此通道用 carveBypassMargin 强裕量防误抹真面。 (default true)")]
         [SerializeField] private bool carveBypassNormal = true;
@@ -196,6 +196,10 @@ namespace Genesis.RoomScan
         [Tooltip("Only changes inside this normalized zero-crossing band can dirty an already observed surface.")]
         [SerializeField, Range(0.25f, 1f)] private float dirtySurfaceBand = 1f;
 
+        [Header("QRS reference production baseline")]
+        [SerializeField, Tooltip("唯一生产主链：QRS 5 cm 全局体、原始质量准入、QRS Surface Nets、一次 HC 平滑与时序顶点稳定。开启时旧 InfiniTAM、GunGel、分块发布、局部 5 cm 与产品化网格全部退为不运行。")]
+        private bool enableQrsReferenceBaseline = true;
+
         [Header("InfiniTAM architecture baseline")]
         [SerializeField, Tooltip("独立 InfiniTAM V1.3 行为基线：Quest 世界位姿下直接写入唯一 raw-projective TSDF；模型 raycast 与残差只读旁证。GunGel、裁判、种面标尺、冻结和制品链全部旁路。")]
         private bool enableInfiniTamBaseline = true;
@@ -203,6 +207,8 @@ namespace Genesis.RoomScan
         private bool enableCompactInfiniTamHistory = true;
         [SerializeField, Tooltip("临时 A/B：强反证仍按两个独立视角触发 16→5；小于半体素的普通变化按视角收集私有均值。新视角可发布上一桶；同一视角需四份方向一致、低波动证据才单次发布，随后冷却并重新取证。")]
         private bool enableInfiniTamSelectiveHistoryRelease = true;
+        [SerializeField, Tooltip("实验：成熟零面的小幅视角桶结果先暂存；同一融合批中相邻端点的候选仍异号时可成对移动零面，若已有零交叉的两端同时变成明确同号，则允许成对消亡。只协调发布，不平滑、不改拓扑、不允许体素互写邻居。")]
+        private bool enableInfiniTamEdgeCoherentPublication = true;
         // 16/2/5 A/B: ordinary surfaces retain a compact 16-vote history.
         // Two reliable, same-direction contradictions from independent observer
         // positions release only that voxel's retained history to five votes.
@@ -283,7 +289,8 @@ namespace Genesis.RoomScan
         private RenderTexture _infiniTamAccumulatedTsdfVolume;
         // Per-world-voxel frame ownership for compact InfiniTAM. Camera-local
         // frustum samples can alias after rotation/snapping. The GPU packs a
-        // 24-bit epoch plus the first accepted TSDF sample into this claim so
+        // 22-bit epoch, two frame-local edge transaction bits, and the first
+        // accepted TSDF sample are packed into this claim so
         // the read-only ledger can classify duplicate aliases without changing
         // the one-frame/one-vote production decision.
         private ComputeBuffer _infiniTamWriteEpochs;
@@ -300,8 +307,11 @@ namespace Genesis.RoomScan
 
         /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
+        /// <summary>QRS 参考融合/提面是否独占生产路径。</summary>
+        public bool QrsReferenceBaselineEnabled => enableQrsReferenceBaseline;
         /// <summary>互斥的 InfiniTAM 风格第一版基线是否拥有生产融合与提面路径。</summary>
-        public bool InfiniTamBaselineEnabled => enableInfiniTamBaseline;
+        public bool InfiniTamBaselineEnabled => !enableQrsReferenceBaseline &&
+                                                enableInfiniTamBaseline;
         /// <summary>
         /// V1.3 publishes after the sole TSDF has received its first real
         /// observation. The dormant V1.6+ experiment retains its old tracked
@@ -439,6 +449,8 @@ namespace Genesis.RoomScan
             Shader.PropertyToID("gsInfiniTamSameViewSlowConfirmations");
         private static readonly int InfiniTamSelectiveHistoryReleaseID =
             Shader.PropertyToID("gsInfiniTamSelectiveHistoryRelease");
+        private static readonly int InfiniTamEdgeCoherentPublicationID =
+            Shader.PropertyToID("gsInfiniTamEdgeCoherentPublication");
         private static readonly int InfiniTamVoteWeightRWID =
             Shader.PropertyToID("gsInfiniTamVoteWeightRW");
         private static readonly int InfiniTamAccumulatedTsdfRWID =
@@ -523,7 +535,19 @@ namespace Genesis.RoomScan
         private ComputeKernelHelper _clearInfiniTamVotesKernel;
         private ComputeKernelHelper _invalidateGunGelSuccessionsKernel;
         private ComputeKernelHelper _integrateKernel;
+        private ComputeKernelHelper _evaluateInfiniTamEdgeCoherenceKernel;
+        private ComputeKernelHelper _commitInfiniTamEdgeCoherenceKernel;
+        private bool _hasInfiniTamEdgeCoherenceKernels;
         private ComputeKernelHelper _pruneKernel;
+        // QRS uses its own original fusion program instead of a kernel copied
+        // into ScanCover's shared VolumeIntegration.compute.  Keeping these
+        // helpers separate prevents later ScanCover globals/helpers from
+        // changing the reference baseline without touching the QRS source.
+        private ComputeShader _qrsReferenceVolumeIntegrationCompute;
+        private ComputeKernelHelper _qrsReferenceClearKernel;
+        private ComputeKernelHelper _qrsReferenceIntegrateKernel;
+        private ComputeKernelHelper _qrsReferencePruneKernel;
+        private bool _qrsReferenceKernelsReady;
         private ComputeKernelHelper _freezeKernel;
         private ComputeKernelHelper _unfreezeKernel;
         private ComputeKernelHelper _applyFreezeMaskKernel;
@@ -621,7 +645,7 @@ namespace Genesis.RoomScan
         // 68..70: provisional seeds, promotions and formal-surface demotions.
         // 71..89: read-only lifecycle forensics: seed source/risk, promotion
         // mechanism, promotion-time risk and immutable birth source.
-        private const int CarveStatsCount = 203; // 199..202=InfiniTAM 同帧体素票侦察账（只读）
+        private const int CarveStatsCount = 206; // 199..202=同帧票；203..205=零交叉一致发布 staged/approved/committed
         private static readonly uint[] ZeroCarveStats = new uint[CarveStatsCount];
         /// <summary>最近一个统计周期的矛盾票计数：0票投出 1排除区拦 2法线闸拦 3遮挡闸拦 4带外拦 5排内抹（不对称放行实际扣减）。</summary>
         public readonly uint[] LastCarveStats = new uint[CarveStatsCount];
@@ -1053,7 +1077,8 @@ namespace Genesis.RoomScan
             string reason, string destinationDirectory, Action<string> completed)
         {
             string failure = string.Empty;
-            var completedResources = new List<string>(3);
+            var completedResources = new List<string>(8);
+            byte[] tsdf = null;
             byte[] responsibilityBytes = null;
             byte[] supportBytes = null;
             try { Directory.CreateDirectory(destinationDirectory); }
@@ -1061,7 +1086,6 @@ namespace Genesis.RoomScan
 
             if (string.IsNullOrEmpty(failure))
             {
-                byte[] tsdf = null;
                 yield return ReadTextureSlabs(_volume, 2, "final_tsdf",
                     data => tsdf = data, error => failure = error);
                 if (string.IsNullOrEmpty(failure))
@@ -1119,6 +1143,7 @@ namespace Genesis.RoomScan
                 int3 capturedVoxelCount = voxelCount;
                 float capturedVoxelSize = voxelSize;
                 float capturedTruncationDistance = voxelDistance;
+                float capturedMinMeshWeight = minMeshWeight;
                 bool compactCrossFrameLedger = enableInfiniTamBaseline &&
                                                enableCompactInfiniTamHistory;
                 Task schemaTask = null;
@@ -1129,10 +1154,15 @@ namespace Genesis.RoomScan
                         WriteTsdfResponsibilitySchema(
                             reason, destinationDirectory, capturedVoxelCount,
                             capturedVoxelSize, capturedTruncationDistance,
-                            compactCrossFrameLedger);
+                            capturedMinMeshWeight, compactCrossFrameLedger);
                         WriteCrossFramePushPullSummary(destinationDirectory,
                             responsibilityBytes, supportBytes, capturedVoxelCount,
                             capturedTruncationDistance);
+                        WriteZeroCrossingEdgeResponsibilitySummary(
+                            destinationDirectory, tsdf, responsibilityBytes,
+                            supportBytes, capturedVoxelCount, capturedVoxelSize,
+                            capturedTruncationDistance, capturedMinMeshWeight,
+                            compactCrossFrameLedger);
                     });
                 }
                 catch (Exception e) { failure = "schema:request:" + e.Message; }
@@ -1149,6 +1179,8 @@ namespace Genesis.RoomScan
                         completedResources.Add("schema");
                         completedResources.Add("cross_frame_push_pull_summary");
                         completedResources.Add("cross_frame_push_pull_worst");
+                        completedResources.Add("zero_crossing_edge_responsibility_summary");
+                        completedResources.Add("zero_crossing_edge_responsibility_worst");
                     }
                 }
                 if (string.IsNullOrEmpty(failure))
@@ -1390,7 +1422,8 @@ namespace Genesis.RoomScan
         private static void WriteTsdfResponsibilitySchema(string reason,
             string destinationDirectory,
             int3 capturedVoxelCount, float capturedVoxelSize,
-            float capturedTruncationDistance, bool compactCrossFrameLedger)
+            float capturedTruncationDistance, float capturedMinMeshWeight,
+            bool compactCrossFrameLedger)
         {
             Directory.CreateDirectory(destinationDirectory);
             string schema = "{\n" +
@@ -1399,6 +1432,7 @@ namespace Genesis.RoomScan
                 "  \"voxelCount\": [" + capturedVoxelCount.x + "," + capturedVoxelCount.y + "," + capturedVoxelCount.z + "],\n" +
                 "  \"voxelSizeMetres\": " + capturedVoxelSize.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
                 "  \"truncationDistanceMetres\": " + capturedTruncationDistance.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
+                "  \"meshMinAbsoluteWeight\": " + capturedMinMeshWeight.ToString("R", CultureInfo.InvariantCulture) + ",\n" +
                 "  \"readback\": \"final TSDF uses single-Z texture requests; integer responsibility lanes use compute-to-structured-buffer staging per Z slice\",\n" +
                 "  \"checkpoint\": \"each completed resource is written immediately and listed in partial_status.json\",\n" +
                 "  \"indexOrder\": \"x-fastest, then y, then z\",\n" +
@@ -1413,7 +1447,8 @@ namespace Genesis.RoomScan
                 "  \"supportOperationCodes\": {\"1\":\"seed\",\"2\":\"positive_growth\",\"3\":\"carve\",\"4\":\"freeze\",\"5\":\"unfreeze\",\"6\":\"reset\"},\n" +
                 "  \"witnessReasonCodes\": {\"1\":\"gungel\",\"2\":\"exclusion\",\"3\":\"normal\",\"4\":\"dilation_occlusion\",\"5\":\"truncation_band\",\"6\":\"abstain_neighbour\",\"9\":\"raw_projective_gate\",\"10\":\"dilation_supply\",\"11\":\"fov_motion_authority\",\"12\":\"frozen\",\"13\":\"blend_quantized\",\"14\":\"mature_discount\",\"15\":\"near_distance\",\"16\":\"invalid_depth\",\"17\":\"seed_quality\",\"18\":\"motion_seed\",\"19\":\"behind_camera\",\"20\":\"outside_fov\",\"21\":\"accepted_cross_frame_observation_push\"},\n" +
                 "  \"join\": \"packed integration ids join runtime_timeline/integration_dispatches.csv integrationCount\",\n" +
-                "  \"crossFrameDerivedFiles\": \"cross_frame_push_pull_summary.json and cross_frame_push_pull_worst.csv; reason 21 is after same-frame aliases were removed\",\n" +
+                "  \"crossFrameDerivedFiles\": \"cross_frame_push_pull_summary.json and cross_frame_push_pull_worst.csv retain per-voxel history; zero_crossing_edge_responsibility_summary.json and zero_crossing_edge_responsibility_worst.csv join the two physical endpoints of each final observed zero crossing adjacent to compact-route cross-frame push history\",\n" +
+                "  \"edgeLedgerLimit\": \"endpoint push counters are lifetime aggregates; matching strongest current/prior ids is exact provenance coincidence, but aggregate counters alone do not prove that two endpoint pushes were simultaneous\",\n" +
                 "  \"authority\": \"diagnostic only; never sampled by production\"\n" +
                 "}\n";
             File.WriteAllText(Path.Combine(destinationDirectory, "schema.json"),
@@ -1519,6 +1554,420 @@ namespace Genesis.RoomScan
                 json, new UTF8Encoding(false));
         }
 
+        private struct ZeroCrossingEdgeResponsibilityRow
+        {
+            public int AIndex;
+            public int BIndex;
+            public int Axis;
+            public int AX;
+            public int AY;
+            public int AZ;
+            public int BX;
+            public int BY;
+            public int BZ;
+            public float ZeroT;
+            public float ZeroLocalX;
+            public float ZeroLocalY;
+            public float ZeroLocalZ;
+            public float ATsdf;
+            public float BTsdf;
+            public float AWeight;
+            public float BWeight;
+            public uint APositive;
+            public uint ANegative;
+            public uint BPositive;
+            public uint BNegative;
+            public uint ACurrent;
+            public uint APrior;
+            public uint BCurrent;
+            public uint BPrior;
+            public uint AReason;
+            public uint BReason;
+            public float ADelta;
+            public float BDelta;
+            public uint ALastGeometry;
+            public uint BLastGeometry;
+            public uint ALastOperation;
+            public uint BLastOperation;
+            public bool SameOrderedStrongestPair;
+
+            public uint ATotal => APositive + ANegative;
+            public uint BTotal => BPositive + BNegative;
+            public uint CombinedTotal => ATotal + BTotal;
+            public uint AOscillationFloor => Math.Min(APositive, ANegative);
+            public uint BOscillationFloor => Math.Min(BPositive, BNegative);
+            public uint CombinedOscillationFloor => AOscillationFloor + BOscillationFloor;
+            public uint JointEndpointPushFloor => Math.Min(ATotal, BTotal);
+        }
+
+        /// <summary>
+        /// Stop-time, read-only join from final TSDF zero crossings to the two
+        /// endpoint responsibility records.  It deliberately derives from the
+        /// already exported voxel ledgers instead of adding another runtime GPU
+        /// buffer or changing fusion/extraction behaviour.
+        /// </summary>
+        private static void WriteZeroCrossingEdgeResponsibilitySummary(
+            string directory, byte[] tsdf, byte[] responsibility, byte[] support,
+            int3 count, float voxelSize, float truncationDistance,
+            float minMeshWeight, bool compactCrossFrameLedger)
+        {
+            if (tsdf == null || responsibility == null || support == null) return;
+            int voxelTotal = count.x * count.y * count.z;
+            if (tsdf.Length < voxelTotal * 2 ||
+                responsibility.Length < voxelTotal * 8 ||
+                support.Length < voxelTotal * 4)
+                throw new InvalidDataException(
+                    "zero-crossing edge responsibility byte count mismatch");
+
+            const uint reasonCrossFrame = 21;
+            const int maxRows = 8192;
+            const string csvHeader =
+                "rank,axis,aX,aY,aZ,bX,bY,bZ,zeroT,zeroLocalXMetres,zeroLocalYMetres,zeroLocalZMetres," +
+                "aTsdfNormalized,bTsdfNormalized,aWeightNormalized,bWeightNormalized," +
+                "aPositivePushes,aNegativePushes,aOscillationFloor,aTotalPushes," +
+                "bPositivePushes,bNegativePushes,bOscillationFloor,bTotalPushes," +
+                "combinedOscillationFloor,jointEndpointPushFloor,combinedPushes," +
+                "endpointWithMoreAcceptedPushes,absoluteEndpointPushDifference," +
+                "aStrongestCurrentIntegration,aStrongestPriorIntegration,aWitnessReason,aStrongestDirection,aStrongestDeltaNormalized,aStrongestDeltaMetres," +
+                "bStrongestCurrentIntegration,bStrongestPriorIntegration,bWitnessReason,bStrongestDirection,bStrongestDeltaNormalized,bStrongestDeltaMetres," +
+                "sameOrderedStrongestPair,responsibilityClass,aLastGeometryIntegration,aLastOperation,bLastGeometryIntegration,bLastOperation";
+            if (!compactCrossFrameLedger)
+            {
+                File.WriteAllText(Path.Combine(directory,
+                        "zero_crossing_edge_responsibility_worst.csv"),
+                    csvHeader + "\n", new UTF8Encoding(false));
+                File.WriteAllText(Path.Combine(directory,
+                        "zero_crossing_edge_responsibility_summary.json"),
+                    "{\n" +
+                    "  \"schema\": \"scancover.zero_crossing_edge_responsibility.v1\",\n" +
+                    "  \"available\": false,\n" +
+                    "  \"issue\": \"support responsibility lane is not using compact cross-frame push-count layout\",\n" +
+                    "  \"authority\": \"read-only; never sampled by production\"\n" +
+                    "}\n", new UTF8Encoding(false));
+                return;
+            }
+            int incidentEdgesChecked = 0;
+            int finalObservedCrossings = 0;
+            int bothEndpointHistory = 0;
+            int bothEndpointOscillating = 0;
+            int sameOrderedPair = 0;
+            int sameStrongestDirection = 0;
+            int opposingStrongestDirection = 0;
+            int aOnly = 0;
+            int bOnly = 0;
+            int aMorePushes = 0;
+            int bMorePushes = 0;
+            int equalPushes = 0;
+            var rows = new List<ZeroCrossingEdgeResponsibilityRow>(maxRows * 2);
+
+            int slice = count.x * count.y;
+            int[] dx = { -1, 1, 0, 0, 0, 0 };
+            int[] dy = { 0, 0, -1, 1, 0, 0 };
+            int[] dz = { 0, 0, 0, 0, -1, 1 };
+            for (int i = 0; i < voxelTotal; i++)
+            {
+                uint supportI = ReadUInt32LittleEndian(support, i * 4);
+                uint iPositive = (supportI >> 12) & 0x3ffu;
+                uint iNegative = (supportI >> 22) & 0x3ffu;
+                if (iPositive + iNegative == 0) continue;
+
+                int ix = i % count.x;
+                int iyz = i / count.x;
+                int iy = iyz % count.y;
+                int iz = iyz / count.y;
+                for (int direction = 0; direction < 6; direction++)
+                {
+                    int nx = ix + dx[direction];
+                    int ny = iy + dy[direction];
+                    int nz = iz + dz[direction];
+                    if (nx < 0 || ny < 0 || nz < 0 ||
+                        nx >= count.x || ny >= count.y || nz >= count.z)
+                        continue;
+                    int neighbour = nx + ny * count.x + nz * slice;
+                    uint supportN = ReadUInt32LittleEndian(support, neighbour * 4);
+                    bool neighbourHasPushHistory =
+                        (((supportN >> 12) & 0x3ffu) +
+                         ((supportN >> 22) & 0x3ffu)) > 0;
+                    // If both endpoints have history, the lower flat index owns
+                    // the physical edge. If only one has history, that endpoint
+                    // owns it. This deduplicates without a volume-sized side map.
+                    if (neighbourHasPushHistory && i > neighbour) continue;
+
+                    int a = Math.Min(i, neighbour);
+                    int b = Math.Max(i, neighbour);
+                    int axis = nx != ix ? 0 : (ny != iy ? 1 : 2);
+                    incidentEdgesChecked++;
+                    if (!TryBuildZeroCrossingEdgeResponsibilityRow(
+                            a, b, axis, count, voxelSize, minMeshWeight,
+                            tsdf, responsibility, support, out var row))
+                        continue;
+
+                    finalObservedCrossings++;
+                    bool aHasHistory = row.ATotal > 0;
+                    bool bHasHistory = row.BTotal > 0;
+                    if (aHasHistory && bHasHistory) bothEndpointHistory++;
+                    else if (aHasHistory) aOnly++;
+                    else if (bHasHistory) bOnly++;
+                    if (row.ATotal > row.BTotal) aMorePushes++;
+                    else if (row.BTotal > row.ATotal) bMorePushes++;
+                    else equalPushes++;
+                    if (row.AOscillationFloor > 0 && row.BOscillationFloor > 0)
+                        bothEndpointOscillating++;
+                    if (row.SameOrderedStrongestPair) sameOrderedPair++;
+                    if (row.AReason == reasonCrossFrame &&
+                        row.BReason == reasonCrossFrame)
+                    {
+                        if ((row.ADelta < 0f) == (row.BDelta < 0f))
+                            sameStrongestDirection++;
+                        else
+                            opposingStrongestDirection++;
+                    }
+
+                    rows.Add(row);
+                    if (rows.Count >= maxRows * 2)
+                    {
+                        rows.Sort(CompareZeroCrossingEdgeResponsibilityRows);
+                        rows.RemoveRange(maxRows, rows.Count - maxRows);
+                    }
+                }
+            }
+
+            rows.Sort(CompareZeroCrossingEdgeResponsibilityRows);
+            if (rows.Count > maxRows)
+                rows.RemoveRange(maxRows, rows.Count - maxRows);
+
+            var csv = new StringBuilder(Math.Max(1024, rows.Count * 384));
+            csv.AppendLine(csvHeader);
+            for (int i = 0; i < rows.Count; i++)
+            {
+                ZeroCrossingEdgeResponsibilityRow row = rows[i];
+                csv.Append(i + 1).Append(',')
+                    .Append(AxisName(row.Axis)).Append(',')
+                    .Append(row.AX).Append(',').Append(row.AY).Append(',').Append(row.AZ).Append(',')
+                    .Append(row.BX).Append(',').Append(row.BY).Append(',').Append(row.BZ).Append(',')
+                    .Append(FormatFloat(row.ZeroT)).Append(',')
+                    .Append(FormatFloat(row.ZeroLocalX)).Append(',')
+                    .Append(FormatFloat(row.ZeroLocalY)).Append(',')
+                    .Append(FormatFloat(row.ZeroLocalZ)).Append(',')
+                    .Append(FormatFloat(row.ATsdf)).Append(',')
+                    .Append(FormatFloat(row.BTsdf)).Append(',')
+                    .Append(FormatFloat(row.AWeight)).Append(',')
+                    .Append(FormatFloat(row.BWeight)).Append(',')
+                    .Append(row.APositive).Append(',').Append(row.ANegative).Append(',')
+                    .Append(row.AOscillationFloor).Append(',').Append(row.ATotal).Append(',')
+                    .Append(row.BPositive).Append(',').Append(row.BNegative).Append(',')
+                    .Append(row.BOscillationFloor).Append(',').Append(row.BTotal).Append(',')
+                    .Append(row.CombinedOscillationFloor).Append(',')
+                    .Append(row.JointEndpointPushFloor).Append(',')
+                    .Append(row.CombinedTotal).Append(',')
+                    .Append(EndpointWithMorePushes(row)).Append(',')
+                    .Append(AbsoluteEndpointPushDifference(row)).Append(',')
+                    .Append(row.ACurrent).Append(',').Append(row.APrior).Append(',')
+                    .Append(row.AReason).Append(',').Append(DeltaDirection(row.AReason, row.ADelta)).Append(',')
+                    .Append(FormatFloat(row.ADelta)).Append(',')
+                    .Append(FormatFloat(row.ADelta * truncationDistance)).Append(',')
+                    .Append(row.BCurrent).Append(',').Append(row.BPrior).Append(',')
+                    .Append(row.BReason).Append(',').Append(DeltaDirection(row.BReason, row.BDelta)).Append(',')
+                    .Append(FormatFloat(row.BDelta)).Append(',')
+                    .Append(FormatFloat(row.BDelta * truncationDistance)).Append(',')
+                    .Append(row.SameOrderedStrongestPair ? "true" : "false").Append(',')
+                    .Append(ResponsibilityClass(row)).Append(',')
+                    .Append(row.ALastGeometry).Append(',').Append(row.ALastOperation).Append(',')
+                    .Append(row.BLastGeometry).Append(',').Append(row.BLastOperation).AppendLine();
+            }
+            File.WriteAllText(Path.Combine(directory,
+                    "zero_crossing_edge_responsibility_worst.csv"),
+                csv.ToString(), new UTF8Encoding(false));
+
+            string json = "{\n" +
+                "  \"schema\": \"scancover.zero_crossing_edge_responsibility.v1\",\n" +
+                "  \"available\": true,\n" +
+                "  \"authority\": \"read-only stop-time join of final observed TSDF zero crossings and accepted per-voxel cross-frame responsibility; never sampled by production\",\n" +
+                "  \"edgeIdentity\": \"canonical lower flat-index endpoint plus x/y/z axis; coordinates are volume-local\",\n" +
+                "  \"ranking\": \"same ordered strongest current/prior pair first, then combined oscillation floor, joint endpoint push floor, combined accepted pushes, and canonical edge identity\",\n" +
+                "  \"limitation\": \"positive/negative push counts are lifetime aggregates and do not prove simultaneous endpoint motion; sameOrderedStrongestPair only proves that both endpoint records name the same strongest current/prior integration ids\",\n" +
+                "  \"incidentEdgesChecked\": " + incidentEdgesChecked + ",\n" +
+                "  \"finalObservedZeroCrossingEdges\": " + finalObservedCrossings + ",\n" +
+                "  \"bothEndpointsHavePushHistory\": " + bothEndpointHistory + ",\n" +
+                "  \"bothEndpointsOscillating\": " + bothEndpointOscillating + ",\n" +
+                "  \"sameOrderedStrongestPairEdges\": " + sameOrderedPair + ",\n" +
+                "  \"sameStrongestDirectionEdges\": " + sameStrongestDirection + ",\n" +
+                "  \"opposingStrongestDirectionEdges\": " + opposingStrongestDirection + ",\n" +
+                "  \"aOnlyPushHistoryEdges\": " + aOnly + ",\n" +
+                "  \"bOnlyPushHistoryEdges\": " + bOnly + ",\n" +
+                "  \"aEndpointHasMoreAcceptedPushes\": " + aMorePushes + ",\n" +
+                "  \"bEndpointHasMoreAcceptedPushes\": " + bMorePushes + ",\n" +
+                "  \"endpointsHaveEqualAcceptedPushes\": " + equalPushes + ",\n" +
+                "  \"csvRows\": " + rows.Count + ",\n" +
+                "  \"csvRowLimit\": " + maxRows + ",\n" +
+                "  \"sourceFrameJoin\": \"endpoint strongestCurrentIntegration/strongestPriorIntegration -> runtime_timeline/integration_dispatches.csv integrationCount\"\n" +
+                "}\n";
+            File.WriteAllText(Path.Combine(directory,
+                    "zero_crossing_edge_responsibility_summary.json"),
+                json, new UTF8Encoding(false));
+        }
+
+        private static bool TryBuildZeroCrossingEdgeResponsibilityRow(
+            int a, int b, int axis, int3 count, float voxelSize,
+            float minMeshWeight, byte[] tsdf, byte[] responsibility, byte[] support,
+            out ZeroCrossingEdgeResponsibilityRow row)
+        {
+            row = default;
+            float aWeight = ReadSNorm8(tsdf[a * 2 + 1]);
+            float bWeight = ReadSNorm8(tsdf[b * 2 + 1]);
+            if (Math.Abs(aWeight) < minMeshWeight ||
+                Math.Abs(bWeight) < minMeshWeight)
+                return false;
+            float aTsdf = ReadSNorm8(tsdf[a * 2]);
+            float bTsdf = ReadSNorm8(tsdf[b * 2]);
+            if ((aTsdf < 0f) == (bTsdf < 0f)) return false;
+            float denominator = aTsdf - bTsdf;
+            if (Math.Abs(denominator) < 1e-7f) return false;
+            float zeroT = Math.Max(0f, Math.Min(1f, aTsdf / denominator));
+
+            int ax = a % count.x;
+            int ayz = a / count.x;
+            int ay = ayz % count.y;
+            int az = ayz / count.y;
+            int bx = b % count.x;
+            int byz = b / count.x;
+            int by = byz % count.y;
+            int bz = byz / count.y;
+            float zeroX = ax + (bx - ax) * zeroT;
+            float zeroY = ay + (by - ay) * zeroT;
+            float zeroZ = az + (bz - az) * zeroT;
+
+            uint aLaneX = ReadUInt32LittleEndian(responsibility, a * 8);
+            uint aLaneY = ReadUInt32LittleEndian(responsibility, a * 8 + 4);
+            uint bLaneX = ReadUInt32LittleEndian(responsibility, b * 8);
+            uint bLaneY = ReadUInt32LittleEndian(responsibility, b * 8 + 4);
+            uint aSupport = ReadUInt32LittleEndian(support, a * 4);
+            uint bSupport = ReadUInt32LittleEndian(support, b * 4);
+            uint aReason = (aLaneY >> 12) & 0x1fu;
+            uint bReason = (bLaneY >> 12) & 0x1fu;
+            uint aCurrent = aLaneY & 0xfffu;
+            uint bCurrent = bLaneY & 0xfffu;
+            uint aPrior = aSupport & 0xfffu;
+            uint bPrior = bSupport & 0xfffu;
+
+            row = new ZeroCrossingEdgeResponsibilityRow
+            {
+                AIndex = a,
+                BIndex = b,
+                Axis = axis,
+                AX = ax,
+                AY = ay,
+                AZ = az,
+                BX = bx,
+                BY = by,
+                BZ = bz,
+                ZeroT = zeroT,
+                ZeroLocalX = (zeroX + 0.5f - count.x * 0.5f) * voxelSize,
+                ZeroLocalY = (zeroY + 0.5f - count.y * 0.5f) * voxelSize,
+                ZeroLocalZ = (zeroZ + 0.5f - count.z * 0.5f) * voxelSize,
+                ATsdf = aTsdf,
+                BTsdf = bTsdf,
+                AWeight = aWeight,
+                BWeight = bWeight,
+                APositive = (aSupport >> 12) & 0x3ffu,
+                ANegative = (aSupport >> 22) & 0x3ffu,
+                BPositive = (bSupport >> 12) & 0x3ffu,
+                BNegative = (bSupport >> 22) & 0x3ffu,
+                ACurrent = aCurrent,
+                APrior = aPrior,
+                BCurrent = bCurrent,
+                BPrior = bPrior,
+                AReason = aReason,
+                BReason = bReason,
+                ADelta = DecodeResponsibilityDelta(aLaneY),
+                BDelta = DecodeResponsibilityDelta(bLaneY),
+                ALastGeometry = (aLaneX >> 12) & 0xfffu,
+                BLastGeometry = (bLaneX >> 12) & 0xfffu,
+                ALastOperation = (aLaneX >> 24) & 0xfu,
+                BLastOperation = (bLaneX >> 24) & 0xfu,
+                SameOrderedStrongestPair = aReason == 21 && bReason == 21 &&
+                    aCurrent != 0 && aPrior != 0 &&
+                    aCurrent == bCurrent && aPrior == bPrior
+            };
+            return true;
+        }
+
+        private static int CompareZeroCrossingEdgeResponsibilityRows(
+            ZeroCrossingEdgeResponsibilityRow a,
+            ZeroCrossingEdgeResponsibilityRow b)
+        {
+            if (a.SameOrderedStrongestPair != b.SameOrderedStrongestPair)
+                return a.SameOrderedStrongestPair ? -1 : 1;
+            int comparison = b.CombinedOscillationFloor.CompareTo(
+                a.CombinedOscillationFloor);
+            if (comparison != 0) return comparison;
+            comparison = b.JointEndpointPushFloor.CompareTo(a.JointEndpointPushFloor);
+            if (comparison != 0) return comparison;
+            comparison = b.CombinedTotal.CompareTo(a.CombinedTotal);
+            if (comparison != 0) return comparison;
+            comparison = a.AIndex.CompareTo(b.AIndex);
+            return comparison != 0 ? comparison : a.Axis.CompareTo(b.Axis);
+        }
+
+        private static float ReadSNorm8(byte value)
+        {
+            int signed = unchecked((sbyte)value);
+            return signed <= -127 ? -1f : signed / 127f;
+        }
+
+        private static float DecodeResponsibilityDelta(uint laneY)
+        {
+            int magnitude = (int)((laneY >> 17) & 0x3fu);
+            bool negative = ((laneY >> 17) & 0x40u) != 0;
+            float normalized = magnitude / 63f;
+            return negative ? -normalized : normalized;
+        }
+
+        private static string FormatFloat(float value)
+        {
+            return value.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        private static string AxisName(int axis)
+        {
+            return axis == 0 ? "x" : (axis == 1 ? "y" : "z");
+        }
+
+        private static string DeltaDirection(uint reason, float delta)
+        {
+            if (reason != 21) return "not_cross_frame_witness";
+            return delta < 0f ? "negative" : "positive";
+        }
+
+        private static string ResponsibilityClass(
+            ZeroCrossingEdgeResponsibilityRow row)
+        {
+            bool a = row.ATotal > 0;
+            bool b = row.BTotal > 0;
+            if (a && b)
+                return row.SameOrderedStrongestPair
+                    ? "both_same_ordered_pair" : "both_different_pair";
+            if (a) return "a_only";
+            if (b) return "b_only";
+            return "no_push_history";
+        }
+
+        private static string EndpointWithMorePushes(
+            ZeroCrossingEdgeResponsibilityRow row)
+        {
+            if (row.ATotal > row.BTotal) return "a";
+            if (row.BTotal > row.ATotal) return "b";
+            return "equal";
+        }
+
+        private static uint AbsoluteEndpointPushDifference(
+            ZeroCrossingEdgeResponsibilityRow row)
+        {
+            return row.ATotal >= row.BTotal
+                ? row.ATotal - row.BTotal
+                : row.BTotal - row.ATotal;
+        }
+
         private static uint ReadUInt32LittleEndian(byte[] data, int offset)
         {
             return (uint)(data[offset] | data[offset + 1] << 8 |
@@ -1562,14 +2011,26 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            if (enableQrsReferenceBaseline)
+            {
+                // QRS is a mutually-exclusive production baseline, not one more
+                // rule layered over the current stack.
+                enableInfiniTamBaseline = false;
+                enableGunGelEvidenceShadow = false;
+                enableGunGelGuardedFusionExperiment = false;
+                enableGunGelTsdfAdmission = false;
+                enableGunGelPoseCorrection = false;
+                enableFinalCourtAdmissionExperiment = false;
+            }
             // Scene/Prefab 中遗留的裁冻值不得重新把产品裁判接回 TSDF。
             // GunGel 流水线只生产同帧身份/候选证据；距离、位姿和唯一 TSDF
             // 保持原始生产含义，裁判平面只在候选网格产品化阶段消费。
-            enableGunGelGuardedFusionExperiment = !enableInfiniTamBaseline;
+            enableGunGelGuardedFusionExperiment = !enableQrsReferenceBaseline &&
+                                                   !enableInfiniTamBaseline;
             enableGunGelTsdfAdmission = false;
             enableGunGelPoseCorrection = false;
             enableFinalCourtAdmissionExperiment = false;
-            if (!enableInfiniTamBaseline)
+            if (!enableQrsReferenceBaseline && !enableInfiniTamBaseline)
                 _productSurfaceCourt.BeginInMemory();
             for (int i = 0; i < _gunGelDeferredFrames.Length; i++)
                 _gunGelDeferredFrames[i] = new GunGelDeferredFrame();
@@ -1599,7 +2060,8 @@ namespace Genesis.RoomScan
         /// </summary>
         private void InitKernels()
         {
-            _clearKernel = new ComputeKernelHelper(compute, "Clear");
+            _clearKernel = new ComputeKernelHelper(compute,
+                enableQrsReferenceBaseline ? "ClearQrsReference" : "Clear");
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -1641,10 +2103,12 @@ namespace Genesis.RoomScan
             _invalidateGunGelSuccessionsKernel.Set(ActivePageBoundaryEpochsID,
                 _activePageBoundaryEpochs);
 
-            bool useCompactInfiniTamKernel =
+            bool useCompactInfiniTamKernel = !enableQrsReferenceBaseline &&
                 enableInfiniTamBaseline && enableCompactInfiniTamHistory;
             _integrateKernel = new ComputeKernelHelper(compute,
-                useCompactInfiniTamKernel
+                enableQrsReferenceBaseline
+                    ? "IntegrateQrsReference"
+                    : useCompactInfiniTamKernel
                     ? "IntegrateInfiniTam"
                     : "Integrate");
             _integrateKernel.Set(VolumeRWID, _volume);
@@ -1665,6 +2129,49 @@ namespace Genesis.RoomScan
                 _tsdfSupportResponsibilityVolume);
             _integrateKernel.Set(DirtyChunkEpochsID, _dirtyChunkEpochs);
             _integrateKernel.Set(DirtyBoundaryEpochsID, _dirtyBoundaryEpochs);
+            if (useCompactInfiniTamKernel)
+            {
+                _evaluateInfiniTamEdgeCoherenceKernel =
+                    new ComputeKernelHelper(compute,
+                        "EvaluateInfiniTamEdgeCoherence");
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(VolumeRWID, _volume);
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamMicroViewMeanRWID,
+                    _infiniTamMicroViewMeanVolume);
+
+                _commitInfiniTamEdgeCoherenceKernel =
+                    new ComputeKernelHelper(compute,
+                        "CommitInfiniTamEdgeCoherence");
+                _commitInfiniTamEdgeCoherenceKernel.Set(VolumeRWID, _volume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(ColorVolumeRWID,
+                    _colorVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamAccumulatedTsdfRWID,
+                    _infiniTamAccumulatedTsdfVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamMicroViewMeanRWID,
+                    _infiniTamMicroViewMeanVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    TsdfSupportResponsibilityRWID,
+                    _tsdfSupportResponsibilityVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(DirtyChunkEpochsID,
+                    _dirtyChunkEpochs);
+                _commitInfiniTamEdgeCoherenceKernel.Set(DirtyBoundaryEpochsID,
+                    _dirtyBoundaryEpochs);
+                _hasInfiniTamEdgeCoherenceKernels = true;
+            }
+            else
+            {
+                _hasInfiniTamEdgeCoherenceKernels = false;
+            }
             if (!useCompactInfiniTamKernel)
             {
                 _integrateKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -1675,7 +2182,8 @@ namespace Genesis.RoomScan
                     _activePageBoundaryEpochs);
             }
 
-            _pruneKernel = new ComputeKernelHelper(compute, "Prune");
+            _pruneKernel = new ComputeKernelHelper(compute,
+                enableQrsReferenceBaseline ? "PruneQrsReference" : "Prune");
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -1743,6 +2251,13 @@ namespace Genesis.RoomScan
             _carveStats = new ComputeBuffer(CarveStatsCount, sizeof(uint));
             _carveStats.SetData(ZeroCarveStats);
             _integrateKernel.Set(CarveStatsID, _carveStats);
+            if (_hasInfiniTamEdgeCoherenceKernels)
+            {
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(CarveStatsID,
+                    _carveStats);
+                _commitInfiniTamEdgeCoherenceKernel.Set(CarveStatsID,
+                    _carveStats);
+            }
 
             // Vulkan requires a valid descriptor even when the legacy route
             // keeps the receipt switch at zero. The buffer is tiny (16 bytes)
@@ -1751,6 +2266,9 @@ namespace Genesis.RoomScan
                 InfiniTamTicketStatCount, sizeof(uint));
             _infiniTamTicketStats.SetData(ZeroInfiniTamTicketStats);
             _integrateKernel.Set(InfiniTamTicketStatsID, _infiniTamTicketStats);
+            if (_hasInfiniTamEdgeCoherenceKernels)
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamTicketStatsID, _infiniTamTicketStats);
             compute.SetFloat(InfiniTamTicketEnabledID, 0f);
 
             // Integrate 内核始终声明枪胶 SRV；基线/B 影子虽然关闭准入，Vulkan
@@ -1787,6 +2305,44 @@ namespace Genesis.RoomScan
             _dummyCamTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
             _dummyCamTex.SetPixel(0, 0, Color.black);
             _dummyCamTex.Apply(false, true);
+
+            InitializeQrsReferenceKernels();
+        }
+
+        private void InitializeQrsReferenceKernels()
+        {
+            if (!enableQrsReferenceBaseline) return;
+
+            _qrsReferenceVolumeIntegrationCompute =
+                Resources.Load<ComputeShader>(
+                    "QrsReference/QrsReferenceVolumeIntegration");
+            if (_qrsReferenceVolumeIntegrationCompute == null)
+                throw new InvalidOperationException(
+                    "QRS reference VolumeIntegration compute is missing from Resources");
+
+            _qrsReferenceClearKernel = new ComputeKernelHelper(
+                _qrsReferenceVolumeIntegrationCompute, "Clear");
+            _qrsReferenceIntegrateKernel = new ComputeKernelHelper(
+                _qrsReferenceVolumeIntegrationCompute, "Integrate");
+            _qrsReferencePruneKernel = new ComputeKernelHelper(
+                _qrsReferenceVolumeIntegrationCompute, "Prune");
+            RebindQrsReferenceKernelTextures();
+            _qrsReferenceKernelsReady = true;
+            Logger.Info(
+                "QRS reference fusion owns Clear/Integrate/Prune through its independent original compute");
+        }
+
+        private void RebindQrsReferenceKernelTextures()
+        {
+            if (!enableQrsReferenceBaseline ||
+                _qrsReferenceVolumeIntegrationCompute == null) return;
+
+            _qrsReferenceClearKernel.Set(VolumeRWID, _volume);
+            _qrsReferenceClearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _qrsReferenceIntegrateKernel.Set(VolumeRWID, _volume);
+            _qrsReferenceIntegrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _qrsReferencePruneKernel.Set(VolumeRWID, _volume);
+            _qrsReferencePruneKernel.Set(ColorVolumeRWID, _colorVolume);
         }
 
         private void OnDestroy()
@@ -2599,6 +3155,7 @@ namespace Genesis.RoomScan
         private void RebindKernelTextures()
         {
             EnsureDirtyChunkBuffer();
+            RebindQrsReferenceKernelTextures();
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
             _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -2652,6 +3209,40 @@ namespace Genesis.RoomScan
             _integrateKernel.Set(ActivePageEpochsID, _activePageEpochs);
             _integrateKernel.Set(ActivePageObservedEpochsID, _activePageObservedEpochs);
             _integrateKernel.Set(ActivePageBoundaryEpochsID, _activePageBoundaryEpochs);
+            if (_hasInfiniTamEdgeCoherenceKernels)
+            {
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(VolumeRWID, _volume);
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamMicroViewMeanRWID,
+                    _infiniTamMicroViewMeanVolume);
+            }
+            if (_hasInfiniTamEdgeCoherenceKernels)
+            {
+                _commitInfiniTamEdgeCoherenceKernel.Set(VolumeRWID, _volume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(ColorVolumeRWID,
+                    _colorVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamVoteWeightRWID, _infiniTamVoteWeightVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamAccumulatedTsdfRWID,
+                    _infiniTamAccumulatedTsdfVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamWriteEpochsID, _infiniTamWriteEpochs);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    InfiniTamMicroViewMeanRWID,
+                    _infiniTamMicroViewMeanVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    TsdfResponsibilityRWID, _tsdfResponsibilityVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    TsdfSupportResponsibilityRWID,
+                    _tsdfSupportResponsibilityVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(DirtyChunkEpochsID,
+                    _dirtyChunkEpochs);
+                _commitInfiniTamEdgeCoherenceKernel.Set(DirtyBoundaryEpochsID,
+                    _dirtyBoundaryEpochs);
+            }
             _pruneKernel.Set(VolumeRWID, _volume);
             _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
             _pruneKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
@@ -2693,17 +3284,21 @@ namespace Genesis.RoomScan
         private void EnsureDirtyChunkBuffer()
         {
             int chunkSize = ExtractionChunkSize;
-            int3 required = new int3(
-                Mathf.CeilToInt(voxelCount.x / (float)chunkSize),
-                Mathf.CeilToInt(voxelCount.y / (float)chunkSize),
-                Mathf.CeilToInt(voxelCount.z / (float)chunkSize));
+            int3 required = enableQrsReferenceBaseline
+                ? new int3(1, 1, 1)
+                : new int3(
+                    Mathf.CeilToInt(voxelCount.x / (float)chunkSize),
+                    Mathf.CeilToInt(voxelCount.y / (float)chunkSize),
+                    Mathf.CeilToInt(voxelCount.z / (float)chunkSize));
             int requiredCount = required.x * required.y * required.z;
             int boundaryCount = Mathf.Max(1, requiredCount * 6);
             int fChunkSize = Mathf.Max(8, frozenChunkSize);
-            int3 frozenRequired = new int3(
-                Mathf.CeilToInt(voxelCount.x / (float)fChunkSize),
-                Mathf.CeilToInt(voxelCount.y / (float)fChunkSize),
-                Mathf.CeilToInt(voxelCount.z / (float)fChunkSize));
+            int3 frozenRequired = enableQrsReferenceBaseline
+                ? new int3(1, 1, 1)
+                : new int3(
+                    Mathf.CeilToInt(voxelCount.x / (float)fChunkSize),
+                    Mathf.CeilToInt(voxelCount.y / (float)fChunkSize),
+                    Mathf.CeilToInt(voxelCount.z / (float)fChunkSize));
             int frozenRequiredCount = frozenRequired.x * frozenRequired.y * frozenRequired.z;
             int activeBoundaryCount = Mathf.Max(1, frozenRequiredCount * 6);
             if (_dirtyChunkEpochs != null && _dirtyChunkEpochs.count == requiredCount &&
@@ -2792,6 +3387,8 @@ namespace Genesis.RoomScan
                 InfiniTamSameViewSlowConfirmations);
             compute.SetFloat(InfiniTamSelectiveHistoryReleaseID,
                 enableInfiniTamSelectiveHistoryRelease ? 1f : 0f);
+            compute.SetFloat(InfiniTamEdgeCoherentPublicationID,
+                enableInfiniTamEdgeCoherentPublication ? 1f : 0f);
         }
 
         private void ConfigureDirtyTracking(bool enabled)
@@ -3408,6 +4005,8 @@ namespace Genesis.RoomScan
             sb.AppendLine("scope=sampled_near_zero_surface_writes;diagnostic_only=true;sample_interval_s=1");
             sb.AppendLine($"enabled={enableInfiniTamBaseline.ToString().ToLowerInvariant()}");
             sb.AppendLine("active_contract=v1.3_external_quest_pose_direct_fusion_read_only_raycast");
+            sb.AppendLine($"edge_coherent_zero_crossing_publication={enableInfiniTamEdgeCoherentPublication.ToString().ToLowerInvariant()}");
+            sb.AppendLine("edge_coherent_contract=same_dispatch_adjacent_candidates_retain_crossing_or_jointly_extinguish_existing_crossing;current_voxel_writes_only;mesh_topology_unchanged");
             sb.AppendLine($"tracking_authority_enabled={enableInfiniTamTrackingAuthority.ToString().ToLowerInvariant()}");
             sb.AppendLine($"sample_ready={_hasInfiniTamTicket.ToString().ToLowerInvariant()}");
             sb.AppendLine($"readback_pending={_infiniTamTicketReadbackPending.ToString().ToLowerInvariant()}");
@@ -3473,6 +4072,9 @@ namespace Genesis.RoomScan
             sb.AppendLine($"attempt_reconcile_delta={(long)sameFrameAttempts - (long)sameFrameFirstClaims - (long)sameFrameDuplicates}");
             sb.AppendLine($"duplicate_rate_percent={duplicateRate.ToString("F6", CultureInfo.InvariantCulture)}");
             sb.AppendLine($"contradictory_share_of_duplicates_percent={contradictoryDuplicateRate.ToString("F6", CultureInfo.InvariantCulture)}");
+            sb.AppendLine($"edge_coherence_candidates_staged={U(CumulativeCarveStats[203])}");
+            sb.AppendLine($"edge_coherence_candidates_approved={U(CumulativeCarveStats[204])}");
+            sb.AppendLine($"edge_coherence_candidates_committed={U(CumulativeCarveStats[205])}");
 
             ulong seedSourceSum = CumulativeCarveStats[71] +
                                   CumulativeCarveStats[72] +
@@ -3869,10 +4471,13 @@ namespace Genesis.RoomScan
             GraphicsFormat traceFormat = SystemInfo.IsFormatSupported(GraphicsFormat.R8_UNorm, FormatUsage.LoadStore)
                 ? GraphicsFormat.R8_UNorm
                 : GraphicsFormat.R16_SFloat;
-            _admissionTraceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            int sidecarWidth = enableQrsReferenceBaseline ? 1 : voxelCount.x;
+            int sidecarHeight = enableQrsReferenceBaseline ? 1 : voxelCount.y;
+            int sidecarDepth = enableQrsReferenceBaseline ? 1 : voxelCount.z;
+            _admissionTraceVolume = new RenderTexture(sidecarWidth, sidecarHeight, 0, traceFormat, 0)
             {
                 dimension = TextureDimension.Tex3D,
-                volumeDepth = voxelCount.z,
+                volumeDepth = sidecarDepth,
                 enableRandomWrite = true,
                 filterMode = FilterMode.Point,
                 wrapMode = TextureWrapMode.Clamp,
@@ -3880,15 +4485,16 @@ namespace Genesis.RoomScan
             };
             _admissionTraceVolume.Create();
             long traceBytesPerVoxel = traceFormat == GraphicsFormat.R8_UNorm ? 1L : 2L;
-            Logger.Info($"Dilation admission trace: {voxelCount} {traceFormat} = " +
-                        $"{(traceBytesPerVoxel * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+            Logger.Info($"Dilation admission trace: " +
+                        $"{sidecarWidth}x{sidecarHeight}x{sidecarDepth} {traceFormat} = " +
+                        $"{(traceBytesPerVoxel * sidecarWidth * sidecarHeight * sidecarDepth) / (1024 * 1024)}MB");
 
             // 置信度通道 v1：与 admission trace 同格式（R8 归一化存分歧 EMA，
             // 不支持时退 R16_SFloat）。只读影子，生产路径一律不读它。
-            _confidenceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            _confidenceVolume = new RenderTexture(sidecarWidth, sidecarHeight, 0, traceFormat, 0)
             {
                 dimension = TextureDimension.Tex3D,
-                volumeDepth = voxelCount.z,
+                volumeDepth = sidecarDepth,
                 enableRandomWrite = true,
                 filterMode = FilterMode.Point,
                 wrapMode = TextureWrapMode.Clamp,
@@ -3897,10 +4503,10 @@ namespace Genesis.RoomScan
             _confidenceVolume.Create();
 
             // v2 相干通道：同格式第二张 R8（0.5 偏置有符号分歧 EMA）。
-            _coherenceVolume = new RenderTexture(voxelCount.x, voxelCount.y, 0, traceFormat, 0)
+            _coherenceVolume = new RenderTexture(sidecarWidth, sidecarHeight, 0, traceFormat, 0)
             {
                 dimension = TextureDimension.Tex3D,
-                volumeDepth = voxelCount.z,
+                volumeDepth = sidecarDepth,
                 enableRandomWrite = true,
                 filterMode = FilterMode.Point,
                 wrapMode = TextureWrapMode.Clamp,
@@ -3913,24 +4519,25 @@ namespace Genesis.RoomScan
             // blocked correction.  This sidecar is write-only diagnostics; production
             // TSDF, extraction and rendering never sample it.
             _tsdfResponsibilityVolume = new RenderTexture(
-                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32G32_UInt, 0)
+                sidecarWidth, sidecarHeight, 0, GraphicsFormat.R32G32_UInt, 0)
             {
                 dimension = TextureDimension.Tex3D,
-                volumeDepth = voxelCount.z,
+                volumeDepth = sidecarDepth,
                 enableRandomWrite = true,
                 filterMode = FilterMode.Point,
                 wrapMode = TextureWrapMode.Clamp,
                 name = "TsdfResponsibility"
             };
             _tsdfResponsibilityVolume.Create();
-            Logger.Info($"TSDF responsibility sidecar: {voxelCount} R32G32_UInt = " +
-                        $"{(8L * voxelCount.x * voxelCount.y * voxelCount.z) / (1024 * 1024)}MB");
+            Logger.Info($"TSDF responsibility sidecar: " +
+                        $"{sidecarWidth}x{sidecarHeight}x{sidecarDepth} R32G32_UInt = " +
+                        $"{(8L * sidecarWidth * sidecarHeight * sidecarDepth) / (1024 * 1024)}MB");
 
             _tsdfSupportResponsibilityVolume = new RenderTexture(
-                voxelCount.x, voxelCount.y, 0, GraphicsFormat.R32_UInt, 0)
+                sidecarWidth, sidecarHeight, 0, GraphicsFormat.R32_UInt, 0)
             {
                 dimension = TextureDimension.Tex3D,
-                volumeDepth = voxelCount.z,
+                volumeDepth = sidecarDepth,
                 enableRandomWrite = true,
                 filterMode = FilterMode.Point,
                 wrapMode = TextureWrapMode.Clamp,
@@ -4018,6 +4625,25 @@ namespace Genesis.RoomScan
             Shader.SetGlobalTexture(ConfidenceGlobalTexID, _confidenceVolume);
             Shader.SetGlobalFloat(ConfidenceMidMaxID, confidenceMidMax);
             Shader.SetGlobalFloat(ConfidenceLowMinID, confidenceLowMin);
+
+            if (enableQrsReferenceBaseline &&
+                _qrsReferenceVolumeIntegrationCompute != null)
+            {
+                // These are exactly the constants set by the original QRS
+                // VolumeIntegrator.  No ScanCover-only admission, motion,
+                // history, dirty-page or confidence state is visible here.
+                ComputeShader qrs = _qrsReferenceVolumeIntegrationCompute;
+                qrs.SetInts(VoxCountID, s.x, s.y, s.z);
+                qrs.SetFloat(VoxSizeID, voxelSize);
+                qrs.SetFloat(VoxMinID, voxelMin);
+                qrs.SetFloat(VoxDistID, voxelDistance);
+                qrs.SetFloat(DepthDispThreshID, depthDisparityThreshold);
+                qrs.SetFloat(MaxUpdateDistID, maxUpdateDist);
+                qrs.SetFloat(BlendRateID, blendRate);
+                qrs.SetFloat(StabilityID, stability);
+                qrs.SetFloat(WeightGrowthID, weightGrowth);
+                qrs.SetFloat(MaxWeightID, maxWeight);
+            }
         }
 
         /// <summary>
@@ -4041,10 +4667,22 @@ namespace Genesis.RoomScan
             compute.SetFloat(WriteColorID, 1f);
             compute.SetFloat(WriteAdmissionTraceID, 1f);
             compute.SetFloat(ConfidenceWriteID, 1f);
-            _clearKernel.Set(VolumeRWID, _volume);
-            _clearKernel.Set(ColorVolumeRWID, _colorVolume);
-            _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
-            _clearKernel.DispatchFit(_volume);
+            if (enableQrsReferenceBaseline)
+            {
+                if (!_qrsReferenceKernelsReady)
+                    throw new InvalidOperationException(
+                        "QRS reference clear requested before its original compute was initialized");
+                _qrsReferenceClearKernel.Set(VolumeRWID, _volume);
+                _qrsReferenceClearKernel.Set(ColorVolumeRWID, _colorVolume);
+                _qrsReferenceClearKernel.DispatchFit(_volume);
+            }
+            else
+            {
+                _clearKernel.Set(VolumeRWID, _volume);
+                _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+                _clearKernel.Set(AdmissionTraceRWID, _admissionTraceVolume);
+                _clearKernel.DispatchFit(_volume);
+            }
             ResetInfiniTamTicket();
             _infiniTamModelRaycast?.Reset();
             ResetInfiniTamDeferredFrame(false);
@@ -4485,7 +5123,10 @@ namespace Genesis.RoomScan
         {
             if (!DepthCapture.DepthAvailable) return;
 
-            Matrix4x4 depthProj = Shader.GetGlobalMatrixArray(DepthCapture.ProjID)[DepthCapture.FusionEyeIndex];
+            int frustumEye = enableQrsReferenceBaseline
+                ? DepthCapture.QrsReferenceEyeIndex
+                : DepthCapture.FusionEyeIndex;
+            Matrix4x4 depthProj = Shader.GetGlobalMatrixArray(DepthCapture.ProjID)[frustumEye];
             FrustumPlanes frustum = depthProj.decomposeProjection;
             frustum.zFar = maxUpdateDist;
 
@@ -4499,7 +5140,9 @@ namespace Genesis.RoomScan
             // Crop around the real optical centre so asymmetric per-eye
             // projections retain their alignment. This limits only new TSDF
             // writes; already integrated volume data remains resident.
-            float viewportScale = Mathf.Clamp(integrationViewportScale, 0.5f, 1f);
+            float viewportScale = enableQrsReferenceBaseline
+                ? 1f
+                : Mathf.Clamp(integrationViewportScale, 0.5f, 1f);
             float xCenter = (ls + rs) * 0.5f;
             float yCenter = (bs + ts) * 0.5f;
             float xHalf = (rs - ls) * 0.5f * viewportScale;
@@ -4546,6 +5189,21 @@ namespace Genesis.RoomScan
             _frustumVolume = new ComputeBuffer(positions.Count, sizeof(float) * 3);
             _frustumVolume.SetData(positions);
             _integrateKernel.Set(FrustumVolumeID, _frustumVolume);
+            if (enableQrsReferenceBaseline)
+            {
+                if (!_qrsReferenceKernelsReady)
+                    throw new InvalidOperationException(
+                        "QRS reference frustum requested before its original compute was initialized");
+                _qrsReferenceIntegrateKernel.Set(
+                    FrustumVolumeID, _frustumVolume);
+            }
+            if (_hasInfiniTamEdgeCoherenceKernels)
+            {
+                _evaluateInfiniTamEdgeCoherenceKernel.Set(
+                    FrustumVolumeID, _frustumVolume);
+                _commitInfiniTamEdgeCoherenceKernel.Set(
+                    FrustumVolumeID, _frustumVolume);
+            }
             compute.SetInt(FrustumVolumeCountID, positions.Count);
             _frustumReady = true;
         }
@@ -4554,10 +5212,102 @@ namespace Genesis.RoomScan
         /// Dispatches one TSDF + color integration pass from the current depth frame.
         /// Handles frustum setup, exclusion zones, warmup clearing, and periodic pruning.
         /// </summary>
+        private bool IntegrateQrsReference(DepthCapture dc)
+        {
+            if (_volume == null || !_qrsReferenceKernelsReady ||
+                _qrsReferenceIntegrateKernel.Shader == null) return false;
+            if (!_frustumReady) SetupFrustumVolume();
+            if (!_frustumReady) return false;
+
+            dc.UpdateDilationIfNeeded();
+            ComputeShader qrs = _qrsReferenceVolumeIntegrationCompute;
+            qrs.SetMatrixArray(DepthCapture.ViewID, dc.View);
+            qrs.SetMatrixArray(DepthCapture.ProjID, dc.Proj);
+            qrs.SetMatrixArray(DepthCapture.ViewInvID, dc.ViewInv);
+            qrs.SetMatrixArray(DepthCapture.ProjInvID, dc.ProjInv);
+
+            int numExclusions = Mathf.Min(ExclusionZones.Count, 64);
+            for (int i = 0; i < numExclusions; i++)
+            {
+                if (ExclusionZones[i] != null)
+                    _exclusionPositions[i] = ExclusionZones[i].position;
+            }
+            qrs.SetInt(NumExclusionsID, numExclusions);
+            qrs.SetVectorArray(ExclusionHeadsID, _exclusionPositions);
+
+            // These are the QRS scene values and are deliberately the only
+            // fusion controls consumed by IntegrateQrsReference.
+            qrs.SetFloat(BlendRateID, blendRate);
+            qrs.SetFloat(StabilityID, stability);
+            qrs.SetFloat(WeightGrowthID, weightGrowth);
+            qrs.SetFloat(MaxWeightID, maxWeight);
+
+            EnsureCamFrameCopy();
+            if (_pendingCamFrame != null && _camFrameCopy != null)
+            {
+                qrs.SetTexture(_qrsReferenceIntegrateKernel.KernelIndex,
+                    CamRGBID, _camFrameCopy);
+                qrs.SetInt(CamAvailableID, 1);
+                qrs.SetVector(CamPosID, _pendingCamPos);
+                qrs.SetMatrix(CamInvRotID,
+                    Matrix4x4.Rotate(Quaternion.Inverse(_pendingCamRot)));
+                qrs.SetVector(CamFocalLenID, _pendingFocalLen);
+                qrs.SetVector(CamPrincipalPtID, _pendingPrincipalPt);
+                qrs.SetVector(CamSensorResID, _pendingSensorRes);
+                qrs.SetVector(CamCurrentResID, _pendingCurrentRes);
+                qrs.SetFloat(CamExposureID, cameraExposure);
+            }
+            else
+            {
+                qrs.SetTexture(_qrsReferenceIntegrateKernel.KernelIndex,
+                    CamRGBID, _dummyCamTex);
+                qrs.SetInt(CamAvailableID, 0);
+            }
+
+            _qrsReferenceIntegrateKernel.Set(DepthCapture.DepthTexID, dc.DepthTex);
+            _qrsReferenceIntegrateKernel.Set(DepthCapture.NormTexID, dc.NormTex);
+            _qrsReferenceIntegrateKernel.Set(
+                DepthCapture.DilatedDepthTexID, dc.DilatedDepthTex);
+            _qrsReferenceIntegrateKernel.DispatchFit(_frustumVolume.count, 1);
+
+            IntegrationCount++;
+            _pendingCamFrame = null;
+
+            if (warmupIntegrations > 0 && IntegrationCount == warmupIntegrations)
+            {
+                Logger.Info($"QRS warmup complete ({warmupIntegrations} frames); clearing startup observations");
+                Clear();
+            }
+
+            float now = Time.time;
+            if (now - _lastPruneTime >= pruneIntervalSeconds)
+            {
+                _lastPruneTime = now;
+                _qrsReferencePruneKernel.Set(VolumeRWID, _volume);
+                _qrsReferencePruneKernel.Set(ColorVolumeRWID, _colorVolume);
+                _qrsReferencePruneKernel.DispatchFit(_volume);
+            }
+
+            if (coverageUpdateInterval > 0 && !_coverageReadbackPending)
+            {
+                _integrationsSinceCoverage++;
+                if (_integrationsSinceCoverage >= coverageUpdateInterval)
+                {
+                    _integrationsSinceCoverage = 0;
+                    DispatchCoverageCount();
+                }
+            }
+
+            Integrated?.Invoke();
+            return true;
+        }
+
         public bool Integrate()
         {
             var dc = DepthCapture.Instance;
             if (dc == null || !DepthCapture.DepthAvailable || dc.DepthTex == null) return false;
+            if (enableQrsReferenceBaseline)
+                return IntegrateQrsReference(dc);
             // The observation view still shows raw source geometry. Do not
             // write those pre-seed frames while it is open. Once a fitted seed
             // is staged, an existing roll must be cleared before the shared
@@ -5296,15 +6046,29 @@ namespace Genesis.RoomScan
             compute.SetInt(FrustumVolumeCountID, _frustumVolume.count);
             if (enableInfiniTamBaseline && enableCompactInfiniTamHistory)
             {
-                // The GPU packs the epoch into 24 bits and reserves zero for a
-                // freshly cleared claim buffer. A normal Quest scan cannot reach
-                // the 16.7M-frame wrap boundary; scan clear resets both together.
-                unchecked { _infiniTamWriteEpoch = (_infiniTamWriteEpoch + 1u) & 0x00ffffffu; }
+                // The edge-coherence transaction reserves the two high claim
+                // bits for staged/approved state.  The remaining 22-bit epoch
+                // still covers more than four million accepted frames and is
+                // reset together with the scan volume.
+                unchecked { _infiniTamWriteEpoch = (_infiniTamWriteEpoch + 1u) & 0x003fffffu; }
                 if (_infiniTamWriteEpoch == 0u) _infiniTamWriteEpoch = 1u;
                 compute.SetInt(InfiniTamWriteEpochID,
                     unchecked((int)_infiniTamWriteEpoch));
             }
             _integrateKernel.DispatchFit(_frustumVolume.count, 1);
+            if (enableInfiniTamBaseline && enableCompactInfiniTamHistory &&
+                enableInfiniTamEdgeCoherentPublication &&
+                _hasInfiniTamEdgeCoherenceKernels)
+            {
+                // Dispatch boundaries are the required GPU barriers: phase 2
+                // sees the complete candidate set, then phase 3 sees the
+                // complete approval set.  Both phases only touch the current
+                // voxel; no neighbour write or mesh/topology rule is added.
+                _evaluateInfiniTamEdgeCoherenceKernel.DispatchFit(
+                    _frustumVolume.count, 1);
+                _commitInfiniTamEdgeCoherenceKernel.DispatchFit(
+                    _frustumVolume.count, 1);
+            }
             compute.SetFloat(InfiniTamTicketEnabledID, 0f);
             if (enableInfiniTamBaseline)
             {
