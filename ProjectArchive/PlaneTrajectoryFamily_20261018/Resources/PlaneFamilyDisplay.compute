@@ -1,0 +1,283 @@
+#pragma kernel PrepareLabels
+#pragma kernel SeedLabels
+#pragma kernel PropagateLabels
+#pragma kernel ResolveFamilies
+#pragma kernel CountTriangles
+
+struct GPUVertex
+{
+    float3 pos;
+    float3 norm;
+    uint packedColor;
+    uint voxelFlatIdx;
+};
+
+StructuredBuffer<GPUVertex> _Vertices;
+StructuredBuffer<uint> _Indices;
+StructuredBuffer<float4> _FamilyPlanes;
+StructuredBuffer<float4> _FamilyCenters;
+StructuredBuffer<uint> _FamilyIds;
+RWStructuredBuffer<uint> _ScratchLabels;
+RWStructuredBuffer<uint> _OutputFamilies;
+RWStructuredBuffer<uint> _Stats;
+
+uint _VertexCount;
+uint _IndexCount;
+uint _FamilySeedCount;
+uint _PreservePrevious;
+float4x4 _LocalToWorld;
+float4x4 _WorldToLocal;
+float _EnterResidual;
+float _ExitResidual;
+float _MinimumNormalDot;
+float _MaximumEdgeLength;
+
+float3 WorldPosition(GPUVertex vertex)
+{
+    return mul(_LocalToWorld, float4(vertex.pos, 1.0)).xyz;
+}
+
+float3 WorldNormal(GPUVertex vertex)
+{
+    return normalize(mul(transpose((float3x3)_WorldToLocal), vertex.norm));
+}
+
+bool VertexFitsSeed(GPUVertex vertex, uint seedIndex, float residualLimit)
+{
+    float4 plane = _FamilyPlanes[seedIndex];
+    float3 normal = normalize(plane.xyz);
+    float3 position = WorldPosition(vertex);
+    if (abs(dot(WorldNormal(vertex), normal)) < _MinimumNormalDot)
+        return false;
+    return abs(dot(position, normal) - plane.w) <= residualLimit;
+}
+
+bool TriangleFitsSeed(uint a, uint b, uint c, uint label)
+{
+    if (label == 0u || label > _FamilySeedCount)
+        return false;
+    uint seedIndex = label - 1u;
+    GPUVertex va = _Vertices[a];
+    GPUVertex vb = _Vertices[b];
+    GPUVertex vc = _Vertices[c];
+    float3 pa = WorldPosition(va);
+    float3 pb = WorldPosition(vb);
+    float3 pc = WorldPosition(vc);
+    if (distance(pa, pb) > _MaximumEdgeLength ||
+        distance(pb, pc) > _MaximumEdgeLength ||
+        distance(pc, pa) > _MaximumEdgeLength)
+        return false;
+    return VertexFitsSeed(va, seedIndex, _EnterResidual) &&
+           VertexFitsSeed(vb, seedIndex, _EnterResidual) &&
+           VertexFitsSeed(vc, seedIndex, _EnterResidual);
+}
+
+bool SeedsCoplanar(uint labelA, uint labelB)
+{
+    if (labelA == 0u || labelB == 0u ||
+        labelA > _FamilySeedCount || labelB > _FamilySeedCount)
+        return false;
+    float4 planeA = _FamilyPlanes[labelA - 1u];
+    float4 planeB = _FamilyPlanes[labelB - 1u];
+    float3 normalA = normalize(planeA.xyz);
+    float3 normalB = normalize(planeB.xyz);
+    float alignment = dot(normalA, normalB);
+    if (abs(alignment) < 0.985)
+        return false;
+    float3 centerA = _FamilyCenters[labelA - 1u].xyz;
+    float3 centerB = _FamilyCenters[labelB - 1u].xyz;
+    float3 offset = centerB - centerA;
+    return abs(dot(offset, normalA)) <= 0.02 &&
+           abs(dot(offset, normalB)) <= 0.02;
+}
+
+void AdoptLabel(uint vertexIndex, uint candidate)
+{
+    uint current = _ScratchLabels[vertexIndex];
+    uint original;
+    if (current == 0u)
+    {
+        InterlockedCompareExchange(_ScratchLabels[vertexIndex], 0u,
+                                   candidate, original);
+        current = original == 0u ? candidate : original;
+    }
+    if (current > candidate && SeedsCoplanar(current, candidate))
+        InterlockedCompareExchange(_ScratchLabels[vertexIndex], current,
+                                   candidate, original);
+}
+
+[numthreads(64, 1, 1)]
+void PrepareLabels(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _VertexCount)
+        _ScratchLabels[id.x] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void SeedLabels(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexIndex = id.x;
+    if (vertexIndex >= _VertexCount)
+        return;
+
+    GPUVertex vertex = _Vertices[vertexIndex];
+    float3 position = WorldPosition(vertex);
+    uint previousFamily = _PreservePrevious != 0u
+        ? _OutputFamilies[vertexIndex] : 0u;
+    float bestScore = 1e9;
+    uint bestLabel = 0u;
+
+    [loop]
+    for (uint i = 0u; i < _FamilySeedCount; i++)
+    {
+        float4 centerRadius = _FamilyCenters[i];
+        float radius = max(0.20, centerRadius.w);
+        float3 delta = position - centerRadius.xyz;
+        float distanceToSeed = length(delta);
+        bool continuing = previousFamily != 0u &&
+                          previousFamily == _FamilyIds[i];
+        float supportMargin = continuing ? _MaximumEdgeLength : 0.0;
+        if (distanceToSeed > radius + supportMargin)
+            continue;
+
+        float4 plane = _FamilyPlanes[i];
+        float3 planeNormal = normalize(plane.xyz);
+        float alignment = abs(dot(WorldNormal(vertex), planeNormal));
+        if (alignment < _MinimumNormalDot)
+            continue;
+        float residual = abs(dot(position, planeNormal) - plane.w);
+        float limit = continuing ? _ExitResidual : _EnterResidual;
+        if (residual > limit)
+            continue;
+
+        float score = residual * 4.0 + distanceToSeed / max(radius, 0.01);
+        if (continuing)
+            score -= 0.25;
+        if (score >= bestScore)
+            continue;
+        bestScore = score;
+        bestLabel = i + 1u;
+    }
+
+    _ScratchLabels[vertexIndex] = bestLabel;
+}
+
+[numthreads(64, 1, 1)]
+void PropagateLabels(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    uint triBase = triangleIndex * 3u;
+    if (triBase + 2u >= _IndexCount)
+        return;
+
+    uint a = _Indices[triBase] & 0x3fffffffu;
+    uint b = _Indices[triBase + 1u] & 0x3fffffffu;
+    uint c = _Indices[triBase + 2u] & 0x3fffffffu;
+    if (a >= _VertexCount || b >= _VertexCount || c >= _VertexCount)
+        return;
+
+    uint label0 = _ScratchLabels[a];
+    uint label1 = _ScratchLabels[b];
+    uint label2 = _ScratchLabels[c];
+    uint candidate = 0u;
+    uint candidateFamily = 0u;
+
+    if (label0 > 0u && label0 <= _FamilySeedCount)
+    {
+        candidate = label0;
+        candidateFamily = _FamilyIds[label0 - 1u];
+    }
+    if (label1 > 0u && label1 <= _FamilySeedCount)
+    {
+        uint family1 = _FamilyIds[label1 - 1u];
+        if (candidate == 0u)
+        {
+            candidate = label1;
+            candidateFamily = family1;
+        }
+        else if (family1 != candidateFamily)
+        {
+            if (!SeedsCoplanar(candidate, label1) ||
+                !TriangleFitsSeed(a, b, c, candidate) ||
+                !TriangleFitsSeed(a, b, c, label1))
+                return;
+            if (label1 < candidate)
+            {
+                candidate = label1;
+                candidateFamily = family1;
+            }
+        }
+        else if (!TriangleFitsSeed(a, b, c, candidate) &&
+                 TriangleFitsSeed(a, b, c, label1))
+            candidate = label1;
+    }
+    if (label2 > 0u && label2 <= _FamilySeedCount)
+    {
+        uint family2 = _FamilyIds[label2 - 1u];
+        if (candidate == 0u)
+        {
+            candidate = label2;
+            candidateFamily = family2;
+        }
+        else if (family2 != candidateFamily)
+        {
+            if (!SeedsCoplanar(candidate, label2) ||
+                !TriangleFitsSeed(a, b, c, candidate) ||
+                !TriangleFitsSeed(a, b, c, label2))
+                return;
+            if (label2 < candidate)
+            {
+                candidate = label2;
+                candidateFamily = family2;
+            }
+        }
+        else if (!TriangleFitsSeed(a, b, c, candidate) &&
+                 TriangleFitsSeed(a, b, c, label2))
+            candidate = label2;
+    }
+
+    if (!TriangleFitsSeed(a, b, c, candidate))
+        return;
+
+    AdoptLabel(a, candidate);
+    AdoptLabel(b, candidate);
+    AdoptLabel(c, candidate);
+}
+
+[numthreads(64, 1, 1)]
+void ResolveFamilies(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexIndex = id.x;
+    if (vertexIndex >= _VertexCount)
+        return;
+    uint label = _ScratchLabels[vertexIndex];
+    _OutputFamilies[vertexIndex] = label > 0u && label <= _FamilySeedCount
+        ? _FamilyIds[label - 1u] : 0u;
+}
+
+[numthreads(64, 1, 1)]
+void CountTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint triBase = id.x * 3u;
+    if (triBase + 2u >= _IndexCount)
+        return;
+    uint a = _Indices[triBase] & 0x3fffffffu;
+    uint b = _Indices[triBase + 1u] & 0x3fffffffu;
+    uint c = _Indices[triBase + 2u] & 0x3fffffffu;
+    if (a >= _VertexCount || b >= _VertexCount || c >= _VertexCount)
+        return;
+    uint f0 = _OutputFamilies[a];
+    uint f1 = _OutputFamilies[b];
+    uint f2 = _OutputFamilies[c];
+    uint family = f0 != 0u ? f0 : (f1 != 0u ? f1 : f2);
+    bool conflict = family != 0u &&
+        ((f0 != 0u && f0 != family) ||
+         (f1 != 0u && f1 != family) ||
+         (f2 != 0u && f2 != family));
+    uint ignored;
+    if (conflict)
+        InterlockedAdd(_Stats[1], 1u, ignored);
+    else if (family != 0u)
+        InterlockedAdd(_Stats[0], 1u, ignored);
+    InterlockedAdd(_Stats[2], 1u, ignored);
+}

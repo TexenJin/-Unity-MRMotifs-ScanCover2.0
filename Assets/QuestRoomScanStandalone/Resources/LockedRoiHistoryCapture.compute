@@ -1,0 +1,296 @@
+#pragma kernel CaptureCells
+#pragma kernel CaptureFusionPre
+#pragma kernel CaptureFusionPost
+
+struct LockedRoiCell
+{
+    int3 coordinate;
+    uint valid;
+    float tsdf;
+    float weight;
+    uint responsibility0;
+    uint responsibility1;
+};
+
+Texture3D<float2> _TsdfVolume;
+Texture3D<uint2> _ResponsibilityVolume;
+RWStructuredBuffer<LockedRoiCell> _LockedRoiCells;
+int3 _RoiMin;
+int3 _RoiCount;
+int3 _VolumeCount;
+int _ResponsibilityAvailable;
+
+// Per-accepted-integration witness. Production never reads this buffer.
+// Every field is a 32-bit scalar so the layout is stable on Vulkan.
+struct LockedRoiFusionWitness
+{
+    int3 coordinate;
+    uint flags;
+    int2 pixel;
+    float rawDepthNdc;
+    float fusionDepthNdc;
+    float dilatedDepthNdc;
+    uint edgeReason;
+    uint temporalReason;
+    float voxelEyeDistance;
+    float depthEyeDistance;
+    float observedTsdf;
+    float preTsdf;
+    float preWeight;
+    float preVoteWeight;
+    float preAccumulatedTsdf;
+    uint preResponsibility0;
+    uint preResponsibility1;
+    float postTsdf;
+    float postWeight;
+    float postVoteWeight;
+    float postAccumulatedTsdf;
+    uint postResponsibility0;
+    uint postResponsibility1;
+    uint writeClaim;
+    float rawDepthEyeDistance;
+    float dilatedDepthEyeDistance;
+    float rawMinusFusionMillimetres;
+    float dilatedMinusFusionMillimetres;
+    uint reserved;
+};
+
+Texture2DArray<float> _RawDepth;
+Texture2DArray<float> _FusionDepth;
+Texture2D<float4> _DilatedDepth;
+Texture2DArray<uint> _EdgeReason;
+Texture2DArray<uint> _TemporalReason;
+Texture3D<float> _VoteWeightVolume;
+Texture3D<float> _AccumulatedTsdfVolume;
+StructuredBuffer<uint> _WriteEpochs;
+RWStructuredBuffer<LockedRoiFusionWitness> _FusionWitness;
+float4x4 _Projection[2];
+float4x4 _ProjectionInverse[2];
+float4x4 _View[2];
+float4x4 _ViewInverse[2];
+int2 _FusionDepthSize;
+float _VoxelSize;
+float _VoxelDistance;
+float _MinUpdateDistance;
+float _MaxUpdateDistance;
+uint _ExpectedWriteEpoch;
+int _RawDepthAvailable;
+int _TemporalReasonAvailable;
+
+#define WITNESS_VALID_COORD       (1u << 0)
+#define WITNESS_IN_PROJECTION     (1u << 1)
+#define WITNESS_RAW_VALID         (1u << 2)
+#define WITNESS_FUSION_VALID      (1u << 3)
+#define WITNESS_DILATED_VALID     (1u << 4)
+#define WITNESS_VOXEL_IN_RANGE    (1u << 5)
+#define WITNESS_DEPTH_IN_RANGE    (1u << 6)
+#define WITNESS_IN_TRUNCATION     (1u << 7)
+#define WITNESS_PRE_OBSERVED      (1u << 8)
+#define WITNESS_POST_OBSERVED     (1u << 9)
+#define WITNESS_WRITE_CLAIMED     (1u << 10)
+#define WITNESS_STATE_CHANGED     (1u << 11)
+#define WITNESS_SIGN_CHANGED      (1u << 12)
+#define WITNESS_EDGE_REASON       (1u << 13)
+#define WITNESS_TEMPORAL_PRESENT  (1u << 14)
+#define WITNESS_TEMPORAL_REASON   (1u << 15)
+
+float3 WitnessVoxelToWorld(int3 coordinate)
+{
+    return ((float3)coordinate + 0.5 - (float3)_VolumeCount * 0.5) * _VoxelSize;
+}
+
+float3 WitnessWorldToNdc(float3 worldPosition)
+{
+    float4 hcs = mul(_Projection[1], mul(_View[1], float4(worldPosition, 1.0)));
+    return (hcs.xyz / hcs.w) * 0.5 + 0.5;
+}
+
+float3 WitnessNdcToWorld(float3 ndc)
+{
+    float4 hcs = float4(ndc * 2.0 - 1.0, 1.0);
+    float4 worldH = mul(_ViewInverse[1], mul(_ProjectionInverse[1], hcs));
+    return worldH.xyz / worldH.w;
+}
+
+[numthreads(4, 4, 4)]
+void CaptureCells(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_RoiCount)) return;
+    uint flat = id.x + (uint)_RoiCount.x *
+        (id.y + (uint)_RoiCount.y * id.z);
+    int3 coordinate = _RoiMin + (int3)id;
+    LockedRoiCell cell;
+    cell.coordinate = coordinate;
+    cell.valid = all(coordinate >= int3(0, 0, 0)) &&
+        all(coordinate < _VolumeCount) ? 1u : 0u;
+    cell.tsdf = -1.0;
+    cell.weight = 0.0;
+    cell.responsibility0 = 0u;
+    cell.responsibility1 = 0u;
+    if (cell.valid != 0u)
+    {
+        float2 sample = _TsdfVolume[coordinate];
+        cell.tsdf = sample.x;
+        cell.weight = sample.y;
+        if (_ResponsibilityAvailable != 0)
+        {
+            uint2 responsibility = _ResponsibilityVolume[coordinate];
+            cell.responsibility0 = responsibility.x;
+            cell.responsibility1 = responsibility.y;
+        }
+    }
+    _LockedRoiCells[flat] = cell;
+}
+
+[numthreads(4, 4, 4)]
+void CaptureFusionPre(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_RoiCount)) return;
+    uint flat = id.x + (uint)_RoiCount.x *
+        (id.y + (uint)_RoiCount.y * id.z);
+    int3 coordinate = _RoiMin + (int3)id;
+
+    LockedRoiFusionWitness witness = (LockedRoiFusionWitness)0;
+    witness.coordinate = coordinate;
+    witness.pixel = int2(-1, -1);
+    witness.rawDepthNdc = -1.0;
+    witness.fusionDepthNdc = -1.0;
+    witness.dilatedDepthNdc = -1.0;
+    witness.observedTsdf = -2.0;
+    witness.preTsdf = -1.0;
+    witness.postTsdf = -1.0;
+
+    bool valid = all(coordinate >= int3(0, 0, 0)) &&
+                 all(coordinate < _VolumeCount);
+    if (!valid)
+    {
+        _FusionWitness[flat] = witness;
+        return;
+    }
+
+    witness.flags |= WITNESS_VALID_COORD;
+    float2 pre = _TsdfVolume[coordinate];
+    witness.preTsdf = pre.x;
+    witness.preWeight = pre.y;
+    witness.preVoteWeight = _VoteWeightVolume[coordinate];
+    witness.preAccumulatedTsdf = _AccumulatedTsdfVolume[coordinate];
+    uint2 preResponsibility = _ResponsibilityVolume[coordinate];
+    witness.preResponsibility0 = preResponsibility.x;
+    witness.preResponsibility1 = preResponsibility.y;
+    witness.postTsdf = pre.x;
+    witness.postWeight = pre.y;
+    witness.postVoteWeight = witness.preVoteWeight;
+    witness.postAccumulatedTsdf = witness.preAccumulatedTsdf;
+    witness.postResponsibility0 = preResponsibility.x;
+    witness.postResponsibility1 = preResponsibility.y;
+    if (abs(pre.y) > 0.0) witness.flags |= WITNESS_PRE_OBSERVED;
+
+    float3 worldPosition = WitnessVoxelToWorld(coordinate);
+    float3 eyePosition = _ViewInverse[1]._m03_m13_m23;
+    witness.voxelEyeDistance = length(worldPosition - eyePosition);
+    float3 viewPosition = mul(_View[1], float4(worldPosition, 1.0)).xyz;
+    float3 ndc = WitnessWorldToNdc(worldPosition);
+    bool inProjection = viewPosition.z <= -0.05 &&
+                        ndc.x >= 0.01 && ndc.x <= 0.99 &&
+                        ndc.y >= 0.01 && ndc.y <= 0.99;
+    if (!inProjection)
+    {
+        _FusionWitness[flat] = witness;
+        return;
+    }
+
+    witness.flags |= WITNESS_IN_PROJECTION;
+    int2 pixel = clamp((int2)floor(ndc.xy * (float2)_FusionDepthSize),
+                       int2(0, 0), _FusionDepthSize - 1);
+    witness.pixel = pixel;
+    witness.fusionDepthNdc = _FusionDepth[uint3(pixel, 1)];
+    witness.dilatedDepthNdc = _DilatedDepth[pixel].z;
+    witness.edgeReason = _EdgeReason[uint3(pixel, 1)];
+    witness.temporalReason = _TemporalReasonAvailable != 0
+        ? _TemporalReason[uint3(pixel, 1)] : 0u;
+    if (_RawDepthAvailable != 0)
+    {
+        witness.rawDepthNdc = _RawDepth[uint3(pixel, 0)];
+        if (witness.rawDepthNdc > 0.0) witness.flags |= WITNESS_RAW_VALID;
+    }
+    if (witness.fusionDepthNdc > 0.0) witness.flags |= WITNESS_FUSION_VALID;
+    if (witness.dilatedDepthNdc > 0.0) witness.flags |= WITNESS_DILATED_VALID;
+    if (witness.voxelEyeDistance <= _MaxUpdateDistance)
+        witness.flags |= WITNESS_VOXEL_IN_RANGE;
+    if (witness.edgeReason != 0u) witness.flags |= WITNESS_EDGE_REASON;
+    if (_TemporalReasonAvailable != 0)
+    {
+        witness.flags |= WITNESS_TEMPORAL_PRESENT;
+        if (witness.temporalReason != 0u) witness.flags |= WITNESS_TEMPORAL_REASON;
+    }
+
+    if (witness.fusionDepthNdc > 0.0)
+    {
+        float3 depthPosition = WitnessNdcToWorld(
+            float3(ndc.xy, witness.fusionDepthNdc));
+        witness.depthEyeDistance = length(depthPosition - eyePosition);
+        if (witness.depthEyeDistance >= _MinUpdateDistance)
+            witness.flags |= WITNESS_DEPTH_IN_RANGE;
+        float projectiveSdf = witness.depthEyeDistance - witness.voxelEyeDistance;
+        witness.observedTsdf = clamp(projectiveSdf / _VoxelDistance, -1.0, 1.0);
+        if (projectiveSdf >= -_VoxelDistance)
+            witness.flags |= WITNESS_IN_TRUNCATION;
+    }
+    if (witness.rawDepthNdc > 0.0)
+    {
+        float3 rawPosition = WitnessNdcToWorld(
+            float3(ndc.xy, witness.rawDepthNdc));
+        witness.rawDepthEyeDistance = length(rawPosition - eyePosition);
+        if (witness.fusionDepthNdc > 0.0)
+            witness.rawMinusFusionMillimetres =
+                (witness.rawDepthEyeDistance - witness.depthEyeDistance) * 1000.0;
+    }
+    if (witness.dilatedDepthNdc > 0.0)
+    {
+        float3 dilatedPosition = WitnessNdcToWorld(
+            float3(ndc.xy, witness.dilatedDepthNdc));
+        witness.dilatedDepthEyeDistance = length(dilatedPosition - eyePosition);
+        if (witness.fusionDepthNdc > 0.0)
+            witness.dilatedMinusFusionMillimetres =
+                (witness.dilatedDepthEyeDistance - witness.depthEyeDistance) * 1000.0;
+    }
+    _FusionWitness[flat] = witness;
+}
+
+[numthreads(4, 4, 4)]
+void CaptureFusionPost(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_RoiCount)) return;
+    uint flat = id.x + (uint)_RoiCount.x *
+        (id.y + (uint)_RoiCount.y * id.z);
+    LockedRoiFusionWitness witness = _FusionWitness[flat];
+    int3 coordinate = witness.coordinate;
+    if ((witness.flags & WITNESS_VALID_COORD) == 0u) return;
+
+    float2 post = _TsdfVolume[coordinate];
+    witness.postTsdf = post.x;
+    witness.postWeight = post.y;
+    witness.postVoteWeight = _VoteWeightVolume[coordinate];
+    witness.postAccumulatedTsdf = _AccumulatedTsdfVolume[coordinate];
+    uint2 postResponsibility = _ResponsibilityVolume[coordinate];
+    witness.postResponsibility0 = postResponsibility.x;
+    witness.postResponsibility1 = postResponsibility.y;
+    if (abs(post.y) > 0.0) witness.flags |= WITNESS_POST_OBSERVED;
+
+    uint volumeFlat = (uint)coordinate.x + (uint)_VolumeCount.x *
+        ((uint)coordinate.y + (uint)_VolumeCount.y * (uint)coordinate.z);
+    witness.writeClaim = _WriteEpochs[volumeFlat];
+    if ((witness.writeClaim >> 8) == (_ExpectedWriteEpoch & 0x00ffffffu))
+        witness.flags |= WITNESS_WRITE_CLAIMED;
+    if (abs(witness.postTsdf - witness.preTsdf) > 1e-6 ||
+        abs(witness.postWeight - witness.preWeight) > 1e-6 ||
+        abs(witness.postVoteWeight - witness.preVoteWeight) > 1e-6)
+        witness.flags |= WITNESS_STATE_CHANGED;
+    if (witness.preWeight > 0.0 && witness.postWeight > 0.0 &&
+        ((witness.preTsdf < 0.0 && witness.postTsdf >= 0.0) ||
+         (witness.preTsdf >= 0.0 && witness.postTsdf < 0.0)))
+        witness.flags |= WITNESS_SIGN_CHANGED;
+    _FusionWitness[flat] = witness;
+}
+
+

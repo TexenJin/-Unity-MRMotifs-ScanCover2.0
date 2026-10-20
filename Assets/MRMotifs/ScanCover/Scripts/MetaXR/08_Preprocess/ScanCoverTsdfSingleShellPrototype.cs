@@ -10463,8 +10463,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
 
         CompactBatchContext context = _compactBatchContext;
         context.SnapshotCount++;
-        Vector3 cameraPosition = snapshot.hasSnapshotCameraPose
-            ? snapshot.snapshotCameraPosition
+        Vector3 cameraPosition = snapshot.hasDispatchEyePosition
+            ? snapshot.dispatchEyePosition
+            : snapshot.hasSnapshotCameraPose
+                ? snapshot.snapshotCameraPosition
             : GetCameraPosition();
         Quaternion cameraRotation = snapshot.hasSnapshotCameraPose
             ? snapshot.snapshotCameraRotation
@@ -12261,8 +12263,10 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         if (!_referenceClassicTsdf.IsCompatible(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters))
             _referenceClassicTsdf.Reset(_dimX, _dimY, _dimZ, _volumeOriginWorld, voxelSizeMeters);
 
-        Vector3 captureCamera = snapshot.hasSnapshotCameraPose
-            ? snapshot.snapshotCameraPosition
+        Vector3 captureCamera = snapshot.hasDispatchEyePosition
+            ? snapshot.dispatchEyePosition
+            : snapshot.hasSnapshotCameraPose
+                ? snapshot.snapshotCameraPosition
             : GetCameraPosition();
         _referenceClassicTsdf.IntegrateFrame(
             positions, normals, meta, width, height, Mathf.Max(1, sampleStridePixels), captureCamera,
@@ -13027,15 +13031,18 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
         BeginFusionDenseStampFrame();
         BeginFastFusionDecisionJournal(snapshot.frameIndex);
 
-        Vector3 cameraPosition = GetCameraPosition();
-        _rawCoverageCaptureCameraPosition = snapshot.hasSnapshotCameraPose
-            ? snapshot.snapshotCameraPosition
-            : cameraPosition;
+        Vector3 currentCameraPosition = GetCameraPosition();
+        Vector3 cameraPosition = snapshot.hasDispatchEyePosition
+            ? snapshot.dispatchEyePosition
+            : snapshot.hasSnapshotCameraPose
+                ? snapshot.snapshotCameraPosition
+                : currentCameraPosition;
+        _rawCoverageCaptureCameraPosition = cameraPosition;
         _rawCoverageCaptureCameraValid = true;
         double integrationRealtime = Time.realtimeSinceStartupAsDouble;
-        float posePositionDelta = snapshot.hasSnapshotCameraPose
-            ? Vector3.Distance(snapshot.snapshotCameraPosition, cameraPosition)
-            : -1f;
+        float posePositionDelta = Vector3.Distance(
+            cameraPosition,
+            currentCameraPosition);
         Quaternion integrationRotation = Camera.main != null ? Camera.main.transform.rotation : Quaternion.identity;
         float poseAngleDelta = snapshot.hasSnapshotCameraPose
             ? Quaternion.Angle(snapshot.snapshotCameraRotation, integrationRotation)
@@ -53302,10 +53309,14 @@ public sealed class ScanCoverTsdfSingleShellPrototype : MonoBehaviour
                 _hudText.color = streamingWarning
                     ? hudWarningColor
                     : hudHealthyColor;
+                string chiselStatus = _questRoomSurfaceNetsPipeline != null &&
+                                      _questRoomSurfaceNetsPipeline.ChiselRouteShadow != null
+                    ? $"\n{_questRoomSurfaceNetsPipeline.ChiselRouteShadow.CompactStatus}"
+                    : "\nCHSL waiting";
                 _hudText.text =
                     $"PAIR {streamingPairs}    STREAM " +
                     $"{(minimalBatchActive ? "ON" : "PAUSED")}    " +
-                    $"ROUND {streamingRound}";
+                    $"ROUND {streamingRound}" + chiselStatus;
                 return;
             }
 

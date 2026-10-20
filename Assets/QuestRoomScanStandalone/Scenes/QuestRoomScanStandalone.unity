@@ -214,8 +214,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 3f9a1c4e8b2d4f6a9c0e1b3d5f708192, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.StandaloneRoomScanner
-  integrationHz: 30
-  meshExtractionHz: 30
+  integrationHz: 10
+  meshExtractionHz: 5
+  infiniTamPhaseMarginSeconds: 0.02
   wireframeMode: 1
   wireThickness: 1
   meshDisplayStride: 1
@@ -223,7 +224,7 @@ MonoBehaviour:
   confidenceViz: 1
   geometryTruthView: 1
   enableHeadExclusion: 1
-  enableFrozenChunkAbExperiment: 0
+  enableFrozenChunkAbExperiment: 1
   enableHeraHierarchicalReplay: 1
   abMaxChunksPerTick: 3
   keepFrozenReplayAfterExport: 1
@@ -250,14 +251,16 @@ MonoBehaviour:
   liveTrackMaxPagesPerSweep: 5
   enableIncrementalHeraRefine: 1
   frozenPageRequeueCooldownSeconds: 15
-  enablePlaneFitShadow: 1
+  enablePlaneFitShadow: 0
   planeFitShadowCompute: {fileID: 7200000, guid: cf3a91b27e4d4f58a6c0d9e1b2a34f56, type: 3}
+  enableStablePlaneLandmarkPreview: 0
   enablePlaneFlatten: 0
   planeFlattenMinDelta: 0.3
   planeFlattenMinConf: 0.25
   planeFlattenIntervalSec: 0.5
   planeFlattenMinCoherence: 0.5
   planeFlattenRepageMaxPerTick: 8
+  enablePlanePriorCensus: 0
   logLevel: 1
   showStatusBadge: 1
   showDetailedRuntimeStatus: 0
@@ -293,7 +296,7 @@ MonoBehaviour:
   coarseSkinStride: 4
   coarseSkinMinWeight: 0.04
   coarseSkinHz: 4
-  enableCoarseSkin: 0
+  enableCoarseSkin: 1
   coarseSkinRouteValidation: 1
   supportTruthCompute: {fileID: 7200000, guid: dba65707c49d4936a893cb434406b3ca, type: 3}
   supportTruthShader: {fileID: 4800000, guid: e8074dd27747421f9cf5bb3e40bf8338, type: 3}
@@ -303,15 +306,16 @@ MonoBehaviour:
   supportTruthSurfelRadius: 0.07
   supportTruthHoldSeconds: 0.75
   gpuVertexBudgetPercent: 0.08
+  enableLockedRoiHistoryCapture: 0
   diagnosticReadbackHz: 2
   enableGeometryStabilityDiagnostics: 1
   geometryDiagnosticHz: 1
   geometryDiagnosticSurfaceBand: 0.3
-  enablePersistentDirtyChunks: 0
+  enablePersistentDirtyChunks: 1
   maxDirtyChunksPerExtraction: 2
   extractionHaloVoxels: 2
   dirtyLedgerReadbackHz: 5
-  enableSparseFoundationSkin: 0
+  infiniTamDirtyReadbackHz: 5
   enableDiagnosticRoi: 1
   diagnosticRoiRect: {x: 0.2, y: 0.25, z: 0.8, w: 0.75}
   diagnosticRoiSplitX: {x: 0.44, y: 0.56}
@@ -334,19 +338,18 @@ MonoBehaviour:
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.VolumeIntegrator
   compute: {fileID: 7200000, guid: 6bdf7fc95400b4f52aae8f59e74a4905, type: 3}
   voxelCount:
-    x: 256
-    y: 256
-    z: 256
-  voxelSize: 0.05
-  voxelDistance: 0.15
+    x: 96
+    y: 64
+    z: 96
+  voxelSize: 0.1
+  voxelDistance: 0.25
   voxelMin: 0.1
   depthDisparityThreshold: 0.5
-  maxUpdateDist: 5
-  minUpdateDist: 0.5
-  exclusionRadius: 0.6
+  maxUpdateDist: 3.5
+  minUpdateDist: 0.15
+  exclusionRadius: 0.35
   maxFrustumPositions: 1000000
-  integrationViewportScale: 1
-  enableFrustumPhaseCoverage: 0
+  integrationViewportScale: 0.85
   blendRate: 0.8
   stability: 2.5
   weightGrowth: 0.025
@@ -354,7 +357,7 @@ MonoBehaviour:
   carveGain: 0.075
   carveInsideExclusion: 1
   rejectNearSamples: 1
-  carveBypassDilation: 0
+  carveBypassDilation: 1
   carveBypassNormal: 1
   carveBypassMargin: 0.5
   carveBypassBoost: 2
@@ -384,9 +387,6 @@ MonoBehaviour:
   extractionChunkSize: 64
   dirtyTsdfThreshold: 0.02
   dirtySurfaceBand: 1
-  enableQrsReferenceBaseline: 1
-  enableInfiniTamBaseline: 0
-  enableCompactInfiniTamHistory: 0
   enableProjectiveShadow: 0
   confidenceRate: 0.15
   confidenceMidMax: 0.1
@@ -395,7 +395,7 @@ MonoBehaviour:
   warmupIntegrations: 3
   pruneIntervalSeconds: 3
   pruneSlicesPerIntegration: 8
-  coverageUpdateInterval: 30
+  coverageUpdateInterval: 120
 --- !u!114 &170429784
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -412,12 +412,9 @@ MonoBehaviour:
   depthDilationCompute: {fileID: 7200000, guid: 0d6a7d2279e7547dd9ab3b58d73f99e8, type: 3}
   bilateralFilterCompute: {fileID: 7200000, guid: bde882d2fb87a4de7ae342e8acf27418, type: 3}
   depthEdgeCleanCompute: {fileID: 7200000, guid: b4f6bc291209432ca9515fbaa165c03e, type: 3}
-  enableSeedPlaneProductionExperiment: 0
-  enableGunGelDualTestimony: 0
-  enableTemporalFilter: 0
   handMaskCompute: {fileID: 0}
   enableNativeHandRemoval: 0
-  enableHandMask: 0
+  enableHandMask: 1
   handPalmRadius: 0.11
   handTipRadius: 0.07
   controllerSphereRadius: 0.13
@@ -426,7 +423,7 @@ MonoBehaviour:
   sigmaColor: 0.1
   sigmaDepth: 0.02
   filterRadius: 2
-  enableDepthEdgeClean: 0
+  enableDepthEdgeClean: 1
   edgeProbeRadiusPixels: 1
   edgeJumpBaseMeters: 0.035
   edgeJumpDistanceScale: 0.018
@@ -451,7 +448,7 @@ MonoBehaviour:
   edgeCrossEyeMarginScale: 0.03
   edgeCrossEyeMinOtherFacing: 0.2
   dilationSteps: 8
-  voxelDistance: 0.2
+  voxelDistance: 0.25
   voxelSize: 0.1
 --- !u!4 &170429785
 Transform:

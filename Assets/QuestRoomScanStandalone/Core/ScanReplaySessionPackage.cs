@@ -24,7 +24,7 @@ namespace Genesis.RoomScan
     /// 距离场或网格。
     /// </summary>
     [DisallowMultipleComponent]
-    internal sealed class ScanReplaySessionPackage : MonoBehaviour
+    internal sealed partial class ScanReplaySessionPackage : MonoBehaviour
     {
         internal const string Schema = "scancover.replay_session.v1";
         private const int RecordedEye = DepthCapture.FusionEyeIndex;
@@ -376,6 +376,7 @@ namespace Genesis.RoomScan
             _active = true;
             Active = this;
             Latest = this;
+            BeginLockedRoiCaptureLedger();
 
             File.WriteAllText(_fusionManifest,
                 "sequence,attemptIndex,sourceFrame,unityFrame,scaledTime,unscaledTime,accepted,decision,guarded,gunGelAdmissionActive,gunGelFrame,translationMm,rotationDeg,angularDegPerSec,linearMps,motionQuality,fusionHeadAvailable,fusionHeadX,fusionHeadY,fusionHeadZ,fusionHeadQx,fusionHeadQy,fusionHeadQz,fusionHeadQw,fusionHeadPitchDeg,fusionHeadYawDeg,fusionHeadRollDeg,fusionEyeAvailable,fusionEyeX,fusionEyeY,fusionEyeZ,fusionEyeForwardX,fusionEyeForwardY,fusionEyeForwardZ,headToFusionEyeMm,cameraAvailable,cameraPitchDeg,cameraYawDeg,cameraRollDeg,depthFile,normalFile,dilatedFile,edgeReasonFile,temporalReasonFile,cameraFile,gunGelObservationsFile,gunGelCorrespondencesFile,metaFile,status\n",
@@ -396,6 +397,9 @@ namespace Genesis.RoomScan
                 BuildFullOutputIndexJson(), new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(_sessionDirectory, "README.txt"),
                 "ScanCover 独立回放会话\n" +
+                (_lockedRoiCaptureEnabled
+                    ? "本轮为蓝色锁框历史模式：不保存整帧 depth_pairs/fusion_inputs；artifacts/locked_roi_history 保存框内体素、已发布 Front 以及每次接纳融合的同帧深度与 TSDF 前后态。\n"
+                    : string.Empty) +
                 "1. capture_complete.json 不存在时，本会话尚未封口，不得作为确定性样本。\n" +
                 "2. HUD 必须显示‘已封口/安全退出[是]’后才能退出应用；hashing 仍是封口过程。\n" +
                 "3. 先运行 Tools/ScanCoverReplaySession.py 校验全部 SHA-256。\n" +
@@ -407,7 +411,7 @@ namespace Genesis.RoomScan
                 "9. runtime_timeline/frames.csv 连续记录帧率、头姿、距离位移、深度帧号、融合 epoch、纸皮队列/提交/显示状态；integration_dispatches.csv 将融合 attempt/sourceFrame 精确接到 dirtyEpoch。\n" +
                 "10. artifacts/paper_audit/production_paper_replacements.csv 记录最终生产纸皮每次整块替换时的姿态、距离、融合状态与旧新占用变化；surface ledger 给出平面残差及相邻页接缝；production_paper_occupancy 是不依赖显示档位的正式5cm纸皮占用。\n" +
                 "11. system_reference/status.json 说明外部系统网格交接状态；旧 Scene 导出的 OBJ 仅作对照，不是生产真值。\n" +
-                "12. artifacts/tsdf_responsibility 保存最终 TSDF 与逐体素当前生命周期的出生、最后几何改写；紧凑 InfiniTAM 路线另输出逐体素 cross_frame_push_pull 账，以及 zero_crossing_edge_responsibility_summary.json 与 worst.csv。后两者把最终零交叉物理边的 A/B 两端、正负推动次数、最强当前/前序融合编号和零点局部坐标放到同一行；integrationCount 可反查实际 sourceFrame。它们均为只读旁路，累计次数不冒充同时发生。\n" +
+                "12. artifacts/tsdf_responsibility 保存最终 TSDF 与逐体素当前生命周期的出生、最后几何改写；紧凑 InfiniTAM 路线另输出 cross_frame_push_pull_summary.json 与 worst.csv，记录同一体素被相邻有效观测向正/负两侧推动的次数和最强两次融合编号。integrationCount 可反查实际 sourceFrame；这些均为只读旁路。\n" +
                 "13. final_surface_court/frame_gate_summary.csv 记录每帧各拒绝关卡汇总；independent_testimonies.csv 记录真正入档的独立证词；decision_checks.csv 记录每次判决的假设、残差、票份额、滞回和冷却结果。它们不逐像素写日志。\n" +
                 "14. production_paper_quality_timeline.csv 记录每次正式块提交时各4x4x4小区的 crossing/raw/final 平整度，区分入场已凹凸、后续抚平、长期残留和恶化。\n" +
                 "15. 将已封口 session 复制到电脑后运行 Tools/AnalyzeFullOutputLedger.ps1 -SessionDirectory <session>；它会生成 artifacts/responsibility_ledger 四张总账，并联合角度、距离、姿态、运动、候选、裁判、TSDF与纸皮，禁止单因素冒名定罪。\n",
@@ -430,7 +434,8 @@ namespace Genesis.RoomScan
             if (Active == this) Active = null;
             _probeShadowLedger?.End();
             _directProjectionShadowLedger?.End();
-            RequestSurfaceFeatureArchiveBuild();
+            if (!_lockedRoiCaptureEnabled)
+                RequestSurfaceFeatureArchiveBuild();
 
             try
             {
@@ -480,6 +485,8 @@ namespace Genesis.RoomScan
 
         private void Update()
         {
+            if (_endRequested && !_depthStreamsComplete)
+                GetComponent<PairedDepthFrameRecorder>()?.TryReportDepthDrain();
             // Begin() normally runs immediately after the volume allocation, but
             // Quest can finish creating the diagnostic UAV one frame later. Give
             // the read-only ledger that short window again while the volume is
@@ -592,6 +599,7 @@ namespace Genesis.RoomScan
 
         private void FlushRuntimeLedgers()
         {
+            FlushLockedRoiCaptureLedger();
             lock (_fileLock)
             {
                 if (_runtimeTimelineBuffer.Length > 0)
@@ -667,7 +675,8 @@ namespace Genesis.RoomScan
             float linearSpeed,
             float motionQuality)
         {
-            if (!_active || _probeShadowLedger == null) return;
+            if (!_active || _lockedRoiCaptureEnabled ||
+                _probeShadowLedger == null) return;
             _preProbeStages[gunGelFrame] = CountProbeStages(correspondences);
             _probeShadowLedger.Record(gunGelFrame, platformFrame, correspondences,
                 gridX, gridY, pixelStride, depthWidth, depthHeight,
@@ -683,14 +692,16 @@ namespace Genesis.RoomScan
             int platformFrame, NativeArray<Unity.Mathematics.uint4> rows,
             float angularSpeed, float linearSpeed, float motionQuality)
         {
-            if (!_active || _directProjectionShadowLedger == null) return;
+            if (!_active || _lockedRoiCaptureEnabled ||
+                _directProjectionShadowLedger == null) return;
             _directProjectionShadowLedger.Record(gunGelFrame, platformFrame,
                 rows, angularSpeed, linearSpeed, motionQuality);
         }
 
         internal void RecordDirectProjectionShadowReadbackError()
         {
-            if (!_active || _directProjectionShadowLedger == null) return;
+            if (!_active || _lockedRoiCaptureEnabled ||
+                _directProjectionShadowLedger == null) return;
             _directProjectionShadowLedger.RecordReadbackError();
         }
 
@@ -735,6 +746,14 @@ namespace Genesis.RoomScan
             int exclusionCount)
         {
             if (!_active) return;
+            if (_lockedRoiCaptureEnabled)
+            {
+                RecordDecisionOnly(attemptIndex, sourceFrame, true,
+                    "locked_roi_only:" + decision, guarded, gunGelFrame,
+                    translationMm, rotationDeg, angularSpeed, linearSpeed,
+                    motionQuality);
+                return;
+            }
             if (OutstandingCount >= MaxOutstandingFusionFrames * 8)
             {
                 Interlocked.Increment(ref _fusionDropped);
@@ -1077,6 +1096,11 @@ namespace Genesis.RoomScan
 
         private void CaptureOnlineArtifacts()
         {
+            if (_lockedRoiCaptureEnabled)
+            {
+                CaptureLockedRoiOnlineArtifacts();
+                return;
+            }
             try
             {
                 MeshExtractor mesh = MeshExtractor.Instance;
@@ -1568,7 +1592,8 @@ namespace Genesis.RoomScan
                              (_directProjectionShadowLedger?.WriteErrors ?? 0) == 0 &&
                              (_directProjectionShadowLedger?.ReadbackErrors ?? 0) == 0 &&
                              (_directProjectionShadowLedger?.OverflowRecords ?? 0) == 0 &&
-                             (_directProjectionShadowLedger?.Frames ?? 0) > 0 &&
+                             (_lockedRoiCaptureEnabled ||
+                              (_directProjectionShadowLedger?.Frames ?? 0) > 0) &&
                              (_probeFinalBufferLedger?.WriteErrors ?? 0) == 0 &&
                              (_probeFinalBufferLedger?.AdjudicatorWriteErrors ?? 0) == 0 &&
                              (_probeFinalBufferLedger?.GraduationRaceWriteErrors ?? 0) == 0 &&
@@ -1662,7 +1687,8 @@ namespace Genesis.RoomScan
                          (_directProjectionShadowLedger?.WriteErrors ?? 0) == 0 &&
                          (_directProjectionShadowLedger?.ReadbackErrors ?? 0) == 0 &&
                          (_directProjectionShadowLedger?.OverflowRecords ?? 0) == 0 &&
-                         (_directProjectionShadowLedger?.Frames ?? 0) > 0 &&
+                         (_lockedRoiCaptureEnabled ||
+                          (_directProjectionShadowLedger?.Frames ?? 0) > 0) &&
                           (_probeFinalBufferLedger?.WriteErrors ?? 0) == 0 &&
                           (_probeFinalBufferLedger?.AdjudicatorWriteErrors ?? 0) == 0 &&
                           (_probeFinalBufferLedger?.GraduationRaceWriteErrors ?? 0) == 0 &&
@@ -1851,7 +1877,7 @@ namespace Genesis.RoomScan
                    "    \"sameEpochSurfaceStageResponsibility\": \"artifacts/paper_audit/production_paper_surface_ledger.txt sections stage_responsibility_contract and stage_responsibility_spatial_csv\",\n" +
                    "    \"committedPaperRoughnessAndSeams\": \"artifacts/paper_audit/production_paper_surface_ledger.txt\",\n" +
                     "    \"fusionVoxelAndFovPeriods\": \"artifacts/paper_audit/fusion_forensic_ledger.txt, fusion_fov_periods.csv and fusion_all_counters.csv for production/raw-projective lanes\",\n" +
-                    "    \"tsdfTransactionResponsibility\": \"artifacts/tsdf_responsibility joins each final zero-crossing endpoint to current-lifetime seed and last geometry writer; compact InfiniTAM keeps per-voxel cross-frame push history and derives zero_crossing_edge_responsibility_summary.json plus zero_crossing_edge_responsibility_worst.csv to place both physical edge endpoints, their accepted push counts and strongest current/prior integration ids on one read-only row\",\n" +
+                    "    \"tsdfTransactionResponsibility\": \"artifacts/tsdf_responsibility joins each final zero-crossing endpoint to current-lifetime seed and last geometry writer; compact InfiniTAM adds per-voxel cross-frame positive/negative push counts plus the strongest current/prior integration pair in cross_frame_push_pull_summary.json and cross_frame_push_pull_worst.csv\",\n" +
                      "    \"blankPaperResponsibility\": \"artifacts/paper_audit/production_paper_occupancy plus final TSDF responsibility are joined offline to locate missing paper at TSDF support/crossing, extraction/candidate or publication boundaries\"\n" +
                    "  },\n" +
                    "  \"antiMaskingRule\": \"attribute the earliest stage where joined records diverge; do not infer one cause from a later mixed surface alone\",\n" +

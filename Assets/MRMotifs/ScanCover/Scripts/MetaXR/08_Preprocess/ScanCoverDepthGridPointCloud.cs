@@ -157,7 +157,6 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
     private Matrix4x4 _pendingDepthReprojectionMatrix = Matrix4x4.identity;
     private bool _pendingHasEyePosition;
     private Vector3 _pendingEyePosition;
-    private static readonly int EnvironmentDepthReprojectionMatricesId = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
     private RawDepthFrameSnapshot _latestRawDepthFrameSnapshot;
     private int _rawDepthSnapshotFrameIndex;
     private bool[] _currentValid = Array.Empty<bool>(); private bool[] _currentLineValid = Array.Empty<bool>(); private Vector3[] _currentPositions = Array.Empty<Vector3>(); private Vector3[] _currentNormals = Array.Empty<Vector3>(); private float[] _currentConfidences = Array.Empty<float>(); private Vector2Int _currentResolution;
@@ -9859,11 +9858,12 @@ public sealed class ScanCoverDepthGridPointCloud : MonoBehaviour
             }
         }
 
-        Matrix4x4[] matrices = Shader.GetGlobalMatrixArray(EnvironmentDepthReprojectionMatricesId);
-        if (matrices != null && _pendingSourceEyeIndex >= 0 && _pendingSourceEyeIndex < matrices.Length)
+        if (preprocessor != null &&
+            preprocessor.HasLastDispatchDepthReprojectionMatrix)
         {
             _pendingHasDepthReprojectionMatrix = true;
-            _pendingDepthReprojectionMatrix = matrices[_pendingSourceEyeIndex];
+            _pendingDepthReprojectionMatrix =
+                preprocessor.LastDispatchDepthReprojectionMatrix;
         }
     }
 

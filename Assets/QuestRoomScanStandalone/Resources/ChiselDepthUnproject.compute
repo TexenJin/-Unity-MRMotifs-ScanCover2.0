@@ -1,0 +1,62 @@
+#pragma kernel UnprojectDepth
+
+Texture2DArray<float> _DepthTex;
+Texture2DArray<float4> _NormalTex;
+RWTexture2D<float4> _WorldPosition;
+RWTexture2D<float4> _ObservationMeta;
+
+int2 _ImageSize;
+int _Eye;
+float4x4 _ProjectionInverse;
+float4x4 _ViewInverse;
+float _MinimumDepthMeters;
+float _MaximumDepthMeters;
+
+[numthreads(8, 8, 1)]
+void UnprojectDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_ImageSize.x || id.y >= (uint)_ImageSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float depthNdc = _DepthTex.Load(int4(pixel, _Eye, 0));
+    float3 normal = _NormalTex.Load(int4(pixel, _Eye, 0)).xyz;
+    bool valid = depthNdc > 0.0 && depthNdc < 1.0;
+    if (!valid)
+    {
+        _WorldPosition[pixel] = 0.0;
+        _ObservationMeta[pixel] = 0.0;
+        return;
+    }
+
+    float2 uv = (float2(pixel) + 0.5) / float2(_ImageSize);
+    float4 clip = float4(uv * 2.0 - 1.0, depthNdc * 2.0 - 1.0, 1.0);
+    float4 viewH = mul(_ProjectionInverse, clip);
+    float4 worldH = mul(_ViewInverse, viewH);
+    valid = abs(viewH.w) > 0.00001 && abs(worldH.w) > 0.00001;
+    float3 world = valid ? worldH.xyz / worldH.w : 0.0;
+    float3 camera = mul(_ViewInverse, float4(0, 0, 0, 1)).xyz;
+    float range = distance(world, camera);
+    // Avoid relying on the HLSL isfinite intrinsic here: some Quest Vulkan
+    // compiler variants reject it. NaN fails self-equality; the magnitude
+    // bound also rejects infinities and corrupt transforms.
+    valid = valid && all(world == world) && all(abs(world) < 100000.0) &&
+            range >= _MinimumDepthMeters && range <= _MaximumDepthMeters;
+
+    float normalLengthSq = dot(normal, normal);
+    float incidence = 0.25;
+    if (valid && normalLengthSq > 0.0625)
+    {
+        float3 rayDirection = normalize(world - camera);
+        incidence = saturate(abs(dot(normalize(normal), -rayDirection)));
+    }
+    // Projective TSDF observations become less certain with range and at
+    // grazing incidence. Keep this as a weight, not a hard visibility gate.
+    float rangeWeight = saturate(3.0 / max(1.0, range));
+    float observationWeight = max(0.05, incidence * rangeWeight);
+
+    _WorldPosition[pixel] = valid ? float4(world, 1.0) : 0.0;
+    _ObservationMeta[pixel] = valid
+        ? float4(1.0, observationWeight, incidence, range)
+        : 0.0;
+}

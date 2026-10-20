@@ -30,13 +30,32 @@ RWTexture3D<float> gsInfiniTamViewTicketRW;
 // one representative when either a stable same-view batch qualifies or an
 // independent view arrives.
 RWTexture3D<float> gsInfiniTamMicroViewMeanRW;
+// Reversible pre-TSDF admission layer.  The model textures are rendered from
+// the sole stable TSDF at the exact pose of the depth frame being integrated.
+// The per-voxel state stores only a signed same-direction confirmation count;
+// support or unknown observations reset it. It is not a second surface map and
+// cannot publish geometry on its own.
+RWTexture3D<float> gsObservationAssociationStateRW;
+Texture2D<float> gsAssociationModelDepth;
+Texture2D<float> gsAssociationModelVoteWeight;
+Texture2D<float4> gsAssociationModelNormal;
+uint2 gsAssociationModelSize;
+float gsObservationAssociationEnable;
+float gsObservationOutlierRejectEnable;
+float gsGlobalStructureConstraintEnable;
+float gsAssociationSupportBandMeters;
+float gsAssociationConflictBandMeters;
+float gsAssociationMinModelVotes;
+int gsAssociationConfirmations;
+int gsStructureConfirmations;
+float gsStructureMinModelVotes;
+float gsStructureNormalAgreement;
 // One accepted compact-InfiniTAM integration may touch a world voxel only
 // once. Camera-local frustum samples can collapse onto the same snapped world
 // voxel after pose rotation; this claim sidecar makes those aliases one vote,
 // rather than several racing read/modify/write operations in the same frame.
-// Bits 29..8 contain a 22-bit frame epoch; bits 31..30 are the frame-local
-// edge-publication transaction; bits 7..0 contain the winning observation
-// quantized from [-1,+1]. The latter is diagnostic-only: it lets
+// Bits 31..8 contain a 24-bit frame epoch and bits 7..0 contain the winning
+// observation quantized from [-1,+1]. The latter is diagnostic-only: it lets
 // the cumulative ledger distinguish harmless duplicate aliases from aliases
 // that disagree by at least half a world voxel.
 RWStructuredBuffer<uint> _InfiniTamWriteEpochs;
@@ -106,7 +125,7 @@ uint gsFrozenChunkSize;        // 冻结块边长（体素）；0=冻结系统�
 float gsFrozenMatureWeight;    // 逐体素冻结资格/成熟度普查下限；冻结同时不得低于可读权重。
                                // 必须远高于种子出生权重 0.06——否则毛坯脚手架与长熟墙在普查里
                                // 同数"稳定"，块一冻权重永停出生值（实机：天棚冻在 0.06 卡黄死锁）
-RWStructuredBuffer<uint> _CarveStats; // 0..198既有；199..202同帧票；203..205零交叉一致发布 staged/approved/committed
+RWStructuredBuffer<uint> _CarveStats; // 0..198既有；199..202同帧票；203..210观测关联
 // ── 置信度通道（v1 只读影子，08-19）─────────────────────────────
 // 存"分歧 EMA"不存置信度：0=逐帧观测完全一致，1=完全矛盾。时序/视差二合一——
 // 头部运动后坏几何的逐帧观测会在 sd 上互相打架，|新观测-存量 sd| 的指数滑动
@@ -131,16 +150,8 @@ float gsInfiniTamCorrectionVoteWeight;
 float gsInfiniTamContradictionThreshold;
 int gsInfiniTamContradictionConfirmations;
 float gsInfiniTamIndependentViewCos;
-int gsInfiniTamSameViewSlowConfirmations;
 float gsInfiniTamSelectiveHistoryRelease;
-// Experimental zero-crossing publication transaction.  The integration pass
-// may stage a mature micro-view result, but only a second read-only pass may
-// approve it after finding a matching endpoint staged by the same accepted
-// depth dispatch.  A pair may either retain/move a zero crossing, or jointly
-// extinguish an existing crossing by becoming clearly same-sign.  A third
-// pass commits approved voxels.  No thread writes a neighbour and Surface
-// Nets/topology remain untouched.
-float gsInfiniTamEdgeCoherentPublication;
+float gsInfiniTamPlanarMicroCorrection;
 float gsWriteColor;
 float gsWriteAdmissionTrace;
 int gsPruneZOffset;
@@ -696,9 +707,7 @@ void RecordInfiniTamCrossFrameObservation(uint3 coord, uint previousClaim,
                                           float observedTsdf)
 {
     if (gsTsdfResponsibilityWrite < 0.5) return;
-    // The top two bits may carry the frame-local edge-coherence transaction.
-    // They are not part of provenance.
-    uint previousEpoch = (previousClaim >> 8u) & 0x003fffffu;
+    uint previousEpoch = previousClaim >> 8u;
     if (previousEpoch == 0u) return;
 
     uint previousByte = previousClaim & 0xffu;
@@ -993,16 +1002,8 @@ void CopyTsdfSupportResponsibilityExportSlice(uint3 id : SV_DispatchThreadID)
 }
 
 #pragma kernel Clear
-#pragma kernel ClearQrsReference
-
-[numthreads(4, 4, 4)]
-void ClearQrsReference(uint3 id : SV_DispatchThreadID)
-{
-    if (any(id >= gsVoxCount)) return;
-    gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
-    gsColorVolumeRW[id] = float4(0, 0, 0, 0);
-}
 #pragma kernel ClearInfiniTamVotes
+#pragma kernel ClearObservationAssociationState
 
 [numthreads(4, 4, 4)]
 void Clear(uint3 id : SV_DispatchThreadID)
@@ -1032,8 +1033,16 @@ void ClearInfiniTamVotes(uint3 id : SV_DispatchThreadID)
     gsInfiniTamAccumulatedTsdfRW[id] = 0.0;
     gsInfiniTamViewTicketRW[id] = 0.0;
     gsInfiniTamMicroViewMeanRW[id] = 0.0;
+    gsObservationAssociationStateRW[id] = 0.0;
     uint flat = id.x + gsVoxCount.x * (id.y + gsVoxCount.y * id.z);
     _InfiniTamWriteEpochs[flat] = 0u;
+}
+
+[numthreads(4, 4, 4)]
+void ClearObservationAssociationState(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= gsVoxCount)) return;
+    gsObservationAssociationStateRW[id] = 0.0;
 }
 
 #pragma kernel InvalidateGunGelSuccessions
@@ -1073,19 +1082,6 @@ void InvalidateGunGelSuccessions(uint3 groupId : SV_GroupID,
 }
 
 #pragma kernel Prune
-#pragma kernel PruneQrsReference
-
-[numthreads(4, 4, 4)]
-void PruneQrsReference(uint3 id : SV_DispatchThreadID)
-{
-    if (any(id >= gsVoxCount)) return;
-    float2 val = gsVolumeRW[id];
-    if (val.y > 0 && val.y < PRUNE_WEIGHT)
-    {
-        gsVolumeRW[id] = float2(GS_EMPTY_VOXEL, 0);
-        gsColorVolumeRW[id] = float4(0, 0, 0, 0);
-    }
-}
 
 [numthreads(4, 4, 4)]
 void Prune(uint3 id : SV_DispatchThreadID)
@@ -1108,29 +1104,6 @@ void Prune(uint3 id : SV_DispatchThreadID)
 }
 
 #pragma kernel IntegrateInfiniTam
-#pragma kernel EvaluateInfiniTamEdgeCoherence
-#pragma kernel CommitInfiniTamEdgeCoherence
-
-// _InfiniTamWriteEpochs doubles as the one-frame transaction ledger.  Compact
-// fusion epochs use 22 bits (more than four million accepted frames per scan),
-// leaving two high bits for staged/approved state.  The low byte always keeps
-// the raw observation for the responsibility ledger; the existing private
-// micro-view mean sidecar holds the staged representative.  Status is
-// frame-local and is overwritten by the next claim.
-static const uint kInfiniTamClaimPayloadMask = 0x000000ffu;
-static const uint kInfiniTamClaimEpochMask = 0x003fffffu;
-static const uint kInfiniTamCandidateApproved = 0x40000000u;
-static const uint kInfiniTamCandidateStaged = 0x80000000u;
-
-uint InfiniTamClaimEpoch(uint packed)
-{
-    return (packed >> 8u) & kInfiniTamClaimEpochMask;
-}
-
-float DecodeInfiniTamClaimTsdf(uint packed)
-{
-    return ((float)(packed & kInfiniTamClaimPayloadMask) / 255.0) * 2.0 - 1.0;
-}
 
 // The compact InfiniTAM route only wakes the persistent 64^3 extraction
 // ledgers. Keeping it separate avoids pulling dormant product/HERA UAVs into
@@ -1207,22 +1180,37 @@ void StoreInfiniTamViewTicket(uint3 coord, uint viewCode, uint sameViewAge)
     gsInfiniTamViewTicketRW[coord] = (float)packed;
 }
 
+void StoreInfiniTamMicroViewTicket(uint3 coord, uint viewCode,
+                                  uint sameViewAge, bool planarQualified)
+{
+    uint packed = (viewCode & 255u) | ((min(sameViewAge, 7u) & 7u) << 8u) |
+                  (planarQualified ? (1u << 11u) : 0u);
+    gsInfiniTamViewTicketRW[coord] = (float)packed;
+}
+
 // Return x = observation to integrate, y = micro-view event:
 // 0 not handled here, 1 bucket collecting/cooling / production quarantined,
 // 2 independent view arrived / commit the previous bucket mean exactly once,
-// 3 one same-view evidence batch stabilized / commit its mean exactly once.
+// 3 one conservative same-view evidence batch stabilized / commit once,
+// 4 a locally planar 1-5 cm same-view pair stabilized / commit once.
 // The helper owns the shared view ticket only while coherence is neutral.
 float2 InfiniTamSelectMicroViewObservation(uint3 coord,
                                           float previousTsdf,
                                           float observedTsdf,
                                           float previousVoteWeight,
-                                          uint currentViewCode)
+                                          uint currentViewCode,
+                                          bool stablePlanarMicroEvidence)
 {
     float coherence = gsCoherenceRW[coord];
     bool neutralCoherence = abs(coherence - 0.5) < 0.125;
     bool smallNearSurfaceChange = previousVoteWeight > 0.0 &&
         abs(previousTsdf) <= 0.5 &&
         abs(observedTsdf - previousTsdf) < gsInfiniTamContradictionThreshold;
+    float planarMinimumDelta = max(2.0 / 127.0,
+        gsInfiniTamContradictionThreshold * 0.20);
+    bool fastPlanarMicro = gsInfiniTamPlanarMicroCorrection > 0.5 &&
+        stablePlanarMicroEvidence && smallNearSurfaceChange &&
+        abs(observedTsdf - previousTsdf) >= planarMinimumDelta;
 
     if (!neutralCoherence || !smallNearSurfaceChange)
     {
@@ -1240,12 +1228,14 @@ float2 InfiniTamSelectMicroViewObservation(uint3 coord,
     uint sampleCount = (packed >> 8u) & 7u;
     if (sampleCount == 0u)
     {
-        StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+        StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u,
+                                     stablePlanarMicroEvidence);
         gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
         return float2(observedTsdf, 1.0);
     }
 
     uint bucketViewCode = packed & 255u;
+    bool bucketPlanarQualified = (packed & (1u << 11u)) != 0u;
     float viewDot = dot(DecodeInfiniTamViewDirection8(bucketViewCode),
                         DecodeInfiniTamViewDirection8(currentViewCode));
 
@@ -1255,14 +1245,24 @@ float2 InfiniTamSelectMicroViewObservation(uint3 coord,
     // same view must finish cooling before it can collect another batch.
     if (sampleCount >= 5u)
     {
-        if (viewDot <= gsInfiniTamIndependentViewCos)
+        // The closed cooldown belongs to the conservative path. A new local
+        // plane certificate may immediately start a fresh two-frame pair; it
+        // never converts an edge or an unsupported observation into evidence.
+        if (fastPlanarMicro)
         {
-            StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+            StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u, true);
+            gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+        }
+        else if (viewDot <= gsInfiniTamIndependentViewCos)
+        {
+            StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u,
+                                         stablePlanarMicroEvidence);
             gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
         }
         else if (sampleCount > 5u)
         {
-            StoreInfiniTamViewTicket(coord, bucketViewCode, sampleCount - 1u);
+            StoreInfiniTamMicroViewTicket(coord, bucketViewCode,
+                                         sampleCount - 1u, false);
         }
         else
         {
@@ -1274,12 +1274,21 @@ float2 InfiniTamSelectMicroViewObservation(uint3 coord,
 
     if (viewDot > gsInfiniTamIndependentViewCos)
     {
+        // A quick pair needs two plane-qualified frames, not one old generic
+        // bucket sample followed by a coincidentally clean frame.
+        if (stablePlanarMicroEvidence && !bucketPlanarQualified)
+        {
+            StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u, true);
+            gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
+            return float2(observedTsdf, 1.0);
+        }
+
+        bool fastPlanarPair = fastPlanarMicro && bucketPlanarQualified;
         float previousMean = gsInfiniTamMicroViewMeanRW[coord];
         float meanDelta = previousMean - previousTsdf;
         float observationDelta = observedTsdf - previousTsdf;
-        // Four consecutive samples must agree in direction and stay within a
-        // quarter of the strong half-voxel gate (<=1.25cm at the current 20cm
-        // truncation band). A disagreement restarts the batch instead of
+        // Samples must agree in direction and stay within a quarter of the
+        // strong half-voxel gate. A disagreement restarts the batch instead of
         // averaging two competing surface positions into a false compromise.
         float stableBand = max(1.0 / 127.0,
             min(gsInfiniTamContradictionThreshold * 0.25, 0.0625));
@@ -1288,25 +1297,40 @@ float2 InfiniTamSelectMicroViewObservation(uint3 coord,
                             abs(observedTsdf - previousMean) <= stableBand;
         if (!stableSample)
         {
-            StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+            StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u,
+                                         stablePlanarMicroEvidence);
             gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
             return float2(observedTsdf, 1.0);
         }
 
-        uint nextCount = min(sampleCount + 1u, 4u);
+        uint requiredSamples = fastPlanarPair ? 2u : 4u;
+        uint nextCount = min(sampleCount + 1u, requiredSamples);
         float nextMean = (previousMean * (float)sampleCount + observedTsdf) /
                          max((float)nextCount, 1.0);
-        StoreInfiniTamViewTicket(coord, bucketViewCode, nextCount);
+        StoreInfiniTamMicroViewTicket(coord, bucketViewCode, nextCount,
+                                     fastPlanarPair);
         gsInfiniTamMicroViewMeanRW[coord] = nextMean;
 
-        if (nextCount >= 4u)
+        if (nextCount >= requiredSamples)
         {
             // Ignore a stable batch that merely repeats the current surface
-            // inside a 5mm noise floor. Meaningful stable evidence publishes
-            // once, then both cases enter the same closed cooldown.
+            // inside a 5mm noise floor. Conservative batches enter the closed
+            // cooldown; a qualified plane pair may immediately collect again.
             float minimumPublishOffset = max(2.0 / 127.0,
                 min(gsInfiniTamContradictionThreshold * 0.10, 0.025));
-            StoreInfiniTamViewTicket(coord, bucketViewCode, 7u);
+            if (fastPlanarPair)
+            {
+                // A qualified plane pair has no extra cooldown. It still keeps
+                // the full compact history, so this only raises observation
+                // cadence; it does not invoke the bounded 16 -> 3 release.
+                gsInfiniTamViewTicketRW[coord] = 0.0;
+                gsInfiniTamMicroViewMeanRW[coord] = 0.0;
+                if (abs(nextMean - previousTsdf) >= minimumPublishOffset)
+                    return float2(nextMean, 4.0);
+                return float2(observedTsdf, 1.0);
+            }
+
+            StoreInfiniTamMicroViewTicket(coord, bucketViewCode, 7u, false);
             gsInfiniTamMicroViewMeanRW[coord] = 0.0;
             if (abs(nextMean - previousTsdf) >= minimumPublishOffset)
                 return float2(nextMean, 3.0);
@@ -1315,22 +1339,17 @@ float2 InfiniTamSelectMicroViewObservation(uint3 coord,
     }
 
     float representative = gsInfiniTamMicroViewMeanRW[coord];
-    StoreInfiniTamViewTicket(coord, currentViewCode, 1u);
+    StoreInfiniTamMicroViewTicket(coord, currentViewCode, 1u,
+                                 stablePlanarMicroEvidence);
     gsInfiniTamMicroViewMeanRW[coord] = observedTsdf;
     return float2(representative, 2.0);
 }
 
 // Return x = retained history weight, y = repair event:
-// 0 normal, 1 independent-view confirmed, 2 active same-direction correction,
-// 3 exited, 4 paused/unreliable, 5 reversed/pending, 6 pending same-view,
-// 7 long-lived same-view slow admission (without 16 -> 5 history release).
-// Events 4..6 are deliberately non-admitting.  The compact 16/2/5 history
-// used to change only the strength of the old history; the current opposing
-// frame was still averaged into the TSDF even while its repair ticket was
-// paused or waiting for confirmation.  That made adjacent frames/views pull
-// the same mature voxel in turn.  The caller now uses these events as the
-// missing admission decision while newborn and low-history voxels keep the
-// original InfiniTAM averaging path.
+// 0 normal, 1 two confirmations reached, 2 active same-direction correction,
+// 3 exited, 4 paused/unreliable, 5 reversed/pending, 6 pending confirmation.
+// Event 4 remains non-admitting. Events 5 and 6 keep the full 16-vote history
+// and blend normally while the two-confirmation ticket is still pending.
 float2 InfiniTamSelectHistoryWeight(uint3 coord,
                                     float previousTsdf,
                                     float observedTsdf,
@@ -1340,7 +1359,7 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
                                     uint currentViewCode)
 {
     // A/B isolation: retain the compact 16-vote high-precision history while
-    // disabling only the abrupt 2-confirmation -> 5-vote local release.
+    // disabling only the two-confirmation -> 5-vote local release.
     if (gsInfiniTamSelectiveHistoryRelease < 0.5)
     {
         gsCoherenceRW[coord] = 0.5;
@@ -1355,6 +1374,13 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
     float delta = observedTsdf - previousTsdf;
     bool localContradiction = abs(previousTsdf) <= 0.5 &&
                               abs(delta) >= gsInfiniTamContradictionThreshold;
+    // A positive delta is not automatically a legitimate surface move: in this
+    // direction the current ray says the old zero crossing is open free space.
+    // Require the observation to clear at least half of the configured truncation
+    // band (12.5 cm) before it can become one of the two reliable witnesses
+    // that release compact history. This is local to this voxel; it
+    // neither delays neighbouring planar growth nor changes mesh publication.
+    bool positiveFreeSpace = observedTsdf >= 0.5;
     float encoded = gsCoherenceRW[coord];
     bool negativeRepairActive = encoded <= 0.125;
     bool positiveRepairActive = encoded >= 0.875;
@@ -1371,7 +1397,8 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
             return float2(previousVoteWeight, 3.0);
         }
 
-        if (!reliableRepairEvidence)
+        if (!reliableRepairEvidence ||
+            (repairDirection > 0 && !positiveFreeSpace))
             return float2(previousVoteWeight, 4.0);
 
         if (direction != repairDirection)
@@ -1398,11 +1425,13 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
         return float2(previousVoteWeight, 0.0);
     }
 
-    if (!reliableRepairEvidence)
+    if (!reliableRepairEvidence ||
+        (direction > 0 && !positiveFreeSpace))
     {
-        // A large but poorly supported new-view observation is evidence of a
-        // dispute, not yet evidence that the stable surface moved.  Preserve
-        // both the TSDF and any already accumulated same-direction ticket.
+        // A large but poorly supported new-view observation—or a positive
+        // observation that does not actually clear the old surface into free
+        // space—is a dispute, not evidence that the stable surface moved.
+        // Preserve both the TSDF and any accumulated same-direction ticket.
         return float2(previousVoteWeight, 4.0);
     }
 
@@ -1417,31 +1446,123 @@ float2 InfiniTamSelectHistoryWeight(uint3 coord,
     }
 
     uint packedTicket = (uint)round(max(gsInfiniTamViewTicketRW[coord], 0.0));
-    uint firstViewCode = packedTicket & 255u;
-    uint sameViewAge = (packedTicket >> 8u) & 7u;
-    float viewDot = dot(DecodeInfiniTamViewDirection8(firstViewCode),
-                        DecodeInfiniTamViewDirection8(currentViewCode));
-    if (viewDot <= gsInfiniTamIndependentViewCos)
+    uint confirmationCount = max((packedTicket >> 8u) & 7u, 1u);
+    confirmationCount = min(confirmationCount + 1u, 7u);
+    StoreInfiniTamViewTicket(coord, currentViewCode, confirmationCount);
+    gsCoherenceRW[coord] = saturate(0.5 +
+        (float)direction / (2.0 * confirmations));
+    if (confirmationCount >= (uint)confirmations)
     {
-        // Only a geometrically independent observer position buys the second
-        // ticket and the fast 16 -> 5 history release.
+        // Same-view observations are valid confirmations when their direction
+        // and local surface evidence remain reliable. The second confirmation
+        // activates the same bounded 16 -> 3 repair as a changed viewpoint.
         gsCoherenceRW[coord] = direction > 0 ? 1.0 : 0.0;
         StoreInfiniTamViewTicket(coord, currentViewCode, 0u);
         return float2(min(previousVoteWeight, correctionWeight), 1.0);
     }
-
-    // Repeated frames from the same observer position refresh one witness; they
-    // never become a second view. A positive slow-confirmation setting retains
-    // the former slow path for controlled experiments. Production verification
-    // currently sends zero, so same-view persistence remains quarantined.
-    sameViewAge = min(sameViewAge + 1u, 7u);
-    StoreInfiniTamViewTicket(coord, firstViewCode, sameViewAge);
-    gsCoherenceRW[coord] = saturate(0.5 +
-        (float)direction / (2.0 * confirmations));
-    if (gsInfiniTamSameViewSlowConfirmations > 0 &&
-        sameViewAge >= (uint)max(gsInfiniTamSameViewSlowConfirmations, 2))
-        return float2(previousVoteWeight, 7.0);
     return float2(previousVoteWeight, 6.0);
+}
+
+// Compare the current exact-frame observation with the old model prediction.
+// Return true only when the observation may reach the existing 16/2/3 fusion
+// logic. A first mismatch is held, never averaged into the TSDF. Unknown model
+// space remains birth-capable so this gate cannot clean the scan by making
+// genuinely new regions permanently empty.
+bool ObservationAssociationAdmits(uint3 coord, float2 uv,
+                                  float observedRange)
+{
+    if (gsObservationAssociationEnable < 0.5)
+    {
+        gsObservationAssociationStateRW[coord] = 0.0;
+        return true;
+    }
+
+    int2 size = max(int2((int)gsAssociationModelSize.x,
+                         (int)gsAssociationModelSize.y), int2(1, 1));
+    int2 pixel = clamp(int2(uv * float2(size)), int2(0, 0), size - 1);
+    float modelRange = gsAssociationModelDepth.Load(int3(pixel, 0));
+    float modelVotes = gsAssociationModelVoteWeight.Load(int3(pixel, 0));
+    if (modelRange <= 0.0 || modelVotes < gsAssociationMinModelVotes)
+    {
+        InterlockedAdd(_CarveStats[203], 1u); // unknown/new model space
+        gsObservationAssociationStateRW[coord] = 0.0;
+        return true;
+    }
+
+    float residual = modelRange - observedRange;
+    float absResidual = abs(residual);
+    if (absResidual <= gsAssociationSupportBandMeters)
+    {
+        InterlockedAdd(_CarveStats[204], 1u); // supports stable model
+        gsObservationAssociationStateRW[coord] = 0.0;
+        return true;
+    }
+
+    bool foregroundOcclusion = residual > 0.0;
+    bool strongConflict = absResidual >= gsAssociationConflictBandMeters;
+    if (foregroundOcclusion)
+        InterlockedAdd(_CarveStats[205], 1u);
+    else
+        InterlockedAdd(_CarveStats[206], 1u);
+    if (!strongConflict)
+    {
+        // The support/conflict hysteresis band is ordinary evolution, not an
+        // outlier conviction. Let the existing 16/2/3 history decide it.
+        InterlockedAdd(_CarveStats[207], 1u);
+        gsObservationAssociationStateRW[coord] = 0.0;
+        return true;
+    }
+
+    if (gsObservationOutlierRejectEnable < 0.5)
+    {
+        gsObservationAssociationStateRW[coord] = 0.0;
+        return true;
+    }
+
+    float4 normalSample = gsAssociationModelNormal.Load(int3(pixel, 0));
+    bool structural = false;
+    if (gsGlobalStructureConstraintEnable > 0.5 &&
+        modelVotes >= gsStructureMinModelVotes && normalSample.w > 0.5)
+    {
+        float3 n = normalize(normalSample.xyz);
+        int2 px = min(pixel + int2(1, 0), size - 1);
+        int2 py = min(pixel + int2(0, 1), size - 1);
+        float4 nx = gsAssociationModelNormal.Load(int3(px, 0));
+        float4 ny = gsAssociationModelNormal.Load(int3(py, 0));
+        bool neighboursAgree = nx.w > 0.5 && ny.w > 0.5 &&
+            abs(dot(n, normalize(nx.xyz))) >= gsStructureNormalAgreement &&
+            abs(dot(n, normalize(ny.xyz))) >= gsStructureNormalAgreement;
+        // Gravity supplies the global frame. Horizontal and vertical stable
+        // sheets cover floors, ceilings, walls and table tops without assuming
+        // that every room follows one hard-coded yaw.
+        float upAlignment = abs(n.y);
+        bool roomOrientation = upAlignment >= 0.90 || upAlignment <= 0.20;
+        structural = neighboursAgree && roomOrientation;
+    }
+
+    int required = max(gsAssociationConfirmations, 2);
+    if (structural)
+    {
+        required = max(required, gsStructureConfirmations);
+        InterlockedAdd(_CarveStats[210], 1u);
+    }
+
+    int direction = foregroundOcclusion ? 1 : -1;
+    float oldState = gsObservationAssociationStateRW[coord];
+    int oldDirection = oldState > 0.5 ? 1 : (oldState < -0.5 ? -1 : 0);
+    int count = oldDirection == direction
+        ? min((int)round(abs(oldState)) + 1, 7)
+        : 1;
+    if (count < required)
+    {
+        gsObservationAssociationStateRW[coord] = (float)(direction * count);
+        InterlockedAdd(_CarveStats[208], 1u); // held/rejected before TSDF
+        return false;
+    }
+
+    gsObservationAssociationStateRW[coord] = 0.0;
+    InterlockedAdd(_CarveStats[209], 1u); // repeated conflict admitted
+    return true;
 }
 
 [numthreads(64, 1, 1)]
@@ -1485,6 +1606,8 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     if (rawProjectiveSdf < -gsVoxDist) return;
 
     float observedTsdf = clamp(rawProjectiveSdf / gsVoxDist, -1.0, 1.0);
+    float2 previous = gsVolumeRW[coord];
+    float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
 
     // Several camera-local lattice samples may snap to this same world voxel.
     // Exactly one valid sample owns the voxel for this accepted frame. Claiming
@@ -1495,15 +1618,15 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     //   202 duplicates disagreeing with the first claim by >= half a voxel.
     uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
     InterlockedAdd(_CarveStats[199], 1u);
-    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
+    uint frameEpoch = gsInfiniTamWriteEpoch & 0x00ffffffu;
     uint observationByte = (uint)round(saturate(observedTsdf * 0.5 + 0.5) * 255.0);
     uint packedClaim = (frameEpoch << 8) | observationByte;
     uint observedClaim = _InfiniTamWriteEpochs[flat];
-    uint observedEpoch = InfiniTamClaimEpoch(observedClaim);
+    uint observedEpoch = observedClaim >> 8;
     if (observedEpoch == frameEpoch)
     {
         InterlockedAdd(_CarveStats[201], 1u);
-        float firstTsdf = DecodeInfiniTamClaimTsdf(observedClaim);
+        float firstTsdf = ((float)(observedClaim & 0xffu) / 255.0) * 2.0 - 1.0;
         if (abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
             InterlockedAdd(_CarveStats[202], 1u);
         return;
@@ -1516,16 +1639,20 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
         // The only writer that can win between the load and this CAS is another
         // valid alias from the same dispatch/frame.
         InterlockedAdd(_CarveStats[201], 1u);
-        float firstTsdf = DecodeInfiniTamClaimTsdf(originalClaim);
-        if (InfiniTamClaimEpoch(originalClaim) == frameEpoch &&
+        float firstTsdf = ((float)(originalClaim & 0xffu) / 255.0) * 2.0 - 1.0;
+        if ((originalClaim >> 8) == frameEpoch &&
             abs(firstTsdf - observedTsdf) * gsVoxDist >= 0.5 * gsVoxSize)
             InterlockedAdd(_CarveStats[202], 1u);
         return;
     }
     InterlockedAdd(_CarveStats[200], 1u);
 
-    float2 previous = gsVolumeRW[coord];
-    float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
+    if (!ObservationAssociationAdmits(coord, voxNDC.xy, depthEyeDist))
+    {
+        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
+        return;
+    }
+
     float previousAccumulatedTsdf = previousVoteWeight > 0.0
         ? gsInfiniTamAccumulatedTsdfRW[coord]
         : previous.x;
@@ -1535,8 +1662,17 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
                               abs(previousAccumulatedTsdf) <= 0.5 &&
                               abs(observedTsdf - previousAccumulatedTsdf) >=
                                   gsInfiniTamContradictionThreshold;
+    float microDelta = abs(observedTsdf - previousAccumulatedTsdf);
+    float planarMicroMinimumDelta = max(2.0 / 127.0,
+        gsInfiniTamContradictionThreshold * 0.20);
+    bool planarMicroFacingNeeded = gsInfiniTamPlanarMicroCorrection > 0.5 &&
+                                   previousVoteWeight > 0.0 &&
+                                   abs(previousAccumulatedTsdf) <= 0.5 &&
+                                   microDelta >= planarMicroMinimumDelta &&
+                                   microDelta < gsInfiniTamContradictionThreshold;
     bool reliableRepairEvidence = false;
-    if (repairFacingNeeded && voxEyeDist > 1e-5)
+    bool stablePlanarMicroEvidence = false;
+    if ((repairFacingNeeded || planarMicroFacingNeeded) && voxEyeDist > 1e-5)
     {
         float2 texel2 = 2.0 / max(float2(gsDepthTexSize), float2(1.0, 1.0));
         float2 uvH = voxNDC.xy + float2(texel2.x, 0.0);
@@ -1555,13 +1691,42 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
             float crossLength = length(normalCross);
             float hRangeDelta = abs(length(depthPosH - eyePos) - depthEyeDist);
             float vRangeDelta = abs(length(depthPosV - eyePos) - depthEyeDist);
-            if (crossLength > 1e-6 && hRangeDelta <= gsVoxDist &&
-                vRangeDelta <= gsVoxDist)
+            if (crossLength > 1e-6)
             {
                 float3 depthNorm = mul((float3x3)gsFusionCorrection,
                                        -normalCross / crossLength);
                 float normDot = -dot(voxPos - eyePos, depthNorm) / voxEyeDist;
-                reliableRepairEvidence = normDot >= 0.60;
+                reliableRepairEvidence = hRangeDelta <= gsVoxDist &&
+                                         vRangeDelta <= gsVoxDist &&
+                                         normDot >= 0.60;
+
+                int2 depthPixel = clamp(
+                    int2(voxNDC.xy * float2(gsDepthTexSize)),
+                    int2(0, 0), int2(gsDepthTexSize) - 1);
+                int2 depthPixelH = clamp(depthPixel + int2(2, 0),
+                    int2(0, 0), int2(gsDepthTexSize) - 1);
+                int2 depthPixelV = clamp(depthPixel + int2(0, 2),
+                    int2(0, 0), int2(gsDepthTexSize) - 1);
+                uint edgeReason = gsEdgeReasonTex[
+                    uint3(uint2(depthPixel), GS_FUSION_EYE)];
+                uint edgeReasonH = gsEdgeReasonTex[
+                    uint3(uint2(depthPixelH), GS_FUSION_EYE)];
+                uint edgeReasonV = gsEdgeReasonTex[
+                    uint3(uint2(depthPixelV), GS_FUSION_EYE)];
+                // Bit 3 is positive plane support and is intentionally allowed.
+                // Every contour, gap, skirt, competing layer, rejected edge or
+                // grazing exception remains ineligible for the fast lane.
+                const uint planarMicroUnsafeReasonMask =
+                    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4) |
+                    (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) |
+                    (1u << 10);
+                stablePlanarMicroEvidence = planarMicroFacingNeeded &&
+                    (edgeReason & planarMicroUnsafeReasonMask) == 0u &&
+                    (edgeReasonH & planarMicroUnsafeReasonMask) == 0u &&
+                    (edgeReasonV & planarMicroUnsafeReasonMask) == 0u &&
+                    hRangeDelta <= 0.5 * gsVoxSize &&
+                    vRangeDelta <= 0.5 * gsVoxSize &&
+                    normDot >= 0.75;
             }
         }
     }
@@ -1570,7 +1735,8 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     float2 microSelection = previousVoteWeight > 0.0
         ? InfiniTamSelectMicroViewObservation(coord, previousAccumulatedTsdf,
                                               observedTsdf, previousVoteWeight,
-                                              currentViewCode)
+                                              currentViewCode,
+                                              stablePlanarMicroEvidence)
         : float2(observedTsdf, 0.0);
     float integrationObservedTsdf = microSelection.x;
 
@@ -1586,27 +1752,8 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
     // representative. Do not run the strong-repair selector here: its normal
     // path clears the shared neutral ticket that belongs to the next bucket or
     // to the post-publication cooldown.
-    bool microPublish = microSelection.y == 2.0 || microSelection.y == 3.0;
-
-    // Mature sub-threshold changes are the path implicated by the endpoint
-    // responsibility ledger.  Stage their representative instead of letting
-    // each endpoint publish independently.  Evaluation/commit run as separate
-    // dispatches, so every endpoint sees a complete immutable candidate set.
-    // Births and strong 16/2/5 corrections remain on the established path.
-    if (microPublish && gsInfiniTamEdgeCoherentPublication > 0.5)
-    {
-        // Preserve the claim's low-byte raw observation for the responsibility
-        // ledger.  The already allocated private mean sidecar temporarily owns
-        // the staged representative; no extra 3D texture is introduced.
-        gsInfiniTamMicroViewMeanRW[coord] = microSelection.x;
-        uint ignored;
-        InterlockedOr(_InfiniTamWriteEpochs[flat],
-                      kInfiniTamCandidateStaged, ignored);
-        InterlockedAdd(_CarveStats[203], 1u);
-        RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
-        return;
-    }
-
+    bool microPublish = microSelection.y == 2.0 || microSelection.y == 3.0 ||
+                        microSelection.y == 4.0;
     float2 historySelection = microPublish
         ? float2(previousVoteWeight, 0.0)
         : (previousVoteWeight > 0.0
@@ -1624,13 +1771,11 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
         gsInfiniTamMicroViewMeanRW[coord] = 0.0;
     }
 
-    // A protected voxel is not changed by a lone, reversed, unreliable or
-    // still-unconfirmed same-view contradiction. The one-frame claim above
-    // still consumes duplicate aliases from this dispatch and the responsibility
-    // ledger still sees the incoming disagreement. Event 7 is disabled by the
-    // verification configuration.
-    bool quarantineObservation = historySelection.y >= 4.0 &&
-                                 historySelection.y <= 6.0;
+    // An observation with unreliable local surface evidence remains
+    // quarantined. A reliable first confirmation and direction reversals
+    // continue through the full retained history, so waiting never freezes the
+    // TSDF; the second same-direction confirmation releases 16 -> 3.
+    bool quarantineObservation = historySelection.y == 4.0;
     if (quarantineObservation)
     {
         RecordInfiniTamCrossFrameObservation(coord, observedClaim, observedTsdf);
@@ -1670,292 +1815,6 @@ void IntegrateInfiniTam(uint id : SV_DispatchThreadID)
 
     if (gsWriteColor > 0.5 && abs(rawProjectiveSdf) <= gsVoxDist)
         gsColorVolumeRW[coord] = float4(1.0, 1.0, 1.0, 1.0);
-}
-
-// Phase 2 of the mature micro-view transaction.  A candidate may replace its
-// published endpoint only when another endpoint of the same physical
-// zero-crossing was staged in this exact accepted-depth dispatch.  Opposite
-// candidate signs retain/move the crossing.  If the published pair currently
-// crosses zero, two clear same-sign candidates may instead extinguish it.
-// This symmetric deletion path prevents a stale surface patch from shrinking
-// forever without disappearing.  This pass marks only the current voxel's
-// claim; it never writes the partner.
-[numthreads(64, 1, 1)]
-void EvaluateInfiniTamEdgeCoherence(uint id : SV_DispatchThreadID)
-{
-    if (id >= gsFrustumVolumeCount) return;
-
-    float3 localPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
-    float3 worldPos = mul(gsDepthViewInv[GS_FUSION_EYE],
-                          float4(localPos, 1.0)).xyz;
-    uint3 coord = gsWorldToVoxel(worldPos);
-    if (any(coord >= gsVoxCount)) return;
-
-    uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
-    uint claim = _InfiniTamWriteEpochs[flat];
-    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
-    if (InfiniTamClaimEpoch(claim) != frameEpoch ||
-        (claim & kInfiniTamCandidateStaged) == 0u)
-        return;
-
-    float candidate = gsInfiniTamMicroViewMeanRW[coord];
-    float2 currentSample = gsVolumeRW[coord];
-    int3 center = (int3)coord;
-
-    bool coherentPartner = false;
-    [unroll]
-    for (uint axisSide = 0u; axisSide < 6u; axisSide++)
-    {
-        int3 offset = int3(0, 0, 0);
-        if (axisSide == 0u) offset.x = -1;
-        else if (axisSide == 1u) offset.x = 1;
-        else if (axisSide == 2u) offset.y = -1;
-        else if (axisSide == 3u) offset.y = 1;
-        else if (axisSide == 4u) offset.z = -1;
-        else offset.z = 1;
-        int3 neighbourSigned = center + offset;
-        if (any(neighbourSigned < int3(0, 0, 0)) ||
-            any(neighbourSigned >= (int3)gsVoxCount))
-            continue;
-
-        uint3 neighbour = (uint3)neighbourSigned;
-        uint neighbourFlat = neighbour.x + gsVoxCount.x *
-            (neighbour.y + gsVoxCount.y * neighbour.z);
-        uint neighbourClaim = _InfiniTamWriteEpochs[neighbourFlat];
-        if (InfiniTamClaimEpoch(neighbourClaim) != frameEpoch ||
-            (neighbourClaim & kInfiniTamCandidateStaged) == 0u)
-            continue;
-
-        float neighbourCandidate =
-            gsInfiniTamMicroViewMeanRW[neighbour];
-        bool candidateCrossing =
-            (candidate <= 0.0 && neighbourCandidate >= 0.0) ||
-            (candidate >= 0.0 && neighbourCandidate <= 0.0);
-
-        // Deletion is deliberately stricter than movement: both published
-        // endpoints must already be observed and form a real crossing, both
-        // replacement candidates must come from this dispatch, and both must
-        // land clearly on the same side.  The small dead band avoids erasing a
-        // surface merely because quantized candidates hover around zero.
-        float2 neighbourCurrentSample = gsVolumeRW[neighbour];
-        bool publishedCrossing =
-            currentSample.y > 0.0 && neighbourCurrentSample.y > 0.0 &&
-            ((currentSample.x <= 0.0 && neighbourCurrentSample.x >= 0.0) ||
-             (currentSample.x >= 0.0 && neighbourCurrentSample.x <= 0.0));
-        const float extinctionSignMargin = 2.0 / 127.0;
-        bool coherentExtinction = publishedCrossing &&
-            ((candidate > extinctionSignMargin &&
-              neighbourCandidate > extinctionSignMargin) ||
-             (candidate < -extinctionSignMargin &&
-              neighbourCandidate < -extinctionSignMargin));
-
-        if (candidateCrossing || coherentExtinction)
-        {
-            coherentPartner = true;
-            break;
-        }
-    }
-
-    if (coherentPartner)
-    {
-        uint previousStatus;
-        InterlockedOr(_InfiniTamWriteEpochs[flat],
-                      kInfiniTamCandidateApproved, previousStatus);
-        if ((previousStatus & kInfiniTamCandidateApproved) == 0u)
-            InterlockedAdd(_CarveStats[204], 1u);
-    }
-}
-
-// Phase 3. Duplicate camera-lattice aliases may map back to the same voxel;
-// the compare/exchange consumes approval exactly once.  The retained history
-// is changed only for this voxel, and dirty publication is raised only after
-// the coherent transaction has actually committed.
-[numthreads(64, 1, 1)]
-void CommitInfiniTamEdgeCoherence(uint id : SV_DispatchThreadID)
-{
-    if (id >= gsFrustumVolumeCount) return;
-
-    float3 localPos = gsFrustumVolume[id] + gsFrustumPhaseOffset;
-    float3 worldPos = mul(gsDepthViewInv[GS_FUSION_EYE],
-                          float4(localPos, 1.0)).xyz;
-    uint3 coord = gsWorldToVoxel(worldPos);
-    if (any(coord >= gsVoxCount)) return;
-
-    uint flat = coord.x + gsVoxCount.x * (coord.y + gsVoxCount.y * coord.z);
-    uint claim = _InfiniTamWriteEpochs[flat];
-    uint frameEpoch = gsInfiniTamWriteEpoch & kInfiniTamClaimEpochMask;
-    uint required = kInfiniTamCandidateStaged | kInfiniTamCandidateApproved;
-    if (InfiniTamClaimEpoch(claim) != frameEpoch ||
-        (claim & required) != required)
-        return;
-
-    uint consumedClaim = claim & ~required;
-    uint originalClaim;
-    InterlockedCompareExchange(_InfiniTamWriteEpochs[flat], claim,
-                               consumedClaim, originalClaim);
-    if (originalClaim != claim) return;
-    InterlockedAdd(_CarveStats[205], 1u);
-
-    float integrationObservedTsdf = gsInfiniTamMicroViewMeanRW[coord];
-    float2 previous = gsVolumeRW[coord];
-    float previousVoteWeight = max(gsInfiniTamVoteWeightRW[coord], 0.0);
-    if (previousVoteWeight <= 0.0) return;
-
-    float previousAccumulatedTsdf = gsInfiniTamAccumulatedTsdfRW[coord];
-    float maxVoteWeight = max(gsInfiniTamMaxVoteWeight, 1.0);
-    float accumulatedVoteWeight = previousVoteWeight + 1.0;
-    float reconstructedTsdf =
-        (previousAccumulatedTsdf * previousVoteWeight +
-         integrationObservedTsdf) / max(accumulatedVoteWeight, 1e-5);
-    float reconstructedVoteWeight = min(accumulatedVoteWeight, maxVoteWeight);
-    float extractionEligibility = max(gsFormalSurfaceWeight + 1.0 / 127.0, 0.1);
-    float2 reconstructed = float2(
-        QuantizeInfiniTamTsdf(reconstructedTsdf), extractionEligibility);
-
-    RecordTsdfGeometryMutation(coord, previous, reconstructed, 2u, 0u);
-    gsInfiniTamVoteWeightRW[coord] = reconstructedVoteWeight;
-    gsInfiniTamAccumulatedTsdfRW[coord] = reconstructedTsdf;
-    gsVolumeRW[coord] = reconstructed;
-    MarkInfiniTamDirtyChunk(coord, previous, reconstructed);
-
-    if (gsInfiniTamTicketEnabled > 0.5 && abs(integrationObservedTsdf) <= 0.5)
-    {
-        if (previousVoteWeight < maxVoteWeight - 0.5)
-            InterlockedAdd(_InfiniTamTicketStats[1], 1u);
-        else
-            InterlockedAdd(_InfiniTamTicketStats[2], 1u);
-        InterlockedAdd(_InfiniTamTicketStats[3],
-                       (uint)round(reconstructedVoteWeight));
-    }
-
-    if (gsWriteColor > 0.5 && abs(integrationObservedTsdf) <= 1.0)
-        gsColorVolumeRW[coord] = float4(1.0, 1.0, 1.0, 1.0);
-}
-
-#pragma kernel IntegrateQrsReference
-
-// QRS reference lane.  This is intentionally kept as a small, self-contained
-// copy of the original QRS integration decision so later ScanCover rules cannot
-// silently leak into the reference baseline.  QRS used eye 0 consistently for
-// its frustum, fusion projection and jump-flood dilation.
-static const int QRS_REFERENCE_EYE = 0;
-[numthreads(64, 1, 1)]
-void IntegrateQrsReference(uint id : SV_DispatchThreadID)
-{
-    float3 vLocalPos = gsFrustumVolume[id];
-    float3 vWorldPos = mul(gsDepthViewInv[QRS_REFERENCE_EYE], float4(vLocalPos, 1)).xyz;
-    uint3 coord = gsWorldToVoxel(vWorldPos);
-    float3 voxPos = gsVoxelToWorld(coord);
-
-    float3 eyePos = gsDepthEyePos(QRS_REFERENCE_EYE);
-    float3 eyeToVox = voxPos - eyePos;
-    float voxEyeDist = length(eyeToVox);
-
-    float3 voxView = mul(gsDepthView[QRS_REFERENCE_EYE], float4(voxPos, 1)).xyz;
-    if (voxView.z > -0.05) return;
-
-    float3 voxNDC = gsDepthWorldToNDC(voxPos, QRS_REFERENCE_EYE);
-    if (voxNDC.x < 0.01 || voxNDC.x > 0.99 ||
-        voxNDC.y < 0.01 || voxNDC.y > 0.99)
-        return;
-
-    float depthNDC = gsDepthSample(voxNDC.xy, QRS_REFERENCE_EYE);
-    float3 depthNorm = gsDepthNormalSample(voxNDC.xy, QRS_REFERENCE_EYE).xyz;
-    float3 depthPos = gsDepthNDCtoWorld(float3(voxNDC.xy, depthNDC),
-                                       QRS_REFERENCE_EYE);
-
-    float3 eyeToDepth = depthPos - eyePos;
-    float depthEyeDist = length(eyeToDepth);
-    float normDot = -dot(eyeToVox, depthNorm) / voxEyeDist;
-
-    float sDist = depthEyeDist - voxEyeDist;
-    sDist *= saturate(normDot);
-
-    bool empty = sDist >= 1.0;
-    float sDistNorm = min(sDist / gsVoxDist, 1.0);
-    bool withinBand = sDistNorm >= -gsVoxMin / gsVoxSize;
-
-    float dilatedDepthNDC = gsSampleDilatedDepth(voxNDC.xy);
-    float dilatedDepthLinear = gsDepthNDCToLinear(dilatedDepthNDC, QRS_REFERENCE_EYE);
-    float depthLinear = gsDepthNDCToLinear(depthNDC, QRS_REFERENCE_EYE);
-    bool acceptableDepthDisparity =
-        depthLinear < dilatedDepthLinear + gsDepthDispThresh;
-    bool unoccludedByDilation =
-        abs(voxView.z) < dilatedDepthLinear || acceptableDepthDisparity;
-    bool validSurfaceNormal = empty || normDot > MIN_DOT;
-
-    bool outsideExclusions = true;
-    for (int p = 0; p < gsNumExclusions; p++)
-    {
-        float3 exclusionHead = gsExclusionHeads[p];
-        float2 diff = vWorldPos.xz - exclusionHead.xz;
-        // Original QRS body cylinder: radius 0.6 m, +0.25/-1.7 m.
-        if (dot(diff, diff) < 0.36 &&
-            vWorldPos.y < exclusionHead.y + 0.25 &&
-            vWorldPos.y > exclusionHead.y - 1.7)
-            outsideExclusions = false;
-    }
-
-    bool valid = withinBand & outsideExclusions &
-                 validSurfaceNormal & unoccludedByDilation;
-    if (!valid) return;
-
-    float distFactor = saturate(1.0 - voxEyeDist / gsMaxUpdateDist);
-    float angleFactor = saturate(normDot);
-    float quality = distFactor * angleFactor;
-    float q2 = quality * quality;
-
-    float2 old = gsVolumeRW[coord];
-    if (old.y < 0) return;
-    float oldVal = old.x;
-    float weight = max(old.y, 0.0);
-    bool wasEmpty = weight < 0.001;
-
-    if (wasEmpty)
-    {
-        if (quality >= MIN_QUALITY_SEED)
-        {
-            gsVolumeRW[coord] = float2(sDistNorm, 0.10);
-            if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
-            {
-                float2 uv = ProjectToCameraUV(voxPos);
-                if (uv.x > 0.02 && uv.x < 0.98 &&
-                    uv.y > 0.02 && uv.y < 0.98)
-                {
-                    float4 camColor =
-                        gsCamRGB.SampleLevel(gsBilinearClampSampler, uv, 0);
-                    float3 boosted = saturate(camColor.rgb * gsCamExposure);
-                    gsColorVolumeRW[coord] =
-                        float4(boosted, quality * 0.1);
-                }
-            }
-        }
-        return;
-    }
-
-    float blend = q2 * gsBlendRate / (1.0 + weight * gsStability);
-    blend = clamp(blend, 0.0, 0.7);
-    if (blend < 0.005) return;
-
-    float newTsdf = lerp(oldVal, sDistNorm, blend);
-    float newWeight = min(weight + q2 * gsWeightGrowth, gsMaxWeight);
-    gsVolumeRW[coord] = float2(newTsdf, newWeight);
-
-    if (gsCamAvailable && abs(sDistNorm) < COLOR_SURFACE_BAND)
-    {
-        float2 uv = ProjectToCameraUV(voxPos);
-        if (uv.x > 0.02 && uv.x < 0.98 && uv.y > 0.02 && uv.y < 0.98)
-        {
-            float4 camColor = gsCamRGB.SampleLevel(gsBilinearClampSampler, uv, 0);
-            float3 boosted = saturate(camColor.rgb * gsCamExposure);
-            float4 oldColor = gsColorVolumeRW[coord];
-            float colorBlend = quality * 0.3;
-            float3 rgb = oldColor.a < 0.01
-                ? boosted : lerp(oldColor.rgb, boosted, colorBlend);
-            float newAlpha = min(oldColor.a + quality * 0.05, 1.0);
-            gsColorVolumeRW[coord] = float4(rgb, newAlpha);
-        }
-    }
 }
 
 #pragma kernel Integrate

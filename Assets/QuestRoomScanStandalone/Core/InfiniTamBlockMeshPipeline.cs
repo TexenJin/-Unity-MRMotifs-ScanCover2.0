@@ -9,10 +9,10 @@ namespace Genesis.RoomScan
     /// <summary>
     /// Minimal InfiniTAM-style block extractor.  It partitions only extraction
     /// and presentation; every block still reads the one authoritative TSDF.
-    /// No candidate history, smoothing, product court, quality gate or legacy
-    /// paper/HERA policy is present on this route.
+    /// Diagnostic capture may observe published Fronts but cannot influence
+    /// extraction, publication, scheduling or rendering.
     /// </summary>
-    internal sealed class InfiniTamBlockMeshPipeline : IDisposable
+    internal sealed partial class InfiniTamBlockMeshPipeline : IDisposable
     {
         private sealed class Block : IDisposable
         {
@@ -24,6 +24,7 @@ namespace Genesis.RoomScan
             public int3 MapCount;
             public uint TargetEpoch;
             public uint ProcessedEpoch;
+            public uint PublishedEpoch;
             public uint CandidateEpoch;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
@@ -36,6 +37,7 @@ namespace Genesis.RoomScan
             // resume. It is discarded and freshly extracted instead.
             public bool DiscardAfterPresentationFreeze;
             public float CommitStartedAt;
+            public float AuditQueuedAt;
             public int CommitSerial;
             public int PendingVertexCount;
             public int PendingIndexCount;
@@ -284,6 +286,7 @@ namespace Genesis.RoomScan
                     uint candidateEpoch = block.TargetEpoch;
                     _extract(block.Surface);
                     block.CandidateEpoch = candidateEpoch;
+                    AuditBlockEvent("extracted", block);
                     block.CommitPending = true;
                     block.CommitStartedAt = Time.realtimeSinceStartup;
                     _inFlightCommits++;
@@ -391,11 +394,19 @@ namespace Genesis.RoomScan
             block.Surface = new GPUSurfaceNets(_compute)
             {
                 MinMeshWeight = _volume.MinMeshWeight,
-                // Clean v3.1 baseline: no post-extraction smoothing. The local
-                // 5 cm experiment must be the only geometry variable in its ROI.
-                SmoothIterations = 0,
-                SmoothLambda = 0f,
+                // One stateless, edge-aware pass removes cell-height纹 from
+                // coherent planes without delaying birth or rounding corners.
+                SmoothIterations = 1,
+                SmoothLambda = 0.5f,
                 SmoothBeta = 0f,
+                PlanarNormalOnlySmooth = true,
+                PlanarSmoothNormalDotMin = 0.9510565f, // cos(18°)
+                PlanarSmoothMaxCorrectionVoxels = 0.15f, // 0.15 voxel (7.5 mm at the current 5 cm setting)
+                PlanarSmoothMinNeighbors = 3,
+                PlanarGridStraighten = true,
+                PlanarGridAxisDotMin = 0.9659258f, // within 15° of a room axis
+                PlanarGridStrength = 1f,
+                PlanarGridMaxCorrectionVoxels = 0.5f, // bounded to half a voxel (2.5 cm currently)
                 TemporalAlphaMax = 1f,
                 TemporalAlphaMin = 1f,
                 TemporalDecayRate = 0f,
@@ -405,6 +416,7 @@ namespace Genesis.RoomScan
                 CandidateHistoryUpdateEnabled = false,
                 FoundationTopologyMode = false,
                 VisualQualityDiagnosticsEnabled = false,
+                StageResponsibilityDiagnosticsEnabled = false,
                 DiagnosticRoiEnabled = false
             };
             block.Surface.EnsureBuffers(_volume.VoxelCount, block.MapMin,
@@ -436,7 +448,8 @@ namespace Genesis.RoomScan
             }
         }
 
-        private void RequestCommit(Block block, uint candidateEpoch, int commitSerial)
+        private void RequestCommit(Block block, uint candidateEpoch,
+            int commitSerial)
         {
             int requestGeneration = _generation;
             AsyncGPUReadback.Request(block.Surface.CountersBuffer, request =>
@@ -474,6 +487,7 @@ namespace Genesis.RoomScan
                 block.PendingVertexCount = vertices;
                 block.PendingIndexCount = indices;
                 block.ReadyToPublish = true;
+                AuditBlockEvent("callback_ready", block);
             });
         }
 
@@ -515,7 +529,9 @@ namespace Genesis.RoomScan
             block.VertexCount = vertices;
             block.IndexCount = indices;
             block.ProcessedEpoch = candidateEpoch;
+            block.PublishedEpoch = candidateEpoch;
             block.Built = true;
+            AuditBlockEvent("published", block);
             ApplyBlockVisibility(block);
             if (block.TargetEpoch > block.ProcessedEpoch)
                 QueueBlock(block.Index, block.TargetEpoch, true);
@@ -659,6 +675,8 @@ namespace Genesis.RoomScan
                 block.Queued)
                 return;
             block.Queued = true;
+            block.AuditQueuedAt = Time.realtimeSinceStartup;
+            AuditBlockEvent("queued", block);
             _dirtyQueue.Enqueue(index);
         }
 
@@ -739,6 +757,8 @@ namespace Genesis.RoomScan
                 block.Built = knownEmpty;
                 block.TargetEpoch = epoch;
                 block.ProcessedEpoch = epoch;
+                block.PublishedEpoch = epoch;
+                block.CandidateEpoch = 0u;
                 block.LastOwnerEpoch = epoch;
                 block.VertexCount = 0;
                 block.IndexCount = 0;

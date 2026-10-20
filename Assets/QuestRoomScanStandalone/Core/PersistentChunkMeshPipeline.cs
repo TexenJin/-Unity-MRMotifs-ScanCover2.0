@@ -191,11 +191,6 @@ namespace Genesis.RoomScan
             public uint BuiltEpoch;
             public uint ProcessedEpoch;
             public uint CandidateEpoch;
-            // TSDF geometry and post-TSDF product constraints have independent
-            // lifetimes.  A ruler/court update may need to rebuild this block
-            // without advancing the TSDF dirty epoch.
-            public uint TargetProductRevision;
-            public uint CandidateProductRevision;
             public uint LastOwnerEpoch;
             public readonly uint[] LastBoundaryEpoch = new uint[6];
             public float CommittedAtRealtime;
@@ -361,9 +356,7 @@ namespace Genesis.RoomScan
         private readonly int _layer;
         private readonly Config _config;
         private readonly Action<GPUSurfaceNets> _extract;
-        private readonly SurfaceProductizer _productizer;
         private readonly ChunkQualityGate _qualityGate = new ChunkQualityGate();
-        private readonly Vector4[] _productConstraintChanges = new Vector4[64];
         private readonly struct QueueEntry
         {
             public readonly int Index;
@@ -594,7 +587,6 @@ namespace Genesis.RoomScan
         // generation globally instead of launching MaxChunksPerTick again on
         // every frame while older GPU readbacks are still in flight.
         private const int MaximumConcurrentProductCommits = 4;
-        private uint _productConstraintRevision = 1u;
         private ulong _localReplacementSequence;
         private ulong _localReplacementDroppedEvents;
         private ulong _localQualityBinDroppedEvents;
@@ -820,8 +812,6 @@ namespace Genesis.RoomScan
             _layer = layer;
             _config = config;
             _extract = extract ?? throw new ArgumentNullException(nameof(extract));
-            if (_config.FoundationAtomicReplacement)
-                _productizer = new SurfaceProductizer(parent, _volume);
 
             _volume.SetDirtyBoundaryHalo(config.HaloVoxels);
             BuildLayout();
@@ -835,9 +825,6 @@ namespace Genesis.RoomScan
         {
             if (_disposed || Failed)
                 return;
-
-            if (_config.FoundationAtomicReplacement)
-                QueueChangedProductConstraints();
 
             // Surface workers retain the mature-triangle ledger.  Treating an
             // idle worker as disposable cache would make an out-of-view chunk
@@ -882,17 +869,14 @@ namespace Genesis.RoomScan
                     if (chunk.CommitPending)
                         continue;
                     uint candidateEpoch = chunk.TargetEpoch;
-                    uint candidateProductRevision = chunk.TargetProductRevision;
                     chunk.CandidateLiveProgressive = chunk.LiveProgressive;
                     _extract(chunk.Surface);
                     chunk.Renderer.UpdateBounds(GetPaddedCoreBounds(chunk));
                     chunk.CandidateEpoch = candidateEpoch;
-                    chunk.CandidateProductRevision = candidateProductRevision;
                     chunk.CommitPending = true;
                     chunk.CommitPendingSince = Time.time;
                     int commitSerial = ++chunk.CommitSerial;
-                    RequestCandidateCommit(chunk, candidateEpoch,
-                        candidateProductRevision, commitSerial);
+                    RequestCandidateCommit(chunk, candidateEpoch, commitSerial);
                 }
                 catch (Exception ex)
                 {
@@ -1320,7 +1304,7 @@ namespace Genesis.RoomScan
         }
 
         private void RequestCandidateCommit(Chunk chunk, uint candidateEpoch,
-            uint candidateProductRevision, int commitSerial)
+            int commitSerial)
         {
             int requestGeneration = _generation;
             AsyncGPUReadback.Request(chunk.Surface.CountersBuffer, request =>
@@ -1351,8 +1335,7 @@ namespace Genesis.RoomScan
                 // go straight to the latest epoch; an obsolete async result
                 // must never flash on screen merely because it finished first.
                 if (_config.FoundationAtomicReplacement &&
-                    (candidateEpoch < chunk.TargetEpoch ||
-                     candidateProductRevision < chunk.TargetProductRevision))
+                    candidateEpoch < chunk.TargetEpoch)
                 {
                     FinishCandidateCommit(chunk, candidateEpoch);
                     return;
@@ -1385,11 +1368,7 @@ namespace Genesis.RoomScan
                     // visible product: stale, empty and abruptly regressive
                     // rebuilds retain the previous immutable front.
                     CaptureVisualQualityPage(chunk, counters);
-                    GPUChunkMeshSnapshot product = _productizer != null
-                        ? _productizer.Build(chunk.Surface, vertices, indices,
-                            chunk.Surface.GetCoreBounds(_volume.VoxelSize),
-                            _volume.VoxelSize)
-                        : null;
+                    GPUChunkMeshSnapshot product = null;
                     ChunkQualityGate.Decision decision = _qualityGate.Evaluate(
                         chunk.Index, candidateEpoch, vertices,
                         indices, chunk.Built && chunk.Snapshot != null &&
@@ -3453,56 +3432,6 @@ namespace Genesis.RoomScan
             return bounds;
         }
 
-        private void QueueChangedProductConstraints()
-        {
-            int count = _volume.DrainProductSurfaceChanges(
-                _productConstraintChanges);
-            if (count <= 0)
-                return;
-
-            // This revision is deliberately separate from DirtyEpoch.  Product
-            // constraints live after TSDF, so changing one must be able to
-            // re-productize an unchanged zero surface at the same TSDF epoch.
-            uint productRevision = ++_productConstraintRevision;
-            if (productRevision == 0u)
-                productRevision = _productConstraintRevision = 1u;
-
-            for (int e = 0; e < count; e++)
-            {
-                Vector4 region = _productConstraintChanges[e];
-                Vector3 localCenter = _parent != null
-                    ? _parent.InverseTransformPoint(new Vector3(
-                        region.x, region.y, region.z))
-                    : new Vector3(region.x, region.y, region.z);
-                float radius = Mathf.Max(region.w, _volume.VoxelSize * 2f);
-                for (int i = 0; i < _chunks.Count; i++)
-                {
-                    Chunk chunk = _chunks[i];
-                    int3 voxels = _volume.VoxelCount;
-                    float voxelSize = _volume.VoxelSize;
-                    float3 min = ((float3)chunk.CoreMin -
-                                  (float3)voxels * 0.5f) * voxelSize;
-                    float3 max = ((float3)chunk.CoreMax -
-                                  (float3)voxels * 0.5f) * voxelSize;
-                    Bounds bounds = new Bounds((Vector3)((min + max) * 0.5f),
-                        (Vector3)(max - min));
-                    if (bounds.SqrDistance(localCenter) > radius * radius)
-                        continue;
-                    chunk.TargetProductRevision = math.max(
-                        chunk.TargetProductRevision, productRevision);
-                    if (chunk.CommitPending)
-                    {
-                        chunk.TargetEpoch = math.max(chunk.TargetEpoch,
-                            math.max(1u, _volume.DirtyEpoch));
-                        chunk.ForceQueueAfterCommit = true;
-                        continue;
-                    }
-                    QueueChunk(chunk.Index, math.max(1u, _volume.DirtyEpoch),
-                        urgent: true, force: true);
-                }
-            }
-        }
-
         private static bool DestructiveCandidateConfirmed(Chunk chunk)
         {
             float now = Time.realtimeSinceStartup;
@@ -3842,7 +3771,6 @@ namespace Genesis.RoomScan
             _dirtyQueue.Clear();
             _urgentQueue.Clear();
             _qualityGate.Clear();
-            _productizer?.Dispose();
         }
     }
 }

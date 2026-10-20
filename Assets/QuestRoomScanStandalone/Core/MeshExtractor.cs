@@ -15,7 +15,7 @@ namespace Genesis.RoomScan
     /// Orchestrates GPU Surface Nets mesh extraction from the TSDF volume.
     /// Dispatches GPUSurfaceNets compute shaders and manages the GPUMeshRenderer.
     /// </summary>
-    public class MeshExtractor : MonoBehaviour
+    public partial class MeshExtractor : MonoBehaviour
     {
         public static MeshExtractor Instance { get; private set; }
 
@@ -155,8 +155,6 @@ namespace Genesis.RoomScan
             : _gpuRenderer != null ? _gpuRenderer.LastSubmittedVertexCount : 0;
         public bool IsInfiniTamBaselineActive =>
             _volume != null && _volume.InfiniTamBaselineEnabled;
-        public bool IsQrsReferenceBaselineActive =>
-            _volume != null && _volume.QrsReferenceBaselineEnabled;
         private bool InfiniTamPublicationReady =>
             _volume != null && _volume.InfiniTamMeshPublicationReady;
         public string InfiniTamBlockStatsCompact => _infiniTamBlocks != null
@@ -167,9 +165,6 @@ namespace Genesis.RoomScan
             !_infiniTamBlocks.Failed;
 
         private GPUSurfaceNets _gpuSurfaceNets;
-        private QrsReferenceSurfaceNets _qrsReferenceSurfaceNets;
-        private ComputeShader _qrsReferenceSurfaceNetsCompute;
-        private Material _qrsReferenceMaterial;
         private GPUMeshRenderer _gpuRenderer;
         // The InfiniTAM baseline extracts into the ordinary whole-volume
         // working buffers, then atomically publishes an immutable snapshot.
@@ -181,7 +176,6 @@ namespace Genesis.RoomScan
         private int _layerEvidenceMode;
         private CoarseSkinRenderer _coarseSkin;
         private SupportTruthRenderer _supportTruth;
-        private LocalFineTsdfExperiment _localFineTsdfExperiment;
         private enum RouteValidationView
         {
             SparseFoundation,
@@ -534,12 +528,7 @@ namespace Genesis.RoomScan
             if (surfaceNetsCompute == null)
                 throw new Exception("[RoomScan] surfaceNetsCompute not assigned on MeshExtractor");
 
-            if (!_volume.QrsReferenceBaselineEnabled)
-                EnsureLocalFineTsdfExperiment();
-
-            if (enableGeometryStabilityDiagnostics &&
-                !_volume.QrsReferenceBaselineEnabled &&
-                !_volume.InfiniTamBaselineEnabled)
+            if (enableGeometryStabilityDiagnostics && !_volume.InfiniTamBaselineEnabled)
             {
                 _geometryStability = gameObject.GetComponent<GeometryStabilityMonitor>();
                 if (_geometryStability == null)
@@ -573,12 +562,6 @@ namespace Genesis.RoomScan
         public void EnsureInitialized()
         {
             if (_volume == null) _volume = VolumeIntegrator.Instance;
-            if (_volume != null && _volume.QrsReferenceBaselineEnabled)
-            {
-                EnsureQrsReferenceResources();
-                return;
-            }
-            EnsureLocalFineTsdfExperiment();
             if (_volume != null && _volume.InfiniTamBaselineEnabled)
             {
                 EnsureInfiniTamBaselineResources();
@@ -590,25 +573,6 @@ namespace Genesis.RoomScan
             EnsureSparseFoundationSkin();
             if (_gpuSurfaceNets != null || _persistentChunks != null) return;
             Init();
-        }
-
-        private void EnsureLocalFineTsdfExperiment()
-        {
-            if (_volume != null && _volume.QrsReferenceBaselineEnabled) return;
-            if (_localFineTsdfExperiment != null) return;
-            if (surfaceNetsCompute == null || scanMeshMaterial == null) return;
-
-            _localFineTsdfExperiment =
-                gameObject.GetComponent<LocalFineTsdfExperiment>();
-            if (_localFineTsdfExperiment == null)
-                _localFineTsdfExperiment =
-                    gameObject.AddComponent<LocalFineTsdfExperiment>();
-            if (!_localFineTsdfExperiment.Initialize(surfaceNetsCompute,
-                    scanMeshMaterial, gameObject.layer))
-            {
-                Destroy(_localFineTsdfExperiment);
-                _localFineTsdfExperiment = null;
-            }
         }
 
         private void EnsureSupportTruth()
@@ -715,13 +679,6 @@ namespace Genesis.RoomScan
             DisposeSparseFoundationSkin();
             DisposeInfiniTamBlockPipeline();
             DisposeInfiniTamBaselineFronts();
-            _qrsReferenceSurfaceNets?.Dispose();
-            _qrsReferenceSurfaceNets = null;
-            if (_qrsReferenceMaterial != null)
-            {
-                Destroy(_qrsReferenceMaterial);
-                _qrsReferenceMaterial = null;
-            }
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
         }
@@ -792,102 +749,12 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Brings up the original QRS-style whole-volume mesh as the sole
-        /// foreground.  All later ScanCover product/chunk/diagnostic mesh lanes
-        /// remain constructed only when the reference baseline is disabled.
-        /// </summary>
-        private void EnsureQrsReferenceResources()
-        {
-            if (_volume == null || scanMeshMaterial == null) return;
-
-            _infiniTamBlocks?.SetVisible(false);
-            _persistentChunks?.SetVisible(false);
-            _sparseFoundationSkin?.SetVisible(false);
-            if (_coarseSkin != null) _coarseSkin.Visible = false;
-            if (_supportTruth != null) _supportTruth.Visible = false;
-            if (_heraReplay != null) _heraReplay.SetVisible(false);
-            if (_localFineTsdfExperiment != null)
-            {
-                _localFineTsdfExperiment.ResetForNewScan();
-                _localFineTsdfExperiment.enabled = false;
-            }
-
-            if (_qrsReferenceSurfaceNetsCompute == null)
-            {
-                _qrsReferenceSurfaceNetsCompute =
-                    Resources.Load<ComputeShader>("QrsReferenceSurfaceNets");
-                if (_qrsReferenceSurfaceNetsCompute == null)
-                    throw new InvalidOperationException(
-                        "QRS reference Surface Nets compute is missing from Resources");
-            }
-
-            if (_qrsReferenceSurfaceNets == null)
-            {
-                // This is a replacement process, not another display layer.
-                // Release any producer that may have existed before a runtime
-                // mode change so it cannot keep buffers or background work.
-                DisposeFrozenHeraReplay();
-                DisposeFrozenChunkReplay();
-                DisposePersistentChunks();
-                DisposeSparseFoundationSkin();
-                DisposeInfiniTamBlockPipeline();
-                DisposeInfiniTamBaselineFronts();
-                _gpuSurfaceNets?.Dispose();
-                _gpuSurfaceNets = null;
-
-                _qrsReferenceSurfaceNets = new QrsReferenceSurfaceNets(
-                    _qrsReferenceSurfaceNetsCompute)
-                {
-                    MinMeshWeight = _volume.MinMeshWeight,
-                    SmoothIterations = meshSmoothIterations,
-                    SmoothLambda = meshSmoothLambda,
-                    SmoothBeta = meshSmoothBeta,
-                    TemporalAlphaMax = temporalAlphaMax,
-                    TemporalAlphaMin = temporalAlphaMin,
-                    TemporalDecayRate = temporalDecayRate,
-                    ConvergenceThreshold = convergenceThreshold,
-                    TemporalDeadzone = temporalDeadzone
-                };
-                _qrsReferenceSurfaceNets.EnsureBuffers(_volume.VoxelCount,
-                    gpuVertexBudgetPercent);
-            }
-
-            if (_qrsReferenceMaterial == null)
-            {
-                Shader qrsShader =
-                    Resources.Load<Shader>("QrsReferenceScanMeshVertexColor");
-                if (qrsShader == null)
-                    throw new InvalidOperationException(
-                        "QRS reference scan mesh shader is missing from Resources");
-                _qrsReferenceMaterial = new Material(qrsShader)
-                {
-                    name = "QRS Reference Scan Mesh (Runtime)",
-                    hideFlags = HideFlags.DontSave
-                };
-            }
-
-            if (_gpuRenderer == null)
-            {
-                _gpuRenderer = gameObject.AddComponent<GPUMeshRenderer>();
-            }
-            _gpuRenderer.GpuMeshMaterial = _qrsReferenceMaterial;
-
-            _gpuRenderer.Initialize(_qrsReferenceSurfaceNets,
-                _qrsReferenceSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
-            _gpuRenderer.SetRearWireOcclusion(false);
-            _gpuRenderer.SetStrictObservedDisplay(false);
-            _gpuRenderer.SetJointDiagnosticDisplay(false);
-            _gpuRenderer.SetTemporalIllegalCandidateActive(false);
-            _gpuRenderer.RenderVisible = renderProductionMesh;
-        }
-
-        /// <summary>
         /// V1 InfiniTAM-style baseline extractor.  It intentionally reuses the
         /// repository's proven GPU Surface Nets kernel only as a stateless
-        /// zero-crossing reader.  No smoothing, temporal candidate history,
-        /// productizer, quality gate, chunk replacement, HERA or 10 cm topology
-        /// owns this route.  A blockwise Marching Cubes extractor is the next
-        /// replaceable stage once this clean reconstruction baseline is measured.
+        /// zero-crossing reader.  Its only geometry post-process is the bounded
+        /// local plane smoother/grid straightener shared with the block path;
+        /// no temporal candidate history, productizer, quality gate, chunk
+        /// replacement, HERA or topology rewrite owns this route.
         /// </summary>
         private void EnsureInfiniTamBaselineResources()
         {
@@ -917,9 +784,19 @@ namespace Genesis.RoomScan
                 _gpuSurfaceNets = new GPUSurfaceNets(surfaceNetsCompute)
                 {
                     MinMeshWeight = _volume.MinMeshWeight,
-                    SmoothIterations = 0,
-                    SmoothLambda = 0f,
+                    // Match the block path when the whole-volume fallback is
+                    // temporarily responsible for the production Front.
+                    SmoothIterations = 1,
+                    SmoothLambda = 0.5f,
                     SmoothBeta = 0f,
+                    PlanarNormalOnlySmooth = true,
+                    PlanarSmoothNormalDotMin = 0.9510565f,
+                    PlanarSmoothMaxCorrectionVoxels = 0.15f,
+                    PlanarSmoothMinNeighbors = 3,
+                    PlanarGridStraighten = true,
+                    PlanarGridAxisDotMin = 0.9659258f,
+                    PlanarGridStrength = 1f,
+                    PlanarGridMaxCorrectionVoxels = 0.5f,
                     TemporalAlphaMax = 1f,
                     TemporalAlphaMin = 1f,
                     TemporalDecayRate = 0f,
@@ -1077,11 +954,6 @@ namespace Genesis.RoomScan
 
         public void SetLayerEvidenceMode(int mode)
         {
-            if (IsQrsReferenceBaselineActive)
-            {
-                _layerEvidenceMode = 0;
-                return;
-            }
             _layerEvidenceMode = Mathf.Clamp(mode, 0, 3);
             _infiniTamBlocks?.SetLayerEvidenceMode(_layerEvidenceMode);
         }
@@ -1202,9 +1074,7 @@ namespace Genesis.RoomScan
              (_routeValidationView == RouteValidationView.PaperFineHybrid &&
               _paperOwnedGrid));
 
-        public string RouteValidationLabel => IsQrsReferenceBaselineActive
-            ? "QRS原链5cm"
-            : !IsRouteValidationActive
+        public string RouteValidationLabel => !IsRouteValidationActive
             ? (IsInfiniTamBaselineActive ? "InfiniTAM基线" : "常规网格")
             : _routeValidationView == RouteValidationView.SparseFoundation
                 ? "制品纸皮10cm"
@@ -1218,7 +1088,6 @@ namespace Genesis.RoomScan
 
         public string CycleRouteValidationView()
         {
-            if (IsQrsReferenceBaselineActive) return "QRS原链5cm";
             if (!IsRouteValidationActive) return "常规网格";
             _routeValidationView = _routeValidationView == RouteValidationView.SparseFoundation
                 ? RouteValidationView.PaperFineHybrid
@@ -1320,12 +1189,6 @@ namespace Genesis.RoomScan
         /// </summary>
         public void PrepareForChunkAbAcquisition()
         {
-            if (IsQrsReferenceBaselineActive)
-            {
-                EnsureQrsReferenceResources();
-                Logger.Info("QRS reference baseline owns the foreground; chunk A/B acquisition is disabled.");
-                return;
-            }
             // 增量精修页是扫描期产物，暂停→继续必须保留（否则已冻块永不重排=永久丢显示）；
             // A 键全场回放会走 BeginFrozenHeraReplay 显式 Dispose 它。
             if (_heraReplay == null || !_heraReplay.IsIncremental)
@@ -1683,26 +1546,6 @@ namespace Genesis.RoomScan
         /// </summary>
         public void Extract()
         {
-            if (IsQrsReferenceBaselineActive)
-            {
-                EnsureQrsReferenceResources();
-                if (_qrsReferenceSurfaceNets == null) return;
-
-                _extractCount++;
-                _qrsReferenceSurfaceNets.MinMeshWeight = _volume.MinMeshWeight;
-                _qrsReferenceSurfaceNets.Extract(
-                    _volume.Volume,
-                    _volume.ColorVolume,
-                    _volume.VoxelSize);
-                if (_gpuRenderer != null)
-                {
-                    _gpuRenderer.UpdateBounds(
-                        _qrsReferenceSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
-                    _gpuRenderer.RenderVisible = renderProductionMesh;
-                }
-                return;
-            }
-
             if (IsInfiniTamBaselineActive)
             {
                 EnsureInfiniTamBaselineResources();
@@ -2021,8 +1864,8 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// The block extractor consumes only the already-fused TSDF.  Passing
-        /// the live shell/depth evidence here would silently rebuild the old
+        /// The block extractor consumes only the already-fused TSDF. Passing
+        /// live shell/depth evidence here would silently rebuild the old
         /// multi-office route inside extraction and break baseline isolation.
         /// </summary>
         private void ExtractInfiniTamBlock(GPUSurfaceNets target)
@@ -2913,13 +2756,6 @@ namespace Genesis.RoomScan
             }
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
-            _qrsReferenceSurfaceNets?.Dispose();
-            _qrsReferenceSurfaceNets = null;
-            if (_qrsReferenceMaterial != null)
-            {
-                Destroy(_qrsReferenceMaterial);
-                _qrsReferenceMaterial = null;
-            }
             _legacySnapshotCaptured = false;
             _legacyFallbackActive = false;
         }
@@ -2945,18 +2781,9 @@ namespace Genesis.RoomScan
             }
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
-            _qrsReferenceSurfaceNets?.Dispose();
-            _qrsReferenceSurfaceNets = null;
-            if (_qrsReferenceMaterial != null)
-            {
-                Destroy(_qrsReferenceMaterial);
-                _qrsReferenceMaterial = null;
-            }
             _legacySnapshotCaptured = false;
             _legacyFallbackActive = false;
-            if (_volume != null && _volume.QrsReferenceBaselineEnabled)
-                EnsureQrsReferenceResources();
-            else if (_volume != null && _volume.InfiniTamBaselineEnabled)
+            if (_volume != null && _volume.InfiniTamBaselineEnabled)
                 EnsureInfiniTamBaselineResources();
             else
                 Init();

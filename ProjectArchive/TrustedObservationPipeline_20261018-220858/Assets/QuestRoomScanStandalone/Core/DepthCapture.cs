@@ -1,0 +1,2008 @@
+using System;
+using System.Collections.Generic;
+using Unity.XR.CoreUtils.Collections;
+using UnityEngine;
+using UnityEngine.Experimental.Rendering;
+using UnityEngine.Rendering;
+using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.ARSubsystems;
+#if UNITY_ANDROID && !UNITY_EDITOR
+using UnityEngine.Android;
+#endif
+
+namespace Genesis.RoomScan
+{
+    /// <summary>
+    /// Captures stereo depth from the AR occlusion subsystem, computes world-space normals,
+    /// runs optional bilateral filtering guided by the passthrough RGB feed, and produces
+    /// dilated depth textures consumed by <see cref="VolumeIntegrator"/> for TSDF integration.
+    /// </summary>
+    [DefaultExecutionOrder(-40)]
+    public class DepthCapture : MonoBehaviour
+    {
+        public const int FusionEyeIndex = 1;
+        public static DepthCapture Instance { get; private set; }
+
+        [SerializeField] private ComputeShader depthNormalCompute;
+        [SerializeField] private ComputeShader depthDilationCompute;
+        [SerializeField] private ComputeShader bilateralFilterCompute;
+        [SerializeField] private ComputeShader depthEdgeCleanCompute;
+        [Tooltip("手部打码 compute；留空则 Resources/HandMask 兜底装载（免场景 YAML 接线）。")]
+        [SerializeField] private ComputeShader handMaskCompute;
+        [Tooltip("源头时序滤波 compute；留空则 Resources/DepthTemporalFilter 兜底装载（免场景 YAML 接线）。")]
+        [SerializeField] private ComputeShader temporalFilterCompute;
+
+        [Header("单帧种子平面→生产深度（实验）")]
+        [SerializeField] private bool enableSeedPlaneProductionExperiment = true;
+
+        [Header("枪胶双证词（数据层）")]
+        [SerializeField, Tooltip("每个实际消费的深度帧在任何预处理前复制融合眼平台深度，" +
+                                 "与预处理后深度共同作为枪胶候选的两份独立证词。")]
+        private bool enableGunGelDualTestimony = true;
+
+        [Header("源头时序滤波（08-20，数据层第一刀）")]
+        [Tooltip("深度先跨帧稳定再进双边/缘洗/TSDF：当前像素重建世界点，重投影到上一拍历史；" +
+                 "世界位移超阈=真变化立即放行，带内才做 EMA。手罩 0=弃权只穿透不清历史。 (default true)")]
+        [SerializeField] private bool enableTemporalFilter = true;
+        [SerializeField, Range(0.05f, 1f), Tooltip("静态/慢动时当前帧权重。0.35≈3 拍收敛到 95%；快速转视会按角速度自动放大到 1。")]
+        private float temporalFilterAlpha = 0.35f;
+        [SerializeField, Min(0.005f), Tooltip("真变化判据基数（米）：重投影历史点与当前世界点距离超此直接放行，不吃滤波延迟。")]
+        private float temporalChangeBaseMeters = 0.04f;
+        [SerializeField, Min(0f), Tooltip("真变化判据距离系数：远处允许更大绝对位移，防边缘 bleed 被平均。")]
+        private float temporalChangeDistanceScale = 0.02f;
+
+        [Header("手部语义剔除（08-20，公共配方 E）")]
+        [Tooltip("第一层=平台原生手部剔除（XR_META_environment_depth_hand_removal）：手追在跑时手像素被" +
+                 "背景估计替换——不烙手也不留洞。持握控制器时手追暂停=自动失效，由第二层球打码补位。 (default true)")]
+        [SerializeField] private bool enableNativeHandRemoval = true;
+        [Tooltip("第二层=控制器/手关节球深度打码：球罩住的像素写 0=弃权（复用缘洗语义：不种不长不抹不投票），" +
+                 "整合/穿越票/拍平/B1 全自动免疫。原生剔除生效时只打控制器球（避免把原生填的背景打回弃权）。 (default true)")]
+        [SerializeField] private bool enableHandMask = true;
+        [SerializeField, Range(0.05f, 0.2f)] private float handPalmRadius = 0.11f;
+        [SerializeField, Range(0.03f, 0.12f)] private float handTipRadius = 0.07f;
+        [SerializeField, Range(0.06f, 0.25f)] private float controllerSphereRadius = 0.13f;
+
+        [Header("Bilateral Depth Filter")]
+        [Tooltip("Edge-preserving depth denoising guided by passthrough RGB. Smooths flat surfaces while keeping object boundaries sharp.")]
+        [SerializeField] private bool enableBilateralFilter = true;
+        [SerializeField, Range(1f, 8f)] private float sigmaSpatial = 3.0f;
+        [SerializeField, Range(0.01f, 0.5f)] private float sigmaColor = 0.1f;
+        [SerializeField, Range(0.001f, 0.1f), Tooltip("深度域标准差（米）。0.02=只让相差约 2 cm 的邻点显著互相平滑；不再随观察距离改变实际尺度。")] private float sigmaDepth = 0.02f;
+        [SerializeField, Range(1, 5)] private int filterRadius = 2;
+
+        [Header("Depth Edge Clean（v0.2 边缘识别 GPU 移植）")]
+        [Tooltip("三段式深度边缘检测（邻域范围→局部平面拟合拒绝→双聚类验证），判为边缘的像素写 0：" +
+                 "融合侧近距闸/截断带自然拦下=弃权不投票（绝不投远票误伤缝隙后墙）。" +
+                 "治折角/缝隙的假网格桥接，TSDF 零先验区恢复系统级 45° 自然倒角。融合 shader 零改动。" +
+                 "验证姿势：开后看点阵/深度预览的边缘切口是否只出现在真折角，斜面地面不应出切口。 (default true)")]
+        [SerializeField] private bool enableDepthEdgeClean = true;
+        [SerializeField, Range(1, 2)] private int edgeProbeRadiusPixels = 1;
+        [SerializeField, Min(0.001f)] private float edgeJumpBaseMeters = 0.035f;
+        [SerializeField, Min(0f)] private float edgeJumpDistanceScale = 0.018f;
+        [SerializeField] private bool edgeUseLocalPlaneReject = true;
+        [SerializeField, Min(0.001f)] private float edgePlaneResidualBaseMeters = 0.012f;
+        [SerializeField, Min(0f)] private float edgePlaneResidualDistanceScale = 0.006f;
+        [SerializeField, Range(0.1f, 1f)] private float edgePlaneMinInlierRatio = 0.65f;
+        [SerializeField, Min(3)] private int edgePlaneMinNeighborPoints = 5;
+        [SerializeField, Range(0.1f, 0.9f)] private float edgeTwoClusterMinFraction = 0.25f;
+        [Tooltip("前景遮蔽否决（③b）：邻域有平坦前景群+真断崖间隙且中心远在间隙后=裙边飞点，杀。" +
+                 "治斜视时深度在边缘拖出的渐变裙边（能通过平面拟合的斜坡桥）。连续斜坡（地面）无断崖不触发。 (default true)")]
+        [SerializeField] private bool edgeSkirtVetoEnabled = true;
+        [SerializeField, Min(2)] private int edgeSkirtMinNearProbes = 2;
+        [Tooltip("掠射面片否决（③c）：局部拟合平面几乎侧对视线（法线·视线 < 阈值）= 沿视线拉出的飞点帘，杀。" +
+                 "治连续斜坡状裙边桥（无断崖间隙、能过平面拟合的那种）。真实面片二维铺开、法线必朝向视线一侧，不触发。" +
+                 "阈值对齐融合法线闸 MIN_DOT 0.3——只弃权融合反正不会用的掠射样本。 (default true)")]
+        [SerializeField] private bool edgeGrazingVetoEnabled = true;
+        [SerializeField, Range(0.05f, 0.9f)] private float edgeGrazingMinFacingDot = 0.3f;
+        [Tooltip("③c 低跨度入口（缓坡帘）：①号断崖门槛抓不到的长缓裙边，用此更低门槛单独喂给朝向否决。" +
+                 "治小掠射角下的假桥（跨度只有几厘米、能过融合法线闸的那种）。误杀远处噪面=调大。 (default 0.02)")]
+        [SerializeField, Min(0.001f)] private float edgeGrazingRangeBaseMeters = 0.02f;
+        [SerializeField, Min(0f)] private float edgeGrazingRangeScale = 0.008f;
+        [Tooltip("v2.1 同平面斜视豁免：掠射样本若有足够局部点贴合中心平面，不因朝向一项直接弃权；" +
+                 "深度双层、裙边和跨眼自由空间证伪仍拥有最高否决权。 (default true)")]
+        [SerializeField] private bool edgeGrazingPlaneExemptionEnabled = true;
+        [SerializeField, Min(0.005f)] private float edgeGrazingPlaneMaxResidualMeters = 0.035f;
+        [SerializeField, Range(0.3f, 1f)] private float edgeGrazingPlaneMinSupportRatio = 0.6f;
+        [SerializeField, Range(3, 25)] private int edgeGrazingPlaneMinSupportPoints = 5;
+        [Tooltip("双眼交叉证伪（③e，最后关卡）：把像素世界点投到另一眼，若另一眼在同一视线上看到更远表面" +
+                 "（该点浮在已知空域）且面片也朝向另一眼 = 飞行像素，杀。飞点帘绕每只眼各自视点生成，" +
+                 "真实表面两眼一致；背向另一眼的面受朝向闸保护。治斜视缓坡帘（单帧无签名的那种）。 (default true)")]
+        [SerializeField] private bool edgeCrossEyeEnabled = true;
+        [SerializeField, Min(0.005f)] private float edgeCrossEyeMarginBaseMeters = 0.05f;
+        [SerializeField, Min(0f)] private float edgeCrossEyeMarginScale = 0.03f;
+        [SerializeField, Range(0.05f, 0.9f)] private float edgeCrossEyeMinOtherFacing = 0.2f;
+
+        [Header("Dilation")]
+        [SerializeField] private int dilationSteps = 8;
+        [SerializeField] private float voxelDistance = 0.25f;
+        [SerializeField] private float voxelSize = 0.10f;
+
+        private readonly Matrix4x4[] _proj = new Matrix4x4[2];
+        private readonly Matrix4x4[] _projInv = new Matrix4x4[2];
+        private readonly Matrix4x4[] _view = new Matrix4x4[2];
+        private readonly Matrix4x4[] _viewInv = new Matrix4x4[2];
+        private Vector2 _planes;
+
+        /// <summary>Per-eye projection matrices derived from the depth frame's FOV and near/far planes.</summary>
+        public Matrix4x4[] Proj => _proj;
+        /// <summary>Inverse projection matrices (per-eye).</summary>
+        public Matrix4x4[] ProjInv => _projInv;
+        /// <summary>Per-eye view matrices (tracking-space to depth-camera-space).</summary>
+        public Matrix4x4[] View => _view;
+        /// <summary>Inverse view matrices (per-eye), mapping depth-camera-space back to tracking-space.</summary>
+        public Matrix4x4[] ViewInv => _viewInv;
+        /// <summary>Near and far clip distances (x = near, y = far) for the current depth frame.</summary>
+        public Vector2 Planes => _planes;
+
+        // 深度位姿角速度（EMA，°/s）：在深度帧到达事件里用原始 XR Pose 四元数计算，
+        // dt = 真实深度帧间隔。融合端不得用"积分间隔 ÷ 矩阵.rotation 增量"推算——
+        // 深度帧率低于积分率时系统性放大，且带负行列式（ScaleFlipZ）的矩阵做
+        // 四元数提取存在分支不连续风险（曾致诊断运动位 100% 饱和失效）。
+        private bool _hasLastDepthRot;
+        private Quaternion _lastDepthRot;
+        private Vector3 _lastDepthPos;
+        private float _lastDepthRotTime;
+        private float _smoothedDepthAngSpeed;
+        private float _smoothedDepthLinSpeed;
+
+        /// <summary>平滑后的深度位姿角速度（°/s），随深度帧到达更新。</summary>
+        public float SmoothedDepthAngularSpeed => _smoothedDepthAngSpeed;
+
+        /// <summary>平滑后的深度位姿线速度（m/s），与角速度同源同时刻。
+        /// 08-21 造炮新增：定点实验实锤平移不转头也触发时延族掉负，噪声模型必须含平移项。</summary>
+        public float SmoothedDepthLinearSpeed => _smoothedDepthLinSpeed;
+
+        private void TrackDepthAngularSpeed(Quaternion rot, Vector3 pos)
+        {
+            float now = Time.unscaledTime;
+            if (_hasLastDepthRot)
+            {
+                float dt = now - _lastDepthRotTime;
+                if (dt > 1e-4f)
+                {
+                    float inst = Quaternion.Angle(_lastDepthRot, rot) / dt;
+                    // 帧时间戳毛刺会产生上万度的假尖峰，截断保护 EMA
+                    _smoothedDepthAngSpeed = Mathf.Lerp(
+                        _smoothedDepthAngSpeed, Mathf.Min(inst, 2000f), 0.35f);
+                    float instLin = Vector3.Distance(_lastDepthPos, pos) / dt;
+                    // 同理截断（追踪丢失重定位会产生瞬移假尖峰）
+                    _smoothedDepthLinSpeed = Mathf.Lerp(
+                        _smoothedDepthLinSpeed, Mathf.Min(instLin, 20f), 0.35f);
+                }
+            }
+            _lastDepthRot = rot;
+            _lastDepthPos = pos;
+            _lastDepthRotTime = now;
+            _hasLastDepthRot = true;
+        }
+
+        // Shader property IDs
+        public static readonly int DepthTexID = Shader.PropertyToID("gsDepthTex");
+        public static readonly int DepthTexRWID = Shader.PropertyToID("gsDepthTexRW");
+        public static readonly int TexSizeID = Shader.PropertyToID("gsDepthTexSize");
+        public static readonly int NormTexID = Shader.PropertyToID("gsDepthNormalTex");
+        public static readonly int NormTexRWID = Shader.PropertyToID("gsDepthNormalTexRW");
+        public static readonly int ZParamsID = Shader.PropertyToID("gsDepthZParams");
+        public static readonly int ProjID = Shader.PropertyToID("gsDepthProj");
+        public static readonly int ProjInvID = Shader.PropertyToID("gsDepthProjInv");
+        public static readonly int ViewID = Shader.PropertyToID("gsDepthView");
+        public static readonly int ViewInvID = Shader.PropertyToID("gsDepthViewInv");
+        public static readonly int InputRawMonoDepthID = Shader.PropertyToID("gsInputRawMonoDepth");
+        public static readonly int DilateSrcID = Shader.PropertyToID("gsDilateSrc");
+        public static readonly int DilateDestID = Shader.PropertyToID("gsDilateDest");
+        public static readonly int DilateStepSizeID = Shader.PropertyToID("gsDilateStepSize");
+        public static readonly int DilatedDepthTexID = Shader.PropertyToID("gsDilatedDepth");
+        public static readonly int EdgeReasonTexID = Shader.PropertyToID("gsEdgeReasonTex");
+        public static readonly int TemporalReasonTexID = Shader.PropertyToID("gsTemporalReasonTex");
+        public static readonly int VoxDistID = Shader.PropertyToID("gsVoxDist");
+        public static readonly int VoxSizeShaderID = Shader.PropertyToID("gsVoxSize");
+
+        // Bilateral filter property IDs
+        private static readonly int BilSrcDepthID = Shader.PropertyToID("_SrcDepth");
+        private static readonly int BilRGBGuideID = Shader.PropertyToID("_RGBGuide");
+        private static readonly int BilDstDepthID = Shader.PropertyToID("_DstDepth");
+        private static readonly int BilDepthWID = Shader.PropertyToID("_DepthW");
+        private static readonly int BilDepthHID = Shader.PropertyToID("_DepthH");
+        private static readonly int BilSigmaSpatialID = Shader.PropertyToID("_SigmaSpatial");
+        private static readonly int BilSigmaColorID = Shader.PropertyToID("_SigmaColor");
+        private static readonly int BilSigmaDepthID = Shader.PropertyToID("_SigmaDepth");
+        private static readonly int BilFilterRadiusID = Shader.PropertyToID("_FilterRadius");
+
+        // Depth edge clean property IDs（_SrcDepth/_DstDepth/_DepthW/_DepthH 与双边同名同 ID，复用）
+        private static readonly int EdgeStatsID = Shader.PropertyToID("_EdgeStats");
+        private static readonly int EdgeReasonRWID = Shader.PropertyToID("_EdgeReason");
+        private static readonly int EdgeProjInvID = Shader.PropertyToID("_DepthProjInv");
+        private static readonly int EdgeViewInvID = Shader.PropertyToID("_DepthViewInv");
+        private static readonly int EdgeLinearizeABID = Shader.PropertyToID("_LinearizeAB");
+        private static readonly int EdgeProbeRadiusID = Shader.PropertyToID("_ProbeRadius");
+        private static readonly int EdgeJumpBaseID = Shader.PropertyToID("_EdgeJumpBase");
+        private static readonly int EdgeJumpDistScaleID = Shader.PropertyToID("_EdgeJumpDistScale");
+        private static readonly int EdgeUsePlaneRejectID = Shader.PropertyToID("_UsePlaneReject");
+        private static readonly int EdgePlaneResidualBaseID = Shader.PropertyToID("_PlaneResidualBase");
+        private static readonly int EdgePlaneResidualDistScaleID = Shader.PropertyToID("_PlaneResidualDistScale");
+        private static readonly int EdgePlaneMinInlierRatioID = Shader.PropertyToID("_PlaneMinInlierRatio");
+        private static readonly int EdgePlaneMinNeighborsID = Shader.PropertyToID("_PlaneMinNeighbors");
+        private static readonly int EdgeTwoClusterMinFractionID = Shader.PropertyToID("_TwoClusterMinFraction");
+        private static readonly int SkirtVetoEnabledID = Shader.PropertyToID("_SkirtVetoEnabled");
+        private static readonly int SkirtMinNearProbesID = Shader.PropertyToID("_SkirtMinNearProbes");
+        private static readonly int GrazingVetoEnabledID = Shader.PropertyToID("_GrazingVetoEnabled");
+        private static readonly int GrazingMinFacingDotID = Shader.PropertyToID("_GrazingMinFacingDot");
+        private static readonly int GrazingRangeBaseID = Shader.PropertyToID("_GrazingRangeBase");
+        private static readonly int GrazingRangeScaleID = Shader.PropertyToID("_GrazingRangeScale");
+        private static readonly int GrazingPlaneExemptionEnabledID = Shader.PropertyToID("_GrazingPlaneExemptionEnabled");
+        private static readonly int GrazingPlaneMaxResidualID = Shader.PropertyToID("_GrazingPlaneMaxResidual");
+        private static readonly int GrazingPlaneMinSupportRatioID = Shader.PropertyToID("_GrazingPlaneMinSupportRatio");
+        private static readonly int GrazingPlaneMinSupportPointsID = Shader.PropertyToID("_GrazingPlaneMinSupportPoints");
+        private static readonly int CrossEyeEnabledID = Shader.PropertyToID("_CrossEyeEnabled");
+        private static readonly int CrossEyeMarginBaseID = Shader.PropertyToID("_CrossEyeMarginBase");
+        private static readonly int CrossEyeMarginScaleID = Shader.PropertyToID("_CrossEyeMarginScale");
+        private static readonly int CrossEyeMinOtherFacingID = Shader.PropertyToID("_CrossEyeMinOtherFacing");
+        private static readonly int EdgeProjFwdID = Shader.PropertyToID("_DepthProj");
+        private static readonly int EdgeViewFwdID = Shader.PropertyToID("_DepthView");
+        // 双边/缘洗共用同名 uniform，同 ID 复用（逐眼交替的眼偏移）
+        private static readonly int EyeOffsetID = Shader.PropertyToID("_EyeOffset");
+
+        private const int MaxSeedPlanePatches = 8;
+        private static readonly int SeedSourceDepthID = Shader.PropertyToID("_SeedSourceDepth");
+        private static readonly int SeedSourceNormalID = Shader.PropertyToID("_SeedSourceNormal");
+        private static readonly int SeedOutputDepthID = Shader.PropertyToID("_SeedOutputDepth");
+        private static readonly int SeedImageSizeID = Shader.PropertyToID("_SeedImageSize");
+        private static readonly int SeedPlaneCountID = Shader.PropertyToID("_SeedPlaneCount");
+        private static readonly int SeedNormalOffsetID = Shader.PropertyToID("_SeedNormalOffset");
+        private static readonly int SeedAxisUMinID = Shader.PropertyToID("_SeedAxisUMin");
+        private static readonly int SeedAxisVMinID = Shader.PropertyToID("_SeedAxisVMin");
+        private static readonly int SeedMaxUVId = Shader.PropertyToID("_SeedMaxUV");
+        private static readonly int SeedProjID = Shader.PropertyToID("_SeedProj");
+        private static readonly int SeedProjInvID = Shader.PropertyToID("_SeedProjInv");
+        private static readonly int SeedViewID = Shader.PropertyToID("_SeedView");
+        private static readonly int SeedViewInvID = Shader.PropertyToID("_SeedViewInv");
+
+        // 手部打码 property IDs（_DepthW/_DepthH 与双边同名同 ID，复用 BilDepthWID/BilDepthHID）
+        private static readonly int RawDepthID = Shader.PropertyToID("_RawDepth");
+        private static readonly int MaskedDepthID = Shader.PropertyToID("_MaskedDepth");
+        private static readonly int HandMaskStatsID = Shader.PropertyToID("_HandMaskStats");
+        private static readonly int HandSpheresID = Shader.PropertyToID("_HandSpheres");
+        private static readonly int HandSphereCountID = Shader.PropertyToID("_HandSphereCount");
+        private static readonly int MaskProjInvID = Shader.PropertyToID("_MaskProjInv");
+        private static readonly int MaskViewInvID = Shader.PropertyToID("_MaskViewInv");
+
+        // 源头时序滤波 property IDs（_SrcDepth/_DstDepth/_DepthW/_DepthH 与双边同名同 ID，复用）
+        private static readonly int TemporalHistDepthID = Shader.PropertyToID("_HistDepth");
+        private static readonly int TemporalNextHistDepthID = Shader.PropertyToID("_NextHistDepth");
+        private static readonly int TemporalReasonRWID = Shader.PropertyToID("_TemporalReason");
+        private static readonly int TemporalStatsID = Shader.PropertyToID("_TemporalStats");
+        private static readonly int TemporalCurProjID = Shader.PropertyToID("_CurProj");
+        private static readonly int TemporalCurProjInvID = Shader.PropertyToID("_CurProjInv");
+        private static readonly int TemporalCurViewID = Shader.PropertyToID("_CurView");
+        private static readonly int TemporalCurViewInvID = Shader.PropertyToID("_CurViewInv");
+        private static readonly int TemporalPrevProjID = Shader.PropertyToID("_PrevProj");
+        private static readonly int TemporalPrevProjInvID = Shader.PropertyToID("_PrevProjInv");
+        private static readonly int TemporalPrevViewID = Shader.PropertyToID("_PrevView");
+        private static readonly int TemporalPrevViewInvID = Shader.PropertyToID("_PrevViewInv");
+        private static readonly int TemporalHasPrevID = Shader.PropertyToID("_HasPrev");
+        private static readonly int TemporalAlphaID = Shader.PropertyToID("_TemporalAlpha");
+        private static readonly int TemporalChangeBaseID = Shader.PropertyToID("_TemporalChangeBase");
+        private static readonly int TemporalChangeScaleID = Shader.PropertyToID("_TemporalChangeScale");
+        private static readonly int WitnessSourceDepthID = Shader.PropertyToID("_SourceDepth");
+        private static readonly int WitnessDestDepthID = Shader.PropertyToID("_DestDepth");
+        private static readonly int WitnessCaptureSizeID = Shader.PropertyToID("_CaptureSize");
+        private static readonly int WitnessSourceEyeID = Shader.PropertyToID("_SourceEyeIndex");
+        private static readonly int WitnessDestEyeID = Shader.PropertyToID("_DestEyeIndex");
+
+        /// <summary>逐眼交替节拍：每次融合前预处理只洗一只眼，0/1 翻转。</summary>
+        private int _preprocessEye;
+
+        /// <summary>True once a valid depth frame has been received from the AR occlusion subsystem.</summary>
+        public static bool DepthAvailable { get; private set; }
+
+        /// <summary>已接收的深度帧总数（诊断"帧是否还在流"：盯着不动时此数仍应持续增长）。</summary>
+        public int FrameCount => _frameCount;
+
+        // ── 中心深度采样（实时轨落点锚定）──
+        // 08-18 实机视频定案：实时轨落点写死 1.5m，站 2.5m 外看墙时落点飘在半空，
+        // slab 七块全是空块 → "空块不排" → 正眼盯着的墙永远不长网。改为每次巡视
+        // 从深度图中心 8×8（生产右眼片）取中位数距离，落点钉在实际表面略后方。
+        private bool _centerDepthRequested;
+        private bool _centerDepthPending;
+        private ComputeKernelHelper _centerDepthKernel;
+        private ComputeBuffer _centerDepthSamplesBuffer;
+        private static readonly int CenterDepthSamplesID = Shader.PropertyToID("gsCenterDepthSamples");
+
+        /// <summary>最近一次中心深度中位数（米，生产右眼线性化）；&lt;0 = 尚无有效样本。</summary>
+        public float LastCenterDepthMeters { get; private set; } = -1f;
+
+        /// <summary>深度帧尺寸（B1 平面拟合影子内核 dispatch 用）；无深度帧时为 0。</summary>
+        public int DepthWidth => _depthTex != null ? _depthTex.width : 0;
+        public int DepthHeight => _depthTex != null ? _depthTex.height : 0;
+
+        /// <summary>
+        /// 请求下一张被融合消费的预处理深度帧做中心 8×8 采样。
+        /// 请求只记账；真正的 GPU 拷贝在 PreprocessLatestFrame 末尾执行，避免直接
+        /// 回读 Meta GraphicsFormat.None 的平台外部纹理。
+        /// </summary>
+        public void RequestCenterDepthSample()
+        {
+            if (!DepthAvailable) return;
+            _centerDepthRequested = true;
+        }
+
+        private void DispatchCenterDepthSample()
+        {
+            if (!_centerDepthRequested || _centerDepthPending || _depthTex == null) return;
+            if (_depthTex.width < 16 || _depthTex.height < 16) return;
+            _centerDepthRequested = false;
+            _centerDepthSamplesBuffer ??= new ComputeBuffer(64, sizeof(float));
+            _centerDepthKernel.Set(DepthTexID, _depthTex);
+            _centerDepthKernel.Set(CenterDepthSamplesID, _centerDepthSamplesBuffer);
+            _centerDepthKernel.Shader.SetInts(TexSizeID, _depthTex.width, _depthTex.height);
+            _centerDepthKernel.DispatchFit(8, 8, 1);
+            _centerDepthPending = true;
+            AsyncGPUReadback.Request(_centerDepthSamplesBuffer, OnCenterDepthReadback);
+        }
+
+        private void OnCenterDepthReadback(AsyncGPUReadbackRequest request)
+        {
+            _centerDepthPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<float>();
+            if (data.Length < 8) return;
+            float a = _linearizeAB[0].x, b = _linearizeAB[0].y;
+            _centerSamples.Clear();
+            for (int i = 0; i < data.Length; i++)
+            {
+                float ndc = data[i];
+                float z = ndc * 2f - 1f;
+                float denom = z + a;
+                if (Mathf.Abs(denom) < 1e-6f) continue;
+                float lin = Mathf.Abs(b / denom);
+                if (lin < 0.3f || lin > 15f) continue; // 弃权像素（写0=near）/超程
+                _centerSamples.Add(lin);
+            }
+            if (_centerSamples.Count < 4) return; // 样本太少=中心正好在缝/弃权区，沿用上次
+            _centerSamples.Sort();
+            LastCenterDepthMeters = _centerSamples[_centerSamples.Count / 2];
+        }
+        private readonly List<float> _centerSamples = new List<float>(64);
+
+        /// <summary>
+        /// True after USE_SCENE permission is confirmed and the initial subsystem check passes.
+        /// Until this is set, <see cref="StartDepthCapture"/> is a no-op.
+        /// </summary>
+        private bool _permissionReady;
+
+        /// <summary>
+        /// Tracks whether the caller (RoomScanner) wants depth capture active.
+        /// Persists across app pause/resume so the subsystem is re-enabled correctly.
+        /// </summary>
+        private bool _captureActive;
+
+        private ComputeKernelHelper _normKernel;
+        private ComputeKernelHelper _monoConvertKernel;
+        private ComputeKernelHelper _initDilateKernel;
+        private ComputeKernelHelper _dilateStepKernel;
+        private ComputeKernelHelper _bilateralKernel;
+        private bool _hasBilateralKernel;
+        private ComputeKernelHelper _edgeCleanKernel;
+        private bool _hasEdgeCleanKernel;
+        private ComputeKernelHelper _handMaskKernel;
+        private bool _hasHandMaskKernel;
+        private ComputeKernelHelper _temporalKernel;
+        private bool _hasTemporalKernel;
+        private ComputeShader _seedPlaneCompute;
+        private int _seedPlaneKernel = -1;
+        private RenderTexture _seedPlaneDepthTex;
+        private bool _seedPlanePreviewActive;
+        private bool _seedPlaneAwaitClear;
+        private int _seedPlaneCount;
+        private int _lastSeedPlaneAppliedFrame = -1;
+        private readonly Vector4[] _seedNormalOffset = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedAxisUMin = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedAxisVMin = new Vector4[MaxSeedPlanePatches];
+        private readonly Vector4[] _seedMaxUV = new Vector4[MaxSeedPlanePatches];
+
+        public readonly struct SeedPlanePatch
+        {
+            public readonly Vector3 Normal, Point, AxisU, AxisV;
+            public readonly float MinU, MaxU, MinV, MaxV;
+
+            public SeedPlanePatch(Vector3 normal, Vector3 point,
+                Vector3 axisU, Vector3 axisV,
+                float minU, float maxU, float minV, float maxV)
+            {
+                Normal = normal; Point = point;
+                AxisU = axisU; AxisV = axisV;
+                MinU = minU; MaxU = maxU; MinV = minV; MaxV = maxV;
+            }
+        }
+
+        public bool SeedPlaneProductionReady => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0 && !_seedPlaneAwaitClear && !_seedPlanePreviewActive;
+        public bool SeedPlaneExperimentEnabled => enableSeedPlaneProductionExperiment;
+        public bool HasStagedSeedPlanes => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0;
+        public bool SeedPlaneAppliedToCurrentFrame =>
+            !SeedPlaneProductionReady || _lastSeedPlaneAppliedFrame == _frameCount;
+        public bool SeedPlanePreviewActive => enableSeedPlaneProductionExperiment &&
+            _seedPlanePreviewActive;
+        public bool SeedPlaneAwaitClear => enableSeedPlaneProductionExperiment &&
+            _seedPlaneCount > 0 && _seedPlaneAwaitClear;
+        public string SeedPlaneProductionStatus => !enableSeedPlaneProductionExperiment
+            ? "关" : _seedPlaneCount == 0 ? "未取样"
+            : _seedPlaneAwaitClear ? "待清卷"
+            : _seedPlanePreviewActive ? "取样中"
+            : _lastSeedPlaneAppliedFrame >= 0 ? $"尺{_seedPlaneCount}块"
+            : $"备{_seedPlaneCount}块";
+
+        public void SetSeedPlanePreviewActive(bool active) =>
+            _seedPlanePreviewActive = active;
+
+        /// <summary>Start a genuinely new roll without inheriting its ruler.</summary>
+        public void ClearSeedPlanePatches()
+        {
+            _seedPlaneCount = 0;
+            _seedPlaneAwaitClear = false;
+            _lastSeedPlaneAppliedFrame = -1;
+            Array.Clear(_seedNormalOffset, 0, _seedNormalOffset.Length);
+            Array.Clear(_seedAxisUMin, 0, _seedAxisUMin.Length);
+            Array.Clear(_seedAxisVMin, 0, _seedAxisVMin.Length);
+            Array.Clear(_seedMaxUV, 0, _seedMaxUV.Length);
+        }
+
+        /// <summary>Stage only measured, fitted world patches.  They are a
+        /// post-TSDF product sidecar: a new set still starts on a clean roll so
+        /// the visual comparison has one unambiguous lifetime, but it never
+        /// rewrites the depth texture or TSDF input.</summary>
+        public bool StageSeedPlanePatches(IReadOnlyList<SeedPlanePatch> patches)
+        {
+            if (!enableSeedPlaneProductionExperiment || patches == null ||
+                patches.Count == 0) return false;
+            _seedPlaneCount = Mathf.Min(patches.Count, MaxSeedPlanePatches);
+            for (int i = 0; i < _seedPlaneCount; i++)
+            {
+                SeedPlanePatch patch = patches[i];
+                Vector3 normal = patch.Normal.normalized;
+                _seedNormalOffset[i] = new Vector4(normal.x, normal.y,
+                    normal.z, Vector3.Dot(normal, patch.Point));
+                _seedAxisUMin[i] = new Vector4(patch.AxisU.x,
+                    patch.AxisU.y, patch.AxisU.z, patch.MinU);
+                _seedAxisVMin[i] = new Vector4(patch.AxisV.x,
+                    patch.AxisV.y, patch.AxisV.z, patch.MinV);
+                _seedMaxUV[i] = new Vector4(patch.MaxU, patch.MaxV, 0f, 0f);
+            }
+            _lastSeedPlaneAppliedFrame = -1;
+            _seedPlaneAwaitClear = VolumeIntegrator.Instance != null &&
+                                   VolumeIntegrator.Instance.IntegrationCount > 0;
+            Logger.Info($"种子平面已暂存{_seedPlaneCount}块；" +
+                        (_seedPlaneAwaitClear ? "须清卷后才启用制品旁路" :
+                         "离开预览后启用制品旁路"));
+            return !_seedPlaneAwaitClear;
+        }
+
+        /// <summary>
+        /// Copies finite seed-plane constraints for the post-TSDF productizer.
+        /// The U/V half extents stay explicit so the shader cannot flatten a
+        /// parallel object merely because it happens to lie inside a broad
+        /// spherical neighbourhood.
+        /// </summary>
+        internal int CopySeedProductConstraints(Bounds worldBounds,
+            Vector4[] equations, Vector4[] centers,
+            Vector4[] axesU, Vector4[] axesV, int start)
+        {
+            if (!SeedPlaneProductionReady || equations == null ||
+                centers == null || axesU == null || axesV == null)
+                return 0;
+            int capacity = Mathf.Min(equations.Length,
+                Mathf.Min(centers.Length, Mathf.Min(axesU.Length, axesV.Length)));
+            int written = 0;
+            for (int i = 0; i < _seedPlaneCount && start + written < capacity; i++)
+            {
+                Vector3 normal = ((Vector3)_seedNormalOffset[i]).normalized;
+                Vector3 axisU = ((Vector3)_seedAxisUMin[i]).normalized;
+                Vector3 axisV = ((Vector3)_seedAxisVMin[i]).normalized;
+                if (normal.sqrMagnitude < 0.99f || axisU.sqrMagnitude < 0.99f ||
+                    axisV.sqrMagnitude < 0.99f)
+                    continue;
+                float minU = _seedAxisUMin[i].w;
+                float maxU = _seedMaxUV[i].x;
+                float minV = _seedAxisVMin[i].w;
+                float maxV = _seedMaxUV[i].y;
+                float halfU = Mathf.Max(0f, (maxU - minU) * 0.5f);
+                float halfV = Mathf.Max(0f, (maxV - minV) * 0.5f);
+                if (halfU <= 0f || halfV <= 0f)
+                    continue;
+                float coordinate = _seedNormalOffset[i].w;
+                Vector3 center = normal * coordinate +
+                                 axisU * ((minU + maxU) * 0.5f) +
+                                 axisV * ((minV + maxV) * 0.5f);
+                float radius = Mathf.Sqrt(halfU * halfU + halfV * halfV) + 0.02f;
+                if (worldBounds.SqrDistance(center) > radius * radius)
+                    continue;
+                int destination = start + written++;
+                equations[destination] = new Vector4(normal.x, normal.y,
+                    normal.z, coordinate);
+                centers[destination] = new Vector4(center.x, center.y,
+                    center.z, radius);
+                axesU[destination] = new Vector4(axisU.x, axisU.y, axisU.z,
+                    halfU + 0.015f);
+                axesV[destination] = new Vector4(axisV.x, axisV.y, axisV.z,
+                    halfV + 0.015f);
+            }
+            return written;
+        }
+
+        private Texture _depthTex;
+        /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
+        public Texture DepthTex => _depthTex;
+
+        // Meta's external depth texture is a swapchain view whose pixels are only
+        // guaranteed for the frame callback.  The production pipeline preprocesses
+        // at the slower fusion cadence, so retaining that Texture reference can pair
+        // a recycled image with the matrices captured by another callback.  Latch
+        // both eyes immediately into an owned texture (the right eye is fused; the
+        // left remains available to cross-eye edge checks), so every downstream pass
+        // consumes pixels and pose from the same platform frame.
+        private ComputeShader _frameLatchShader;
+        private int _frameLatchKernel = -1;
+        private RenderTexture _latchedDepthTex;
+        private bool _frameLatchFaultLogged;
+
+        private ComputeShader _platformWitnessCopyShader;
+        private int _platformWitnessCopyKernel = -1;
+        private RenderTexture _platformDepthWitnessTex;
+        /// <summary>
+        /// 当前被融合消费帧的右眼平台直接深度快照（单层 R32）。它在手罩、时序、
+        /// 双边和缘洗之前复制，只供枪胶双证词使用，不参与显示。
+        /// </summary>
+        public Texture PlatformDepthWitnessTex =>
+            enableGunGelDualTestimony ? _platformDepthWitnessTex : null;
+
+        private RenderTexture _normTex;
+        /// <summary>World-space normals computed from the depth texture via the DepthNorm compute shader.</summary>
+        public RenderTexture NormTex => _normTex;
+
+        private RenderTexture _dilationA, _dilationB;
+        private RenderTexture _dilatedDepth;
+        /// <summary>Depth texture after jump-flood dilation, used by the integrator to fill holes near voxel boundaries.</summary>
+        public RenderTexture DilatedDepthTex => _dilatedDepth;
+
+        private RenderTexture _simulatedDepthTex;
+        private RenderTexture _filteredDepthTex;
+        private RenderTexture _edgeCleanedDepthTex;
+        private RenderTexture _edgeReasonTex;
+        public RenderTexture EdgeReasonTex => _edgeReasonTex;
+        private ComputeBuffer _edgeStats;
+        private bool _edgeStatsReadbackPending;
+        private int _edgeCleansSinceStats;
+        // 手部语义剔除状态（球打码层）
+        private RenderTexture _handMaskedDepthTex;
+        private ComputeBuffer _handMaskStats;
+        private bool _handMaskStatsReadbackPending;
+        private int _handMasksSinceStats;
+        private readonly HandSphereCollector _handSphereCollector = new HandSphereCollector();
+        private static readonly uint[] ZeroHandMaskStats = new uint[1];
+        // 源头时序滤波状态：输出 + 历史读/写双缓冲（重投影读邻域，读写必须分卷防竞态）。
+        private RenderTexture _temporalDepthTex;
+        private RenderTexture _temporalHistReadTex;
+        private RenderTexture _temporalHistWriteTex;
+        private RenderTexture _temporalReasonTex;
+        /// <summary>逐像素时序判因（0..6），只供融合黑匣子读取，不参与任何生产裁决。</summary>
+        public RenderTexture TemporalReasonTex => TemporalFilterEnabled && _hasTemporalHistory
+            ? _temporalReasonTex
+            : null;
+        private ComputeBuffer _temporalStats;
+        private bool _temporalStatsReadbackPending;
+        private int _temporalSinceStats;
+        private bool _hasTemporalHistory;
+        private readonly Matrix4x4[] _prevTemporalProj = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalProjInv = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalView = new Matrix4x4[2];
+        private readonly Matrix4x4[] _prevTemporalViewInv = new Matrix4x4[2];
+        private static readonly uint[] ZeroTemporalStats = new uint[2];
+        private bool _handRemovalTried;
+        private bool _handRemovalActive;
+        private readonly Vector4[] _linearizeAB = new Vector4[2];
+        private static readonly uint[] ZeroEdgeStats = new uint[4];
+        private int _dilationMaxStep;
+
+        /// <summary>本统计周期被判为深度边缘并作废的像素数（HUD"缘:"读数）。</summary>
+        public uint LastEdgeCleanCount { get; private set; }
+        /// <summary>其中由③c 掠射否决击杀的像素数（HUD"掠:"读数）——定责：桥区此数高=清洗在打但桥不在深度里；低=没抓到。</summary>
+        public uint LastGrazingKillCount { get; private set; }
+        /// <summary>局部中心平面支持成立的掠射像素数；跨眼证伪仍可能最终击杀。</summary>
+        public uint LastGrazingPlaneSupportedCount { get; private set; }
+        /// <summary>依靠同平面证据免于纯朝向击杀的掠射像素数。</summary>
+        public uint LastGrazingPlaneRescuedCount { get; private set; }
+        /// <summary>边缘清洗统计是否已有首批读数。</summary>
+        public bool HasEdgeCleanStats { get; private set; }
+
+        /// <summary>平台原生手部剔除是否已生效（HUD"剔"）。</summary>
+        public bool NativeHandRemovalActive => _handRemovalActive;
+        /// <summary>本拍参与打码的球数（HUD"手"）；0=无手无柄在追或打码关。</summary>
+        public int HandSphereCount => _handSphereCollector.Count;
+        /// <summary>手部追踪子系统是否在跑（HUD 诊断）。</summary>
+        public bool HandTrackingRunning => _handSphereCollector.HandTrackingRunning;
+        /// <summary>上一统计周期被球打码罩住的像素数（HUD"罩"）。</summary>
+        public uint LastHandMaskedPixels { get; private set; }
+        /// <summary>球打码 pass 是否可用（开关+内核齐备）。</summary>
+        public bool HandMaskEnabled => enableHandMask && _hasHandMaskKernel;
+        /// <summary>源头时序滤波 pass 是否可用（开关+内核齐备）。</summary>
+        public bool TemporalFilterEnabled => enableTemporalFilter && _hasTemporalKernel;
+        /// <summary>上一统计周期带内稳定混合的像素数（HUD"时稳"）。</summary>
+        public uint LastTemporalStablePixels { get; private set; }
+        /// <summary>上一统计周期判为真变化并全速放行的像素数（HUD"时变"）。</summary>
+        public uint LastTemporalChangedPixels { get; private set; }
+        /// <summary>时序滤波统计是否已有首批读数。</summary>
+        public bool HasTemporalStats { get; private set; }
+
+        private Texture _rgbGuide;
+
+        private AROcclusionManager _arOcclusionManager;
+        private Unity.XR.CoreUtils.XROrigin _xrOrigin;
+        private Transform _trackingSpaceTransform;
+        private Camera _mainCam;
+        private bool _started;
+        private bool _dilationDirty;
+        private int _frameCount;
+        /// <summary>当前平台深度帧序号；供独立回放会话关联源帧与融合尝试。</summary>
+        public int CurrentPlatformFrame => _frameCount;
+        private long _lastDepthTimestampNs;
+        private bool _hasDepthTimestamp;
+        private float _lastDepthArrivalRealtime;
+        /// <summary>平台深度相邻时间戳间隔（毫秒）；无平台时间戳时退回本地到达间隔。</summary>
+        public float LastDepthFrameIntervalMs { get; private set; }
+        /// <summary>最近消费帧从回调到预处理完成的本地帧龄（毫秒）。</summary>
+        public float LastPreprocessAgeMs { get; private set; }
+        /// <summary>平台时间戳严格倒退累计次数；不包含重复帧。</summary>
+        public uint DepthTimestampBackstepCount { get; private set; }
+        public uint DepthTimestampRepeatCount { get; private set; }
+        public bool LastDepthTimestampRepeated { get; private set; }
+        /// <summary>最近一帧的平台时间戳是否倒退；仅影响本次审计，避免一次旧故障永久污染后续样本。</summary>
+        public bool LastDepthTimestampBackstepped { get; private set; }
+        public bool HasDepthTimestamp => _hasDepthTimestamp;
+        private float _lastLogTime;
+        private PairedDepthFrameRecorder _pairedFrameRecorder;
+
+        private const string ScenePermission = "com.oculus.permission.USE_SCENE";
+
+        /// <summary>Raised after each depth frame is processed (filtering, normals computed, globals set).</summary>
+        public event Action Updated;
+        /// <summary>
+        /// 当前深度、配套位姿矩阵与世界法线已完成同帧预处理。
+        /// 只读诊断应从这里取样，避免新位姿配旧纹理制造假错层。
+        /// </summary>
+        public event Action Preprocessed;
+
+        /// <summary>平台前处理/本工程后处理双路逐帧采集是否正在接收新帧。</summary>
+        public bool PairedFrameCaptureActive => _pairedFrameRecorder != null && _pairedFrameRecorder.IsCapturing;
+        /// <summary>独立回放会话目录；设备端位于 ScanCoverDiagnostics/replay_sessions 下。</summary>
+        public string PairedFrameCaptureDirectory => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.SessionDirectory
+            : string.Empty;
+        /// <summary>尚在 GPU 回读或后台写盘的帧对数量。</summary>
+        public int PairedFrameCapturePending => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.OutstandingPairCount
+            : 0;
+        /// <summary>因回读/写盘队列满而明确丢弃的帧对数量。</summary>
+        public int PairedFrameCaptureDropped => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.DroppedPairCount
+            : 0;
+        /// <summary>因独立会话 GPU 回读队列满而丢失的融合输入快照数。</summary>
+        public int ReplayFusionCaptureDropped => _pairedFrameRecorder != null
+            ? _pairedFrameRecorder.DroppedFusionFrameCount
+            : 0;
+
+        public bool TogglePairedFrameCapture()
+        {
+            if (_pairedFrameRecorder == null)
+                _pairedFrameRecorder = GetComponent<PairedDepthFrameRecorder>() ??
+                                       gameObject.AddComponent<PairedDepthFrameRecorder>();
+
+            if (_pairedFrameRecorder.IsCapturing)
+            {
+                _pairedFrameRecorder.StopCapture();
+                return false;
+            }
+
+            return _pairedFrameRecorder.StartCapture();
+        }
+
+        /// <summary>Stops new replay input and returns the package that must finish sealing.</summary>
+        internal ScanReplaySessionPackage StopReplayCaptureForSeal()
+        {
+            if (_pairedFrameRecorder == null)
+                return ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
+            return _pairedFrameRecorder.StopAndGetPackageForSeal() ??
+                   ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
+        }
+
+        /// <summary>
+        /// Provide an RGB texture as edge guide for bilateral depth filtering.
+        /// Call each frame from RoomScanner with the passthrough camera frame.
+        /// </summary>
+        public void SetRGBGuide(Texture tex) => _rgbGuide = tex;
+
+        private static readonly Vector3 ScaleFlipZ = new(1, 1, -1);
+
+        /// <summary>
+        /// Convert a pose from XR tracking space to Unity world space.
+        /// Required because MRUK's world-lock may offset TrackingSpace from the XROrigin root.
+        /// </summary>
+        public Pose TrackingToWorld(Pose trackingPose)
+        {
+            if (_trackingSpaceTransform == null) return trackingPose;
+            return new Pose(
+                _trackingSpaceTransform.TransformPoint(trackingPose.position),
+                _trackingSpaceTransform.rotation * trackingPose.rotation);
+        }
+
+        private void Awake()
+        {
+            Instance = this;
+            _pairedFrameRecorder = GetComponent<PairedDepthFrameRecorder>() ??
+                                   gameObject.AddComponent<PairedDepthFrameRecorder>();
+        }
+
+        private void Start()
+        {
+            // Editor + no XR loader = AR subsystems will all be null and any
+            // toggle of AROcclusionManager.enabled blows up DestroyTextures.
+            // Build/run on Quest (or via Link) to actually scan.
+            if (!XRRuntimeGuard.IsXRActive)
+            {
+                Logger.Warning("DepthCapture: " + XRRuntimeGuard.EditorDisabledMessage);
+                enabled = false;
+                return;
+            }
+
+            EnsureARSession();
+
+            _arOcclusionManager = FindFirstObjectByType<AROcclusionManager>();
+            if (!_arOcclusionManager)
+                throw new Exception("[RoomScan] AROcclusionManager not found in scene");
+
+            _xrOrigin = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
+            CacheTrackingSpaceTransform();
+
+            _normKernel = new ComputeKernelHelper(depthNormalCompute, "DepthNorm");
+            _centerDepthKernel = new ComputeKernelHelper(depthNormalCompute, "CenterDepthSample");
+            _monoConvertKernel = new ComputeKernelHelper(depthNormalCompute, "MonoRawDepthToStereo");
+            _initDilateKernel = new ComputeKernelHelper(depthDilationCompute, "InitDepthDilation");
+            _dilateStepKernel = new ComputeKernelHelper(depthDilationCompute, "DilateDepthStep");
+            if (bilateralFilterCompute != null)
+            {
+                _bilateralKernel = new ComputeKernelHelper(bilateralFilterCompute, "BilateralFilter");
+                _hasBilateralKernel = true;
+            }
+            if (depthEdgeCleanCompute != null)
+            {
+                _edgeCleanKernel = new ComputeKernelHelper(depthEdgeCleanCompute, "DepthEdgeClean");
+                _hasEdgeCleanKernel = true;
+            }
+            // 手部打码内核（PlaneFitShadow 案教训 checklist）：HasKernel 前置闸 + try/catch 保险丝，
+            // 内核缺失/编译失败只停打码，不得截断 Start 后半截饿死融合。
+            if (handMaskCompute == null)
+                handMaskCompute = Resources.Load<ComputeShader>("HandMask");
+            if (handMaskCompute != null && handMaskCompute.HasKernel("HandMask"))
+            {
+                try
+                {
+                    _handMaskKernel = new ComputeKernelHelper(handMaskCompute, "HandMask");
+                    _hasHandMaskKernel = true;
+                }
+                catch (Exception e)
+                {
+                    Logger.Warning("DepthCapture: HandMask 内核初始化失败，球打码停用：" + e.Message);
+                }
+            }
+            else if (handMaskCompute != null)
+            {
+                Logger.Warning("DepthCapture: HandMask.compute 无 HandMask 内核（导入失败？查 Editor.log），球打码停用");
+            }
+
+            // 源头时序滤波内核（与 HandMask 同 checklist）：内核缺失只停滤波，不得截断 Start 后半截。
+            if (temporalFilterCompute == null)
+                temporalFilterCompute = Resources.Load<ComputeShader>("DepthTemporalFilter");
+            if (temporalFilterCompute != null && temporalFilterCompute.HasKernel("TemporalFilter"))
+            {
+                try
+                {
+                    _temporalKernel = new ComputeKernelHelper(temporalFilterCompute, "TemporalFilter");
+                    _hasTemporalKernel = true;
+                }
+                catch (Exception e)
+                {
+                    Logger.Warning("DepthCapture: TemporalFilter 内核初始化失败，源头时序滤波停用：" + e.Message);
+                }
+            }
+            else if (temporalFilterCompute != null)
+            {
+                Logger.Warning("DepthCapture: DepthTemporalFilter.compute 无 TemporalFilter 内核（导入失败？查 Editor.log），源头时序滤波停用");
+            }
+
+            _dilationMaxStep = 1;
+            for (int i = 0; i < dilationSteps; i++)
+                _dilationMaxStep *= 2;
+
+            // Disable occlusion manager initially, enable after permission is confirmed
+            _arOcclusionManager.enabled = false;
+            CheckPermissionAndEnable();
+
+            _started = true;
+        }
+
+        /// <summary>
+        /// Resolves the TrackingSpace transform — the parent of the XR cameras that
+        /// MRUK world-lock can reposition each frame. Using this instead of the XROrigin
+        /// root ensures depth-to-world conversion includes the world-lock offset.
+        /// </summary>
+        private void CacheTrackingSpaceTransform()
+        {
+            // Prefer OVRCameraRig.trackingSpace (most reliable on Meta devices)
+            var ovrRig = FindFirstObjectByType<OVRCameraRig>();
+            if (ovrRig != null && ovrRig.trackingSpace != null)
+            {
+                _trackingSpaceTransform = ovrRig.trackingSpace;
+                Logger.Info($"DepthCapture: using OVRCameraRig.trackingSpace '{_trackingSpaceTransform.name}'");
+                return;
+            }
+
+            // Fallback: XROrigin.CameraFloorOffsetObject
+            if (_xrOrigin != null && _xrOrigin.CameraFloorOffsetObject != null)
+            {
+                _trackingSpaceTransform = _xrOrigin.CameraFloorOffsetObject.transform;
+                Logger.Info($"DepthCapture: using XROrigin.CameraFloorOffsetObject '{_trackingSpaceTransform.name}'");
+                return;
+            }
+
+            // Last resort: XROrigin root (pre-fix behaviour)
+            _trackingSpaceTransform = _xrOrigin != null ? _xrOrigin.transform : null;
+            Logger.Warning("DepthCapture: no TrackingSpace found, falling back to XROrigin root");
+        }
+
+        private void EnsureARSession()
+        {
+            if (FindFirstObjectByType<ARSession>() == null)
+            {
+                var go = new GameObject("[AR Session]");
+                go.AddComponent<ARSession>();
+                Logger.Info("Created ARSession (was missing from scene)");
+            }
+        }
+
+        private void CheckPermissionAndEnable()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (Permission.HasUserAuthorizedPermission(ScenePermission))
+            {
+                EnableOcclusion();
+            }
+            else
+            {
+                Logger.Info("Requesting USE_SCENE permission...");
+                var callbacks = new PermissionCallbacks();
+                callbacks.PermissionGranted += _ => EnableOcclusion();
+                callbacks.PermissionDenied += _ => Logger.Error("USE_SCENE permission denied — depth will not work");
+                Permission.RequestUserPermission(ScenePermission, callbacks);
+            }
+#else
+            EnableOcclusion();
+#endif
+        }
+
+        private bool _subscribed;
+
+        private async void EnableOcclusion()
+        {
+            if (_arOcclusionManager == null) return;
+
+            Logger.Info("Verifying AROcclusionManager subsystem...");
+
+            _arOcclusionManager.frameReceived -= OnDepthFrame;
+            _arOcclusionManager.enabled = false;
+
+            await Awaitable.NextFrameAsync();
+            await Awaitable.NextFrameAsync();
+
+            if (_arOcclusionManager == null) return;
+
+            // Briefly enable to verify the subsystem is functional
+            _arOcclusionManager.enabled = true;
+
+            await Awaitable.NextFrameAsync();
+            await Awaitable.NextFrameAsync();
+
+            if (_arOcclusionManager == null) return;
+            var sub = _arOcclusionManager.subsystem;
+            Logger.Info($"Occlusion subsystem: {(sub != null ? sub.GetType().Name : "null")}, running={sub?.running}");
+
+            _permissionReady = true;
+
+            if (_captureActive)
+            {
+                _arOcclusionManager.frameReceived += OnDepthFrame;
+                _subscribed = true;
+                Logger.Info("DepthCapture: subsystem left running (scan already active)");
+            }
+            else
+            {
+                _arOcclusionManager.enabled = false;
+                Logger.Info("DepthCapture: subsystem disabled (no active scan)");
+            }
+        }
+
+        /// <summary>
+        /// Enables the AROcclusionManager and subscribes to depth frames.
+        /// Called by RoomScanner when scanning starts.
+        /// </summary>
+        public void StartDepthCapture()
+        {
+            _captureActive = true;
+            _hasDepthTimestamp = false;
+            _lastDepthTimestampNs = 0;
+            _lastDepthArrivalRealtime = 0f;
+            LastDepthFrameIntervalMs = 0f;
+            LastPreprocessAgeMs = 0f;
+            DepthTimestampBackstepCount = 0u;
+            DepthTimestampRepeatCount = 0u;
+            LastDepthTimestampRepeated = false;
+            LastDepthTimestampBackstepped = false;
+            if (!_permissionReady || _arOcclusionManager == null) return;
+            if (!_arOcclusionManager.enabled)
+                _arOcclusionManager.enabled = true;
+            if (!_subscribed)
+            {
+                _arOcclusionManager.frameReceived += OnDepthFrame;
+                _subscribed = true;
+            }
+            Logger.Info("DepthCapture: subsystem started");
+        }
+
+        /// <summary>
+        /// Unsubscribes from depth frames and disables the AROcclusionManager,
+        /// stopping the depth sensor and neural inference pipeline on Quest.
+        /// Called by RoomScanner when scanning stops.
+        /// </summary>
+        public void StopDepthCapture()
+        {
+            _captureActive = false;
+            if (_arOcclusionManager != null)
+            {
+                if (_subscribed)
+                {
+                    _arOcclusionManager.frameReceived -= OnDepthFrame;
+                    _subscribed = false;
+                }
+                _arOcclusionManager.enabled = false;
+            }
+            DepthAvailable = false;
+            _hasTemporalHistory = false; // 停扫后再开必须重新种历史，防隔夜残影
+            _hasDepthTimestamp = false;
+            _lastDepthArrivalRealtime = 0f;
+            LastDepthTimestampBackstepped = false;
+            LastDepthTimestampRepeated = false;
+        }
+
+        private void OnApplicationPause(bool paused)
+        {
+            if (!_started) return;
+
+            if (paused)
+            {
+                if (_arOcclusionManager != null)
+                {
+                    _arOcclusionManager.frameReceived -= OnDepthFrame;
+                    _arOcclusionManager.enabled = false;
+                    _subscribed = false;
+                }
+                DepthAvailable = false;
+                _hasTemporalHistory = false; // 应用暂停期间位姿/世界锁可能重建
+            }
+            else if (_captureActive)
+            {
+                CheckPermissionAndEnable();
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (_arOcclusionManager != null && _subscribed)
+            {
+                _arOcclusionManager.frameReceived -= OnDepthFrame;
+                _subscribed = false;
+            }
+        }
+
+        private void OnDestroy()
+        {
+            ReleaseResources();
+        }
+
+        /// <summary>
+        /// Destroys GPU textures (normals, dilation, filtered depth) to free memory.
+        /// Textures are lazily recreated when the next depth frame arrives.
+        /// </summary>
+        public void ReleaseResources()
+        {
+            if (_normTex) { Destroy(_normTex); _normTex = null; }
+            if (_dilationA) { Destroy(_dilationA); _dilationA = null; }
+            if (_dilationB) { Destroy(_dilationB); _dilationB = null; }
+            if (_simulatedDepthTex) { Destroy(_simulatedDepthTex); _simulatedDepthTex = null; }
+            if (_latchedDepthTex) { Destroy(_latchedDepthTex); _latchedDepthTex = null; }
+            if (_platformDepthWitnessTex) { Destroy(_platformDepthWitnessTex); _platformDepthWitnessTex = null; }
+            if (_filteredDepthTex) { Destroy(_filteredDepthTex); _filteredDepthTex = null; }
+            if (_edgeCleanedDepthTex) { Destroy(_edgeCleanedDepthTex); _edgeCleanedDepthTex = null; }
+            if (_seedPlaneDepthTex) { Destroy(_seedPlaneDepthTex); _seedPlaneDepthTex = null; }
+            if (_edgeReasonTex) { Destroy(_edgeReasonTex); _edgeReasonTex = null; }
+            _edgeStats?.Release();
+            _edgeStats = null;
+            _edgeStatsReadbackPending = false;
+            HasEdgeCleanStats = false;
+            if (_handMaskedDepthTex) { Destroy(_handMaskedDepthTex); _handMaskedDepthTex = null; }
+            _handMaskStats?.Release();
+            _handMaskStats = null;
+            _handMaskStatsReadbackPending = false;
+            LastHandMaskedPixels = 0;
+            if (_temporalDepthTex) { Destroy(_temporalDepthTex); _temporalDepthTex = null; }
+            if (_temporalHistReadTex) { Destroy(_temporalHistReadTex); _temporalHistReadTex = null; }
+            if (_temporalHistWriteTex) { Destroy(_temporalHistWriteTex); _temporalHistWriteTex = null; }
+            if (_temporalReasonTex) { Destroy(_temporalReasonTex); _temporalReasonTex = null; }
+            _temporalStats?.Release();
+            _temporalStats = null;
+            _temporalStatsReadbackPending = false;
+            HasTemporalStats = false;
+            LastTemporalStablePixels = 0;
+            LastTemporalChangedPixels = 0;
+            _hasTemporalHistory = false;
+            _centerDepthSamplesBuffer?.Release();
+            _centerDepthSamplesBuffer = null;
+            _centerDepthRequested = false;
+            _centerDepthPending = false;
+            _dilatedDepth = null;
+            Logger.Info("DepthCapture: GPU resources released");
+        }
+
+        private void Update()
+        {
+            float t = Time.unscaledTime;
+            if (t - _lastLogTime >= 5f)
+            {
+                _lastLogTime = t;
+                var sub = _arOcclusionManager != null ? _arOcclusionManager.subsystem : null;
+                Logger.Info($"DepthCapture: frames={_frameCount}, depthAvail={DepthAvailable}, " +
+                          $"occMgr.enabled={_arOcclusionManager?.enabled}, sub={sub?.GetType().Name ?? "null"}, " +
+                          $"running={sub?.running}");
+            }
+        }
+
+        private void OnDepthFrame(AROcclusionFrameEventArgs args)
+        {
+            _frameCount++;
+            float arrivalRealtime = Time.realtimeSinceStartup;
+            LastDepthTimestampBackstepped = false;
+            LastDepthTimestampRepeated = false;
+            bool hasTimestampNow = args.TryGetTimestamp(out long timestampNowNs);
+            if (hasTimestampNow)
+            {
+                if (_hasDepthTimestamp)
+                {
+                    long deltaNs = timestampNowNs - _lastDepthTimestampNs;
+                    if (deltaNs > 0)
+                        LastDepthFrameIntervalMs = Mathf.Clamp(deltaNs / 1000000f, 0f, 999f);
+                    else if (deltaNs < 0)
+                    {
+                        DepthTimestampBackstepCount++;
+                        LastDepthTimestampBackstepped = true;
+                    }
+                    else
+                    {
+                        DepthTimestampRepeatCount++;
+                        LastDepthTimestampRepeated = true;
+                    }
+                }
+                _lastDepthTimestampNs = timestampNowNs;
+                _hasDepthTimestamp = true;
+            }
+            else if (_lastDepthArrivalRealtime > 0f)
+            {
+                LastDepthFrameIntervalMs = Mathf.Clamp(
+                    (arrivalRealtime - _lastDepthArrivalRealtime) * 1000f, 0f, 999f);
+            }
+            _lastDepthArrivalRealtime = arrivalRealtime;
+            if (_frameCount <= 3 || _frameCount % 100 == 0)
+                Logger.Info($"OnDepthFrame #{_frameCount}, textures={args.externalTextures.Count}");
+
+            if (Application.isEditor)
+                HandleEditorSimulation(args);
+            else
+                HandleDeviceDepth(args);
+
+            if (!DepthAvailable) return;
+
+            // 外部 swapchain 纹理只保证当前帧有效。诊断采集必须在回调内立刻复制，
+            // 不能只保存 Texture 引用等到融合节拍再读，否则拿到的可能已经是下一拍。
+            if (_pairedFrameRecorder != null && _pairedFrameRecorder.IsCapturing)
+            {
+                bool hasTimestamp = args.TryGetTimestamp(out long timestampNs);
+                ReadOnlyList<XRFov> captureFovs = default;
+                ReadOnlyList<Pose> capturePoses = default;
+                bool hasFrameGeometry = args.TryGetFovs(out captureFovs) &&
+                                        args.TryGetPoses(out capturePoses) &&
+                                        captureFovs.Count >= 2 && capturePoses.Count >= 2;
+                if (hasFrameGeometry)
+                {
+                    _pairedFrameRecorder.StagePlatformFrame(
+                        _depthTex,
+                        _frameCount,
+                        hasTimestamp,
+                        timestampNs,
+                        capturePoses[0],
+                        capturePoses[1],
+                        captureFovs[0],
+                        captureFovs[1],
+                        _planes,
+                        _proj,
+                        _projInv,
+                        _view,
+                        _viewInv);
+                }
+            }
+
+            // Own the pixels before leaving the platform callback.  The pose/FOV
+            // arrays were populated by HandleDeviceDepth above, so this is the
+            // atomic hand-off from the platform frame to the 10 Hz production path.
+            if (!LatchProductionDepthFrame())
+            {
+                DepthAvailable = false;
+                return;
+            }
+
+            // JIT 化（08-18 实机：预处理链全速跑吃掉 24→72 帧的差价）：
+            // 深度到达只做轻量双眼锁帧；双边/缘洗/法线挪到
+            // PreprocessLatestFrame，由 scanner 在每次融合前调用——重加工节拍=
+            // 融合节拍（生产10Hz）。这样保住帧-位姿身份，又不把完整预处理
+            // 恢复到平台深度帧率。
+            _preprocessDirty = true;
+            Updated?.Invoke();
+        }
+
+        private bool LatchProductionDepthFrame()
+        {
+            Texture source = _depthTex;
+            if (source == null) return false;
+
+            if (_frameLatchShader == null || _frameLatchKernel < 0)
+            {
+                _frameLatchShader = Resources.Load<ComputeShader>("DepthPairCaptureCopy");
+                if (_frameLatchShader == null)
+                {
+                    if (!_frameLatchFaultLogged)
+                    {
+                        _frameLatchFaultLogged = true;
+                        Logger.Warning("DepthCapture: 缺少深度锁帧内核；拒绝把外部纹理直接送入 TSDF");
+                    }
+                    return false;
+                }
+                _frameLatchKernel = _frameLatchShader.FindKernel("CopyDepth");
+            }
+
+            bool recreate = _latchedDepthTex == null ||
+                            _latchedDepthTex.width != source.width ||
+                            _latchedDepthTex.height != source.height;
+            if (recreate)
+            {
+                if (_latchedDepthTex) Destroy(_latchedDepthTex);
+                if (!SystemInfo.IsFormatSupported(GraphicsFormat.R32_SFloat,
+                                                   GraphicsFormatUsage.LoadStore))
+                {
+                    if (!_frameLatchFaultLogged)
+                    {
+                        _frameLatchFaultLogged = true;
+                        Logger.Warning("DepthCapture: 设备不支持 R32_SFloat 深度锁帧；本帧不进入 TSDF");
+                    }
+                    _latchedDepthTex = null;
+                    return false;
+                }
+                _latchedDepthTex = new RenderTexture(source.width, source.height, 0,
+                    GraphicsFormat.R32_SFloat, 1)
+                {
+                    name = "ProductionDepthFrameLatch",
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _latchedDepthTex.Create();
+                if (!_latchedDepthTex.IsCreated()) return false;
+            }
+
+            _frameLatchShader.SetTexture(_frameLatchKernel, WitnessSourceDepthID, source);
+            _frameLatchShader.SetTexture(_frameLatchKernel, WitnessDestDepthID, _latchedDepthTex);
+            _frameLatchShader.SetInts(WitnessCaptureSizeID, source.width, source.height);
+            for (int eye = 0; eye < 2; eye++)
+            {
+                _frameLatchShader.SetInt(WitnessSourceEyeID, eye);
+                _frameLatchShader.SetInt(WitnessDestEyeID, eye);
+                _frameLatchShader.Dispatch(_frameLatchKernel,
+                    Mathf.CeilToInt(source.width / 8f),
+                    Mathf.CeilToInt(source.height / 8f), 1);
+            }
+            _depthTex = _latchedDepthTex;
+            _frameLatchFaultLogged = false;
+            return true;
+        }
+
+        private bool _preprocessDirty;
+
+        /// <summary>
+        /// 融合前预处理：手罩 → 源头时序滤波 → 双边滤波 → 边缘清洗 → 全局属性 → 法线 → 标膨胀脏。
+        /// 只在 scanner 即将 Integrate 时调用；无新深度帧则空转早退。
+        /// </summary>
+        public void PreprocessLatestFrame()
+        {
+            if (!_preprocessDirty || !DepthAvailable) return;
+            _preprocessDirty = false;
+
+            // VolumeIntegration.compute 的融合采样固定读取右眼 texture-array slice 1。
+            // 因此每次只清洗融合真正消费的右眼：保持单眼 GPU 成本不变，
+            // 避免“一只眼刚更新、另一只眼却配当前位姿进入 TSDF”的错层融合。
+            _preprocessEye = FusionEyeIndex;
+
+            CapturePlatformDepthWitness();
+            ApplyHandMask(); // 手部打码必须在时序/双边之前：滤波邻域会把弃权值洇回有效像素
+            ApplyTemporalFilter(); // 数据层第一刀：深度先跨帧稳定再进空间滤波/TSDF
+            ApplyBilateralFilter();
+            ApplyDepthEdgeClean();
+            SetGlobalShaderProperties();
+            ComputeNormals();
+            // A captured seed is a post-TSDF product ruler.  Activate its
+            // sidecar lifetime here, but never replace _depthTex or _normTex:
+            // GunGel and the sole TSDF must continue to consume the screened
+            // Quest observation itself.
+            ActivateSeedPlaneSidecar();
+            _dilationDirty = true;
+            _pairedFrameRecorder?.CapturePreprocessedFrame(_depthTex, _frameCount, _preprocessEye);
+            DispatchCenterDepthSample();
+            LastPreprocessAgeMs = _lastDepthArrivalRealtime > 0f
+                ? Mathf.Clamp((Time.realtimeSinceStartup - _lastDepthArrivalRealtime) * 1000f,
+                              0f, 999f)
+                : 0f;
+            Preprocessed?.Invoke();
+        }
+
+        private void CapturePlatformDepthWitness()
+        {
+            if (!enableGunGelDualTestimony || _depthTex == null)
+                return;
+            if (_platformWitnessCopyShader == null || _platformWitnessCopyKernel < 0)
+            {
+                _platformWitnessCopyShader = Resources.Load<ComputeShader>("DepthPairCaptureCopy");
+                if (_platformWitnessCopyShader == null)
+                {
+                    Logger.Warning("枪胶双证词：缺少 Resources/DepthPairCaptureCopy.compute，退回单证词");
+                    return;
+                }
+                _platformWitnessCopyKernel = _platformWitnessCopyShader.FindKernel("CopyDepth");
+            }
+
+            int width = _depthTex.width;
+            int height = _depthTex.height;
+            bool recreate = _platformDepthWitnessTex == null ||
+                            _platformDepthWitnessTex.width != width ||
+                            _platformDepthWitnessTex.height != height;
+            if (recreate)
+            {
+                if (_platformDepthWitnessTex) Destroy(_platformDepthWitnessTex);
+                if (!SystemInfo.IsFormatSupported(GraphicsFormat.R32_SFloat,
+                                                   GraphicsFormatUsage.LoadStore))
+                {
+                    Logger.Warning("枪胶双证词：设备不支持 R32_SFloat UAV，退回单证词");
+                    _platformDepthWitnessTex = null;
+                    return;
+                }
+                _platformDepthWitnessTex = new RenderTexture(width, height, 0,
+                    GraphicsFormat.R32_SFloat, 1)
+                {
+                    name = "GunGel_PlatformDepthWitness",
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 1,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _platformDepthWitnessTex.Create();
+            }
+
+            _platformWitnessCopyShader.SetTexture(_platformWitnessCopyKernel,
+                WitnessSourceDepthID, _depthTex);
+            _platformWitnessCopyShader.SetTexture(_platformWitnessCopyKernel,
+                WitnessDestDepthID, _platformDepthWitnessTex);
+            _platformWitnessCopyShader.SetInts(WitnessCaptureSizeID, width, height);
+            _platformWitnessCopyShader.SetInt(WitnessSourceEyeID, FusionEyeIndex);
+            _platformWitnessCopyShader.SetInt(WitnessDestEyeID, 0);
+            _platformWitnessCopyShader.Dispatch(_platformWitnessCopyKernel,
+                Mathf.CeilToInt(width / 8f), Mathf.CeilToInt(height / 8f), 1);
+        }
+
+        /// <summary>
+        /// Run dilation if depth has been updated since last call.
+        /// Called by VolumeIntegrator before integration (not every frame).
+        /// </summary>
+        public void UpdateDilationIfNeeded()
+        {
+            if (!_dilationDirty || !DepthAvailable) return;
+            ComputeDilation();
+            _dilationDirty = false;
+        }
+
+        private void HandleEditorSimulation(AROcclusionFrameEventArgs args)
+        {
+            Texture rawDepth = args.externalTextures[0].texture;
+            DepthAvailable = rawDepth != null;
+            if (!DepthAvailable) return;
+
+            if (_simulatedDepthTex == null ||
+                _simulatedDepthTex.width != rawDepth.width ||
+                _simulatedDepthTex.height != rawDepth.height)
+            {
+                if (_simulatedDepthTex) Destroy(_simulatedDepthTex);
+                _simulatedDepthTex = new RenderTexture(rawDepth.width, rawDepth.height, 0,
+                    GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true
+                };
+            }
+
+            _monoConvertKernel.Set(DepthTexRWID, _simulatedDepthTex);
+            _monoConvertKernel.Set(InputRawMonoDepthID, rawDepth);
+            _monoConvertKernel.DispatchFit(rawDepth.width, rawDepth.height);
+            _depthTex = _simulatedDepthTex;
+
+            if (!_mainCam) _mainCam = Camera.main;
+            if (!_mainCam) return;
+
+            TrackDepthAngularSpeed(_mainCam.transform.rotation, _mainCam.transform.position);
+
+            Matrix4x4 p = _mainCam.projectionMatrix;
+            Matrix4x4 pi = p.inverse;
+            Transform ct = _mainCam.transform;
+            Matrix4x4 vi = Matrix4x4.TRS(ct.position, ct.rotation, ScaleFlipZ);
+            Matrix4x4 v = vi.inverse;
+
+            for (int i = 0; i < 2; i++)
+            {
+                _proj[i] = p;
+                _projInv[i] = pi;
+                _view[i] = v;
+                _viewInv[i] = vi;
+            }
+
+            _planes = new Vector2(_mainCam.nearClipPlane, _mainCam.farClipPlane);
+        }
+
+        private void HandleDeviceDepth(AROcclusionFrameEventArgs args)
+        {
+            _depthTex = args.externalTextures[0].texture;
+
+            ReadOnlyList<XRFov> fovs = default;
+            ReadOnlyList<Pose> poses = default;
+            XRNearFarPlanes depthPlanes = default;
+
+            DepthAvailable = _depthTex != null &&
+                             args.TryGetFovs(out fovs) &&
+                             args.TryGetPoses(out poses) &&
+                             args.TryGetNearFarPlanes(out depthPlanes);
+
+            if (!DepthAvailable) return;
+
+            // 第一层手部语义剔除=平台原生（XR_META_environment_depth_hand_removal）：
+            // 手追在跑时手像素被背景估计替换（不烙手也不留洞）。裸手主防线；
+            // 持握控制器时手追暂停自动失效，由 ApplyHandMask 控制器球补位。
+            // 此处子系统已 running；设置失败/不支持不影响扫描，只记日志。
+            if (!_handRemovalTried)
+            {
+                _handRemovalTried = true;
+                if (enableNativeHandRemoval &&
+                    _arOcclusionManager.subsystem is UnityEngine.XR.OpenXR.Features.Meta.MetaOpenXROcclusionSubsystem metaOcc)
+                {
+                    try
+                    {
+                        if (metaOcc.isHandRemovalSupported == Supported.Supported)
+                        {
+                            var res = metaOcc.TrySetHandRemovalEnabled(true);
+                            _handRemovalActive = res == UnityEngine.XR.OpenXR.NativeTypes.XrResult.Success;
+                            Logger.Info($"DepthCapture: 原生手部剔除 TrySet → {res}（active={_handRemovalActive}）");
+                        }
+                        else
+                        {
+                            Logger.Info($"DepthCapture: 原生手部剔除不受支持（{metaOcc.isHandRemovalSupported}），纯球打码兜底");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Warning("DepthCapture: 原生手部剔除设置失败（不影响扫描）：" + e.Message);
+                    }
+                }
+            }
+
+            TrackDepthAngularSpeed(poses[FusionEyeIndex].rotation, poses[FusionEyeIndex].position);
+
+            for (int i = 0; i < 2; i++)
+            {
+                _proj[i] = CalculateProjectionMatrix(fovs[i], depthPlanes);
+                _projInv[i] = Matrix4x4.Inverse(_proj[i]);
+
+                Pose pose = poses[i];
+                Matrix4x4 depthFrameMat = Matrix4x4.TRS(pose.position, pose.rotation, ScaleFlipZ);
+
+                Matrix4x4 worldToTracking = _trackingSpaceTransform != null
+                    ? _trackingSpaceTransform.worldToLocalMatrix
+                    : Matrix4x4.identity;
+
+                _view[i] = depthFrameMat.inverse * worldToTracking;
+                _viewInv[i] = Matrix4x4.Inverse(_view[i]);
+            }
+
+            _planes = new Vector2(depthPlanes.nearZ, depthPlanes.farZ);
+        }
+
+        /// <summary>双边滤波开关状态（HUD 用）。</summary>
+        public bool BilateralEnabled => enableBilateralFilter;
+        /// <summary>边缘清洗开关状态（HUD 用）。</summary>
+        public bool EdgeCleanEnabled => enableDepthEdgeClean;
+
+        /// <summary>
+        /// 性能二分热键（scanner 转发）：深度预处理三态循环——
+        /// 全开 → 半（关双边留缘洗，定位链内主猪/保幽灵桥防护）→ 全关 → 全开。
+        /// 两个 pass 都由各自 enable 字段自门控、原位替换 _depthTex，运行时翻转
+        /// 即下游自动读回原始深度，管线零改线。法线不在此刀范围（融合 quality 要用）。
+        /// 返回新档位：0=全开 1=半 2=全关。
+        /// </summary>
+        public int CycleDepthPreprocessingMode()
+        {
+            if (enableBilateralFilter && enableDepthEdgeClean)
+            {
+                enableBilateralFilter = false;
+                return 1;
+            }
+            if (!enableBilateralFilter && enableDepthEdgeClean)
+            {
+                enableDepthEdgeClean = false;
+                return 2;
+            }
+            enableBilateralFilter = true;
+            enableDepthEdgeClean = true;
+            return 0;
+        }
+
+        /// <summary>
+        /// 性能二分热键（scanner 转发，左摇杆上）：源头时序滤波开关。
+        /// 盯墙养绿 A/B 用：同墙同段实时切换，比打两个包干净。关闭即
+        /// ApplyTemporalFilter 早退（其内部自门控已清 _hasTemporalHistory，
+        /// 重开不吃隔夜残影），管线零改线。返回新状态。
+        /// </summary>
+        public bool ToggleTemporalFilter()
+        {
+            enableTemporalFilter = !enableTemporalFilter;
+            _hasTemporalHistory = false;
+            return enableTemporalFilter;
+        }
+
+        private bool _loggedBilateralSkip;
+
+        /// <summary>
+        /// 手部语义剔除第二层（球打码）：控制器/手关节球罩住的深度像素写 0=弃权，
+        /// 复用缘洗弃权语义（不种不长不抹），整合/穿越票/拍平/B1 全自动免疫。
+        /// 与"弃权像素不投穿越票"通用闸（VolumeIntegration 冻票路径）同车——
+        /// 不拦的话 0=近端算出深负 frozenDelta 会给球后方冻块灌遮挡票=误解冻。
+        /// 原生剔除生效时采集器只回控制器球（避免把原生填的背景估计打回弃权）。
+        /// 无球=不 dispatch 不换纹理=零成本透传。双眼同拍（深度图低清，成本可忽略）。
+        /// </summary>
+        private void ApplyHandMask()
+        {
+            if (!enableHandMask || !_hasHandMaskKernel || _depthTex == null) return;
+
+            _handSphereCollector.Refresh(_trackingSpaceTransform, _handRemovalActive,
+                handPalmRadius, handTipRadius, controllerSphereRadius);
+            if (_handSphereCollector.Count <= 0) return;
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+
+            if (_handMaskedDepthTex == null || _handMaskedDepthTex.width != w || _handMaskedDepthTex.height != h)
+            {
+                if (_handMaskedDepthTex) Destroy(_handMaskedDepthTex);
+                _handMaskedDepthTex = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _handMaskedDepthTex.Create();
+            }
+
+            if (_handMaskStats == null)
+            {
+                _handMaskStats = new ComputeBuffer(1, sizeof(uint));
+                _handMaskStats.SetData(ZeroHandMaskStats);
+            }
+
+            var cs = handMaskCompute;
+            _handMaskKernel.Set(RawDepthID, _depthTex);
+            _handMaskKernel.Set(MaskedDepthID, _handMaskedDepthTex);
+            _handMaskKernel.Set(HandMaskStatsID, _handMaskStats);
+            cs.SetVectorArray(HandSpheresID, _handSphereCollector.Spheres);
+            cs.SetInt(HandSphereCountID, _handSphereCollector.Count);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetMatrixArray(MaskProjInvID, _projInv);
+            cs.SetMatrixArray(MaskViewInvID, _viewInv);
+
+            _handMaskKernel.DispatchFit(w, h, 2);
+
+            _depthTex = _handMaskedDepthTex;
+
+            // 罩像素读数（HUD"罩"）：每 15 次打码结算一次，读回即清零开新周期
+            _handMasksSinceStats++;
+            if (_handMasksSinceStats >= 15 && !_handMaskStatsReadbackPending)
+            {
+                _handMasksSinceStats = 0;
+                _handMaskStatsReadbackPending = true;
+                AsyncGPUReadback.Request(_handMaskStats, OnHandMaskStatsReadback);
+            }
+        }
+
+        private void OnHandMaskStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _handMaskStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 1) return;
+            LastHandMaskedPixels = data[0];
+            _handMaskStats?.SetData(ZeroHandMaskStats);
+        }
+
+        /// <summary>
+        /// 源头时序滤波：当前深度先经世界点重投影与上一拍对齐；带内噪声做 EMA，
+        /// 带外真变化直接全速放行。放在手罩之后、双边之前——弃权 0 穿透且不清洗历史，
+        /// 双边邻域也就不会把旧表面/弃权值互相洇染。输出原位替换 _depthTex，下游零改线。
+        /// </summary>
+        private void ApplyTemporalFilter()
+        {
+            if (!enableTemporalFilter || !_hasTemporalKernel || _depthTex == null)
+            {
+                _hasTemporalHistory = false; // 停用后再开不得吃隔夜历史
+                return;
+            }
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+            bool recreate = _temporalDepthTex == null || _temporalReasonTex == null ||
+                            _temporalDepthTex.width != w || _temporalDepthTex.height != h;
+            if (recreate)
+            {
+                if (_temporalDepthTex) Destroy(_temporalDepthTex);
+                if (_temporalHistReadTex) Destroy(_temporalHistReadTex);
+                if (_temporalHistWriteTex) Destroy(_temporalHistWriteTex);
+                if (_temporalReasonTex) Destroy(_temporalReasonTex);
+                _temporalDepthTex = CreateTemporalDepthTexture(w, h, "DepthTemporalOut");
+                _temporalHistReadTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistRead");
+                _temporalHistWriteTex = CreateTemporalDepthTexture(w, h, "DepthTemporalHistWrite");
+                _temporalReasonTex = CreateTemporalReasonTexture(w, h);
+                _hasTemporalHistory = false;
+            }
+
+            if (_temporalStats == null)
+            {
+                _temporalStats = new ComputeBuffer(2, sizeof(uint));
+                _temporalStats.SetData(ZeroTemporalStats);
+            }
+
+            var cs = temporalFilterCompute;
+            _temporalKernel.Set(BilSrcDepthID, _depthTex);
+            _temporalKernel.Set(TemporalHistDepthID, _temporalHistReadTex);
+            _temporalKernel.Set(BilDstDepthID, _temporalDepthTex);
+            _temporalKernel.Set(TemporalNextHistDepthID, _temporalHistWriteTex);
+            _temporalKernel.Set(TemporalReasonRWID, _temporalReasonTex);
+            _temporalKernel.Set(TemporalStatsID, _temporalStats);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetMatrixArray(TemporalCurProjID, _proj);
+            cs.SetMatrixArray(TemporalCurProjInvID, _projInv);
+            cs.SetMatrixArray(TemporalCurViewID, _view);
+            cs.SetMatrixArray(TemporalCurViewInvID, _viewInv);
+            cs.SetMatrixArray(TemporalPrevProjID, _prevTemporalProj);
+            cs.SetMatrixArray(TemporalPrevProjInvID, _prevTemporalProjInv);
+            cs.SetMatrixArray(TemporalPrevViewID, _prevTemporalView);
+            cs.SetMatrixArray(TemporalPrevViewInvID, _prevTemporalViewInv);
+            cs.SetInt(TemporalHasPrevID, _hasTemporalHistory ? 1 : 0);
+            // 转头越快，当前帧权重越大；到融合运动闸同杆（90°/s）时基本直通。
+            float motionAlpha = Mathf.Clamp01(_smoothedDepthAngSpeed / 90f);
+            cs.SetFloat(TemporalAlphaID, Mathf.Max(temporalFilterAlpha, motionAlpha));
+            cs.SetFloat(TemporalChangeBaseID, temporalChangeBaseMeters);
+            cs.SetFloat(TemporalChangeScaleID, temporalChangeDistanceScale);
+
+            _temporalKernel.DispatchFit(w, h, 2);
+
+            _depthTex = _temporalDepthTex;
+            (_temporalHistReadTex, _temporalHistWriteTex) = (_temporalHistWriteTex, _temporalHistReadTex);
+            Array.Copy(_proj, _prevTemporalProj, 2);
+            Array.Copy(_projInv, _prevTemporalProjInv, 2);
+            Array.Copy(_view, _prevTemporalView, 2);
+            Array.Copy(_viewInv, _prevTemporalViewInv, 2);
+            _hasTemporalHistory = true;
+
+            _temporalSinceStats++;
+            if (_temporalSinceStats >= 15 && !_temporalStatsReadbackPending)
+            {
+                _temporalSinceStats = 0;
+                _temporalStatsReadbackPending = true;
+                AsyncGPUReadback.Request(_temporalStats, OnTemporalStatsReadback);
+            }
+        }
+
+        private static RenderTexture CreateTemporalDepthTexture(int w, int h, string name)
+        {
+            var rt = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+            {
+                name = name,
+                dimension = TextureDimension.Tex2DArray,
+                volumeDepth = 2,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            rt.Create();
+            return rt;
+        }
+
+        private static RenderTexture CreateTemporalReasonTexture(int w, int h)
+        {
+            var rt = new RenderTexture(w, h, 0, GraphicsFormat.R32_UInt, 1)
+            {
+                name = "DepthTemporalReason",
+                dimension = TextureDimension.Tex2DArray,
+                volumeDepth = 2,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            rt.Create();
+            return rt;
+        }
+
+        private void OnTemporalStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _temporalStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 2) return;
+            LastTemporalStablePixels = data[0];
+            LastTemporalChangedPixels = data[1];
+            HasTemporalStats = true;
+            _temporalStats?.SetData(ZeroTemporalStats);
+        }
+
+        private void ApplyBilateralFilter()
+        {
+            if (!enableBilateralFilter || !_hasBilateralKernel || _rgbGuide == null || _depthTex == null)
+            {
+                if (!_loggedBilateralSkip && enableBilateralFilter && _hasBilateralKernel && _rgbGuide == null)
+                {
+                    _loggedBilateralSkip = true;
+                    Logger.Info("Bilateral depth filter skipped — no RGB guide (camera unavailable). " +
+                              "Depth will be noisier at edges.");
+                }
+                return;
+            }
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+
+            if (_filteredDepthTex == null || _filteredDepthTex.width != w || _filteredDepthTex.height != h)
+            {
+                if (_filteredDepthTex) Destroy(_filteredDepthTex);
+                _filteredDepthTex = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _filteredDepthTex.Create();
+            }
+
+            var cs = bilateralFilterCompute;
+            _bilateralKernel.Set(BilSrcDepthID, _depthTex);
+            _bilateralKernel.Set(BilRGBGuideID, _rgbGuide);
+            _bilateralKernel.Set(BilDstDepthID, _filteredDepthTex);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetFloat(BilSigmaSpatialID, sigmaSpatial);
+            cs.SetFloat(BilSigmaColorID, sigmaColor);
+            cs.SetFloat(BilSigmaDepthID, sigmaDepth);
+            cs.SetInt(BilFilterRadiusID, filterRadius);
+            cs.SetInt(EyeOffsetID, _preprocessEye);
+            _linearizeAB[0] = new Vector4(_proj[0][2, 2], _proj[0][2, 3], 0f, 0f);
+            _linearizeAB[1] = new Vector4(_proj[1][2, 2], _proj[1][2, 3], 0f, 0f);
+            cs.SetVectorArray(EdgeLinearizeABID, _linearizeAB);
+
+            _bilateralKernel.DispatchFit(w, h, 1);
+
+            _depthTex = _filteredDepthTex;
+        }
+
+        /// <summary>
+        /// 深度边缘清洗（v0.2 IsDepthEdgeTexCoord 的 GPU 移植）：三段式判决找断崖像素并写 0。
+        /// 夹在双边滤波与法线/膨胀之间，原位替换 _depthTex（与双边同模式），融合 shader 零改动。
+        /// 边缘像素 NDC 0 = 近端，融合侧近距闸/截断带双保险拦下 = 弃权，不投"远=空"票。
+        /// </summary>
+        private void ApplyDepthEdgeClean()
+        {
+            if (!enableDepthEdgeClean || !_hasEdgeCleanKernel || _depthTex == null) return;
+
+            int w = _depthTex.width;
+            int h = _depthTex.height;
+
+            if (_edgeCleanedDepthTex == null || _edgeCleanedDepthTex.width != w || _edgeCleanedDepthTex.height != h)
+            {
+                if (_edgeCleanedDepthTex) Destroy(_edgeCleanedDepthTex);
+                _edgeCleanedDepthTex = new RenderTexture(w, h, 0, GraphicsFormat.R16_UNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _edgeCleanedDepthTex.Create();
+            }
+
+            if (_edgeReasonTex == null || _edgeReasonTex.width != w || _edgeReasonTex.height != h)
+            {
+                if (_edgeReasonTex) Destroy(_edgeReasonTex);
+                _edgeReasonTex = new RenderTexture(w, h, 0, GraphicsFormat.R32_UInt, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                _edgeReasonTex.Create();
+            }
+
+            if (_edgeStats == null)
+            {
+                _edgeStats = new ComputeBuffer(4, sizeof(uint));
+                _edgeStats.SetData(ZeroEdgeStats);
+            }
+
+            var cs = depthEdgeCleanCompute;
+            _edgeCleanKernel.Set(BilSrcDepthID, _depthTex);
+            _edgeCleanKernel.Set(BilDstDepthID, _edgeCleanedDepthTex);
+            _edgeCleanKernel.Set(EdgeReasonRWID, _edgeReasonTex);
+            _edgeCleanKernel.Set(EdgeStatsID, _edgeStats);
+            cs.SetMatrixArray(EdgeProjInvID, _projInv);
+            cs.SetMatrixArray(EdgeViewInvID, _viewInv);
+            _linearizeAB[0] = new Vector4(_proj[0][2, 2], _proj[0][2, 3], 0f, 0f);
+            _linearizeAB[1] = new Vector4(_proj[1][2, 2], _proj[1][2, 3], 0f, 0f);
+            cs.SetVectorArray(EdgeLinearizeABID, _linearizeAB);
+            cs.SetInt(BilDepthWID, w);
+            cs.SetInt(BilDepthHID, h);
+            cs.SetInt(EdgeProbeRadiusID, edgeProbeRadiusPixels);
+            cs.SetFloat(EdgeJumpBaseID, edgeJumpBaseMeters);
+            cs.SetFloat(EdgeJumpDistScaleID, edgeJumpDistanceScale);
+            cs.SetInt(EdgeUsePlaneRejectID, edgeUseLocalPlaneReject ? 1 : 0);
+            cs.SetFloat(EdgePlaneResidualBaseID, edgePlaneResidualBaseMeters);
+            cs.SetFloat(EdgePlaneResidualDistScaleID, edgePlaneResidualDistanceScale);
+            cs.SetFloat(EdgePlaneMinInlierRatioID, edgePlaneMinInlierRatio);
+            cs.SetInt(EdgePlaneMinNeighborsID, edgePlaneMinNeighborPoints);
+            cs.SetFloat(EdgeTwoClusterMinFractionID, edgeTwoClusterMinFraction);
+            cs.SetInt(SkirtVetoEnabledID, edgeSkirtVetoEnabled ? 1 : 0);
+            cs.SetInt(SkirtMinNearProbesID, edgeSkirtMinNearProbes);
+            cs.SetInt(GrazingVetoEnabledID, edgeGrazingVetoEnabled ? 1 : 0);
+            cs.SetFloat(GrazingMinFacingDotID, edgeGrazingMinFacingDot);
+            cs.SetFloat(GrazingRangeBaseID, edgeGrazingRangeBaseMeters);
+            cs.SetFloat(GrazingRangeScaleID, edgeGrazingRangeScale);
+            cs.SetInt(GrazingPlaneExemptionEnabledID, edgeGrazingPlaneExemptionEnabled ? 1 : 0);
+            cs.SetFloat(GrazingPlaneMaxResidualID, edgeGrazingPlaneMaxResidualMeters);
+            cs.SetFloat(GrazingPlaneMinSupportRatioID, edgeGrazingPlaneMinSupportRatio);
+            cs.SetInt(GrazingPlaneMinSupportPointsID, edgeGrazingPlaneMinSupportPoints);
+            cs.SetInt(CrossEyeEnabledID, edgeCrossEyeEnabled ? 1 : 0);
+            cs.SetFloat(CrossEyeMarginBaseID, edgeCrossEyeMarginBaseMeters);
+            cs.SetFloat(CrossEyeMarginScaleID, edgeCrossEyeMarginScale);
+            cs.SetFloat(CrossEyeMinOtherFacingID, edgeCrossEyeMinOtherFacing);
+            cs.SetMatrixArray(EdgeProjFwdID, _proj);
+            cs.SetMatrixArray(EdgeViewFwdID, _view);
+            cs.SetInt(EyeOffsetID, _preprocessEye);
+
+            _edgeCleanKernel.DispatchFit(w, h, 1);
+
+            _depthTex = _edgeCleanedDepthTex;
+
+            // 边缘计数读数（HUD"缘:"）：每 15 次清洗结算一次，读回即清零开新周期
+            _edgeCleansSinceStats++;
+            if (_edgeCleansSinceStats >= 15 && !_edgeStatsReadbackPending)
+            {
+                _edgeCleansSinceStats = 0;
+                _edgeStatsReadbackPending = true;
+                AsyncGPUReadback.Request(_edgeStats, OnEdgeStatsReadback);
+            }
+        }
+
+        private void OnEdgeStatsReadback(AsyncGPUReadbackRequest request)
+        {
+            _edgeStatsReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 4) return;
+            LastEdgeCleanCount = data[0];
+            LastGrazingKillCount = data[1];
+            LastGrazingPlaneSupportedCount = data[2];
+            LastGrazingPlaneRescuedCount = data[3];
+            HasEdgeCleanStats = true;
+            _edgeStats?.SetData(ZeroEdgeStats);
+        }
+
+        private bool EnsureSeedPlaneCompute()
+        {
+            if (_seedPlaneKernel >= 0 && _seedPlaneCompute != null) return true;
+            _seedPlaneCompute = Resources.Load<ComputeShader>("InstantSeedDepthProject");
+            if (_seedPlaneCompute == null ||
+                !_seedPlaneCompute.HasKernel("ProjectSeedPlanes"))
+            {
+                Logger.Warning("种子平面生产入口缺少 InstantSeedDepthProject 内核；保持原深度，不伪称接入");
+                return false;
+            }
+            _seedPlaneKernel = _seedPlaneCompute.FindKernel("ProjectSeedPlanes");
+            return _seedPlaneKernel >= 0;
+        }
+
+        private void ActivateSeedPlaneSidecar()
+        {
+            if (!enableSeedPlaneProductionExperiment || _seedPlaneCount == 0 ||
+                _seedPlanePreviewActive || _depthTex == null || _normTex == null)
+                return;
+            if (_seedPlaneAwaitClear)
+            {
+                if (VolumeIntegrator.Instance != null &&
+                    VolumeIntegrator.Instance.IntegrationCount > 0)
+                    return;
+                _seedPlaneAwaitClear = false;
+            }
+            if (_lastSeedPlaneAppliedFrame < 0)
+                Logger.Info($"种面标尺旁路已启用：{_seedPlaneCount}块；原深度不改写，只约束TSDF后制品");
+            _lastSeedPlaneAppliedFrame = _frameCount;
+        }
+
+        private void SetGlobalShaderProperties()
+        {
+            Shader.SetGlobalMatrixArray(ProjID, _proj);
+            Shader.SetGlobalMatrixArray(ProjInvID, _projInv);
+            Shader.SetGlobalMatrixArray(ViewID, _view);
+            Shader.SetGlobalMatrixArray(ViewInvID, _viewInv);
+            Shader.SetGlobalVector(ZParamsID, _planes);
+            Shader.SetGlobalVector(TexSizeID, new Vector2(_depthTex.width, _depthTex.height));
+            Shader.SetGlobalTexture(DepthTexID, _depthTex);
+        }
+
+        private void ComputeNormals()
+        {
+            if (_normTex == null || _normTex.width != _depthTex.width || _normTex.height != _depthTex.height)
+            {
+                if (_normTex) Destroy(_normTex);
+                _normTex = new RenderTexture(_depthTex.width, _depthTex.height, 0,
+                    GraphicsFormat.R8G8B8A8_SNorm, 1)
+                {
+                    dimension = TextureDimension.Tex2DArray,
+                    volumeDepth = 2,
+                    useMipMap = false,
+                    enableRandomWrite = true
+                };
+            }
+
+            _normKernel.Set(DepthTexID, _depthTex);
+            _normKernel.Set(NormTexRWID, _normTex);
+            _normKernel.DispatchFit(_normTex);
+            Shader.SetGlobalTexture(NormTexID, _normTex);
+        }
+
+        private void ComputeDilation()
+        {
+            if (_dilationA == null || _dilationA.width != _depthTex.width || _dilationA.height != _depthTex.height)
+            {
+                if (_dilationA) Destroy(_dilationA);
+                if (_dilationB) Destroy(_dilationB);
+
+                var desc = new RenderTextureDescriptor
+                {
+                    width = _depthTex.width,
+                    height = _depthTex.height,
+                    volumeDepth = 1,
+                    dimension = TextureDimension.Tex2D,
+                    autoGenerateMips = false,
+                    enableRandomWrite = true,
+                    graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat,
+                    msaaSamples = 1
+                };
+
+                _dilationA = new RenderTexture(desc);
+                _dilationB = new RenderTexture(desc);
+            }
+
+            depthDilationCompute.SetFloat(VoxDistID, voxelDistance);
+            depthDilationCompute.SetFloat(VoxSizeShaderID, voxelSize);
+
+            _initDilateKernel.Set(DepthTexID, _depthTex);
+            _initDilateKernel.Set(DilateSrcID, _dilationA);
+            _initDilateKernel.Set(DilateDestID, _dilationB);
+            _initDilateKernel.DispatchFit(_dilationA.width, _dilationA.height);
+
+            int stepSize = _dilationMaxStep;
+            for (int i = 0; i < dilationSteps; i++)
+            {
+                _dilateStepKernel.Set(DilateSrcID, _dilationA);
+                _dilateStepKernel.Set(DilateDestID, _dilationB);
+                depthDilationCompute.SetInt(DilateStepSizeID, stepSize);
+                _dilateStepKernel.DispatchFit(_dilationA.width, _dilationA.height);
+
+                stepSize /= 2;
+                (_dilationA, _dilationB) = (_dilationB, _dilationA);
+            }
+
+            _dilatedDepth = _dilationA;
+            Shader.SetGlobalTexture(DilatedDepthTexID, _dilatedDepth);
+        }
+
+        private static Matrix4x4 CalculateProjectionMatrix(XRFov fov, XRNearFarPlanes planes)
+        {
+            float left = Mathf.Tan(fov.angleLeft);
+            float right = Mathf.Tan(fov.angleRight);
+            float bottom = Mathf.Tan(fov.angleDown);
+            float top = Mathf.Tan(fov.angleUp);
+
+            float near = planes.nearZ;
+            float far = planes.farZ;
+
+            float x = 2.0f / (right - left);
+            float y = 2.0f / (top - bottom);
+            float a = (right + left) / (right - left);
+            float b = (top + bottom) / (top - bottom);
+
+            float c, d;
+            if (float.IsInfinity(far))
+            {
+                c = -1.0f;
+                d = -2.0f * near;
+            }
+            else
+            {
+                c = -(far + near) / (far - near);
+                d = -(2.0f * far * near) / (far - near);
+            }
+
+            return new Matrix4x4
+            {
+                m00 = x,  m01 = 0, m02 = a,  m03 = 0,
+                m10 = 0,  m11 = y, m12 = b,  m13 = 0,
+                m20 = 0,  m21 = 0, m22 = c,  m23 = d,
+                m30 = 0,  m31 = 0, m32 = -1, m33 = 0
+            };
+        }
+
+        /// <summary>
+        /// Update voxel parameters used by dilation (called by VolumeIntegrator when its values change).
+        /// </summary>
+        public void SetVoxelParams(float voxDist, float voxSize)
+        {
+            voxelDistance = voxDist;
+            voxelSize = voxSize;
+        }
+    }
+}

@@ -33,7 +33,6 @@ namespace Genesis.RoomScan
         private static readonly int ID_TemporalIllegalActive = Shader.PropertyToID("_RSTemporalIllegalActive");
         private static readonly int ID_HeraReplayActive = Shader.PropertyToID("_RSHeraReplayActive");
         private static readonly int ID_ProductGridMode = Shader.PropertyToID("_RSProductGridMode");
-        private static readonly int ID_ComparisonOverlay = Shader.PropertyToID("_RSComparisonOverlay");
         private static readonly int ID_Wireframe = Shader.PropertyToID("_RSWireframe");
         private static readonly int ID_PaperGridMode = Shader.PropertyToID("_RSPaperGridMode");
         private static readonly int ID_DepthPrepassMaxViewDistance =
@@ -53,7 +52,6 @@ namespace Genesis.RoomScan
         private bool _temporalIllegalCandidateActive;
         private bool _heraReplayActive;
         private bool _productGridMode;
-        private bool _comparisonOverlay;
 
         private bool _renderVisible = true;
 
@@ -75,22 +73,6 @@ namespace Genesis.RoomScan
         public void SetStrictObservedDisplay(bool strictObserved)
         {
             _extractionColor = strictObserved ? StrictObservedColor : ProductionColor;
-        }
-
-        /// <summary>
-        /// Marks this draw as an explicit A/B comparison surface. Its assigned
-        /// color remains visible even while the normal production route is in
-        /// white geometry-truth mode. Display only; mesh data is unchanged.
-        /// </summary>
-        public void SetComparisonDisplay(Color color)
-        {
-            _comparisonOverlay = true;
-            _extractionColor = color;
-        }
-
-        public void SetRearWireOcclusion(bool enabled)
-        {
-            occludeRearWireframe = enabled;
         }
 
         public void SetJointDiagnosticDisplay(bool enabled)
@@ -215,7 +197,6 @@ namespace Genesis.RoomScan
             _props.SetFloat(ID_TemporalIllegalActive, _temporalIllegalCandidateActive ? 1f : 0f);
             _props.SetFloat(ID_HeraReplayActive, _heraReplayActive ? 1f : 0f);
             _props.SetFloat(ID_ProductGridMode, _productGridMode ? 1f : 0f);
-            _props.SetFloat(ID_ComparisonOverlay, _comparisonOverlay ? 1f : 0f);
             _props.SetFloat(ID_DepthPrepassMaxViewDistance,
                 rearWireOccluderMaxViewDistance);
 

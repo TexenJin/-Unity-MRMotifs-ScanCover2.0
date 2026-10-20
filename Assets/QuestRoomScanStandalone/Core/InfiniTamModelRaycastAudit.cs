@@ -39,6 +39,8 @@ namespace Genesis.RoomScan
         private static readonly int ModelVoteWeightID = Shader.PropertyToID("gsModelVoteWeight");
         private static readonly int ModelDepthRWID = Shader.PropertyToID("gsModelDepthRW");
         private static readonly int ModelResidualMmRWID = Shader.PropertyToID("gsModelResidualMmRW");
+        private static readonly int ModelVoteWeightRWID = Shader.PropertyToID("gsModelVoteWeightRW");
+        private static readonly int ModelNormalRWID = Shader.PropertyToID("gsModelNormalRW");
         private static readonly int StatsID = Shader.PropertyToID("gsModelRaycastStats");
         private static readonly int TrackingPairsID = Shader.PropertyToID("gsModelTrackingPairs");
         private static readonly int DepthSizeID = Shader.PropertyToID("gsDepthTexSize");
@@ -59,6 +61,8 @@ namespace Genesis.RoomScan
         private ComputeBuffer _trackingPairs;
         private RenderTexture _modelDepth;
         private RenderTexture _modelResidualMm;
+        private RenderTexture _modelVoteWeight;
+        private RenderTexture _modelNormal;
         private bool _initializationFailed;
         private bool _readbackPending;
         private bool _trackingReadbackPending;
@@ -206,6 +210,11 @@ namespace Genesis.RoomScan
 
         public RenderTexture ModelDepth => _modelDepth;
         public RenderTexture ModelResidualMm => _modelResidualMm;
+        public RenderTexture ModelVoteWeight => _modelVoteWeight;
+        public RenderTexture ModelNormal => _modelNormal;
+        public Vector2Int ModelOutputSize => _modelDepth != null
+            ? new Vector2Int(_modelDepth.width, _modelDepth.height)
+            : Vector2Int.one;
         public bool HasSample { get; private set; }
         public bool ProductionTrackingPending => _productionTrackingPending;
 
@@ -268,6 +277,36 @@ namespace Genesis.RoomScan
             _productionState = null;
             _productionTrackingPending = false;
             return false;
+        }
+
+        /// <summary>
+        /// Produces an exact-frame, read-only prediction immediately before
+        /// fusion. This instance performs no CPU readback and never changes the
+        /// supplied TSDF; the caller may consume the textures as a GPU-side
+        /// observation-association witness in the following dispatch.
+        /// </summary>
+        public bool DispatchPredictionOnly(Texture acceptedDepth,
+            Matrix4x4[] projection, Matrix4x4[] view,
+            Matrix4x4[] projectionInverse, Matrix4x4[] viewInverse,
+            RenderTexture soleTsdf, RenderTexture soleVoteWeight,
+            int3 voxelCount, float voxelSize, float voxelDistance,
+            float minWeight, float minObservedRange, float maxObservedRange,
+            int sourceFrame)
+        {
+            if (acceptedDepth == null || soleTsdf == null || soleVoteWeight == null ||
+                projection == null || view == null || projectionInverse == null ||
+                viewInverse == null || projection.Length < 2 || view.Length < 2 ||
+                projectionInverse.Length < 2 || viewInverse.Length < 2)
+                return false;
+            if (!EnsureResources(acceptedDepth.width, acceptedDepth.height,
+                                 _pixelStride))
+                return false;
+
+            ConfigureAndDispatch(acceptedDepth, projection, view,
+                projectionInverse, viewInverse, soleTsdf, soleVoteWeight,
+                voxelCount, voxelSize, voxelDistance, minWeight,
+                minObservedRange, maxObservedRange, sourceFrame, _pixelStride);
+            return true;
         }
 
         private bool DispatchProductionPass(ProductionTrackingState state)
@@ -518,6 +557,8 @@ namespace Genesis.RoomScan
             _raycastKernel.Set(ModelVoteWeightID, soleVoteWeight);
             _raycastKernel.Set(ModelDepthRWID, _modelDepth);
             _raycastKernel.Set(ModelResidualMmRWID, _modelResidualMm);
+            _raycastKernel.Set(ModelVoteWeightRWID, _modelVoteWeight);
+            _raycastKernel.Set(ModelNormalRWID, _modelNormal);
             _raycastKernel.Set(StatsID, _stats);
             _raycastKernel.Set(TrackingPairsID, _trackingPairs);
             _raycastKernel.DispatchFit(_modelDepth.width, _modelDepth.height, 1);
@@ -691,8 +732,12 @@ namespace Genesis.RoomScan
             _trackingPairs = null;
             if (_modelDepth != null) UnityEngine.Object.Destroy(_modelDepth);
             if (_modelResidualMm != null) UnityEngine.Object.Destroy(_modelResidualMm);
+            if (_modelVoteWeight != null) UnityEngine.Object.Destroy(_modelVoteWeight);
+            if (_modelNormal != null) UnityEngine.Object.Destroy(_modelNormal);
             _modelDepth = null;
             _modelResidualMm = null;
+            _modelVoteWeight = null;
+            _modelNormal = null;
             _shader = null;
         }
 
@@ -706,7 +751,7 @@ namespace Genesis.RoomScan
                 if (_shader == null || !_shader.HasKernel("ClearModelRaycastStats") ||
                     !_shader.HasKernel("RaycastModel"))
                 {
-                    Logger.Warning("InfiniTAM 模型预测内核缺失；bootstrap 后严格停笔，绝不绕回原始位姿污染 TSDF");
+                    Logger.Warning("InfiniTAM 模型预测内核缺失；调用方将按自身策略停笔或旁路");
                     _shader = null;
                     _initializationFailed = true;
                     return false;
@@ -723,12 +768,15 @@ namespace Genesis.RoomScan
             int height = Mathf.Max(1,
                 Mathf.CeilToInt((float)depthHeight / safeStride));
             if (_modelDepth != null && _modelDepth.width == width &&
-                _modelDepth.height == height && _trackingPairs != null &&
+                _modelDepth.height == height && _modelVoteWeight != null &&
+                _modelNormal != null && _trackingPairs != null &&
                 _trackingPairs.count == width * height)
                 return true;
 
             if (_modelDepth != null) UnityEngine.Object.Destroy(_modelDepth);
             if (_modelResidualMm != null) UnityEngine.Object.Destroy(_modelResidualMm);
+            if (_modelVoteWeight != null) UnityEngine.Object.Destroy(_modelVoteWeight);
+            if (_modelNormal != null) UnityEngine.Object.Destroy(_modelNormal);
             _trackingPairs?.Release();
             _trackingPairs = null;
             GraphicsFormat format = SystemInfo.IsFormatSupported(
@@ -738,14 +786,24 @@ namespace Genesis.RoomScan
             _modelDepth = CreateOutput(width, height, format, "InfiniTamModelDepth");
             _modelResidualMm = CreateOutput(width, height, format,
                 "InfiniTamModelResidualMm");
+            _modelVoteWeight = CreateOutput(width, height, format,
+                "InfiniTamModelVoteWeight");
+            GraphicsFormat normalFormat = SystemInfo.IsFormatSupported(
+                GraphicsFormat.R16G16B16A16_SFloat, FormatUsage.LoadStore)
+                ? GraphicsFormat.R16G16B16A16_SFloat
+                : GraphicsFormat.R32G32B32A32_SFloat;
+            _modelNormal = CreateOutput(width, height, normalFormat,
+                "InfiniTamModelNormal");
             _trackingPairs = new ComputeBuffer(width * height,
                 Marshal.SizeOf<ModelTrackingPair>());
             bool ready = _modelDepth != null && _modelDepth.IsCreated() &&
                          _modelResidualMm != null && _modelResidualMm.IsCreated() &&
+                         _modelVoteWeight != null && _modelVoteWeight.IsCreated() &&
+                         _modelNormal != null && _modelNormal.IsCreated() &&
                          _trackingPairs != null;
             if (!ready)
             {
-                Logger.Warning("InfiniTAM 模型预测资源创建失败；bootstrap 后严格停笔，绝不绕回原始位姿污染 TSDF");
+                Logger.Warning("InfiniTAM 模型预测资源创建失败；调用方将按自身策略停笔或旁路");
                 _initializationFailed = true;
             }
             return ready;

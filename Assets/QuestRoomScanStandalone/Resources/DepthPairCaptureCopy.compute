@@ -4,13 +4,16 @@ Texture2DArray<float> _SourceDepth;
 RWTexture2DArray<float> _DestDepth;
 int2 _CaptureSize;
 int _SourceEyeIndex;
+int _DestEyeIndex;
 
 [numthreads(8, 8, 1)]
 void CopyDepth(uint3 id : SV_DispatchThreadID)
 {
-    // 采集文件只保存融合实际读取的单眼切片（当前为 slice 1 / right）。
+    // Caller selects both source and destination slices. Diagnostic capture stores
+    // only the fusion eye; the production frame latch invokes this once per eye.
     if (id.x >= (uint)_CaptureSize.x || id.y >= (uint)_CaptureSize.y || id.z >= 1)
         return;
 
-    _DestDepth[id] = _SourceDepth.Load(int4(id.xy, _SourceEyeIndex, 0));
+    _DestDepth[int3(id.xy, _DestEyeIndex)] =
+        _SourceDepth.Load(int4(id.xy, _SourceEyeIndex, 0));
 }

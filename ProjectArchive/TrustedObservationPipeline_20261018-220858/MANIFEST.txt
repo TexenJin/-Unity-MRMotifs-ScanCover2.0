@@ -1,0 +1,9 @@
+checkpoint=20261018-220858
+purpose=pre_trusted_observation_pipeline
+master_rollback=restore these exact files or disable enableTrustedObservationPipeline
+files=
+Assets\QuestRoomScanStandalone\Core\DepthCapture.cs
+Assets\QuestRoomScanStandalone\Core\VolumeIntegrator.cs
+Assets\QuestRoomScanStandalone\Core\InfiniTamModelRaycastAudit.cs
+Assets\QuestRoomScanStandalone\Shaders\VolumeIntegration.compute
+Assets\QuestRoomScanStandalone\Resources\InfiniTamModelRaycast.compute

@@ -32,6 +32,7 @@ namespace Genesis.RoomScan
         private RenderTexture _processedSnapshot;
 
         private bool _isCapturing;
+        private bool _lockedRoiOnly;
         private bool _stagedEligible;
         private int _stagedPlatformFrame = -1;
         private FrameMetadata _stagedMetadata;
@@ -53,6 +54,7 @@ namespace Genesis.RoomScan
         private static readonly int DestDepthId = Shader.PropertyToID("_DestDepth");
         private static readonly int CaptureSizeId = Shader.PropertyToID("_CaptureSize");
         private static readonly int SourceEyeIndexId = Shader.PropertyToID("_SourceEyeIndex");
+        private static readonly int DestEyeIndexId = Shader.PropertyToID("_DestEyeIndex");
 
         public bool IsCapturing => _isCapturing;
         public string SessionDirectory => _sessionDirectory;
@@ -87,6 +89,7 @@ namespace Genesis.RoomScan
                     "请先完成/清空本次扫描，再开始下一次采集。");
                 return false;
             }
+            _lockedRoiOnly = false;
             if (!EnsureShader()) return false;
             _depthCapture = GetComponent<DepthCapture>();
 
@@ -109,12 +112,20 @@ namespace Genesis.RoomScan
                     Path.Combine(_sessionDirectory, "depth_pairs", "schema.json"),
                     BuildSchemaJson(),
                     new UTF8Encoding(false));
+                if (_lockedRoiOnly)
+                    File.WriteAllText(
+                        Path.Combine(_sessionDirectory, "depth_pairs", "ROI_ONLY.txt"),
+                        "Locked ROI mode: full-frame depth pairs are intentionally not persisted. " +
+                        "The bounded history is under artifacts/locked_roi_history.\n",
+                        new UTF8Encoding(false));
                 _sessionPackage = GetComponent<ScanReplaySessionPackage>() ??
                                   gameObject.AddComponent<ScanReplaySessionPackage>();
                 _sessionPackage.Begin(_sessionDirectory);
             }
             catch (Exception e)
             {
+                _sessionPackage?.AbortLockedRoiCaptureBegin();
+                _sessionPackage = null;
                 Logger.Warning("双路深度采集无法创建目录：" + e.Message);
                 _sessionDirectory = string.Empty;
                 return false;
@@ -139,6 +150,7 @@ namespace Genesis.RoomScan
             _stagedEligible = false;
             _sessionPackage?.End();
             WriteStatusFile("stopped");
+            TryReportDepthDrain();
             Logger.Info($"双路深度采集停止：帧对={_pairSequence}，丢={_droppedPairs}，" +
                         $"回读错={_readbackErrors}，待写={OutstandingPairCount}，目录={_sessionDirectory}");
         }
@@ -172,7 +184,7 @@ namespace Genesis.RoomScan
         {
             _stagedEligible = false;
             _stagedPlatformFrame = platformFrame;
-            if (!_isCapturing || platformDepth == null) return;
+            if (!_isCapturing || _lockedRoiOnly || platformDepth == null) return;
 
             if (LocalOutstandingPairCount >= MaxOutstandingPairs)
             {
@@ -217,7 +229,7 @@ namespace Genesis.RoomScan
 
         public void CapturePreprocessedFrame(Texture processedDepth, int platformFrame, int updatedEye)
         {
-            if (!_isCapturing || !_stagedEligible || processedDepth == null ||
+            if (!_isCapturing || _lockedRoiOnly || !_stagedEligible || processedDepth == null ||
                 platformFrame != _stagedPlatformFrame)
                 return;
 
@@ -351,8 +363,10 @@ namespace Genesis.RoomScan
             }
             finally
             {
-                Interlocked.Decrement(ref _writesInFlight);
                 if (!_isCapturing) WriteStatusFile("stopped");
+                // Status belongs to this worker; sealing must not hash while
+                // the final writer can still mutate it.
+                Interlocked.Decrement(ref _writesInFlight);
             }
         }
 
@@ -422,6 +436,7 @@ namespace Genesis.RoomScan
             _copyShader.SetTexture(_copyKernel, DestDepthId, destination);
             _copyShader.SetInts(CaptureSizeId, destination.width, destination.height);
             _copyShader.SetInt(SourceEyeIndexId, FusionEyeIndex);
+            _copyShader.SetInt(DestEyeIndexId, 0);
             _copyShader.Dispatch(
                 _copyKernel,
                 Mathf.CeilToInt(destination.width / 8f),
@@ -658,6 +673,11 @@ namespace Genesis.RoomScan
         }
 
         private void Update()
+        {
+            TryReportDepthDrain();
+        }
+
+        internal void TryReportDepthDrain()
         {
             if (_isCapturing || _depthDrainReported || LocalOutstandingPairCount > 0)
                 return;

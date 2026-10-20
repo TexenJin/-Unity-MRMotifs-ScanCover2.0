@@ -154,15 +154,7 @@ Shader "QRS/MeshLayerEvidence"
                         float3 voxel = (float3)(cell + CornerOffset(a)) +
                             t * (float3)(CornerOffset(b) - CornerOffset(a));
                         world = VoxelToLocal(voxel);
-                        // Mode 3 is the responsibility view. Yellow means the
-                        // cell's crossings still form one local direction;
-                        // magenta means two or more direction families are
-                        // being reduced into this one Surface-Nets vertex.
-                        bool crossDirectionMixed =
-                            (evidence.w & (1u << 24u)) != 0u;
-                        color = _LayerEvidenceMode >= 3 && crossDirectionMixed
-                            ? float4(1.0, 0.02, 0.82, 1.0)
-                            : float4(1.0, 0.88, 0.0, 1.0);
+                        color = float4(1.0, 0.88, 0.0, 1.0);
                         size = _CrossingPointSize;
                     }
                     else

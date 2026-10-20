@@ -64,6 +64,42 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
     public double LastSuccessfulRefreshRealtimeSeconds { get; private set; } = -1d;
     public int SuccessfulRefreshCount { get; private set; }
 
+    /// <summary>
+    /// Returns the immutable pose/calibration contract which produced the
+    /// currently published output textures.  Consumers must use this matrix as
+    /// world-to-depth-clip directly; sampling Camera.main later would combine a
+    /// newer render pose with an older Environment Depth observation.
+    /// </summary>
+    public bool TryGetLastDispatchFrameContract(
+        out int refreshFrame,
+        out double refreshRealtimeSeconds,
+        out Matrix4x4 worldToDepthClip,
+        out Vector3 eyeWorldPosition)
+    {
+        refreshFrame = LastSuccessfulRefreshFrame;
+        refreshRealtimeSeconds = LastSuccessfulRefreshRealtimeSeconds;
+        worldToDepthClip = LastDispatchDepthReprojectionMatrix;
+        eyeWorldPosition = Vector3.zero;
+
+        if (!_isReady || refreshFrame < 0 ||
+            !HasLastDispatchDepthReprojectionMatrix ||
+            !HasLastDispatchEyePosition)
+            return false;
+
+        if (!ScanCoverDepthFrameContract.TryRecoverEyeWorldPosition(
+                worldToDepthClip, out Vector3 recoveredEye))
+            return false;
+
+        // Both values originate from the same provider matrix.  Keeping this
+        // check here prevents a partially refreshed contract from escaping if
+        // the producer is changed later.
+        if ((recoveredEye - LastDispatchEyePosition).sqrMagnitude > 0.000001f)
+            return false;
+
+        eyeWorldPosition = recoveredEye;
+        return true;
+    }
+
     private static readonly int EnvironmentDepthTextureId = Shader.PropertyToID("_EnvironmentDepthTexture");
     private static readonly int ReprojectionMatricesId = Shader.PropertyToID("_EnvironmentDepthReprojectionMatrices");
     private static readonly int ZBufferParamsId = Shader.PropertyToID("_EnvironmentDepthZBufferParams");
@@ -215,8 +251,18 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
         computeShader.SetFloat(BilateralSigmaColorId, bilateralSigmaColor);
         if (rgbGuideFrame != null)
             computeShader.SetTexture(_kernelIndex, RgbGuideId, rgbGuideFrame);
-        Camera sourceCamera = Camera.main;
-        Vector3 cameraWorldPosition = ResolveSelectedEyeWorldPosition(sourceCamera, out bool hasEyePosition);
+        // The matching provider reprojection matrix is the authoritative owner
+        // of this depth observation's pose.  Camera.main is a render-time pose
+        // and may already have advanced beyond the depth texture generation.
+        Vector3 cameraWorldPosition = ResolveSelectedEyeWorldPosition(
+            LastDispatchDepthReprojectionMatrix,
+            out bool hasEyePosition);
+        if (!hasEyePosition)
+        {
+            HasLastDispatchEyePosition = false;
+            LastDispatchEyePosition = Vector3.zero;
+            return SetIssue("Depth frame contract is incomplete: reprojection matrix has no finite camera centre.");
+        }
         HasLastDispatchEyePosition = hasEyePosition;
         LastDispatchEyePosition = cameraWorldPosition;
         computeShader.SetVector(CameraWorldPositionId, new Vector4(
@@ -496,32 +542,14 @@ public sealed class ScanCoverDepthPreprocessor : MonoBehaviour
             _observationMetaTexture != null;
     }
 
-    private Vector3 ResolveSelectedEyeWorldPosition(Camera sourceCamera, out bool valid)
+    private static Vector3 ResolveSelectedEyeWorldPosition(
+        Matrix4x4 depthReprojectionMatrix,
+        out bool valid)
     {
-        valid = false;
-        if (sourceCamera == null)
-            return Vector3.zero;
-
-        try
-        {
-            Camera.StereoscopicEye eye = sourceEye == SourceEye.Left
-                ? Camera.StereoscopicEye.Left
-                : Camera.StereoscopicEye.Right;
-            Matrix4x4 eyeToWorld = sourceCamera.GetStereoViewMatrix(eye).inverse;
-            Vector4 column = eyeToWorld.GetColumn(3);
-            Vector3 position = new Vector3(column.x, column.y, column.z);
-            if (float.IsFinite(position.x) && float.IsFinite(position.y) && float.IsFinite(position.z))
-            {
-                valid = true;
-                return position;
-            }
-        }
-        catch
-        {
-            // Non-stereo editor cameras fall back to the camera transform.
-        }
-
-        return sourceCamera.transform.position;
+        valid = ScanCoverDepthFrameContract.TryRecoverEyeWorldPosition(
+            depthReprojectionMatrix,
+            out Vector3 position);
+        return valid ? position : Vector3.zero;
     }
 
     private static RenderTexture CreateOutputTexture(string textureName, Vector2Int size, GraphicsFormat format)

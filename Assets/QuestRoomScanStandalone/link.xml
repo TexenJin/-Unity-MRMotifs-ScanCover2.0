@@ -1,0 +1,12 @@
+<linker>
+  <!--
+    StandaloneChiselSparseTsdfBridge deliberately resolves this optional
+    diagnostic-only shadow by reflection so the production RoomScan assembly
+    has no compile-time dependency on Assembly-CSharp. Preserve the target in
+    IL2CPP player builds; otherwise managed stripping can make STREAM stay OFF
+    even though it works in the Editor.
+  -->
+  <assembly fullname="Assembly-CSharp">
+    <type fullname="ScanCoverChiselSparseTsdfShadow" preserve="all" />
+  </assembly>
+</linker>

@@ -12,6 +12,8 @@ Texture3D<float2> gsModelTsdf;
 Texture3D<float> gsModelVoteWeight;
 RWTexture2D<float> gsModelDepthRW;
 RWTexture2D<float> gsModelResidualMmRW;
+RWTexture2D<float> gsModelVoteWeightRW;
+RWTexture2D<float4> gsModelNormalRW;
 RWStructuredBuffer<uint> gsModelRaycastStats;
 
 struct ModelTrackingPair
@@ -186,6 +188,10 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     emptyPair.modelResidual = 0.0;
     emptyPair.normalVote = 0.0;
     gsModelTrackingPairs[trackingIndex] = emptyPair;
+    gsModelDepthRW[id.xy] = 0.0;
+    gsModelResidualMmRW[id.xy] = 0.0;
+    gsModelVoteWeightRW[id.xy] = 0.0;
+    gsModelNormalRW[id.xy] = 0.0;
 
     InterlockedAdd(gsModelRaycastStats[0], 1u);
     int stride = max(gsModelPixelStride, 1);
@@ -244,8 +250,6 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     float nearT, farT;
     if (!IntersectVolume(eye, direction, nearT, farT))
     {
-        gsModelDepthRW[id.xy] = 0.0;
-        gsModelResidualMmRW[id.xy] = 0.0;
         if (hasObservedDepth)
         {
             InterlockedAdd(gsModelRaycastStats[9], 1u);
@@ -319,7 +323,6 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     }
 
     gsModelDepthRW[id.xy] = hit ? modelRange : 0.0;
-    gsModelResidualMmRW[id.xy] = 0.0;
     if (!hit)
     {
         if (hasObservedDepth)
@@ -334,6 +337,13 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     InterlockedMax(gsModelRaycastStats[30],
         (uint)min(round(modelRange * 1000.0), 65535.0));
     InterlockedMax(gsModelRaycastStats[31], crossingCount);
+    float3 modelWorld = eye + direction * modelRange;
+    float modelVoteWeight = SampleVoteWeight(modelWorld);
+    float3 modelNormal = 0.0;
+    bool modelNormalValid = SampleModelNormal(modelWorld, modelNormal);
+    gsModelVoteWeightRW[id.xy] = modelVoteWeight;
+    gsModelNormalRW[id.xy] = float4(modelNormal,
+                                    modelNormalValid ? 1.0 : 0.0);
     if (!hasObservedDepth)
     {
         InterlockedAdd(gsModelRaycastStats[10], 1u);
@@ -344,8 +354,6 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     float residualMm = (modelRange - observedRange) * 1000.0;
     float absResidualMmF = abs(residualMm);
     uint absResidualMm = (uint)min(round(absResidualMmF), 65535.0);
-    float3 modelWorld = eye + direction * modelRange;
-    float modelVoteWeight = SampleVoteWeight(eye + direction * modelRange);
     uint modelVoteWeightX10 = (uint)min(round(modelVoteWeight * 10.0), 1000.0);
     gsModelResidualMmRW[id.xy] = residualMm;
     InterlockedAdd(gsModelRaycastStats[13], absResidualMm);
@@ -358,9 +366,8 @@ void RaycastModel(uint3 id : SV_DispatchThreadID)
     // correction can explain the discrepancy while rejecting another room
     // layer or a metre-scale ghost.  This shader never writes TSDF; the CPU may
     // consume the read-back decision before fusing the retained exact frame.
-    float3 modelNormal;
     if (abs(modelRange - observedRange) <= 0.15 &&
-        SampleModelNormal(modelWorld, modelNormal))
+        modelNormalValid)
     {
         float planeResidual = dot(observedWorld - modelWorld, modelNormal);
         if (abs(planeResidual) <= 0.08)

@@ -76,6 +76,18 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         }
     }
 
+    private struct PreparedEyeInput
+    {
+        public RenderTexture worldPosition;
+        public RenderTexture worldNormal;
+        public RenderTexture observationMeta;
+        public Matrix4x4 worldToDepthClip;
+        public Vector3 eyeWorld;
+        public int providerFrame;
+        public double providerRealtimeSeconds;
+        public bool hasProviderFrameContract;
+    }
+
     [Header("Production candidate")]
     [SerializeField] private bool renderVisible = true;
     [SerializeField] private Color wireColor = new Color(1f, 0.62f, 0.02f, 0.96f);
@@ -126,6 +138,11 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     [SerializeField, Range(1, 30)] private int counterReadbackIntervalIntegrations = 2;
     [SerializeField, Range(5f, 250f)]
     private float maximumAcceptedStereoDispatchDeltaMilliseconds = 75f;
+    [Header("CHISEL route shadow")]
+    [Tooltip("Independent sparse chunked TSDF proof. It never writes the production TSDF or publication state.")]
+    [SerializeField] private bool enableChiselRouteShadow = true;
+    [Tooltip("When CHSL is the selected production view, reuse this component only for exact stereo preparation and do not also run the hidden dense QRS fusion/extraction route.")]
+    [SerializeField] private bool chiselOnlyExecution = true;
 
     public bool HasRenderableSurface { get; private set; }
     public int IntegrationCount { get; private set; }
@@ -161,6 +178,9 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     public int LastAcceptedSnapshotFrame { get; private set; } = -1;
     public EyeInputDiagnostics LeftEyeDiagnostics => _leftEyeDiagnostics;
     public EyeInputDiagnostics RightEyeDiagnostics => _rightEyeDiagnostics;
+    public ScanCoverChiselSparseTsdfShadow ChiselRouteShadow => _chiselRouteShadow;
+    public bool ChiselOnlyExecution =>
+        enableChiselRouteShadow && chiselOnlyExecution;
 
     private const int VertexStride = 32;
     private ComputeShader _tsdfCompute;
@@ -218,6 +238,7 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
     private MaterialPropertyBlock _propertyBlock;
     private ScanCoverDepthPreprocessor _acceptedLeftSource;
     private ScanCoverDepthPreprocessor _acceptedRightSource;
+    private ScanCoverChiselSparseTsdfShadow _chiselRouteShadow;
     private readonly EyeInputDiagnostics _leftEyeDiagnostics = new EyeInputDiagnostics();
     private readonly EyeInputDiagnostics _rightEyeDiagnostics = new EyeInputDiagnostics();
 
@@ -303,26 +324,40 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             ? acceptedSnapshot.frameIndex
             : frameOrdinal;
 
-        if (!EnsureResources())
-            return;
-        if (!_volumePlaced)
-            PlaceVolumeAroundViewer();
+        EnsureChiselRouteShadow();
+        bool useChiselOnly = ChiselOnlyExecution &&
+                             _chiselRouteShadow != null;
+        if (useChiselOnly)
+        {
+            // A previously selected dense route may already own sizeable 3D
+            // textures and buffers. They are not needed to prepare the exact
+            // stereo pair for CHSL, so release them instead of paying a hidden
+            // second fusion/extraction cost.
+            if (_resourcesReady)
+                ReleaseResources();
+        }
+        else
+        {
+            if (!EnsureResources())
+                return;
+            if (!_volumePlaced)
+                PlaceVolumeAroundViewer();
+        }
 
-        int integratedEyes = 0;
-        if (TryIntegrateBoundEye(
-                _acceptedLeftSource,
-                ScanCoverDepthPreprocessor.SourceEye.Left,
-                acceptedSnapshot,
-                _leftEyeDiagnostics))
-            integratedEyes++;
-        if (TryIntegrateBoundEye(
-                _acceptedRightSource,
-                ScanCoverDepthPreprocessor.SourceEye.Right,
-                acceptedSnapshot,
-                _rightEyeDiagnostics))
-            integratedEyes++;
+        bool leftPrepared = TryPrepareBoundEye(
+            _acceptedLeftSource,
+            ScanCoverDepthPreprocessor.SourceEye.Left,
+            acceptedSnapshot,
+            _leftEyeDiagnostics,
+            out PreparedEyeInput leftInput);
+        bool rightPrepared = TryPrepareBoundEye(
+            _acceptedRightSource,
+            ScanCoverDepthPreprocessor.SourceEye.Right,
+            acceptedSnapshot,
+            _rightEyeDiagnostics,
+            out PreparedEyeInput rightInput);
 
-        if (integratedEyes == 0)
+        if (!leftPrepared || !rightPrepared)
         {
             RejectedAcceptedFrameCount++;
             LastIssue =
@@ -331,13 +366,81 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             return;
         }
 
-        if (integratedEyes == 2)
+        float crossEyeDispatchDeltaMilliseconds = (float)Math.Abs(
+            (leftInput.providerRealtimeSeconds -
+             rightInput.providerRealtimeSeconds) * 1000d);
+        if (leftInput.providerFrame != rightInput.providerFrame ||
+            crossEyeDispatchDeltaMilliseconds >
+                maximumAcceptedStereoDispatchDeltaMilliseconds)
+        {
+            _leftEyeDiagnostics.issue = "stereo_generation_mismatch";
+            _rightEyeDiagnostics.issue = "stereo_generation_mismatch";
+            RejectedAcceptedFrameCount++;
+            LastIssue =
+                $"accepted_stereo_generation_mismatch:" +
+                $"leftFrame={leftInput.providerFrame};" +
+                $"rightFrame={rightInput.providerFrame};" +
+                $"deltaMs={crossEyeDispatchDeltaMilliseconds:F2}";
+            return;
+        }
+
+        bool wasWarmupPending = _warmupPending;
+
+        if (useChiselOnly)
+        {
             StereoPairIntegrationCount++;
-        else
-            PartialStereoIntegrationCount++;
+            IntegrationCount++;
+            _leftEyeDiagnostics.integrations++;
+            _rightEyeDiagnostics.integrations++;
+            _leftEyeDiagnostics.issue = "chisel_only";
+            _rightEyeDiagnostics.issue = "chisel_only";
+
+            // Retain the established startup-noise quarantine without creating
+            // or clearing the unused dense QRS volume.
+            if (_warmupPending)
+            {
+                _integrationsSinceClear++;
+                if (_integrationsSinceClear >= WarmupIntegrations)
+                {
+                    _integrationsSinceClear = 0;
+                    _warmupPending = false;
+                    IntegrationCount = 0;
+                }
+                LastIssue = "chisel_warmup";
+                return;
+            }
+
+            if (leftInput.hasProviderFrameContract &&
+                rightInput.hasProviderFrameContract)
+            {
+                _chiselRouteShadow.ObserveAcceptedStereoPair(
+                    frameOrdinal,
+                    leftInput.worldPosition,
+                    leftInput.observationMeta,
+                    leftInput.eyeWorld,
+                    leftInput.worldToDepthClip,
+                    rightInput.worldPosition,
+                    rightInput.observationMeta,
+                    rightInput.eyeWorld,
+                    rightInput.worldToDepthClip);
+                LastIssue = null;
+            }
+            else
+            {
+                RejectedAcceptedFrameCount++;
+                LastIssue = "chisel_provider_frame_contract_unavailable";
+            }
+            return;
+        }
+
+        // Atomic admission: neither eye is allowed to mutate the production TSDF
+        // until both eyes, their matrices and their matrix-derived eye positions
+        // have passed the same-generation contract above.
+        DispatchPreparedEye(leftInput, _leftEyeDiagnostics);
+        DispatchPreparedEye(rightInput, _rightEyeDiagnostics);
+        StereoPairIntegrationCount++;
 
         IntegrationCount++;
-
         // QRS warmup (VolumeIntegrator.cs:666-670): discard the first N
         // integrations — Quest depth sensor startup calibration noise.
         if (_warmupPending)
@@ -354,6 +457,25 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             }
         }
 
+        // The CHISEL shadow must see the same retained observation domain as
+        // production.  Warmup pairs are deliberately omitted because the dense
+        // TSDF clears them instead of retaining them.
+        if (!wasWarmupPending && _chiselRouteShadow != null &&
+            leftInput.hasProviderFrameContract &&
+            rightInput.hasProviderFrameContract)
+        {
+            _chiselRouteShadow.ObserveAcceptedStereoPair(
+                frameOrdinal,
+                leftInput.worldPosition,
+                leftInput.observationMeta,
+                leftInput.eyeWorld,
+                leftInput.worldToDepthClip,
+                rightInput.worldPosition,
+                rightInput.observationMeta,
+                rightInput.eyeWorld,
+                rightInput.worldToDepthClip);
+        }
+
         // QRS periodic prune (VolumeIntegrator.cs:673-679): every 3s reset
         // seeded-but-never-confirmed voxels so they cannot ghost.
         if (_pruneTsdfKernel >= 0 && Time.time >= _nextPruneTime)
@@ -363,26 +485,25 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         }
 
         ExtractSurface();
-        LastIssue = integratedEyes == 2
-            ? null
-            : $"accepted_stereo_partial:left={_leftEyeDiagnostics.issue};" +
-              $"right={_rightEyeDiagnostics.issue}";
+        LastIssue = null;
         if (debugLog && (IntegrationCount <= 2 || IntegrationCount % 12 == 0))
         {
             Debug.Log(
                 $"[ScanCoverQuestRoomSurfaceNets] integrate={IntegrationCount} acceptedFrame={LastAcceptedSnapshotFrame} " +
-                $"eyes={integratedEyes} left={_leftEyeDiagnostics.issue} right={_rightEyeDiagnostics.issue} " +
+                $"eyes=2 left={_leftEyeDiagnostics.issue} right={_rightEyeDiagnostics.issue} " +
                 $"verts={LastVertexCount} lineIndices={LastLineIndexCount} overflow={LastOverflowCount}",
                 this);
         }
     }
 
-    private bool TryIntegrateBoundEye(
+    private bool TryPrepareBoundEye(
         ScanCoverDepthPreprocessor source,
         ScanCoverDepthPreprocessor.SourceEye expectedEye,
         ScanCoverDepthGridPointCloud.RawDepthFrameSnapshot acceptedSnapshot,
-        EyeInputDiagnostics diagnostics)
+        EyeInputDiagnostics diagnostics,
+        out PreparedEyeInput prepared)
     {
+        prepared = default;
         int acceptedFrame = acceptedSnapshot != null
             ? acceptedSnapshot.frameIndex
             : _lastAcceptedFrameOrdinal;
@@ -434,40 +555,28 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             return false;
         }
 
+        bool hasFrameContract = source.TryGetLastDispatchFrameContract(
+            out int providerFrame,
+            out double providerRealtimeSeconds,
+            out Matrix4x4 worldToDepthClip,
+            out Vector3 eyeWorld);
+        diagnostics.reprojectionAvailable = hasFrameContract;
+        diagnostics.eyePoseAvailable = hasFrameContract;
+        diagnostics.dispatchFrame = providerFrame;
+        if (!hasFrameContract)
+        {
+            diagnostics.issue = "provider_frame_contract_unavailable";
+            return false;
+        }
+
         bool isAcceptedSnapshotEye = acceptedSnapshot != null &&
                                      acceptedSnapshot.sourceEyeIndex == (int)expectedEye;
-        bool hasReprojection = isAcceptedSnapshotEye && acceptedSnapshot.hasDepthReprojectionMatrix;
-        Matrix4x4 reprojection = hasReprojection
-            ? acceptedSnapshot.depthReprojectionMatrix
-            : source.LastDispatchDepthReprojectionMatrix;
-        if (!hasReprojection)
-            hasReprojection = source.HasLastDispatchDepthReprojectionMatrix;
-        diagnostics.reprojectionAvailable = hasReprojection;
-        if (!hasReprojection)
-        {
-            diagnostics.issue = "reprojection_unavailable";
-            return false;
-        }
-
-        bool hasEyePose = isAcceptedSnapshotEye && acceptedSnapshot.hasDispatchEyePosition;
-        Vector3 eyeWorld = hasEyePose
-            ? acceptedSnapshot.dispatchEyePosition
-            : source.LastDispatchEyePosition;
-        if (!hasEyePose)
-            hasEyePose = source.HasLastDispatchEyePosition;
-        diagnostics.eyePoseAvailable = hasEyePose;
-        if (!hasEyePose)
-        {
-            diagnostics.issue = "eye_pose_unavailable";
-            return false;
-        }
-
-        if (acceptedSnapshot != null &&
+        if (isAcceptedSnapshotEye &&
             acceptedSnapshot.dispatchRealtimeSeconds > 0d &&
-            source.LastSuccessfulRefreshRealtimeSeconds > 0d)
+            providerRealtimeSeconds > 0d)
         {
             diagnostics.dispatchDeltaMilliseconds = (float)Math.Abs(
-                (source.LastSuccessfulRefreshRealtimeSeconds -
+                (providerRealtimeSeconds -
                  acceptedSnapshot.dispatchRealtimeSeconds) * 1000d);
             if (diagnostics.dispatchDeltaMilliseconds >
                 maximumAcceptedStereoDispatchDeltaMilliseconds)
@@ -477,24 +586,71 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
             }
         }
 
+        prepared = new PreparedEyeInput
+        {
+            worldPosition = worldPosition,
+            worldNormal = worldNormal,
+            observationMeta = observationMeta,
+            worldToDepthClip = worldToDepthClip,
+            eyeWorld = eyeWorld,
+            providerFrame = providerFrame,
+            providerRealtimeSeconds = providerRealtimeSeconds,
+            hasProviderFrameContract = true
+        };
+        diagnostics.issue = "prepared";
+        return true;
+    }
+
+    private void DispatchPreparedEye(
+        PreparedEyeInput prepared,
+        EyeInputDiagnostics diagnostics)
+    {
         DispatchProjectiveIntegration(
-            worldPosition,
-            worldNormal,
-            observationMeta,
-            reprojection,
-            eyeWorld);
+            prepared.worldPosition,
+            prepared.worldNormal,
+            prepared.observationMeta,
+            prepared.worldToDepthClip,
+            prepared.eyeWorld);
         diagnostics.integrated = true;
         diagnostics.integrations++;
         diagnostics.issue = "integrated";
-        return true;
+    }
+
+    private void EnsureChiselRouteShadow()
+    {
+        if (!enableChiselRouteShadow)
+        {
+            if (_chiselRouteShadow != null && _chiselRouteShadow.enabled)
+            {
+                _chiselRouteShadow.ClearShadow();
+                _chiselRouteShadow.enabled = false;
+            }
+            return;
+        }
+
+        if (_chiselRouteShadow == null)
+            _chiselRouteShadow = GetComponent<ScanCoverChiselSparseTsdfShadow>();
+        if (_chiselRouteShadow == null)
+            _chiselRouteShadow = gameObject.AddComponent<ScanCoverChiselSparseTsdfShadow>();
+        _chiselRouteShadow.enabled = true;
     }
 
     public void ClearAll()
     {
-        if (!EnsureResources()) return;
-        BindTsdfVolumes();
-        DispatchVolume(_tsdfCompute, _clearTsdfKernel);
-        DispatchVolume(_surfaceCompute, _initTemporalKernel);
+        EnsureChiselRouteShadow();
+        bool useChiselOnly = ChiselOnlyExecution &&
+                             _chiselRouteShadow != null;
+        if (!useChiselOnly)
+        {
+            if (!EnsureResources()) return;
+            BindTsdfVolumes();
+            DispatchVolume(_tsdfCompute, _clearTsdfKernel);
+            DispatchVolume(_surfaceCompute, _initTemporalKernel);
+        }
+        else if (_resourcesReady)
+        {
+            ReleaseResources();
+        }
         HasRenderableSurface = false;
         IntegrationCount = 0;
         LastVertexCount = 0;
@@ -514,6 +670,7 @@ public sealed class ScanCoverQuestRoomSurfaceNetsPipeline : MonoBehaviour
         LastAcceptedSnapshotFrame = -1;
         _leftEyeDiagnostics.ResetAll();
         _rightEyeDiagnostics.ResetAll();
+        _chiselRouteShadow?.ClearShadow();
         if (_rejectStats != null)
         {
             _rejectStats.SetData(ZeroRejectStats);

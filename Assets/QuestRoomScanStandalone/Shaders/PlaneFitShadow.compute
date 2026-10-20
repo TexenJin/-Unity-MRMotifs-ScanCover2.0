@@ -16,11 +16,19 @@
 #pragma kernel OffsetAccum
 #pragma kernel FlattenSplat
 #pragma kernel PlaneCensus
+#pragma kernel RoomStructureProbe
 
 // 槽位约定按内核各自绑定独立缓冲（C# 侧 B1=_planeFitStats / B2=_planeFlatStats）：
 // B1：[0]点数 [1-3]Σp [4-9]Σpp [10]偏移和mm [11]偏移数 [12]|偏移|和mm
 // B2：[12]冻块索引追加计数 [13]压下体素总数 [14]其中冻块 [15]相干闸拦下
 RWStructuredBuffer<int> _PlaneFitStats;
+
+// Per-voxel valid depth-frame claim ledger from the production InfiniTAM path.
+// The probe reads it only to distinguish a newly observed TSDF patch from an
+// unchanged old patch.  It never writes this production buffer.
+StructuredBuffer<uint> _RoomProbeWriteEpochs;
+uint _RoomProbeCurrentWriteEpoch;
+uint _RoomProbeFreshEpochWindow;
 
 float4x4 _FitWorldToLocal;   // 体积 worldToLocal（meshExtractor.transform）
 float3 _FitBlockCenterVox;   // 块中心（体素单位，体积局部体素坐标系）
@@ -135,6 +143,20 @@ float _PlaneLowConfMaxFrac;
 float _PlaneMaxResidualMeters;
 float _PlaneFillBandMeters;
 int _PlaneMinSurfaceVoxels;
+
+// ── 房间骨架可行性探针（只读、与冻结块/发布/显示生产路径完全解耦）────────────
+// 每个 8³ 左右的小窗由一个线程独立拟合；输出只供 CPU 做跨窗、跨时间聚类。
+// 不写 TSDF，不改变 weight/confidence，也不依赖网格边界。
+RWStructuredBuffer<int> _RoomProbeRecords; // _RoomProbeBlockCount * 17 ints
+Texture3D<float> _RoomProbeConfidence;
+int _RoomProbeBlockCount;
+int3 _RoomProbeChunkCount;
+int _RoomProbeChunkSize;
+float _RoomProbeMinWeight;
+float _RoomProbeLowConfMin;
+float _RoomProbeLowConfMaxFrac;
+float _RoomProbeMaxResidualMeters;
+int _RoomProbeMinSurfaceVoxels;
 
 [numthreads(8,8,1)]
 void FlattenSplat(uint3 id : SV_DispatchThreadID)
@@ -410,4 +432,310 @@ void PlaneCensus(uint3 id : SV_DispatchThreadID)
     InterlockedAdd(_PlaneCensusStats[1], 1);
     InterlockedAdd(_PlaneCensusStats[4], fillCandidates);
     InterlockedAdd(_PlaneCensusStats[5], (int)round(residual * 1000.0));
+}
+
+// 记录槽：
+bool RoomProbeFitRegion(int3 regionMin, int3 regionMax, int minSamples,
+    out int surfaceCount, out int lowConfCount, out float residualMeters,
+    out float3 normalFit, out float3 centerVoxel, out int supportMask)
+{
+    surfaceCount = 0;
+    lowConfCount = 0;
+    residualMeters = 0.0;
+    normalFit = float3(0.0, 1.0, 0.0);
+    centerVoxel = ((float3)regionMin + (float3)regionMax) * 0.5;
+    supportMask = 0;
+    float3 halfSize = ((float3)(regionMax - regionMin)) * 0.5;
+    float3 sumPos = 0.0;
+    float3 sumSq = 0.0;
+    float3 sumCross = 0.0;
+    float sumT = 0.0;
+    float sumT2 = 0.0;
+    float3 sumTP = 0.0;
+
+    [loop]
+    for (int z = regionMin.z; z < regionMax.z; z++)
+    {
+        [loop]
+        for (int y = regionMin.y; y < regionMax.y; y++)
+        {
+            [loop]
+            for (int x = regionMin.x; x < regionMax.x; x++)
+            {
+                float2 sampleValue = _FitTsdfVolume[int3(x, y, z)];
+                if (abs(sampleValue.y) < _RoomProbeMinWeight || abs(sampleValue.x) > 0.6)
+                    continue;
+                float3 relative = float3(x, y, z) - (float3)regionMin - halfSize;
+                sumPos += relative;
+                sumSq += relative * relative;
+                sumCross += float3(relative.x * relative.y,
+                    relative.x * relative.z, relative.y * relative.z);
+                sumT += sampleValue.x;
+                sumT2 += sampleValue.x * sampleValue.x;
+                sumTP += sampleValue.x * relative;
+                surfaceCount++;
+                int3 midpoint = (regionMin + regionMax) / 2;
+                int octant = (x >= midpoint.x ? 1 : 0) |
+                    (y >= midpoint.y ? 2 : 0) |
+                    (z >= midpoint.z ? 4 : 0);
+                supportMask |= 1 << octant;
+                if (_RoomProbeConfidence[int3(x, y, z)] > _RoomProbeLowConfMin)
+                    lowConfCount++;
+            }
+        }
+    }
+    if (surfaceCount < minSamples) return false;
+
+    float invN = 1.0 / (float)surfaceCount;
+    float3 centerFit = sumPos * invN;
+    float meanT = sumT * invN;
+    float xx = sumSq.x * invN - centerFit.x * centerFit.x;
+    float yy = sumSq.y * invN - centerFit.y * centerFit.y;
+    float zz = sumSq.z * invN - centerFit.z * centerFit.z;
+    float xy = sumCross.x * invN - centerFit.x * centerFit.y;
+    float xz = sumCross.y * invN - centerFit.x * centerFit.z;
+    float yz = sumCross.z * invN - centerFit.y * centerFit.z;
+    float3 covPT = sumTP * invN - centerFit * meanT;
+    float varT = max(sumT2 * invN - meanT * meanT, 0.0);
+
+    float3 normal0;
+    float lambda0;
+    if (!PlaneCensusEigen(xx, xy, xz, yy, yz, zz, normal0, lambda0)) return false;
+    if (dot(normal0, covPT) < 0.0) normal0 = -normal0;
+    float correctionScale = gsVoxDist / _FitVoxelSize;
+    float varianceCorrection = correctionScale * correctionScale * varT;
+    float cxx = xx - 2.0 * correctionScale * covPT.x * normal0.x + varianceCorrection * normal0.x * normal0.x;
+    float cyy = yy - 2.0 * correctionScale * covPT.y * normal0.y + varianceCorrection * normal0.y * normal0.y;
+    float czz = zz - 2.0 * correctionScale * covPT.z * normal0.z + varianceCorrection * normal0.z * normal0.z;
+    float cxy = xy - correctionScale * (covPT.x * normal0.y + covPT.y * normal0.x) + varianceCorrection * normal0.x * normal0.y;
+    float cxz = xz - correctionScale * (covPT.x * normal0.z + covPT.z * normal0.x) + varianceCorrection * normal0.x * normal0.z;
+    float cyz = yz - correctionScale * (covPT.y * normal0.z + covPT.z * normal0.y) + varianceCorrection * normal0.y * normal0.z;
+    float lambdaFit;
+    if (!PlaneCensusEigen(cxx, cxy, cxz, cyy, cyz, czz, normalFit, lambdaFit))
+        return false;
+    if (dot(normalFit, normal0) < 0.0) normalFit = -normalFit;
+    residualMeters = sqrt(max(lambdaFit, 0.0)) * _FitVoxelSize;
+    float3 centerCorrected = centerFit - correctionScale * meanT * normal0;
+    centerVoxel = (float3)regionMin + halfSize + centerCorrected + 0.5;
+    return true;
+}
+
+bool RoomProbeFindFineFit(int3 blockMin, int3 blockMax,
+    out int bestSurface, out int bestLowConf, out float bestResidual,
+    out float3 bestNormal, out float3 bestCenter, out int3 bestMin,
+    out int3 bestMax, out int bestSupportMask)
+{
+    bestSurface = 0;
+    bestLowConf = 0;
+    bestResidual = 0.0;
+    bestNormal = float3(0.0, 1.0, 0.0);
+    bestCenter = ((float3)blockMin + (float3)blockMax) * 0.5;
+    bestMin = blockMin;
+    bestMax = blockMax;
+    bestSupportMask = 0;
+    bool found = false;
+    [unroll]
+    for (int subZ = 0; subZ < 2; subZ++)
+    {
+        [unroll]
+        for (int subY = 0; subY < 2; subY++)
+        {
+            [unroll]
+            for (int subX = 0; subX < 2; subX++)
+            {
+                int3 fineMin = blockMin + int3(subX, subY, subZ) * 4;
+                if (any(fineMin >= blockMax)) continue;
+                int3 fineMax = min(fineMin + 4, blockMax);
+                int fineSurface;
+                int fineLowConf;
+                float fineResidual;
+                float3 fineNormal;
+                float3 fineCenter;
+                int fineSupportMask;
+                if (!RoomProbeFitRegion(fineMin, fineMax, 8, fineSurface,
+                        fineLowConf, fineResidual, fineNormal, fineCenter,
+                        fineSupportMask)) continue;
+                if ((float)fineLowConf > _RoomProbeLowConfMaxFrac * (float)fineSurface ||
+                    fineResidual > _RoomProbeMaxResidualMeters) continue;
+                if (found && (fineSurface < bestSurface ||
+                    (fineSurface == bestSurface && fineResidual >= bestResidual))) continue;
+                found = true;
+                bestSurface = fineSurface;
+                bestLowConf = fineLowConf;
+                bestResidual = fineResidual;
+                bestNormal = fineNormal;
+                bestCenter = fineCenter;
+                bestMin = fineMin;
+                bestMax = fineMax;
+                bestSupportMask = fineSupportMask;
+            }
+        }
+    }
+    return found;
+}
+
+// [0]判决 1=合格 2=样本少 3=低置信 4=特征分解失败 5=残差大
+// [1]面样本 [2]低置信样本 [3]残差(0.1mm)
+// [4..6]法向(*100000) [7..9]修正后中心体素坐标(*1000)
+// [10]正侧自由空间 [11]负侧实侧 [12]有效比较数
+// [13]粗窗线性索引 [14]低8位=实际窗口边长，高位=细窗八分位
+// [15]实际近零交叉样本占据的窗口八分位掩码
+// [16]其中最近若干融合帧真正触及的面样本数（旧TSDF不得重复投票）
+[numthreads(1, 1, 1)]
+void RoomStructureProbe(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= (uint)_RoomProbeBlockCount) return;
+    int recordBase = (int)slot * 17;
+    [unroll]
+    for (int clearIndex = 0; clearIndex < 17; clearIndex++)
+        _RoomProbeRecords[recordBase + clearIndex] = 0;
+    _RoomProbeRecords[recordBase + 13] = (int)slot;
+
+    int3 chunkCoord;
+    chunkCoord.x = (int)slot % _RoomProbeChunkCount.x;
+    chunkCoord.y = ((int)slot / _RoomProbeChunkCount.x) % _RoomProbeChunkCount.y;
+    chunkCoord.z = (int)slot / (_RoomProbeChunkCount.x * _RoomProbeChunkCount.y);
+    int3 blockMin = chunkCoord * _RoomProbeChunkSize;
+    int3 blockMax = min(blockMin + _RoomProbeChunkSize,
+                        int3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ));
+
+    int surfaceCount;
+    int lowConfCount;
+    float residualMeters;
+    float3 normalFit;
+    float3 centerVoxel;
+    int supportMask;
+    bool coarseFit = RoomProbeFitRegion(blockMin, blockMax,
+        _RoomProbeMinSurfaceVoxels, surfaceCount, lowConfCount,
+        residualMeters, normalFit, centerVoxel, supportMask);
+    bool lowConfidenceRejected = coarseFit &&
+        (float)lowConfCount > _RoomProbeLowConfMaxFrac * (float)surfaceCount;
+    bool residualRejected = coarseFit && residualMeters > _RoomProbeMaxResidualMeters;
+    int verdict = coarseFit ? (lowConfidenceRejected ? 3 :
+        (residualRejected ? 5 : 1)) :
+        (surfaceCount < _RoomProbeMinSurfaceVoxels ? 2 : 4);
+    int selectedCellSize = _RoomProbeChunkSize;
+    int selectedWindowCode = 0;
+    int3 witnessMin = blockMin;
+    int3 witnessMax = blockMax;
+
+    // Only unresolved surface-bearing coarse windows pay for the 4^3 fallback.
+    // Empty space is never rescanned and a fine result must pass the original
+    // confidence/residual rules before it may become a temporal core.
+    if (verdict != 1 && surfaceCount >= 8)
+    {
+        int fineSurface;
+        int fineLowConf;
+        float fineResidual;
+        float3 fineNormal;
+        float3 fineCenter;
+        int3 fineMin;
+        int3 fineMax;
+        int fineSupportMask;
+        if (RoomProbeFindFineFit(blockMin, blockMax, fineSurface, fineLowConf,
+                fineResidual, fineNormal, fineCenter, fineMin, fineMax,
+                fineSupportMask))
+        {
+            surfaceCount = fineSurface;
+            lowConfCount = fineLowConf;
+            residualMeters = fineResidual;
+            normalFit = fineNormal;
+            centerVoxel = fineCenter;
+            witnessMin = fineMin;
+            witnessMax = fineMax;
+            selectedCellSize = 4;
+            selectedWindowCode =
+                (fineMin.x - blockMin.x >= 4 ? 1 : 0) |
+                (fineMin.y - blockMin.y >= 4 ? 2 : 0) |
+                (fineMin.z - blockMin.z >= 4 ? 4 : 0);
+            supportMask = fineSupportMask;
+            verdict = 1;
+        }
+    }
+
+    _RoomProbeRecords[recordBase + 1] = surfaceCount;
+    _RoomProbeRecords[recordBase + 2] = lowConfCount;
+    _RoomProbeRecords[recordBase + 3] = (int)round(residualMeters * 10000.0);
+    _RoomProbeRecords[recordBase + 14] =
+        selectedCellSize | (selectedWindowCode << 8);
+    _RoomProbeRecords[recordBase + 15] = supportMask;
+    if (!coarseFit && verdict != 1)
+    {
+        _RoomProbeRecords[recordBase] = verdict;
+        return;
+    }
+    _RoomProbeRecords[recordBase + 4] = (int)round(normalFit.x * 100000.0);
+    _RoomProbeRecords[recordBase + 5] = (int)round(normalFit.y * 100000.0);
+    _RoomProbeRecords[recordBase + 6] = (int)round(normalFit.z * 100000.0);
+    _RoomProbeRecords[recordBase + 7] = (int)round(centerVoxel.x * 1000.0);
+    _RoomProbeRecords[recordBase + 8] = (int)round(centerVoxel.y * 1000.0);
+    _RoomProbeRecords[recordBase + 9] = (int)round(centerVoxel.z * 1000.0);
+
+    float3 absNormal = abs(normalFit);
+    int3 axisStep = int3(0, 0, 0);
+    if (absNormal.x >= absNormal.y && absNormal.x >= absNormal.z)
+        axisStep.x = normalFit.x >= 0.0 ? 1 : -1;
+    else if (absNormal.y >= absNormal.z)
+        axisStep.y = normalFit.y >= 0.0 ? 1 : -1;
+    else
+        axisStep.z = normalFit.z >= 0.0 ? 1 : -1;
+    int freeWitness = 0;
+    int solidWitness = 0;
+    int sideComparisons = 0;
+    int freshSurfaceWitness = 0;
+    [loop]
+    for (int sideZ = witnessMin.z; sideZ < witnessMax.z; sideZ++)
+    {
+        [loop]
+        for (int sideY = witnessMin.y; sideY < witnessMax.y; sideY++)
+        {
+            [loop]
+            for (int sideX = witnessMin.x; sideX < witnessMax.x; sideX++)
+            {
+                int3 surfaceCoord = int3(sideX, sideY, sideZ);
+                float2 surfaceSample = _FitTsdfVolume[surfaceCoord];
+                if (abs(surfaceSample.y) < _RoomProbeMinWeight || abs(surfaceSample.x) > 0.6) continue;
+                uint flat = (uint)surfaceCoord.x + (uint)_FitVoxCountX *
+                    ((uint)surfaceCoord.y + (uint)_FitVoxCountY *
+                    (uint)surfaceCoord.z);
+                uint packedWrite = _RoomProbeWriteEpochs[flat];
+                uint observedEpoch = packedWrite >> 8;
+                uint epochAge = (_RoomProbeCurrentWriteEpoch - observedEpoch) &
+                    0x00ffffffu;
+                if (observedEpoch != 0u &&
+                    epochAge <= _RoomProbeFreshEpochWindow)
+                    freshSurfaceWitness++;
+                int3 frontCoord = surfaceCoord + axisStep * 2;
+                int3 backCoord = surfaceCoord - axisStep * 2;
+                bool frontInside = all(frontCoord >= 0) &&
+                    all(frontCoord < int3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ));
+                bool backInside = all(backCoord >= 0) &&
+                    all(backCoord < int3(_FitVoxCountX, _FitVoxCountY, _FitVoxCountZ));
+                if (frontInside)
+                {
+                    float2 frontSample = _FitTsdfVolume[frontCoord];
+                    if (abs(frontSample.y) >= _RoomProbeMinWeight)
+                    {
+                        sideComparisons++;
+                        if (frontSample.x > 0.05) freeWitness++;
+                    }
+                }
+                if (backInside)
+                {
+                    float2 backSample = _FitTsdfVolume[backCoord];
+                    if (abs(backSample.y) >= _RoomProbeMinWeight)
+                    {
+                        sideComparisons++;
+                        if (backSample.x < -0.05) solidWitness++;
+                    }
+                }
+            }
+        }
+    }
+    _RoomProbeRecords[recordBase + 10] = freeWitness;
+    _RoomProbeRecords[recordBase + 11] = solidWitness;
+    _RoomProbeRecords[recordBase + 12] = sideComparisons;
+    _RoomProbeRecords[recordBase + 16] = freshSurfaceWitness;
+    _RoomProbeRecords[recordBase] = verdict;
 }

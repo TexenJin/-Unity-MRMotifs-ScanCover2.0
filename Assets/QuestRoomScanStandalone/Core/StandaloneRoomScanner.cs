@@ -23,12 +23,16 @@ namespace Genesis.RoomScan
         [Header("扫描频率")]
         [SerializeField, Tooltip("TSDF 融合使用独立时钟。InfiniTAM 生产档固定 10Hz。")]
         private float integrationHz = 10f;
-        [SerializeField, Range(1f, 15f), Tooltip("完整体积网格提取频率。融合保持高频，网格沿用上次结果直到下一次提取。08-18 帧率手术后 8→12（HERA 节拍 16→24/s），帧率跌破 50 退回 8。")]
-        private float meshExtractionHz = 12f;
+        [SerializeField, Range(1f, 15f), Tooltip("完整体积网格提取频率。生产档固定 5Hz；网格沿用上次结果直到下一次提取。")]
+        private float meshExtractionHz = 5f;
 
         [Header("InfiniTAM 固定错峰")]
-        [SerializeField, Range(0.01f, 0.04f), Tooltip("网格提取/发布只在两次融合之间的固定窗口运行，不再读取 FPS 或超时强抢融合帧。")]
+        [SerializeField, Range(0.01f, 0.04f), Tooltip("网格提取/发布只在两次融合之间的固定窗口运行。10Hz 融合使用 20ms 边界。")]
         private float infiniTamPhaseMarginSeconds = 0.02f;
+
+        [Header("CHISEL 独立旁路")]
+        [SerializeField, Tooltip("只读同一已接受深度/位姿包，写入独立 5cm/15cm 稀疏 TSDF。关闭即可完整退出；生产 TSDF、提取与显示从不读取它。")]
+        private bool enableChiselSparseShadow = true;
 
         [Header("渲染")]
         [SerializeField, Tooltip("主显示形态：开=线框（QRS Wireframe，重心坐标边缘检测）；关=顶点色实体（QRS Vertex）")]
@@ -132,8 +136,15 @@ namespace Genesis.RoomScan
         [Header("平面拍平（B1 影子，只读验证）")]
         [SerializeField, Tooltip("B1 影子平面拟合：对视线落点块的当帧高质量观测做 PCA 平面拟合（只读不写 TSDF），" +
                  "HUD 拍行输出残差（拟合优度）/存量偏移（拍平幅度预估）/点数/主轴。验证'观测共识面干净+存量偏离'假设，成立才开 B2 写入。 (default true)")]
-        private bool enablePlaneFitShadow = true;
+        private bool enablePlaneFitShadow = false;
         [SerializeField] private ComputeShader planeFitShadowCompute;
+
+        [Header("稳定平面地标（只读验证层）")]
+        [SerializeField, Tooltip("读取稳定TSDF/权重/置信度，后台维护持久房间平面；仅在X的结构面验证档显示半透明色面。关闭后不创建回读、网格或材质，也不影响融合/提取/发布。")]
+        // Archived experimental route. False keeps it out of construction,
+        // ticking, HUD and the X-key display cycle while preserving one clean
+        // switch for a deliberate future reactivation.
+        private bool enableStablePlaneLandmarkPreview = false;
 
         [Header("平面拍平（B2 已退出生产）")]
         [SerializeField, Tooltip("B2 会绕过枪胶逐点准入，直接用预处理深度改写 TSDF；这会把近平行的错误深度压进几何，并抹平床/枕头等真实层次。" +
@@ -154,7 +165,7 @@ namespace Genesis.RoomScan
         [Header("M3/B3 平面先验普查（只读影子）")]
         [SerializeField, Tooltip("M3/B3 第一刀：对冻结块做平面资格普查（只读 TSDF/置信度，不写任何生产状态）。" +
                  "HUD 报 合格平面块数/面旁无数据候选面积/拒因分布——先量出值不值得，再决定接不接显示层补全皮。 (default true)")]
-        private bool enablePlanePriorCensus = true;
+        private bool enablePlanePriorCensus = false;
         [SerializeField, Range(0.5f, 10f), Tooltip("普查节拍（秒）。冻结块集合低频变化，2s 足够；一块一线程，开销可忽略")]
         private float planePriorCensusIntervalSec = 2f;
         [SerializeField, Range(0.03f, 0.2f), Tooltip("正式面 weight 门槛（与出网门槛同杆 0.08）：低于此不算面证据")]
@@ -334,6 +345,7 @@ namespace Genesis.RoomScan
         private DepthPointCloudOverlay _depthPointCloudOverlay;
         private GunGelCourtOverlay _gunGelCourtOverlay;
         private InstantDepthShellOverlay _instantDepthShellOverlay;
+        private StandaloneChiselSparseTsdfBridge _chiselSparseBridge;
         private bool _bbPresentationCaptured;
         private bool _bbRestoreMeshVisible;
         private bool _bbRestoreCoarseSkinVisible;
@@ -636,6 +648,7 @@ namespace Genesis.RoomScan
         private VolumeIntegrator _volumeIntegrator;
         private MeshExtractor _meshExtractor;
         private PassthroughCameraProvider _cameraProvider;
+        private RoomStructureFeasibilityProbe _stablePlaneLandmarkPreview;
 
         [Header("Persistent Primary Status Badge")]
         [SerializeField, Tooltip("开启后恢复冻结票、置信度、页面债、计时账等完整诊断 HUD；默认隐藏，后台统计不受影响。")]
@@ -643,10 +656,14 @@ namespace Genesis.RoomScan
         private UnityEngine.UI.Text _statusBadgeText;
         private UnityEngine.UI.Text _statusBadgeHeaderText;
         private UnityEngine.UI.Text _statusBadgeRightText;
-        private const float DiagnosticHudWidth = 1040f;
-        private const float DiagnosticHudHeaderHeight = 58f;
-        private const float DiagnosticHudPadding = 14f;
+        private const float DiagnosticHudWidth = 1280f;
+        private const float DiagnosticHudHeaderHeight = 72f;
+        private const float DiagnosticHudPadding = 18f;
         private int _meshLayerEvidenceMode;
+        private int StablePlaneEvidenceMode => enableStablePlaneLandmarkPreview ? 4 : -1;
+        private int ChiselPreviewEvidenceMode => enableStablePlaneLandmarkPreview ? 5 : 4;
+        private bool IsChiselPreviewMode =>
+            _meshLayerEvidenceMode == ChiselPreviewEvidenceMode;
         private bool _operatorFrozen;
         private GameObject _probeReticleRoot;
         private RectTransform _probeTargetMarkerRect;
@@ -662,8 +679,6 @@ namespace Genesis.RoomScan
 
         /// <summary>正在融合（未暂停）。</summary>
         public bool IsScanning { get; private set; }
-        /// <summary>A 键观察定格：采集会话仍在，但所有网格生产链停止变更。</summary>
-        public bool IsOperatorFrozen => _operatorFrozen;
         /// <summary>本次运行期间曾经开始过扫描（暂停后为 true，清空后归 false）。</summary>
         public bool HasStarted { get; private set; }
         public bool IsSaveAndClearInProgress { get; private set; }
@@ -704,30 +719,29 @@ namespace Genesis.RoomScan
             _volumeIntegrator = GetComponent<VolumeIntegrator>();
             _meshExtractor = GetComponent<MeshExtractor>();
             _cameraProvider = GetComponent<PassthroughCameraProvider>();
-            if (_volumeIntegrator != null &&
-                (_volumeIntegrator.QrsReferenceBaselineEnabled ||
-                 _volumeIntegrator.InfiniTamBaselineEnabled))
+            if (_volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled)
             {
-                // A reconstruction baseline owns one fusion path, one extractor
-                // and one renderer. A serialized A/B flag must not tear it down
-                // and replace it with HERA/freeze acquisition during startup.
+                // The architecture baseline owns one reconstruction and one
+                // renderer.  Do not let a serialized A/B flag tear it down and
+                // replace it with HERA/freeze acquisition during StartScanning.
                 enableFrozenChunkAbExperiment = false;
-                if (_volumeIntegrator.QrsReferenceBaselineEnabled)
-                {
-                    // Match QRS: full-volume integration and extraction may run
-                    // together at its serialized 30 Hz cadence.
-                    integrationHz = 30f;
-                    meshExtractionHz = 30f;
-                }
-                else
-                {
-                    integrationHz = 10f;
-                    meshExtractionHz = 5f;
-                }
+                // Production cadence: 10 Hz fusion with one small block step at
+                // a predictable 5 Hz logical extraction cadence. Scene values
+                // cannot silently override the production 10/5 profile.
+                integrationHz = 10f;
+                meshExtractionHz = 5f;
+            }
+            if (enableChiselSparseShadow)
+            {
+                _chiselSparseBridge = GetComponent<StandaloneChiselSparseTsdfBridge>();
+                if (_chiselSparseBridge == null)
+                    _chiselSparseBridge = gameObject.AddComponent<StandaloneChiselSparseTsdfBridge>();
             }
             SyncCaptureModeIdentity();
             DisableLegacyManagementBlockWireOverlay();
             _volumeIntegrator.Cleared += ResetFrozenBlockSupervisor;
+            if (_chiselSparseBridge != null)
+                _volumeIntegrator.Cleared += _chiselSparseBridge.ClearShadow;
             SetSafeShaderDefaults();
         }
 
@@ -778,6 +792,14 @@ namespace Genesis.RoomScan
             StartCoroutine(CreateStatusBadgeWhenCameraReady());
             if (showDebugHud)
                 StartCoroutine(CreateHudWhenCameraReady());
+            if (enableStablePlaneLandmarkPreview && _volumeIntegrator != null &&
+                planeFitShadowCompute != null)
+            {
+                _stablePlaneLandmarkPreview = new RoomStructureFeasibilityProbe(
+                    _volumeIntegrator, _volumeIntegrator.transform,
+                    planeFitShadowCompute);
+                _stablePlaneLandmarkPreview.SetOverlayVisible(false);
+            }
             Application.logMessageReceived += OnLogMessage;
             Logger.Info(enableFrozenChunkAbExperiment
                 ? (enableHeraHierarchicalReplay
@@ -813,7 +835,7 @@ namespace Genesis.RoomScan
             root.transform.localRotation = Quaternion.identity;
             // Large enough to read in Quest recording, but wholly inside the
             // lower-centre band rather than the exact geometry inspection point.
-            root.transform.localScale = Vector3.one * 0.00026f;
+            root.transform.localScale = Vector3.one * 0.00034f;
 
             var canvas = root.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.WorldSpace;
@@ -874,7 +896,7 @@ namespace Genesis.RoomScan
             textObject.transform.SetParent(root, false);
             var text = textObject.AddComponent<UnityEngine.UI.Text>();
             text.font = font;
-            text.fontSize = 30;
+            text.fontSize = 38;
             text.alignment = TextAnchor.UpperCenter;
             text.horizontalOverflow = HorizontalWrapMode.Wrap;
             text.verticalOverflow = VerticalWrapMode.Overflow;
@@ -1149,9 +1171,7 @@ namespace Genesis.RoomScan
                 viewState = _meshExtractor.RouteValidationLabel;
 
             string productionAdmission =
-                _volumeIntegrator != null && _volumeIntegrator.QrsReferenceBaselineEnabled
-                ? "QRS原始TSDF直融"
-                : _volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled
+                _volumeIntegrator != null && _volumeIntegrator.InfiniTamBaselineEnabled
                 ? "InfiniTAM V1.3直融"
                 : _volumeIntegrator != null && _volumeIntegrator.GunGelIdentityOnlyMode
                 ? "原深度TSDF→块裁决"
@@ -1288,11 +1308,14 @@ namespace Genesis.RoomScan
                               _operatorFrozen ? "冻结" :
                               IsScanning ? "采集" :
                               HasStarted ? "暂停" : "待机";
-            string viewState = _meshLayerEvidenceMode switch
+            string viewState = IsChiselPreviewMode
+                ? "CHSL旁路网格"
+                : _meshLayerEvidenceMode switch
             {
                 1 => "成因关系",
                 2 => "TSDF来源格",
                 3 => "TSDF推手箭头",
+                4 => "结构面验证",
                 _ => "原始网格"
             };
             Color color = IsSaveAndClearInProgress
@@ -1311,26 +1334,59 @@ namespace Genesis.RoomScan
             string saveLine = IsSaveAndClearInProgress
                 ? "B事务:停止采样 → 排空 → 导账 → 哈希 → 清卷"
                 : "扳机采集  A冻结/继续  X切换剖面  B封存并清卷";
-
+            string streamLine = BuildProductionStreamHud();
             _statusBadgeHeaderText.gameObject.SetActive(true);
             _statusBadgeHeaderText.color = color;
-            _statusBadgeHeaderText.fontSize = 32;
+            _statusBadgeHeaderText.fontSize = 42;
             _statusBadgeHeaderText.fontStyle = FontStyle.Bold;
             _statusBadgeHeaderText.alignment = TextAnchor.MiddleLeft;
-            _statusBadgeHeaderText.text = _meshLayerEvidenceMode switch
+            _statusBadgeHeaderText.text = IsChiselPreviewMode
+                ? $"{runState}｜{viewState}｜{_hudStatus}\n" +
+                  $"{streamLine}\n" +
+                  $"{(_chiselSparseBridge?.PreviewStatus ?? "CHSL网格:未就绪")}\n" +
+                  $"青色=独立5cm/15cm稀疏TSDF网格｜白色生产网格已隐藏\n" +
+                  $"{sealLine}\n{saveLine}"
+                : _meshLayerEvidenceMode switch
             {
-                1 => $"{runState}｜{viewState}｜{_hudStatus}\n黄交点 → 青SN均值｜白=同批网格\n{sealLine}\n{saveLine}",
-                2 => $"{runState}｜{viewState}｜{_hudStatus}\n粉/绿TSDF端点 → 黄交点｜蓝格=10cm单元\n{sealLine}\n{saveLine}",
-                3 => $"{runState}｜{viewState}｜{_hudStatus}\n洋红A/青B → 黄交点｜同色圈=主责端\n{sealLine}\n{saveLine}",
-                _ => $"{runState}｜{viewState}｜{_hudStatus}\n{sealLine}\n{saveLine}"
+                1 => $"{runState}｜{viewState}｜{_hudStatus}\n{streamLine}\n黄交点 → 青SN均值｜白=同批网格\n{sealLine}\n{saveLine}",
+                2 => $"{runState}｜{viewState}｜{_hudStatus}\n{streamLine}\n粉/绿TSDF端点 → 黄交点｜蓝格=10cm单元\n{sealLine}\n{saveLine}",
+                3 => $"{runState}｜{viewState}｜{_hudStatus}\n{streamLine}\n洋红A/青B → 黄交点｜同色圈=主责端\n{sealLine}\n{saveLine}",
+                4 => $"{runState}｜{viewState}｜{_hudStatus}\n" +
+                     $"{streamLine}\n" +
+                     $"{(_stablePlaneLandmarkPreview?.StatusCompact ?? "结构面:未就绪")}\n" +
+                     $"半透明色面=持久成熟平面｜空白=证据不足\n{sealLine}\n{saveLine}",
+                _ => $"{runState}｜{viewState}｜{_hudStatus}\n{streamLine}\n{sealLine}\n{saveLine}"
             };
             _statusBadgeText.gameObject.SetActive(false);
             _statusBadgeRightText.gameObject.SetActive(false);
 
             if (_statusBadgeHeaderText.transform.parent is RectTransform root)
+            {
+                float modeMinimum = (_meshLayerEvidenceMode == 4 ||
+                                     IsChiselPreviewMode) ? 540f :
+                    _meshLayerEvidenceMode > 0 ? 510f : 460f;
                 root.sizeDelta = new Vector2(DiagnosticHudWidth,
-                    _meshLayerEvidenceMode > 0 ? 310f : 235f);
+                    Mathf.Max(modeMinimum,
+                        _statusBadgeHeaderText.preferredHeight + DiagnosticHudPadding * 2f));
+            }
             return true;
+        }
+
+        private string BuildProductionStreamHud()
+        {
+            int sourcePairs = _depthCapture != null
+                ? Mathf.Max(0, _depthCapture.CurrentPlatformFrame)
+                : 0;
+            bool chiselReady = _chiselSparseBridge != null &&
+                               _chiselSparseBridge.RouteReady;
+            bool chiselStreaming = chiselReady &&
+                                   _chiselSparseBridge.AcceptedPairCount > 0;
+            string streamState = chiselStreaming ? "ON" : chiselReady ? "WAIT" : "OFF";
+            string chisel = _chiselSparseBridge != null
+                ? _chiselSparseBridge.CompactStatus
+                : "CHSL disabled";
+
+            return $"PAIR {sourcePairs}  STREAM {streamState}\n{chisel}";
         }
 
         private string BuildPrimaryHudPrompt(string viewState, string seedState)
@@ -2042,12 +2098,11 @@ namespace Genesis.RoomScan
                 $"累计账:{(_meshExtractor != null ? _meshExtractor.GetLedgerSessionStatsCompact() : "无")}\n" +
                 $"局部替换:{(_meshExtractor != null ? _meshExtractor.GetLocalReplacementStatsCompact() : "无")}\n" +
                 $"框内三栏:{(_meshExtractor != null ? _meshExtractor.GetDiagnosticRoiStatsCompact() : "无")}\n" +
-                $"{(LocalFineTsdfExperiment.Instance != null ? LocalFineTsdfExperiment.Instance.StatusCompact : "5cm框:未创建")}\n" +
                 $"提取:生产  严格:{(_meshExtractor != null ? _meshExtractor.GetStrictObservedStatsCompact() : "无")}\n" +
                 $"最近按键:{_hudLastInput}\n" +
                 BuildInputDiagLine() +
                 $"显示:{(wireframeMode ? "线框" : "实体")}  扳机=开始/继续  A=暂停  B=保存并清空\n" +
-                $"盯住目标=5cm框自动贴面 右摇杆按=锁定/取消  X=证据层" +
+                $"摇杆按=线框 左摇杆左=裁冻锁定  Y=生产A/候选B" +
                 (_hudLastError.Length > 0 ? $"\n<color=#FF6060>错误:{_hudLastError}</color>" : "");
         }
 
@@ -2076,11 +2131,17 @@ namespace Genesis.RoomScan
         {
             Application.logMessageReceived -= OnLogMessage;
             if (_volumeIntegrator != null)
+            {
                 _volumeIntegrator.Cleared -= ResetFrozenBlockSupervisor;
+                if (_chiselSparseBridge != null)
+                    _volumeIntegrator.Cleared -= _chiselSparseBridge.ClearShadow;
+            }
             if (_diagnosticRoiFrame != null)
                 Destroy(_diagnosticRoiFrame);
             if (_probeReticleRoot != null)
                 Destroy(_probeReticleRoot);
+            _stablePlaneLandmarkPreview?.Dispose();
+            _stablePlaneLandmarkPreview = null;
             _planeFitStats?.Release();
             _planeFitStats = null;
             _planeFlatStats?.Release();
@@ -2111,6 +2172,7 @@ namespace Genesis.RoomScan
             _gunGelCourtOverlay?.SetVisible(false);
             _instantDepthShellOverlay?.SetAcquiring(false);
             _instantDepthShellOverlay?.SetVisible(false);
+            _stablePlaneLandmarkPreview?.SetOverlayVisible(false);
             if (IsScanning) PauseScanning();
         }
 
@@ -2126,6 +2188,12 @@ namespace Genesis.RoomScan
             _meshExtractor?.SetPaperObservationTransparency(probeSessionActive);
             // The legacy Reject quarantine stays dormant; keep the hash path disabled.
             Shader.SetGlobalFloat(PaperCorrectionHideActiveID, 0f);
+
+            // Structure tracking is a read-only consumer. It advances only
+            // when the volume reports a new accepted integration; selecting
+            // display mode 4 merely reveals its independent overlay.
+            _stablePlaneLandmarkPreview?.Tick(Time.time,
+                _meshLayerEvidenceMode == StablePlaneEvidenceMode);
 
             // 主 HUD 由自己的稳定时钟刷新，不再依赖网格提取、页面提交或冻结回放
             // 恰好发生。这样 Reject 的倒计时/方位/换位资格最多约 0.25s 延迟。
@@ -2185,34 +2253,6 @@ namespace Genesis.RoomScan
             if (_operatorFrozen) return;
 
             float t = Time.time;
-            if (_volumeIntegrator != null &&
-                _volumeIntegrator.QrsReferenceBaselineEnabled)
-            {
-                // The QRS reference lane is deliberately self-contained. Do
-                // not run freeze supervision, page requeues, plane management,
-                // confidence census or any later ScanCover maintenance beside it.
-                if (t - _lastIntegrationTime >= IntegrationInterval)
-                {
-                    _lastIntegrationTime = t;
-                    ProvideColorFrame();
-                    _depthCapture?.PreprocessLatestFrame();
-                    bool dispatched = _volumeIntegrator.Integrate();
-                    if (dispatched)
-                    {
-                        Integrated?.Invoke();
-                        _integrateCount++;
-                    }
-
-                    if (t - _lastMeshTime >= MeshInterval)
-                    {
-                        _lastMeshTime = t;
-                        _meshExtractor.Extract();
-                        MeshExtracted?.Invoke();
-                    }
-                }
-                return;
-            }
-
             TickFrozenBlockSupervisor(t);
             bool directTruthRoute = _meshExtractor != null &&
                                     _meshExtractor.RouteValidationPausesHera;
@@ -2276,6 +2316,7 @@ namespace Genesis.RoomScan
                     _emaIntegrateMs = _emaIntegrateMs < 0f ? iMs : Mathf.Lerp(_emaIntegrateMs, iMs, 0.25f);
                     if (dispatched)
                     {
+                        _chiselSparseBridge?.ObserveAcceptedFrame(_depthCapture);
                         Integrated?.Invoke();
                         _integrateCount++;
                     }
@@ -2334,9 +2375,16 @@ namespace Genesis.RoomScan
 
                 ProvideColorFrame();
                 _depthCapture?.PreprocessLatestFrame();
+                var integrateStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 bool dispatched = _volumeIntegrator.Integrate();
+                integrateStopwatch.Stop();
+                float integrateMs = (float)integrateStopwatch.Elapsed.TotalMilliseconds;
+                _emaIntegrateMs = _emaIntegrateMs < 0f
+                    ? integrateMs
+                    : Mathf.Lerp(_emaIntegrateMs, integrateMs, 0.25f);
                 if (dispatched)
                 {
+                    _chiselSparseBridge?.ObserveAcceptedFrame(_depthCapture);
                     Integrated?.Invoke();
                     _integrateCount++;
                 }
@@ -2799,6 +2847,7 @@ namespace Genesis.RoomScan
             _censusHudRejFew = 0;
             _planeProbePending = false;
             _probeHud = "";
+            _stablePlaneLandmarkPreview?.Reset();
             _planeResidualMm = 0f;
             _planeOffsetMm = 0f;
             _planePointCount = 0;
@@ -3961,9 +4010,7 @@ namespace Genesis.RoomScan
                 bool resuming = HasStarted;
                 _operatorFrozen = false;
                 _meshExtractor?.SetLayerObservationFrozen(false);
-                if (!resuming &&
-                    !(_volumeIntegrator != null &&
-                      _volumeIntegrator.QrsReferenceBaselineEnabled))
+                if (!resuming)
                 {
                     _instantDepthShellOverlay?.ResetProductionWitnessLedger();
                     if (!(_volumeIntegrator != null &&
@@ -3977,16 +4024,13 @@ namespace Genesis.RoomScan
                     _meshExtractor.BeginLedgerSession();
                 }
 
-                // 阶段 3：相机 + 深度（此时启动安全）
+                // 阶段 3：相机 + 深度。蓝框采集不参与启动条件。
                 _cameraProvider?.StartCapture();
                 _depthCapture.StartDepthCapture();
 
-                // 新空卷必须从第一帧开始建独立回放契约；若等扫到一半才手动开，
-                // 离线端缺少初始 TSDF/候选状态，形式上有文件却不能从零复现。
-                if (!resuming &&
-                    !(_volumeIntegrator != null &&
-                      _volumeIntegrator.QrsReferenceBaselineEnabled) &&
-                    !_depthCapture.PairedFrameCaptureActive)
+                // 新空卷仍从第一帧建立普通独立回放包，但它不再创建、
+                // 等待或封存任何蓝框专项证据。
+                if (!resuming && !_depthCapture.PairedFrameCaptureActive)
                 {
                     bool replayStarted = _depthCapture.TogglePairedFrameCapture();
                     Logger.Info(replayStarted
@@ -4099,27 +4143,43 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// X-key four-state display switch. All evidence modes use only data
-        /// captured by the exact ClassifyAndEmit call that produced each
-        /// published block; legacy point-cloud/shell/court display gears are
-        /// forcibly hidden and no longer reachable from the controller.
+        /// X-key five-state display switch. Modes 1-3 use data captured by the
+        /// exact ClassifyAndEmit call that produced each published block;
+        /// mode 4 is the separately owned read-only stable-TSDF landmark view.
+        /// Legacy point-cloud/shell/court gears stay unreachable.
         /// </summary>
         public void ToggleMeshLayerEvidenceView()
         {
-            _meshLayerEvidenceMode = (_meshLayerEvidenceMode + 1) % 4;
+            int evidenceModeCount = ChiselPreviewEvidenceMode + 1;
+            _meshLayerEvidenceMode =
+                (_meshLayerEvidenceMode + 1) % evidenceModeCount;
+            bool stablePlaneMode =
+                _meshLayerEvidenceMode == StablePlaneEvidenceMode;
+            bool chiselPreviewMode = IsChiselPreviewMode;
             _shellPaperOnlyView = false;
             _coverageOverlay?.SetMarkersVisible(false);
             _depthPointCloudOverlay?.SetVisible(false);
             _gunGelCourtOverlay?.SetVisible(false);
             _instantDepthShellOverlay?.SetVisible(false);
             _managementBlockWireOverlay?.SetVisible(false);
-            _meshExtractor?.SetProductionMeshVisible(_meshLayerEvidenceMode < 2);
-            _meshExtractor?.SetLayerEvidenceMode(_meshLayerEvidenceMode);
-            NotifyInput(_meshLayerEvidenceMode switch
+            _meshExtractor?.SetProductionMeshVisible(
+                !chiselPreviewMode &&
+                (_meshLayerEvidenceMode < 2 || stablePlaneMode));
+            _meshExtractor?.SetLayerEvidenceMode(
+                (stablePlaneMode || chiselPreviewMode) ? 0 :
+                _meshLayerEvidenceMode);
+            _stablePlaneLandmarkPreview?.SetOverlayVisible(
+                stablePlaneMode);
+            _chiselSparseBridge?.SetPreviewVisible(chiselPreviewMode);
+            ApplyDisplayMode();
+            NotifyInput(chiselPreviewMode
+                ? "CHSL旁路网格：青色=独立5cm/15cm网格；白色生产网格隐藏"
+                : _meshLayerEvidenceMode switch
             {
                 1 => "成因关系：白网格 / 黄零交叉 → 青SN均值",
                 2 => "TSDF来源格：正负端点 → 黄零交叉 / 10cm单元（无白网格）",
-                3 => "TSDF权责：箭头端点→零交叉；黄=单方向，洋红=跨方向混合",
+                3 => "TSDF权责：洋红A / 青B → 黄零交叉；同色圈标主责端",
+                4 => "结构面验证：半透明色面=持久成熟平面 / 空白=证据不足",
                 _ => "原始网格"
             });
             RefreshStatusBadge();
@@ -4286,8 +4346,7 @@ namespace Genesis.RoomScan
             // Stop the replay recorder before touching either ledger or volume.
             // Keep the exact package reference: Latest may change on a later run,
             // but this B transaction must await the package that owns these writes.
-            ScanReplaySessionPackage replayPackage =
-                _depthCapture != null
+            ScanReplaySessionPackage replayPackage = _depthCapture != null
                     ? _depthCapture.StopReplayCaptureForSeal()
                     : ScanReplaySessionPackage.Active ?? ScanReplaySessionPackage.Latest;
             _hudStatus = "B封存：导出累计账";
@@ -4338,6 +4397,14 @@ namespace Genesis.RoomScan
                     _hudStatus = "封包失败，未清卷";
                     Logger.Error("B键封包失败：" + replayPackage.FinalizeIssue +
                                  "；TSDF/网格仍保留，可导出后重试");
+                    IsSaveAndClearInProgress = false;
+                    RefreshStatusBadge();
+                    yield break;
+                }
+                if (!replayPackage.RequiredCaptureComplete)
+                {
+                    _hudStatus = "封包采集不完整，未清卷";
+                    Logger.Error("封包必要证据未齐；已保留 TSDF 和显示网格，可重试导出。");
                     IsSaveAndClearInProgress = false;
                     RefreshStatusBadge();
                     yield break;
