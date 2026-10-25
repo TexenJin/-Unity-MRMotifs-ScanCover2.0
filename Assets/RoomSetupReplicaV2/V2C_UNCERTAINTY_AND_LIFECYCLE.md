@@ -109,3 +109,21 @@ whereas the current replica applies the same retention predicate to an entire
 16 x 16 x 16 storage Chunk. Leaf-granular frustum GC must therefore be tested
 as a separate V2-C change. Its native trigger frequency remains unresolved and
 must not be invented silently.
+
+### Implementation prepared
+
+The next build now partitions each storage Chunk into 4 x 4 x 4 source leaves,
+tests each leaf against the union of the two current depth-eye frusta, and
+applies the recovered predicate independently:
+
+```text
+retain leaf iff any voxel has
+    weight > 0 and sdf < 0.3 m * clamp(viewDepth, 1, 2)
+```
+
+Released leaves clear their 64-voxel storage and dirty the corresponding mesh
+neighbourhood. An empty parent Chunk is then returned to the existing pool.
+The cadence remains once per accepted pair solely to preserve the V2-B
+variable; the receipt calls this `Preserved_NotNativeConfirmed`. Candidate and
+released leaves, cleared voxels, released parent Chunks, and pass count are all
+recorded for the next same-tape A/B.

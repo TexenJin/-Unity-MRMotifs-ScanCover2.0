@@ -27,6 +27,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float ResampleRatio = VoxelMeters / DerivedVoxelMeters;
     private const int MeshStride = 2;
     private const int MeshCells = ChunkSize / MeshStride;
+    private const int GarbageLeafSize = 4;
+    private const float GarbageBaseThresholdMeters = 0.30f;
     private const float MinimumDepthMeters = 0.30f;
     private const float MaximumDepthMeters = 6.00f;
     private const float PositiveTruncationScale = 0.20f;
@@ -267,8 +269,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         new List<Vector3Int>(256);
     private readonly List<Vector3Int> _rightCandidates =
         new List<Vector3Int>(256);
-    private readonly HashSet<Vector3Int> _garbageSet =
-        new HashSet<Vector3Int>();
     private readonly List<Vector3Int> _garbageCandidates =
         new List<Vector3Int>(256);
     private readonly HashSet<Vector3Int> _touchedChunks =
@@ -352,6 +352,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private bool _asyncMeshingPending;
     private int _skippedAsyncBusyCount;
     private int _meshPublicationCount;
+    private int _garbagePassCount;
+    private int _garbageCandidateLeafCount;
+    private int _garbageReleasedLeafCount;
+    private int _garbageClearedVoxelCount;
+    private int _garbageReleasedChunkCount;
     private int _passDerivedValidSamples;
     private int _passDerivedMissingSamples;
 
@@ -670,7 +675,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _candidateSet.Clear();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
-        _garbageSet.Clear();
         _garbageCandidates.Clear();
         _touchedChunks.Clear();
         _touchedMasks.Clear();
@@ -684,6 +688,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _asyncMeshingPending = false;
         _skippedAsyncBusyCount = 0;
         _meshPublicationCount = 0;
+        _garbagePassCount = 0;
+        _garbageCandidateLeafCount = 0;
+        _garbageReleasedLeafCount = 0;
+        _garbageClearedVoxelCount = 0;
+        _garbageReleasedChunkCount = 0;
         AcceptedPairCount = 0;
         DroppedBusyPairCount = 0;
         ReadbackFailureCount = 0;
@@ -841,7 +850,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _candidateSet.Clear();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
-        _garbageSet.Clear();
         _garbageCandidates.Clear();
         _touchedChunks.Clear();
         _touchedMasks.Clear();
@@ -1079,7 +1087,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _candidateSet.Clear();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
-        _garbageSet.Clear();
         _garbageCandidates.Clear();
         _touchedChunks.Clear();
         _touchedMasks.Clear();
@@ -1359,52 +1366,157 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void BeginGarbagePass()
     {
-        _garbageSet.Clear();
         _garbageCandidates.Clear();
-        for (int i = 0; i < _leftCandidates.Count; i++)
-            if (_garbageSet.Add(_leftCandidates[i]))
-                _garbageCandidates.Add(_leftCandidates[i]);
-        for (int i = 0; i < _rightCandidates.Count; i++)
-            if (_garbageSet.Add(_rightCandidates[i]))
-                _garbageCandidates.Add(_rightCandidates[i]);
+        // Native postSdfFusion enumerates allocated sparse leaves intersecting
+        // the current camera frustum. Our storage Chunk contains 4x4x4 such
+        // 4^3 leaves, so first take a conservative stereo-frustum snapshot of
+        // allocated Chunks and classify their leaves below.
+        foreach (Vector3Int chunkId in _chunks.Keys)
+        {
+            Vector3Int origin = chunkId * ChunkSize;
+            if (GridBoxIntersectsFrustum(
+                    origin, ChunkSize, _leftWorldToClip) ||
+                GridBoxIntersectsFrustum(
+                    origin, ChunkSize, _rightWorldToClip))
+                _garbageCandidates.Add(chunkId);
+        }
+        _garbagePassCount++;
         _garbageCursor = 0;
     }
 
     private void CollectGarbageChunk(Vector3Int chunkId)
     {
-        if (!_chunks.TryGetValue(chunkId, out Chunk chunk) ||
-            HasRetainedVoxel(chunkId, chunk, _leftWorldToClip))
+        if (!_chunks.TryGetValue(chunkId, out Chunk chunk))
             return;
-        for (int i = 0; i < chunk.voxels.Length; i++)
-            if (chunk.voxels[i].weight > 0f)
-                WeightedVoxelCount--;
+        Vector3Int origin = chunkId * ChunkSize;
+        byte dirtyMask = 0;
+        int remainingWeighted = 0;
+        for (int leafZ = 0; leafZ < ChunkSize;
+             leafZ += GarbageLeafSize)
+        for (int leafY = 0; leafY < ChunkSize;
+             leafY += GarbageLeafSize)
+        for (int leafX = 0; leafX < ChunkSize;
+             leafX += GarbageLeafSize)
+        {
+            Vector3Int leafOrigin = origin +
+                new Vector3Int(leafX, leafY, leafZ);
+            bool inLeft = GridBoxIntersectsFrustum(
+                leafOrigin, GarbageLeafSize, _leftWorldToClip);
+            bool inRight = GridBoxIntersectsFrustum(
+                leafOrigin, GarbageLeafSize, _rightWorldToClip);
+            int weighted = 0;
+            bool retained = false;
+            float threshold = GarbageRetentionThreshold(
+                leafOrigin, inLeft, inRight);
+            for (int z = leafZ; z < leafZ + GarbageLeafSize; z++)
+            for (int y = leafY; y < leafY + GarbageLeafSize; y++)
+            for (int x = leafX; x < leafX + GarbageLeafSize; x++)
+            {
+                int local = x + ChunkSize * (y + ChunkSize * z);
+                Voxel voxel = chunk.voxels[local];
+                if (voxel.weight <= 0f)
+                    continue;
+                weighted++;
+                if ((inLeft || inRight) &&
+                    float.IsFinite(voxel.distance) &&
+                    voxel.distance < threshold)
+                    retained = true;
+            }
+            if (weighted <= 0)
+                continue;
+            if (!inLeft && !inRight)
+            {
+                remainingWeighted += weighted;
+                continue;
+            }
+            _garbageCandidateLeafCount++;
+            if (retained)
+            {
+                remainingWeighted += weighted;
+                continue;
+            }
+            for (int z = leafZ; z < leafZ + GarbageLeafSize; z++)
+            for (int y = leafY; y < leafY + GarbageLeafSize; y++)
+            for (int x = leafX; x < leafX + GarbageLeafSize; x++)
+            {
+                int local = x + ChunkSize * (y + ChunkSize * z);
+                if (chunk.voxels[local].weight <= 0f)
+                    continue;
+                chunk.voxels[local] = default;
+                AddDirtyVoxel(ref dirtyMask, local);
+            }
+            WeightedVoxelCount -= weighted;
+            _garbageReleasedLeafCount++;
+            _garbageClearedVoxelCount += weighted;
+        }
         WeightedVoxelCount = Mathf.Max(0, WeightedVoxelCount);
-        RecordTouched(chunkId, 7);
-        _chunks.Remove(chunkId);
-        DisposeChunkPreview(chunk);
-        RecycleChunk(chunk);
+        if (remainingWeighted <= 0)
+        {
+            RecordTouched(chunkId, 7);
+            _chunks.Remove(chunkId);
+            DisposeChunkPreview(chunk);
+            RecycleChunk(chunk);
+            _garbageReleasedChunkCount++;
+            return;
+        }
+        if ((dirtyMask & 8) != 0)
+            RecordTouched(chunkId, dirtyMask);
     }
 
-    private bool HasRetainedVoxel(
-        Vector3Int chunkId, Chunk chunk, Matrix4x4 worldToClip)
+    private float GarbageRetentionThreshold(
+        Vector3Int leafOrigin, bool inLeft, bool inRight)
     {
-        Vector3Int origin = chunkId * ChunkSize;
-        PrepareProjectionTerms(origin, worldToClip);
-        for (int z = 0; z < ChunkSize; z++)
-        for (int y = 0; y < ChunkSize; y++)
-        for (int x = 0; x < ChunkSize; x++)
+        Vector3 world = (Vector3)leafOrigin * VoxelMeters;
+        float viewDepth = 0f;
+        if (inLeft)
+            viewDepth = Mathf.Max(viewDepth, ProjectiveDepth(
+                _leftWorldToClip, world.x, world.y, world.z));
+        if (inRight)
+            viewDepth = Mathf.Max(viewDepth, ProjectiveDepth(
+                _rightWorldToClip, world.x, world.y, world.z));
+        return GarbageBaseThresholdMeters *
+               Mathf.Clamp(viewDepth, 1f, 2f);
+    }
+
+    private static bool GridBoxIntersectsFrustum(
+        Vector3Int gridOrigin, int gridSize, Matrix4x4 worldToClip)
+    {
+        bool outsideLeft = true;
+        bool outsideRight = true;
+        bool outsideBottom = true;
+        bool outsideTop = true;
+        bool outsideNear = true;
+        bool outsideFar = true;
+        bool anyFiniteCorner = false;
+        for (int z = 0; z <= 1; z++)
+        for (int y = 0; y <= 1; y++)
+        for (int x = 0; x <= 1; x++)
         {
-            Voxel voxel = chunk.voxels[
-                x + ChunkSize * (y + ChunkSize * z)];
-            if (voxel.weight <= 0f)
+            float worldX = (gridOrigin.x + x * gridSize) * VoxelMeters;
+            float worldY = (gridOrigin.y + y * gridSize) * VoxelMeters;
+            float worldZ = (gridOrigin.z + z * gridSize) * VoxelMeters;
+            float clipX = worldToClip.m00 * worldX +
+                          worldToClip.m01 * worldY +
+                          worldToClip.m02 * worldZ + worldToClip.m03;
+            float clipY = worldToClip.m10 * worldX +
+                          worldToClip.m11 * worldY +
+                          worldToClip.m12 * worldZ + worldToClip.m13;
+            float depth = ProjectiveDepth(
+                worldToClip, worldX, worldY, worldZ);
+            if (!float.IsFinite(clipX) || !float.IsFinite(clipY) ||
+                !float.IsFinite(depth))
                 continue;
-            float viewDepth = ((_depthX[x] + _depthY[y]) +
-                               _depthZ[z]) + worldToClip.m33;
-            if (float.IsFinite(viewDepth) && viewDepth > 0f &&
-                voxel.distance < 0.3f * Mathf.Clamp(viewDepth, 1f, 2f))
-                return true;
+            anyFiniteCorner = true;
+            outsideLeft &= clipX < -depth;
+            outsideRight &= clipX > depth;
+            outsideBottom &= clipY < -depth;
+            outsideTop &= clipY > depth;
+            outsideNear &= depth < MinimumDepthMeters;
+            outsideFar &= depth > MaximumDepthMeters;
         }
-        return false;
+        return anyFiniteCorner &&
+               !(outsideLeft || outsideRight || outsideBottom ||
+                 outsideTop || outsideNear || outsideFar);
     }
 
     private void PrepareProjectionTerms(
@@ -1447,7 +1559,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _processingReplayFrame = false;
         _leftCandidates.Clear();
         _rightCandidates.Clear();
-        _garbageSet.Clear();
         _garbageCandidates.Clear();
         _workStage = WorkStage.None;
     }
@@ -1533,6 +1644,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int skippedAsyncBusy;
         public int meshPublications;
         public string publicationOrder;
+        public string garbageCollectionMode;
+        public string garbageCollectionCadence;
+        public int garbageLeafEdgeVoxels;
+        public int garbageLeafVoxelCount;
+        public float garbageBaseThresholdMeters;
+        public int garbagePasses;
+        public int garbageCandidateLeaves;
+        public int garbageReleasedLeaves;
+        public int garbageClearedVoxels;
+        public int garbageReleasedChunks;
         public string finalMeshPath;
         public string finalMeshSha256;
         public int finalMeshVertices;
@@ -1582,7 +1703,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2CWhiteboxLifecycleRegular10cmMesh",
+                    "V2CWhiteboxLifecycleLeafGcRegular10cmMesh",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1708,6 +1829,19 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 meshPublications = _meshPublicationCount,
                 publicationOrder =
                     "BuildBack_ReplaceFront_ThenReleaseOldFront",
+                garbageCollectionMode = "StereoFrustumLeaf4x4x4",
+                garbageCollectionCadence =
+                    "EveryAcceptedPair_Preserved_NotNativeConfirmed",
+                garbageLeafEdgeVoxels = GarbageLeafSize,
+                garbageLeafVoxelCount = GarbageLeafSize *
+                    GarbageLeafSize * GarbageLeafSize,
+                garbageBaseThresholdMeters =
+                    GarbageBaseThresholdMeters,
+                garbagePasses = _garbagePassCount,
+                garbageCandidateLeaves = _garbageCandidateLeafCount,
+                garbageReleasedLeaves = _garbageReleasedLeafCount,
+                garbageClearedVoxels = _garbageClearedVoxelCount,
+                garbageReleasedChunks = _garbageReleasedChunkCount,
                 finalMeshPath = meshMetrics.path,
                 finalMeshSha256 = meshMetrics.sha256,
                 finalMeshVertices = meshMetrics.vertices,

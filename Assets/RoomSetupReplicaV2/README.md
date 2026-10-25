@@ -86,6 +86,15 @@ view-dependent garbage collection, 10 cm Marching Cubes, adaptive
 single-flight mesh cadence, and front/back publication. The unresolved native
 uncertainty channel is not guessed or substituted.
 
+V2-C garbage collection uses the recovered sparse-leaf granularity: each
+16-cubed storage Chunk is partitioned into 4x4x4 leaves containing 64 source
+voxels. Only leaves intersecting either current depth-eye frustum are tested;
+a leaf survives when any weighted voxel has
+`sdf < 0.3 m * clamp(viewDepth, 1, 2)`. Otherwise that leaf is cleared and its
+mesh neighbourhood is rebuilt. The native GC trigger frequency is still
+unresolved, so this experiment deliberately preserves the earlier
+once-per-accepted-pair cadence and labels that boundary in the receipt.
+
 Artifacts on Quest are written below
 `Application.persistentDataPath/RoomSetupReplicaV2/`:
 
@@ -97,6 +106,7 @@ Artifacts on Quest are written below
 
 The replay receipt also reports the known-but-unavailable uncertainty rule,
 adaptive interval constants, single-flight busy skips, mesh publication count,
+leaf-GC mode/cadence and release counts,
 first-mesh latency, local dirty-to-publication delay, replay throughput,
 pre/post `<32` cleanup counts and time, XRT
 pre/target/post counts, accepted collapses, rejection counts, stop reason and
