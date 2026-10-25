@@ -109,6 +109,10 @@ This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace
 Quest device A/B validation.
 
+The accepted Quest 3 receipt for the current geometry baseline is frozen in
+`V2B_REGULAR_10CM_BASELINE.md`. V2-C uncertainty and lifecycle changes must use
+that receipt as their before-state.
+
 Tape format 2 uses Quest Stage coordinates. Format-1 tapes stored a previous
 Unity session's world coordinates and are rejected because their cross-session
 translation and yaw cannot be reconstructed reliably; record once again after
