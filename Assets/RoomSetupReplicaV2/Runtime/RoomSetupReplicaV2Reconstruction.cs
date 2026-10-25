@@ -205,6 +205,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly List<int> _meshLines = new List<int>(8192);
     private readonly HashSet<ulong> _uniqueLines = new HashSet<ulong>();
 
+    // A projective matrix is separable on the regular 16^3 voxel lattice.
+    // Cache the three axis terms once per chunk so each voxel retains the
+    // original left-to-right float additions without repeating nine scalar
+    // multiplications. These arrays are single-flight scratch, like meshing.
+    private readonly float[] _clipXX = new float[ChunkSize];
+    private readonly float[] _clipXY = new float[ChunkSize];
+    private readonly float[] _clipXZ = new float[ChunkSize];
+    private readonly float[] _clipYX = new float[ChunkSize];
+    private readonly float[] _clipYY = new float[ChunkSize];
+    private readonly float[] _clipYZ = new float[ChunkSize];
+    private readonly float[] _depthX = new float[ChunkSize];
+    private readonly float[] _depthY = new float[ChunkSize];
+    private readonly float[] _depthZ = new float[ChunkSize];
+
     private static readonly Vector3Int[] CubeOffsets =
     {
         new Vector3Int(0, 0, 0), new Vector3Int(1, 0, 0),
@@ -982,6 +996,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         }
 
         Vector3Int origin = chunkId * ChunkSize;
+        PrepareProjectionTerms(origin, worldToClip);
         bool wrote = false;
         byte dirtyMask = 0;
         for (int z = 0; z < ChunkSize; z++)
@@ -989,17 +1004,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         for (int x = 0; x < ChunkSize; x++)
         {
             int local = x + ChunkSize * (y + ChunkSize * z);
-            float worldX = (origin.x + x + 0.5f) * VoxelMeters;
-            float worldY = (origin.y + y + 0.5f) * VoxelMeters;
-            float worldZ = (origin.z + z + 0.5f) * VoxelMeters;
-            float clipX = worldToClip.m00 * worldX +
-                          worldToClip.m01 * worldY +
-                          worldToClip.m02 * worldZ + worldToClip.m03;
-            float clipY = worldToClip.m10 * worldX +
-                          worldToClip.m11 * worldY +
-                          worldToClip.m12 * worldZ + worldToClip.m13;
-            float voxelDepth = ProjectiveDepth(
-                worldToClip, worldX, worldY, worldZ);
+            float clipX = ((_clipXX[x] + _clipXY[y]) +
+                           _clipXZ[z]) + worldToClip.m03;
+            float clipY = ((_clipYX[x] + _clipYY[y]) +
+                           _clipYZ[z]) + worldToClip.m13;
+            float voxelDepth = ((_depthX[x] + _depthY[y]) +
+                                _depthZ[z]) + worldToClip.m33;
             if (!float.IsFinite(voxelDepth) || voxelDepth <= 0.000001f)
                 continue;
             float u = clipX / voxelDepth * 0.5f + 0.5f;
@@ -1092,10 +1102,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         RecycleChunk(chunk);
     }
 
-    private static bool HasRetainedVoxel(
+    private bool HasRetainedVoxel(
         Vector3Int chunkId, Chunk chunk, Matrix4x4 worldToClip)
     {
         Vector3Int origin = chunkId * ChunkSize;
+        PrepareProjectionTerms(origin, worldToClip);
         for (int z = 0; z < ChunkSize; z++)
         for (int y = 0; y < ChunkSize; y++)
         for (int x = 0; x < ChunkSize; x++)
@@ -1104,16 +1115,39 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 x + ChunkSize * (y + ChunkSize * z)];
             if (voxel.weight <= 0f)
                 continue;
-            float worldX = (origin.x + x + 0.5f) * VoxelMeters;
-            float worldY = (origin.y + y + 0.5f) * VoxelMeters;
-            float worldZ = (origin.z + z + 0.5f) * VoxelMeters;
-            float viewDepth = ProjectiveDepth(
-                worldToClip, worldX, worldY, worldZ);
+            float viewDepth = ((_depthX[x] + _depthY[y]) +
+                               _depthZ[z]) + worldToClip.m33;
             if (float.IsFinite(viewDepth) && viewDepth > 0f &&
                 voxel.distance < 0.3f * Mathf.Clamp(viewDepth, 1f, 2f))
                 return true;
         }
         return false;
+    }
+
+    private void PrepareProjectionTerms(
+        Vector3Int origin, Matrix4x4 worldToClip)
+    {
+        for (int x = 0; x < ChunkSize; x++)
+        {
+            float world = (origin.x + x + 0.5f) * VoxelMeters;
+            _clipXX[x] = worldToClip.m00 * world;
+            _clipYX[x] = worldToClip.m10 * world;
+            _depthX[x] = worldToClip.m30 * world;
+        }
+        for (int y = 0; y < ChunkSize; y++)
+        {
+            float world = (origin.y + y + 0.5f) * VoxelMeters;
+            _clipXY[y] = worldToClip.m01 * world;
+            _clipYY[y] = worldToClip.m11 * world;
+            _depthY[y] = worldToClip.m31 * world;
+        }
+        for (int z = 0; z < ChunkSize; z++)
+        {
+            float world = (origin.z + z + 0.5f) * VoxelMeters;
+            _clipXZ[z] = worldToClip.m02 * world;
+            _clipYZ[z] = worldToClip.m12 * world;
+            _depthZ[z] = worldToClip.m32 * world;
+        }
     }
 
     private void FinalizePair()

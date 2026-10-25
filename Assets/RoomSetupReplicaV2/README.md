@@ -40,6 +40,12 @@ longer imposes an artificial multi-frame minimum on a stereo pair; the time
 budget still bounds work on each Unity frame. Fusion, truncation, voxel values,
 derived-field rules and topology are unchanged by this scheduling correction.
 
+The next fusion optimization factors each chunk's regular 16x16x16 projective
+coordinates into reusable X/Y/Z matrix terms. Per-voxel float addition order,
+pixel selection, integration order and all reconstruction rules remain the
+same; only repeated scalar multiplications are removed. The identical Stage
+tape is the acceptance input for geometry and replay-time comparison.
+
 Everything else stays on the recovered active chain: 5 cm sparse projective
 SDF, central-gradient rejection at 0.1 m, asymmetric depth-scaled truncation,
 inverse-square weights capped at 1000, half-precision voxel storage,
