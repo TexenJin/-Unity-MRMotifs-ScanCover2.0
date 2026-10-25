@@ -1,0 +1,42 @@
+#pragma kernel UnprojectDepth
+
+Texture2DArray<float> _DepthTex;
+RWTexture2D<float4> _WorldPosition;
+
+int2 _ImageSize;
+int _Eye;
+float4x4 _ProjectionInverse;
+float4x4 _ViewInverse;
+float _MinimumDepthMeters;
+float _MaximumDepthMeters;
+
+[numthreads(8, 8, 1)]
+void UnprojectDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_ImageSize.x || id.y >= (uint)_ImageSize.y)
+        return;
+
+    int2 pixel = int2(id.xy);
+    float depthNdc = _DepthTex.Load(int4(pixel, _Eye, 0));
+    bool valid = depthNdc > 0.0 && depthNdc < 1.0;
+    if (!valid)
+    {
+        _WorldPosition[pixel] = 0.0;
+        return;
+    }
+
+    float2 uv = (float2(pixel) + 0.5) / float2(_ImageSize);
+    float4 clip = float4(uv * 2.0 - 1.0, depthNdc * 2.0 - 1.0, 1.0);
+    float4 viewH = mul(_ProjectionInverse, clip);
+    float4 worldH = mul(_ViewInverse, viewH);
+    valid = abs(viewH.w) > 0.00001 && abs(worldH.w) > 0.00001;
+    float3 world = valid ? worldH.xyz / worldH.w : 0.0;
+    float3 camera = mul(_ViewInverse, float4(0, 0, 0, 1)).xyz;
+    float range = distance(world, camera);
+    valid = valid && all(world == world) && all(abs(world) < 100000.0) &&
+            range >= _MinimumDepthMeters && range <= _MaximumDepthMeters;
+    // Preserve the exact NDC depth in alpha. V2 records this channel as
+    // 32-bit floats so a replay can rebuild the same world sample from the
+    // captured projection/view matrices without reading Meta's live texture.
+    _WorldPosition[pixel] = valid ? float4(world, depthNdc) : 0.0;
+}
