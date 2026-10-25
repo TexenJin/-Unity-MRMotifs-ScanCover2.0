@@ -1553,7 +1553,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxDirectSampleRemoveSmall32XrtPointPlaneEmptyFallback",
+                    "V2BWhiteboxDirectSampleRemoveSmall32XrtBoundaryCollapse",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,

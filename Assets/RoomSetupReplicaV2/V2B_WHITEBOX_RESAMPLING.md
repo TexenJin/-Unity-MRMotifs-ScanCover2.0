@@ -90,6 +90,7 @@ candidates per batch          16 unique directed triangle corners
 accepted cost                 cost < 0.075 m
 optional regularizer factors  float bits 0x00000080 and 0x00000020
 normal compatibility          oldNormal dot newNormal >= 0.1
+open-fan terminal cost        keep-point distance to boundary-edge line
 failed-batch stop             200 total failed batches
 ```
 
@@ -119,6 +120,13 @@ multiplied by the base error, both optional terms underflow to near zero.
 Consequently the active physical metric is overwhelmingly accumulated
 point-to-plane displacement; `0.1 / 0.5` belongs to a different constant pair
 and must not be substituted.
+
+The same kernel also adds a non-optional terminal term when the removed
+vertex's half-edge fan is open. For each open side it measures the
+perpendicular distance from the surviving endpoint to the line of the
+corresponding boundary edge. Omitting this term leaves coplanar open surfaces
+at zero cost and was device-proven to over-collapse the 27,393-face replay to
+3,000 faces, far beyond the native captures' typical 3.7--5.8x reduction.
 
 ## Static evidence
 

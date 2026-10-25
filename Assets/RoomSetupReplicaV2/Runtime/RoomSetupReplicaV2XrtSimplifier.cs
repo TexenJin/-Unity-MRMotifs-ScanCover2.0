@@ -418,6 +418,50 @@ internal static class RoomSetupReplicaV2XrtSimplifier
             }
         }
 
+        // Native 0x797180 adds a terminal distance for every open fan side:
+        // the surviving endpoint must remain close to the infinite line of
+        // each boundary edge incident to the removed vertex. This term is
+        // essential on open room surfaces; without it, coplanar boundary
+        // vertices have zero point-to-plane cost and collapse into very long
+        // triangles even though the surface plane itself is unchanged.
+        foreach (int faceIndex in incident[remove])
+        {
+            Face face = faces[faceIndex];
+            if (!face.active)
+                continue;
+            for (int corner = 0; corner < 3; corner++)
+            {
+                int neighbour = face.Vertex(corner);
+                if (neighbour == remove)
+                    continue;
+                int edgeFaces = 0;
+                foreach (int adjacentIndex in incident[remove])
+                {
+                    Face adjacent = faces[adjacentIndex];
+                    if (adjacent.active && adjacent.Contains(neighbour) &&
+                        ++edgeFaces > 1)
+                        break;
+                }
+                if (edgeFaces != 1)
+                    continue;
+                Vector3 boundary = vertices[neighbour] - vertices[remove];
+                float boundaryLength = boundary.magnitude;
+                if (!(boundaryLength > 0.0000001f))
+                {
+                    rejection = Rejection.Normal;
+                    return float.MaxValue;
+                }
+                Vector3 toKeep = vertices[keep] - vertices[remove];
+                cost += Vector3.Cross(toKeep, boundary).magnitude /
+                        boundaryLength;
+                if (!(cost < MaximumErrorMeters))
+                {
+                    rejection = Rejection.Error;
+                    return cost;
+                }
+            }
+        }
+
         rejection = cost < MaximumErrorMeters
             ? Rejection.None
             : Rejection.Error;
