@@ -106,9 +106,9 @@ improvement.
 
 The recovered GC operates on sparse leaves containing 64 voxels (4 x 4 x 4),
 whereas the current replica applies the same retention predicate to an entire
-16 x 16 x 16 storage Chunk. Leaf-granular frustum GC must therefore be tested
-as a separate V2-C change. Its native trigger frequency remains unresolved and
-must not be invented silently.
+16 x 16 x 16 storage Chunk. Leaf-granular frustum GC therefore had to be tested
+as a separate V2-C change. At this point in the investigation its native
+trigger frequency was unresolved and could not be invented silently.
 
 ### Implementation prepared
 
@@ -123,10 +123,10 @@ retain leaf iff any voxel has
 
 Released leaves clear their 64-voxel storage and dirty the corresponding mesh
 neighbourhood. An empty parent Chunk is then returned to the existing pool.
-The cadence remains once per accepted pair solely to preserve the V2-B
-variable; the receipt calls this `Preserved_NotNativeConfirmed`. Candidate and
-released leaves, cleared voxels, released parent Chunks, and pass count are all
-recorded for the next same-tape A/B.
+The first test retained a once-per-accepted-pair cadence solely to preserve the
+V2-B variable; its receipt called this `Preserved_NotNativeConfirmed`.
+Candidate and released leaves, cleared voxels, released parent Chunks, and pass
+count were recorded for the same-tape A/B.
 
 ### Leaf-GC Quest 3 replay on 2026-10-26
 
@@ -160,7 +160,38 @@ regression, accompanied by repeated clear/reintegrate churn and a 2.83 percent
 replay-time cost.
 
 Keep the recovered 4 x 4 x 4 leaf rule as the V2-C candidate mechanism. Do not
-freeze the current cadence. The next isolated task is to recover or bound the
-native GC trigger frequency, then replay the same tape and require that the
-field reduction remains without this 45-triangle split or increased component
-count.
+freeze the once-per-pair cadence.
+
+### Native frequency gate recovered
+
+A whole-binary scalar-reference scan linked the `postSdfFusion` member at
+`this+0x18c` to the construction path and its registered configuration object:
+
+```text
+_INIT_413 at 0x58a5f0
+    DAT_012423e0 -> DAT_012425c0
+    config current/default double = -0.15
+
+constructor path at 0x6cc740
+    this+0x18c = float(*(DAT_012423e0 + 0x10))
+
+postSdfFusion at 0x788f80
+    run iff frequency > 0 and
+        lastTimestamp + 1e9/frequency < currentTimestamp
+    advance lastTimestamp when the pass starts
+```
+
+The native binary therefore defaults this optional lifecycle pass to disabled;
+a positive runtime configuration override would enable the recovered frequency
+gate. The replica now uses `-0.15 Hz` as the documented native default and does
+not run GC for a non-positive or non-finite value. If later device evidence
+recovers a positive runtime override, setting the serialized frequency applies
+the same strict `last + 1/frequency < current` gate to capture timestamps. The
+receipt records the configured frequency, the native default, whether GC was
+enabled, and the source of the rule.
+
+The next same-tape replay should consequently return to the accepted 11
+post-cleanup components and original V2-C geometry while reporting zero GC
+passes. That replay validates the gate/default integration; it does not erase
+the separately proven leaf-GC mechanism or claim that no server-side override
+can exist.

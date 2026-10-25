@@ -29,6 +29,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const int MeshCells = ChunkSize / MeshStride;
     private const int GarbageLeafSize = 4;
     private const float GarbageBaseThresholdMeters = 0.30f;
+    // libmrengine _INIT_413 initializes the postSdfFusion frequency config to
+    // -0.15. postSdfFusion runs only when this value is positive, using a
+    // strict lastTimestamp + 1/frequency < currentTimestamp gate.
+    private const float NativeGarbageFrequencyDefaultHz = -0.15f;
     private const float MinimumDepthMeters = 0.30f;
     private const float MaximumDepthMeters = 6.00f;
     private const float PositiveTruncationScale = 0.20f;
@@ -203,6 +207,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [SerializeField, Range(1, 16)]
     private int meshChunksPerFrame = 8;
 
+    [Header("White-box lifecycle")]
+    [SerializeField, Tooltip(
+        "Recovered postSdfFusion frequency in Hz. The current native " +
+        "binary defaults to -0.15, which disables GC. Set a positive value " +
+        "only when a native runtime override has been evidenced.")]
+    private float garbageCollectionFrequencyHz =
+        NativeGarbageFrequencyDefaultHz;
+
     [Header("Deterministic input tape")]
     [SerializeField, Range(10, 600)]
     private int maximumRecordedPairs = 180;
@@ -357,6 +369,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private int _garbageReleasedLeafCount;
     private int _garbageClearedVoxelCount;
     private int _garbageReleasedChunkCount;
+    private double _lastGarbageCaptureTime;
     private int _passDerivedValidSamples;
     private int _passDerivedMissingSamples;
 
@@ -693,6 +706,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _garbageReleasedLeafCount = 0;
         _garbageClearedVoxelCount = 0;
         _garbageReleasedChunkCount = 0;
+        _lastGarbageCaptureTime = 0d;
         AcceptedPairCount = 0;
         DroppedBusyPairCount = 0;
         ReadbackFailureCount = 0;
@@ -960,8 +974,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     }
                     else
                     {
-                        BeginGarbagePass();
-                        BeginStage(WorkStage.GarbageCollect);
+                        if (IsGarbagePassDue())
+                        {
+                            BeginGarbagePass();
+                            BeginStage(WorkStage.GarbageCollect);
+                        }
+                        else
+                        {
+                            BeginStage(WorkStage.Finalize);
+                        }
                     }
                     break;
                 case WorkStage.GarbageCollect:
@@ -1384,6 +1405,23 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _garbageCursor = 0;
     }
 
+    private bool IsGarbagePassDue()
+    {
+        float frequency = garbageCollectionFrequencyHz;
+        if (!float.IsFinite(frequency) || frequency <= 0f)
+            return false;
+        double captureTime = _pendingCaptureTime;
+        if (!double.IsFinite(captureTime))
+            return false;
+        double interval = 1d / frequency;
+        if (!(_lastGarbageCaptureTime + interval < captureTime))
+            return false;
+        // The recovered native path advances this timestamp when the due
+        // postSdfFusion pass starts, not after leaf enumeration finishes.
+        _lastGarbageCaptureTime = captureTime;
+        return true;
+    }
+
     private void CollectGarbageChunk(Vector3Int chunkId)
     {
         if (!_chunks.TryGetValue(chunkId, out Chunk chunk))
@@ -1646,6 +1684,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string publicationOrder;
         public string garbageCollectionMode;
         public string garbageCollectionCadence;
+        public bool garbageCollectionEnabled;
+        public float garbageCollectionConfiguredFrequencyHz;
+        public float garbageCollectionNativeDefaultFrequencyHz;
+        public string garbageCollectionFrequencySource;
         public int garbageLeafEdgeVoxels;
         public int garbageLeafVoxelCount;
         public float garbageBaseThresholdMeters;
@@ -1703,7 +1745,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2CWhiteboxLifecycleLeafGcRegular10cmMesh",
+                    "V2CWhiteboxLifecycleFrequencyGatedLeafGcRegular10cmMesh",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1831,7 +1873,18 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     "BuildBack_ReplaceFront_ThenReleaseOldFront",
                 garbageCollectionMode = "StereoFrustumLeaf4x4x4",
                 garbageCollectionCadence =
-                    "EveryAcceptedPair_Preserved_NotNativeConfirmed",
+                    garbageCollectionFrequencyHz > 0f
+                        ? "NativeTimestampGate_OneOverFrequencySeconds"
+                        : "DisabledByRecoveredNativeDefaultNonPositiveFrequency",
+                garbageCollectionEnabled =
+                    float.IsFinite(garbageCollectionFrequencyHz) &&
+                    garbageCollectionFrequencyHz > 0f,
+                garbageCollectionConfiguredFrequencyHz =
+                    garbageCollectionFrequencyHz,
+                garbageCollectionNativeDefaultFrequencyHz =
+                    NativeGarbageFrequencyDefaultHz,
+                garbageCollectionFrequencySource =
+                    "libmrengine_INIT_413_ConfigDefault_And_postSdfFusionGate",
                 garbageLeafEdgeVoxels = GarbageLeafSize,
                 garbageLeafVoxelCount = GarbageLeafSize *
                     GarbageLeafSize * GarbageLeafSize,

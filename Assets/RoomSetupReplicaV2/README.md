@@ -91,9 +91,11 @@ V2-C garbage collection uses the recovered sparse-leaf granularity: each
 voxels. Only leaves intersecting either current depth-eye frustum are tested;
 a leaf survives when any weighted voxel has
 `sdf < 0.3 m * clamp(viewDepth, 1, 2)`. Otherwise that leaf is cleared and its
-mesh neighbourhood is rebuilt. The native GC trigger frequency is still
-unresolved, so this experiment deliberately preserves the earlier
-once-per-accepted-pair cadence and labels that boundary in the receipt.
+mesh neighbourhood is rebuilt. The recovered native frequency configuration
+defaults to `-0.15`; `postSdfFusion` runs only for a positive value and then
+uses the strict capture-time gate `last + 1/frequency < current`. The replica
+therefore leaves leaf GC disabled by default while retaining the exact
+frequency-gated mechanism for a later evidenced positive runtime override.
 
 Artifacts on Quest are written below
 `Application.persistentDataPath/RoomSetupReplicaV2/`:
