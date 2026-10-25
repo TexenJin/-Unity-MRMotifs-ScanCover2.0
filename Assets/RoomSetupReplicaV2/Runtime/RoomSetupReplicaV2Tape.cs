@@ -8,7 +8,8 @@ using UnityEngine;
 /// <summary>
 /// Deterministic V2 input tape. It stores the exact 32-bit NDC depth values
 /// read from the callback-owned stereo packet together with that packet's
-/// projection/view matrices. Replay performs a deterministic CPU unprojection
+/// projection/view matrices expressed in Quest Stage space. Replay performs a
+/// deterministic CPU unprojection
 /// from those inputs; it does not claim bit identity with the live GPU's
 /// world-position arithmetic. File I/O is isolated on one bounded writer
 /// thread; when storage cannot keep up, frames are dropped instead of
@@ -19,7 +20,10 @@ public static class RoomSetupReplicaV2Tape
     private const uint Magic = 0x32565352u; // RSV2
     private const uint FrameMarker = 0x4d415246u; // FRAM
     private const uint EndMarker = 0x21444e45u; // END!
-    private const int Version = 1;
+    // Version 1 stored session-local Unity world matrices. Those matrices
+    // cannot be aligned reliably after an application restart. Version 2 uses
+    // Quest Stage space and intentionally rejects the ambiguous old format.
+    private const int Version = 2;
 
     public sealed class Frame
     {
@@ -202,6 +206,7 @@ public static class RoomSetupReplicaV2Tape
 
         public int Width { get; }
         public int Height { get; }
+        public string CoordinateSpace => "QuestStage";
 
         public Reader(string path)
         {

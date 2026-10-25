@@ -19,8 +19,11 @@ Quest controls:
 V2 keeps V1 intact and changes two deliberately isolated parts:
 
 - It records the exact 32-bit NDC depth accepted from both eyes, together with
-  that packet's projection/view matrices. File writes use a bounded background
-  queue; storage pressure drops a recording pair instead of stalling fusion.
+  that packet's projection/view matrices in Quest Stage space. File writes use
+  a bounded background queue; storage pressure drops a recording pair instead
+  of stalling fusion. Stage space keeps position and yaw tied to the room
+  across application restarts; changing the Guardian/room boundary invalidates
+  that relationship and requires a new tape.
 - The 10 cm mesh field is no longer made by directly taking every second 5 cm
   voxel. Each lattice sample is rebuilt from all eight surrounding source
   voxels with source-confidence weights. A missing source remains unknown, so
@@ -49,3 +52,8 @@ Artifacts on Quest are written below
 This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace
 Quest device A/B validation.
+
+Tape format 2 uses Quest Stage coordinates. Format-1 tapes stored a previous
+Unity session's world coordinates and are rejected because their cross-session
+translation and yaw cannot be reconstructed reliably; record once again after
+installing this version.

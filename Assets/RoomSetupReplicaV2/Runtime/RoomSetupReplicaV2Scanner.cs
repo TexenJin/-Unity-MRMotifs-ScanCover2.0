@@ -64,6 +64,7 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         if (IsScanning)
             return;
         _reconstruction?.StopReplay();
+        _reconstruction?.PrepareForLiveCapture();
         IsScanning = true;
         _lastSubmittedPlatformFrame = -1;
         _nextCaptureTime = 0f;

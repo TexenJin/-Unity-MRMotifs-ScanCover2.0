@@ -160,6 +160,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private Matrix4x4 _rightProjectionInverse;
     private Matrix4x4 _leftViewInverse;
     private Matrix4x4 _rightViewInverse;
+    private Matrix4x4 _pendingStageToWorld;
+    private Matrix4x4 _pendingWorldToStage;
+    private bool _pendingStageValid;
     private Vector3 _leftEye;
     private Vector3 _rightEye;
     private float[] _leftDepth;
@@ -174,6 +177,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private bool _processingReplayFrame;
     private float _nextReplayTime;
     private int _replayedFrames;
+    private bool _replayUsesStageSpace;
+    private bool _stageUnavailableLogged;
+    private OVRCameraRig _ovrRig;
 
     private GameObject _previewRoot;
     private Material _lineMaterial;
@@ -240,6 +246,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _rightProjectionInverse = depth.ProjInv[1];
         _leftViewInverse = depth.ViewInv[0];
         _rightViewInverse = depth.ViewInv[1];
+        _pendingStageValid = TryGetStageTransforms(
+            out _pendingStageToWorld, out _pendingWorldToStage);
         _leftEye = depth.ViewInv[0].MultiplyPoint3x4(Vector3.zero);
         _rightEye = depth.ViewInv[1].MultiplyPoint3x4(Vector3.zero);
         _pendingFrame = depth.CurrentPlatformFrame;
@@ -269,6 +277,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             Debug.LogWarning(
                 "[RoomSetupReplicaV2] wait for the first live depth pair " +
                 "before recording.");
+            return false;
+        }
+        if (!TryGetStageTransforms(out _, out _))
+        {
+            Debug.LogWarning(
+                "[RoomSetupReplicaV2] Quest Stage space is unavailable; " +
+                "recording was not started.");
             return false;
         }
         try
@@ -321,6 +336,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 reader.Dispose();
                 return false;
             }
+            if (!TryGetStageTransforms(out _, out _))
+            {
+                reader.Dispose();
+                Debug.LogWarning(
+                    "[RoomSetupReplicaV2] Quest Stage space is unavailable; " +
+                    "replay was not started.");
+                return false;
+            }
+            _replayUsesStageSpace = true;
+            UpdatePreviewTransform();
             _tapeReader = reader;
             _replayedFrames = 0;
             _nextReplayTime = 0f;
@@ -344,6 +369,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _tapeReader = null;
         _processingReplayFrame = false;
         Debug.Log("[RoomSetupReplicaV2] replay stopped.");
+    }
+
+    public void PrepareForLiveCapture()
+    {
+        if (!_replayUsesStageSpace)
+            return;
+        ClearReplica();
+        _replayUsesStageSpace = false;
+        UpdatePreviewTransform();
     }
 
     public void SetPreviewVisible(bool visible)
@@ -387,6 +421,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void Update()
     {
+        UpdatePreviewTransform();
         if (_readbackPending)
             CompleteReadbackWhenReady();
         if (_workStage != WorkStage.None)
@@ -661,15 +696,38 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         RoomSetupReplicaV2Tape.Writer writer = _tapeWriter;
         if (writer == null)
             return;
+        if (!_pendingStageValid)
+        {
+            if (!_stageUnavailableLogged)
+            {
+                _stageUnavailableLogged = true;
+                Debug.LogWarning(
+                    "[RoomSetupReplicaV2] skipped tape pair because Quest " +
+                    "Stage space was unavailable at capture time.");
+            }
+            return;
+        }
+        _stageUnavailableLogged = false;
+
+        // Freeze the packet in the persistent room coordinate frame rather
+        // than this application's session-local Unity world frame.
+        Matrix4x4 leftStageToClip =
+            _leftWorldToClip * _pendingStageToWorld;
+        Matrix4x4 rightStageToClip =
+            _rightWorldToClip * _pendingStageToWorld;
+        Matrix4x4 leftViewInverseStage =
+            _pendingWorldToStage * _leftViewInverse;
+        Matrix4x4 rightViewInverseStage =
+            _pendingWorldToStage * _rightViewInverse;
         bool accepted = writer.TryEnqueue(
             _pendingFrame,
             _pendingCaptureTime,
-            _leftWorldToClip,
-            _rightWorldToClip,
+            leftStageToClip,
+            rightStageToClip,
             _leftProjectionInverse,
             _rightProjectionInverse,
-            _leftViewInverse,
-            _rightViewInverse,
+            leftViewInverseStage,
+            rightViewInverseStage,
             _leftNdc,
             _rightNdc);
         if (writer.Failure != null ||
@@ -1076,6 +1134,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private sealed class ReplayReceipt
     {
         public string tape;
+        public string coordinateSpace;
         public int inputWidth;
         public int inputHeight;
         public int replayedPairs;
@@ -1105,6 +1164,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 tape = TapePath,
+                coordinateSpace = reader != null
+                    ? reader.CoordinateSpace
+                    : "QuestStage",
                 inputWidth = reader != null ? reader.Width : _width,
                 inputHeight = reader != null ? reader.Height : _height,
                 replayedPairs = _replayedFrames,
@@ -1487,6 +1549,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 Vector3.zero, Quaternion.identity);
             _previewRoot.transform.localScale = Vector3.one;
             _previewRoot.SetActive(showReplica);
+            UpdatePreviewTransform();
         }
         if (_lineMaterial == null)
         {
@@ -1588,6 +1651,57 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         return float.IsFinite(value.x) &&
                float.IsFinite(value.y) &&
                float.IsFinite(value.z);
+    }
+
+    private bool TryGetStageTransforms(
+        out Matrix4x4 stageToWorld, out Matrix4x4 worldToStage)
+    {
+        if (_ovrRig == null)
+            _ovrRig = FindAnyObjectByType<OVRCameraRig>();
+        Transform trackingSpace = _ovrRig != null
+            ? _ovrRig.trackingSpace
+            : null;
+        if (trackingSpace == null)
+        {
+            stageToWorld = Matrix4x4.identity;
+            worldToStage = Matrix4x4.identity;
+            return false;
+        }
+
+        OVRPose stageToLocal = OVRPlugin
+            .GetTrackingTransformRelativePose(OVRPlugin.TrackingOrigin.Stage)
+            .ToOVRPose();
+        Matrix4x4 stageToLocalMatrix = Matrix4x4.TRS(
+            stageToLocal.position, stageToLocal.orientation, Vector3.one);
+        stageToWorld = trackingSpace.localToWorldMatrix *
+                       stageToLocalMatrix;
+        float determinant = stageToWorld.determinant;
+        if (!float.IsFinite(determinant) ||
+            Mathf.Abs(determinant) < 0.000001f)
+        {
+            stageToWorld = Matrix4x4.identity;
+            worldToStage = Matrix4x4.identity;
+            return false;
+        }
+        worldToStage = stageToWorld.inverse;
+        return true;
+    }
+
+    private void UpdatePreviewTransform()
+    {
+        if (_previewRoot == null)
+            return;
+        if (_replayUsesStageSpace &&
+            TryGetStageTransforms(out Matrix4x4 stageToWorld, out _))
+        {
+            _previewRoot.transform.SetPositionAndRotation(
+                stageToWorld.GetColumn(3), stageToWorld.rotation);
+            _previewRoot.transform.localScale = Vector3.one;
+            return;
+        }
+        _previewRoot.transform.SetPositionAndRotation(
+            Vector3.zero, Quaternion.identity);
+        _previewRoot.transform.localScale = Vector3.one;
     }
 
     private static void EnsureArray(ref float[] array, int length)
