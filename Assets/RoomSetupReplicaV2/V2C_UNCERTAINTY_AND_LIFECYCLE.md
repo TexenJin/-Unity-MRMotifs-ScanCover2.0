@@ -70,3 +70,42 @@ baseline. Geometry acceptance is:
   in the older build caused a difference;
 - the new uncertainty and lifecycle receipt fields contain the values described
   above.
+
+### Quest 3 replay accepted on 2026-10-26
+
+The same 156-pair Quest Stage tape was replayed after commit `a43c101`.
+
+```text
+algorithm                         V2CWhiteboxLifecycleRegular10cmMesh
+activeChunks                      407
+weightedVoxels                    697294
+preview/final triangles           27393 / 27393
+pre-cleanup components            138
+removed <32 components/triangles  127 / 510
+post-cleanup components           11
+simplification applied/collapses  false / 0
+mesh publications                 57
+skipped async busy                0
+first mesh                        0.2970 s at pair 1
+mean correction delay             0.2675 s
+mean correction pair lag          0.3741
+replay elapsed                    34.7382 s
+direct depth support              0.90789616
+final mesh SHA-256                4E12E007F652E1EE13203B298B1E665D6687B35A42E2AC32A7C9E083EE3F5906
+```
+
+The final hash, vertex/triangle counts, component counts, plane residuals, and
+direct-depth support are identical to the frozen V2-B baseline. The scheduling
+change therefore altered publication timing without altering final geometry.
+Mean correction delay improved from approximately 0.32 s to 0.27 s and mean
+pair lag from 0.59 to 0.37. The single-run maxima moved from 3.57 s / 13 pairs
+to 3.83 s / 14 pairs; this is retained as timing variance, not presented as an
+improvement.
+
+## Next isolated lifecycle step
+
+The recovered GC operates on sparse leaves containing 64 voxels (4 x 4 x 4),
+whereas the current replica applies the same retention predicate to an entire
+16 x 16 x 16 storage Chunk. Leaf-granular frustum GC must therefore be tested
+as a separate V2-C change. Its native trigger frequency remains unresolved and
+must not be invented silently.
