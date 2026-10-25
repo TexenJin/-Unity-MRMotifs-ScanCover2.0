@@ -195,3 +195,37 @@ post-cleanup components and original V2-C geometry while reporting zero GC
 passes. That replay validates the gate/default integration; it does not erase
 the separately proven leaf-GC mechanism or claim that no server-side override
 can exist.
+
+### Native-default gate Quest 3 replay accepted on 2026-10-26
+
+The same 156-pair Quest Stage tape was replayed after commit `4b0aa81`.
+
+```text
+configured/default frequency      -0.15 / -0.15 Hz
+GC enabled/passes                 false / 0
+candidate/released leaves         0 / 0
+cleared voxels/released Chunks    0 / 0
+active Chunks                     409
+weighted voxels                   716842
+preview/final triangles           27397 / 27397
+post-cleanup components           11
+largest component                 21359 triangles
+direct depth support              0.90790963
+plane RMS/P95                     0.00818797 / 0.01647617 m
+replay elapsed                    35.5396 s
+final mesh SHA-256                3C528BE8B2615E06F48038252A7F93A9134F11D657F29782C042F9700D4C4B9D
+```
+
+The recovered default and execution gate are accepted: every GC counter is
+zero and the 45-triangle split introduced by once-per-pair leaf GC is gone.
+Welded component sizes are identical to the pre-leaf-GC V2-C replay except for
+the largest component, which contains four additional triangles (`21355 ->
+21359`). All ten smaller component sizes match exactly. The different final
+hash is therefore not a new island or topology regression; disabling the old
+invented cadence preserves slightly more of the main surface and 19,548 more
+weighted voxels than the former whole-Chunk-GC baseline.
+
+This accepts the compiled native default, not an unevidenced claim that Meta
+can never provide a positive runtime override. The positive-frequency leaf
+path remains implemented behind the recovered timestamp gate for future
+runtime evidence.
