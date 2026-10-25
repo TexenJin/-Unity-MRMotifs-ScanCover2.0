@@ -40,6 +40,13 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   Source fusion and derived meshing both use world-anchored integer grid
   points; the native `+0.5` terms belong to image pixels, not voxel-space
   sample positions. See `V2B_WHITEBOX_RESAMPLING.md` for the evidence boundary.
+- After Marching Cubes, the recovered `RemoveSmallConnectedComponents` stage
+  operates on the global candidate mesh: while the candidate has fewer than
+  40,000 triangles it removes components with strictly fewer than 32
+  triangles. Components spanning Chunk seams are joined for classification;
+  exactly 32 triangles are retained. The raw candidate is preserved so a
+  temporarily removed fragment can grow and reappear, and the filtered meshes
+  are published together only when the mesh pass completes.
 
 The first device-backed scheduling correction raises the per-slice chunk guard
 from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no
@@ -70,12 +77,13 @@ Artifacts on Quest are written below
   Quest Stage coordinates. The receipt includes its SHA-256 hash.
 
 The replay receipt also reports first-mesh latency, local dirty-to-publication
-delay, replay throughput, seam-welded connected components, and a local planar
-residual over normal-consistent vertices. Direct-depth support reprojects every
-final triangle against every stereo tape packet. A triangle is supported when
-its centroid agrees with either eye's depth within 5 cm, or at least two of its
-vertices agree within the same packet. The receipt keeps this offline analysis
-time separate from replay throughput; TSDF weights are not used as a substitute.
+delay, replay throughput, pre/post `<32` cleanup counts and time, seam-welded
+connected components, and a local planar residual over normal-consistent
+vertices. Direct-depth support reprojects every final triangle against every
+stereo tape packet. A triangle is supported when its centroid agrees with
+either eye's depth within 5 cm, or at least two of its vertices agree within
+the same packet. The receipt keeps this offline analysis time separate from
+replay throughput; TSDF weights are not used as a substitute.
 
 This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace

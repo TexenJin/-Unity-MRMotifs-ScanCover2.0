@@ -34,6 +34,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float MaximumWeight = 1000f;
     private const float PlanarMetricNormalDot = 0.94f;
     private const float SeamWeldUnitsPerMeter = 10000f;
+    private const int RemoveSmallTriangleThreshold = 32;
+    private const int RemoveSmallTriangleGate = 40000;
 
     private enum WorkStage : byte
     {
@@ -66,6 +68,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public MeshRenderer previewRenderer;
         public Mesh frontMesh;
         public Mesh backMesh;
+        public Vector3[] candidateVertices = Array.Empty<Vector3>();
+        public int[] candidateTriangles = Array.Empty<int>();
+        public int candidateTriangleCount;
         public int triangleCount;
     }
 
@@ -207,6 +212,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public float LastMeshingMilliseconds { get; private set; }
     public int LastDerivedValidSampleCount { get; private set; }
     public int LastDerivedMissingSampleCount { get; private set; }
+    public int LastPreCleanupTriangleCount { get; private set; }
+    public int LastPreCleanupComponentCount { get; private set; }
+    public int LastRemovedSmallComponentCount { get; private set; }
+    public int LastRemovedSmallTriangleCount { get; private set; }
+    public int LastPostCleanupComponentCount { get; private set; }
+    public float LastComponentCleanupMilliseconds { get; private set; }
     public bool HasPendingWork => _readbackPending || _workStage != WorkStage.None;
     public bool PreviewVisible => showReplica;
     public bool IsRecording => _tapeWriter != null;
@@ -243,6 +254,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         new Queue<Vector3Int>();
     private readonly Dictionary<Vector3Int, DirtyStamp> _meshDirtyStamps =
         new Dictionary<Vector3Int, DirtyStamp>();
+    private readonly HashSet<Vector3Int> _meshPassPublicationChunks =
+        new HashSet<Vector3Int>();
 
     private ComputeShader _unproject;
     private int _unprojectKernel = -1;
@@ -325,6 +338,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly HashSet<ulong> _uniqueLines = new HashSet<ulong>();
     private readonly List<KeyValuePair<Vector3Int, Chunk>> _orderedChunks =
         new List<KeyValuePair<Vector3Int, Chunk>>(256);
+    private readonly List<int> _orderedChunkVertexBases =
+        new List<int>(256);
+    private readonly Dictionary<int, int> _publishedVertexRemap =
+        new Dictionary<int, int>(4096);
     private readonly List<Vector3> _finalVertices =
         new List<Vector3>(32768);
     private readonly List<int> _finalTriangles = new List<int>(65536);
@@ -554,6 +571,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _queuedMeshChunks.Clear();
         _meshQueue.Clear();
         _meshDirtyStamps.Clear();
+        _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
         _nextMeshTime = 0f;
         AcceptedPairCount = 0;
@@ -563,6 +581,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         PreviewTriangleCount = 0;
         LastDerivedValidSampleCount = 0;
         LastDerivedMissingSampleCount = 0;
+        LastPreCleanupTriangleCount = 0;
+        LastPreCleanupComponentCount = 0;
+        LastRemovedSmallComponentCount = 0;
+        LastRemovedSmallTriangleCount = 0;
+        LastPostCleanupComponentCount = 0;
+        LastComponentCleanupMilliseconds = 0f;
         LastReconstructionMilliseconds = 0f;
         LastMeshingMilliseconds = 0f;
     }
@@ -1321,6 +1345,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int activeChunks;
         public int weightedVoxels;
         public int previewTriangles;
+        public bool removeSmallApplied;
+        public int removeSmallTriangleThreshold;
+        public int removeSmallTriangleGate;
+        public int preCleanupTriangles;
+        public int preCleanupComponents;
+        public int removedSmallTriangles;
+        public int removedSmallComponents;
+        public int postCleanupComponents;
+        public float componentCleanupMilliseconds;
         public int lastMeshPassDerivedValidSamples;
         public int lastMeshPassDerivedMissingSamples;
         public float lastReconstructionMilliseconds;
@@ -1382,7 +1415,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm = "V2BWhiteboxGridPointFusionDirectSample",
+                algorithm =
+                    "V2BWhiteboxGridPointFusionDirectSampleRemoveSmall32",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1399,6 +1433,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 activeChunks = ActiveChunkCount,
                 weightedVoxels = WeightedVoxelCount,
                 previewTriangles = PreviewTriangleCount,
+                removeSmallApplied =
+                    LastPreCleanupTriangleCount < RemoveSmallTriangleGate,
+                removeSmallTriangleThreshold = RemoveSmallTriangleThreshold,
+                removeSmallTriangleGate = RemoveSmallTriangleGate,
+                preCleanupTriangles = LastPreCleanupTriangleCount,
+                preCleanupComponents = LastPreCleanupComponentCount,
+                removedSmallTriangles = LastRemovedSmallTriangleCount,
+                removedSmallComponents = LastRemovedSmallComponentCount,
+                postCleanupComponents = LastPostCleanupComponentCount,
+                componentCleanupMilliseconds =
+                    LastComponentCleanupMilliseconds,
                 lastMeshPassDerivedValidSamples =
                     LastDerivedValidSampleCount,
                 lastMeshPassDerivedMissingSamples =
@@ -1906,14 +1951,26 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _meshPassActive = true;
         _passDerivedValidSamples = 0;
         _passDerivedMissingSamples = 0;
+        _meshPassPublicationChunks.Clear();
         return true;
     }
 
     private void CompleteMeshPass()
     {
+        PublishRemoveSmallCandidateMeshes();
+        foreach (Vector3Int chunkId in _meshPassPublicationChunks)
+            RecordCorrectionPublication(chunkId);
+        _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
         LastDerivedValidSampleCount = _passDerivedValidSamples;
         LastDerivedMissingSampleCount = _passDerivedMissingSamples;
+        if (IsReplaying && PreviewTriangleCount > 0 &&
+            _firstMeshLatencySeconds < 0f)
+        {
+            _firstMeshLatencySeconds = (float)(
+                Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
+            _firstMeshPair = _replayedFrames;
+        }
         int band = Mathf.Max(0, PreviewTriangleCount) / 6000;
         _nextMeshTime = Time.unscaledTime +
                         Mathf.Min(0.9f, 0.15f + 0.25f * band);
@@ -1941,20 +1998,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _queuedMeshChunks.Remove(chunkId);
             if (_chunks.TryGetValue(chunkId, out Chunk chunk))
                 RebuildChunkMesh(chunkId, chunk);
-            RecordCorrectionPublication(chunkId);
+            // A removed chunk is also a published correction: its previous
+            // Front has disappeared when the global candidate is committed.
+            _meshPassPublicationChunks.Add(chunkId);
             processed++;
             if (Time.realtimeSinceStartupAsDouble - start >= budget)
                 break;
-        }
-        PreviewTriangleCount = 0;
-        foreach (Chunk chunk in _chunks.Values)
-            PreviewTriangleCount += chunk.triangleCount;
-        if (IsReplaying && PreviewTriangleCount > 0 &&
-            _firstMeshLatencySeconds < 0f)
-        {
-            _firstMeshLatencySeconds = (float)(
-                Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
-            _firstMeshPair = _replayedFrames;
         }
         LastMeshingMilliseconds = (float)(
             (Time.realtimeSinceStartupAsDouble - start) * 1000d);
@@ -2052,13 +2101,177 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 _meshTriangles.Add(a);
                 _meshTriangles.Add(b);
                 _meshTriangles.Add(c);
-                AddLine(a, b);
-                AddLine(b, c);
-                AddLine(c, a);
                 triangles++;
             }
         }
 
+        // Keep the unfiltered candidate separate from the published Front.
+        // A component that is currently below 32 triangles may grow on a
+        // later pass; destructively filtering this source would prevent that.
+        chunk.candidateVertices = triangles > 0
+            ? _meshVertices.ToArray()
+            : Array.Empty<Vector3>();
+        chunk.candidateTriangles = triangles > 0
+            ? _meshTriangles.ToArray()
+            : Array.Empty<int>();
+        chunk.candidateTriangleCount = triangles;
+    }
+
+    private void PublishRemoveSmallCandidateMeshes()
+    {
+        double start = Time.realtimeSinceStartupAsDouble;
+        _orderedChunks.Clear();
+        foreach (KeyValuePair<Vector3Int, Chunk> item in _chunks)
+            _orderedChunks.Add(item);
+        _orderedChunks.Sort(CompareChunks);
+
+        _orderedChunkVertexBases.Clear();
+        int vertexCount = 0;
+        int triangleCount = 0;
+        for (int i = 0; i < _orderedChunks.Count; i++)
+        {
+            Chunk chunk = _orderedChunks[i].Value;
+            _orderedChunkVertexBases.Add(vertexCount);
+            vertexCount += chunk.candidateVertices.Length;
+            triangleCount += chunk.candidateTriangleCount;
+        }
+
+        var union = new UnionFind(vertexCount);
+        for (int chunkIndex = 0;
+             chunkIndex < _orderedChunks.Count;
+             chunkIndex++)
+        {
+            Chunk chunk = _orderedChunks[chunkIndex].Value;
+            int vertexBase = _orderedChunkVertexBases[chunkIndex];
+            int[] triangles = chunk.candidateTriangles;
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                int a = vertexBase + triangles[i];
+                int b = vertexBase + triangles[i + 1];
+                int c = vertexBase + triangles[i + 2];
+                union.Union(a, b);
+                union.Union(b, c);
+            }
+        }
+
+        // Marching-Cubes chunks duplicate boundary vertices. Weld positions at
+        // 0.1 mm only for connectivity classification; geometry is unchanged.
+        var seamOwners = new Dictionary<QuantizedPosition, int>(vertexCount);
+        for (int chunkIndex = 0;
+             chunkIndex < _orderedChunks.Count;
+             chunkIndex++)
+        {
+            Vector3[] vertices =
+                _orderedChunks[chunkIndex].Value.candidateVertices;
+            int vertexBase = _orderedChunkVertexBases[chunkIndex];
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                int global = vertexBase + i;
+                var key = new QuantizedPosition(vertices[i]);
+                if (seamOwners.TryGetValue(key, out int owner))
+                    union.Union(global, owner);
+                else
+                    seamOwners.Add(key, global);
+            }
+        }
+
+        var trianglesByRoot = new Dictionary<int, int>();
+        for (int chunkIndex = 0;
+             chunkIndex < _orderedChunks.Count;
+             chunkIndex++)
+        {
+            Chunk chunk = _orderedChunks[chunkIndex].Value;
+            int vertexBase = _orderedChunkVertexBases[chunkIndex];
+            int[] triangles = chunk.candidateTriangles;
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                int root = union.Find(vertexBase + triangles[i]);
+                if (trianglesByRoot.TryGetValue(root, out int count))
+                    trianglesByRoot[root] = count + 1;
+                else
+                    trianglesByRoot.Add(root, 1);
+            }
+        }
+
+        bool applyCleanup = triangleCount < RemoveSmallTriangleGate;
+        var removedRoots = new HashSet<int>();
+        int removedTriangles = 0;
+        if (applyCleanup)
+        {
+            foreach (KeyValuePair<int, int> item in trianglesByRoot)
+            {
+                // Recovered native rule is strictly less than 32. A component
+                // with exactly 32 triangles must survive.
+                if (item.Value >= RemoveSmallTriangleThreshold)
+                    continue;
+                removedRoots.Add(item.Key);
+                removedTriangles += item.Value;
+            }
+        }
+
+        for (int chunkIndex = 0;
+             chunkIndex < _orderedChunks.Count;
+             chunkIndex++)
+        {
+            PublishFilteredChunkMesh(
+                _orderedChunks[chunkIndex].Key,
+                _orderedChunks[chunkIndex].Value,
+                _orderedChunkVertexBases[chunkIndex],
+                union,
+                removedRoots);
+        }
+
+        LastPreCleanupTriangleCount = triangleCount;
+        LastPreCleanupComponentCount = trianglesByRoot.Count;
+        LastRemovedSmallComponentCount = removedRoots.Count;
+        LastRemovedSmallTriangleCount = removedTriangles;
+        LastPostCleanupComponentCount =
+            trianglesByRoot.Count - removedRoots.Count;
+        PreviewTriangleCount = 0;
+        foreach (Chunk chunk in _chunks.Values)
+            PreviewTriangleCount += chunk.triangleCount;
+        LastComponentCleanupMilliseconds = (float)(
+            (Time.realtimeSinceStartupAsDouble - start) * 1000d);
+        Debug.Log(
+            $"[RoomSetupReplicaV2] RemoveSmall<32 applied={applyCleanup} " +
+            $"components={LastPreCleanupComponentCount}->" +
+            $"{LastPostCleanupComponentCount} triangles=" +
+            $"{LastPreCleanupTriangleCount}->{PreviewTriangleCount} " +
+            $"removed={LastRemovedSmallTriangleCount} " +
+            $"ms={LastComponentCleanupMilliseconds:F1}");
+    }
+
+    private void PublishFilteredChunkMesh(
+        Vector3Int chunkId,
+        Chunk chunk,
+        int vertexBase,
+        UnionFind union,
+        HashSet<int> removedRoots)
+    {
+        _meshVertices.Clear();
+        _meshTriangles.Clear();
+        _meshLines.Clear();
+        _uniqueLines.Clear();
+        _publishedVertexRemap.Clear();
+
+        int[] candidates = chunk.candidateTriangles;
+        for (int i = 0; i < candidates.Length; i += 3)
+        {
+            if (removedRoots.Contains(
+                    union.Find(vertexBase + candidates[i])))
+                continue;
+            int a = RemapPublishedVertex(chunk, candidates[i]);
+            int b = RemapPublishedVertex(chunk, candidates[i + 1]);
+            int c = RemapPublishedVertex(chunk, candidates[i + 2]);
+            _meshTriangles.Add(a);
+            _meshTriangles.Add(b);
+            _meshTriangles.Add(c);
+            AddLine(a, b);
+            AddLine(b, c);
+            AddLine(c, a);
+        }
+
+        int triangles = _meshTriangles.Count / 3;
         if (triangles <= 0)
         {
             if (chunk.previewObject != null)
@@ -2081,6 +2294,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         staging.subMeshCount = 2;
         staging.SetIndices(_meshTriangles, MeshTopology.Triangles, 0, false);
         staging.SetIndices(_meshLines, MeshTopology.Lines, 1, false);
+        Vector3Int origin = chunkId * ChunkSize;
         float chunkWorld = ChunkSize * VoxelMeters;
         staging.bounds = new Bounds(
             new Vector3(
@@ -2094,6 +2308,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         chunk.frontMesh = staging;
         chunk.triangleCount = triangles;
         chunk.previewObject.SetActive(showReplica);
+    }
+
+    private int RemapPublishedVertex(Chunk chunk, int candidateIndex)
+    {
+        if (_publishedVertexRemap.TryGetValue(
+                candidateIndex, out int published))
+            return published;
+        published = _meshVertices.Count;
+        _publishedVertexRemap.Add(candidateIndex, published);
+        _meshVertices.Add(chunk.candidateVertices[candidateIndex]);
+        return published;
     }
 
     private void CacheSamples(Vector3Int chunkId)
@@ -2293,6 +2518,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void RecycleChunk(Chunk chunk)
     {
         Array.Clear(chunk.voxels, 0, chunk.voxels.Length);
+        chunk.candidateVertices = Array.Empty<Vector3>();
+        chunk.candidateTriangles = Array.Empty<int>();
+        chunk.candidateTriangleCount = 0;
         chunk.triangleCount = 0;
         if (_chunkPool.Count < 64)
             _chunkPool.Push(chunk);
@@ -2433,6 +2661,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         DisposeChunkPreview(chunk);
         Array.Clear(chunk.voxels, 0, chunk.voxels.Length);
+        chunk.candidateVertices = Array.Empty<Vector3>();
+        chunk.candidateTriangles = Array.Empty<int>();
+        chunk.candidateTriangleCount = 0;
+        chunk.triangleCount = 0;
     }
 
     private void OnDestroy()

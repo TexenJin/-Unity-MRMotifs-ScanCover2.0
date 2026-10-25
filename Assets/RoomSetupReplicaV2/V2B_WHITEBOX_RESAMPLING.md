@@ -65,15 +65,28 @@ that smoothing can reduce fragmentation, but it is no longer presented as the
 recovered Room Setup resampling kernel.
 
 V2-B now tests the white-box-aligned exact-copy rule against the same tape and
-the same receipts. Room Setup's confirmed connected-component cleanup and
-metric-error simplification remain later, separate production stages; their
-effects must not be silently folded into the resampler.
+the same receipts. Its next recovered stage is kept separate from resampling:
+after Marching Cubes, the full candidate mesh is classified into global
+connected components and any component with strictly fewer than 32 triangles
+is removed when the pre-cleanup mesh has fewer than 40,000 triangles. A
+32-triangle component survives. Chunk-boundary duplicates are welded at
+0.1 mm for connectivity classification only; vertex positions are unchanged.
+
+The unfiltered candidate remains stored behind the published Front mesh. This
+allows a fragment removed on one pass to grow past the threshold on a later
+pass. Publication happens after the whole mesh pass so connectivity is never
+decided independently per chunk. The replay receipt records pre/post component
+and triangle counts plus cleanup time. Metric-error simplification remains a
+later, separate production stage and is not silently folded into either the
+resampler or this cleanup.
 
 ## Static evidence
 
 - `libmrengine.so` SHA-256:
   `0E558058C08A6E22EA6E2FB1C8B7890BE5A472B515076C84CF643C57F112BABE`
-- `0x78c4b0`: active `Resampled` orchestration.
+- `0x78c4b0`: active `Resampled` orchestration; invokes
+  `RemoveSmallConnectedComponents` after extraction and before simplification
+  when the active triangle count is below 40,000.
 - `0x78cc60`: derived-volume reset.
 - `0x78cd20`: ratio validation, aligned exact copy, and non-aligned trilinear
   fallback.
@@ -81,3 +94,4 @@ effects must not be silently folded into the resampler.
   half-cell addition.
 - Active configuration: source pitch `0.05 m`, ratio `0.5`, derived pitch
   `0.10 m`.
+- Recovered cleanup threshold: remove components with `<32` triangles.
