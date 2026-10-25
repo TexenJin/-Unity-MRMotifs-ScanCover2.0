@@ -32,10 +32,12 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   of stalling fusion. Stage space keeps position and yaw tied to the room
   across application restarts; changing the Guardian/room boundary invalidates
   that relationship and requires a new tape.
-- The 10 cm mesh field is no longer made by directly taking every second 5 cm
-  voxel. Each lattice sample is rebuilt from all eight surrounding source
-  voxels with source-confidence weights. A missing source remains unknown, so
-  the mesh extractor cannot invent support across an unobserved gap.
+- V2-B follows the recovered active `voxelSizeRatio=0.5` path in native
+  `0x78cd20`: each 10 cm derived lattice coordinate maps to an aligned even
+  coordinate in the 5 cm source field, and the stored half SDF/weight are
+  copied exactly. A missing aligned source stays unobserved. The function's
+  trilinear branch supports non-aligned ratios but is not active for `0.5`.
+  See `V2B_WHITEBOX_RESAMPLING.md` for the evidence boundary.
 
 The first device-backed scheduling correction raises the per-slice chunk guard
 from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no

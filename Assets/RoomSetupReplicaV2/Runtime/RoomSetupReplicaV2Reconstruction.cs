@@ -22,6 +22,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const int SampleSize = ChunkSize + 1;
     private const int SampleCount = SampleSize * SampleSize * SampleSize;
     private const float VoxelMeters = 0.05f;
+    private const float DerivedVoxelMeters = 0.10f;
+    private const float ResampleRatio = VoxelMeters / DerivedVoxelMeters;
     private const int MeshStride = 2;
     private const int MeshCells = ChunkSize / MeshStride;
     private const float MinimumDepthMeters = 0.30f;
@@ -1300,6 +1302,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private sealed class ReplayReceipt
     {
         public string algorithm;
+        public float sourceVoxelMeters;
+        public float derivedVoxelMeters;
+        public float resampleRatio;
+        public string resampleKernel;
+        public string missingSourceRule;
         public string tape;
         public string coordinateSpace;
         public int inputWidth;
@@ -1369,7 +1376,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm = "V2WeightedEightNeighbourField",
+                algorithm = "V2BWhiteboxHalfRatioDirectSample",
+                sourceVoxelMeters = VoxelMeters,
+                derivedVoxelMeters = DerivedVoxelMeters,
+                resampleRatio = ResampleRatio,
+                resampleKernel = "AlignedExactCopy",
+                missingSourceRule = "KeepDerivedSampleUnobserved",
                 tape = TapePath,
                 coordinateSpace = reader != null
                     ? reader.CoordinateSpace
@@ -2102,31 +2114,23 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private bool TryResampleDerivedField(
         Vector3Int lattice, out float distance)
     {
-        double weightedDistance = 0d;
-        double weightSum = 0d;
-        for (int z = -1; z <= 0; z++)
-        for (int y = -1; y <= 0; y++)
-        for (int x = -1; x <= 0; x++)
-        {
-            if (!TryGetVoxel(
-                    lattice + new Vector3Int(x, y, z), out Voxel voxel) ||
-                voxel.weight <= 0f ||
-                !float.IsFinite(voxel.distance) ||
-                !float.IsFinite(voxel.weight))
-            {
-                distance = 0f;
-                return false;
-            }
-            weightedDistance += voxel.distance * (double)voxel.weight;
-            weightSum += voxel.weight;
-        }
-        if (weightSum <= 0.000001d)
+        // Room Setup's active Resampled mode passes ratio 0.5 to 0x78cd20.
+        // Every integer derived coordinate therefore maps to an exact even
+        // source coordinate (derived / 0.5), selecting the function's exact
+        // half-SDF/half-weight copy branch. Its trilinear branch is retained
+        // for non-aligned ratios, but is not the active 5 cm -> 10 cm kernel.
+        // `lattice` is already expressed in source-grid coordinates at stride
+        // two, so this lookup is the equivalent aligned source sample.
+        if (!TryGetVoxel(lattice, out Voxel voxel) ||
+            voxel.weight <= 0f ||
+            !float.IsFinite(voxel.distance) ||
+            !float.IsFinite(voxel.weight))
         {
             distance = 0f;
             return false;
         }
-        distance = QuantizeHalf((float)(weightedDistance / weightSum));
-        return float.IsFinite(distance);
+        distance = voxel.distance;
+        return true;
     }
 
     private bool TryGetVoxel(Vector3Int global, out Voxel voxel)
