@@ -37,7 +37,9 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   coordinate in the 5 cm source field, and the stored half SDF/weight are
   copied exactly. A missing aligned source stays unobserved. The function's
   trilinear branch supports non-aligned ratios but is not active for `0.5`.
-  See `V2B_WHITEBOX_RESAMPLING.md` for the evidence boundary.
+  Source fusion and derived meshing both use world-anchored integer grid
+  points; the native `+0.5` terms belong to image pixels, not voxel-space
+  sample positions. See `V2B_WHITEBOX_RESAMPLING.md` for the evidence boundary.
 
 The first device-backed scheduling correction raises the per-slice chunk guard
 from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no

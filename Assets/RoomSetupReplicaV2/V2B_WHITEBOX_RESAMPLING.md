@@ -39,6 +39,24 @@ else:
 The derived lattice uses its own 10 cm coordinate grid. It must not inherit the
 source field's 2.5 cm voxel-centre offset.
 
+The source field follows the same integer-grid convention. Native
+`fuseDepthMap` (`0x7a5400`) converts sparse-tree integer voxel coordinates to
+float and applies the spatial scale directly; it does not add `0.5` in voxel
+space. The `+0.5` terms visible in that function are part of image-pixel
+centre/principal-point handling. Consequently, both 5 cm fusion samples and
+10 cm derived samples are anchored at integer grid points:
+
+```text
+source world position  = sourceIndex  * 0.05 m
+derived world position = derivedIndex * 0.10 m
+sourceIndex             = derivedIndex * 2
+```
+
+Keeping the old source `index+0.5` convention while removing the offset only
+from the derived mesh creates a uniform 2.5 cm disagreement between the field
+and its published surface. The first V2-B device run isolated exactly that
+translation and is retained as evidence, not as the final coordinate rule.
+
 ## Controlled comparison
 
 The previous strict eight-neighbour confidence-weighted candidate is retained
@@ -59,5 +77,7 @@ effects must not be silently folded into the resampler.
 - `0x78cc60`: derived-volume reset.
 - `0x78cd20`: ratio validation, aligned exact copy, and non-aligned trilinear
   fallback.
+- `0x7a5400`: integer sparse-tree coordinates are scaled without a voxel-space
+  half-cell addition.
 - Active configuration: source pitch `0.05 m`, ratio `0.5`, derived pitch
   `0.10 m`.

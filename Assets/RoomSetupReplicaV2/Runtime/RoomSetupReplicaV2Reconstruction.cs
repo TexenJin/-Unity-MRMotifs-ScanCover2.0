@@ -1261,23 +1261,28 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void PrepareProjectionTerms(
         Vector3Int origin, Matrix4x4 worldToClip)
     {
+        // Native fuseDepthMap (0x7a5400) converts the sparse-tree integer
+        // coordinates directly to float before applying its spatial scale.
+        // Its +0.5 terms belong to image-pixel coordinates, not voxel-space
+        // sample positions. Keep source fusion and the derived 10 cm lattice
+        // on the same world-anchored integer grid.
         for (int x = 0; x < ChunkSize; x++)
         {
-            float world = (origin.x + x + 0.5f) * VoxelMeters;
+            float world = (origin.x + x) * VoxelMeters;
             _clipXX[x] = worldToClip.m00 * world;
             _clipYX[x] = worldToClip.m10 * world;
             _depthX[x] = worldToClip.m30 * world;
         }
         for (int y = 0; y < ChunkSize; y++)
         {
-            float world = (origin.y + y + 0.5f) * VoxelMeters;
+            float world = (origin.y + y) * VoxelMeters;
             _clipXY[y] = worldToClip.m01 * world;
             _clipYY[y] = worldToClip.m11 * world;
             _depthY[y] = worldToClip.m31 * world;
         }
         for (int z = 0; z < ChunkSize; z++)
         {
-            float world = (origin.z + z + 0.5f) * VoxelMeters;
+            float world = (origin.z + z) * VoxelMeters;
             _clipXZ[z] = worldToClip.m02 * world;
             _clipYZ[z] = worldToClip.m12 * world;
             _depthZ[z] = worldToClip.m32 * world;
@@ -1305,6 +1310,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float sourceVoxelMeters;
         public float derivedVoxelMeters;
         public float resampleRatio;
+        public string sourceSampleCoordinates;
         public string resampleKernel;
         public string missingSourceRule;
         public string tape;
@@ -1376,10 +1382,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm = "V2BWhiteboxHalfRatioDirectSample",
+                algorithm = "V2BWhiteboxGridPointFusionDirectSample",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
+                sourceSampleCoordinates = "IntegerGridPoints",
                 resampleKernel = "AlignedExactCopy",
                 missingSourceRule = "KeepDerivedSampleUnobserved",
                 tape = TapePath,
@@ -2077,9 +2084,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         float chunkWorld = ChunkSize * VoxelMeters;
         staging.bounds = new Bounds(
             new Vector3(
-                (origin.x + ChunkSize * 0.5f + 0.5f) * VoxelMeters,
-                (origin.y + ChunkSize * 0.5f + 0.5f) * VoxelMeters,
-                (origin.z + ChunkSize * 0.5f + 0.5f) * VoxelMeters),
+                (origin.x + ChunkSize * 0.5f) * VoxelMeters,
+                (origin.y + ChunkSize * 0.5f) * VoxelMeters,
+                (origin.z + ChunkSize * 0.5f) * VoxelMeters),
             Vector3.one * (chunkWorld + VoxelMeters));
         staging.UploadMeshData(false);
         chunk.previewFilter.sharedMesh = staging;
