@@ -10,11 +10,16 @@ placeholder scene with a Meta XR Building Blocks scene, adds only `DepthCapture`
 
 Quest controls:
 
-- Right index trigger: pause/resume capture.
-- A: start/stop a bounded exact-input recording (up to 180 stereo pairs).
-- Y: pause live capture, clear the current replica, and replay the last tape.
+- Right index trigger: start/stop coverage and its bounded exact-input
+  recording together (up to 180 accepted stereo pairs).
+- A: stop live coverage, clear the current replica, and replay the last tape.
 - B: clear the replica volume and mesh.
 - X: show/hide the replica mesh.
+
+The application starts idle. Recording is armed by the same trigger press as
+coverage and begins on the first accepted stereo depth pair, so visual coverage
+cannot silently run without its matching tape. The second trigger press closes
+the tape before stopping capture.
 
 V2 keeps V1 intact and changes two deliberately isolated parts:
 

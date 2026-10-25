@@ -198,7 +198,7 @@ MonoBehaviour:
   m_Name:
   m_EditorClassIdentifier: Assembly-CSharp::RoomSetupReplicaV2Scanner
   captureHz: 10
-  startAutomatically: 1
+  startAutomatically: 0
 --- !u!114 &340680394
 MonoBehaviour:
   m_ObjectHideFlags: 0

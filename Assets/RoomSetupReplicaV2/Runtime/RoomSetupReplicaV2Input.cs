@@ -1,8 +1,8 @@
 using UnityEngine;
 
 /// <summary>
-/// Right trigger starts/pauses live capture; A records an exact input tape;
-/// Y replays it; B clears; X toggles the replica mesh.
+/// Right trigger starts/stops coverage and recording together; A replays the
+/// last tape; B clears; X toggles the replica mesh.
 /// </summary>
 public sealed class RoomSetupReplicaV2Input : MonoBehaviour
 {
@@ -21,7 +21,7 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
         _previousTrigger = trigger;
         if (triggerDown)
         {
-            scanner.ToggleScanning();
+            scanner.ToggleCoverageAndRecording();
             Pulse();
         }
         if (OVRInput.GetDown(OVRInput.Button.Two, controller))
@@ -30,11 +30,6 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
             Pulse(0.5f, 0.12f);
         }
         if (OVRInput.GetDown(OVRInput.RawButton.A))
-        {
-            scanner.ToggleRecording();
-            Pulse(0.5f, 0.12f);
-        }
-        if (OVRInput.GetDown(OVRInput.RawButton.Y))
         {
             scanner.ReplayLastTape();
             Pulse(0.5f, 0.12f);

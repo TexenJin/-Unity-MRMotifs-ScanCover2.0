@@ -50,8 +50,8 @@ public static class RoomSetupReplicaV2SceneSetup
             EditorUtility.DisplayDialog(
                 "Room Setup Replica V2",
                 "独立场景已建立并设为唯一 Build Scene。\n" +
-                "运行后会自动开始；右扳机暂停/继续，A 录制/停止，" +
-                "Y 回放，B 清空，X 显示/隐藏。",
+                "右扳机同时开始/停止覆盖与录制，A 回放，" +
+                "B 清空，X 显示/隐藏。",
                 "好");
         }
         catch (Exception exception)
