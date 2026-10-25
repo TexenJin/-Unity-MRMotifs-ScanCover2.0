@@ -38,6 +38,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const int RemoveSmallTriangleThreshold = 32;
     private const int RemoveSmallTriangleGate = 40000;
     private const int MinimumRecordedPairsToCommit = 16;
+    // Recovered Room Setup input rule. The public Meta OpenXR provider used by
+    // this project exposes only _EnvironmentDepthTexture, not the native
+    // uncertainty image, so the rule is receipt-visible but deliberately not
+    // applied to a guessed substitute.
+    private const float UncertaintyRejectThreshold = 89f;
+    private const float MeshIntervalMaximumSeconds = 0.9f;
+    private const float MeshIntervalBaseSeconds = 0.15f;
+    private const float MeshIntervalBucketSeconds = 0.25f;
+    private const int MeshIntervalTriangleBucket = 6000;
 
     private enum WorkStage : byte
     {
@@ -332,8 +341,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private int _correctionPublicationCount;
     private Task<RoomSetupReplicaV2XrtSimplifier.Result>
         _simplificationTask;
-    private RoomSetupReplicaV2XrtSimplifier.Input
-        _pendingSimplificationInput;
     private int _simplificationSerial;
 
     private GameObject _previewRoot;
@@ -341,6 +348,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private Material _depthMaterial;
     private bool _meshPassActive;
     private float _nextMeshTime;
+    private float _lastScheduledMeshIntervalSeconds;
+    private bool _asyncMeshingPending;
+    private int _skippedAsyncBusyCount;
+    private int _meshPublicationCount;
     private int _passDerivedValidSamples;
     private int _passDerivedMissingSamples;
 
@@ -668,8 +679,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _meshDirtyStamps.Clear();
         _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
-        _pendingSimplificationInput = null;
         _nextMeshTime = 0f;
+        _lastScheduledMeshIntervalSeconds = 0f;
+        _asyncMeshingPending = false;
+        _skippedAsyncBusyCount = 0;
+        _meshPublicationCount = 0;
         AcceptedPairCount = 0;
         DroppedBusyPairCount = 0;
         ReadbackFailureCount = 0;
@@ -1029,8 +1043,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             if (!reader.TryReadNext(out frame))
             {
                 if (_meshQueue.Count > 0 || _meshPassActive ||
-                    _simplificationTask != null ||
-                    _pendingSimplificationInput != null)
+                    _simplificationTask != null)
                 {
                     _nextReplayTime = Time.unscaledTime + 0.05f;
                     return;
@@ -1449,6 +1462,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string sourceSampleCoordinates;
         public string resampleKernel;
         public string missingSourceRule;
+        public bool uncertaintyRuleKnown;
+        public float uncertaintyRejectThreshold;
+        public string uncertaintyRule;
+        public bool uncertaintyInputAvailable;
+        public bool uncertaintyApplied;
+        public string uncertaintyInputStatus;
         public string tape;
         public string coordinateSpace;
         public int inputWidth;
@@ -1504,6 +1523,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float correctionDelayMaxSeconds;
         public float correctionPairLagMean;
         public int correctionPairLagMax;
+        public bool adaptiveMeshIntervalEnabled;
+        public int adaptiveMeshIntervalMaximumMilliseconds;
+        public int adaptiveMeshIntervalBaseMilliseconds;
+        public int adaptiveMeshIntervalBucketMilliseconds;
+        public int adaptiveMeshIntervalTriangleBucket;
+        public float lastScheduledMeshIntervalSeconds;
+        public bool asyncMeshingSingleFlight;
+        public int skippedAsyncBusy;
+        public int meshPublications;
+        public string publicationOrder;
         public string finalMeshPath;
         public string finalMeshSha256;
         public int finalMeshVertices;
@@ -1553,13 +1582,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxDirectSampleRemoveSmall32Regular10cmMesh",
+                    "V2CWhiteboxLifecycleRegular10cmMesh",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
                 sourceSampleCoordinates = "IntegerGridPoints",
                 resampleKernel = "AlignedExactCopy",
                 missingSourceRule = "KeepDerivedSampleUnobserved",
+                uncertaintyRuleKnown = true,
+                uncertaintyRejectThreshold = UncertaintyRejectThreshold,
+                uncertaintyRule =
+                    "DiscardIfUncertaintyGreaterThan89AndDepthWithinMax",
+                uncertaintyInputAvailable = false,
+                uncertaintyApplied = false,
+                uncertaintyInputStatus =
+                    "MetaOpenXRProviderPublishesDepthOnly_NoSubstitution",
                 tape = TapePath,
                 coordinateSpace = reader != null
                     ? reader.CoordinateSpace
@@ -1655,6 +1692,22 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                       _correctionPublicationCount
                     : 0f,
                 correctionPairLagMax = _correctionPairLagMax,
+                adaptiveMeshIntervalEnabled = true,
+                adaptiveMeshIntervalMaximumMilliseconds =
+                    Mathf.RoundToInt(MeshIntervalMaximumSeconds * 1000f),
+                adaptiveMeshIntervalBaseMilliseconds =
+                    Mathf.RoundToInt(MeshIntervalBaseSeconds * 1000f),
+                adaptiveMeshIntervalBucketMilliseconds =
+                    Mathf.RoundToInt(MeshIntervalBucketSeconds * 1000f),
+                adaptiveMeshIntervalTriangleBucket =
+                    MeshIntervalTriangleBucket,
+                lastScheduledMeshIntervalSeconds =
+                    _lastScheduledMeshIntervalSeconds,
+                asyncMeshingSingleFlight = true,
+                skippedAsyncBusy = _skippedAsyncBusyCount,
+                meshPublications = _meshPublicationCount,
+                publicationOrder =
+                    "BuildBack_ReplaceFront_ThenReleaseOldFront",
                 finalMeshPath = meshMetrics.path,
                 finalMeshSha256 = meshMetrics.sha256,
                 finalMeshVertices = meshMetrics.vertices,
@@ -2132,8 +2185,27 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         if (_meshPassActive)
             return true;
-        if (Time.unscaledTime < _nextMeshTime)
+        if (Time.unscaledTime <= _nextMeshTime)
             return false;
+        int band = Mathf.Max(0, PreviewTriangleCount) /
+                   MeshIntervalTriangleBucket;
+        _lastScheduledMeshIntervalSeconds = Mathf.Min(
+            MeshIntervalMaximumSeconds,
+            MeshIntervalBaseSeconds + MeshIntervalBucketSeconds * band);
+        // The recovered gate advances its timestamp as soon as a due trigger
+        // fires, before the separate submit path discovers a busy future.
+        _nextMeshTime = Time.unscaledTime +
+                        _lastScheduledMeshIntervalSeconds;
+        // Native scheduling is single-flight across the complete asynchronous
+        // meshing job. A due trigger while the prior future is still running
+        // is skipped; it does not accumulate another immutable snapshot.
+        if (_simplificationTask != null)
+        {
+            _skippedAsyncBusyCount++;
+            _asyncMeshingPending = true;
+            return false;
+        }
+        _asyncMeshingPending = false;
         _meshPassActive = true;
         _passDerivedValidSamples = 0;
         _passDerivedMissingSamples = 0;
@@ -2155,9 +2227,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
             _firstMeshPair = _replayedFrames;
         }
-        int band = Mathf.Max(0, PreviewTriangleCount) / 6000;
-        _nextMeshTime = Time.unscaledTime +
-                        Mathf.Min(0.9f, 0.15f + 0.25f * band);
     }
 
     private void ProcessMeshSlice()
@@ -2483,12 +2552,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void QueueSimplification(
         RoomSetupReplicaV2XrtSimplifier.Input input)
     {
-        // Mirror the recovered single-flight publication behavior. Meshing
-        // can continue while one immutable snapshot is simplified; only the
-        // newest waiting snapshot is retained.
+        // The normal path cannot enter here while a prior job is active,
+        // because BeginMeshPass enforces single-flight. Keep the same skip
+        // semantics as a defensive invariant instead of queuing a snapshot.
         if (_simplificationTask != null)
         {
-            _pendingSimplificationInput = input;
+            if (!_asyncMeshingPending)
+                _skippedAsyncBusyCount++;
+            _asyncMeshingPending = true;
+            for (int i = 0; i < input.publicationChunkIds.Length; i++)
+            {
+                Vector3Int chunkId = input.publicationChunkIds[i];
+                if (_queuedMeshChunks.Add(chunkId))
+                    _meshQueue.Enqueue(chunkId);
+            }
             return;
         }
         StartSimplification(input);
@@ -2520,16 +2597,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "[RoomSetupReplicaV2] XRT simplification failed: " +
                 exception);
         }
-        RoomSetupReplicaV2XrtSimplifier.Input pending =
-            _pendingSimplificationInput;
-        _pendingSimplificationInput = null;
-        if (pending != null && pending.resetGeneration == _resetGeneration)
-            StartSimplification(pending);
     }
 
     private void PublishSimplificationResult(
         RoomSetupReplicaV2XrtSimplifier.Result result)
     {
+        _meshPublicationCount++;
         LastSimplificationApplied = result.applied;
         LastPreSimplificationVertexCount = result.inputVertices;
         LastPreSimplificationTriangleCount = result.inputTriangles;

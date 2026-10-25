@@ -58,9 +58,10 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   target is deliberately not forced; the error/topology rules may stop first.
   Surviving vertices remain at measured Marching-Cubes positions, so this is
   simplification rather than an unrelated smoothing pass. It runs on an
-  immutable background snapshot with one active job and one newest pending
-  snapshot; the current Front remains visible until a complete result is
-  ready. While disabled, the post-`<32` mesh passes through unchanged. Until
+  immutable background snapshot with one active job. A due trigger while that
+  job is busy is skipped and counted rather than queued; the current Front
+  remains visible until a complete result is ready. While disabled, the
+  post-`<32` mesh passes through unchanged. Until
   the exact native terminal topology rule is resolved, a
   non-empty cleaned input that simplifies to zero faces is rejected and the
   cleaned input is published unchanged; this is an explicit publication
@@ -94,8 +95,10 @@ Artifacts on Quest are written below
 - `last-replay-mesh.ply`: deterministic binary little-endian final mesh in
   Quest Stage coordinates. The receipt includes its SHA-256 hash.
 
-The replay receipt also reports first-mesh latency, local dirty-to-publication
-delay, replay throughput, pre/post `<32` cleanup counts and time, XRT
+The replay receipt also reports the known-but-unavailable uncertainty rule,
+adaptive interval constants, single-flight busy skips, mesh publication count,
+first-mesh latency, local dirty-to-publication delay, replay throughput,
+pre/post `<32` cleanup counts and time, XRT
 pre/target/post counts, accepted collapses, rejection counts, stop reason and
 background processing time, seam-welded connected components, and a local
 planar residual over normal-consistent vertices. Direct-depth support
