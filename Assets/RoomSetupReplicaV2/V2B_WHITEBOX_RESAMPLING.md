@@ -88,7 +88,7 @@ target                        current vertices / 20
 random generator              MT19937, seed 13
 candidates per batch          16 unique directed triangle corners
 accepted cost                 cost < 0.075 m
-physical-error terms          0.0075 m and 0.0375 m
+optional regularizer factors  float bits 0x00000080 and 0x00000020
 normal compatibility          oldNormal dot newNormal >= 0.1
 failed-batch stop             200 total failed batches
 ```
@@ -108,6 +108,17 @@ clean-room equivalent of native `0x797180`, not a claim of instruction-level
 or floating-point-order identity. The replay receipt exposes every reduction,
 rejection and stop reason so the same tape can reveal a mismatched metric
 instead of hiding it behind a visually pleasant result.
+
+An initial implementation incorrectly associated the nearby `0.1 / 0.5`
+constant pair with the XRT regularizer fields. Device replay exposed the
+mistake: only 130 of 14,829 vertices collapsed before 200 failed batches.
+Rechecking constructor assembly at actual ELF `0x60dc20` shows that it loads
+eight bytes from VA `0x120060`, whose two dwords are `0x00000080` and
+`0x00000020`. Interpreted by the later floating-point instructions and
+multiplied by the base error, both optional terms underflow to near zero.
+Consequently the active physical metric is overwhelmingly accumulated
+point-to-plane displacement; `0.1 / 0.5` belongs to a different constant pair
+and must not be substituted.
 
 ## Static evidence
 

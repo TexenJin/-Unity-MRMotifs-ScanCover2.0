@@ -51,8 +51,9 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   complete seam-welded candidate. It follows the observed XRT directed-edge
   collapse envelope: minimum 100 input triangles, target `vertices / 20`,
   MT19937 seed 13, 16 unique directed candidates per batch, a `0.075 m`
-  acceptance ceiling, `0.0075 / 0.0375` physical-error terms, manifold and
-  normal-flip rejection (`dot >= 0.1`), and at most 200 failed batches. The
+  point-to-plane acceptance ceiling, near-zero optional regularizers loaded
+  from float bit patterns `0x80 / 0x20`, manifold and normal-flip rejection
+  (`dot >= 0.1`), and at most 200 failed batches. The
   target is deliberately not forced; the error/topology rules may stop first.
   Surviving vertices remain at measured Marching-Cubes positions, so this is
   simplification rather than an unrelated smoothing pass. It runs on an

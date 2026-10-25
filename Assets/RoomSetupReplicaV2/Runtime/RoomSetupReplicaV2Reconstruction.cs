@@ -1399,6 +1399,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int simplificationMaximumFailedBatches;
         public int simplificationRandomSeed;
         public float simplificationMaximumErrorMeters;
+        public int simplificationAreaErrorFactorBits;
+        public int simplificationShapeErrorFactorBits;
         public float simplificationAreaErrorMeters;
         public float simplificationShapeErrorMeters;
         public float simplificationMinimumNormalDot;
@@ -1476,7 +1478,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxDirectSampleRemoveSmall32XrtMetricCollapse",
+                    "V2BWhiteboxDirectSampleRemoveSmall32XrtPointPlaneCollapse",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1518,6 +1520,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     (int)RoomSetupReplicaV2XrtSimplifier.RandomSeed,
                 simplificationMaximumErrorMeters =
                     RoomSetupReplicaV2XrtSimplifier.MaximumErrorMeters,
+                simplificationAreaErrorFactorBits =
+                    RoomSetupReplicaV2XrtSimplifier.AreaErrorFactorBits,
+                simplificationShapeErrorFactorBits =
+                    RoomSetupReplicaV2XrtSimplifier.ShapeErrorFactorBits,
                 simplificationAreaErrorMeters =
                     RoomSetupReplicaV2XrtSimplifier.AreaErrorMeters,
                 simplificationShapeErrorMeters =

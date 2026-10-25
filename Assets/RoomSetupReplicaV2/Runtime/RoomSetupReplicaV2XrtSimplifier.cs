@@ -18,8 +18,22 @@ internal static class RoomSetupReplicaV2XrtSimplifier
     internal const int MaximumFailedBatches = 200;
     internal const uint RandomSeed = 13;
     internal const float MaximumErrorMeters = 0.075f;
-    internal const float AreaErrorMeters = 0.0075f;
-    internal const float ShapeErrorMeters = 0.0375f;
+    // Constructor 0x60dc20 loads the dword bit patterns 0x80 and 0x20 from
+    // libmrengine VA 0x120060 into the two XRT multiplier fields. They are
+    // floats, not the decimal values 0.1 and 0.5 found at a different address.
+    // Multiplication by the 0.075 m base therefore underflows both optional
+    // regularizers to near zero; the active metric is overwhelmingly the
+    // accumulated point-to-plane displacement recovered at 0x697180.
+    internal const int AreaErrorFactorBits = 0x00000080;
+    internal const int ShapeErrorFactorBits = 0x00000020;
+    internal const float AreaErrorFactor =
+        1.793662034335766e-43f;
+    internal const float ShapeErrorFactor =
+        4.484155085839415e-44f;
+    internal const float AreaErrorMeters =
+        MaximumErrorMeters * AreaErrorFactor;
+    internal const float ShapeErrorMeters =
+        MaximumErrorMeters * ShapeErrorFactor;
     internal const float MinimumNormalDot = 0.1f;
 
     internal sealed class Input
@@ -385,7 +399,7 @@ internal static class RoomSetupReplicaV2XrtSimplifier
             float qualityRatio = oldQuality /
                                  Mathf.Max(0.0000001f, newQuality);
             cost += pointPlane +
-                    newLength * 0.25f * AreaErrorMeters +
+                    newLength * 0.5f * AreaErrorMeters +
                     qualityRatio * ShapeErrorMeters;
             if (!(cost < MaximumErrorMeters))
             {
@@ -449,7 +463,8 @@ internal static class RoomSetupReplicaV2XrtSimplifier
         Result result)
     {
         var remap = new int[sourceVertices.Length];
-        Array.Fill(remap, -1);
+        for (int i = 0; i < remap.Length; i++)
+            remap[i] = -1;
         var vertices = new List<Vector3>(sourceVertices.Length);
         var triangles = new List<int>(faces.Length * 3);
         var owners = new List<int>(faces.Length);
