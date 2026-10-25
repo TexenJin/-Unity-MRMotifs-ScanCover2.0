@@ -10,19 +10,17 @@ placeholder scene with a Meta XR Building Blocks scene, adds only `DepthCapture`
 
 Quest controls:
 
-- Right index trigger: start/stop coverage and its bounded exact-input
-  recording together (up to 180 accepted stereo pairs).
-- A: stop live coverage, clear the current replica, and replay the last tape.
-- B: clear the replica volume and mesh.
-- X: show/hide the replica mesh.
+- A: clear the current replica and replay the fixed last tape.
+- Right index trigger, B and X are temporarily disabled in `replayOnlyMode`
+  while the V2-B simplifier is compared on one immutable input.
 
 All controller actions share a 250 ms debounce window so one physical press
 cannot restart a replay or trigger two state transitions.
 
-The application starts idle. Recording is armed by the same trigger press as
-coverage and begins on the first accepted stereo depth pair, so visual coverage
-cannot silently run without its matching tape. The second trigger press closes
-the tape before stopping capture.
+When recording controls are restored, capture writes to a temporary tape.
+Only a clean recording containing at least 16 stereo pairs replaces
+`last-session.rsv2`; a short, failed or interrupted recording preserves the
+previous comparison tape.
 
 V2 keeps V1 intact and changes two deliberately isolated parts:
 
@@ -59,7 +57,10 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   simplification rather than an unrelated smoothing pass. It runs on an
   immutable background snapshot with one active job and one newest pending
   snapshot; the current Front remains visible until a complete result is
-  ready.
+  ready. Until the exact native terminal topology rule is resolved, a
+  non-empty cleaned input that simplifies to zero faces is rejected and the
+  cleaned input is published unchanged; this is an explicit publication
+  fail-safe rather than a substitute simplification metric.
 
 The first device-backed scheduling correction raises the per-slice chunk guard
 from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no

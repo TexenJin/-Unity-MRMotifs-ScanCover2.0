@@ -314,6 +314,16 @@ internal static class RoomSetupReplicaV2XrtSimplifier
             ? "TargetVertexCount"
             : "MaximumFailedBatches";
         Compact(input.vertices, faces, vertexActive, result);
+        // A short, nearly planar tape can make every directed collapse look
+        // geometrically free. Never replace a non-empty cleaned Front with an
+        // empty result while the exact native terminal topology rule remains
+        // unresolved. This is a publication fail-safe, not a metric change.
+        if (result.inputTriangles > 0 && result.outputTriangles == 0)
+        {
+            CopyInput(input, result);
+            result.applied = false;
+            result.stopReason = "EmptyOutputRejected";
+        }
         watch.Stop();
         result.elapsedMilliseconds = watch.Elapsed.TotalMilliseconds;
         return result;

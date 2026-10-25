@@ -1,13 +1,14 @@
 using UnityEngine;
 
 /// <summary>
-/// Right trigger starts/stops coverage and recording together; A replays the
-/// last tape; B clears; X toggles the replica mesh.
+/// Replay-lab input. A replays the fixed tape. Other controls remain in the
+/// component for later capture work but are disabled by replayOnlyMode.
 /// </summary>
 public sealed class RoomSetupReplicaV2Input : MonoBehaviour
 {
     [SerializeField] private OVRInput.Controller controller =
         OVRInput.Controller.RTouch;
+    [SerializeField] private bool replayOnlyMode = true;
     [SerializeField, Range(0.05f, 0.5f)]
     private float actionDebounceSeconds = 0.25f;
     private float _previousTrigger;
@@ -17,6 +18,13 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
     {
         RoomSetupReplicaV2Scanner scanner = RoomSetupReplicaV2Scanner.Instance;
         if (scanner == null)
+            return;
+        if (OVRInput.GetDown(OVRInput.RawButton.A) && AcceptAction())
+        {
+            scanner.ReplayLastTape();
+            Pulse(0.5f, 0.12f);
+        }
+        if (replayOnlyMode)
             return;
         float trigger = OVRInput.Get(
             OVRInput.Axis1D.PrimaryIndexTrigger, controller);
@@ -31,11 +39,6 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
             AcceptAction())
         {
             scanner.ClearReplica();
-            Pulse(0.5f, 0.12f);
-        }
-        if (OVRInput.GetDown(OVRInput.RawButton.A) && AcceptAction())
-        {
-            scanner.ReplayLastTape();
             Pulse(0.5f, 0.12f);
         }
         if (OVRInput.GetDown(OVRInput.RawButton.X) && AcceptAction())

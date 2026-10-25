@@ -37,6 +37,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float SeamWeldUnitsPerMeter = 10000f;
     private const int RemoveSmallTriangleThreshold = 32;
     private const int RemoveSmallTriangleGate = 40000;
+    private const int MinimumRecordedPairsToCommit = 16;
 
     private enum WorkStage : byte
     {
@@ -240,6 +241,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public string TapePath => Path.Combine(
         Application.persistentDataPath,
         "RoomSetupReplicaV2", "last-session.rsv2");
+    private string PendingTapePath => TapePath + ".recording";
+    private string BackupTapePath => TapePath + ".previous";
     public string CompactStatus =>
         $"RS-V2 p={AcceptedPairCount:D6} chunk={ActiveChunkCount:D4} " +
         $"vox={WeightedVoxelCount:D7} tri={PreviewTriangleCount:D6} " +
@@ -463,9 +466,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         }
         try
         {
+            RecoverInterruptedRecording();
             _tapeWriter = new RoomSetupReplicaV2Tape.Writer(
-                TapePath, _width, _height, maximumRecordedPairs);
-            Debug.Log("[RoomSetupReplicaV2] recording: " + TapePath);
+                PendingTapePath, _width, _height, maximumRecordedPairs);
+            Debug.Log(
+                "[RoomSetupReplicaV2] recording pending: " +
+                PendingTapePath);
             return true;
         }
         catch (Exception exception)
@@ -484,12 +490,81 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         RoomSetupReplicaV2Tape.Writer writer = _tapeWriter;
         _tapeWriter = null;
         writer.Dispose();
+        bool committed = writer.Failure == null &&
+                         writer.WrittenFrames >=
+                         MinimumRecordedPairsToCommit &&
+                         TryCommitRecording(writer.Path);
+        if (!committed)
+            DeleteFileQuietly(writer.Path);
         Debug.Log(
             $"[RoomSetupReplicaV2] tape closed written={writer.WrittenFrames} " +
-            $"dropped={writer.DroppedFrames} path={writer.Path}");
+            $"dropped={writer.DroppedFrames} committed={committed} " +
+            $"path={(committed ? TapePath : writer.Path)}");
         if (writer.Failure != null)
             Debug.LogError(
                 "[RoomSetupReplicaV2] tape writer failed: " + writer.Failure);
+        else if (writer.WrittenFrames < MinimumRecordedPairsToCommit)
+            Debug.LogWarning(
+                "[RoomSetupReplicaV2] short recording rejected; existing " +
+                $"tape preserved ({writer.WrittenFrames} < " +
+                $"{MinimumRecordedPairsToCommit} pairs)");
+    }
+
+    private void RecoverInterruptedRecording()
+    {
+        string directory = Path.GetDirectoryName(TapePath);
+        if (!string.IsNullOrEmpty(directory))
+            Directory.CreateDirectory(directory);
+        if (!File.Exists(TapePath) && File.Exists(BackupTapePath))
+            File.Move(BackupTapePath, TapePath);
+        else if (File.Exists(BackupTapePath))
+            File.Delete(BackupTapePath);
+        DeleteFileQuietly(PendingTapePath);
+    }
+
+    private bool TryCommitRecording(string pendingPath)
+    {
+        try
+        {
+            DeleteFileQuietly(BackupTapePath);
+            bool hadPrevious = File.Exists(TapePath);
+            if (hadPrevious)
+                File.Move(TapePath, BackupTapePath);
+            try
+            {
+                File.Move(pendingPath, TapePath);
+            }
+            catch
+            {
+                if (!File.Exists(TapePath) && File.Exists(BackupTapePath))
+                    File.Move(BackupTapePath, TapePath);
+                throw;
+            }
+            DeleteFileQuietly(BackupTapePath);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Debug.LogError(
+                "[RoomSetupReplicaV2] tape commit failed; previous tape " +
+                "was preserved when recoverable: " + exception);
+            return false;
+        }
+    }
+
+    private static void DeleteFileQuietly(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception exception)
+        {
+            Debug.LogWarning(
+                "[RoomSetupReplicaV2] could not delete temporary tape " +
+                path + ": " + exception.Message);
+        }
     }
 
     public bool BeginReplayLast()
@@ -1478,7 +1553,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxDirectSampleRemoveSmall32XrtPointPlaneCollapse",
+                    "V2BWhiteboxDirectSampleRemoveSmall32XrtPointPlaneEmptyFallback",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
