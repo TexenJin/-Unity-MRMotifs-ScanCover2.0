@@ -67,9 +67,11 @@ Artifacts on Quest are written below
 
 The replay receipt also reports first-mesh latency, local dirty-to-publication
 delay, replay throughput, seam-welded connected components, and a local planar
-residual over normal-consistent vertices. Direct-depth support is explicitly
-marked unavailable until final triangles are reprojected against every tape
-packet; TSDF weights are not used as a substitute.
+residual over normal-consistent vertices. Direct-depth support reprojects every
+final triangle against every stereo tape packet. A triangle is supported when
+its centroid agrees with either eye's depth within 5 cm, or at least two of its
+vertices agree within the same packet. The receipt keeps this offline analysis
+time separate from replay throughput; TSDF weights are not used as a substitute.
 
 This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace

@@ -85,6 +85,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int planarVertices;
         public float planeResidualRmsMeters;
         public float planeResidualP95Meters;
+        public bool directDepthSupportMeasured;
+        public int trianglesWithoutDirectDepthSupport;
+        public float directDepthSupportRatio;
+        public float directDepthAnalysisMilliseconds;
     }
 
     private readonly struct QuantizedPosition : IEquatable<QuantizedPosition>
@@ -1295,6 +1299,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [Serializable]
     private sealed class ReplayReceipt
     {
+        public string algorithm;
         public string tape;
         public string coordinateSpace;
         public int inputWidth;
@@ -1328,6 +1333,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float planeResidualP95Meters;
         public bool directDepthSupportMeasured;
         public int trianglesWithoutDirectDepthSupport;
+        public float directDepthSupportRatio;
+        public float directDepthAnalysisMilliseconds;
     }
 
     private void CompleteReplay()
@@ -1346,11 +1353,23 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             FinalMeshMetrics meshMetrics =
                 ExportAndMeasureFinalMesh(directory ??
                                          Application.persistentDataPath);
+            Debug.Log(
+                "[RoomSetupReplicaV2] measuring final-triangle direct " +
+                "depth support...");
+            MeasureDirectDepthSupport(TapePath, meshMetrics);
+            Debug.Log(
+                $"[RoomSetupReplicaV2] direct support=" +
+                $"{meshMetrics.directDepthSupportRatio:P2} " +
+                $"unsupported=" +
+                $"{meshMetrics.trianglesWithoutDirectDepthSupport} " +
+                $"analysisMs=" +
+                $"{meshMetrics.directDepthAnalysisMilliseconds:F1}");
             string receiptPath = Path.Combine(
                 directory ?? Application.persistentDataPath,
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
+                algorithm = "V2WeightedEightNeighbourField",
                 tape = TapePath,
                 coordinateSpace = reader != null
                     ? reader.CoordinateSpace
@@ -1399,10 +1418,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     meshMetrics.planeResidualRmsMeters,
                 planeResidualP95Meters =
                     meshMetrics.planeResidualP95Meters,
-                // This requires reprojection against every recorded depth
-                // packet. Source TSDF weights are not substituted for it.
-                directDepthSupportMeasured = false,
-                trianglesWithoutDirectDepthSupport = -1
+                directDepthSupportMeasured =
+                    meshMetrics.directDepthSupportMeasured,
+                trianglesWithoutDirectDepthSupport =
+                    meshMetrics.trianglesWithoutDirectDepthSupport,
+                directDepthSupportRatio =
+                    meshMetrics.directDepthSupportRatio,
+                directDepthAnalysisMilliseconds =
+                    meshMetrics.directDepthAnalysisMilliseconds
             };
             File.WriteAllText(
                 receiptPath, JsonUtility.ToJson(receipt, true));
@@ -1452,6 +1475,133 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         MeasureConnectedComponents(metrics);
         MeasurePlanarResidual(metrics);
         return metrics;
+    }
+
+    private void MeasureDirectDepthSupport(
+        string tapePath, FinalMeshMetrics metrics)
+    {
+        int triangleCount = _finalTriangles.Count / 3;
+        double start = Time.realtimeSinceStartupAsDouble;
+        if (triangleCount <= 0)
+        {
+            metrics.directDepthSupportMeasured = true;
+            metrics.trianglesWithoutDirectDepthSupport = 0;
+            metrics.directDepthSupportRatio = 1f;
+            metrics.directDepthAnalysisMilliseconds = 0f;
+            return;
+        }
+
+        var supported = new bool[triangleCount];
+        int remaining = triangleCount;
+        using (var reader = new RoomSetupReplicaV2Tape.Reader(tapePath))
+        {
+            while (remaining > 0 && reader.TryReadNext(out var frame))
+            {
+                for (int triangle = 0;
+                     triangle < triangleCount;
+                     triangle++)
+                {
+                    if (supported[triangle])
+                        continue;
+                    int index = triangle * 3;
+                    Vector3 a = _finalVertices[
+                        _finalTriangles[index]];
+                    Vector3 b = _finalVertices[
+                        _finalTriangles[index + 1]];
+                    Vector3 c = _finalVertices[
+                        _finalTriangles[index + 2]];
+                    Vector3 centroid = (a + b + c) / 3f;
+                    bool hasSupport = HasDirectDepthSupport(
+                        centroid, frame, reader.Width, reader.Height);
+                    if (!hasSupport)
+                    {
+                        int supportedVertices = 0;
+                        if (HasDirectDepthSupport(
+                                a, frame, reader.Width, reader.Height))
+                            supportedVertices++;
+                        if (HasDirectDepthSupport(
+                                b, frame, reader.Width, reader.Height))
+                            supportedVertices++;
+                        if (supportedVertices < 2 &&
+                            HasDirectDepthSupport(
+                                c, frame, reader.Width, reader.Height))
+                            supportedVertices++;
+                        hasSupport = supportedVertices >= 2;
+                    }
+                    if (!hasSupport)
+                        continue;
+                    supported[triangle] = true;
+                    remaining--;
+                }
+            }
+        }
+
+        metrics.directDepthSupportMeasured = true;
+        metrics.trianglesWithoutDirectDepthSupport = remaining;
+        metrics.directDepthSupportRatio =
+            1f - remaining / (float)triangleCount;
+        metrics.directDepthAnalysisMilliseconds = (float)(
+            (Time.realtimeSinceStartupAsDouble - start) * 1000d);
+    }
+
+    private static bool HasDirectDepthSupport(
+        Vector3 stagePoint,
+        RoomSetupReplicaV2Tape.Frame frame,
+        int width,
+        int height)
+    {
+        return HasDirectDepthSupport(
+                   stagePoint, frame.leftWorldToClip,
+                   frame.leftProjectionInverse, frame.leftViewInverse,
+                   frame.leftNdc, width, height) ||
+               HasDirectDepthSupport(
+                   stagePoint, frame.rightWorldToClip,
+                   frame.rightProjectionInverse, frame.rightViewInverse,
+                   frame.rightNdc, width, height);
+    }
+
+    private static bool HasDirectDepthSupport(
+        Vector3 stagePoint,
+        Matrix4x4 stageToClip,
+        Matrix4x4 projectionInverse,
+        Matrix4x4 viewInverse,
+        float[] ndcDepths,
+        int width,
+        int height)
+    {
+        Vector4 clip = stageToClip * new Vector4(
+            stagePoint.x, stagePoint.y, stagePoint.z, 1f);
+        if (!float.IsFinite(clip.w) || clip.w <= 0.00001f)
+            return false;
+        float inverseW = 1f / clip.w;
+        float u = clip.x * inverseW * 0.5f + 0.5f;
+        float v = clip.y * inverseW * 0.5f + 0.5f;
+        if (!float.IsFinite(u) || !float.IsFinite(v) ||
+            u < 0f || u >= 1f || v < 0f || v >= 1f)
+            return false;
+        int x = Mathf.Clamp((int)(u * width), 0, width - 1);
+        int y = Mathf.Clamp((int)(v * height), 0, height - 1);
+        float ndc = ndcDepths[x + y * width];
+        if (!(ndc > 0f && ndc < 1f))
+            return false;
+
+        float sampleU = (x + 0.5f) / width;
+        float sampleV = (y + 0.5f) / height;
+        Vector4 viewH = projectionInverse * new Vector4(
+            sampleU * 2f - 1f,
+            sampleV * 2f - 1f,
+            ndc * 2f - 1f,
+            1f);
+        Vector4 stageH = viewInverse * viewH;
+        if (!float.IsFinite(stageH.w) ||
+            Mathf.Abs(stageH.w) <= 0.00001f)
+            return false;
+        Vector3 observed = new Vector3(
+            stageH.x / stageH.w,
+            stageH.y / stageH.w,
+            stageH.z / stageH.w);
+        return Finite(observed) &&
+               Vector3.Distance(stagePoint, observed) <= VoxelMeters;
     }
 
     private static int CompareChunks(
