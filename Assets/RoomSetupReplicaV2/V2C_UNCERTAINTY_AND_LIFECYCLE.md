@@ -229,3 +229,60 @@ This accepts the compiled native default, not an unevidenced claim that Meta
 can never provide a positive runtime override. The positive-frequency leaf
 path remains implemented behind the recovered timestamp gate for future
 runtime evidence.
+
+## Final bounded uncertainty trace and scar-correction implementation
+
+Static tracing is now closed at the private `Depth` / `SporadicDepthCompute`
+packet boundary. The float uncertainty plane reaches
+`filterDepthUncertainty` with the confirmed `> 89` rejection rule, but the
+packet and its owner are carried by private capability callbacks. The only
+related exports register system AOSP image/event callbacks; they do not return
+the reconstruction depth packet or uncertainty plane. The exact rule remains
+receipt-visible and unapplied. Confidence, TSDF weight, gradients, and temporal
+stability are not substituted for it.
+
+The next V2-C implementation consists of three independently receipted rules:
+
+1. `last-replay-spatial-receipt.json` maps every final triangle lacking direct
+   tape support into welded spatial clusters. Per-triangle centroid, normal,
+   area, bounds, depth residual range, and evidence counts are retained. Both
+   foreground and background residual signs classify a cross-layer connection
+   candidate; repeated one-sided contradiction classifies a historical-shell
+   candidate. The result is an offline receipt only and does not add a HUD.
+2. Every source voxel retains its latest direct surface anchor. Before
+   Marching Cubes, the eight corners of a 10 cm cell are projected onto that
+   cell's SDF-gradient normal. A span greater than `0.15 m`, or a corner with
+   no direct layer witness, leaves the cell empty. Tangential separation on
+   the same wall is allowed. This is a depth-layer compatibility rule, not an
+   eight-neighbour count.
+3. A weighted voxel is locally retired only after three distinct stereo pairs
+   directly provide a sign-opposite sample at least half a source voxel from
+   zero. Confirming evidence resets the streak. No unobserved/out-of-range
+   voxel is changed, and there is no global weight decay.
+
+Both production rules are serialized switches and default enabled. The normal
+replay receipt records their thresholds, rejected-cell/vote/retirement counts,
+and the spatial receipt path. Quest APK and device acceptance remain a separate
+step; source implementation alone does not accept the geometry.
+
+### Frozen-baseline spatial receipt generated
+
+The offline tool was run against the accepted native-GC-gate mesh and the
+preserved 156-pair Quest Stage tape. It independently reproduced the existing
+direct-support result exactly before classifying it:
+
+```text
+final triangles                    27397
+triangles without direct support    2523
+direct support ratio             0.9079096251
+welded scar clusters                    130
+cross-layer candidates                2213
+historical-shell candidates            298
+insufficient evidence                   12
+mesh SHA-256       3C528BE8B2615E06F48038252A7F93A9134F11D657F29782C042F9700D4C4B9D
+tape SHA-256       A37036993CF429E4386DFB5BF2201EC82C48C8DD05C19BDFC7630869417C0399
+```
+
+The resulting `last-replay-spatial-receipt.json` contains exactly 2,523
+triangle records and 130 cluster records. Classification is evidence for the
+next A/B test, not proof that every listed triangle is visibly objectionable.

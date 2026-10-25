@@ -43,6 +43,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float SeamWeldUnitsPerMeter = 10000f;
     private const int RemoveSmallTriangleThreshold = 32;
     private const int RemoveSmallTriangleGate = 40000;
+    private const float DirectSupportMeters = VoxelMeters;
+    private const float ScarContradictionMeters = DerivedVoxelMeters;
+    private const float SameLayerMaximumSeparationMeters = 0.15f;
+    private const float ContradictionMinimumDistanceMeters =
+        VoxelMeters * 0.5f;
+    private const byte ContradictionPairsToRetire = 3;
     private const int MinimumRecordedPairsToCommit = 16;
     // Recovered Room Setup input rule. The public Meta OpenXR provider used by
     // this project exposes only _EnvironmentDepthTexture, not the native
@@ -75,6 +81,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         public float distance;
         public float weight;
+        // Latest directly observed surface point that supported this source
+        // voxel. It is provenance, not another filtering weight.
+        public Vector3 layerAnchor;
+        public int lastEvidencePair;
+        public byte contradictionStreak;
     }
 
     private sealed class Chunk
@@ -113,6 +124,55 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int trianglesWithoutDirectDepthSupport;
         public float directDepthSupportRatio;
         public float directDepthAnalysisMilliseconds;
+        public string spatialReceiptPath = string.Empty;
+        public int scarClusters;
+        public int crossLayerCandidateTriangles;
+        public int historicalShellCandidateTriangles;
+        public int insufficientEvidenceTriangles;
+    }
+
+    [Serializable]
+    private sealed class SpatialTriangleReceipt
+    {
+        public int triangle;
+        public int cluster;
+        public Vector3 centroid;
+        public Vector3 normal;
+        public float areaSquareMeters;
+        public int validDepthObservations;
+        public int foregroundContradictions;
+        public int backgroundContradictions;
+        public float nearestAbsoluteResidualMeters;
+        public float minimumResidualMeters;
+        public float maximumResidualMeters;
+        public string classification;
+    }
+
+    [Serializable]
+    private sealed class SpatialClusterReceipt
+    {
+        public int cluster;
+        public int triangles;
+        public Vector3 boundsMin;
+        public Vector3 boundsMax;
+        public int crossLayerCandidates;
+        public int historicalShellCandidates;
+        public int insufficientEvidence;
+    }
+
+    [Serializable]
+    private sealed class SpatialScarReceipt
+    {
+        public string coordinateSpace;
+        public string sourceMeshSha256;
+        public float directSupportMeters;
+        public float contradictionMeters;
+        public string classificationRule;
+        public int totalTriangles;
+        public int unsupportedTriangles;
+        public int clusters;
+        public SpatialClusterReceipt[] clusterReceipts;
+        public SpatialTriangleReceipt[] triangleReceipts;
     }
 
     private readonly struct QuantizedPosition : IEquatable<QuantizedPosition>
@@ -215,6 +275,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private float garbageCollectionFrequencyHz =
         NativeGarbageFrequencyDefaultHz;
 
+    [Header("V2-C scar correction")]
+    [SerializeField, Tooltip(
+        "Require the eight 10 cm cell samples to describe one compatible " +
+        "depth layer. This uses direct surface provenance, not neighbour " +
+        "counting.")]
+    private bool enforceSameLayerSupport = true;
+    [SerializeField, Tooltip(
+        "Retire an old zero crossing only after three distinct stereo pairs " +
+        "directly observe the opposite sign. Unobserved voxels never decay.")]
+    private bool retireRepeatedContradictions = true;
+
     [Header("Deterministic input tape")]
     [SerializeField, Range(10, 600)]
     private int maximumRecordedPairs = 180;
@@ -243,6 +314,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int LastRemovedSmallTriangleCount { get; private set; }
     public int LastPostCleanupComponentCount { get; private set; }
     public float LastComponentCleanupMilliseconds { get; private set; }
+    public int SameLayerRejectedCellCount { get; private set; }
+    public int ContradictionVoteCount { get; private set; }
+    public int RetiredContradictedVoxelCount { get; private set; }
     public bool LastSimplificationApplied { get; private set; }
     public int LastPreSimplificationVertexCount { get; private set; }
     public int LastPreSimplificationTriangleCount { get; private set; }
@@ -375,6 +449,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private readonly float[] _sampleDistances = new float[SampleCount];
     private readonly byte[] _sampleObserved = new byte[SampleCount];
+    private readonly Vector3[] _sampleLayerAnchors =
+        new Vector3[SampleCount];
+    private readonly byte[] _sampleLayerObserved = new byte[SampleCount];
     private readonly int[] _xEdgeVertices =
         new int[ChunkSize * SampleSize * SampleSize];
     private readonly int[] _yEdgeVertices =
@@ -720,6 +797,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastRemovedSmallTriangleCount = 0;
         LastPostCleanupComponentCount = 0;
         LastComponentCleanupMilliseconds = 0f;
+        SameLayerRejectedCellCount = 0;
+        ContradictionVoteCount = 0;
+        RetiredContradictedVoxelCount = 0;
         LastSimplificationApplied = false;
         LastPreSimplificationVertexCount = 0;
         LastPreSimplificationTriangleCount = 0;
@@ -952,7 +1032,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     {
                         IntegrateChunk(
                             _leftCandidates[_leftChunkCursor++],
-                            _leftDepth, _leftContinuous,
+                            _leftPixels, _leftDepth, _leftContinuous,
                             _leftWorldToClip);
                         chunkWork++;
                     }
@@ -968,7 +1048,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     {
                         IntegrateChunk(
                             _rightCandidates[_rightChunkCursor++],
-                            _rightDepth, _rightContinuous,
+                            _rightPixels, _rightDepth, _rightContinuous,
                             _rightWorldToClip);
                         chunkWork++;
                     }
@@ -1295,6 +1375,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void IntegrateChunk(
         Vector3Int chunkId,
+        NativeArray<Color> pixels,
         float[] depths,
         byte[] accepted,
         Matrix4x4 worldToClip)
@@ -1345,18 +1426,62 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             float sampleWeight = 1f /
                 Mathf.Max(0.000001f, factor * factor);
             Voxel old = chunk.voxels[local];
+            int pair = _processingReplayFrame
+                ? _replayedFrames + 1
+                : AcceptedPairCount + 1;
+            byte contradictionStreak = old.contradictionStreak;
+            int lastEvidencePair = old.lastEvidencePair;
+            bool oppositeDirectObservation = old.weight > 0f &&
+                Mathf.Abs(old.distance) >=
+                    ContradictionMinimumDistanceMeters &&
+                Mathf.Abs(sampleDistance) >=
+                    ContradictionMinimumDistanceMeters &&
+                Mathf.Sign(old.distance) != Mathf.Sign(sampleDistance);
+            if (old.weight > 0f && pair != lastEvidencePair)
+            {
+                if (oppositeDirectObservation)
+                {
+                    contradictionStreak = (byte)Mathf.Min(
+                        byte.MaxValue, contradictionStreak + 1);
+                    ContradictionVoteCount++;
+                }
+                else
+                {
+                    contradictionStreak = 0;
+                }
+                lastEvidencePair = pair;
+            }
             float retained = old.weight > 0f
                 ? Mathf.Min(old.weight, MaximumWeight - sampleWeight)
                 : 0f;
+            if (retireRepeatedContradictions &&
+                contradictionStreak >= ContradictionPairsToRetire)
+            {
+                // Retirement is local and evidence driven. Nothing happens
+                // to voxels that are absent or outside the direct depth view.
+                retained = 0f;
+                contradictionStreak = 0;
+                RetiredContradictedVoxelCount++;
+            }
             retained = Mathf.Max(0f, retained);
             float newWeight = retained + sampleWeight;
+            Color surface = pixels[index];
+            Vector3 layerAnchor = new Vector3(
+                surface.r, surface.g, surface.b);
             Voxel updated = new Voxel
             {
                 distance = QuantizeHalf(retained > 0f
                     ? (old.distance * retained + sampleDistance * sampleWeight) /
                       newWeight
                     : sampleDistance),
-                weight = QuantizeHalf(newWeight)
+                weight = QuantizeHalf(newWeight),
+                layerAnchor = Finite(layerAnchor)
+                    ? layerAnchor
+                    : old.layerAnchor,
+                lastEvidencePair = lastEvidencePair == 0
+                    ? pair
+                    : lastEvidencePair,
+                contradictionStreak = contradictionStreak
             };
             chunk.voxels[local] = updated;
             if (old.weight <= 0f)
@@ -1710,6 +1835,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int trianglesWithoutDirectDepthSupport;
         public float directDepthSupportRatio;
         public float directDepthAnalysisMilliseconds;
+        public string spatialScarReceiptPath;
+        public int spatialScarClusters;
+        public int crossLayerCandidateTriangles;
+        public int historicalShellCandidateTriangles;
+        public int insufficientEvidenceTriangles;
+        public bool sameLayerSupportEnabled;
+        public float sameLayerMaximumSeparationMeters;
+        public int sameLayerRejectedCells;
+        public string sameLayerRule;
+        public bool contradictionRetirementEnabled;
+        public float contradictionMinimumDistanceMeters;
+        public int contradictionPairsToRetire;
+        public int contradictionVotes;
+        public int retiredContradictedVoxels;
+        public string contradictionRetirementRule;
     }
 
     private void CompleteReplay()
@@ -1745,7 +1885,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2CWhiteboxLifecycleFrequencyGatedLeafGcRegular10cmMesh",
+                    "V2CSpatialReceiptSameLayerRepeatedContradiction",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1759,7 +1899,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 uncertaintyInputAvailable = false,
                 uncertaintyApplied = false,
                 uncertaintyInputStatus =
-                    "MetaOpenXRProviderPublishesDepthOnly_NoSubstitution",
+                    "PrivateDepthCapabilityBuffer_NoExport_NoSubstitution",
                 tape = TapePath,
                 coordinateSpace = reader != null
                     ? reader.CoordinateSpace
@@ -1915,7 +2055,33 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 directDepthSupportRatio =
                     meshMetrics.directDepthSupportRatio,
                 directDepthAnalysisMilliseconds =
-                    meshMetrics.directDepthAnalysisMilliseconds
+                    meshMetrics.directDepthAnalysisMilliseconds,
+                spatialScarReceiptPath =
+                    meshMetrics.spatialReceiptPath,
+                spatialScarClusters = meshMetrics.scarClusters,
+                crossLayerCandidateTriangles =
+                    meshMetrics.crossLayerCandidateTriangles,
+                historicalShellCandidateTriangles =
+                    meshMetrics.historicalShellCandidateTriangles,
+                insufficientEvidenceTriangles =
+                    meshMetrics.insufficientEvidenceTriangles,
+                sameLayerSupportEnabled = enforceSameLayerSupport,
+                sameLayerMaximumSeparationMeters =
+                    SameLayerMaximumSeparationMeters,
+                sameLayerRejectedCells = SameLayerRejectedCellCount,
+                sameLayerRule =
+                    "EightDirectSurfaceAnchorsMustShareOneSdfNormalLayer",
+                contradictionRetirementEnabled =
+                    retireRepeatedContradictions,
+                contradictionMinimumDistanceMeters =
+                    ContradictionMinimumDistanceMeters,
+                contradictionPairsToRetire =
+                    ContradictionPairsToRetire,
+                contradictionVotes = ContradictionVoteCount,
+                retiredContradictedVoxels =
+                    RetiredContradictedVoxelCount,
+                contradictionRetirementRule =
+                    "ThreeDistinctDirectPairsOpposeOldSign_LocalReset_NoDecay"
             };
             File.WriteAllText(
                 receiptPath, JsonUtility.ToJson(receipt, true));
@@ -1982,10 +2148,19 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         }
 
         var supported = new bool[triangleCount];
+        var validObservations = new int[triangleCount];
+        var foregroundContradictions = new int[triangleCount];
+        var backgroundContradictions = new int[triangleCount];
+        var minimumResiduals = new float[triangleCount];
+        var maximumResiduals = new float[triangleCount];
+        var nearestResiduals = new float[triangleCount];
+        Array.Fill(minimumResiduals, float.PositiveInfinity);
+        Array.Fill(maximumResiduals, float.NegativeInfinity);
+        Array.Fill(nearestResiduals, float.PositiveInfinity);
         int remaining = triangleCount;
         using (var reader = new RoomSetupReplicaV2Tape.Reader(tapePath))
         {
-            while (remaining > 0 && reader.TryReadNext(out var frame))
+            while (reader.TryReadNext(out var frame))
             {
                 for (int triangle = 0;
                      triangle < triangleCount;
@@ -2001,6 +2176,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     Vector3 c = _finalVertices[
                         _finalTriangles[index + 2]];
                     Vector3 centroid = (a + b + c) / 3f;
+                    AccumulateDepthResidual(
+                        centroid, frame, reader.Width, reader.Height,
+                        ref validObservations[triangle],
+                        ref foregroundContradictions[triangle],
+                        ref backgroundContradictions[triangle],
+                        ref minimumResiduals[triangle],
+                        ref maximumResiduals[triangle],
+                        ref nearestResiduals[triangle]);
+                    if (supported[triangle])
+                        continue;
                     bool hasSupport = HasDirectDepthSupport(
                         centroid, frame, reader.Width, reader.Height);
                     if (!hasSupport)
@@ -2032,6 +2217,78 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             1f - remaining / (float)triangleCount;
         metrics.directDepthAnalysisMilliseconds = (float)(
             (Time.realtimeSinceStartupAsDouble - start) * 1000d);
+        string directory = Path.GetDirectoryName(metrics.path);
+        metrics.spatialReceiptPath = Path.Combine(
+            string.IsNullOrEmpty(directory)
+                ? Application.persistentDataPath
+                : directory,
+            "last-replay-spatial-receipt.json");
+        WriteSpatialScarReceipt(
+            metrics.spatialReceiptPath, metrics.sha256, supported,
+            validObservations, foregroundContradictions,
+            backgroundContradictions, minimumResiduals,
+            maximumResiduals, nearestResiduals, metrics);
+    }
+
+    private static void AccumulateDepthResidual(
+        Vector3 stagePoint,
+        RoomSetupReplicaV2Tape.Frame frame,
+        int width,
+        int height,
+        ref int valid,
+        ref int foreground,
+        ref int background,
+        ref float minimum,
+        ref float maximum,
+        ref float nearest)
+    {
+        int frameForeground = 0;
+        int frameBackground = 0;
+        AccumulateDepthResidual(
+            stagePoint, frame.leftWorldToClip,
+            frame.leftProjectionInverse, frame.leftViewInverse,
+            frame.leftNdc, width, height,
+            ref valid, ref frameForeground, ref frameBackground,
+            ref minimum, ref maximum, ref nearest);
+        AccumulateDepthResidual(
+            stagePoint, frame.rightWorldToClip,
+            frame.rightProjectionInverse, frame.rightViewInverse,
+            frame.rightNdc, width, height,
+            ref valid, ref frameForeground, ref frameBackground,
+            ref minimum, ref maximum, ref nearest);
+        if (frameForeground > 0)
+            foreground++;
+        if (frameBackground > 0)
+            background++;
+    }
+
+    private static void AccumulateDepthResidual(
+        Vector3 stagePoint,
+        Matrix4x4 stageToClip,
+        Matrix4x4 projectionInverse,
+        Matrix4x4 viewInverse,
+        float[] ndcDepths,
+        int width,
+        int height,
+        ref int valid,
+        ref int foreground,
+        ref int background,
+        ref float minimum,
+        ref float maximum,
+        ref float nearest)
+    {
+        if (!TryDepthResidual(
+                stagePoint, stageToClip, projectionInverse, viewInverse,
+                ndcDepths, width, height, out float residual, out _))
+            return;
+        valid++;
+        minimum = Mathf.Min(minimum, residual);
+        maximum = Mathf.Max(maximum, residual);
+        nearest = Mathf.Min(nearest, Mathf.Abs(residual));
+        if (residual <= -ScarContradictionMeters)
+            foreground++;
+        else if (residual >= ScarContradictionMeters)
+            background++;
     }
 
     private static bool HasDirectDepthSupport(
@@ -2059,6 +2316,25 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         int width,
         int height)
     {
+        return TryDepthResidual(
+                   stagePoint, stageToClip, projectionInverse, viewInverse,
+                   ndcDepths, width, height, out _, out float distance) &&
+               distance <= DirectSupportMeters;
+    }
+
+    private static bool TryDepthResidual(
+        Vector3 stagePoint,
+        Matrix4x4 stageToClip,
+        Matrix4x4 projectionInverse,
+        Matrix4x4 viewInverse,
+        float[] ndcDepths,
+        int width,
+        int height,
+        out float residual,
+        out float pointDistance)
+    {
+        residual = 0f;
+        pointDistance = float.PositiveInfinity;
         Vector4 clip = stageToClip * new Vector4(
             stagePoint.x, stagePoint.y, stagePoint.z, 1f);
         if (!float.IsFinite(clip.w) || clip.w <= 0.00001f)
@@ -2090,8 +2366,176 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             stageH.x / stageH.w,
             stageH.y / stageH.w,
             stageH.z / stageH.w);
-        return Finite(observed) &&
-               Vector3.Distance(stagePoint, observed) <= VoxelMeters;
+        if (!Finite(observed))
+            return false;
+        Vector3 eye = viewInverse.MultiplyPoint3x4(Vector3.zero);
+        if (!Finite(eye))
+            return false;
+        pointDistance = Vector3.Distance(stagePoint, observed);
+        residual = Vector3.Distance(eye, observed) -
+                   Vector3.Distance(eye, stagePoint);
+        return float.IsFinite(residual) && float.IsFinite(pointDistance);
+    }
+
+    private void WriteSpatialScarReceipt(
+        string path,
+        string meshSha256,
+        bool[] supported,
+        int[] validObservations,
+        int[] foregroundContradictions,
+        int[] backgroundContradictions,
+        float[] minimumResiduals,
+        float[] maximumResiduals,
+        float[] nearestResiduals,
+        FinalMeshMetrics metrics)
+    {
+        int triangleCount = _finalTriangles.Count / 3;
+        var union = new UnionFind(triangleCount);
+        var vertexOwner = new Dictionary<QuantizedPosition, int>();
+        for (int triangle = 0; triangle < triangleCount; triangle++)
+        {
+            if (supported[triangle])
+                continue;
+            int index = triangle * 3;
+            for (int corner = 0; corner < 3; corner++)
+            {
+                Vector3 vertex = _finalVertices[
+                    _finalTriangles[index + corner]];
+                var key = new QuantizedPosition(vertex);
+                if (vertexOwner.TryGetValue(key, out int owner))
+                    union.Union(triangle, owner);
+                else
+                    vertexOwner.Add(key, triangle);
+            }
+        }
+
+        var compactClusters = new Dictionary<int, int>();
+        var triangleReceipts = new List<SpatialTriangleReceipt>();
+        var clusterTriangles = new List<int>();
+        var clusterMins = new List<Vector3>();
+        var clusterMaxs = new List<Vector3>();
+        var clusterCross = new List<int>();
+        var clusterShell = new List<int>();
+        var clusterUnknown = new List<int>();
+        for (int triangle = 0; triangle < triangleCount; triangle++)
+        {
+            if (supported[triangle])
+                continue;
+            int root = union.Find(triangle);
+            if (!compactClusters.TryGetValue(root, out int cluster))
+            {
+                cluster = compactClusters.Count;
+                compactClusters.Add(root, cluster);
+                clusterTriangles.Add(0);
+                clusterMins.Add(new Vector3(
+                    float.PositiveInfinity, float.PositiveInfinity,
+                    float.PositiveInfinity));
+                clusterMaxs.Add(new Vector3(
+                    float.NegativeInfinity, float.NegativeInfinity,
+                    float.NegativeInfinity));
+                clusterCross.Add(0);
+                clusterShell.Add(0);
+                clusterUnknown.Add(0);
+            }
+
+            int index = triangle * 3;
+            Vector3 a = _finalVertices[_finalTriangles[index]];
+            Vector3 b = _finalVertices[_finalTriangles[index + 1]];
+            Vector3 c = _finalVertices[_finalTriangles[index + 2]];
+            Vector3 cross = Vector3.Cross(b - a, c - a);
+            Vector3 normal = cross.sqrMagnitude > 0.00000001f
+                ? cross.normalized
+                : Vector3.zero;
+            string classification;
+            if (foregroundContradictions[triangle] > 0 &&
+                backgroundContradictions[triangle] > 0)
+            {
+                classification = "CrossLayerConnectionCandidate";
+                clusterCross[cluster]++;
+                metrics.crossLayerCandidateTriangles++;
+            }
+            else if (validObservations[triangle] >=
+                         ContradictionPairsToRetire &&
+                     (foregroundContradictions[triangle] >=
+                          ContradictionPairsToRetire ||
+                      backgroundContradictions[triangle] >=
+                          ContradictionPairsToRetire))
+            {
+                classification = "HistoricalShellCandidate";
+                clusterShell[cluster]++;
+                metrics.historicalShellCandidateTriangles++;
+            }
+            else
+            {
+                classification = "InsufficientEvidence";
+                clusterUnknown[cluster]++;
+                metrics.insufficientEvidenceTriangles++;
+            }
+
+            Vector3 centroid = (a + b + c) / 3f;
+            triangleReceipts.Add(new SpatialTriangleReceipt
+            {
+                triangle = triangle,
+                cluster = cluster,
+                centroid = centroid,
+                normal = normal,
+                areaSquareMeters = cross.magnitude * 0.5f,
+                validDepthObservations = validObservations[triangle],
+                foregroundContradictions =
+                    foregroundContradictions[triangle],
+                backgroundContradictions =
+                    backgroundContradictions[triangle],
+                nearestAbsoluteResidualMeters =
+                    float.IsFinite(nearestResiduals[triangle])
+                        ? nearestResiduals[triangle]
+                        : -1f,
+                minimumResidualMeters =
+                    float.IsFinite(minimumResiduals[triangle])
+                        ? minimumResiduals[triangle]
+                        : 0f,
+                maximumResidualMeters =
+                    float.IsFinite(maximumResiduals[triangle])
+                        ? maximumResiduals[triangle]
+                        : 0f,
+                classification = classification
+            });
+            clusterTriangles[cluster]++;
+            clusterMins[cluster] = Vector3.Min(
+                clusterMins[cluster], Vector3.Min(a, Vector3.Min(b, c)));
+            clusterMaxs[cluster] = Vector3.Max(
+                clusterMaxs[cluster], Vector3.Max(a, Vector3.Max(b, c)));
+        }
+
+        var clusters = new SpatialClusterReceipt[compactClusters.Count];
+        for (int cluster = 0; cluster < clusters.Length; cluster++)
+        {
+            clusters[cluster] = new SpatialClusterReceipt
+            {
+                cluster = cluster,
+                triangles = clusterTriangles[cluster],
+                boundsMin = clusterMins[cluster],
+                boundsMax = clusterMaxs[cluster],
+                crossLayerCandidates = clusterCross[cluster],
+                historicalShellCandidates = clusterShell[cluster],
+                insufficientEvidence = clusterUnknown[cluster]
+            };
+        }
+        metrics.scarClusters = clusters.Length;
+        var receipt = new SpatialScarReceipt
+        {
+            coordinateSpace = "QuestStage",
+            sourceMeshSha256 = meshSha256,
+            directSupportMeters = DirectSupportMeters,
+            contradictionMeters = ScarContradictionMeters,
+            classificationRule =
+                "BothResidualSigns=CrossLayer;RepeatedOneSign=HistoricalShell",
+            totalTriangles = triangleCount,
+            unsupportedTriangles = triangleReceipts.Count,
+            clusters = clusters.Length,
+            clusterReceipts = clusters,
+            triangleReceipts = triangleReceipts.ToArray()
+        };
+        File.WriteAllText(path, JsonUtility.ToJson(receipt, true));
     }
 
     private static int CompareChunks(
@@ -2510,6 +2954,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             }
             if (!observed || configuration == 0 || configuration == 255)
                 continue;
+            if (enforceSameLayerSupport &&
+                !CellHasCompatibleLayerSupport(sx, sy, sz))
+            {
+                SameLayerRejectedCellCount++;
+                continue;
+            }
 
             for (int edge = 0; edge < 12; edge++)
             {
@@ -2925,6 +3375,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         Array.Clear(_sampleDistances, 0, _sampleDistances.Length);
         Array.Clear(_sampleObserved, 0, _sampleObserved.Length);
+        Array.Clear(_sampleLayerAnchors, 0, _sampleLayerAnchors.Length);
+        Array.Clear(_sampleLayerObserved, 0, _sampleLayerObserved.Length);
         Vector3Int origin = chunkId * ChunkSize;
         for (int z = 0; z < SampleSize; z += MeshStride)
         for (int y = 0; y < SampleSize; y += MeshStride)
@@ -2932,19 +3384,25 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         {
             int sample = SampleIndex(x, y, z);
             Vector3Int lattice = origin + new Vector3Int(x, y, z);
-            if (!TryResampleDerivedField(lattice, out float distance))
+            if (!TryResampleDerivedField(
+                    lattice, out float distance, out Voxel voxel))
             {
                 _passDerivedMissingSamples++;
                 continue;
             }
             _sampleObserved[sample] = 1;
             _sampleDistances[sample] = distance;
+            if (voxel.lastEvidencePair > 0 && Finite(voxel.layerAnchor))
+            {
+                _sampleLayerObserved[sample] = 1;
+                _sampleLayerAnchors[sample] = voxel.layerAnchor;
+            }
             _passDerivedValidSamples++;
         }
     }
 
     private bool TryResampleDerivedField(
-        Vector3Int lattice, out float distance)
+        Vector3Int lattice, out float distance, out Voxel voxel)
     {
         // Room Setup's active Resampled mode passes ratio 0.5 to 0x78cd20.
         // Every integer derived coordinate therefore maps to an exact even
@@ -2953,16 +3411,58 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         // for non-aligned ratios, but is not the active 5 cm -> 10 cm kernel.
         // `lattice` is already expressed in source-grid coordinates at stride
         // two, so this lookup is the equivalent aligned source sample.
-        if (!TryGetVoxel(lattice, out Voxel voxel) ||
+        if (!TryGetVoxel(lattice, out voxel) ||
             voxel.weight <= 0f ||
             !float.IsFinite(voxel.distance) ||
             !float.IsFinite(voxel.weight))
         {
             distance = 0f;
+            voxel = default;
             return false;
         }
         distance = voxel.distance;
         return true;
+    }
+
+    private bool CellHasCompatibleLayerSupport(int sx, int sy, int sz)
+    {
+        // Estimate the zero-crossing normal from the eight SDF corners, then
+        // compare direct surface witnesses along that normal. Tangentially
+        // separated points on one wall remain compatible; parallel foreground
+        // and background layers do not. This is deliberately not an 8-neighbour
+        // occupancy heuristic.
+        float gx = (_cornerDistances[1] + _cornerDistances[2] +
+                    _cornerDistances[5] + _cornerDistances[6] -
+                    _cornerDistances[0] - _cornerDistances[3] -
+                    _cornerDistances[4] - _cornerDistances[7]) * 0.25f;
+        float gy = (_cornerDistances[2] + _cornerDistances[3] +
+                    _cornerDistances[6] + _cornerDistances[7] -
+                    _cornerDistances[0] - _cornerDistances[1] -
+                    _cornerDistances[4] - _cornerDistances[5]) * 0.25f;
+        float gz = (_cornerDistances[4] + _cornerDistances[5] +
+                    _cornerDistances[6] + _cornerDistances[7] -
+                    _cornerDistances[0] - _cornerDistances[1] -
+                    _cornerDistances[2] - _cornerDistances[3]) * 0.25f;
+        Vector3 normal = new Vector3(gx, gy, gz);
+        if (!Finite(normal) || normal.sqrMagnitude <= 0.000001f)
+            return true;
+        normal.Normalize();
+
+        float minimum = float.PositiveInfinity;
+        float maximum = float.NegativeInfinity;
+        for (int corner = 0; corner < 8; corner++)
+        {
+            Vector3Int offset = CubeOffsets[corner] * MeshStride;
+            int sample = SampleIndex(
+                sx + offset.x, sy + offset.y, sz + offset.z);
+            if (_sampleLayerObserved[sample] == 0)
+                return false;
+            float plane = Vector3.Dot(
+                _sampleLayerAnchors[sample], normal);
+            minimum = Mathf.Min(minimum, plane);
+            maximum = Mathf.Max(maximum, plane);
+        }
+        return maximum - minimum <= SameLayerMaximumSeparationMeters;
     }
 
     private bool TryGetVoxel(Vector3Int global, out Voxel voxel)
