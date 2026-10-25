@@ -127,3 +127,40 @@ The cadence remains once per accepted pair solely to preserve the V2-B
 variable; the receipt calls this `Preserved_NotNativeConfirmed`. Candidate and
 released leaves, cleared voxels, released parent Chunks, and pass count are all
 recorded for the next same-tape A/B.
+
+### Leaf-GC Quest 3 replay on 2026-10-26
+
+The same 156-pair Quest Stage tape was replayed after commit `b30e69e`.
+
+```text
+algorithm                         V2CWhiteboxLifecycleLeafGcRegular10cmMesh
+GC passes                         156
+candidate/released leaves         524314 / 44912
+cleared weighted voxel events     2519379
+released parent Chunks            68
+resident weighted voxels          632011 (-9.36%)
+preview/final triangles           27418 / 27418 (+25)
+post-cleanup components           12 (+1)
+direct depth support              0.90849078 (+0.00059462)
+plane RMS                         0.00818584 m (-0.08%)
+mean correction delay             0.2618 s (-2.12%)
+mean correction pair lag          0.3406 (-8.96%)
+replay elapsed                    35.7199 s (+2.83%)
+final mesh SHA-256                2F793B32B2F9BA2D3E3C80E1588E02F116AEC5378386925D17B907E22F14BECC
+```
+
+The near-identical visible surface is expected: most released leaves contain
+positive/free-space SDF rather than a final zero crossing. The counters prove
+that leaf GC executed and materially reduced the resident field, but the
+preserved once-per-pair cadence is not accepted as native-equivalent. A welded
+topology comparison located the extra surviving component as a 45-triangle
+piece near `(3.25, 1.16, 0.44) m`, split from the former local component rather
+than introduced as a distant island. This is a small but real topology
+regression, accompanied by repeated clear/reintegrate churn and a 2.83 percent
+replay-time cost.
+
+Keep the recovered 4 x 4 x 4 leaf rule as the V2-C candidate mechanism. Do not
+freeze the current cadence. The next isolated task is to recover or bound the
+native GC trigger frequency, then replay the same tape and require that the
+field reduction remains without this 45-triangle split or increased component
+count.
