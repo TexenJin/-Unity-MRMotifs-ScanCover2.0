@@ -28,10 +28,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float NegativeTruncationScale = 0.20f / 3f;
     private const float GradientThresholdSquared = 0.01f;
     private const float MaximumWeight = 1000f;
-    private const float CoplanarNormalDot = 0.94f;
-    private const float TangentialRelaxation = 0.35f;
-    private const float MaximumTangentialMove = VoxelMeters * 0.25f;
-    private const float SeamPinEpsilon = 0.0005f;
 
     private enum WorkStage : byte
     {
@@ -208,11 +204,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly List<int> _meshTriangles = new List<int>(8192);
     private readonly List<int> _meshLines = new List<int>(8192);
     private readonly HashSet<ulong> _uniqueLines = new HashSet<ulong>();
-    private Vector3[] _relaxNormalSums = Array.Empty<Vector3>();
-    private Vector3[] _relaxNeighborSums = Array.Empty<Vector3>();
-    private Vector3[] _relaxNormals = Array.Empty<Vector3>();
-    private float[] _relaxMinimumNormalDots = Array.Empty<float>();
-    private int[] _relaxNeighborCounts = Array.Empty<int>();
 
     // A projective matrix is separable on the regular 16^3 voxel lattice.
     // Cache the three axis terms once per chunk so each voxel retains the
@@ -1433,7 +1424,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         }
 
         EnsureChunkPreview(chunkId, chunk);
-        RegularizeCoplanarInteriorVertices(origin);
         Mesh staging = chunk.backMesh;
         staging.Clear(false);
         staging.SetVertices(_meshVertices);
@@ -1453,127 +1443,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         chunk.frontMesh = staging;
         chunk.triangleCount = triangles;
         chunk.previewObject.SetActive(showReplica);
-    }
-
-    private void RegularizeCoplanarInteriorVertices(Vector3Int origin)
-    {
-        int vertexCount = _meshVertices.Count;
-        if (vertexCount < 3 || _meshTriangles.Count < 3)
-            return;
-        EnsureRelaxationCapacity(vertexCount);
-        Array.Clear(_relaxNormalSums, 0, vertexCount);
-        Array.Clear(_relaxNeighborSums, 0, vertexCount);
-        Array.Clear(_relaxNormals, 0, vertexCount);
-        Array.Clear(_relaxNeighborCounts, 0, vertexCount);
-        for (int i = 0; i < vertexCount; i++)
-            _relaxMinimumNormalDots[i] = 1f;
-
-        for (int i = 0; i < _meshTriangles.Count; i += 3)
-        {
-            int a = _meshTriangles[i];
-            int b = _meshTriangles[i + 1];
-            int c = _meshTriangles[i + 2];
-            Vector3 pa = _meshVertices[a];
-            Vector3 pb = _meshVertices[b];
-            Vector3 pc = _meshVertices[c];
-            Vector3 face = Vector3.Cross(pb - pa, pc - pa);
-            float length = face.magnitude;
-            if (!float.IsFinite(length) || length <= 0.000001f)
-                continue;
-            face /= length;
-            _relaxNormalSums[a] += face;
-            _relaxNormalSums[b] += face;
-            _relaxNormalSums[c] += face;
-            _relaxNeighborSums[a] += pb + pc;
-            _relaxNeighborSums[b] += pa + pc;
-            _relaxNeighborSums[c] += pa + pb;
-            _relaxNeighborCounts[a] += 2;
-            _relaxNeighborCounts[b] += 2;
-            _relaxNeighborCounts[c] += 2;
-        }
-
-        for (int i = 0; i < vertexCount; i++)
-        {
-            Vector3 sum = _relaxNormalSums[i];
-            float length = sum.magnitude;
-            if (float.IsFinite(length) && length > 0.000001f)
-                _relaxNormals[i] = sum / length;
-        }
-
-        // A vertex moves only when every incident face agrees with its local
-        // normal. Corners and thin features therefore remain pinned.
-        for (int i = 0; i < _meshTriangles.Count; i += 3)
-        {
-            int a = _meshTriangles[i];
-            int b = _meshTriangles[i + 1];
-            int c = _meshTriangles[i + 2];
-            Vector3 pa = _meshVertices[a];
-            Vector3 face = Vector3.Cross(
-                _meshVertices[b] - pa, _meshVertices[c] - pa);
-            float length = face.magnitude;
-            if (!float.IsFinite(length) || length <= 0.000001f)
-                continue;
-            face /= length;
-            _relaxMinimumNormalDots[a] = Mathf.Min(
-                _relaxMinimumNormalDots[a],
-                Mathf.Abs(Vector3.Dot(_relaxNormals[a], face)));
-            _relaxMinimumNormalDots[b] = Mathf.Min(
-                _relaxMinimumNormalDots[b],
-                Mathf.Abs(Vector3.Dot(_relaxNormals[b], face)));
-            _relaxMinimumNormalDots[c] = Mathf.Min(
-                _relaxMinimumNormalDots[c],
-                Mathf.Abs(Vector3.Dot(_relaxNormals[c], face)));
-        }
-
-        Vector3 chunkMinimum = new Vector3(
-            origin.x * VoxelMeters,
-            origin.y * VoxelMeters,
-            origin.z * VoxelMeters);
-        float chunkWorld = ChunkSize * VoxelMeters;
-        Vector3 chunkMaximum = chunkMinimum + Vector3.one * chunkWorld;
-        for (int i = 0; i < vertexCount; i++)
-        {
-            if (_relaxNeighborCounts[i] < 4 ||
-                _relaxMinimumNormalDots[i] < CoplanarNormalDot)
-                continue;
-            Vector3 vertex = _meshVertices[i];
-            if (Near(vertex.x, chunkMinimum.x) ||
-                Near(vertex.y, chunkMinimum.y) ||
-                Near(vertex.z, chunkMinimum.z) ||
-                Near(vertex.x, chunkMaximum.x) ||
-                Near(vertex.y, chunkMaximum.y) ||
-                Near(vertex.z, chunkMaximum.z))
-                continue;
-            Vector3 normal = _relaxNormals[i];
-            if (!Finite(normal))
-                continue;
-            Vector3 average = _relaxNeighborSums[i] /
-                              _relaxNeighborCounts[i];
-            Vector3 delta = average - vertex;
-            Vector3 tangent = delta - normal * Vector3.Dot(delta, normal);
-            Vector3 move = Vector3.ClampMagnitude(
-                tangent * TangentialRelaxation,
-                MaximumTangentialMove);
-            if (Finite(move))
-                _meshVertices[i] = vertex + move;
-        }
-    }
-
-    private void EnsureRelaxationCapacity(int vertexCount)
-    {
-        if (_relaxNormalSums.Length >= vertexCount)
-            return;
-        int capacity = Mathf.NextPowerOfTwo(vertexCount);
-        _relaxNormalSums = new Vector3[capacity];
-        _relaxNeighborSums = new Vector3[capacity];
-        _relaxNormals = new Vector3[capacity];
-        _relaxMinimumNormalDots = new float[capacity];
-        _relaxNeighborCounts = new int[capacity];
-    }
-
-    private static bool Near(float value, float boundary)
-    {
-        return Mathf.Abs(value - boundary) <= SeamPinEpsilon;
     }
 
     private void CacheSamples(Vector3Int chunkId)

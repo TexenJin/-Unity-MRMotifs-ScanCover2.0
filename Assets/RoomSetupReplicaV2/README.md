@@ -46,13 +46,6 @@ pixel selection, integration order and all reconstruction rules remain the
 same; only repeated scalar multiplications are removed. The identical Stage
 tape is the acceptance input for geometry and replay-time comparison.
 
-Mesh candidates receive one bounded, feature-preserving regularization pass.
-Only interior vertices whose incident face normals all agree are moved, only
-inside the estimated tangent plane, and by at most 1.25 cm. Chunk seams,
-corners, thin structures and normal discontinuities are pinned. This improves
-planar spacing and curved-surface faceting without filling unknown space,
-removing components, changing topology or smoothing the source SDF.
-
 Everything else stays on the recovered active chain: 5 cm sparse projective
 SDF, central-gradient rejection at 0.1 m, asymmetric depth-scaled truncation,
 inverse-square weights capped at 1000, half-precision voxel storage,
