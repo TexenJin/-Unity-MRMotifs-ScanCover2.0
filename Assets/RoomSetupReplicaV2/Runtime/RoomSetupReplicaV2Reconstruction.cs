@@ -66,8 +66,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [Header("Execution budgets")]
     [SerializeField, Range(0.5f, 12f)]
     private float reconstructionBudgetMilliseconds = 6f;
-    [SerializeField, Range(1, 64)]
-    private int integrationChunksPerFrame = 32;
+    // This is only a runaway-work guard. The millisecond deadline below is
+    // the real frame-time limiter. A value of 32 forced a 329-chunk stereo
+    // pair to span at least ~22 display frames even when CPU budget remained.
+    [SerializeField, Range(1, 512)]
+    private int integrationChunksPerFrame = 256;
     [SerializeField, Range(0.5f, 12f)]
     private float meshingBudgetMilliseconds = 4f;
     [SerializeField, Range(1, 16)]

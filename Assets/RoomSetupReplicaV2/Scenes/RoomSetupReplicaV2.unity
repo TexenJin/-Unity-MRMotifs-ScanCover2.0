@@ -212,7 +212,7 @@ MonoBehaviour:
   m_Name:
   m_EditorClassIdentifier: Assembly-CSharp::RoomSetupReplicaV2Reconstruction
   reconstructionBudgetMilliseconds: 6
-  integrationChunksPerFrame: 32
+  integrationChunksPerFrame: 256
   meshingBudgetMilliseconds: 4
   meshChunksPerFrame: 8
   maximumRecordedPairs: 180

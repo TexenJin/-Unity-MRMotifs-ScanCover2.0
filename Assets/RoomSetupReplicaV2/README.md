@@ -26,6 +26,12 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   voxels with source-confidence weights. A missing source remains unknown, so
   the mesh extractor cannot invent support across an unobserved gap.
 
+The first device-backed scheduling correction raises the per-slice chunk guard
+from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no
+longer imposes an artificial multi-frame minimum on a stereo pair; the time
+budget still bounds work on each Unity frame. Fusion, truncation, voxel values,
+derived-field rules and topology are unchanged by this scheduling correction.
+
 Everything else stays on the recovered active chain: 5 cm sparse projective
 SDF, central-gradient rejection at 0.1 m, asymmetric depth-scaled truncation,
 inverse-square weights capped at 1000, half-precision voxel storage,
