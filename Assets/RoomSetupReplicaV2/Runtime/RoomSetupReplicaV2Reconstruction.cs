@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using Genesis.RoomScan;
 using Unity.Collections;
 using UnityEngine;
@@ -28,6 +30,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float NegativeTruncationScale = 0.20f / 3f;
     private const float GradientThresholdSquared = 0.01f;
     private const float MaximumWeight = 1000f;
+    private const float PlanarMetricNormalDot = 0.94f;
+    private const float SeamWeldUnitsPerMeter = 10000f;
 
     private enum WorkStage : byte
     {
@@ -61,6 +65,105 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public Mesh frontMesh;
         public Mesh backMesh;
         public int triangleCount;
+    }
+
+    private struct DirtyStamp
+    {
+        public double realtime;
+        public int pair;
+    }
+
+    private sealed class FinalMeshMetrics
+    {
+        public string path = string.Empty;
+        public string sha256 = string.Empty;
+        public int vertices;
+        public int triangles;
+        public int connectedComponents;
+        public int isolatedComponents;
+        public int largestComponentTriangles;
+        public int planarVertices;
+        public float planeResidualRmsMeters;
+        public float planeResidualP95Meters;
+    }
+
+    private readonly struct QuantizedPosition : IEquatable<QuantizedPosition>
+    {
+        private readonly int _x;
+        private readonly int _y;
+        private readonly int _z;
+
+        public QuantizedPosition(Vector3 value)
+        {
+            _x = Mathf.RoundToInt(value.x * SeamWeldUnitsPerMeter);
+            _y = Mathf.RoundToInt(value.y * SeamWeldUnitsPerMeter);
+            _z = Mathf.RoundToInt(value.z * SeamWeldUnitsPerMeter);
+        }
+
+        public bool Equals(QuantizedPosition other)
+        {
+            return _x == other._x && _y == other._y && _z == other._z;
+        }
+
+        public override bool Equals(object value)
+        {
+            return value is QuantizedPosition other && Equals(other);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = _x;
+                hash = hash * 397 ^ _y;
+                return hash * 397 ^ _z;
+            }
+        }
+    }
+
+    private sealed class UnionFind
+    {
+        private readonly int[] _parent;
+        private readonly byte[] _rank;
+
+        public UnionFind(int count)
+        {
+            _parent = new int[count];
+            _rank = new byte[count];
+            for (int i = 0; i < count; i++)
+                _parent[i] = i;
+        }
+
+        public int Find(int value)
+        {
+            int root = value;
+            while (_parent[root] != root)
+                root = _parent[root];
+            while (_parent[value] != value)
+            {
+                int next = _parent[value];
+                _parent[value] = root;
+                value = next;
+            }
+            return root;
+        }
+
+        public void Union(int first, int second)
+        {
+            int a = Find(first);
+            int b = Find(second);
+            if (a == b)
+                return;
+            if (_rank[a] < _rank[b])
+                _parent[a] = b;
+            else if (_rank[a] > _rank[b])
+                _parent[b] = a;
+            else
+            {
+                _parent[b] = a;
+                _rank[a]++;
+            }
+        }
     }
 
     [Header("Execution budgets")]
@@ -132,6 +235,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         new HashSet<Vector3Int>();
     private readonly Queue<Vector3Int> _meshQueue =
         new Queue<Vector3Int>();
+    private readonly Dictionary<Vector3Int, DirtyStamp> _meshDirtyStamps =
+        new Dictionary<Vector3Int, DirtyStamp>();
 
     private ComputeShader _unproject;
     private int _unprojectKernel = -1;
@@ -180,6 +285,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private bool _replayUsesStageSpace;
     private bool _stageUnavailableLogged;
     private OVRCameraRig _ovrRig;
+    private double _replayStartRealtime;
+    private float _firstMeshLatencySeconds = -1f;
+    private int _firstMeshPair = -1;
+    private double _correctionDelaySecondsSum;
+    private double _correctionDelaySecondsMax;
+    private long _correctionPairLagSum;
+    private int _correctionPairLagMax;
+    private int _correctionPublicationCount;
 
     private GameObject _previewRoot;
     private Material _lineMaterial;
@@ -204,6 +317,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly List<int> _meshTriangles = new List<int>(8192);
     private readonly List<int> _meshLines = new List<int>(8192);
     private readonly HashSet<ulong> _uniqueLines = new HashSet<ulong>();
+    private readonly List<KeyValuePair<Vector3Int, Chunk>> _orderedChunks =
+        new List<KeyValuePair<Vector3Int, Chunk>>(256);
+    private readonly List<Vector3> _finalVertices =
+        new List<Vector3>(32768);
+    private readonly List<int> _finalTriangles = new List<int>(65536);
 
     // A projective matrix is separable on the regular 16^3 voxel lattice.
     // Cache the three axis terms once per chunk so each voxel retains the
@@ -363,6 +481,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _tapeReader = reader;
             _replayedFrames = 0;
             _nextReplayTime = 0f;
+            _replayStartRealtime = Time.realtimeSinceStartupAsDouble;
+            _firstMeshLatencySeconds = -1f;
+            _firstMeshPair = -1;
+            _correctionDelaySecondsSum = 0d;
+            _correctionDelaySecondsMax = 0d;
+            _correctionPairLagSum = 0;
+            _correctionPairLagMax = 0;
+            _correctionPublicationCount = 0;
+            _meshDirtyStamps.Clear();
             Debug.Log("[RoomSetupReplicaV2] replay started: " + TapePath);
             return true;
         }
@@ -420,6 +547,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _touchedMasks.Clear();
         _queuedMeshChunks.Clear();
         _meshQueue.Clear();
+        _meshDirtyStamps.Clear();
         _meshPassActive = false;
         _nextMeshTime = 0f;
         AcceptedPairCount = 0;
@@ -1179,6 +1307,27 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int lastMeshPassDerivedMissingSamples;
         public float lastReconstructionMilliseconds;
         public float lastMeshingMilliseconds;
+        public float replayElapsedSeconds;
+        public float replayPairsPerSecond;
+        public float firstMeshLatencySeconds;
+        public int firstMeshPair;
+        public int correctionPublications;
+        public float correctionDelayMeanSeconds;
+        public float correctionDelayMaxSeconds;
+        public float correctionPairLagMean;
+        public int correctionPairLagMax;
+        public string finalMeshPath;
+        public string finalMeshSha256;
+        public int finalMeshVertices;
+        public int finalMeshTriangles;
+        public int connectedComponents;
+        public int isolatedComponents;
+        public int largestComponentTriangles;
+        public int planarVertices;
+        public float planeResidualRmsMeters;
+        public float planeResidualP95Meters;
+        public bool directDepthSupportMeasured;
+        public int trianglesWithoutDirectDepthSupport;
     }
 
     private void CompleteReplay()
@@ -1187,11 +1336,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _tapeReader = null;
         reader?.Dispose();
         _processingReplayFrame = false;
+        float replayElapsedSeconds = (float)Math.Max(
+            0d, Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
         try
         {
             string directory = Path.GetDirectoryName(TapePath);
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
+            FinalMeshMetrics meshMetrics =
+                ExportAndMeasureFinalMesh(directory ??
+                                         Application.persistentDataPath);
             string receiptPath = Path.Combine(
                 directory ?? Application.persistentDataPath,
                 "last-replay-receipt.json");
@@ -1213,7 +1367,42 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     LastDerivedMissingSampleCount,
                 lastReconstructionMilliseconds =
                     LastReconstructionMilliseconds,
-                lastMeshingMilliseconds = LastMeshingMilliseconds
+                lastMeshingMilliseconds = LastMeshingMilliseconds,
+                replayElapsedSeconds = replayElapsedSeconds,
+                replayPairsPerSecond = replayElapsedSeconds > 0f
+                    ? _replayedFrames / replayElapsedSeconds
+                    : 0f,
+                firstMeshLatencySeconds = _firstMeshLatencySeconds,
+                firstMeshPair = _firstMeshPair,
+                correctionPublications = _correctionPublicationCount,
+                correctionDelayMeanSeconds = _correctionPublicationCount > 0
+                    ? (float)(_correctionDelaySecondsSum /
+                              _correctionPublicationCount)
+                    : 0f,
+                correctionDelayMaxSeconds =
+                    (float)_correctionDelaySecondsMax,
+                correctionPairLagMean = _correctionPublicationCount > 0
+                    ? (float)_correctionPairLagSum /
+                      _correctionPublicationCount
+                    : 0f,
+                correctionPairLagMax = _correctionPairLagMax,
+                finalMeshPath = meshMetrics.path,
+                finalMeshSha256 = meshMetrics.sha256,
+                finalMeshVertices = meshMetrics.vertices,
+                finalMeshTriangles = meshMetrics.triangles,
+                connectedComponents = meshMetrics.connectedComponents,
+                isolatedComponents = meshMetrics.isolatedComponents,
+                largestComponentTriangles =
+                    meshMetrics.largestComponentTriangles,
+                planarVertices = meshMetrics.planarVertices,
+                planeResidualRmsMeters =
+                    meshMetrics.planeResidualRmsMeters,
+                planeResidualP95Meters =
+                    meshMetrics.planeResidualP95Meters,
+                // This requires reprojection against every recorded depth
+                // packet. Source TSDF weights are not substituted for it.
+                directDepthSupportMeasured = false,
+                trianglesWithoutDirectDepthSupport = -1
             };
             File.WriteAllText(
                 receiptPath, JsonUtility.ToJson(receipt, true));
@@ -1227,6 +1416,265 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "[RoomSetupReplicaV2] cannot write replay receipt: " +
                 exception);
         }
+    }
+
+    private FinalMeshMetrics ExportAndMeasureFinalMesh(string directory)
+    {
+        _orderedChunks.Clear();
+        foreach (KeyValuePair<Vector3Int, Chunk> item in _chunks)
+            if (item.Value.frontMesh != null && item.Value.triangleCount > 0)
+                _orderedChunks.Add(item);
+        _orderedChunks.Sort(CompareChunks);
+
+        _finalVertices.Clear();
+        _finalTriangles.Clear();
+        for (int chunkIndex = 0;
+             chunkIndex < _orderedChunks.Count;
+             chunkIndex++)
+        {
+            Mesh mesh = _orderedChunks[chunkIndex].Value.frontMesh;
+            Vector3[] vertices = mesh.vertices;
+            int[] triangles = mesh.GetTriangles(0);
+            int vertexBase = _finalVertices.Count;
+            _finalVertices.AddRange(vertices);
+            for (int i = 0; i < triangles.Length; i++)
+                _finalTriangles.Add(vertexBase + triangles[i]);
+        }
+
+        var metrics = new FinalMeshMetrics
+        {
+            vertices = _finalVertices.Count,
+            triangles = _finalTriangles.Count / 3,
+            path = Path.Combine(directory, "last-replay-mesh.ply")
+        };
+        WriteBinaryPly(metrics.path, _finalVertices, _finalTriangles);
+        metrics.sha256 = ComputeFileSha256(metrics.path);
+        MeasureConnectedComponents(metrics);
+        MeasurePlanarResidual(metrics);
+        return metrics;
+    }
+
+    private static int CompareChunks(
+        KeyValuePair<Vector3Int, Chunk> first,
+        KeyValuePair<Vector3Int, Chunk> second)
+    {
+        int compare = first.Key.x.CompareTo(second.Key.x);
+        if (compare != 0) return compare;
+        compare = first.Key.y.CompareTo(second.Key.y);
+        return compare != 0
+            ? compare
+            : first.Key.z.CompareTo(second.Key.z);
+    }
+
+    private static void WriteBinaryPly(
+        string path, List<Vector3> vertices, List<int> triangles)
+    {
+        var header = new StringBuilder(256);
+        header.Append("ply\n")
+              .Append("format binary_little_endian 1.0\n")
+              .Append("comment coordinate_space QuestStage\n")
+              .Append("element vertex ").Append(vertices.Count).Append('\n')
+              .Append("property float x\n")
+              .Append("property float y\n")
+              .Append("property float z\n")
+              .Append("element face ").Append(triangles.Count / 3)
+              .Append('\n')
+              .Append("property list uchar int vertex_indices\n")
+              .Append("end_header\n");
+        using (var writer = new BinaryWriter(new FileStream(
+                   path, FileMode.Create, FileAccess.Write, FileShare.Read,
+                   1 << 20, FileOptions.SequentialScan)))
+        {
+            writer.Write(Encoding.ASCII.GetBytes(header.ToString()));
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                Vector3 vertex = vertices[i];
+                writer.Write(vertex.x);
+                writer.Write(vertex.y);
+                writer.Write(vertex.z);
+            }
+            for (int i = 0; i < triangles.Count; i += 3)
+            {
+                writer.Write((byte)3);
+                writer.Write(triangles[i]);
+                writer.Write(triangles[i + 1]);
+                writer.Write(triangles[i + 2]);
+            }
+        }
+    }
+
+    private static string ComputeFileSha256(string path)
+    {
+        byte[] hash;
+        using (SHA256 sha = SHA256.Create())
+        using (FileStream stream = File.OpenRead(path))
+            hash = sha.ComputeHash(stream);
+        var text = new StringBuilder(hash.Length * 2);
+        for (int i = 0; i < hash.Length; i++)
+            text.Append(hash[i].ToString("X2"));
+        return text.ToString();
+    }
+
+    private void MeasureConnectedComponents(FinalMeshMetrics metrics)
+    {
+        int vertexCount = _finalVertices.Count;
+        if (vertexCount == 0 || _finalTriangles.Count == 0)
+            return;
+        var union = new UnionFind(vertexCount);
+        for (int i = 0; i < _finalTriangles.Count; i += 3)
+        {
+            int a = _finalTriangles[i];
+            int b = _finalTriangles[i + 1];
+            int c = _finalTriangles[i + 2];
+            union.Union(a, b);
+            union.Union(b, c);
+        }
+
+        // Chunk meshes duplicate seam vertices. A 0.1 mm spatial weld makes
+        // connectivity independent of chunk ownership without changing the
+        // exported geometry or joining visibly separate surfaces.
+        var seamOwners = new Dictionary<QuantizedPosition, int>(vertexCount);
+        for (int i = 0; i < vertexCount; i++)
+        {
+            var key = new QuantizedPosition(_finalVertices[i]);
+            if (seamOwners.TryGetValue(key, out int owner))
+                union.Union(i, owner);
+            else
+                seamOwners.Add(key, i);
+        }
+
+        var trianglesByRoot = new Dictionary<int, int>();
+        for (int i = 0; i < _finalTriangles.Count; i += 3)
+        {
+            int root = union.Find(_finalTriangles[i]);
+            if (trianglesByRoot.TryGetValue(root, out int count))
+                trianglesByRoot[root] = count + 1;
+            else
+                trianglesByRoot.Add(root, 1);
+        }
+        metrics.connectedComponents = trianglesByRoot.Count;
+        metrics.isolatedComponents = Mathf.Max(
+            0, metrics.connectedComponents - 1);
+        foreach (int count in trianglesByRoot.Values)
+            metrics.largestComponentTriangles = Mathf.Max(
+                metrics.largestComponentTriangles, count);
+    }
+
+    private void MeasurePlanarResidual(FinalMeshMetrics metrics)
+    {
+        int vertexCount = _finalVertices.Count;
+        if (vertexCount == 0 || _finalTriangles.Count == 0)
+            return;
+        var normalSums = new Vector3[vertexCount];
+        var normals = new Vector3[vertexCount];
+        var minimumDots = new float[vertexCount];
+        var faceCounts = new int[vertexCount];
+        var residualSquares = new double[vertexCount];
+        var residualCounts = new int[vertexCount];
+        for (int i = 0; i < vertexCount; i++)
+            minimumDots[i] = 1f;
+
+        for (int i = 0; i < _finalTriangles.Count; i += 3)
+        {
+            int a = _finalTriangles[i];
+            int b = _finalTriangles[i + 1];
+            int c = _finalTriangles[i + 2];
+            Vector3 face = Vector3.Cross(
+                _finalVertices[b] - _finalVertices[a],
+                _finalVertices[c] - _finalVertices[a]);
+            float length = face.magnitude;
+            if (!float.IsFinite(length) || length <= 0.000001f)
+                continue;
+            face /= length;
+            normalSums[a] += face;
+            normalSums[b] += face;
+            normalSums[c] += face;
+            faceCounts[a]++;
+            faceCounts[b]++;
+            faceCounts[c]++;
+        }
+        for (int i = 0; i < vertexCount; i++)
+        {
+            float length = normalSums[i].magnitude;
+            if (float.IsFinite(length) && length > 0.000001f)
+                normals[i] = normalSums[i] / length;
+        }
+
+        for (int i = 0; i < _finalTriangles.Count; i += 3)
+        {
+            int a = _finalTriangles[i];
+            int b = _finalTriangles[i + 1];
+            int c = _finalTriangles[i + 2];
+            Vector3 pa = _finalVertices[a];
+            Vector3 pb = _finalVertices[b];
+            Vector3 pc = _finalVertices[c];
+            Vector3 face = Vector3.Cross(pb - pa, pc - pa);
+            float length = face.magnitude;
+            if (!float.IsFinite(length) || length <= 0.000001f)
+                continue;
+            face /= length;
+            AccumulatePlanarMetric(
+                a, pa, pb, pc, face, normals,
+                minimumDots, residualSquares, residualCounts);
+            AccumulatePlanarMetric(
+                b, pb, pa, pc, face, normals,
+                minimumDots, residualSquares, residualCounts);
+            AccumulatePlanarMetric(
+                c, pc, pa, pb, face, normals,
+                minimumDots, residualSquares, residualCounts);
+        }
+
+        var vertexResiduals = new List<float>(vertexCount);
+        double totalSquares = 0d;
+        long totalSamples = 0;
+        for (int i = 0; i < vertexCount; i++)
+        {
+            if (faceCounts[i] < 2 || residualCounts[i] <= 0 ||
+                minimumDots[i] < PlanarMetricNormalDot)
+                continue;
+            float rms = Mathf.Sqrt((float)(
+                residualSquares[i] / residualCounts[i]));
+            if (!float.IsFinite(rms))
+                continue;
+            vertexResiduals.Add(rms);
+            totalSquares += residualSquares[i];
+            totalSamples += residualCounts[i];
+        }
+        metrics.planarVertices = vertexResiduals.Count;
+        if (totalSamples <= 0 || vertexResiduals.Count == 0)
+            return;
+        metrics.planeResidualRmsMeters = Mathf.Sqrt(
+            (float)(totalSquares / totalSamples));
+        vertexResiduals.Sort();
+        int p95 = Mathf.Clamp(
+            Mathf.CeilToInt(vertexResiduals.Count * 0.95f) - 1,
+            0, vertexResiduals.Count - 1);
+        metrics.planeResidualP95Meters = vertexResiduals[p95];
+    }
+
+    private static void AccumulatePlanarMetric(
+        int index,
+        Vector3 center,
+        Vector3 first,
+        Vector3 second,
+        Vector3 face,
+        Vector3[] normals,
+        float[] minimumDots,
+        double[] residualSquares,
+        int[] residualCounts)
+    {
+        Vector3 normal = normals[index];
+        if (!Finite(normal) || normal.sqrMagnitude <= 0.000001f)
+            return;
+        minimumDots[index] = Mathf.Min(
+            minimumDots[index],
+            Mathf.Abs(Vector3.Dot(normal, face)));
+        float firstDistance = Vector3.Dot(first - center, normal);
+        float secondDistance = Vector3.Dot(second - center, normal);
+        residualSquares[index] +=
+            firstDistance * (double)firstDistance +
+            secondDistance * (double)secondDistance;
+        residualCounts[index] += 2;
     }
 
     private void RecordTouched(Vector3Int chunkId, byte mask)
@@ -1264,6 +1712,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             for (int x = minX; x <= 0; x++)
             {
                 Vector3Int dirty = touched + new Vector3Int(x, y, z);
+                if (_processingReplayFrame || IsReplaying)
+                {
+                    _meshDirtyStamps[dirty] = new DirtyStamp
+                    {
+                        realtime = Time.realtimeSinceStartupAsDouble,
+                        pair = _replayedFrames + 1
+                    };
+                }
                 if (_queuedMeshChunks.Add(dirty))
                     _meshQueue.Enqueue(dirty);
             }
@@ -1316,6 +1772,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _queuedMeshChunks.Remove(chunkId);
             if (_chunks.TryGetValue(chunkId, out Chunk chunk))
                 RebuildChunkMesh(chunkId, chunk);
+            RecordCorrectionPublication(chunkId);
             processed++;
             if (Time.realtimeSinceStartupAsDouble - start >= budget)
                 break;
@@ -1323,8 +1780,33 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         PreviewTriangleCount = 0;
         foreach (Chunk chunk in _chunks.Values)
             PreviewTriangleCount += chunk.triangleCount;
+        if (IsReplaying && PreviewTriangleCount > 0 &&
+            _firstMeshLatencySeconds < 0f)
+        {
+            _firstMeshLatencySeconds = (float)(
+                Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
+            _firstMeshPair = _replayedFrames;
+        }
         LastMeshingMilliseconds = (float)(
             (Time.realtimeSinceStartupAsDouble - start) * 1000d);
+    }
+
+    private void RecordCorrectionPublication(Vector3Int chunkId)
+    {
+        if (!_meshDirtyStamps.TryGetValue(
+                chunkId, out DirtyStamp stamp))
+            return;
+        _meshDirtyStamps.Remove(chunkId);
+        double seconds = Math.Max(
+            0d, Time.realtimeSinceStartupAsDouble - stamp.realtime);
+        int pairLag = Mathf.Max(0, _replayedFrames - stamp.pair);
+        _correctionDelaySecondsSum += seconds;
+        _correctionDelaySecondsMax = Math.Max(
+            _correctionDelaySecondsMax, seconds);
+        _correctionPairLagSum += pairLag;
+        _correctionPairLagMax = Mathf.Max(
+            _correctionPairLagMax, pairLag);
+        _correctionPublicationCount++;
     }
 
     private void RebuildChunkMesh(Vector3Int chunkId, Chunk chunk)

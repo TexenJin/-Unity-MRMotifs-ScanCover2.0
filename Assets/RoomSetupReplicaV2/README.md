@@ -16,6 +16,9 @@ Quest controls:
 - B: clear the replica volume and mesh.
 - X: show/hide the replica mesh.
 
+All controller actions share a 250 ms debounce window so one physical press
+cannot restart a replay or trigger two state transitions.
+
 The application starts idle. Recording is armed by the same trigger press as
 coverage and begins on the first accepted stereo depth pair, so visual coverage
 cannot silently run without its matching tape. The second trigger press closes
@@ -59,6 +62,14 @@ Artifacts on Quest are written below
 - `last-session.rsv2`: deterministic stereo input tape.
 - `last-replay-receipt.json`: replayed-pair, source-field, derived-field and
   final mesh counts after the mesh queue has drained.
+- `last-replay-mesh.ply`: deterministic binary little-endian final mesh in
+  Quest Stage coordinates. The receipt includes its SHA-256 hash.
+
+The replay receipt also reports first-mesh latency, local dirty-to-publication
+delay, replay throughput, seam-welded connected components, and a local planar
+residual over normal-consistent vertices. Direct-depth support is explicitly
+marked unavailable until final triangles are reprojected against every tape
+packet; TSDF weights are not used as a substitute.
 
 This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace
