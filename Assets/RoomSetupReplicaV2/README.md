@@ -45,8 +45,10 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   exactly 32 triangles are retained. The raw candidate is preserved so a
   temporarily removed fragment can grow and reappear, and the filtered meshes
   are published together only when the mesh pass completes.
-- The next recovered production stage now runs after `<32` cleanup on the
-  complete seam-welded candidate. It follows the observed XRT directed-edge
+- The recovered XRT production stage is retained after `<32` cleanup on the
+  complete seam-welded candidate, but is currently disabled. The requested
+  output is the regular 10 cm coverage mesh, not the later performance mesh.
+  When re-enabled in a future phase, it follows the observed directed-edge
   collapse envelope: minimum 100 input triangles, target `vertices / 20`,
   MT19937 seed 13, 16 unique directed candidates per batch, a `0.075 m`
   point-to-plane acceptance ceiling, near-zero optional regularizers loaded
@@ -58,7 +60,8 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   simplification rather than an unrelated smoothing pass. It runs on an
   immutable background snapshot with one active job and one newest pending
   snapshot; the current Front remains visible until a complete result is
-  ready. Until the exact native terminal topology rule is resolved, a
+  ready. While disabled, the post-`<32` mesh passes through unchanged. Until
+  the exact native terminal topology rule is resolved, a
   non-empty cleaned input that simplifies to zero faces is rejected and the
   cleaned input is published unchanged; this is an explicit publication
   fail-safe rather than a substitute simplification metric.

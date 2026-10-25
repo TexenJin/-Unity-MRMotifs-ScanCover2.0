@@ -12,6 +12,10 @@ using UnityEngine;
 /// </summary>
 internal static class RoomSetupReplicaV2XrtSimplifier
 {
+    // Current target: the regular 10 cm coverage mesh. Keep the recovered XRT
+    // implementation for a later performance phase, but do not coarsen the
+    // geometry published by this comparison build.
+    internal const bool Enabled = false;
     internal const int MinimumTriangles = 100;
     internal const int TargetVertexDivisor = 20;
     internal const int CandidateBatchSize = 16;
@@ -178,6 +182,16 @@ internal static class RoomSetupReplicaV2XrtSimplifier
             targetVertices = Math.Max(4,
                 input.vertices.Length / TargetVertexDivisor)
         };
+
+        if (!Enabled)
+        {
+            CopyInput(input, result);
+            result.applied = false;
+            result.stopReason = "DisabledForRegular10cmMesh";
+            watch.Stop();
+            result.elapsedMilliseconds = watch.Elapsed.TotalMilliseconds;
+            return result;
+        }
 
         if (result.inputTriangles < MinimumTriangles ||
             input.vertices.Length < 4)

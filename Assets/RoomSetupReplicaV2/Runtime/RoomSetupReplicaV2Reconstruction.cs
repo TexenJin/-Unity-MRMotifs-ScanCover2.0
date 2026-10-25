@@ -1553,7 +1553,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxDirectSampleRemoveSmall32XrtBoundaryCollapse",
+                    "V2BWhiteboxDirectSampleRemoveSmall32Regular10cmMesh",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1582,7 +1582,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 componentCleanupMilliseconds =
                     LastComponentCleanupMilliseconds,
                 simplificationApplied = LastSimplificationApplied,
-                simplificationMode = "XRTDirectedEdgeCollapse",
+                simplificationMode = RoomSetupReplicaV2XrtSimplifier.Enabled
+                    ? "XRTDirectedEdgeCollapse"
+                    : "DisabledForRegular10cmMesh",
                 simplificationMinimumTriangles =
                     RoomSetupReplicaV2XrtSimplifier.MinimumTriangles,
                 simplificationTargetVertexDivisor =
@@ -2566,7 +2568,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _firstMeshPair = _replayedFrames;
         }
         Debug.Log(
-            $"[RoomSetupReplicaV2] XRT simplify applied={result.applied} " +
+            $"[RoomSetupReplicaV2] mesh post-process " +
+            $"mode={(RoomSetupReplicaV2XrtSimplifier.Enabled ? "XRT" : "Regular10cm")} " +
+            $"applied={result.applied} " +
             $"vertices={result.inputVertices}->{result.outputVertices} " +
             $"target={result.targetVertices} triangles=" +
             $"{result.inputTriangles}->{result.outputTriangles} " +

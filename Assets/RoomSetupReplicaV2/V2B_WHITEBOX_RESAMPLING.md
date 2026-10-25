@@ -78,9 +78,11 @@ pass. Publication happens after the whole mesh pass so connectivity is never
 decided independently per chunk. The replay receipt records pre/post component
 and triangle counts plus cleanup time. Metric-error simplification remains a
 separate production stage and is not silently folded into either the resampler
-or this cleanup. It is now implemented immediately after cleanup as a global
-XRT-style directed-edge collapse pass. The recovered wrapper and kernel
-establish the following contract:
+or this cleanup. Its implementation is retained immediately after cleanup but
+is disabled in the current comparison build: publication stops at the regular
+10 cm Marching-Cubes mesh after `<32` cleanup. XRT is reserved for a later
+performance phase. When re-enabled, the recovered wrapper and kernel establish
+the following contract:
 
 ```text
 minimum input                 100 triangles
