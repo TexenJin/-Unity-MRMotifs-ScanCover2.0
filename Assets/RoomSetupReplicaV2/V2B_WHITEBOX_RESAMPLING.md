@@ -77,8 +77,37 @@ allows a fragment removed on one pass to grow past the threshold on a later
 pass. Publication happens after the whole mesh pass so connectivity is never
 decided independently per chunk. The replay receipt records pre/post component
 and triangle counts plus cleanup time. Metric-error simplification remains a
-later, separate production stage and is not silently folded into either the
-resampler or this cleanup.
+separate production stage and is not silently folded into either the resampler
+or this cleanup. It is now implemented immediately after cleanup as a global
+XRT-style directed-edge collapse pass. The recovered wrapper and kernel
+establish the following contract:
+
+```text
+minimum input                 100 triangles
+target                        current vertices / 20
+random generator              MT19937, seed 13
+candidates per batch          16 unique directed triangle corners
+accepted cost                 cost < 0.075 m
+physical-error terms          0.0075 m and 0.0375 m
+normal compatibility          oldNormal dot newNormal >= 0.1
+failed-batch stop             200 total failed batches
+```
+
+Each candidate collapses one existing endpoint onto the other. No midpoint,
+plane fit, vertex smoothing, or new surface position is introduced. Standard
+link-condition checks prevent a collapse that would make the local triangle
+topology non-manifold, while degenerate faces and excessive normal changes are
+rejected before the physical metric is considered. The target is a lower
+bound request, not permission to violate the error ceiling.
+
+The implementation preserves an explicit evidence boundary. The wrapper
+constants, XRT selection, seeded 16-candidate sampling, directed endpoint
+collapse, topology/normal gates, target condition and 200-failure condition
+are recovered behavior. The C# expression of the per-face physical cost is a
+clean-room equivalent of native `0x797180`, not a claim of instruction-level
+or floating-point-order identity. The replay receipt exposes every reduction,
+rejection and stop reason so the same tape can reveal a mismatched metric
+instead of hiding it behind a visually pleasant result.
 
 ## Static evidence
 
@@ -92,6 +121,13 @@ resampler or this cleanup.
   fallback.
 - `0x7a5400`: integer sparse-tree coordinates are scaled without a voxel-space
   half-cell addition.
+- `0x789ab0`: simplification wrapper, minimum input, target and three error
+  arguments.
+- `0x796400`: active XRT kernel, seed 13, 16-candidate batches and 200 failed
+  batches.
+- `0x796f70`: directed-collapse topology legality.
+- `0x797180`: local physical-error and normal-compatibility evaluation.
+- `0x797820`: half-edge collapse and adjacency rewiring.
 - Active configuration: source pitch `0.05 m`, ratio `0.5`, derived pitch
   `0.10 m`.
 - Recovered cleanup threshold: remove components with `<32` triangles.

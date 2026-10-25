@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using Genesis.RoomScan;
 using Unity.Collections;
 using UnityEngine;
@@ -218,6 +219,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int LastRemovedSmallTriangleCount { get; private set; }
     public int LastPostCleanupComponentCount { get; private set; }
     public float LastComponentCleanupMilliseconds { get; private set; }
+    public bool LastSimplificationApplied { get; private set; }
+    public int LastPreSimplificationVertexCount { get; private set; }
+    public int LastPreSimplificationTriangleCount { get; private set; }
+    public int LastSimplificationTargetVertexCount { get; private set; }
+    public int LastPostSimplificationVertexCount { get; private set; }
+    public int LastPostSimplificationTriangleCount { get; private set; }
+    public int LastAcceptedCollapseCount { get; private set; }
+    public int LastSimplificationFailedBatchCount { get; private set; }
+    public int LastSimplificationTopologyRejectCount { get; private set; }
+    public int LastSimplificationNormalRejectCount { get; private set; }
+    public int LastSimplificationErrorRejectCount { get; private set; }
+    public string LastSimplificationStopReason { get; private set; } =
+        string.Empty;
+    public float LastSimplificationMilliseconds { get; private set; }
     public bool HasPendingWork => _readbackPending || _workStage != WorkStage.None;
     public bool PreviewVisible => showReplica;
     public bool IsRecording => _tapeWriter != null;
@@ -312,6 +327,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private long _correctionPairLagSum;
     private int _correctionPairLagMax;
     private int _correctionPublicationCount;
+    private Task<RoomSetupReplicaV2XrtSimplifier.Result>
+        _simplificationTask;
+    private RoomSetupReplicaV2XrtSimplifier.Input
+        _pendingSimplificationInput;
+    private int _simplificationSerial;
 
     private GameObject _previewRoot;
     private Material _lineMaterial;
@@ -573,6 +593,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _meshDirtyStamps.Clear();
         _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
+        _pendingSimplificationInput = null;
         _nextMeshTime = 0f;
         AcceptedPairCount = 0;
         DroppedBusyPairCount = 0;
@@ -587,6 +608,19 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastRemovedSmallTriangleCount = 0;
         LastPostCleanupComponentCount = 0;
         LastComponentCleanupMilliseconds = 0f;
+        LastSimplificationApplied = false;
+        LastPreSimplificationVertexCount = 0;
+        LastPreSimplificationTriangleCount = 0;
+        LastSimplificationTargetVertexCount = 0;
+        LastPostSimplificationVertexCount = 0;
+        LastPostSimplificationTriangleCount = 0;
+        LastAcceptedCollapseCount = 0;
+        LastSimplificationFailedBatchCount = 0;
+        LastSimplificationTopologyRejectCount = 0;
+        LastSimplificationNormalRejectCount = 0;
+        LastSimplificationErrorRejectCount = 0;
+        LastSimplificationStopReason = string.Empty;
+        LastSimplificationMilliseconds = 0f;
         LastReconstructionMilliseconds = 0f;
         LastMeshingMilliseconds = 0f;
     }
@@ -594,6 +628,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void Update()
     {
         UpdatePreviewTransform();
+        PollSimplification();
         if (_readbackPending)
             CompleteReadbackWhenReady();
         if (_workStage != WorkStage.None)
@@ -918,7 +953,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         {
             if (!reader.TryReadNext(out frame))
             {
-                if (_meshQueue.Count > 0 || _meshPassActive)
+                if (_meshQueue.Count > 0 || _meshPassActive ||
+                    _simplificationTask != null ||
+                    _pendingSimplificationInput != null)
                 {
                     _nextReplayTime = Time.unscaledTime + 0.05f;
                     return;
@@ -1354,6 +1391,29 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int removedSmallComponents;
         public int postCleanupComponents;
         public float componentCleanupMilliseconds;
+        public bool simplificationApplied;
+        public string simplificationMode;
+        public int simplificationMinimumTriangles;
+        public int simplificationTargetVertexDivisor;
+        public int simplificationCandidateBatchSize;
+        public int simplificationMaximumFailedBatches;
+        public int simplificationRandomSeed;
+        public float simplificationMaximumErrorMeters;
+        public float simplificationAreaErrorMeters;
+        public float simplificationShapeErrorMeters;
+        public float simplificationMinimumNormalDot;
+        public int preSimplificationVertices;
+        public int preSimplificationTriangles;
+        public int simplificationTargetVertices;
+        public int postSimplificationVertices;
+        public int postSimplificationTriangles;
+        public int acceptedCollapses;
+        public int simplificationFailedBatches;
+        public int simplificationTopologyRejects;
+        public int simplificationNormalRejects;
+        public int simplificationErrorRejects;
+        public string simplificationStopReason;
+        public float simplificationMilliseconds;
         public int lastMeshPassDerivedValidSamples;
         public int lastMeshPassDerivedMissingSamples;
         public float lastReconstructionMilliseconds;
@@ -1416,7 +1476,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             var receipt = new ReplayReceipt
             {
                 algorithm =
-                    "V2BWhiteboxGridPointFusionDirectSampleRemoveSmall32",
+                    "V2BWhiteboxDirectSampleRemoveSmall32XrtMetricCollapse",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -1444,6 +1504,49 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 postCleanupComponents = LastPostCleanupComponentCount,
                 componentCleanupMilliseconds =
                     LastComponentCleanupMilliseconds,
+                simplificationApplied = LastSimplificationApplied,
+                simplificationMode = "XRTDirectedEdgeCollapse",
+                simplificationMinimumTriangles =
+                    RoomSetupReplicaV2XrtSimplifier.MinimumTriangles,
+                simplificationTargetVertexDivisor =
+                    RoomSetupReplicaV2XrtSimplifier.TargetVertexDivisor,
+                simplificationCandidateBatchSize =
+                    RoomSetupReplicaV2XrtSimplifier.CandidateBatchSize,
+                simplificationMaximumFailedBatches =
+                    RoomSetupReplicaV2XrtSimplifier.MaximumFailedBatches,
+                simplificationRandomSeed =
+                    (int)RoomSetupReplicaV2XrtSimplifier.RandomSeed,
+                simplificationMaximumErrorMeters =
+                    RoomSetupReplicaV2XrtSimplifier.MaximumErrorMeters,
+                simplificationAreaErrorMeters =
+                    RoomSetupReplicaV2XrtSimplifier.AreaErrorMeters,
+                simplificationShapeErrorMeters =
+                    RoomSetupReplicaV2XrtSimplifier.ShapeErrorMeters,
+                simplificationMinimumNormalDot =
+                    RoomSetupReplicaV2XrtSimplifier.MinimumNormalDot,
+                preSimplificationVertices =
+                    LastPreSimplificationVertexCount,
+                preSimplificationTriangles =
+                    LastPreSimplificationTriangleCount,
+                simplificationTargetVertices =
+                    LastSimplificationTargetVertexCount,
+                postSimplificationVertices =
+                    LastPostSimplificationVertexCount,
+                postSimplificationTriangles =
+                    LastPostSimplificationTriangleCount,
+                acceptedCollapses = LastAcceptedCollapseCount,
+                simplificationFailedBatches =
+                    LastSimplificationFailedBatchCount,
+                simplificationTopologyRejects =
+                    LastSimplificationTopologyRejectCount,
+                simplificationNormalRejects =
+                    LastSimplificationNormalRejectCount,
+                simplificationErrorRejects =
+                    LastSimplificationErrorRejectCount,
+                simplificationStopReason =
+                    LastSimplificationStopReason,
+                simplificationMilliseconds =
+                    LastSimplificationMilliseconds,
                 lastMeshPassDerivedValidSamples =
                     LastDerivedValidSampleCount,
                 lastMeshPassDerivedMissingSamples =
@@ -1958,8 +2061,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void CompleteMeshPass()
     {
         PublishRemoveSmallCandidateMeshes();
-        foreach (Vector3Int chunkId in _meshPassPublicationChunks)
-            RecordCorrectionPublication(chunkId);
         _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
         LastDerivedValidSampleCount = _passDerivedValidSamples;
@@ -2209,16 +2310,42 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             }
         }
 
+        // XRT operates on the complete extracted mesh, not independently on
+        // rendering chunks. Weld duplicated seam vertices into one topology
+        // while retaining each triangle's original publishing chunk.
+        var compactVertices = new List<Vector3>(vertexCount);
+        var compactTriangles = new List<int>(triangleCount * 3);
+        var compactOwners = new List<int>(triangleCount);
+        var weldedVertices =
+            new Dictionary<QuantizedPosition, int>(vertexCount);
         for (int chunkIndex = 0;
              chunkIndex < _orderedChunks.Count;
              chunkIndex++)
         {
-            PublishFilteredChunkMesh(
-                _orderedChunks[chunkIndex].Key,
-                _orderedChunks[chunkIndex].Value,
-                _orderedChunkVertexBases[chunkIndex],
-                union,
-                removedRoots);
+            Chunk chunk = _orderedChunks[chunkIndex].Value;
+            int vertexBase = _orderedChunkVertexBases[chunkIndex];
+            int[] triangles = chunk.candidateTriangles;
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                if (removedRoots.Contains(
+                        union.Find(vertexBase + triangles[i])))
+                    continue;
+                int a = RemapWeldedVertex(
+                    chunk.candidateVertices[triangles[i]],
+                    compactVertices, weldedVertices);
+                int b = RemapWeldedVertex(
+                    chunk.candidateVertices[triangles[i + 1]],
+                    compactVertices, weldedVertices);
+                int c = RemapWeldedVertex(
+                    chunk.candidateVertices[triangles[i + 2]],
+                    compactVertices, weldedVertices);
+                if (a == b || b == c || c == a)
+                    continue;
+                compactTriangles.Add(a);
+                compactTriangles.Add(b);
+                compactTriangles.Add(c);
+                compactOwners.Add(chunkIndex);
+            }
         }
 
         LastPreCleanupTriangleCount = triangleCount;
@@ -2227,26 +2354,151 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastRemovedSmallTriangleCount = removedTriangles;
         LastPostCleanupComponentCount =
             trianglesByRoot.Count - removedRoots.Count;
-        PreviewTriangleCount = 0;
-        foreach (Chunk chunk in _chunks.Values)
-            PreviewTriangleCount += chunk.triangleCount;
         LastComponentCleanupMilliseconds = (float)(
             (Time.realtimeSinceStartupAsDouble - start) * 1000d);
+        var ownerChunkIds = new Vector3Int[_orderedChunks.Count];
+        for (int i = 0; i < _orderedChunks.Count; i++)
+            ownerChunkIds[i] = _orderedChunks[i].Key;
+        var publicationChunkIds =
+            new Vector3Int[_meshPassPublicationChunks.Count];
+        _meshPassPublicationChunks.CopyTo(publicationChunkIds);
+        var input = new RoomSetupReplicaV2XrtSimplifier.Input
+        {
+            vertices = compactVertices.ToArray(),
+            triangles = compactTriangles.ToArray(),
+            triangleOwners = compactOwners.ToArray(),
+            ownerChunkIds = ownerChunkIds,
+            publicationChunkIds = publicationChunkIds,
+            resetGeneration = _resetGeneration,
+            serial = ++_simplificationSerial
+        };
+        QueueSimplification(input);
         Debug.Log(
             $"[RoomSetupReplicaV2] RemoveSmall<32 applied={applyCleanup} " +
             $"components={LastPreCleanupComponentCount}->" +
             $"{LastPostCleanupComponentCount} triangles=" +
-            $"{LastPreCleanupTriangleCount}->{PreviewTriangleCount} " +
+            $"{LastPreCleanupTriangleCount}->" +
+            $"{compactTriangles.Count / 3} " +
             $"removed={LastRemovedSmallTriangleCount} " +
             $"ms={LastComponentCleanupMilliseconds:F1}");
     }
 
-    private void PublishFilteredChunkMesh(
+    private static int RemapWeldedVertex(
+        Vector3 position,
+        List<Vector3> vertices,
+        Dictionary<QuantizedPosition, int> weldedVertices)
+    {
+        var key = new QuantizedPosition(position);
+        if (weldedVertices.TryGetValue(key, out int mapped))
+            return mapped;
+        mapped = vertices.Count;
+        weldedVertices.Add(key, mapped);
+        vertices.Add(position);
+        return mapped;
+    }
+
+    private void QueueSimplification(
+        RoomSetupReplicaV2XrtSimplifier.Input input)
+    {
+        // Mirror the recovered single-flight publication behavior. Meshing
+        // can continue while one immutable snapshot is simplified; only the
+        // newest waiting snapshot is retained.
+        if (_simplificationTask != null)
+        {
+            _pendingSimplificationInput = input;
+            return;
+        }
+        StartSimplification(input);
+    }
+
+    private void StartSimplification(
+        RoomSetupReplicaV2XrtSimplifier.Input input)
+    {
+        _simplificationTask = Task.Run(
+            () => RoomSetupReplicaV2XrtSimplifier.Run(input));
+    }
+
+    private void PollSimplification()
+    {
+        Task<RoomSetupReplicaV2XrtSimplifier.Result> task =
+            _simplificationTask;
+        if (task == null || !task.IsCompleted)
+            return;
+        _simplificationTask = null;
+        try
+        {
+            RoomSetupReplicaV2XrtSimplifier.Result result = task.Result;
+            if (result.resetGeneration == _resetGeneration)
+                PublishSimplificationResult(result);
+        }
+        catch (Exception exception)
+        {
+            Debug.LogError(
+                "[RoomSetupReplicaV2] XRT simplification failed: " +
+                exception);
+        }
+        RoomSetupReplicaV2XrtSimplifier.Input pending =
+            _pendingSimplificationInput;
+        _pendingSimplificationInput = null;
+        if (pending != null && pending.resetGeneration == _resetGeneration)
+            StartSimplification(pending);
+    }
+
+    private void PublishSimplificationResult(
+        RoomSetupReplicaV2XrtSimplifier.Result result)
+    {
+        LastSimplificationApplied = result.applied;
+        LastPreSimplificationVertexCount = result.inputVertices;
+        LastPreSimplificationTriangleCount = result.inputTriangles;
+        LastSimplificationTargetVertexCount = result.targetVertices;
+        LastPostSimplificationVertexCount = result.outputVertices;
+        LastPostSimplificationTriangleCount = result.outputTriangles;
+        LastAcceptedCollapseCount = result.acceptedCollapses;
+        LastSimplificationFailedBatchCount = result.failedBatches;
+        LastSimplificationTopologyRejectCount =
+            result.topologyRejectedCandidates;
+        LastSimplificationNormalRejectCount =
+            result.normalRejectedCandidates;
+        LastSimplificationErrorRejectCount =
+            result.errorRejectedCandidates;
+        LastSimplificationStopReason = result.stopReason;
+        LastSimplificationMilliseconds =
+            (float)result.elapsedMilliseconds;
+
+        for (int owner = 0; owner < result.ownerChunkIds.Length; owner++)
+        {
+            Vector3Int chunkId = result.ownerChunkIds[owner];
+            if (_chunks.TryGetValue(chunkId, out Chunk chunk))
+                PublishSimplifiedChunkMesh(
+                    chunkId, chunk, owner, result);
+        }
+        PreviewTriangleCount = 0;
+        foreach (Chunk chunk in _chunks.Values)
+            PreviewTriangleCount += chunk.triangleCount;
+        for (int i = 0; i < result.publicationChunkIds.Length; i++)
+            RecordCorrectionPublication(result.publicationChunkIds[i]);
+        if (IsReplaying && PreviewTriangleCount > 0 &&
+            _firstMeshLatencySeconds < 0f)
+        {
+            _firstMeshLatencySeconds = (float)(
+                Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
+            _firstMeshPair = _replayedFrames;
+        }
+        Debug.Log(
+            $"[RoomSetupReplicaV2] XRT simplify applied={result.applied} " +
+            $"vertices={result.inputVertices}->{result.outputVertices} " +
+            $"target={result.targetVertices} triangles=" +
+            $"{result.inputTriangles}->{result.outputTriangles} " +
+            $"collapses={result.acceptedCollapses} " +
+            $"failedBatches={result.failedBatches} " +
+            $"stop={result.stopReason} ms={result.elapsedMilliseconds:F1}");
+    }
+
+    private void PublishSimplifiedChunkMesh(
         Vector3Int chunkId,
         Chunk chunk,
-        int vertexBase,
-        UnionFind union,
-        HashSet<int> removedRoots)
+        int owner,
+        RoomSetupReplicaV2XrtSimplifier.Result result)
     {
         _meshVertices.Clear();
         _meshTriangles.Clear();
@@ -2254,15 +2506,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _uniqueLines.Clear();
         _publishedVertexRemap.Clear();
 
-        int[] candidates = chunk.candidateTriangles;
-        for (int i = 0; i < candidates.Length; i += 3)
+        int[] triangles = result.triangles;
+        int faceCount = triangles.Length / 3;
+        for (int face = 0; face < faceCount; face++)
         {
-            if (removedRoots.Contains(
-                    union.Find(vertexBase + candidates[i])))
+            if (face >= result.triangleOwners.Length ||
+                result.triangleOwners[face] != owner)
                 continue;
-            int a = RemapPublishedVertex(chunk, candidates[i]);
-            int b = RemapPublishedVertex(chunk, candidates[i + 1]);
-            int c = RemapPublishedVertex(chunk, candidates[i + 2]);
+            int index = face * 3;
+            int a = RemapPublishedVertex(
+                result.vertices, triangles[index]);
+            int b = RemapPublishedVertex(
+                result.vertices, triangles[index + 1]);
+            int c = RemapPublishedVertex(
+                result.vertices, triangles[index + 2]);
             _meshTriangles.Add(a);
             _meshTriangles.Add(b);
             _meshTriangles.Add(c);
@@ -2271,8 +2528,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             AddLine(c, a);
         }
 
-        int triangles = _meshTriangles.Count / 3;
-        if (triangles <= 0)
+        int publishedTriangleCount = _meshTriangles.Count / 3;
+        if (publishedTriangleCount <= 0)
         {
             if (chunk.previewObject != null)
             {
@@ -2294,30 +2551,28 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         staging.subMeshCount = 2;
         staging.SetIndices(_meshTriangles, MeshTopology.Triangles, 0, false);
         staging.SetIndices(_meshLines, MeshTopology.Lines, 1, false);
-        Vector3Int origin = chunkId * ChunkSize;
-        float chunkWorld = ChunkSize * VoxelMeters;
-        staging.bounds = new Bounds(
-            new Vector3(
-                (origin.x + ChunkSize * 0.5f) * VoxelMeters,
-                (origin.y + ChunkSize * 0.5f) * VoxelMeters,
-                (origin.z + ChunkSize * 0.5f) * VoxelMeters),
-            Vector3.one * (chunkWorld + VoxelMeters));
+        // A legal collapse may retain the endpoint owned by a neighbouring
+        // extraction chunk. Recalculate bounds from the actual surviving
+        // vertices rather than assuming every point remains inside its old
+        // chunk AABB.
+        staging.RecalculateBounds();
         staging.UploadMeshData(false);
         chunk.previewFilter.sharedMesh = staging;
         chunk.backMesh = chunk.frontMesh;
         chunk.frontMesh = staging;
-        chunk.triangleCount = triangles;
+        chunk.triangleCount = publishedTriangleCount;
         chunk.previewObject.SetActive(showReplica);
     }
 
-    private int RemapPublishedVertex(Chunk chunk, int candidateIndex)
+    private int RemapPublishedVertex(
+        Vector3[] vertices, int candidateIndex)
     {
         if (_publishedVertexRemap.TryGetValue(
                 candidateIndex, out int published))
             return published;
         published = _meshVertices.Count;
         _publishedVertexRemap.Add(candidateIndex, published);
-        _meshVertices.Add(chunk.candidateVertices[candidateIndex]);
+        _meshVertices.Add(vertices[candidateIndex]);
         return published;
     }
 
