@@ -62,6 +62,10 @@
     <div class="scar-detail-title" data-detail-title>高置信连续缺陷</div>
     <div class="text-small" data-detail-evidence>默认只显示无直接支持、主导锚点分离超过 30 cm，且组成至少 8 个连续面的区域。</div>
     <div class="text-small text-muted" data-detail-action>处理：在实际过零边阻止不同跨帧主导层连接；证据不足区域不删除。</div>
+    <div class="viz-row scar-report-row">
+      <button class="btn" type="button" data-report disabled>报告选中位置为漏检</button>
+      <span class="text-small text-muted">也可以点击未着色的房间基线三角形</span>
+    </div>
   </div>
 
   <div class="scar-legend text-small" aria-label="通用识别特征与解决方式">
@@ -97,6 +101,7 @@
 }
 #scar-source-audit-3d .scar-detail { margin-top: 10px; }
 #scar-source-audit-3d .scar-detail-title { font-weight: 500; margin-bottom: 4px; }
+#scar-source-audit-3d .scar-report-row { margin-top: 8px; }
 #scar-source-audit-3d .scar-legend { display: grid; gap: 7px; margin-top: 10px; }
 #scar-source-audit-3d .scar-legend > div { display: grid; grid-template-columns: 12px 1fr; gap: 7px; align-items: start; }
 #scar-source-audit-3d .scar-swatch { width: 10px; height: 10px; display: inline-block; }
@@ -128,6 +133,8 @@ const actionNode = root.querySelector('[data-detail-action]');
 const clusterSelect = root.querySelector('[data-cluster]');
 const categoryChecks = [...root.querySelectorAll('[data-category]')];
 const baseCheck = root.querySelector('[data-base]');
+const reportButton = root.querySelector('[data-report]');
+let selectedFaceId = null;
 
 root.querySelector('[data-stat="confirmed"]').textContent = payload.s.confirmed.toLocaleString();
 root.querySelector('[data-stat="bridge"]').textContent = payload.s.bridgeCandidates.toLocaleString();
@@ -291,13 +298,24 @@ function showCategory(code, prefix = '') {
 
 function showTriangle(faceId) {
   const row = metadata.get(faceId);
-  if (!row) return;
+  selectedFaceId = faceId;
+  reportButton.disabled = false;
+  if (!row) {
+    titleNode.textContent = `三角形 ${faceId} · 当前漏检/正常对照范围`;
+    evidenceNode.textContent = '该三角形不在原“无直接支持”目标集中，因此旧检测器不会着色；它可能具有直接深度支持但仍形成视觉折痕。';
+    actionNode.textContent = '处理：将它作为人工确认正样本，追查局部法线折痕、时间深度层和主导锚点，不因“有直接支持”而自动放行。';
+    highlight.geometry.dispose();
+    highlight.geometry = geometryFor([faceId]);
+    saveState();
+    return;
+  }
   const [triangle, cluster, code, separationMm, stereo, switches, positive, negative, sameView, viewSeparated, coherentSize] = row;
   titleNode.textContent = `簇 ${cluster} · 三角形 ${triangle} · ${categoryNames[code]}`;
   evidenceNode.textContent = `主导锚点分离 ${separationMm} mm；高分离连续面 ${coherentSize}；左右眼冲突最大 ${stereo} 次；跨帧翻转最大 ${switches} 次；正/负证据最大 ${positive}/${negative} 对；同视角/视角分离混层角点 ${sameView}/${viewSeparated}。`;
   actionNode.textContent = categoryActions[code];
   highlight.geometry.dispose();
   highlight.geometry = geometryFor([faceId]);
+  saveState();
 }
 
 for (const cluster of payload.k) {
@@ -316,10 +334,12 @@ canvas.addEventListener('click', event => {
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
   const activeMeshes = meshes.filter((mesh, code) => mesh.visible && visibleFaceIds[code].length);
-  const hit = raycaster.intersectObjects(activeMeshes, false)[0];
+  let hit = raycaster.intersectObjects(activeMeshes, false)[0];
+  if (!hit && baseCheck.checked) hit = raycaster.intersectObject(baseSolid, false)[0];
   if (!hit) return;
-  const code = hit.object.userData.category;
-  const faceId = visibleFaceIds[code][hit.faceIndex];
+  const faceId = hit.object === baseSolid
+    ? hit.faceIndex
+    : visibleFaceIds[hit.object.userData.category][hit.faceIndex];
   showTriangle(faceId);
 });
 
@@ -327,7 +347,11 @@ function saveState() {
   if (!window.openai?.setWidgetState) return;
   const enabled = categoryChecks.map(input => input.checked);
   window.openai.setWidgetState({
-    modelContent: { selectedCluster: clusterSelect.value || null, enabled },
+    modelContent: {
+      selectedCluster: clusterSelect.value || null,
+      selectedFaceId,
+      enabled
+    },
     privateContent: { baseVisible: baseCheck.checked }
   }).catch(() => {});
 }
@@ -340,6 +364,10 @@ function restoreState(state) {
   }
   if (model?.selectedCluster != null && payload.kf[String(model.selectedCluster)]) {
     clusterSelect.value = String(model.selectedCluster);
+  }
+  if (Number.isInteger(model?.selectedFaceId) && model.selectedFaceId >= 0 &&
+      model.selectedFaceId < payload.s.triangles) {
+    selectedFaceId = model.selectedFaceId;
   }
   if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
   baseSolid.visible = baseCheck.checked;
@@ -362,6 +390,17 @@ root.querySelector('[data-fit]').addEventListener('click', () => {
   const facesToFit = currentClusterFaces() || allFaceIds();
   fitFaces(facesToFit);
 });
+reportButton.addEventListener('click', async () => {
+  if (selectedFaceId == null || !window.openai?.sendFollowUpMessage) return;
+  const row = metadata.get(selectedFaceId);
+  const classification = row ? categoryNames[row[2]] : '旧检测器目标集之外';
+  const position = camera.position.toArray().map(value => Number(value.toFixed(4)));
+  const target = controls.target.toArray().map(value => Number(value.toFixed(4)));
+  await window.openai.sendFollowUpMessage({
+    title: '报告可见缺陷漏检',
+    prompt: `我在 Room Mesh 3D 模型中确认三角形 ${selectedFaceId} 是肉眼可见缺陷，但当前分类“${classification}”未正确过滤。查看相机位置 ${JSON.stringify(position)}，观察目标 ${JSON.stringify(target)}。请把它作为人工正样本继续追查相邻折痕并修正通用识别规则。`
+  });
+});
 window.addEventListener('openai:set_globals', event => {
   restoreState(event.detail?.globals?.widgetState);
   updateFilter(false);
@@ -377,6 +416,7 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 updateFilter(false);
+if (selectedFaceId != null) showTriangle(selectedFaceId);
 
 function animate() {
   controls.update();

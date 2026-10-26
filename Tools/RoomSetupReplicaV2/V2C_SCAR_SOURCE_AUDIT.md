@@ -124,6 +124,33 @@ AND welded high-separation component contains >= 8 triangles
 It identifies 459 triangles in 11 coherent components. The wider 0.15 m rule
 remains a candidate overlay only; it is not labeled as a confirmed defect.
 
+## Human-visible false-negative boundary
+
+Visual inspection of the first 3D result identified a long, wavy interior
+crease/ribbon that the high-confidence bridge rule did not color. This is a
+confirmed false negative: the 459-triangle rule is a high-specificity detector,
+not a complete scar detector. Its miss proves that `no direct support` cannot
+be a universal prerequisite; a sensor-supported but geometrically corrugated
+surface may still be a visible reconstruction defect.
+
+The 3D inspector therefore raycasts the complete baseline mesh, not only the
+colored audit targets. Clicking an uncolored triangle exposes its mesh face ID
+and can report that face, cluster view, and camera pose as an explicit human
+positive label. The next audit for such labels must add a separate supported
+crease signature:
+
+- an internal welded edge, not an open mesh boundary;
+- a coherent elongated chain of high adjacent-face dihedral angles;
+- the chain lies inside a broader locally planar patch rather than at a room
+  corner, furniture silhouette, or genuine surface boundary;
+- local depth/anchor history explains whether the fold is stable input
+  geometry, temporal corrugation, or a pose-linked warp.
+
+Until the clicked triangle ID is recorded, the screenshot alone has no viewer
+matrix and cannot be mapped unambiguously back to Quest Stage coordinates. The
+high-confidence bridge rule remains valid for the regions it selects, but its
+recall is explicitly unaccepted.
+
 ## What is established
 
 1. Same-pair stereo opposition is not the dominant source. It appears at least
