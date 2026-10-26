@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from build_spatial_scar_receipt import frames, read_ply
+from build_spatial_scar_receipt import UnionFind, frames, read_ply
 
 
 SOURCE_VOXEL_METERS = 0.05
@@ -33,6 +33,8 @@ REPEATED_SWITCHES = 3
 SAME_VIEW_EYE_DISTANCE_METERS = 0.15
 SAME_VIEW_RAY_ANGLE_DEGREES = 5.0
 DOMINANT_ANCHOR_SEPARATION_METERS = 0.15
+COHERENT_BRIDGE_SEPARATION_METERS = 0.30
+COHERENT_BRIDGE_MINIMUM_TRIANGLES = 8
 CORNER_OFFSETS = np.array([
     [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
     [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
@@ -192,6 +194,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
     platform_frames = []
     pair_sign_history = []
     mid_eye_positions = []
+    head_rotations = []
     pair_anchor_history = []
     pair_anchor_valid_history = []
     frame_count = 0
@@ -212,6 +215,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
         left_eye = matrices[4][:3, 3]
         right_eye = matrices[5][:3, 3]
         mid_eye_positions.append((left_eye + right_eye) * 0.5)
+        head_rotations.append(matrices[4][:3, :3].copy())
         stereo_baselines.append(float(np.linalg.norm(left_eye - right_eye)))
         identity = np.eye(4)
         for eye in range(2):
@@ -326,6 +330,83 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
         same_view_mixed[corner] = bool(np.any(close_view))
         view_separated_mixed[corner] = not same_view_mixed[corner]
 
+    head_rotations = np.asarray(head_rotations, dtype=np.float64)
+    capture_times_array = np.asarray(capture_times, dtype=np.float64)
+    step_seconds = np.diff(capture_times_array)
+    linear_speed = np.zeros(frame_count, dtype=np.float64)
+    angular_speed = np.zeros(frame_count, dtype=np.float64)
+    linear_speed[1:] = (
+        np.linalg.norm(np.diff(mid_eyes, axis=0), axis=1) /
+        np.maximum(step_seconds, 1e-6))
+    relative = np.einsum(
+        "nij,njk->nik",
+        np.transpose(head_rotations[:-1], (0, 2, 1)),
+        head_rotations[1:])
+    cosine = np.clip(
+        (np.trace(relative, axis1=1, axis2=2) - 1.0) * 0.5,
+        -1.0, 1.0)
+    angular_speed[1:] = (
+        np.degrees(np.arccos(cosine)) /
+        np.maximum(step_seconds, 1e-6))
+    switch_pair_indices = []
+    same_view_switch_pair_indices = []
+    for corner in np.flatnonzero(repeated_mixed):
+        observed_pairs = np.flatnonzero(sign_history[:, corner] != 0)
+        if len(observed_pairs) < 2:
+            continue
+        changed = (sign_history[observed_pairs[1:], corner] !=
+                   sign_history[observed_pairs[:-1], corner])
+        indices = observed_pairs[1:][changed]
+        switch_pair_indices.extend(indices.tolist())
+        if same_view_mixed[corner]:
+            same_view_switch_pair_indices.extend(indices.tolist())
+
+    def motion_summary(indices):
+        if not indices:
+            return {
+                "events": 0,
+                "linearSpeedMedianMetersPerSecond": 0.0,
+                "linearSpeedP90MetersPerSecond": 0.0,
+                "angularSpeedMedianDegreesPerSecond": 0.0,
+                "angularSpeedP90DegreesPerSecond": 0.0,
+                "shareInTopLinearMotionQuartile": 0.0,
+                "shareInTopAngularMotionQuartile": 0.0,
+            }
+        indices = np.asarray(indices, dtype=np.int64)
+        linear = linear_speed[indices]
+        angular = angular_speed[indices]
+        linear_q75 = np.percentile(linear_speed[1:], 75)
+        angular_q75 = np.percentile(angular_speed[1:], 75)
+        return {
+            "events": int(len(indices)),
+            "linearSpeedMedianMetersPerSecond": float(np.median(linear)),
+            "linearSpeedP90MetersPerSecond": float(np.percentile(linear, 90)),
+            "angularSpeedMedianDegreesPerSecond": float(np.median(angular)),
+            "angularSpeedP90DegreesPerSecond": float(np.percentile(angular, 90)),
+            "shareInTopLinearMotionQuartile": float(np.mean(linear >= linear_q75)),
+            "shareInTopAngularMotionQuartile": float(np.mean(angular >= angular_q75)),
+        }
+
+    motion_audit = {
+        "allRecordedPairs": {
+            "linearSpeedMedianMetersPerSecond": float(
+                np.median(linear_speed[1:])),
+            "linearSpeedP90MetersPerSecond": float(
+                np.percentile(linear_speed[1:], 90)),
+            "angularSpeedMedianDegreesPerSecond": float(
+                np.median(angular_speed[1:])),
+            "angularSpeedP90DegreesPerSecond": float(
+                np.percentile(angular_speed[1:], 90)),
+        },
+        "repeatedMixedCornerSwitchEvents": motion_summary(
+            switch_pair_indices),
+        "sameViewMixedCornerSwitchEvents": motion_summary(
+            same_view_switch_pair_indices),
+        "interpretationBoundary": (
+            "Motion association can support a depth-pose latency hypothesis, "
+            "but cannot prove latency without independent pose ground truth."),
+    }
+
     cell_distances = distance[triangle_corner_indices]
     gx = (cell_distances[:, 1] + cell_distances[:, 2] +
           cell_distances[:, 5] + cell_distances[:, 6] -
@@ -378,6 +459,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
         "sameViewRepeatedMixedSignSourceVoxel": 0,
         "viewSeparatedRepeatedMixedSignSourceVoxel": 0,
         "dominantAnchorLayerBridge": 0,
+        "coherentHighSeparationBridge": 0,
         "noRepeatedMixedCornerZeroCrossing": 0,
         "reconstructedCellCrossing": 0,
     }
@@ -444,6 +526,8 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
                 dominant_anchor_incompatible_edges[index]),
             "dominantAnchorMaximumNormalSeparationMeters": float(
                 dominant_anchor_maximum_separation[index]),
+            "coherentHighSeparationBridge": False,
+            "highSeparationComponentTriangles": 0,
             "mechanisms": mechanisms,
             "cornerEvidence": {
                 "observed": int(np.count_nonzero(corner_observed[corners])),
@@ -479,6 +563,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
             "sameViewRepeatedMixedSignSourceVoxel": 0,
             "viewSeparatedRepeatedMixedSignSourceVoxel": 0,
             "dominantAnchorLayerBridge": 0,
+            "coherentHighSeparationBridge": 0,
             "noRepeatedMixedCornerZeroCrossing": 0,
             "reconstructedCellCrossing": 0,
         })
@@ -488,6 +573,37 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
             cluster[key] += 1
         if cell_crossing[index]:
             cluster["reconstructedCellCrossing"] += 1
+
+    high_separation_records = [
+        index for index, record in enumerate(triangle_records)
+        if record["dominantAnchorMaximumNormalSeparationMeters"] >
+        COHERENT_BRIDGE_SEPARATION_METERS
+    ]
+    union = UnionFind(len(high_separation_records))
+    owners = {}
+    for local, record_index in enumerate(high_separation_records):
+        triangle = triangle_records[record_index]["triangle"]
+        for vertex in vertices[triangles[triangle]]:
+            key = tuple(np.rint(vertex * 10000.0).astype(np.int64))
+            if key in owners:
+                union.union(local, owners[key])
+            else:
+                owners[key] = local
+    component_sizes = {}
+    for local in range(len(high_separation_records)):
+        root = union.find(local)
+        component_sizes[root] = component_sizes.get(root, 0) + 1
+    for local, record_index in enumerate(high_separation_records):
+        size = component_sizes[union.find(local)]
+        record = triangle_records[record_index]
+        record["highSeparationComponentTriangles"] = size
+        if size < COHERENT_BRIDGE_MINIMUM_TRIANGLES:
+            continue
+        record["coherentHighSeparationBridge"] = True
+        record["mechanisms"].append("CoherentHighSeparationBridge")
+        overlap_counts["coherentHighSeparationBridge"] += 1
+        cluster_totals[record["cluster"]][
+            "coherentHighSeparationBridge"] += 1
 
     cluster_records = [
         {"cluster": cluster, **values}
@@ -516,6 +632,10 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
             "sameViewRayAngleDegrees": SAME_VIEW_RAY_ANGLE_DEGREES,
             "dominantAnchorSeparationMeters":
                 DOMINANT_ANCHOR_SEPARATION_METERS,
+            "coherentBridgeSeparationMeters":
+                COHERENT_BRIDGE_SEPARATION_METERS,
+            "coherentBridgeMinimumTriangles":
+                COHERENT_BRIDGE_MINIMUM_TRIANGLES,
         },
         "matrixAndTimingAudit": {
             "pairs": frame_count,
@@ -532,6 +652,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
             "captureIntervalMeanSeconds": float(np.mean(time_steps)),
             "captureIntervalMaximumSeconds": float(np.max(time_steps, initial=0.0)),
         },
+        "motionCorrelationAudit": motion_audit,
         "reconstructionCheck": {
             "unsupportedTriangles": len(triangle_records),
             "uniqueDerivedCells": int(len(np.unique(cells, axis=0))),
@@ -565,6 +686,7 @@ def main():
         args.mesh, args.tape, args.spatial_receipt, args.output)
     print(json.dumps({
         "matrixAndTimingAudit": receipt["matrixAndTimingAudit"],
+        "motionCorrelationAudit": receipt["motionCorrelationAudit"],
         "reconstructionCheck": receipt["reconstructionCheck"],
         "mechanismOverlapCounts": receipt["mechanismOverlapCounts"],
     }, indent=2))

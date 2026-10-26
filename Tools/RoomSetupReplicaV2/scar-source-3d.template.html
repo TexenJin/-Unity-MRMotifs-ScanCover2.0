@@ -1,0 +1,387 @@
+<div id="scar-source-audit-3d">
+  <h2>Room Mesh 缺陷来源定位（对照校验）</h2>
+
+  <div class="viz-grid scar-stats" aria-label="已确认的缺陷证据数量">
+    <div class="card viz-stat">
+      <div class="text-muted">高置信连续缺陷</div>
+      <div class="viz-stat-value tabular-nums" data-stat="confirmed"></div>
+      <div class="text-small text-muted">无支持＋分离 &gt;30 cm＋连续 ≥8 面</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">宽松跨层候选</div>
+      <div class="viz-stat-value tabular-nums" data-stat="bridge"></div>
+      <div class="text-small text-muted">主导锚点分离 &gt;15 cm</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">空间匹配正常对照命中</div>
+      <div class="viz-stat-value tabular-nums" data-stat="control"></div>
+      <div class="text-small text-muted">同规模 2,523 个直接支持三角形</div>
+    </div>
+  </div>
+
+  <div class="viz-controls scar-controls" aria-label="3D 缺陷筛选">
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="0" checked>
+      <span class="scar-swatch scar-confirmed" aria-hidden="true"></span>
+      <span class="form-check-label">高置信缺陷</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="1">
+      <span class="scar-swatch scar-bridge" aria-hidden="true"></span>
+      <span class="form-check-label">宽松搭桥候选</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="2">
+      <span class="scar-swatch scar-mixed" aria-hidden="true"></span>
+      <span class="form-check-label">混层线索（非缺陷判据）</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="3">
+      <span class="scar-swatch scar-unproven" aria-hidden="true"></span>
+      <span class="form-check-label">证据不足</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-base checked>
+      <span class="form-check-label">房间基线</span>
+    </label>
+    <label class="form-label scar-cluster-label">
+      空间簇
+      <select class="form-select" data-cluster aria-label="选择空间簇">
+        <option value="">全部高置信区域</option>
+      </select>
+    </label>
+    <button class="btn" type="button" data-fit>适配视图</button>
+  </div>
+
+  <div class="scar-viewport">
+    <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格缺陷三维模型"></canvas>
+    <div class="scar-help text-small text-muted">拖动旋转 · 滚轮缩放 · 点击彩色三角形查看证据</div>
+  </div>
+
+  <div class="card scar-detail" aria-live="polite">
+    <div class="scar-detail-title" data-detail-title>高置信连续缺陷</div>
+    <div class="text-small" data-detail-evidence>默认只显示无直接支持、主导锚点分离超过 30 cm，且组成至少 8 个连续面的区域。</div>
+    <div class="text-small text-muted" data-detail-action>处理：在实际过零边阻止不同跨帧主导层连接；证据不足区域不删除。</div>
+  </div>
+
+  <div class="scar-legend text-small" aria-label="通用识别特征与解决方式">
+    <div><span class="scar-swatch scar-confirmed" aria-hidden="true"></span><span><strong>高置信缺陷：</strong>无直接支持＋过零边锚点分离 &gt;30 cm＋同类连续面 ≥8。 <span class="text-muted">匹配正常对照仅命中 32/2,523，而异常组命中 459/2,523。</span></span></div>
+    <div><span class="scar-swatch scar-bridge" aria-hidden="true"></span><span><strong>宽松搭桥候选：</strong>过零边锚点分离 &gt;15 cm，但未达到连续高分离判据。 <span class="text-muted">用于观察，不应自动删除。</span></span></div>
+    <div><span class="scar-swatch scar-mixed" aria-hidden="true"></span><span><strong>混层线索：</strong>同一 5 cm 角点反复出现正负证据。 <span class="text-muted">正常对照中更常见，因此不能单独作为缺陷判据，只用于解释已确认搭桥的上游历史。</span></span></div>
+    <div><span class="scar-swatch scar-unproven" aria-hidden="true"></span><span><strong>证据不足：</strong>只有无直接支持，缺少连续高分离搭桥。 <span class="text-muted">可能是正常 TSDF 插值，不得按缺陷清除。</span></span></div>
+  </div>
+</div>
+
+<style>
+#scar-source-audit-3d { width: 100%; color: var(--foreground); }
+#scar-source-audit-3d h2 { margin: 0 0 12px; }
+#scar-source-audit-3d .scar-stats { margin-bottom: 12px; }
+#scar-source-audit-3d .scar-controls { margin-bottom: 10px; align-items: end; }
+#scar-source-audit-3d .form-check { display: inline-flex; align-items: center; gap: 6px; }
+#scar-source-audit-3d .scar-cluster-label { min-width: 220px; margin: 0; }
+#scar-source-audit-3d .scar-cluster-label .form-select { margin-top: 4px; }
+#scar-source-audit-3d .scar-viewport {
+  position: relative;
+  width: 100%;
+  height: 560px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+#scar-source-audit-3d canvas { display: block; width: 100%; height: 100%; }
+#scar-source-audit-3d .scar-help {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  padding: 3px 6px;
+  background: color-mix(in srgb, var(--background) 78%, transparent);
+}
+#scar-source-audit-3d .scar-detail { margin-top: 10px; }
+#scar-source-audit-3d .scar-detail-title { font-weight: 500; margin-bottom: 4px; }
+#scar-source-audit-3d .scar-legend { display: grid; gap: 7px; margin-top: 10px; }
+#scar-source-audit-3d .scar-legend > div { display: grid; grid-template-columns: 12px 1fr; gap: 7px; align-items: start; }
+#scar-source-audit-3d .scar-swatch { width: 10px; height: 10px; display: inline-block; }
+#scar-source-audit-3d .scar-mixed { background: var(--viz-series-1); }
+#scar-source-audit-3d .scar-bridge { background: var(--viz-series-2); }
+#scar-source-audit-3d .scar-confirmed { background: var(--viz-series-3); }
+#scar-source-audit-3d .scar-unproven { background: var(--muted-foreground); }
+@media (max-width: 560px) {
+  #scar-source-audit-3d .scar-viewport { height: 420px; }
+  #scar-source-audit-3d .scar-cluster-label { min-width: 100%; }
+  #scar-source-audit-3d .scar-legend > div { grid-template-columns: 12px 1fr; }
+}
+</style>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const root = document.getElementById('scar-source-audit-3d');
+const payload = __SCAR_SOURCE_PAYLOAD__;
+const canvas = root.querySelector('[data-canvas]');
+const viewport = root.querySelector('.scar-viewport');
+const titleNode = root.querySelector('[data-detail-title]');
+const evidenceNode = root.querySelector('[data-detail-evidence]');
+const actionNode = root.querySelector('[data-detail-action]');
+const clusterSelect = root.querySelector('[data-cluster]');
+const categoryChecks = [...root.querySelectorAll('[data-category]')];
+const baseCheck = root.querySelector('[data-base]');
+
+root.querySelector('[data-stat="confirmed"]').textContent = payload.s.confirmed.toLocaleString();
+root.querySelector('[data-stat="bridge"]').textContent = payload.s.bridgeCandidates.toLocaleString();
+root.querySelector('[data-stat="control"]').textContent = `${payload.s.controlConfirmed.toLocaleString()} / 2,523`;
+
+const categoryNames = ['高置信连续缺陷', '宽松搭桥候选', '混层线索', '证据不足'];
+const categoryEvidence = [
+  '无直接支持，过零边主导锚点分离超过 30 cm，并形成至少 8 个连续三角形；已通过空间匹配正常对照。',
+  '实际零交叉边两端主导锚点分离超过 15 cm，但空间连续性或分离强度不足以实锤。',
+  '同一 5 cm 源角点反复收到正、负证据；正常对照同样常见，不能独立判错。',
+  '只有无直接深度支持，尚无连续高分离跨层证据。'
+];
+const categoryActions = [
+  '处理：跨帧累计成熟主导层，只检查实际过零边；强分离且空间连续时留空或分层，保留旧正确 Front。',
+  '处理：只作为候选继续观察，不自动删除；需要更强分离、空间连续或直接视觉对应。',
+  '处理：仅在已确认搭桥区域用于选择融合策略；不能据此全局减权、退休或删面。',
+  '处理：不删除。继续保留为普通 TSDF 插值，除非取得新的直接因果证据。'
+];
+
+function tokenColor(name) {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  probe.style.position = 'absolute';
+  probe.style.visibility = 'hidden';
+  root.appendChild(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  const colorCanvas = document.createElement('canvas');
+  colorCanvas.width = 1;
+  colorCanvas.height = 1;
+  const context = colorCanvas.getContext('2d');
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const pixel = context.getImageData(0, 0, 1, 1).data;
+  return new THREE.Color(pixel[0] / 255, pixel[1] / 255, pixel[2] / 255);
+}
+
+const positions = new Float32Array(payload.v.length);
+for (let i = 0; i < payload.v.length; i += 1) positions[i] = payload.v[i] / 1000;
+const faces = new Uint32Array(payload.f);
+const metadata = new Map(payload.m.map(row => [row[0], row]));
+
+function geometryFor(faceIds) {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+  const indices = new Uint32Array(faceIds.length * 3);
+  for (let i = 0; i < faceIds.length; i += 1) {
+    const source = faceIds[i] * 3;
+    const target = i * 3;
+    indices[target] = faces[source];
+    indices[target + 1] = faces[source + 1];
+    indices[target + 2] = faces[source + 2];
+  }
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.02, 100);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const baseGeometry = new THREE.BufferGeometry();
+baseGeometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+baseGeometry.setIndex(new THREE.BufferAttribute(faces.slice(), 1));
+baseGeometry.computeBoundingBox();
+baseGeometry.computeBoundingSphere();
+const baseSolid = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.035,
+  side: THREE.DoubleSide, depthWrite: false
+}));
+const baseWire = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.11,
+  wireframe: true, depthWrite: false
+}));
+scene.add(baseSolid, baseWire);
+
+const materialTokens = ['--viz-series-3', '--viz-series-2', '--viz-series-1', '--muted-foreground'];
+const meshes = [];
+const visibleFaceIds = [];
+for (let code = 0; code < 4; code += 1) {
+  const material = new THREE.MeshBasicMaterial({
+    color: tokenColor(materialTokens[code]), transparent: true,
+    opacity: code === 3 ? 0.42 : 0.9, side: THREE.DoubleSide,
+    depthWrite: code !== 3, polygonOffset: true,
+    polygonOffsetFactor: -1 - code, polygonOffsetUnits: -1
+  });
+  const mesh = new THREE.Mesh(geometryFor(payload.c[code]), material);
+  mesh.userData.category = code;
+  scene.add(mesh);
+  meshes.push(mesh);
+  visibleFaceIds.push(payload.c[code].slice());
+}
+
+const highlightMaterial = new THREE.MeshBasicMaterial({
+  color: tokenColor('--primary'), side: THREE.DoubleSide,
+  transparent: true, opacity: 1, polygonOffset: true,
+  polygonOffsetFactor: -8, polygonOffsetUnits: -8
+});
+const highlight = new THREE.Mesh(geometryFor([]), highlightMaterial);
+scene.add(highlight);
+
+function allFaceIds() {
+  return Array.from({ length: payload.s.triangles }, (_, index) => index);
+}
+
+function fitFaces(faceIds) {
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const faceId of faceIds) {
+    for (let corner = 0; corner < 3; corner += 1) {
+      const vertex = faces[faceId * 3 + corner] * 3;
+      point.set(positions[vertex], positions[vertex + 1], positions[vertex + 2]);
+      box.expandByPoint(point);
+    }
+  }
+  if (box.isEmpty()) return;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 0.25);
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).add(new THREE.Vector3(1, 0.55, 1).normalize().multiplyScalar(radius * 2.6));
+  camera.near = Math.max(0.01, radius / 100);
+  camera.far = Math.max(20, radius * 20);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function currentClusterFaces() {
+  const selected = clusterSelect.value;
+  return selected ? payload.kf[selected] : null;
+}
+
+function updateFilter(shouldSave = true) {
+  const clusterFaces = currentClusterFaces();
+  const allowed = clusterFaces ? new Set(clusterFaces) : null;
+  for (let code = 0; code < 4; code += 1) {
+    const filtered = allowed ? payload.c[code].filter(face => allowed.has(face)) : payload.c[code].slice();
+    meshes[code].geometry.dispose();
+    meshes[code].geometry = geometryFor(filtered);
+    visibleFaceIds[code] = filtered;
+    meshes[code].visible = categoryChecks[code].checked;
+  }
+  highlight.geometry.dispose();
+  highlight.geometry = geometryFor([]);
+  if (clusterFaces) fitFaces(clusterFaces); else fitFaces(allFaceIds());
+  if (shouldSave) saveState();
+}
+
+function showCategory(code, prefix = '') {
+  titleNode.textContent = `${prefix}${categoryNames[code]}`;
+  evidenceNode.textContent = categoryEvidence[code];
+  actionNode.textContent = categoryActions[code];
+}
+
+function showTriangle(faceId) {
+  const row = metadata.get(faceId);
+  if (!row) return;
+  const [triangle, cluster, code, separationMm, stereo, switches, positive, negative, sameView, viewSeparated, coherentSize] = row;
+  titleNode.textContent = `簇 ${cluster} · 三角形 ${triangle} · ${categoryNames[code]}`;
+  evidenceNode.textContent = `主导锚点分离 ${separationMm} mm；高分离连续面 ${coherentSize}；左右眼冲突最大 ${stereo} 次；跨帧翻转最大 ${switches} 次；正/负证据最大 ${positive}/${negative} 对；同视角/视角分离混层角点 ${sameView}/${viewSeparated}。`;
+  actionNode.textContent = categoryActions[code];
+  highlight.geometry.dispose();
+  highlight.geometry = geometryFor([faceId]);
+}
+
+for (const cluster of payload.k) {
+  if (cluster[2] <= 0) continue;
+  const option = document.createElement('option');
+  option.value = String(cluster[0]);
+  option.textContent = `簇 ${cluster[0]} · 高置信 ${cluster[2]} / 总计 ${cluster[1]}`;
+  clusterSelect.appendChild(option);
+}
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+canvas.addEventListener('click', event => {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const activeMeshes = meshes.filter((mesh, code) => mesh.visible && visibleFaceIds[code].length);
+  const hit = raycaster.intersectObjects(activeMeshes, false)[0];
+  if (!hit) return;
+  const code = hit.object.userData.category;
+  const faceId = visibleFaceIds[code][hit.faceIndex];
+  showTriangle(faceId);
+});
+
+function saveState() {
+  if (!window.openai?.setWidgetState) return;
+  const enabled = categoryChecks.map(input => input.checked);
+  window.openai.setWidgetState({
+    modelContent: { selectedCluster: clusterSelect.value || null, enabled },
+    privateContent: { baseVisible: baseCheck.checked }
+  }).catch(() => {});
+}
+
+function restoreState(state) {
+  const model = state?.modelContent;
+  const privateState = state?.privateContent;
+  if (Array.isArray(model?.enabled) && model.enabled.length === 4) {
+    categoryChecks.forEach((input, index) => { input.checked = Boolean(model.enabled[index]); });
+  }
+  if (model?.selectedCluster != null && payload.kf[String(model.selectedCluster)]) {
+    clusterSelect.value = String(model.selectedCluster);
+  }
+  if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+}
+
+restoreState(window.openai?.widgetState);
+categoryChecks.forEach((input, code) => input.addEventListener('change', () => {
+  meshes[code].visible = input.checked;
+  showCategory(code);
+  saveState();
+}));
+baseCheck.addEventListener('change', () => {
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+  saveState();
+});
+clusterSelect.addEventListener('change', updateFilter);
+root.querySelector('[data-fit]').addEventListener('click', () => {
+  const facesToFit = currentClusterFaces() || allFaceIds();
+  fitFaces(facesToFit);
+});
+window.addEventListener('openai:set_globals', event => {
+  restoreState(event.detail?.globals?.widgetState);
+  updateFilter(false);
+});
+
+function resize() {
+  const width = Math.max(1, viewport.clientWidth);
+  const height = Math.max(1, viewport.clientHeight);
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(viewport);
+resize();
+updateFilter(false);
+
+function animate() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
