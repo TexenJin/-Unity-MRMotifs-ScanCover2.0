@@ -466,6 +466,16 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
     cluster_totals = {}
     for index, item in enumerate(triangle_receipts):
         corners = triangle_corner_indices[index]
+        final_corner_distances = cell_distances[index]
+        final_corner_weights = weight[corners]
+        final_corner_signs = cell_signs[index]
+        configuration = sum(
+            (1 << corner) if final_corner_distances[corner] < 0.0 else 0
+            for corner in range(8))
+        crossing_edges = int(np.count_nonzero(
+            (final_corner_distances[EDGE_PAIRS[:, 0]] < 0.0) !=
+            (final_corner_distances[EDGE_PAIRS[:, 1]] < 0.0)))
+        cell_modulo = np.mod(cells[index], 8)
         stereo = bool(np.any(stereo_conflicts[corners] > 0))
         stereo_repeated = bool(np.any(stereo_conflicts[corners] >= 3))
         temporal_any = bool(np.any(
@@ -529,6 +539,32 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
             "coherentHighSeparationBridge": False,
             "highSeparationComponentTriangles": 0,
             "mechanisms": mechanisms,
+            "finalCell": {
+                "marchingCubesConfiguration": int(configuration),
+                "negativeCorners": int(np.count_nonzero(
+                    final_corner_signs < 0)),
+                "positiveCorners": int(np.count_nonzero(
+                    final_corner_signs > 0)),
+                "crossingEdges": crossing_edges,
+                "distancesMeters": [float(value)
+                                    for value in final_corner_distances],
+                "weights": [float(value)
+                            for value in final_corner_weights],
+                "observationPairs": [int(value)
+                                     for value in observation_pairs[corners]],
+                "positivePairs": [int(value)
+                                  for value in positive_pairs[corners]],
+                "negativePairs": [int(value)
+                                  for value in negative_pairs[corners]],
+                "temporalSwitches": [int(value)
+                                     for value in temporal_switches[corners]],
+                "layerJumps": [int(value)
+                               for value in layer_jumps[corners]],
+                "cellModulo8": [int(value) for value in cell_modulo],
+                "touchesChunkBoundaryAxes": [
+                    bool(value == 0 or value == 7)
+                    for value in cell_modulo],
+            },
             "cornerEvidence": {
                 "observed": int(np.count_nonzero(corner_observed[corners])),
                 "directPairMaximum": int(np.max(direct_pairs[corners])),
@@ -654,6 +690,7 @@ def audit(mesh_path: Path, tape_path: Path, spatial_path: Path,
         },
         "motionCorrelationAudit": motion_audit,
         "reconstructionCheck": {
+            "targetTriangles": len(triangle_records),
             "unsupportedTriangles": len(triangle_records),
             "uniqueDerivedCells": int(len(np.unique(cells, axis=0))),
             "uniqueAlignedSourceCorners": count,
