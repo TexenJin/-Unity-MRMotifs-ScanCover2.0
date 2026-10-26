@@ -316,3 +316,11 @@ The next package therefore keeps same-layer support enabled and disables
 contradiction retirement by default. It must replay the same tape before any
 threshold change or new scan. Only after the same-layer-only result is measured
 should retirement be reintroduced as a separate A/B variable.
+
+The first attempted same-layer-only APK still emitted the byte-identical
+combined receipt (`0A14C1...ABD41`) and 32,390 retirement events. ADB confirmed
+that the APK had updated and the replay ran; Unity had preserved the previously
+loaded serialized `true` value through hot reload/build. The A/B switches are
+therefore compile-time constants from the next commit onward: same-layer is
+fixed on and contradiction retirement fixed off. Inspector/scene state cannot
+silently change the experiment.

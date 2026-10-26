@@ -49,6 +49,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float ContradictionMinimumDistanceMeters =
         VoxelMeters * 0.5f;
     private const byte ContradictionPairsToRetire = 3;
+    // Compile-time A/B route. Do not use serialized defaults here: Unity hot
+    // reload preserves the previously loaded component value across builds.
+    private const bool SameLayerSupportEnabled = true;
+    private const bool ContradictionRetirementEnabled = false;
     private const int MinimumRecordedPairsToCommit = 16;
     // Recovered Room Setup input rule. The public Meta OpenXR provider used by
     // this project exposes only _EnvironmentDepthTexture, not the native
@@ -274,17 +278,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         "only when a native runtime override has been evidenced.")]
     private float garbageCollectionFrequencyHz =
         NativeGarbageFrequencyDefaultHz;
-
-    [Header("V2-C scar correction")]
-    [SerializeField, Tooltip(
-        "Require the eight 10 cm cell samples to describe one compatible " +
-        "depth layer. This uses direct surface provenance, not neighbour " +
-        "counting.")]
-    private bool enforceSameLayerSupport = true;
-    [SerializeField, Tooltip(
-        "Retire an old zero crossing only after three distinct stereo pairs " +
-        "directly observe the opposite sign. Unobserved voxels never decay.")]
-    private bool retireRepeatedContradictions = false;
 
     [Header("Deterministic input tape")]
     [SerializeField, Range(10, 600)]
@@ -1454,7 +1447,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             float retained = old.weight > 0f
                 ? Mathf.Min(old.weight, MaximumWeight - sampleWeight)
                 : 0f;
-            if (retireRepeatedContradictions &&
+            if (ContradictionRetirementEnabled &&
                 contradictionStreak >= ContradictionPairsToRetire)
             {
                 // Retirement is local and evidence driven. Nothing happens
@@ -1884,11 +1877,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm = enforceSameLayerSupport
-                    ? (retireRepeatedContradictions
+                algorithm = SameLayerSupportEnabled
+                    ? (ContradictionRetirementEnabled
                         ? "V2CSpatialReceiptSameLayerRepeatedContradiction"
                         : "V2CSpatialReceiptSameLayerOnly")
-                    : (retireRepeatedContradictions
+                    : (ContradictionRetirementEnabled
                         ? "V2CSpatialReceiptRepeatedContradictionOnly"
                         : "V2CSpatialReceiptBaseline"),
                 sourceVoxelMeters = VoxelMeters,
@@ -2070,14 +2063,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     meshMetrics.historicalShellCandidateTriangles,
                 insufficientEvidenceTriangles =
                     meshMetrics.insufficientEvidenceTriangles,
-                sameLayerSupportEnabled = enforceSameLayerSupport,
+                sameLayerSupportEnabled = SameLayerSupportEnabled,
                 sameLayerMaximumSeparationMeters =
                     SameLayerMaximumSeparationMeters,
                 sameLayerRejectedCells = SameLayerRejectedCellCount,
                 sameLayerRule =
                     "EightDirectSurfaceAnchorsMustShareOneSdfNormalLayer",
                 contradictionRetirementEnabled =
-                    retireRepeatedContradictions,
+                    ContradictionRetirementEnabled,
                 contradictionMinimumDistanceMeters =
                     ContradictionMinimumDistanceMeters,
                 contradictionPairsToRetire =
@@ -2959,7 +2952,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             }
             if (!observed || configuration == 0 || configuration == 255)
                 continue;
-            if (enforceSameLayerSupport &&
+            if (SameLayerSupportEnabled &&
                 !CellHasCompatibleLayerSupport(sx, sy, sz))
             {
                 SameLayerRejectedCellCount++;
