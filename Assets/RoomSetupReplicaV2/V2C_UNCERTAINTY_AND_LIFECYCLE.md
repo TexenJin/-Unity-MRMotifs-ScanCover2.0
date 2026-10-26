@@ -385,3 +385,35 @@ retirement: minimum mature weight 1, five consistent sign-opposite stereo
 pairs, `0.075 m` anchor consistency, and at most one local reset per voxel.
 Spatial-receipt classification remains at its original three-observation
 threshold so before/after scar counts stay comparable.
+
+### Conservative contradicted-voxel retirement is rejected
+
+The retirement A/B did not fail because it was inactive: 9,281 source voxels
+were locally reset. It nevertheless produced no material visual improvement
+and regressed the final evidence relative to the frozen same-layer baseline:
+
+```text
+                              same-layer only       plus retirement
+final triangles                         26656                 27550
+connected components                       11                    11
+largest component                       20848                 21517
+unsupported triangles                    2340                  2551
+cross-layer candidates                    2064                  2285
+historical-shell candidates                264                   254
+scar clusters                              132                   148
+retirement events                            0                  9281
+```
+
+Retirement slightly reduced historical-shell candidates but created more
+cross-layer candidates and unsupported surface elsewhere. This indicates that
+locally clearing a fused voxel does not remove the causal input: the same
+alternating foreground/background observations refill it and create new zero
+crossings. The mechanism is disabled again. The safe frozen state remains the
+same-pair zero-crossing-edge rule with no retirement or global decay.
+
+The next production experiment must move before TSDF averaging: retain a
+dominant directly observed depth layer per source voxel, compare an incoming
+surface along the current viewing ray, and require repeated coherent evidence
+before switching layers. It must be A/B tested independently and preserve
+unobserved geometry. Post-mesh deletion or another retirement-threshold sweep
+would not address the observed failure.

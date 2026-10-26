@@ -55,7 +55,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     // Compile-time A/B route. Do not use serialized defaults here: Unity hot
     // reload preserves the previously loaded component value across builds.
     private const bool SameLayerSupportEnabled = true;
-    private const bool ContradictionRetirementEnabled = true;
+    private const bool ContradictionRetirementEnabled = false;
     private const int MinimumRecordedPairsToCommit = 16;
     // Recovered Room Setup input rule. The public Meta OpenXR provider used by
     // this project exposes only _EnvironmentDepthTexture, not the native
