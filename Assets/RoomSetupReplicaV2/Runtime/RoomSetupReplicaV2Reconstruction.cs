@@ -141,6 +141,44 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int insufficientEvidenceTriangles;
     }
 
+    public readonly struct ReplayProbeHit
+    {
+        public readonly int triangle;
+        public readonly float distanceMeters;
+        public readonly Vector3 barycentric;
+        public readonly Vector3 stagePoint;
+        public readonly Vector3 stageNormal;
+        public readonly Vector3 worldPoint;
+        public readonly Vector3 worldNormal;
+        public readonly Vector3 stageA;
+        public readonly Vector3 stageB;
+        public readonly Vector3 stageC;
+
+        public ReplayProbeHit(
+            int triangle,
+            float distanceMeters,
+            Vector3 barycentric,
+            Vector3 stagePoint,
+            Vector3 stageNormal,
+            Vector3 worldPoint,
+            Vector3 worldNormal,
+            Vector3 stageA,
+            Vector3 stageB,
+            Vector3 stageC)
+        {
+            this.triangle = triangle;
+            this.distanceMeters = distanceMeters;
+            this.barycentric = barycentric;
+            this.stagePoint = stagePoint;
+            this.stageNormal = stageNormal;
+            this.worldPoint = worldPoint;
+            this.worldNormal = worldNormal;
+            this.stageA = stageA;
+            this.stageB = stageB;
+            this.stageC = stageC;
+        }
+    }
+
     [Serializable]
     private sealed class SpatialTriangleReceipt
     {
@@ -337,6 +375,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public bool PreviewVisible => showReplica;
     public bool IsRecording => _tapeWriter != null;
     public bool IsReplaying => _tapeReader != null;
+    public bool CanProbeFinalMesh { get; private set; }
+    public string LastReplayMeshPath { get; private set; } = string.Empty;
+    public string LastReplayMeshSha256 { get; private set; } = string.Empty;
+    public int LastReplayPairCount { get; private set; }
+    public int FinalReplayTriangleCount => _finalTriangles.Count / 3;
+    public Transform ReplayStageTransform =>
+        _previewRoot != null ? _previewRoot.transform : null;
     public string TapePath => Path.Combine(
         Application.persistentDataPath,
         "RoomSetupReplicaV2", "last-session.rsv2");
@@ -821,6 +866,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastSimplificationMilliseconds = 0f;
         LastReconstructionMilliseconds = 0f;
         LastMeshingMilliseconds = 0f;
+        CanProbeFinalMesh = false;
+        LastReplayMeshPath = string.Empty;
+        LastReplayMeshSha256 = string.Empty;
+        LastReplayPairCount = 0;
+        _finalVertices.Clear();
+        _finalTriangles.Clear();
     }
 
     private void Update()
@@ -1907,6 +1958,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             FinalMeshMetrics meshMetrics =
                 ExportAndMeasureFinalMesh(directory ??
                                          Application.persistentDataPath);
+            LastReplayMeshPath = meshMetrics.path;
+            LastReplayMeshSha256 = meshMetrics.sha256;
+            LastReplayPairCount = _replayedFrames;
+            CanProbeFinalMesh = meshMetrics.triangles > 0;
             Debug.Log(
                 "[RoomSetupReplicaV2] measuring final-triangle direct " +
                 "depth support...");
@@ -3782,6 +3837,120 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _previewRoot.transform.SetPositionAndRotation(
             Vector3.zero, Quaternion.identity);
         _previewRoot.transform.localScale = Vector3.one;
+    }
+
+    public bool TryRaycastFinalMesh(
+        Ray worldRay,
+        float maximumDistanceMeters,
+        out ReplayProbeHit hit)
+    {
+        hit = default;
+        if (!CanProbeFinalMesh || _previewRoot == null ||
+            _finalTriangles.Count < 3 ||
+            maximumDistanceMeters <= 0f)
+            return false;
+
+        Transform stage = _previewRoot.transform;
+        Vector3 origin = stage.InverseTransformPoint(worldRay.origin);
+        Vector3 direction = stage.InverseTransformDirection(
+            worldRay.direction).normalized;
+        float nearest = maximumDistanceMeters;
+        int nearestTriangle = -1;
+        float nearestU = 0f;
+        float nearestV = 0f;
+
+        for (int index = 0; index < _finalTriangles.Count; index += 3)
+        {
+            Vector3 a = _finalVertices[_finalTriangles[index]];
+            Vector3 b = _finalVertices[_finalTriangles[index + 1]];
+            Vector3 c = _finalVertices[_finalTriangles[index + 2]];
+            if (!RayTriangle(
+                    origin, direction, a, b, c,
+                    out float distance, out float u, out float v) ||
+                distance > nearest)
+                continue;
+            nearest = distance;
+            nearestTriangle = index / 3;
+            nearestU = u;
+            nearestV = v;
+        }
+
+        if (nearestTriangle < 0)
+            return false;
+        int triangleIndex = nearestTriangle * 3;
+        Vector3 stageA = _finalVertices[_finalTriangles[triangleIndex]];
+        Vector3 stageB = _finalVertices[_finalTriangles[triangleIndex + 1]];
+        Vector3 stageC = _finalVertices[_finalTriangles[triangleIndex + 2]];
+        Vector3 stagePoint = origin + direction * nearest;
+        Vector3 stageNormal = Vector3.Cross(
+            stageB - stageA, stageC - stageA).normalized;
+        Vector3 worldPoint = stage.TransformPoint(stagePoint);
+        Vector3 worldNormal = stage.TransformDirection(stageNormal).normalized;
+        hit = new ReplayProbeHit(
+            nearestTriangle,
+            Vector3.Distance(worldRay.origin, worldPoint),
+            new Vector3(1f - nearestU - nearestV, nearestU, nearestV),
+            stagePoint,
+            stageNormal,
+            worldPoint,
+            worldNormal,
+            stageA,
+            stageB,
+            stageC);
+        return true;
+    }
+
+    public Vector3 ReplayWorldToStagePoint(Vector3 worldPoint)
+    {
+        return _previewRoot != null
+            ? _previewRoot.transform.InverseTransformPoint(worldPoint)
+            : worldPoint;
+    }
+
+    public Vector3 ReplayWorldToStageDirection(Vector3 worldDirection)
+    {
+        return _previewRoot != null
+            ? _previewRoot.transform.InverseTransformDirection(
+                worldDirection).normalized
+            : worldDirection.normalized;
+    }
+
+    private static bool RayTriangle(
+        Vector3 origin,
+        Vector3 direction,
+        Vector3 a,
+        Vector3 b,
+        Vector3 c,
+        out float distance,
+        out float u,
+        out float v)
+    {
+        Vector3 edge1 = b - a;
+        Vector3 edge2 = c - a;
+        Vector3 cross = Vector3.Cross(direction, edge2);
+        float determinant = Vector3.Dot(edge1, cross);
+        if (Mathf.Abs(determinant) < 0.000001f)
+        {
+            distance = u = v = 0f;
+            return false;
+        }
+        float inverse = 1f / determinant;
+        Vector3 fromA = origin - a;
+        u = Vector3.Dot(fromA, cross) * inverse;
+        if (u < 0f || u > 1f)
+        {
+            distance = v = 0f;
+            return false;
+        }
+        Vector3 cross2 = Vector3.Cross(fromA, edge1);
+        v = Vector3.Dot(direction, cross2) * inverse;
+        if (v < 0f || u + v > 1f)
+        {
+            distance = 0f;
+            return false;
+        }
+        distance = Vector3.Dot(edge2, cross2) * inverse;
+        return distance >= 0f;
     }
 
     private static void EnsureArray(ref float[] array, int length)

@@ -51,7 +51,9 @@ public static class RoomSetupReplicaV2SceneSetup
                 "Room Setup Replica V2",
                 "独立场景已建立并设为唯一 Build Scene。\n" +
                 "右扳机同时开始/停止覆盖与录制，A 回放，" +
-                "B 清空，X 显示/隐藏。",
+                "B 清空，X 显示/隐藏。\n" +
+                "回放完成后：右手射线＋长按扳机涂选/擦除，" +
+                "B 撤销上一整笔。",
                 "好");
         }
         catch (Exception exception)
@@ -179,6 +181,8 @@ public static class RoomSetupReplicaV2SceneSetup
             root.AddComponent<RoomSetupReplicaV2Scanner>();
         if (root.GetComponent<RoomSetupReplicaV2Input>() == null)
             root.AddComponent<RoomSetupReplicaV2Input>();
+        if (root.GetComponent<RoomSetupReplicaV2ReplayProbe>() == null)
+            root.AddComponent<RoomSetupReplicaV2ReplayProbe>();
         return root;
     }
 

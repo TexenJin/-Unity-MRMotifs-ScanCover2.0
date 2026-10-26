@@ -1,8 +1,9 @@
 using UnityEngine;
 
 /// <summary>
-/// Replay-lab input. A replays the fixed tape. Other controls remain in the
-/// component for later capture work but are disabled by replayOnlyMode.
+/// Replay-lab input. A replays the fixed tape. The separate read-only replay
+/// probe owns right-trigger paint/erase and B-stroke undo after replay; live
+/// capture controls remain disabled by replayOnlyMode.
 /// </summary>
 public sealed class RoomSetupReplicaV2Input : MonoBehaviour
 {
@@ -13,6 +14,14 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
     private float actionDebounceSeconds = 0.25f;
     private float _previousTrigger;
     private float _nextActionTime;
+
+    private void Awake()
+    {
+        // Existing serialized V2 scenes predate the replay probe. Add the
+        // read-only annotator at runtime so rebuilding the scene is optional.
+        if (GetComponent<RoomSetupReplicaV2ReplayProbe>() == null)
+            gameObject.AddComponent<RoomSetupReplicaV2ReplayProbe>();
+    }
 
     private void Update()
     {

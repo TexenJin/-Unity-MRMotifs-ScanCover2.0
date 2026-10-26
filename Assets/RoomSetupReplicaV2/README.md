@@ -11,8 +11,14 @@ placeholder scene with a Meta XR Building Blocks scene, adds only `DepthCapture`
 Quest controls:
 
 - A: clear the current replica and replay the fixed last tape.
-- Right index trigger, B and X are temporarily disabled in `replayOnlyMode`
-  while the V2-B simplifier is compared on one immutable input.
+- After replay completes, aim the right-controller ray and hold the right
+  index trigger. Starting on an unselected face paints visible-defect labels;
+  starting on a selected face erases labels. Sweep the ray to mark or unmark
+  a whole ribbon without clicking each triangle. Selected faces are
+  highlighted in magenta and autosaved during the stroke and on release.
+- B after replay undoes the most recent complete paint/erase stroke.
+- Live coverage/recording and X remain disabled in `replayOnlyMode`; the probe
+  is a read-only annotation layer over the frozen final mesh.
 
 All controller actions share a 250 ms debounce window so one physical press
 cannot restart a replay or trigger two state transitions.
@@ -105,6 +111,17 @@ Artifacts on Quest are written below
   final mesh counts after the mesh queue has drained.
 - `last-replay-mesh.ply`: deterministic binary little-endian final mesh in
   Quest Stage coordinates. The receipt includes its SHA-256 hash.
+- `last-replay-human-labels.json`: controller-picked visible-defect triangle
+  IDs, barycentric hit, Stage-space triangle vertices/hit/normal/ray, head and
+  controller poses, replay pair count, and the exact mesh SHA-256. The global
+  triangle ID uses the same sorted-Chunk order as `last-replay-mesh.ply`, so
+  desktop source audits can address the selected face without screenshot
+  coordinate guessing.
+
+After pulling the JSON, `Tools/RoomSetupReplicaV2/build_replay_probe_receipt.py`
+verifies the mesh SHA-256 and converts the painted faces/strokes directly into
+the input accepted by `audit_scar_sources.py`. This keeps human-visible labels
+and the replayed source history on the same global triangle IDs.
 
 The replay receipt also reports the known-but-unavailable uncertainty rule,
 adaptive interval constants, single-flight busy skips, mesh publication count,
