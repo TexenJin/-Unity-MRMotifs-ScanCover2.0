@@ -286,3 +286,33 @@ tape SHA-256       A37036993CF429E4386DFB5BF2201EC82C48C8DD05C19BDFC7630869417C0
 The resulting `last-replay-spatial-receipt.json` contains exactly 2,523
 triangle records and 130 cluster records. Classification is evidence for the
 next A/B test, not proof that every listed triangle is visibly objectionable.
+
+### Combined same-layer plus retirement replay is not accepted
+
+The first Quest replay with both experimental correction switches enabled used
+the same 156-pair tape:
+
+```text
+                                  baseline       combined
+final triangles                      27397          22377  (-18.32%)
+largest component                    21359          18979  (-11.14%)
+connected components                    11             14
+unsupported triangles                 2523            725  (-71.26%)
+direct support ratio            0.90790963     0.96760064
+plane RMS                         0.00818797     0.00806052 m
+replay elapsed                       35.540         36.763 s
+same-layer rejected cells                 0          48952
+contradiction votes                       0         273099
+retirement events                         0          32390
+```
+
+The unsupported reduction is real, but it is not sufficient for acceptance.
+The former 3,829-triangle second-largest component split into fragments of
+1,257, 495, 390, 85, and 67 triangles, while the component count increased.
+This is evidence of possible over-cutting, and the combined replay cannot
+attribute it to either rule.
+
+The next package therefore keeps same-layer support enabled and disables
+contradiction retirement by default. It must replay the same tape before any
+threshold change or new scan. Only after the same-layer-only result is measured
+should retirement be reintroduced as a separate A/B variable.

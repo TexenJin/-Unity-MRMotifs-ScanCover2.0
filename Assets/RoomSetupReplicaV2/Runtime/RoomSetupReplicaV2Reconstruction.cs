@@ -284,7 +284,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [SerializeField, Tooltip(
         "Retire an old zero crossing only after three distinct stereo pairs " +
         "directly observe the opposite sign. Unobserved voxels never decay.")]
-    private bool retireRepeatedContradictions = true;
+    private bool retireRepeatedContradictions = false;
 
     [Header("Deterministic input tape")]
     [SerializeField, Range(10, 600)]
@@ -1884,8 +1884,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm =
-                    "V2CSpatialReceiptSameLayerRepeatedContradiction",
+                algorithm = enforceSameLayerSupport
+                    ? (retireRepeatedContradictions
+                        ? "V2CSpatialReceiptSameLayerRepeatedContradiction"
+                        : "V2CSpatialReceiptSameLayerOnly")
+                    : (retireRepeatedContradictions
+                        ? "V2CSpatialReceiptRepeatedContradictionOnly"
+                        : "V2CSpatialReceiptBaseline"),
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
