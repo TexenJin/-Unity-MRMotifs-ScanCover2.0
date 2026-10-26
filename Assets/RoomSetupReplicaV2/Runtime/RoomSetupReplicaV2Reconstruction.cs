@@ -308,6 +308,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int LastPostCleanupComponentCount { get; private set; }
     public float LastComponentCleanupMilliseconds { get; private set; }
     public int SameLayerRejectedCellCount { get; private set; }
+    public int SameLayerComparableEdgeCount { get; private set; }
+    public int SameLayerUncomparableEdgeCount { get; private set; }
+    public int SameLayerIncompatibleEdgeCount { get; private set; }
     public int ContradictionVoteCount { get; private set; }
     public int RetiredContradictedVoxelCount { get; private set; }
     public bool LastSimplificationApplied { get; private set; }
@@ -445,6 +448,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly Vector3[] _sampleLayerAnchors =
         new Vector3[SampleCount];
     private readonly byte[] _sampleLayerObserved = new byte[SampleCount];
+    private readonly int[] _sampleLayerPairs = new int[SampleCount];
     private readonly int[] _xEdgeVertices =
         new int[ChunkSize * SampleSize * SampleSize];
     private readonly int[] _yEdgeVertices =
@@ -791,6 +795,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastPostCleanupComponentCount = 0;
         LastComponentCleanupMilliseconds = 0f;
         SameLayerRejectedCellCount = 0;
+        SameLayerComparableEdgeCount = 0;
+        SameLayerUncomparableEdgeCount = 0;
+        SameLayerIncompatibleEdgeCount = 0;
         ContradictionVoteCount = 0;
         RetiredContradictedVoxelCount = 0;
         LastSimplificationApplied = false;
@@ -1836,6 +1843,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public bool sameLayerSupportEnabled;
         public float sameLayerMaximumSeparationMeters;
         public int sameLayerRejectedCells;
+        public int sameLayerComparableEdges;
+        public int sameLayerUncomparableEdges;
+        public int sameLayerIncompatibleEdges;
         public string sameLayerRule;
         public bool contradictionRetirementEnabled;
         public float contradictionMinimumDistanceMeters;
@@ -1880,7 +1890,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 algorithm = SameLayerSupportEnabled
                     ? (ContradictionRetirementEnabled
                         ? "V2CSpatialReceiptSameLayerRepeatedContradiction"
-                        : "V2CSpatialReceiptSameLayerOnly")
+                        : "V2CSpatialReceiptSamePairCrossingEdgeLayerOnly")
                     : (ContradictionRetirementEnabled
                         ? "V2CSpatialReceiptRepeatedContradictionOnly"
                         : "V2CSpatialReceiptBaseline"),
@@ -2067,8 +2077,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 sameLayerMaximumSeparationMeters =
                     SameLayerMaximumSeparationMeters,
                 sameLayerRejectedCells = SameLayerRejectedCellCount,
+                sameLayerComparableEdges =
+                    SameLayerComparableEdgeCount,
+                sameLayerUncomparableEdges =
+                    SameLayerUncomparableEdgeCount,
+                sameLayerIncompatibleEdges =
+                    SameLayerIncompatibleEdgeCount,
                 sameLayerRule =
-                    "EightDirectSurfaceAnchorsMustShareOneSdfNormalLayer",
+                    "RejectOnlyIncompatibleZeroCrossingEdgeWithSamePairWitness",
                 contradictionRetirementEnabled =
                     ContradictionRetirementEnabled,
                 contradictionMinimumDistanceMeters =
@@ -3375,6 +3391,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         Array.Clear(_sampleObserved, 0, _sampleObserved.Length);
         Array.Clear(_sampleLayerAnchors, 0, _sampleLayerAnchors.Length);
         Array.Clear(_sampleLayerObserved, 0, _sampleLayerObserved.Length);
+        Array.Clear(_sampleLayerPairs, 0, _sampleLayerPairs.Length);
         Vector3Int origin = chunkId * ChunkSize;
         for (int z = 0; z < SampleSize; z += MeshStride)
         for (int y = 0; y < SampleSize; y += MeshStride)
@@ -3394,6 +3411,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             {
                 _sampleLayerObserved[sample] = 1;
                 _sampleLayerAnchors[sample] = voxel.layerAnchor;
+                _sampleLayerPairs[sample] = voxel.lastEvidencePair;
             }
             _passDerivedValidSamples++;
         }
@@ -3424,11 +3442,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private bool CellHasCompatibleLayerSupport(int sx, int sy, int sz)
     {
-        // Estimate the zero-crossing normal from the eight SDF corners, then
-        // compare direct surface witnesses along that normal. Tangentially
-        // separated points on one wall remain compatible; parallel foreground
-        // and background layers do not. This is deliberately not an 8-neighbour
-        // occupancy heuristic.
+        // Estimate the zero-crossing normal from the eight SDF corners. Only
+        // edges that actually cross zero can create this cell's triangles.
+        // Reject only when both edge endpoints carry direct witnesses from the
+        // same stereo pair and those witnesses occupy incompatible layers.
+        // Different-pair or missing evidence is not permission to erase a
+        // surface: it remains uncomparable until a shared observation exists.
         float gx = (_cornerDistances[1] + _cornerDistances[2] +
                     _cornerDistances[5] + _cornerDistances[6] -
                     _cornerDistances[0] - _cornerDistances[3] -
@@ -3446,21 +3465,37 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             return true;
         normal.Normalize();
 
-        float minimum = float.PositiveInfinity;
-        float maximum = float.NegativeInfinity;
-        for (int corner = 0; corner < 8; corner++)
+        for (int edge = 0; edge < 12; edge++)
         {
-            Vector3Int offset = CubeOffsets[corner] * MeshStride;
-            int sample = SampleIndex(
-                sx + offset.x, sy + offset.y, sz + offset.z);
-            if (_sampleLayerObserved[sample] == 0)
-                return false;
-            float plane = Vector3.Dot(
-                _sampleLayerAnchors[sample], normal);
-            minimum = Mathf.Min(minimum, plane);
-            maximum = Mathf.Max(maximum, plane);
+            int a = EdgePairs[edge, 0];
+            int b = EdgePairs[edge, 1];
+            if ((_cornerDistances[a] < 0f) ==
+                (_cornerDistances[b] < 0f))
+                continue;
+            Vector3Int offsetA = CubeOffsets[a] * MeshStride;
+            Vector3Int offsetB = CubeOffsets[b] * MeshStride;
+            int sampleA = SampleIndex(
+                sx + offsetA.x, sy + offsetA.y, sz + offsetA.z);
+            int sampleB = SampleIndex(
+                sx + offsetB.x, sy + offsetB.y, sz + offsetB.z);
+            int pair = _sampleLayerPairs[sampleA];
+            if (_sampleLayerObserved[sampleA] == 0 ||
+                _sampleLayerObserved[sampleB] == 0 ||
+                pair <= 0 || pair != _sampleLayerPairs[sampleB])
+            {
+                SameLayerUncomparableEdgeCount++;
+                continue;
+            }
+            SameLayerComparableEdgeCount++;
+            float separation = Mathf.Abs(Vector3.Dot(
+                _sampleLayerAnchors[sampleA] -
+                _sampleLayerAnchors[sampleB], normal));
+            if (separation <= SameLayerMaximumSeparationMeters)
+                continue;
+            SameLayerIncompatibleEdgeCount++;
+            return false;
         }
-        return maximum - minimum <= SameLayerMaximumSeparationMeters;
+        return true;
     }
 
     private bool TryGetVoxel(Vector3Int global, out Voxel voxel)

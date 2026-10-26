@@ -324,3 +324,32 @@ loaded serialized `true` value through hot reload/build. The A/B switches are
 therefore compile-time constants from the next commit onward: same-layer is
 fixed on and contradiction retirement fixed off. Inspector/scene state cannot
 silently change the experiment.
+
+### Eight-corner latest-anchor same-layer rule is rejected
+
+The hard-pinned same-layer-only replay confirmed zero retirement events but
+removed even more geometry than the combined experiment:
+
+```text
+                                  baseline   same-layer only
+final triangles                      27397             21798  (-20.44%)
+largest component                    21359             18438  (-13.68%)
+connected components                    11                13
+unsupported triangles                 2523               993  (-60.64%)
+direct support ratio            0.90790963        0.95444536
+plane RMS                         0.00818797        0.00786180 m
+retirement events                         0                 0
+```
+
+The old rule compared all eight corners using each voxel's latest surface
+anchor. Those anchors can come from different frames and viewpoints, so a valid
+wall, furniture boundary, or room corner can appear to span incompatible
+layers. Requiring every corner to be comparable also converts missing shared
+evidence into deletion. This mechanism is rejected.
+
+The next A/B route checks only edges that actually cross zero. An edge can be
+rejected only when both endpoint witnesses come from the same stereo pair and
+their separation along the cell SDF normal exceeds 0.15 m. Missing or
+different-pair evidence is counted as uncomparable and preserves the cell.
+Receipt counters separately report comparable, uncomparable, and incompatible
+crossing edges. Contradiction retirement remains compile-time disabled.
