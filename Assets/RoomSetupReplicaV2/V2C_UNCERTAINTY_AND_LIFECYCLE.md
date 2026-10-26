@@ -250,20 +250,23 @@ The next V2-C implementation consists of three independently receipted rules:
    candidate; repeated one-sided contradiction classifies a historical-shell
    candidate. The result is an offline receipt only and does not add a HUD.
 2. Every source voxel retains its latest direct surface anchor. Before
-   Marching Cubes, the eight corners of a 10 cm cell are projected onto that
-   cell's SDF-gradient normal. A span greater than `0.15 m`, or a corner with
-   no direct layer witness, leaves the cell empty. Tangential separation on
-   the same wall is allowed. This is a depth-layer compatibility rule, not an
-   eight-neighbour count.
-3. A weighted voxel is locally retired only after three distinct stereo pairs
-   directly provide a sign-opposite sample at least half a source voxel from
-   zero. Confirming evidence resets the streak. No unobserved/out-of-range
-   voxel is changed, and there is no global weight decay.
+   Marching Cubes, only cell edges that actually cross zero are checked. An
+   edge can be rejected only when both endpoint witnesses came from the same
+   stereo pair and their separation along the cell SDF-gradient normal exceeds
+   `0.15 m`. Missing or different-pair evidence preserves the cell. This is a
+   depth-layer compatibility rule, not an eight-neighbour count.
+3. A mature weighted voxel can be locally retired only after five distinct
+   stereo pairs directly provide sign-opposite samples at least half a source
+   voxel from zero, with a stable new surface anchor within `0.075 m` between
+   votes. Confirming or inconsistent evidence resets the streak, and each
+   voxel can be retired at most once per reconstruction. No unobserved or
+   out-of-range voxel is changed, and there is no global weight decay.
 
-Both production rules are serialized switches and default enabled. The normal
-replay receipt records their thresholds, rejected-cell/vote/retirement counts,
-and the spatial receipt path. Quest APK and device acceptance remain a separate
-step; source implementation alone does not accept the geometry.
+The A/B routes are compile-time constants so Unity serialization cannot retain
+a stale Inspector value between packages. The normal replay receipt records
+their thresholds, rejected-cell/vote/retirement counts, and the spatial receipt
+path. Quest APK and device acceptance remain a separate step; source
+implementation alone does not accept the geometry.
 
 ### Frozen-baseline spatial receipt generated
 
@@ -353,3 +356,32 @@ their separation along the cell SDF normal exceeds 0.15 m. Missing or
 different-pair evidence is counted as uncomparable and preserves the cell.
 Receipt counters separately report comparable, uncomparable, and incompatible
 crossing edges. Contradiction retirement remains compile-time disabled.
+
+### Same-pair zero-crossing-edge rule is frozen
+
+The refined same-layer-only replay used the same 156-pair tape and restored the
+accepted topology while removing only locally witnessed incompatible edges:
+
+```text
+                                  baseline    refined same-layer
+final triangles                      27397                 26656  (-2.70%)
+largest component                    21359                 20848  (-2.39%)
+connected components                    11                    11
+unsupported triangles                 2523                  2340  (-7.25%)
+direct support ratio            0.90790963            0.91221488
+plane RMS                         0.00818797            0.00812528 m
+same-layer rejected cells                 0                  9141
+retirement events                         0                     0
+```
+
+The largest unsupported spatial cluster fell from 726 to 628 triangles;
+cross-layer candidates fell from 2,213 to 2,064 and historical-shell candidates
+from 298 to 264. Unlike the rejected eight-corner rule, component count stayed
+at 11 and the largest component lost only 2.39%. This result is frozen as the
+V2-C conservative same-layer baseline.
+
+The next A/B keeps this exact extraction rule and enables only conservative
+retirement: minimum mature weight 1, five consistent sign-opposite stereo
+pairs, `0.075 m` anchor consistency, and at most one local reset per voxel.
+Spatial-receipt classification remains at its original three-observation
+threshold so before/after scar counts stay comparable.

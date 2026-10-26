@@ -48,11 +48,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float SameLayerMaximumSeparationMeters = 0.15f;
     private const float ContradictionMinimumDistanceMeters =
         VoxelMeters * 0.5f;
-    private const byte ContradictionPairsToRetire = 3;
+    private const byte SpatialHistoricalPairsThreshold = 3;
+    private const byte ContradictionPairsToRetire = 5;
+    private const float ContradictionMinimumMatureWeight = 1f;
+    private const float ContradictionAnchorConsistencyMeters = 0.075f;
     // Compile-time A/B route. Do not use serialized defaults here: Unity hot
     // reload preserves the previously loaded component value across builds.
     private const bool SameLayerSupportEnabled = true;
-    private const bool ContradictionRetirementEnabled = false;
+    private const bool ContradictionRetirementEnabled = true;
     private const int MinimumRecordedPairsToCommit = 16;
     // Recovered Room Setup input rule. The public Meta OpenXR provider used by
     // this project exposes only _EnvironmentDepthTexture, not the native
@@ -88,8 +91,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         // Latest directly observed surface point that supported this source
         // voxel. It is provenance, not another filtering weight.
         public Vector3 layerAnchor;
+        public Vector3 contradictionAnchor;
         public int lastEvidencePair;
         public byte contradictionStreak;
+        public sbyte contradictionSign;
+        public bool retiredOnce;
     }
 
     private sealed class Chunk
@@ -1429,9 +1435,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             int pair = _processingReplayFrame
                 ? _replayedFrames + 1
                 : AcceptedPairCount + 1;
+            Color surface = pixels[index];
+            Vector3 layerAnchor = new Vector3(
+                surface.r, surface.g, surface.b);
             byte contradictionStreak = old.contradictionStreak;
+            Vector3 contradictionAnchor = old.contradictionAnchor;
+            sbyte contradictionSign = old.contradictionSign;
             int lastEvidencePair = old.lastEvidencePair;
-            bool oppositeDirectObservation = old.weight > 0f &&
+            bool oppositeDirectObservation = !old.retiredOnce &&
+                old.weight >= ContradictionMinimumMatureWeight &&
                 Mathf.Abs(old.distance) >=
                     ContradictionMinimumDistanceMeters &&
                 Mathf.Abs(sampleDistance) >=
@@ -1441,19 +1453,37 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             {
                 if (oppositeDirectObservation)
                 {
-                    contradictionStreak = (byte)Mathf.Min(
-                        byte.MaxValue, contradictionStreak + 1);
+                    sbyte sampleSign = sampleDistance > 0f
+                        ? (sbyte)1
+                        : (sbyte)-1;
+                    bool consistentCandidate =
+                        contradictionStreak > 0 &&
+                        contradictionSign == sampleSign &&
+                        Finite(layerAnchor) &&
+                        Finite(contradictionAnchor) &&
+                        Vector3.Distance(
+                            layerAnchor, contradictionAnchor) <=
+                            ContradictionAnchorConsistencyMeters;
+                    contradictionStreak = consistentCandidate
+                        ? (byte)Mathf.Min(
+                            byte.MaxValue, contradictionStreak + 1)
+                        : (byte)1;
+                    contradictionAnchor = layerAnchor;
+                    contradictionSign = sampleSign;
                     ContradictionVoteCount++;
                 }
                 else
                 {
                     contradictionStreak = 0;
+                    contradictionAnchor = default;
+                    contradictionSign = 0;
                 }
                 lastEvidencePair = pair;
             }
             float retained = old.weight > 0f
                 ? Mathf.Min(old.weight, MaximumWeight - sampleWeight)
                 : 0f;
+            bool retiredNow = false;
             if (ContradictionRetirementEnabled &&
                 contradictionStreak >= ContradictionPairsToRetire)
             {
@@ -1461,13 +1491,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 // to voxels that are absent or outside the direct depth view.
                 retained = 0f;
                 contradictionStreak = 0;
+                contradictionAnchor = default;
+                contradictionSign = 0;
+                retiredNow = true;
                 RetiredContradictedVoxelCount++;
             }
             retained = Mathf.Max(0f, retained);
             float newWeight = retained + sampleWeight;
-            Color surface = pixels[index];
-            Vector3 layerAnchor = new Vector3(
-                surface.r, surface.g, surface.b);
             Voxel updated = new Voxel
             {
                 distance = QuantizeHalf(retained > 0f
@@ -1478,10 +1508,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 layerAnchor = Finite(layerAnchor)
                     ? layerAnchor
                     : old.layerAnchor,
+                contradictionAnchor = contradictionAnchor,
                 lastEvidencePair = lastEvidencePair == 0
                     ? pair
                     : lastEvidencePair,
-                contradictionStreak = contradictionStreak
+                contradictionStreak = contradictionStreak,
+                contradictionSign = contradictionSign,
+                retiredOnce = old.retiredOnce || retiredNow
             };
             chunk.voxels[local] = updated;
             if (old.weight <= 0f)
@@ -1849,7 +1882,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string sameLayerRule;
         public bool contradictionRetirementEnabled;
         public float contradictionMinimumDistanceMeters;
+        public float contradictionMinimumMatureWeight;
+        public float contradictionAnchorConsistencyMeters;
         public int contradictionPairsToRetire;
+        public bool contradictionSingleRetirementPerVoxel;
         public int contradictionVotes;
         public int retiredContradictedVoxels;
         public string contradictionRetirementRule;
@@ -1889,7 +1925,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             {
                 algorithm = SameLayerSupportEnabled
                     ? (ContradictionRetirementEnabled
-                        ? "V2CSpatialReceiptSameLayerRepeatedContradiction"
+                        ? "V2CSpatialReceiptSamePairCrossingEdgeConservativeRetirement"
                         : "V2CSpatialReceiptSamePairCrossingEdgeLayerOnly")
                     : (ContradictionRetirementEnabled
                         ? "V2CSpatialReceiptRepeatedContradictionOnly"
@@ -2089,13 +2125,19 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     ContradictionRetirementEnabled,
                 contradictionMinimumDistanceMeters =
                     ContradictionMinimumDistanceMeters,
+                contradictionMinimumMatureWeight =
+                    ContradictionMinimumMatureWeight,
+                contradictionAnchorConsistencyMeters =
+                    ContradictionAnchorConsistencyMeters,
                 contradictionPairsToRetire =
                     ContradictionPairsToRetire,
+                contradictionSingleRetirementPerVoxel = true,
                 contradictionVotes = ContradictionVoteCount,
                 retiredContradictedVoxels =
                     RetiredContradictedVoxelCount,
                 contradictionRetirementRule =
-                    "ThreeDistinctDirectPairsOpposeOldSign_LocalReset_NoDecay"
+                    "FiveConsistentDirectPairsOpposeMatureOldSign_" +
+                    "StableAnchor_OneLocalReset_NoDecay"
             };
             File.WriteAllText(
                 receiptPath, JsonUtility.ToJson(receipt, true));
@@ -2469,11 +2511,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 metrics.crossLayerCandidateTriangles++;
             }
             else if (validObservations[triangle] >=
-                         ContradictionPairsToRetire &&
+                         SpatialHistoricalPairsThreshold &&
                      (foregroundContradictions[triangle] >=
-                          ContradictionPairsToRetire ||
+                          SpatialHistoricalPairsThreshold ||
                       backgroundContradictions[triangle] >=
-                          ContradictionPairsToRetire))
+                          SpatialHistoricalPairsThreshold))
             {
                 classification = "HistoricalShellCandidate";
                 clusterShell[cluster]++;
