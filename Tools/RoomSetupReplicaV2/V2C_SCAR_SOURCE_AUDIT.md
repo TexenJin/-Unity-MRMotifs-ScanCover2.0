@@ -151,6 +151,55 @@ matrix and cannot be mapped unambiguously back to Quest Stage coordinates. The
 high-confidence bridge rule remains valid for the regions it selects, but its
 recall is explicitly unaccepted.
 
+### Human-positive supported crease 1778
+
+The later, precise viewer selection identifies triangle `1778` at Quest Stage
+centroid `(-2.472, 1.733, -0.273) m`. Unlike the unsupported receipt, this
+seed reaches the long visible wall scar through a shared welded vertex. At a
+24-degree internal-dihedral threshold the connected component contains 28
+internal fold edges and 53 incident faces. Its accumulated edge length is
+2.696 m and its PCA spans are 2.272 / 0.211 / 0.110 m: a 10.75:1 elongated
+band, not a compact rough patch. Median fold angle is 41.19 degrees and normal
+coherence is 0.818, meaning the faces still predominantly belong to one broad
+surface rather than two orthogonal room planes.
+
+This component ranks first by long-axis span among 18 provisional elongated
+fold candidates found across the frozen mesh. The automatic geometry rule is:
+
+```text
+internal welded dihedral >= 24 degrees
+AND connected edge count >= 6
+AND principal-axis span >= 0.50 m
+AND principal-axis elongation >= 4:1
+AND median dihedral <= 65 degrees
+AND dominant-normal coherence >= 0.65
+```
+
+It is a candidate generator, not yet a deletion rule: genuine furniture edges
+and room boundaries can still pass. The human-positive `1778` component is
+shown separately from the remaining 17 candidates in the 3D inspector.
+
+Source replay was then rerun on the 53 component faces plus seed `1778`, without
+requiring absent direct support. All 54 reconstructed target cells reproduced
+their final zero crossing. Results are:
+
+```text
+repeated mixed-sign source voxel               54 / 54
+same-view repeated mixed-sign source voxel     52 / 54
+repeated temporal sign switching               36 / 54
+dominant-anchor layer bridge                     0 / 54
+same-pair stereo opposition                     10 / 54
+```
+
+Therefore this labelled scar is not the unsupported dominant-anchor bridge
+class. It is a directly-supported, coherent corrugation whose aligned source
+samples repeatedly change sign, usually from nearly the same view. Source
+mixing still cannot authorize a global filter because the earlier matched
+controls falsified that rule in isolation. Here it becomes relevant only after
+the independent human-positive, elongated interior-fold geometry has selected
+the same spatial band. A clean patch from the same wall is still required as a
+local matched control before assigning the final repair.
+
 ## What is established
 
 1. Same-pair stereo opposition is not the dominant source. It appears at least

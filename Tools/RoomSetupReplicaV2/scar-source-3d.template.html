@@ -2,6 +2,11 @@
   <h2>Room Mesh 缺陷来源定位（对照校验）</h2>
 
   <div class="viz-grid scar-stats" aria-label="已确认的缺陷证据数量">
+    <div class="card viz-stat" data-human-stat>
+      <div class="text-muted">用户指认长折痕</div>
+      <div class="viz-stat-value tabular-nums" data-stat="human"></div>
+      <div class="text-small text-muted" data-stat="human-detail"></div>
+    </div>
     <div class="card viz-stat">
       <div class="text-muted">高置信连续缺陷</div>
       <div class="viz-stat-value tabular-nums" data-stat="confirmed"></div>
@@ -20,8 +25,18 @@
   </div>
 
   <div class="viz-controls scar-controls" aria-label="3D 缺陷筛选">
+    <label class="form-check" data-human-control>
+      <input class="form-check-input" type="checkbox" data-human checked>
+      <span class="scar-swatch scar-human" aria-hidden="true"></span>
+      <span class="form-check-label">指认位置同类折痕链</span>
+    </label>
+    <label class="form-check" data-fold-control>
+      <input class="form-check-input" type="checkbox" data-fold-candidates>
+      <span class="scar-swatch scar-fold-candidate" aria-hidden="true"></span>
+      <span class="form-check-label">全场同类候选</span>
+    </label>
     <label class="form-check">
-      <input class="form-check-input" type="checkbox" data-category="0" checked>
+      <input class="form-check-input" type="checkbox" data-category="0">
       <span class="scar-swatch scar-confirmed" aria-hidden="true"></span>
       <span class="form-check-label">高置信缺陷</span>
     </label>
@@ -51,6 +66,7 @@
       </select>
     </label>
     <button class="btn" type="button" data-fit>适配视图</button>
+    <button class="btn btn-primary" type="button" data-fit-human>定位指认折痕</button>
   </div>
 
   <div class="scar-viewport">
@@ -69,6 +85,8 @@
   </div>
 
   <div class="scar-legend text-small" aria-label="通用识别特征与解决方式">
+    <div data-human-legend><span class="scar-swatch scar-human" aria-hidden="true"></span><span><strong>用户指认折痕链：</strong>从所选三角形出发，沿内部高二面角边连接得到的细长连续分量。 <span class="text-muted">它允许存在直接深度支持，不再被旧入口条件排除。</span></span></div>
+    <div data-fold-legend><span class="scar-swatch scar-fold-candidate" aria-hidden="true"></span><span><strong>全场同类候选：</strong>长轴 ≥0.5 m、长宽比 ≥4、二面角 ≥24°、法线仍以同一大平面为主。 <span class="text-muted">包含真实家具边或墙角的可能性，必须再结合深度历史排除。</span></span></div>
     <div><span class="scar-swatch scar-confirmed" aria-hidden="true"></span><span><strong>高置信缺陷：</strong>无直接支持＋过零边锚点分离 &gt;30 cm＋同类连续面 ≥8。 <span class="text-muted">匹配正常对照仅命中 32/2,523，而异常组命中 459/2,523。</span></span></div>
     <div><span class="scar-swatch scar-bridge" aria-hidden="true"></span><span><strong>宽松搭桥候选：</strong>过零边锚点分离 &gt;15 cm，但未达到连续高分离判据。 <span class="text-muted">用于观察，不应自动删除。</span></span></div>
     <div><span class="scar-swatch scar-mixed" aria-hidden="true"></span><span><strong>混层线索：</strong>同一 5 cm 角点反复出现正负证据。 <span class="text-muted">正常对照中更常见，因此不能单独作为缺陷判据，只用于解释已确认搭桥的上游历史。</span></span></div>
@@ -109,6 +127,8 @@
 #scar-source-audit-3d .scar-bridge { background: var(--viz-series-2); }
 #scar-source-audit-3d .scar-confirmed { background: var(--viz-series-3); }
 #scar-source-audit-3d .scar-unproven { background: var(--muted-foreground); }
+#scar-source-audit-3d .scar-human { background: var(--viz-series-6); }
+#scar-source-audit-3d .scar-fold-candidate { background: var(--viz-series-4); }
 @media (max-width: 560px) {
   #scar-source-audit-3d .scar-viewport { height: 420px; }
   #scar-source-audit-3d .scar-cluster-label { min-width: 100%; }
@@ -134,11 +154,24 @@ const clusterSelect = root.querySelector('[data-cluster]');
 const categoryChecks = [...root.querySelectorAll('[data-category]')];
 const baseCheck = root.querySelector('[data-base]');
 const reportButton = root.querySelector('[data-report]');
+const humanCheck = root.querySelector('[data-human]');
+const foldCandidateCheck = root.querySelector('[data-fold-candidates]');
 let selectedFaceId = null;
 
 root.querySelector('[data-stat="confirmed"]').textContent = payload.s.confirmed.toLocaleString();
 root.querySelector('[data-stat="bridge"]').textContent = payload.s.bridgeCandidates.toLocaleString();
 root.querySelector('[data-stat="control"]').textContent = `${payload.s.controlConfirmed.toLocaleString()} / 2,523`;
+if (payload.hp) {
+  root.querySelector('[data-stat="human"]').textContent = `${payload.hp.faces.toLocaleString()} 面`;
+  root.querySelector('[data-stat="human-detail"]').textContent = `种子 ${payload.hp.seed} · 几何排序 ${payload.hp.componentRank}/${payload.hp.candidateComponents} · 最大跨度 ${(Math.max(...payload.hp.spanMm) / 1000).toFixed(2)} m`;
+} else {
+  root.querySelector('[data-human-stat]').hidden = true;
+  root.querySelector('[data-human-control]').hidden = true;
+  root.querySelector('[data-fold-control]').hidden = true;
+  root.querySelector('[data-human-legend]').hidden = true;
+  root.querySelector('[data-fold-legend]').hidden = true;
+  root.querySelector('[data-fit-human]').hidden = true;
+}
 
 const categoryNames = ['高置信连续缺陷', '宽松搭桥候选', '混层线索', '证据不足'];
 const categoryEvidence = [
@@ -236,6 +269,31 @@ for (let code = 0; code < 4; code += 1) {
   visibleFaceIds.push(payload.c[code].slice());
 }
 
+const humanMaterial = new THREE.MeshBasicMaterial({
+  color: tokenColor('--viz-series-6'), transparent: true, opacity: 0.94,
+  side: THREE.DoubleSide, depthWrite: true, polygonOffset: true,
+  polygonOffsetFactor: -7, polygonOffsetUnits: -7
+});
+const humanFaces = payload.hp?.componentFaces || [];
+const humanFaceSet = new Set(humanFaces);
+const humanMesh = new THREE.Mesh(geometryFor(humanFaces), humanMaterial);
+humanMesh.userData.human = true;
+humanMesh.visible = Boolean(payload.hp);
+scene.add(humanMesh);
+
+const foldCandidateMaterial = new THREE.MeshBasicMaterial({
+  color: tokenColor('--viz-series-4'), transparent: true, opacity: 0.52,
+  side: THREE.DoubleSide, depthWrite: false, polygonOffset: true,
+  polygonOffsetFactor: -5, polygonOffsetUnits: -5
+});
+const foldCandidateFaces = payload.hp?.allCandidateFaces || [];
+const foldCandidateFaceSet = new Set(foldCandidateFaces);
+const foldCandidateMesh = new THREE.Mesh(
+  geometryFor(foldCandidateFaces), foldCandidateMaterial);
+foldCandidateMesh.userData.foldCandidate = true;
+foldCandidateMesh.visible = false;
+scene.add(foldCandidateMesh);
+
 const highlightMaterial = new THREE.MeshBasicMaterial({
   color: tokenColor('--primary'), side: THREE.DoubleSide,
   transparent: true, opacity: 1, polygonOffset: true,
@@ -300,6 +358,29 @@ function showTriangle(faceId) {
   const row = metadata.get(faceId);
   selectedFaceId = faceId;
   reportButton.disabled = false;
+  if (faceId === payload.hp?.seed || humanFaceSet.has(faceId)) {
+    titleNode.textContent = `三角形 ${faceId} · 用户指认连续折痕链`;
+    const source = payload.hp.source;
+    evidenceNode.textContent = source
+      ? `几何分量 ${payload.hp.faces} 面、${payload.hp.edges} 条折边、跨度 ${(Math.max(...payload.hp.spanMm) / 1000).toFixed(2)} m；来源回查 ${source.triangles}/${source.triangles} 面均含反复正负源体素，${source.sameViewMixed}/${source.triangles} 面在近似同视角下重现，主导锚点跨层搭桥 ${source.anchorBridge} 面。`
+      : `由种子三角形 ${payload.hp.seed} 沿共享顶点连接内部高二面角边得到；当前分量 ${payload.hp.faces} 面、${payload.hp.edges} 条折边，最大空间跨度 ${(Math.max(...payload.hp.spanMm) / 1000).toFixed(2)} m。`;
+    actionNode.textContent = source
+      ? '当前指向受直接支持但源体素符号反复切换的时序褶皱，而不是旧规则寻找的无支持跨层桥；仍需用同墙面洁净区域作局部对照后才能授权修复。'
+      : '下一步：对这整条空间链逐面回查直接深度、姿态和跨帧主导锚点，区分输入真实边缘与受支持的时序错位褶皱。';
+    highlight.geometry.dispose();
+    highlight.geometry = geometryFor([faceId]);
+    saveState();
+    return;
+  }
+  if (foldCandidateFaceSet.has(faceId)) {
+    titleNode.textContent = `三角形 ${faceId} · 同类几何候选`;
+    evidenceNode.textContent = `属于全场 ${payload.hp.candidateComponents} 个细长高二面角连通分量之一；这里只证明形态同类，尚未由人工或深度历史确认。`;
+    actionNode.textContent = '处理：回查该连通分量的逐帧深度和锚点；真实墙角与家具轮廓保留，平面内部反复错位形成的褶皱才进入修复。';
+    highlight.geometry.dispose();
+    highlight.geometry = geometryFor([faceId]);
+    saveState();
+    return;
+  }
   if (!row) {
     titleNode.textContent = `三角形 ${faceId} · 当前漏检/正常对照范围`;
     evidenceNode.textContent = '该三角形不在原“无直接支持”目标集中，因此旧检测器不会着色；它可能具有直接深度支持但仍形成视觉折痕。';
@@ -334,12 +415,18 @@ canvas.addEventListener('click', event => {
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
   const activeMeshes = meshes.filter((mesh, code) => mesh.visible && visibleFaceIds[code].length);
+  if (humanMesh.visible && humanFaces.length) activeMeshes.unshift(humanMesh);
+  if (foldCandidateMesh.visible && foldCandidateFaces.length) activeMeshes.unshift(foldCandidateMesh);
   let hit = raycaster.intersectObjects(activeMeshes, false)[0];
   if (!hit && baseCheck.checked) hit = raycaster.intersectObject(baseSolid, false)[0];
   if (!hit) return;
   const faceId = hit.object === baseSolid
     ? hit.faceIndex
-    : visibleFaceIds[hit.object.userData.category][hit.faceIndex];
+    : hit.object === humanMesh
+      ? humanFaces[hit.faceIndex]
+      : hit.object === foldCandidateMesh
+        ? foldCandidateFaces[hit.faceIndex]
+      : visibleFaceIds[hit.object.userData.category][hit.faceIndex];
   showTriangle(faceId);
 });
 
@@ -352,7 +439,11 @@ function saveState() {
       selectedFaceId,
       enabled
     },
-    privateContent: { baseVisible: baseCheck.checked }
+    privateContent: {
+      baseVisible: baseCheck.checked,
+      humanVisible: humanCheck?.checked ?? false,
+      foldCandidatesVisible: foldCandidateCheck?.checked ?? false
+    }
   }).catch(() => {});
 }
 
@@ -370,8 +461,12 @@ function restoreState(state) {
     selectedFaceId = model.selectedFaceId;
   }
   if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
+  if (humanCheck && typeof privateState?.humanVisible === 'boolean') humanCheck.checked = privateState.humanVisible;
+  if (foldCandidateCheck && typeof privateState?.foldCandidatesVisible === 'boolean') foldCandidateCheck.checked = privateState.foldCandidatesVisible;
   baseSolid.visible = baseCheck.checked;
   baseWire.visible = baseCheck.checked;
+  humanMesh.visible = Boolean(payload.hp) && (humanCheck?.checked ?? false);
+  foldCandidateMesh.visible = Boolean(payload.hp) && (foldCandidateCheck?.checked ?? false);
 }
 
 restoreState(window.openai?.widgetState);
@@ -385,10 +480,26 @@ baseCheck.addEventListener('change', () => {
   baseWire.visible = baseCheck.checked;
   saveState();
 });
+humanCheck?.addEventListener('change', () => {
+  humanMesh.visible = Boolean(payload.hp) && humanCheck.checked;
+  saveState();
+});
+foldCandidateCheck?.addEventListener('change', () => {
+  foldCandidateMesh.visible = Boolean(payload.hp) && foldCandidateCheck.checked;
+  saveState();
+});
 clusterSelect.addEventListener('change', updateFilter);
 root.querySelector('[data-fit]').addEventListener('click', () => {
   const facesToFit = currentClusterFaces() || allFaceIds();
   fitFaces(facesToFit);
+});
+root.querySelector('[data-fit-human]').addEventListener('click', () => {
+  if (!humanFaces.length) return;
+  clusterSelect.value = '';
+  humanCheck.checked = true;
+  humanMesh.visible = true;
+  fitFaces(humanFaces);
+  showTriangle(payload.hp.seed);
 });
 reportButton.addEventListener('click', async () => {
   if (selectedFaceId == null || !window.openai?.sendFollowUpMessage) return;
@@ -416,7 +527,12 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 updateFilter(false);
-if (selectedFaceId != null) showTriangle(selectedFaceId);
+if (selectedFaceId != null) {
+  showTriangle(selectedFaceId);
+} else if (payload.hp && humanFaces.length) {
+  fitFaces(humanFaces);
+  showTriangle(payload.hp.seed);
+}
 
 function animate() {
   controls.update();
