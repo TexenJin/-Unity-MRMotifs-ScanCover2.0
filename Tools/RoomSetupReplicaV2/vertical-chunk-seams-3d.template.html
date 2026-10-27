@@ -41,16 +41,25 @@
     </label>
     <label class="form-check">
       <input class="form-check-input" type="checkbox" data-pick-baseline checked>
-      <span class="form-check-label">点选任意灰色网格边</span>
+      <span class="form-check-label">选择任意灰色网格边</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-paint checked>
+      <span class="form-check-label">拖动连续画线</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-erase>
+      <span class="form-check-label">擦除模式</span>
     </label>
     <button class="btn" type="button" data-fit-room>适配全房间</button>
+    <button class="btn" type="button" data-clear-edges>清空自选边</button>
     <button class="btn btn-primary" type="button" data-confirm disabled>确认这是截图中的连线</button>
-    <button class="btn btn-primary" type="button" data-confirm-edge disabled>确认红线种子边</button>
+    <button class="btn btn-primary" type="button" data-confirm-edge disabled>确认整组自选边</button>
   </div>
 
   <div class="seam-viewport">
     <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格与竖向Chunk接缝三维模型"></canvas>
-    <div class="seam-help text-small text-muted">拖动旋转 · 滚轮缩放 · 勾选“点选任意灰色网格边”后点击红线附近</div>
+    <div class="seam-help text-small text-muted">画线模式：拖动累计边 · 擦除模式：拖动取消 · 取消“拖动连续画线”后旋转</div>
   </div>
 
   <div class="card seam-detail" aria-live="polite">
@@ -109,6 +118,9 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 
 const root = document.getElementById('vertical-chunk-seams-3d');
 const payload = __VERTICAL_SEAM_PAYLOAD__;
@@ -118,6 +130,8 @@ const chainSelect = root.querySelector('[data-chain]');
 const baseCheck = root.querySelector('[data-base]');
 const adjacentCheck = root.querySelector('[data-adjacent]');
 const pickBaselineCheck = root.querySelector('[data-pick-baseline]');
+const paintCheck = root.querySelector('[data-paint]');
+const eraseCheck = root.querySelector('[data-erase]');
 const confirmButton = root.querySelector('[data-confirm]');
 const confirmEdgeButton = root.querySelector('[data-confirm-edge]');
 const titleNode = root.querySelector('[data-detail-title]');
@@ -128,6 +142,8 @@ let selectedFaceId = null;
 let selectedEdge = null;
 let selectedPointMm = null;
 let stateHasCamera = false;
+let selectedMeshRecords = [];
+let isPainting = false;
 
 root.querySelector('[data-stat="chains"]').textContent = payload.s.verticalChunkSeamChains.toLocaleString();
 root.querySelector('[data-stat="full"]').textContent = payload.s.fullHeightChains.toLocaleString();
@@ -224,9 +240,12 @@ const selectedFaces = new THREE.Mesh(geometryForFaces([]), new THREE.MeshBasicMa
   polygonOffsetFactor: -5, polygonOffsetUnits: -5
 }));
 scene.add(selectedFaces);
-const selectedMeshEdge = new THREE.LineSegments(geometryForEdges([]), new THREE.LineBasicMaterial({
-  color: tokenColor('--primary')
-}));
+const selectedMeshEdgeMaterial = new LineMaterial({
+  color: tokenColor('--primary').getHex(), linewidth: 4,
+  transparent: true, opacity: 1
+});
+const selectedMeshEdge = new LineSegments2(
+  new LineSegmentsGeometry(), selectedMeshEdgeMaterial);
 scene.add(selectedMeshEdge);
 
 function fitBounds(minimum, maximum) {
@@ -254,8 +273,9 @@ function clearSavedMeshEdge() {
   selectedFaceId = null;
   selectedEdge = null;
   selectedPointMm = null;
+  selectedMeshRecords = [];
   selectedMeshEdge.geometry.dispose();
-  selectedMeshEdge.geometry = geometryForEdges([]);
+  selectedMeshEdge.geometry = new LineSegmentsGeometry();
   confirmEdgeButton.disabled = true;
 }
 
@@ -287,7 +307,7 @@ function distanceToSegment(point, a, b) {
   return point.distanceTo(nearest);
 }
 
-function selectMeshEdge(faceId, hitPoint, shouldSave = true) {
+function nearestMeshEdge(faceId, hitPoint) {
   const vertexIds = [
     faces[faceId * 3], faces[faceId * 3 + 1], faces[faceId * 3 + 2]
   ];
@@ -298,51 +318,70 @@ function selectMeshEdge(faceId, hitPoint, shouldSave = true) {
     const distance = distanceToSegment(hitPoint, points[pair[0]], points[pair[1]]);
     return distance < best.distance ? { pair, distance } : best;
   }, { pair: pairs[0], distance: Infinity });
+  return {
+    face: faceId,
+    a: vertexIds[closest.pair[0]],
+    b: vertexIds[closest.pair[1]],
+    pointMm: hitPoint.toArray().map(value => Math.round(value * 1000))
+  };
+}
+
+function edgeKey(record) {
+  return record.a < record.b ? `${record.a}:${record.b}` : `${record.b}:${record.a}`;
+}
+
+function refreshSelectedMeshEdges() {
+  const edgeCoordinates = [];
+  for (const record of selectedMeshRecords) {
+    for (const vertex of [record.a, record.b]) {
+      edgeCoordinates.push(
+        positions[vertex * 3],
+        positions[vertex * 3 + 1],
+        positions[vertex * 3 + 2]);
+    }
+  }
+  selectedMeshEdge.geometry.dispose();
+  const geometry = new LineSegmentsGeometry();
+  if (edgeCoordinates.length) geometry.setPositions(edgeCoordinates);
+  selectedMeshEdge.geometry = geometry;
+  selectedFaces.geometry.dispose();
+  selectedFaces.geometry = geometryForFaces([]);
+  selectedFaces.visible = false;
+  confirmEdgeButton.disabled = selectedMeshRecords.length === 0;
+}
+
+function applyMeshEdge(faceId, hitPoint, erase = false) {
+  const record = nearestMeshEdge(faceId, hitPoint);
+  const key = edgeKey(record);
+  const existing = selectedMeshRecords.findIndex(value => edgeKey(value) === key);
+  if (erase) {
+    if (existing >= 0) selectedMeshRecords.splice(existing, 1);
+  } else if (existing < 0 && selectedMeshRecords.length < 256) {
+    selectedMeshRecords.push(record);
+  }
   selectedChain = null;
   chainSelect.value = '';
   selectedLine.geometry.dispose();
   selectedLine.geometry = geometryForEdges([]);
   confirmButton.disabled = true;
-  selectedFaceId = faceId;
-  selectedEdge = [vertexIds[closest.pair[0]], vertexIds[closest.pair[1]]];
-  selectedPointMm = hitPoint.toArray().map(value => Math.round(value * 1000));
-  selectedFaces.geometry.dispose();
-  selectedFaces.geometry = geometryForFaces([faceId]);
-  selectedFaces.visible = true;
-  const edgeCoordinates = [];
-  for (const vertex of selectedEdge) {
-    edgeCoordinates.push(
-      Math.round(positions[vertex * 3] * 1000),
-      Math.round(positions[vertex * 3 + 1] * 1000),
-      Math.round(positions[vertex * 3 + 2] * 1000));
-  }
-  selectedMeshEdge.geometry.dispose();
-  selectedMeshEdge.geometry = geometryForEdges(edgeCoordinates);
-  confirmEdgeButton.disabled = false;
-  titleNode.textContent = `灰色网格种子 · 三角形 ${faceId} · 边 ${selectedEdge[0]}–${selectedEdge[1]}`;
-  evidenceNode.textContent = `点击位置 [${selectedPointMm.join(', ')}] mm；已选取该三角形中距点击位置最近的原始网格边。`;
-  boundaryNode.textContent = '这只是精确空间种子，尚未给它套用Chunk接缝或104面成因；下一步将从该边双向追踪整条锯齿链并回查两侧拓扑。';
-  if (shouldSave) saveState();
+  const last = selectedMeshRecords[selectedMeshRecords.length - 1] || null;
+  selectedFaceId = last?.face ?? null;
+  selectedEdge = last ? [last.a, last.b] : null;
+  selectedPointMm = last?.pointMm ?? null;
+  refreshSelectedMeshEdges();
+  titleNode.textContent = `自选问题边链 · ${selectedMeshRecords.length} 条边`;
+  evidenceNode.textContent = erase
+    ? `擦除后保留 ${selectedMeshRecords.length} 条边；可继续拖动擦除。`
+    : `已累计 ${selectedMeshRecords.length} 条任意灰色网格边；新选择不会覆盖旧选择。`;
+  boundaryNode.textContent = '只高亮原始边，不再用三角面填充遮挡；确认后将按整组边共同追踪结构和来源。';
 }
 
 function showSavedMeshEdge() {
-  if (selectedFaceId == null || !selectedEdge) return;
-  selectedFaces.geometry.dispose();
-  selectedFaces.geometry = geometryForFaces([selectedFaceId]);
-  selectedFaces.visible = true;
-  const edgeCoordinates = [];
-  for (const vertex of selectedEdge) {
-    edgeCoordinates.push(
-      Math.round(positions[vertex * 3] * 1000),
-      Math.round(positions[vertex * 3 + 1] * 1000),
-      Math.round(positions[vertex * 3 + 2] * 1000));
-  }
-  selectedMeshEdge.geometry.dispose();
-  selectedMeshEdge.geometry = geometryForEdges(edgeCoordinates);
-  confirmEdgeButton.disabled = false;
-  titleNode.textContent = `灰色网格种子 · 三角形 ${selectedFaceId} · 边 ${selectedEdge[0]}–${selectedEdge[1]}`;
-  evidenceNode.textContent = `点击位置 [${(selectedPointMm || []).join(', ')}] mm；点选已保留，恢复状态不会移动相机。`;
-  boundaryNode.textContent = '这只是精确空间种子，尚未给它套用Chunk接缝或104面成因；下一步将从该边双向追踪整条锯齿链并回查两侧拓扑。';
+  if (!selectedMeshRecords.length) return;
+  refreshSelectedMeshEdges();
+  titleNode.textContent = `自选问题边链 · ${selectedMeshRecords.length} 条边`;
+  evidenceNode.textContent = '多边选择已保留；恢复状态不会移动相机。';
+  boundaryNode.textContent = '确认后将按整组边共同追踪结构和来源。';
 }
 
 for (const chain of payload.q) {
@@ -355,14 +394,45 @@ for (const chain of payload.q) {
 const raycaster = new THREE.Raycaster();
 raycaster.params.Line.threshold = 0.035;
 const pointer = new THREE.Vector2();
-canvas.addEventListener('click', event => {
+function setPointer(event) {
   const rect = canvas.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+}
+
+function paintAt(event) {
+  setPointer(event);
+  const baseHit = raycaster.intersectObject(baseSolid, false)[0];
+  if (baseHit) applyMeshEdge(baseHit.faceIndex, baseHit.point, eraseCheck.checked);
+}
+
+canvas.addEventListener('pointerdown', event => {
+  if (!pickBaselineCheck.checked || !paintCheck.checked) return;
+  isPainting = true;
+  canvas.setPointerCapture(event.pointerId);
+  paintAt(event);
+});
+canvas.addEventListener('pointermove', event => {
+  if (isPainting) paintAt(event);
+});
+function finishPainting(event) {
+  if (!isPainting) return;
+  isPainting = false;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  saveState();
+}
+canvas.addEventListener('pointerup', finishPainting);
+canvas.addEventListener('pointercancel', finishPainting);
+canvas.addEventListener('click', event => {
+  setPointer(event);
   if (pickBaselineCheck.checked) {
+    if (paintCheck.checked) return;
     const baseHit = raycaster.intersectObject(baseSolid, false)[0];
-    if (baseHit) selectMeshEdge(baseHit.faceIndex, baseHit.point);
+    if (baseHit) {
+      applyMeshEdge(baseHit.faceIndex, baseHit.point, eraseCheck.checked);
+      saveState();
+    }
     return;
   }
   const hit = raycaster.intersectObjects(lineObjects, false)[0];
@@ -377,13 +447,18 @@ function saveState() {
       selectedFaceId,
       selectedEdge,
       selectedPointMm,
+      selectedMeshRecords: selectedMeshRecords.map(record => [
+        record.face, record.a, record.b, record.pointMm
+      ]),
       cameraPosition: camera.position.toArray().map(value => Number(value.toFixed(4))),
       cameraTarget: controls.target.toArray().map(value => Number(value.toFixed(4)))
     },
     privateContent: {
       baseVisible: baseCheck.checked,
       adjacentVisible: adjacentCheck.checked,
-      pickBaseline: pickBaselineCheck.checked
+      pickBaseline: pickBaselineCheck.checked,
+      paintMode: paintCheck.checked,
+      eraseMode: eraseCheck.checked
     }
   }).catch(() => {});
 }
@@ -393,13 +468,26 @@ function restoreState(state) {
   const privateState = state?.privateContent;
   selectedChain = Number.isInteger(model?.selectedChain) && payload.q[model.selectedChain]
     ? model.selectedChain : null;
-  selectedFaceId = Number.isInteger(model?.selectedFaceId)
-    ? model.selectedFaceId : null;
-  selectedEdge = Array.isArray(model?.selectedEdge) && model.selectedEdge.length === 2
-    ? model.selectedEdge : null;
-  selectedPointMm = Array.isArray(model?.selectedPointMm) && model.selectedPointMm.length === 3
-    ? model.selectedPointMm : null;
-  if (selectedFaceId != null && selectedEdge) selectedChain = null;
+  if (Array.isArray(model?.selectedMeshRecords)) {
+    selectedMeshRecords = model.selectedMeshRecords.slice(0, 256).flatMap(row =>
+      Array.isArray(row) && row.length === 4 && Number.isInteger(row[0]) &&
+      Number.isInteger(row[1]) && Number.isInteger(row[2]) && Array.isArray(row[3])
+        ? [{ face: row[0], a: row[1], b: row[2], pointMm: row[3] }] : []);
+  } else if (Number.isInteger(model?.selectedFaceId) &&
+      Array.isArray(model?.selectedEdge) && model.selectedEdge.length === 2) {
+    selectedMeshRecords = [{
+      face: model.selectedFaceId,
+      a: model.selectedEdge[0], b: model.selectedEdge[1],
+      pointMm: Array.isArray(model?.selectedPointMm) ? model.selectedPointMm : []
+    }];
+  } else {
+    selectedMeshRecords = [];
+  }
+  const last = selectedMeshRecords[selectedMeshRecords.length - 1] || null;
+  selectedFaceId = last?.face ?? null;
+  selectedEdge = last ? [last.a, last.b] : null;
+  selectedPointMm = last?.pointMm ?? null;
+  if (selectedMeshRecords.length) selectedChain = null;
   stateHasCamera = (
     Array.isArray(model?.cameraPosition) && model.cameraPosition.length === 3 &&
     Array.isArray(model?.cameraTarget) && model.cameraTarget.length === 3);
@@ -411,10 +499,11 @@ function restoreState(state) {
   if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
   if (typeof privateState?.adjacentVisible === 'boolean') adjacentCheck.checked = privateState.adjacentVisible;
   if (typeof privateState?.pickBaseline === 'boolean') pickBaselineCheck.checked = privateState.pickBaseline;
+  if (typeof privateState?.paintMode === 'boolean') paintCheck.checked = privateState.paintMode;
+  if (typeof privateState?.eraseMode === 'boolean') eraseCheck.checked = privateState.eraseMode;
   baseSolid.visible = baseCheck.checked;
   baseWire.visible = baseCheck.checked;
-  selectedFaces.visible = selectedFaceId != null ||
-    (adjacentCheck.checked && selectedChain != null);
+  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
 }
 
 restoreState(window.openai?.widgetState);
@@ -439,12 +528,28 @@ baseCheck.addEventListener('change', () => {
   saveState();
 });
 adjacentCheck.addEventListener('change', () => {
-  selectedFaces.visible = selectedFaceId != null ||
-    (adjacentCheck.checked && selectedChain != null);
+  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
   saveState();
 });
-pickBaselineCheck.addEventListener('change', saveState);
+function updateInteractionMode() {
+  controls.enabled = !(pickBaselineCheck.checked && paintCheck.checked);
+}
+pickBaselineCheck.addEventListener('change', () => {
+  updateInteractionMode();
+  saveState();
+});
+paintCheck.addEventListener('change', () => {
+  updateInteractionMode();
+  saveState();
+});
+eraseCheck.addEventListener('change', saveState);
 root.querySelector('[data-fit-room]').addEventListener('click', fitRoom);
+root.querySelector('[data-clear-edges]').addEventListener('click', () => {
+  clearSavedMeshEdge();
+  titleNode.textContent = '自选问题边链 · 0 条边';
+  evidenceNode.textContent = '已清空，可重新拖动选择。';
+  saveState();
+});
 confirmButton.addEventListener('click', async () => {
   if (selectedChain == null || !window.openai?.sendFollowUpMessage) return;
   const chain = payload.q[selectedChain];
@@ -454,12 +559,13 @@ confirmButton.addEventListener('click', async () => {
   });
 });
 confirmEdgeButton.addEventListener('click', async () => {
-  if (selectedFaceId == null || !selectedEdge || !window.openai?.sendFollowUpMessage) return;
+  if (!selectedMeshRecords.length || !window.openai?.sendFollowUpMessage) return;
   const position = camera.position.toArray().map(value => Number(value.toFixed(4)));
   const target = controls.target.toArray().map(value => Number(value.toFixed(4)));
+  const records = selectedMeshRecords.map(record => [record.face, record.a, record.b]);
   await window.openai.sendFollowUpMessage({
-    title: '确认红线种子边',
-    prompt: `我确认三角形 ${selectedFaceId} 的边 ${selectedEdge[0]}–${selectedEdge[1]}（点击位置mm ${JSON.stringify(selectedPointMm)}）位于截图红线所指的锯齿状不美观连线上。当前相机位置 ${JSON.stringify(position)}，观察目标 ${JSON.stringify(target)}。请从这条边双向追踪整条链，查明两侧几何、MC构型、Chunk归属和来源历史。`
+    title: '确认自选问题边链',
+    prompt: `我连续选择了 ${selectedMeshRecords.length} 条边，记录为 [三角形,顶点A,顶点B]：${JSON.stringify(records)}。这些边共同表示截图所指的不美观结构。当前相机位置 ${JSON.stringify(position)}，观察目标 ${JSON.stringify(target)}。请按整组边追踪结构，查明两侧几何、MC构型、Chunk归属和来源历史。`
   });
 });
 window.addEventListener('openai:set_globals', event => {
@@ -475,11 +581,13 @@ function resize() {
   const width = Math.max(1, viewport.clientWidth);
   const height = Math.max(1, viewport.clientHeight);
   renderer.setSize(width, height, false);
+  selectedMeshEdgeMaterial.resolution.set(width, height);
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
+updateInteractionMode();
 if (selectedFaceId != null && selectedEdge) {
   showSavedMeshEdge();
 } else if (selectedChain != null) {
