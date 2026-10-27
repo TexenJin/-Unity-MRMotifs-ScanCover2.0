@@ -175,3 +175,31 @@ related to the 104-face near-zero topology problem, but belongs to the stronger
 repeated-mixing subtype rather than the 104 non-repeated subtype. Its repair
 belongs in a shared near-zero plane decision plus stable local layer history,
 not Chunk vertex welding.
+
+## Manual multi-edge positive atlas
+
+After the picker was changed to preserve and toggle multiple arbitrary edges,
+the user marked 48 representative edges. This is a positive atlas, not an
+exhaustive defect mask. Expanding those edges to their exact mesh owners gives
+83 unique adjacent triangles:
+
+- 82/83 have `RepeatedMixedSignSourceVoxel`;
+- 79/83 have `SameViewRepeatedMixedSignSourceVoxel`;
+- 76/83 have `RepeatedTemporalSignSwitching`;
+- only one owner has `NoRepeatedMixedCornerZeroCrossing`;
+- 45/48 selected edges are ordinary two-owner manifold edges, so the visual
+  line is not explained by unwelded Chunk boundaries.
+
+The atlas contains two spatial expressions of the same source-instability
+family. The long wall portion follows the exact `z=-0.20 m` derived sample
+plane and separates adjacent `z=-3/-2` cells. The lower, more folded portion
+passes through both adjacent-cell boundaries and same-cell triangulation, but
+retains the repeated mixed-source signature. Therefore an automatic locator
+must combine source history with edge-chain geometry; neither a Chunk-seam
+test nor a generic high-dihedral/crease test is sufficient.
+
+The persisted input is
+`manual-edge-positive-atlas-20261027.json`. Future full-mesh expansion must
+keep the 48 edges pinned as positives, rank unlabelled matches, and retain a
+review-only class rather than treating every unlabelled edge as clean or every
+mixed-source triangle as defective.
