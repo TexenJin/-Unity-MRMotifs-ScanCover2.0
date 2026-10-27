@@ -145,3 +145,33 @@ The visualization also keeps the other 546 human-confirmed faces visible as a
 separate class. Those faces belong to repeated mixed-source, weak temporal
 switching, or paint-boundary categories and must not be presented as evidence
 for the 104-face zero-plane mechanism.
+
+## Selected long red-line seed
+
+The arbitrary-edge picker captured triangle 1,842, edge `1162-1166`, at
+approximately `[-2.648, 2.271, -0.194] m`. The original UI then appeared to
+lose the selection because the stale selected Chunk-chain state refocused the
+camera; the seed itself remained valid.
+
+The selected edge is not an unwelded 0.8 m Chunk seam. It is shared normally by
+triangles 1,791 and 1,842, whose normals differ by only 0.12 degrees. The two
+triangles come from adjacent derived-cell layers `z=-3` and `z=-2`, meet on the
+exact `z=-0.20 m` 10 cm sample plane, and use MC configurations 159 and 9.
+
+Tracing the same cross-plane condition above and below the seed finds three
+stacked chains that visually form one long line:
+
+- 23 edges and 46 adjacent triangles;
+- bounds approximately `x=-2.686..-2.529 m`, `y=0.30..2.40 m`,
+  `z=-0.20 m`;
+- 23 faces extracted from each side of the sample plane;
+- all 46 faces have repeated temporal switching, repeated mixed-sign source
+  voxels, and same-view repeated mixing;
+- the dominant paired MC configurations are 159 and 9, with 19 faces each.
+
+This is a long inter-cell zero-plane phase boundary: the same physical wall is
+repeatedly represented from opposite sides of one derived sample plane. It is
+related to the 104-face near-zero topology problem, but belongs to the stronger
+repeated-mixing subtype rather than the 104 non-repeated subtype. Its repair
+belongs in a shared near-zero plane decision plus stable local layer history,
+not Chunk vertex welding.
