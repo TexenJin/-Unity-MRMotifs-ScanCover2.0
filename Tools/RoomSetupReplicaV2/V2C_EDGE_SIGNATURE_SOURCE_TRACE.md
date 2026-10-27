@@ -203,3 +203,35 @@ mixed-layer/source cases. The 109 zero-plane cases may represent one physical
 surface whose near-zero SDF sign alternates across adjacent derived cells; they
 must not be mislabeled as two distinct depth layers. The last eight remain
 outside automatic repair acceptance.
+
+## Conservative causal-chain reclassification
+
+Visual review showed that the first positive-only expansion had low precision
+outside the directly observed repeated layer/sign-switching cases. Its
+"high-confidence" name was therefore too strong: a learned MC configuration,
+one matching owner, and vertex-connected propagation identify a shared source
+family but are not sufficient to identify a visible defect.
+
+`detect_causal_scar_patches.py` replaces that expansion with a conservative
+review rule. Every non-manual edge now requires strict repeated mixed-sign,
+same-view mixed-sign, and temporal-switch evidence on **both** owner triangles.
+Edges are then joined only through direction-compatible turns, and a retained
+component must contain at least three edges, two exact 10 cm phase anchors,
+`0.12-2.40 m` total edge length, and `0.10 m` spatial extent.
+
+On the same frozen mesh and the combined A/B positive atlases:
+
+| Result | Edges |
+| --- | ---: |
+| Combined manual positives | 139 |
+| Strict two-owner phase cores | 196 |
+| Bounded direction-chain extensions | 225 |
+| Old-rule candidates withdrawn | 829 |
+| Strict retained components | 62 |
+
+The resulting 421 non-manual edges remain **causal review candidates**, not a
+deletion mask or confirmed defect count. The 829 withdrawn edges are retained
+only as a disabled before/after comparison layer. Final precision must be
+measured from explicit user accept/reject labels or by showing that a targeted
+same-tape intervention removes the candidate while preserving supported room
+surfaces.
