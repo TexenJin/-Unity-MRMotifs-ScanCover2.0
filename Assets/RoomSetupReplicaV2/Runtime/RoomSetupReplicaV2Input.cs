@@ -1,15 +1,17 @@
 using UnityEngine;
 
 /// <summary>
-/// Replay-lab input. A replays the fixed tape. The separate read-only replay
-/// probe owns right-trigger paint/erase and B-stroke undo after replay; live
-/// capture controls remain disabled by replayOnlyMode.
+/// Room Setup replica input. Right trigger toggles the paired live coverage
+/// and recording session; A replays the fixed tape, B clears the replica, and
+/// X toggles preview visibility. Replay-only annotation is disabled while live
+/// controls are open so the same trigger cannot paint and start capture.
 /// </summary>
+[DefaultExecutionOrder(-15)]
 public sealed class RoomSetupReplicaV2Input : MonoBehaviour
 {
     [SerializeField] private OVRInput.Controller controller =
         OVRInput.Controller.RTouch;
-    [SerializeField] private bool replayOnlyMode = true;
+    [SerializeField] private bool replayOnlyMode = false;
     [SerializeField, Range(0.05f, 0.5f)]
     private float actionDebounceSeconds = 0.25f;
     private float _previousTrigger;
@@ -17,10 +19,20 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
 
     private void Awake()
     {
-        // Existing serialized V2 scenes predate the replay probe. Add the
-        // read-only annotator at runtime so rebuilding the scene is optional.
-        if (GetComponent<RoomSetupReplicaV2ReplayProbe>() == null)
-            gameObject.AddComponent<RoomSetupReplicaV2ReplayProbe>();
+        RoomSetupReplicaV2ReplayProbe probe =
+            GetComponent<RoomSetupReplicaV2ReplayProbe>();
+        if (replayOnlyMode)
+        {
+            // Existing serialized V2 scenes predate the probe. Add the
+            // read-only annotator without requiring a scene rebuild.
+            if (probe == null)
+                probe = gameObject.AddComponent<RoomSetupReplicaV2ReplayProbe>();
+            probe.enabled = true;
+        }
+        else if (probe != null)
+        {
+            probe.enabled = false;
+        }
     }
 
     private void Update()

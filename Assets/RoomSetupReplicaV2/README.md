@@ -10,15 +10,14 @@ placeholder scene with a Meta XR Building Blocks scene, adds only `DepthCapture`
 
 Quest controls:
 
+- Right index trigger: start or stop live coverage and its matching recording
+  as one debounced action.
 - A: clear the current replica and replay the fixed last tape.
-- After replay completes, aim the right-controller ray and hold the right
-  index trigger. Starting on an unselected face paints visible-defect labels;
-  starting on a selected face erases labels. Sweep the ray to mark or unmark
-  a whole ribbon without clicking each triangle. Selected faces are
-  highlighted in magenta and autosaved during the stroke and on release.
-- B after replay undoes the most recent complete paint/erase stroke.
-- Live coverage/recording and X remain disabled in `replayOnlyMode`; the probe
-  is a read-only annotation layer over the frozen final mesh.
+- B: clear the current replica.
+- X: toggle replica preview visibility.
+- The replay annotation probe remains available in source for frozen-tape
+  diagnosis, but is disabled while live controls are open so it cannot consume
+  the same right-trigger press.
 
 All controller actions share a 250 ms debounce window so one physical press
 cannot restart a replay or trigger two state transitions.

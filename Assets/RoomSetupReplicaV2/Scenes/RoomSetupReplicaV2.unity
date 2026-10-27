@@ -185,6 +185,7 @@ MonoBehaviour:
   m_Name:
   m_EditorClassIdentifier: Assembly-CSharp::RoomSetupReplicaV2Input
   controller: 2
+  replayOnlyMode: 0
   actionDebounceSeconds: 0.25
 --- !u!114 &340680393
 MonoBehaviour:
