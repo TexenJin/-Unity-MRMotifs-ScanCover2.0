@@ -49,7 +49,7 @@
     </label>
     <label class="form-check">
       <input class="form-check-input" type="checkbox" data-erase>
-      <span class="form-check-label">擦除模式</span>
+      <span class="form-check-label">强制擦除模式</span>
     </label>
     <button class="btn" type="button" data-fit-room>适配全房间</button>
     <button class="btn" type="button" data-clear-edges>清空自选边</button>
@@ -59,7 +59,7 @@
 
   <div class="seam-viewport">
     <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格与竖向Chunk接缝三维模型"></canvas>
-    <div class="seam-help text-small text-muted">画线模式：拖动累计边 · 擦除模式：拖动取消 · 取消“拖动连续画线”后旋转</div>
+    <div class="seam-help text-small text-muted">单击：加入／再次点击取消 · 拖动：由落笔边决定整笔添加或擦除 · 取消“拖动连续画线”后旋转</div>
   </div>
 
   <div class="card seam-detail" aria-live="polite">
@@ -144,6 +144,7 @@ let selectedPointMm = null;
 let stateHasCamera = false;
 let selectedMeshRecords = [];
 let isPainting = false;
+let strokeErase = false;
 
 root.querySelector('[data-stat="chains"]').textContent = payload.s.verticalChunkSeamChains.toLocaleString();
 root.querySelector('[data-stat="full"]').textContent = payload.s.fullHeightChains.toLocaleString();
@@ -330,6 +331,11 @@ function edgeKey(record) {
   return record.a < record.b ? `${record.a}:${record.b}` : `${record.b}:${record.a}`;
 }
 
+function isMeshEdgeSelected(record) {
+  const key = edgeKey(record);
+  return selectedMeshRecords.some(value => edgeKey(value) === key);
+}
+
 function refreshSelectedMeshEdges() {
   const edgeCoordinates = [];
   for (const record of selectedMeshRecords) {
@@ -350,8 +356,7 @@ function refreshSelectedMeshEdges() {
   confirmEdgeButton.disabled = selectedMeshRecords.length === 0;
 }
 
-function applyMeshEdge(faceId, hitPoint, erase = false) {
-  const record = nearestMeshEdge(faceId, hitPoint);
+function applyMeshRecord(record, erase = false) {
   const key = edgeKey(record);
   const existing = selectedMeshRecords.findIndex(value => edgeKey(value) === key);
   if (erase) {
@@ -371,9 +376,15 @@ function applyMeshEdge(faceId, hitPoint, erase = false) {
   refreshSelectedMeshEdges();
   titleNode.textContent = `自选问题边链 · ${selectedMeshRecords.length} 条边`;
   evidenceNode.textContent = erase
-    ? `擦除后保留 ${selectedMeshRecords.length} 条边；可继续拖动擦除。`
-    : `已累计 ${selectedMeshRecords.length} 条任意灰色网格边；新选择不会覆盖旧选择。`;
+    ? `已取消所指边，当前保留 ${selectedMeshRecords.length} 条；从已选边落笔可连续擦除。`
+    : `已累计 ${selectedMeshRecords.length} 条任意灰色网格边；再次点击已选边即可取消。`;
   boundaryNode.textContent = '只高亮原始边，不再用三角面填充遮挡；确认后将按整组边共同追踪结构和来源。';
+}
+
+function meshEdgeAt(event) {
+  setPointer(event);
+  const hit = raycaster.intersectObject(baseSolid, false)[0];
+  return hit ? nearestMeshEdge(hit.faceIndex, hit.point) : null;
 }
 
 function showSavedMeshEdge() {
@@ -402,16 +413,18 @@ function setPointer(event) {
 }
 
 function paintAt(event) {
-  setPointer(event);
-  const baseHit = raycaster.intersectObject(baseSolid, false)[0];
-  if (baseHit) applyMeshEdge(baseHit.faceIndex, baseHit.point, eraseCheck.checked);
+  const record = meshEdgeAt(event);
+  if (record) applyMeshRecord(record, strokeErase);
 }
 
 canvas.addEventListener('pointerdown', event => {
   if (!pickBaselineCheck.checked || !paintCheck.checked) return;
+  const record = meshEdgeAt(event);
+  if (!record) return;
+  strokeErase = eraseCheck.checked || isMeshEdgeSelected(record);
   isPainting = true;
   canvas.setPointerCapture(event.pointerId);
-  paintAt(event);
+  applyMeshRecord(record, strokeErase);
 });
 canvas.addEventListener('pointermove', event => {
   if (isPainting) paintAt(event);
@@ -425,16 +438,16 @@ function finishPainting(event) {
 canvas.addEventListener('pointerup', finishPainting);
 canvas.addEventListener('pointercancel', finishPainting);
 canvas.addEventListener('click', event => {
-  setPointer(event);
   if (pickBaselineCheck.checked) {
     if (paintCheck.checked) return;
-    const baseHit = raycaster.intersectObject(baseSolid, false)[0];
-    if (baseHit) {
-      applyMeshEdge(baseHit.faceIndex, baseHit.point, eraseCheck.checked);
+    const record = meshEdgeAt(event);
+    if (record) {
+      applyMeshRecord(record, eraseCheck.checked || isMeshEdgeSelected(record));
       saveState();
     }
     return;
   }
+  setPointer(event);
   const hit = raycaster.intersectObjects(lineObjects, false)[0];
   if (hit) selectChain(hit.object.userData.chain);
 });
