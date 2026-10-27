@@ -203,3 +203,11 @@ The persisted input is
 keep the 48 edges pinned as positives, rank unlabelled matches, and retain a
 review-only class rather than treating every unlabelled edge as clean or every
 mixed-source triangle as defective.
+
+The conservative full-mesh expansion found 208 new high-confidence derived
+phase-boundary edges, 317 high-confidence connected continuations, and 187
+probable review-only edges. It explicitly rejected 22,431 other edges carrying
+some repeated mixed-source signature because source mixing without the learned
+geometry and topology is not a defect classifier. The causal consolidation and
+static production-path trace are recorded in
+`V2C_EDGE_SIGNATURE_SOURCE_TRACE.md`.

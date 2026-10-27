@@ -1,0 +1,373 @@
+<div id="manual-edge-signature-3d">
+  <h2>人工边图鉴 · 全网格同型定位</h2>
+
+  <div class="viz-grid edge-stats" aria-label="定位统计">
+    <div class="card viz-stat">
+      <div class="text-muted">人工正样本</div>
+      <div class="viz-stat-value tabular-nums" data-stat="manual"></div>
+      <div class="text-small text-muted">保持固定，不参与自动否决</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">高置信同型新边</div>
+      <div class="viz-stat-value tabular-nums" data-stat="high"></div>
+      <div class="text-small text-muted" data-stat="high-detail"></div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">待复核候选</div>
+      <div class="viz-stat-value tabular-nums" data-stat="probable"></div>
+      <div class="text-small text-muted">放宽时间与折角条件</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">已排除的宽泛混层边</div>
+      <div class="viz-stat-value tabular-nums" data-stat="excluded"></div>
+      <div class="text-small text-muted">混层本身不足以判为伤疤</div>
+    </div>
+  </div>
+
+  <div class="viz-controls edge-controls" aria-label="显示图层">
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="0" checked>
+      <span class="edge-swatch edge-manual" aria-hidden="true"></span>
+      <span class="form-check-label">人工正样本</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="1" checked>
+      <span class="edge-swatch edge-phase" aria-hidden="true"></span>
+      <span class="form-check-label">高置信相位边</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="2" checked>
+      <span class="edge-swatch edge-continuation" aria-hidden="true"></span>
+      <span class="form-check-label">高置信链延伸</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="3">
+      <span class="edge-swatch edge-probable" aria-hidden="true"></span>
+      <span class="form-check-label">待复核候选</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-base checked>
+      <span class="form-check-label">房间基线</span>
+    </label>
+    <button class="btn btn-primary" type="button" data-fit-manual>定位人工区域</button>
+    <button class="btn" type="button" data-fit-high>适配高置信</button>
+    <button class="btn" type="button" data-fit-room>适配全房间</button>
+  </div>
+
+  <div class="edge-viewport">
+    <canvas data-canvas role="img" aria-label="人工边正样本与全房间同型候选的可旋转三维模型"></canvas>
+    <div class="edge-help text-small text-muted">拖动旋转 · 滚轮缩放 · 点击彩色边查看来源证据</div>
+  </div>
+
+  <div class="card edge-detail" aria-live="polite">
+    <div class="edge-detail-title" data-detail-title>48 条人工边已固定为正样本</div>
+    <div class="text-small" data-detail-evidence>高置信结果同时要求同源历史、相同 MC 构型家族、相容折角，以及相位边界或连接到相位边界的链结构。</div>
+    <div class="text-small text-muted" data-detail-boundary>反复混层只作为来源证据；没有匹配几何与拓扑的宽泛混层边不会被判成伤疤。</div>
+  </div>
+
+  <div class="edge-legend text-small" aria-label="证据层级">
+    <div><span class="edge-swatch edge-manual" aria-hidden="true"></span><span><strong>人工正样本：</strong>你直接描出的典型边，始终保留。</span></div>
+    <div><span class="edge-swatch edge-phase" aria-hidden="true"></span><span><strong>高置信相位边：</strong>跨相邻 10 cm 派生单元、落在共同采样平面，并复现正样本 MC 与混层时序特征。</span></div>
+    <div><span class="edge-swatch edge-continuation" aria-hidden="true"></span><span><strong>高置信链延伸：</strong>同一来源与构型家族，并在拓扑上连接高置信相位边。</span></div>
+    <div><span class="edge-swatch edge-probable" aria-hidden="true"></span><span><strong>待复核：</strong>同一图鉴家族，但时间翻转或折角条件被放宽，不进入自动修复。</span></div>
+  </div>
+</div>
+
+<style>
+#manual-edge-signature-3d { width: 100%; color: var(--foreground); }
+#manual-edge-signature-3d h2 { margin: 0 0 12px; }
+#manual-edge-signature-3d .edge-stats { margin-bottom: 12px; }
+#manual-edge-signature-3d .edge-controls { margin-bottom: 10px; align-items: center; }
+#manual-edge-signature-3d .form-check { display: inline-flex; align-items: center; gap: 6px; }
+#manual-edge-signature-3d .edge-viewport {
+  position: relative;
+  width: 100%;
+  height: 560px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+#manual-edge-signature-3d canvas { display: block; width: 100%; height: 100%; }
+#manual-edge-signature-3d .edge-help {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  padding: 3px 6px;
+  background: color-mix(in srgb, var(--background) 78%, transparent);
+}
+#manual-edge-signature-3d .edge-detail { margin-top: 10px; }
+#manual-edge-signature-3d .edge-detail-title { font-weight: 500; margin-bottom: 4px; }
+#manual-edge-signature-3d .edge-legend { display: grid; gap: 7px; margin-top: 10px; }
+#manual-edge-signature-3d .edge-legend > div { display: grid; grid-template-columns: 12px 1fr; gap: 7px; align-items: start; }
+#manual-edge-signature-3d .edge-swatch { width: 10px; height: 10px; display: inline-block; }
+#manual-edge-signature-3d .edge-manual { background: var(--viz-series-6); }
+#manual-edge-signature-3d .edge-phase { background: var(--viz-series-1); }
+#manual-edge-signature-3d .edge-continuation { background: var(--viz-series-3); }
+#manual-edge-signature-3d .edge-probable { background: var(--viz-series-4); }
+@media (max-width: 560px) {
+  #manual-edge-signature-3d .edge-viewport { height: 420px; }
+}
+</style>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+
+const root = document.getElementById('manual-edge-signature-3d');
+const payload = __MANUAL_EDGE_SIGNATURE_PAYLOAD__;
+const canvas = root.querySelector('[data-canvas]');
+const viewport = root.querySelector('.edge-viewport');
+const titleNode = root.querySelector('[data-detail-title]');
+const evidenceNode = root.querySelector('[data-detail-evidence]');
+const boundaryNode = root.querySelector('[data-detail-boundary]');
+const categoryChecks = [...root.querySelectorAll('[data-category]')];
+const baseCheck = root.querySelector('[data-base]');
+let selectedEdgeKey = null;
+
+root.querySelector('[data-stat="manual"]').textContent = payload.s.manualPositiveEdges.toLocaleString();
+root.querySelector('[data-stat="high"]').textContent = payload.s.highConfidenceNewEdges.toLocaleString();
+root.querySelector('[data-stat="high-detail"]').textContent = `${payload.s.highConfidencePhaseEdges.toLocaleString()} 条相位边＋${payload.s.highConfidenceContinuationEdges.toLocaleString()} 条链延伸`;
+root.querySelector('[data-stat="probable"]').textContent = payload.s.probableNewEdges.toLocaleString();
+root.querySelector('[data-stat="excluded"]').textContent = payload.s.sourceSignatureExcludedEdges.toLocaleString();
+
+const categoryNames = ['人工正样本', '高置信相位边', '高置信链延伸', '待复核候选'];
+const typeNames = ['10 cm 单元相位边界', '同单元链延伸', '开放边界链段'];
+const materialTokens = ['--viz-series-6', '--viz-series-1', '--viz-series-3', '--viz-series-4'];
+const metadata = new Map(payload.m.map(row => [`${row[0]}:${row[1]}`, row]));
+
+function tokenColor(name) {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  probe.style.position = 'absolute';
+  probe.style.visibility = 'hidden';
+  root.appendChild(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  const colorCanvas = document.createElement('canvas');
+  colorCanvas.width = 1;
+  colorCanvas.height = 1;
+  const context = colorCanvas.getContext('2d');
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const pixel = context.getImageData(0, 0, 1, 1).data;
+  return new THREE.Color(pixel[0] / 255, pixel[1] / 255, pixel[2] / 255);
+}
+
+const positions = new Float32Array(payload.v.length);
+for (let index = 0; index < payload.v.length; index += 1) positions[index] = payload.v[index] / 1000;
+const faces = new Uint32Array(payload.f);
+
+function baseGeometry() {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+  geometry.setIndex(new THREE.BufferAttribute(faces.slice(), 1));
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function edgeCoordinates(edges) {
+  const values = [];
+  for (const [a, b] of edges) {
+    for (const vertex of [a, b]) {
+      values.push(positions[vertex * 3], positions[vertex * 3 + 1], positions[vertex * 3 + 2]);
+    }
+  }
+  return values;
+}
+
+function lineFor(edges, token, width) {
+  const geometry = new LineSegmentsGeometry();
+  geometry.setPositions(edgeCoordinates(edges));
+  const material = new LineMaterial({
+    color: tokenColor(token), linewidth: width,
+    transparent: true, opacity: 0.96, depthTest: true
+  });
+  const line = new LineSegments2(geometry, material);
+  line.computeLineDistances();
+  return line;
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.02, 100);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const roomGeometry = baseGeometry();
+const baseSolid = new THREE.Mesh(roomGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.018,
+  side: THREE.DoubleSide, depthWrite: false
+}));
+const baseWire = new THREE.Mesh(roomGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.10,
+  wireframe: true, depthWrite: false
+}));
+scene.add(baseSolid, baseWire);
+
+const lines = payload.c.map((edges, category) => {
+  const line = lineFor(edges, materialTokens[category], category === 0 ? 5 : 3.5);
+  line.visible = categoryChecks[category].checked;
+  scene.add(line);
+  return line;
+});
+const highlight = lineFor([], '--primary', 7);
+highlight.visible = false;
+scene.add(highlight);
+
+function fitEdges(edges) {
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const edge of edges) {
+    for (const vertex of edge) {
+      point.set(positions[vertex * 3], positions[vertex * 3 + 1], positions[vertex * 3 + 2]);
+      box.expandByPoint(point);
+    }
+  }
+  if (box.isEmpty()) return;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 0.2);
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).add(
+    new THREE.Vector3(1, 0.55, 1).normalize().multiplyScalar(radius * 2.8));
+  camera.near = Math.max(0.01, radius / 100);
+  camera.far = Math.max(20, radius * 20);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function distanceToSegment(point, a, b) {
+  const delta = new THREE.Vector3().subVectors(b, a);
+  const amount = Math.max(0, Math.min(1,
+    new THREE.Vector3().subVectors(point, a).dot(delta) / Math.max(delta.lengthSq(), 1e-12)));
+  return point.distanceTo(new THREE.Vector3().copy(a).addScaledVector(delta, amount));
+}
+
+function showEdge(row) {
+  const [a, b, category, type, ownerCount, configA, configB, switches, jumps, dihedralMilli, lengthMicrometers] = row;
+  selectedEdgeKey = `${a}:${b}`;
+  titleNode.textContent = `边 ${a}-${b} · ${categoryNames[category]}`;
+  const configurations = configB >= 0 ? `${configA}/${configB}` : `${configA}`;
+  evidenceNode.textContent = `${typeNames[type]}；${ownerCount} 个相邻三角形；MC 构型 ${configurations}；时间翻转/层跳最大 ${switches}/${jumps}；折角 ${(dihedralMilli / 1000).toFixed(1)}°；长度 ${(lengthMicrometers / 1000).toFixed(1)} mm。`;
+  boundaryNode.textContent = category === 3
+    ? '这是放宽规则后的待复核边，不进入自动退休或删除。'
+    : '该边同时满足来源、构型和链结构证据；仍需在修复前后用同一回放输入复核。';
+  highlight.geometry.dispose();
+  const geometry = new LineSegmentsGeometry();
+  geometry.setPositions(edgeCoordinates([[a, b]]));
+  highlight.geometry = geometry;
+  highlight.visible = true;
+  saveState();
+}
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+canvas.addEventListener('click', event => {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObject(baseSolid, false)[0];
+  if (!hit) return;
+  let best = null;
+  let bestDistance = 0.055;
+  for (let category = 0; category < payload.c.length; category += 1) {
+    if (!categoryChecks[category].checked) continue;
+    for (const [a, b] of payload.c[category]) {
+      const pointA = new THREE.Vector3(positions[a * 3], positions[a * 3 + 1], positions[a * 3 + 2]);
+      const pointB = new THREE.Vector3(positions[b * 3], positions[b * 3 + 1], positions[b * 3 + 2]);
+      const distance = distanceToSegment(hit.point, pointA, pointB);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = metadata.get(`${a}:${b}`);
+      }
+    }
+  }
+  if (best) showEdge(best);
+});
+
+function saveState() {
+  if (!window.openai?.setWidgetState) return;
+  window.openai.setWidgetState({
+    modelContent: {
+      selectedEdgeKey,
+      enabled: categoryChecks.map(input => input.checked)
+    },
+    privateContent: { baseVisible: baseCheck.checked }
+  }).catch(() => {});
+}
+
+function restoreState(state) {
+  const model = state?.modelContent;
+  const privateState = state?.privateContent;
+  if (Array.isArray(model?.enabled) && model.enabled.length === 4) {
+    categoryChecks.forEach((input, index) => { input.checked = Boolean(model.enabled[index]); });
+  }
+  if (typeof model?.selectedEdgeKey === 'string' && metadata.has(model.selectedEdgeKey)) {
+    selectedEdgeKey = model.selectedEdgeKey;
+  }
+  if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
+  lines.forEach((line, category) => { line.visible = categoryChecks[category].checked; });
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+}
+
+restoreState(window.openai?.widgetState);
+categoryChecks.forEach((input, category) => input.addEventListener('change', () => {
+  lines[category].visible = input.checked;
+  titleNode.textContent = categoryNames[category];
+  evidenceNode.textContent = category === 0
+    ? '人工正样本始终作为图鉴锚点。'
+    : `当前图层包含 ${payload.c[category].length.toLocaleString()} 条边。`;
+  boundaryNode.textContent = category === 3
+    ? '待复核候选不会自动进入修复。'
+    : '颜色表达证据层级，不代表所有混层网格都被判错。';
+  saveState();
+}));
+baseCheck.addEventListener('change', () => {
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+  saveState();
+});
+root.querySelector('[data-fit-manual]').addEventListener('click', () => fitEdges(payload.c[0]));
+root.querySelector('[data-fit-high]').addEventListener('click', () => fitEdges([...payload.c[0], ...payload.c[1], ...payload.c[2]]));
+root.querySelector('[data-fit-room]').addEventListener('click', () => {
+  const box = roomGeometry.boundingBox;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).add(new THREE.Vector3(1, 0.55, 1).normalize().multiplyScalar(sphere.radius * 2.8));
+  controls.update();
+});
+window.addEventListener('openai:set_globals', event => {
+  restoreState(event.detail?.globals?.widgetState);
+  if (selectedEdgeKey && metadata.has(selectedEdgeKey)) showEdge(metadata.get(selectedEdgeKey));
+});
+
+function resize() {
+  const width = Math.max(1, viewport.clientWidth);
+  const height = Math.max(1, viewport.clientHeight);
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  for (const line of [...lines, highlight]) line.material.resolution.set(width, height);
+}
+new ResizeObserver(resize).observe(viewport);
+resize();
+fitEdges(payload.c[0]);
+if (selectedEdgeKey && metadata.has(selectedEdgeKey)) showEdge(metadata.get(selectedEdgeKey));
+
+function animate() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
