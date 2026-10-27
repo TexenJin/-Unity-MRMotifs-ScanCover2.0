@@ -39,13 +39,18 @@
       <input class="form-check-input" type="checkbox" data-adjacent checked>
       <span class="form-check-label">选中链相邻三角形</span>
     </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-pick-baseline checked>
+      <span class="form-check-label">点选任意灰色网格边</span>
+    </label>
     <button class="btn" type="button" data-fit-room>适配全房间</button>
     <button class="btn btn-primary" type="button" data-confirm disabled>确认这是截图中的连线</button>
+    <button class="btn btn-primary" type="button" data-confirm-edge disabled>确认红线种子边</button>
   </div>
 
   <div class="seam-viewport">
     <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格与竖向Chunk接缝三维模型"></canvas>
-    <div class="seam-help text-small text-muted">拖动旋转 · 滚轮缩放 · 点击彩色线选择接缝</div>
+    <div class="seam-help text-small text-muted">拖动旋转 · 滚轮缩放 · 勾选“点选任意灰色网格边”后点击红线附近</div>
   </div>
 
   <div class="card seam-detail" aria-live="polite">
@@ -112,11 +117,16 @@ const viewport = root.querySelector('.seam-viewport');
 const chainSelect = root.querySelector('[data-chain]');
 const baseCheck = root.querySelector('[data-base]');
 const adjacentCheck = root.querySelector('[data-adjacent]');
+const pickBaselineCheck = root.querySelector('[data-pick-baseline]');
 const confirmButton = root.querySelector('[data-confirm]');
+const confirmEdgeButton = root.querySelector('[data-confirm-edge]');
 const titleNode = root.querySelector('[data-detail-title]');
 const evidenceNode = root.querySelector('[data-detail-evidence]');
 const boundaryNode = root.querySelector('[data-detail-boundary]');
 let selectedChain = null;
+let selectedFaceId = null;
+let selectedEdge = null;
+let selectedPointMm = null;
 
 root.querySelector('[data-stat="chains"]').textContent = payload.s.verticalChunkSeamChains.toLocaleString();
 root.querySelector('[data-stat="full"]').textContent = payload.s.fullHeightChains.toLocaleString();
@@ -213,6 +223,10 @@ const selectedFaces = new THREE.Mesh(geometryForFaces([]), new THREE.MeshBasicMa
   polygonOffsetFactor: -5, polygonOffsetUnits: -5
 }));
 scene.add(selectedFaces);
+const selectedMeshEdge = new THREE.LineSegments(geometryForEdges([]), new THREE.LineBasicMaterial({
+  color: tokenColor('--primary')
+}));
+scene.add(selectedMeshEdge);
 
 function fitBounds(minimum, maximum) {
   const box = new THREE.Box3(
@@ -253,6 +267,48 @@ function selectChain(identifier, shouldSave = true) {
   if (shouldSave) saveState();
 }
 
+function distanceToSegment(point, a, b) {
+  const delta = new THREE.Vector3().subVectors(b, a);
+  const denominator = Math.max(delta.lengthSq(), 1e-12);
+  const amount = Math.max(0, Math.min(1,
+    new THREE.Vector3().subVectors(point, a).dot(delta) / denominator));
+  const nearest = new THREE.Vector3().copy(a).addScaledVector(delta, amount);
+  return point.distanceTo(nearest);
+}
+
+function selectMeshEdge(faceId, hitPoint, shouldSave = true) {
+  const vertexIds = [
+    faces[faceId * 3], faces[faceId * 3 + 1], faces[faceId * 3 + 2]
+  ];
+  const points = vertexIds.map(vertex => new THREE.Vector3(
+    positions[vertex * 3], positions[vertex * 3 + 1], positions[vertex * 3 + 2]));
+  const pairs = [[0, 1], [1, 2], [2, 0]];
+  const closest = pairs.reduce((best, pair) => {
+    const distance = distanceToSegment(hitPoint, points[pair[0]], points[pair[1]]);
+    return distance < best.distance ? { pair, distance } : best;
+  }, { pair: pairs[0], distance: Infinity });
+  selectedFaceId = faceId;
+  selectedEdge = [vertexIds[closest.pair[0]], vertexIds[closest.pair[1]]];
+  selectedPointMm = hitPoint.toArray().map(value => Math.round(value * 1000));
+  selectedFaces.geometry.dispose();
+  selectedFaces.geometry = geometryForFaces([faceId]);
+  selectedFaces.visible = true;
+  const edgeCoordinates = [];
+  for (const vertex of selectedEdge) {
+    edgeCoordinates.push(
+      Math.round(positions[vertex * 3] * 1000),
+      Math.round(positions[vertex * 3 + 1] * 1000),
+      Math.round(positions[vertex * 3 + 2] * 1000));
+  }
+  selectedMeshEdge.geometry.dispose();
+  selectedMeshEdge.geometry = geometryForEdges(edgeCoordinates);
+  confirmEdgeButton.disabled = false;
+  titleNode.textContent = `灰色网格种子 · 三角形 ${faceId} · 边 ${selectedEdge[0]}–${selectedEdge[1]}`;
+  evidenceNode.textContent = `点击位置 [${selectedPointMm.join(', ')}] mm；已选取该三角形中距点击位置最近的原始网格边。`;
+  boundaryNode.textContent = '这只是精确空间种子，尚未给它套用Chunk接缝或104面成因；下一步将从该边双向追踪整条锯齿链并回查两侧拓扑。';
+  if (shouldSave) saveState();
+}
+
 for (const chain of payload.q) {
   const option = document.createElement('option');
   option.value = String(chain.id);
@@ -268,6 +324,11 @@ canvas.addEventListener('click', event => {
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  if (pickBaselineCheck.checked) {
+    const baseHit = raycaster.intersectObject(baseSolid, false)[0];
+    if (baseHit) selectMeshEdge(baseHit.faceIndex, baseHit.point);
+    return;
+  }
   const hit = raycaster.intersectObjects(lineObjects, false)[0];
   if (hit) selectChain(hit.object.userData.chain);
 });
@@ -275,10 +336,18 @@ canvas.addEventListener('click', event => {
 function saveState() {
   if (!window.openai?.setWidgetState) return;
   window.openai.setWidgetState({
-    modelContent: { selectedChain },
+    modelContent: {
+      selectedChain,
+      selectedFaceId,
+      selectedEdge,
+      selectedPointMm,
+      cameraPosition: camera.position.toArray().map(value => Number(value.toFixed(4))),
+      cameraTarget: controls.target.toArray().map(value => Number(value.toFixed(4)))
+    },
     privateContent: {
       baseVisible: baseCheck.checked,
-      adjacentVisible: adjacentCheck.checked
+      adjacentVisible: adjacentCheck.checked,
+      pickBaseline: pickBaselineCheck.checked
     }
   }).catch(() => {});
 }
@@ -287,8 +356,12 @@ function restoreState(state) {
   const model = state?.modelContent;
   const privateState = state?.privateContent;
   if (Number.isInteger(model?.selectedChain) && payload.q[model.selectedChain]) selectedChain = model.selectedChain;
+  if (Number.isInteger(model?.selectedFaceId)) selectedFaceId = model.selectedFaceId;
+  if (Array.isArray(model?.selectedEdge) && model.selectedEdge.length === 2) selectedEdge = model.selectedEdge;
+  if (Array.isArray(model?.selectedPointMm) && model.selectedPointMm.length === 3) selectedPointMm = model.selectedPointMm;
   if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
   if (typeof privateState?.adjacentVisible === 'boolean') adjacentCheck.checked = privateState.adjacentVisible;
+  if (typeof privateState?.pickBaseline === 'boolean') pickBaselineCheck.checked = privateState.pickBaseline;
   baseSolid.visible = baseCheck.checked;
   baseWire.visible = baseCheck.checked;
   selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
@@ -318,6 +391,7 @@ adjacentCheck.addEventListener('change', () => {
   selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
   saveState();
 });
+pickBaselineCheck.addEventListener('change', saveState);
 root.querySelector('[data-fit-room]').addEventListener('click', fitRoom);
 confirmButton.addEventListener('click', async () => {
   if (selectedChain == null || !window.openai?.sendFollowUpMessage) return;
@@ -325,6 +399,15 @@ confirmButton.addEventListener('click', async () => {
   await window.openai.sendFollowUpMessage({
     title: '确认截图中的竖向接缝',
     prompt: `我确认3D模型中的接缝链 ${chain.id}（跨度 ${(chain.y / 1000).toFixed(2)} m，${chain.t.toUpperCase()}=${(chain.c / 1000).toFixed(2)} m）就是截图红圈所指的那条不美观连线。请继续追查并给出生产修复。`
+  });
+});
+confirmEdgeButton.addEventListener('click', async () => {
+  if (selectedFaceId == null || !selectedEdge || !window.openai?.sendFollowUpMessage) return;
+  const position = camera.position.toArray().map(value => Number(value.toFixed(4)));
+  const target = controls.target.toArray().map(value => Number(value.toFixed(4)));
+  await window.openai.sendFollowUpMessage({
+    title: '确认红线种子边',
+    prompt: `我确认三角形 ${selectedFaceId} 的边 ${selectedEdge[0]}–${selectedEdge[1]}（点击位置mm ${JSON.stringify(selectedPointMm)}）位于截图红线所指的锯齿状不美观连线上。当前相机位置 ${JSON.stringify(position)}，观察目标 ${JSON.stringify(target)}。请从这条边双向追踪整条链，查明两侧几何、MC构型、Chunk归属和来源历史。`
   });
 });
 window.addEventListener('openai:set_globals', event => {
