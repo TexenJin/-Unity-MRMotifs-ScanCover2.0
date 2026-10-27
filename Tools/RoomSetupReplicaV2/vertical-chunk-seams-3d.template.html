@@ -127,6 +127,7 @@ let selectedChain = null;
 let selectedFaceId = null;
 let selectedEdge = null;
 let selectedPointMm = null;
+let stateHasCamera = false;
 
 root.querySelector('[data-stat="chains"]').textContent = payload.s.verticalChunkSeamChains.toLocaleString();
 root.querySelector('[data-stat="full"]').textContent = payload.s.fullHeightChains.toLocaleString();
@@ -249,9 +250,19 @@ function fitRoom() {
   fitBounds(box.min.toArray().map(value => value * 1000), box.max.toArray().map(value => value * 1000));
 }
 
-function selectChain(identifier, shouldSave = true) {
+function clearSavedMeshEdge() {
+  selectedFaceId = null;
+  selectedEdge = null;
+  selectedPointMm = null;
+  selectedMeshEdge.geometry.dispose();
+  selectedMeshEdge.geometry = geometryForEdges([]);
+  confirmEdgeButton.disabled = true;
+}
+
+function selectChain(identifier, shouldSave = true, shouldFit = true) {
   const chain = payload.q[identifier];
   if (!chain) return;
+  clearSavedMeshEdge();
   selectedChain = identifier;
   chainSelect.value = String(identifier);
   selectedLine.geometry.dispose();
@@ -263,7 +274,7 @@ function selectChain(identifier, shouldSave = true) {
   titleNode.textContent = `接缝链 ${chain.id} · 竖向跨度 ${(chain.y / 1000).toFixed(2)} m`;
   evidenceNode.textContent = `${chain.e.length / 6}条原拓扑未焊接边；相邻${chain.f.length}面；墙面法线主轴 ${chain.a.toUpperCase()}；切向Chunk轴 ${chain.t.toUpperCase()} = ${(chain.c / 1000).toFixed(2)} m；法线一致度 ${(chain.n / 1000).toFixed(3)}。`;
   boundaryNode.textContent = '边的空间坐标已经重合，但原始顶点索引分离；修复应在Chunk共享样本/边界焊接与一致三角化层完成。';
-  fitBounds(chain.b0, chain.b1);
+  if (shouldFit) fitBounds(chain.b0, chain.b1);
   if (shouldSave) saveState();
 }
 
@@ -287,6 +298,11 @@ function selectMeshEdge(faceId, hitPoint, shouldSave = true) {
     const distance = distanceToSegment(hitPoint, points[pair[0]], points[pair[1]]);
     return distance < best.distance ? { pair, distance } : best;
   }, { pair: pairs[0], distance: Infinity });
+  selectedChain = null;
+  chainSelect.value = '';
+  selectedLine.geometry.dispose();
+  selectedLine.geometry = geometryForEdges([]);
+  confirmButton.disabled = true;
   selectedFaceId = faceId;
   selectedEdge = [vertexIds[closest.pair[0]], vertexIds[closest.pair[1]]];
   selectedPointMm = hitPoint.toArray().map(value => Math.round(value * 1000));
@@ -307,6 +323,26 @@ function selectMeshEdge(faceId, hitPoint, shouldSave = true) {
   evidenceNode.textContent = `点击位置 [${selectedPointMm.join(', ')}] mm；已选取该三角形中距点击位置最近的原始网格边。`;
   boundaryNode.textContent = '这只是精确空间种子，尚未给它套用Chunk接缝或104面成因；下一步将从该边双向追踪整条锯齿链并回查两侧拓扑。';
   if (shouldSave) saveState();
+}
+
+function showSavedMeshEdge() {
+  if (selectedFaceId == null || !selectedEdge) return;
+  selectedFaces.geometry.dispose();
+  selectedFaces.geometry = geometryForFaces([selectedFaceId]);
+  selectedFaces.visible = true;
+  const edgeCoordinates = [];
+  for (const vertex of selectedEdge) {
+    edgeCoordinates.push(
+      Math.round(positions[vertex * 3] * 1000),
+      Math.round(positions[vertex * 3 + 1] * 1000),
+      Math.round(positions[vertex * 3 + 2] * 1000));
+  }
+  selectedMeshEdge.geometry.dispose();
+  selectedMeshEdge.geometry = geometryForEdges(edgeCoordinates);
+  confirmEdgeButton.disabled = false;
+  titleNode.textContent = `灰色网格种子 · 三角形 ${selectedFaceId} · 边 ${selectedEdge[0]}–${selectedEdge[1]}`;
+  evidenceNode.textContent = `点击位置 [${(selectedPointMm || []).join(', ')}] mm；点选已保留，恢复状态不会移动相机。`;
+  boundaryNode.textContent = '这只是精确空间种子，尚未给它套用Chunk接缝或104面成因；下一步将从该边双向追踪整条锯齿链并回查两侧拓扑。';
 }
 
 for (const chain of payload.q) {
@@ -355,16 +391,30 @@ function saveState() {
 function restoreState(state) {
   const model = state?.modelContent;
   const privateState = state?.privateContent;
-  if (Number.isInteger(model?.selectedChain) && payload.q[model.selectedChain]) selectedChain = model.selectedChain;
-  if (Number.isInteger(model?.selectedFaceId)) selectedFaceId = model.selectedFaceId;
-  if (Array.isArray(model?.selectedEdge) && model.selectedEdge.length === 2) selectedEdge = model.selectedEdge;
-  if (Array.isArray(model?.selectedPointMm) && model.selectedPointMm.length === 3) selectedPointMm = model.selectedPointMm;
+  selectedChain = Number.isInteger(model?.selectedChain) && payload.q[model.selectedChain]
+    ? model.selectedChain : null;
+  selectedFaceId = Number.isInteger(model?.selectedFaceId)
+    ? model.selectedFaceId : null;
+  selectedEdge = Array.isArray(model?.selectedEdge) && model.selectedEdge.length === 2
+    ? model.selectedEdge : null;
+  selectedPointMm = Array.isArray(model?.selectedPointMm) && model.selectedPointMm.length === 3
+    ? model.selectedPointMm : null;
+  if (selectedFaceId != null && selectedEdge) selectedChain = null;
+  stateHasCamera = (
+    Array.isArray(model?.cameraPosition) && model.cameraPosition.length === 3 &&
+    Array.isArray(model?.cameraTarget) && model.cameraTarget.length === 3);
+  if (stateHasCamera) {
+    camera.position.set(...model.cameraPosition);
+    controls.target.set(...model.cameraTarget);
+    controls.update();
+  }
   if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
   if (typeof privateState?.adjacentVisible === 'boolean') adjacentCheck.checked = privateState.adjacentVisible;
   if (typeof privateState?.pickBaseline === 'boolean') pickBaselineCheck.checked = privateState.pickBaseline;
   baseSolid.visible = baseCheck.checked;
   baseWire.visible = baseCheck.checked;
-  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
+  selectedFaces.visible = selectedFaceId != null ||
+    (adjacentCheck.checked && selectedChain != null);
 }
 
 restoreState(window.openai?.widgetState);
@@ -373,6 +423,7 @@ chainSelect.addEventListener('change', () => {
     selectedChain = null;
     selectedLine.geometry.dispose();
     selectedLine.geometry = geometryForEdges([]);
+    clearSavedMeshEdge();
     selectedFaces.geometry.dispose();
     selectedFaces.geometry = geometryForFaces([]);
     confirmButton.disabled = true;
@@ -388,7 +439,8 @@ baseCheck.addEventListener('change', () => {
   saveState();
 });
 adjacentCheck.addEventListener('change', () => {
-  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
+  selectedFaces.visible = selectedFaceId != null ||
+    (adjacentCheck.checked && selectedChain != null);
   saveState();
 });
 pickBaselineCheck.addEventListener('change', saveState);
@@ -412,7 +464,11 @@ confirmEdgeButton.addEventListener('click', async () => {
 });
 window.addEventListener('openai:set_globals', event => {
   restoreState(event.detail?.globals?.widgetState);
-  if (selectedChain != null) selectChain(selectedChain, false);
+  if (selectedFaceId != null && selectedEdge) {
+    showSavedMeshEdge();
+  } else if (selectedChain != null) {
+    selectChain(selectedChain, false, false);
+  }
 });
 
 function resize() {
@@ -424,7 +480,13 @@ function resize() {
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
-if (selectedChain != null) selectChain(selectedChain, false); else fitRoom();
+if (selectedFaceId != null && selectedEdge) {
+  showSavedMeshEdge();
+} else if (selectedChain != null) {
+  selectChain(selectedChain, false, !stateHasCamera);
+} else if (!stateHasCamera) {
+  fitRoom();
+}
 
 function animate() {
   controls.update();
