@@ -8,14 +8,19 @@
       <div class="text-small text-muted">104 面全部被同一静态特征召回</div>
     </div>
     <div class="card viz-stat">
-      <div class="text-muted">同链未涂延伸</div>
-      <div class="viz-stat-value tabular-nums" data-stat="continuation"></div>
-      <div class="text-small text-muted">与确认面共享边并处于同一特征连通分量</div>
+      <div class="text-muted">高置信同类新发现</div>
+      <div class="viz-stat-value tabular-nums" data-stat="high"></div>
+      <div class="text-small text-muted" data-stat="high-detail"></div>
     </div>
     <div class="card viz-stat">
-      <div class="text-muted">全场同特征待复核</div>
-      <div class="viz-stat-value tabular-nums" data-stat="candidate"></div>
-      <div class="text-small text-muted">不能据此自动删除</div>
+      <div class="text-muted">可能同类新发现</div>
+      <div class="viz-stat-value tabular-nums" data-stat="probable"></div>
+      <div class="text-small text-muted">进入逐链视觉复核</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">宽召回静态命中</div>
+      <div class="viz-stat-value tabular-nums" data-stat="broad"></div>
+      <div class="text-small text-muted">相似度不足，不能直接判错</div>
     </div>
   </div>
 
@@ -28,15 +33,20 @@
     <label class="form-check">
       <input class="form-check-input" type="checkbox" data-category="1" checked>
       <span class="phase-swatch phase-continuation" aria-hidden="true"></span>
-      <span class="form-check-label">同链未涂延伸</span>
+      <span class="form-check-label">高置信同类新发现</span>
     </label>
     <label class="form-check">
-      <input class="form-check-input" type="checkbox" data-category="2">
+      <input class="form-check-input" type="checkbox" data-category="2" checked>
       <span class="phase-swatch phase-candidate" aria-hidden="true"></span>
-      <span class="form-check-label">全场同特征候选</span>
+      <span class="form-check-label">可能同类新发现</span>
     </label>
     <label class="form-check">
-      <input class="form-check-input" type="checkbox" data-category="3" checked>
+      <input class="form-check-input" type="checkbox" data-category="3">
+      <span class="phase-swatch phase-broad" aria-hidden="true"></span>
+      <span class="form-check-label">宽召回静态命中</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="4">
       <span class="phase-swatch phase-other" aria-hidden="true"></span>
       <span class="form-check-label">其余人工确认缺陷</span>
     </label>
@@ -45,6 +55,7 @@
       <span class="form-check-label">房间基线</span>
     </label>
     <button class="btn btn-primary" type="button" data-fit-confirmed>定位 104 面及延伸</button>
+    <button class="btn" type="button" data-fit-high>适配高置信</button>
     <button class="btn" type="button" data-fit-room>适配全房间</button>
   </div>
 
@@ -54,15 +65,16 @@
   </div>
 
   <div class="card phase-detail" aria-live="polite">
-    <div class="phase-detail-title" data-detail-title>104 面人工确认＋72 面同链延伸</div>
-    <div class="text-small" data-detail-evidence>默认先显示已经指认的 104 面，以及和它们共享边、且满足同一来源特征的未涂三角形。</div>
-    <div class="text-small text-muted" data-detail-boundary>全场同特征候选是复核清单，不是“全部都错”的删除掩码；真实表面恰好落在 10 cm 格点附近时也可能命中。</div>
+    <div class="phase-detail-title" data-detail-title>104 面特征图鉴：人工确认＋高置信与可能同类</div>
+    <div class="text-small" data-detail-evidence>默认显示104面、344面高置信新发现和294面可能同类；分类同时利用局部SDF、MC拓扑、法线、面积、时间证据和连续结构。</div>
+    <div class="text-small text-muted" data-detail-boundary>1,050面宽召回命中默认隐藏，因为它们只满足基础静态条件，不能直接视为问题网格。</div>
   </div>
 
   <div class="phase-legend text-small" aria-label="识别层级">
     <div><span class="phase-swatch phase-confirmed" aria-hidden="true"></span><span><strong>人工确认：</strong>手柄涂出的 104 面；无反复混层源体素、MC 构型不是对应轴的平面构型、质心距 10 cm 格平面不超过 5 mm。</span></div>
-    <div><span class="phase-swatch phase-continuation" aria-hidden="true"></span><span><strong>同链延伸：</strong>满足同一规则，并与 104 面处于共享边连通分量；这是当前最强的未涂漏标候选。</span></div>
-    <div><span class="phase-swatch phase-candidate" aria-hidden="true"></span><span><strong>独立候选：</strong>全房间满足同一静态签名，但没有连接到人工确认链；需要视觉或运行时证据二次确认。</span></div>
+    <div><span class="phase-swatch phase-continuation" aria-hidden="true"></span><span><strong>高置信同类：</strong>包括72面共享边延伸，以及272面在房间其他位置匹配104面特征图鉴的独立三角形。</span></div>
+    <div><span class="phase-swatch phase-candidate" aria-hidden="true"></span><span><strong>可能同类：</strong>另294面处于人工正样本留一距离的90%至95%区间，适合下一轮逐链复核。</span></div>
+    <div><span class="phase-swatch phase-broad" aria-hidden="true"></span><span><strong>宽召回命中：</strong>其余1,050面只满足基础静态签名，特征图鉴相似度不足，不得自动删除。</span></div>
     <div><span class="phase-swatch phase-other" aria-hidden="true"></span><span><strong>其余确认缺陷：</strong>已人工点选但属于反复混层、弱时间层切换或边界未决，不属于这 104 面的成因。</span></div>
   </div>
 </div>
@@ -96,6 +108,7 @@
 #grid-phase-candidates-3d .phase-confirmed { background: var(--viz-series-6); }
 #grid-phase-candidates-3d .phase-continuation { background: var(--viz-series-3); }
 #grid-phase-candidates-3d .phase-candidate { background: var(--viz-series-4); }
+#grid-phase-candidates-3d .phase-broad { background: var(--muted-foreground); }
 #grid-phase-candidates-3d .phase-other { background: var(--viz-series-2); }
 @media (max-width: 560px) {
   #grid-phase-candidates-3d .phase-viewport { height: 420px; }
@@ -121,19 +134,23 @@ const baseCheck = root.querySelector('[data-base]');
 let selectedFaceId = null;
 
 root.querySelector('[data-stat="confirmed"]').textContent = payload.s.humanConfirmedGridPhaseTriangles.toLocaleString();
-root.querySelector('[data-stat="continuation"]').textContent = payload.s.connectedUnpaintedContinuationTriangles.toLocaleString();
-root.querySelector('[data-stat="candidate"]').textContent = payload.s.independentSameSignatureCandidateTriangles.toLocaleString();
+root.querySelector('[data-stat="high"]').textContent = payload.s.highConfidenceSameProblemTriangles.toLocaleString();
+root.querySelector('[data-stat="high-detail"]').textContent = `${payload.s.connectedUnpaintedContinuationTriangles.toLocaleString()} 面同链延伸＋${payload.s.highConfidenceIndependentTriangles.toLocaleString()} 面独立匹配`;
+root.querySelector('[data-stat="probable"]').textContent = payload.s.probableSameProblemTriangles.toLocaleString();
+root.querySelector('[data-stat="broad"]').textContent = payload.s.broadSignatureOnlyTriangles.toLocaleString();
 
 const categoryNames = [
   '人工确认零平面伤疤',
-  '同链未涂延伸',
-  '独立同特征候选',
+  '高置信同类新发现',
+  '可能同类新发现',
+  '宽召回静态命中',
   '其余人工确认缺陷'
 ];
 const categoryEvidence = [
   '这 104 面由手柄直接指认，并全部满足零平面相位签名。',
-  '未被手柄涂到，但和确认面共享边、处在同一个签名连通分量。',
-  '满足相同局部静态签名，但没有连接到已确认链，当前只能列为待复核候选。',
+  '未被手柄涂到；它们要么连接到确认链，要么在局部SDF、拓扑、法线、面积、时序和连续结构上高度接近104面。',
+  '特征图鉴距离处于正样本留一分布的90%至95%区间，具有同类可能但仍需逐链复核。',
+  '只满足基础零平面静态签名；与104面完整特征图鉴不够接近。',
   '人工已经确认可见异常，但来源被归入反复混层、弱时间层切换或边界未决。'
 ];
 const otherCauseNames = ['', '反复混层源体素', '弱时间层切换', '涂画边界或未决'];
@@ -199,13 +216,13 @@ const baseWire = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
 }));
 scene.add(baseSolid, baseWire);
 
-const materialTokens = ['--viz-series-6', '--viz-series-3', '--viz-series-4', '--viz-series-2'];
+const materialTokens = ['--viz-series-6', '--viz-series-3', '--viz-series-4', '--muted-foreground', '--viz-series-2'];
 const meshes = [];
-for (let code = 0; code < 4; code += 1) {
+for (let code = 0; code < 5; code += 1) {
   const mesh = new THREE.Mesh(geometryFor(payload.c[code]), new THREE.MeshBasicMaterial({
     color: tokenColor(materialTokens[code]), transparent: true,
-    opacity: code === 2 ? 0.52 : 0.94, side: THREE.DoubleSide,
-    depthWrite: code !== 2, polygonOffset: true,
+    opacity: code === 3 ? 0.4 : 0.94, side: THREE.DoubleSide,
+    depthWrite: code !== 3, polygonOffset: true,
     polygonOffsetFactor: -2 - code, polygonOffsetUnits: -2 - code
   }));
   mesh.userData.category = code;
@@ -247,15 +264,17 @@ function showTriangle(faceId) {
   const row = metadata.get(faceId);
   if (!row) return;
   selectedFaceId = faceId;
-  const [triangle, category, component, axis, planeMicrometers, configuration, switches, jumps, areaMicrometers, otherCause] = row;
+  const [triangle, category, component, axis, planeMicrometers, configuration, switches, jumps, areaMicrometers, otherCause, atlasMilli, connected] = row;
   titleNode.textContent = `三角形 ${triangle} · ${categoryNames[category]}`;
-  if (category === 3) {
+  if (category === 4) {
     evidenceNode.textContent = `人工分类：${otherCauseNames[otherCause] || '其他'}；它不是 104 面零平面相位类。`;
   } else {
-    evidenceNode.textContent = `签名分量 ${component}；主法线轴 ${'XYZ'[axis]}；距最近 10 cm 格平面 ${(planeMicrometers / 1000).toFixed(2)} mm；MC 构型 ${configuration}；时间翻转/层跳最大 ${switches}/${jumps}；面积 ${(areaMicrometers / 100).toFixed(2)} cm²。`;
+    const atlasText = atlasMilli >= 0 ? `；图鉴距离 ${(atlasMilli / 1000).toFixed(3)}` : '';
+    const connectedText = connected ? '；连接人工确认链' : '';
+    evidenceNode.textContent = `签名分量 ${component}；主法线轴 ${'XYZ'[axis]}；距最近 10 cm 格平面 ${(planeMicrometers / 1000).toFixed(2)} mm；MC 构型 ${configuration}；时间翻转/层跳最大 ${switches}/${jumps}；面积 ${(areaMicrometers / 100).toFixed(2)} cm²${atlasText}${connectedText}。`;
   }
-  boundaryNode.textContent = category === 2
-    ? '这是同特征候选，不是自动删除结论；需要对照画面或时序深度继续确认。'
+  boundaryNode.textContent = category === 3
+    ? '这里只满足宽召回规则，不是自动删除结论；需要对照画面或时序深度继续确认。'
     : categoryEvidence[category];
   highlight.geometry.dispose();
   highlight.geometry = geometryFor([faceId]);
@@ -289,7 +308,7 @@ function saveState() {
 function restoreState(state) {
   const model = state?.modelContent;
   const privateState = state?.privateContent;
-  if (Array.isArray(model?.enabled) && model.enabled.length === 4) {
+  if (Array.isArray(model?.enabled) && model.enabled.length === 5) {
     categoryChecks.forEach((input, index) => { input.checked = Boolean(model.enabled[index]); });
   }
   if (Number.isInteger(model?.selectedFaceId) && metadata.has(model.selectedFaceId)) {
@@ -306,8 +325,8 @@ categoryChecks.forEach((input, code) => input.addEventListener('change', () => {
   meshes[code].visible = input.checked;
   titleNode.textContent = categoryNames[code];
   evidenceNode.textContent = categoryEvidence[code];
-  boundaryNode.textContent = code === 2
-    ? '独立候选仍需二次确认；当前规则不授权自动删除。'
+  boundaryNode.textContent = code === 3
+    ? '宽召回命中仍需二次确认；当前规则不授权自动删除。'
     : '颜色表示证据层级，不表示全场候选已经全部确认为错误。';
   saveState();
 }));
@@ -317,6 +336,9 @@ baseCheck.addEventListener('change', () => {
   saveState();
 });
 root.querySelector('[data-fit-confirmed]').addEventListener('click', () => {
+  fitFaces([...payload.c[0], ...payload.p.connectedContinuation]);
+});
+root.querySelector('[data-fit-high]').addEventListener('click', () => {
   fitFaces([...payload.c[0], ...payload.c[1]]);
 });
 root.querySelector('[data-fit-room]').addEventListener('click', () => {
@@ -336,7 +358,7 @@ function resize() {
 }
 new ResizeObserver(resize).observe(viewport);
 resize();
-fitFaces([...payload.c[0], ...payload.c[1]]);
+fitFaces([...payload.c[0], ...payload.p.connectedContinuation]);
 if (selectedFaceId != null) showTriangle(selectedFaceId);
 
 function animate() {

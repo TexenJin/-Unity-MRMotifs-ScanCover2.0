@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Locate the frozen replay's 10 cm zero-plane phase signature.
 
-The detector deliberately separates three evidence levels:
+The detector deliberately separates evidence levels:
 
 * controller-confirmed faces in the 104-face class;
 * unpainted faces in the same edge-connected signature components;
-* the same local signature elsewhere in the mesh.
+* high/probable nearest-neighbour matches to the 104-face feature atlas;
+* broad static-signature hits that remain review-only.
 
 The third set is a review set, not an automatic deletion mask.  A real planar
 surface can lie close to the world-anchored 10 cm lattice and produce the same
@@ -15,6 +16,7 @@ static signature without being visually defective.
 import argparse
 import hashlib
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -37,6 +39,10 @@ CAUSE_CODES = {
     "WeakTemporalLayerSwitch": 2,
     "PaintBoundaryOrUnresolved": 3,
 }
+CORNER_OFFSETS = np.asarray([
+    [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+    [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+], dtype=np.int64)
 
 
 def sha256(path):
@@ -80,6 +86,78 @@ def connected_components(mask, adjacency):
             component_id[triangle] = identifier
         components.append(sorted(component))
     return component_id, components
+
+
+def atlas_features(records, centroids, normals, areas, axes,
+                   plane_distances, signature, adjacency, component_ids,
+                   components):
+    """Build rotation-independent local features learned from the 104 faces."""
+    maximum_component = max((len(value) for value in components), default=1)
+    component_scale = math.log1p(maximum_component)
+    features = np.zeros((len(records), 12), dtype=np.float64)
+    for triangle, record in enumerate(records):
+        axis = int(axes[triangle])
+        cell = np.asarray(record["cell"], dtype=np.int64)
+        nearest_plane = int(round(
+            float(centroids[triangle, axis]) / DERIVED_VOXEL_METERS))
+        plane_offset = nearest_plane - int(cell[axis])
+        if plane_offset in (0, 1):
+            layer = np.flatnonzero(
+                CORNER_OFFSETS[:, axis] == plane_offset)
+        else:
+            layer = np.arange(8)
+        distances = np.asarray(
+            record["finalCell"]["distancesMeters"], dtype=np.float64)
+        layer_absolute = np.abs(distances[layer])
+        evidence = record["cornerEvidence"]
+        candidate_neighbours = sum(
+            1 for neighbour in adjacency[triangle]
+            if signature[neighbour])
+        component = int(component_ids[triangle])
+        component_size = (
+            len(components[component]) if component >= 0 else 0)
+        features[triangle] = [
+            plane_distances[triangle] / ZERO_PLANE_BAND_METERS,
+            1.0 - float(np.max(np.abs(normals[triangle]))),
+            math.log10(max(float(areas[triangle]), 1e-9)),
+            float(evidence["temporalSwitchMaximum"]) / 4.0,
+            float(evidence["layerJumpMaximum"]) / 11.0,
+            float(record["finalCell"]["crossingEdges"]) / 12.0,
+            float(record["finalCell"]["negativeCorners"]) / 8.0,
+            float(np.median(layer_absolute)) / 0.02,
+            float(np.min(layer_absolute)) / 0.02,
+            float(np.std(distances[layer])) / 0.02,
+            float(candidate_neighbours) / 3.0,
+            math.log1p(component_size) / component_scale,
+        ]
+    return features
+
+
+def atlas_scores(features, positives, candidates):
+    positive_features = features[positives]
+    median = np.median(positive_features, axis=0)
+    lower, upper = np.quantile(positive_features, [0.25, 0.75], axis=0)
+    scale = np.maximum(
+        upper - lower, np.std(positive_features, axis=0) * 0.5)
+    # Each input was normalized to a comparable physical range above.  This
+    # floor prevents a nearly constant positive feature from dominating.
+    scale = np.maximum(scale, 0.05)
+    normalized = (features - median) / scale
+    positive_normalized = normalized[positives]
+    pairwise = np.sqrt(np.mean(
+        (positive_normalized[:, None, :] -
+         positive_normalized[None, :, :]) ** 2, axis=2))
+    np.fill_diagonal(pairwise, np.inf)
+    leave_one_out = np.min(pairwise, axis=1)
+    candidate_scores = np.sqrt(np.min(np.mean(
+        (normalized[candidates, None, :] -
+         positive_normalized[None, :, :]) ** 2, axis=2), axis=1))
+    return (
+        candidate_scores,
+        float(np.quantile(leave_one_out, 0.90)),
+        float(np.quantile(leave_one_out, 0.95)),
+        leave_one_out,
+    )
 
 
 def build(mesh_path, audit_path, human_path):
@@ -140,14 +218,38 @@ def build(mesh_path, audit_path, human_path):
         for component in touched_components
         for triangle in components[component]
     } - confirmed
-    independent_candidates = set(np.flatnonzero(signature).tolist()) - (
+    all_candidates = np.flatnonzero(signature).astype(np.int64)
+    independent_candidates = set(all_candidates.tolist()) - (
         confirmed | connected_continuations)
     other_human = set(human_causes) - confirmed
 
+    confirmed_array = np.asarray(sorted(confirmed), dtype=np.int64)
+    features = atlas_features(
+        records, centroids, normals, areas, axes, plane_distances,
+        signature, adjacency, component_ids, components)
+    candidate_scores, high_threshold, probable_threshold, leave_one_out = (
+        atlas_scores(features, confirmed_array, all_candidates))
+    score_by_triangle = {
+        int(triangle): float(score)
+        for triangle, score in zip(all_candidates, candidate_scores)
+    }
+    high_confidence = connected_continuations | {
+        triangle for triangle in independent_candidates
+        if score_by_triangle[triangle] <= high_threshold
+    }
+    probable_matches = {
+        triangle for triangle in independent_candidates
+        if (high_threshold < score_by_triangle[triangle] <=
+            probable_threshold)
+    }
+    broad_signature_only = independent_candidates - (
+        high_confidence | probable_matches)
+
     categories = [
         sorted(confirmed),
-        sorted(connected_continuations),
-        sorted(independent_candidates),
+        sorted(high_confidence),
+        sorted(probable_matches),
+        sorted(broad_signature_only),
         sorted(other_human),
     ]
     category_by_triangle = {}
@@ -169,6 +271,8 @@ def build(mesh_path, audit_path, human_path):
             int(evidence["layerJumpMaximum"]),
             int(round(areas[triangle] * 1_000_000.0)),
             int(CAUSE_CODES.get(human_causes.get(triangle, ""), 0)),
+            int(round(score_by_triangle.get(triangle, -1.0) * 1000.0)),
+            int(triangle in connected_continuations),
         ])
 
     component_receipts = []
@@ -190,8 +294,12 @@ def build(mesh_path, audit_path, human_path):
         "humanConfirmedGridPhaseTriangles": len(confirmed),
         "connectedUnpaintedContinuationTriangles": len(
             connected_continuations),
-        "independentSameSignatureCandidateTriangles": len(
-            independent_candidates),
+        "highConfidenceSameProblemTriangles": len(high_confidence),
+        "highConfidenceIndependentTriangles": len(
+            high_confidence - connected_continuations),
+        "probableSameProblemTriangles": len(probable_matches),
+        "broadSignatureOnlyTriangles": len(broad_signature_only),
+        "independentSameSignatureCandidateTriangles": len(independent_candidates),
         "sameSignatureCandidateTriangles": int(np.count_nonzero(signature)),
         "sameSignatureComponents": len(components),
         "componentsTouchedByHumanConfirmation": len(touched_components),
@@ -199,6 +307,10 @@ def build(mesh_path, audit_path, human_path):
         "humanGridPhaseRecall": (
             float(sum(signature[triangle] for triangle in confirmed) /
                   len(confirmed)) if confirmed else 0.0),
+        "atlasLeaveOneOutHighRecall": float(np.mean(
+            leave_one_out <= high_threshold)),
+        "atlasLeaveOneOutProbableRecall": float(np.mean(
+            leave_one_out <= probable_threshold)),
     }
     receipt = {
         "kind": "RoomSetupReplicaV2GridPhaseCandidateReceipt",
@@ -217,18 +329,43 @@ def build(mesh_path, audit_path, human_path):
             "derivedVoxelMeters": DERIVED_VOXEL_METERS,
             "zeroPlaneBandMeters": ZERO_PLANE_BAND_METERS,
         },
+        "atlas": {
+            "positiveExamples": len(confirmed),
+            "features": [
+                "normalizedDistanceTo10cmPlane",
+                "dominantNormalAxisDeviation",
+                "logTriangleArea",
+                "temporalSwitchMaximum",
+                "layerJumpMaximum",
+                "crossingEdgeCount",
+                "negativeCornerCount",
+                "nearGridLayerAbsoluteSdfMedian",
+                "nearGridLayerAbsoluteSdfMinimum",
+                "nearGridLayerSdfStandardDeviation",
+                "sameSignatureEdgeNeighbourCount",
+                "sameSignatureComponentSize",
+            ],
+            "distance": "RobustScaledNearestPositiveRms",
+            "highThreshold": high_threshold,
+            "probableThreshold": probable_threshold,
+            "highThresholdSource": "PositiveLeaveOneOut90thPercentile",
+            "probableThresholdSource": "PositiveLeaveOneOut95thPercentile",
+        },
         "interpretationBoundary": (
-            "The 104 painted faces are exact confirmed positives. Faces in "
-            "their edge-connected signature components are high-priority "
-            "continuations. Independent same-signature faces are review "
-            "candidates, not an automatic deletion mask; unlabelled mesh is "
-            "not assumed clean or defective."),
+            "The 104 painted faces are exact confirmed positives. The high "
+            "class combines their edge-connected continuations with "
+            "independent faces inside the positive atlas 90th-percentile "
+            "leave-one-out distance. Probable matches extend to the 95th "
+            "percentile. Broad static-signature hits are review-only, not an "
+            "automatic deletion mask; unlabelled mesh is not assumed clean "
+            "or defective."),
         "summary": summary,
         "categories": {
             "humanConfirmedGridPhase": categories[0],
-            "connectedUnpaintedContinuation": categories[1],
-            "independentSameSignatureCandidate": categories[2],
-            "otherHumanConfirmed": categories[3],
+            "highConfidenceSameProblem": categories[1],
+            "probableSameProblem": categories[2],
+            "broadSignatureOnly": categories[3],
+            "otherHumanConfirmed": categories[4],
         },
         "metadataRows": metadata,
         "components": component_receipts,
@@ -240,6 +377,9 @@ def build(mesh_path, audit_path, human_path):
         "c": categories,
         "m": metadata,
         "s": summary,
+        "p": {
+            "connectedContinuation": sorted(connected_continuations),
+        },
     }
     return receipt, payload
 

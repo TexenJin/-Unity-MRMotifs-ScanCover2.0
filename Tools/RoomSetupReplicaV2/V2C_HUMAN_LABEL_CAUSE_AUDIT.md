@@ -121,16 +121,25 @@ split by evidence strength:
 
 | Evidence level | Triangles | Interpretation |
 | --- | ---: | --- |
-| Human-confirmed zero-plane class | 104 | Exact controller-painted positives; rule recall is 104/104 |
-| Unpainted continuation in the same shared-edge components | 72 | Strongest missed continuations of the painted structures |
-| Independent same-signature candidates | 1,616 | Review set elsewhere in the room; not automatically defective |
+| Human-confirmed zero-plane class | 104 | Exact controller-painted positives; base rule recall is 104/104 |
+| High-confidence same-problem discoveries | 344 | All 72 shared-edge continuations plus 272 independent atlas matches |
+| Probable same-problem discoveries | 294 | Independent atlas matches between the positive leave-one-out 90th and 95th percentile distances |
+| Broad static-signature hits | 1,050 | Base-rule matches with insufficient atlas similarity; review-only |
 
-The 1,792 same-signature triangles form 571 shared-edge components. Sixteen
-components contain at least one of the 104 confirmed faces. The remaining
-components are not counted as confirmed defects because a legitimate physical
-plane may also lie within 5 mm of the world-anchored 10 cm lattice and use a
-non-axis-planar Marching Cubes case. This is why the full-mesh result is a
-ranked localization receipt rather than a deletion mask.
+The feature atlas is rotation-independent and includes distance to the 10 cm
+plane, dominant-normal deviation, triangle area, MC crossing/negative-corner
+structure, near-grid-layer SDF median/minimum/spread, temporal switches, layer
+jumps, same-signature neighbours, and component size. Its high threshold is
+the 90th percentile of positive leave-one-out nearest-neighbour distance; the
+probable threshold is the 95th percentile. Leave-one-out recall is 93/104 and
+98/104 respectively. Manually confirmed faces remain pinned as positives.
+
+The 1,792 base-signature triangles form 571 shared-edge components. Sixteen
+components contain at least one of the 104 confirmed faces. A legitimate
+physical plane can still lie within 5 mm of the world-anchored 10 cm lattice
+and use a non-axis-planar Marching Cubes case, so the remaining 1,050 broad
+hits are not counted as defects. This is why the full-mesh result is a ranked
+localization receipt rather than a deletion mask.
 
 The visualization also keeps the other 546 human-confirmed faces visible as a
 separate class. Those faces belong to repeated mixed-source, weak temporal
