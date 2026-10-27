@@ -183,3 +183,23 @@ working taxonomy is consequently:
 They are two manifestations of the same source/fusion instability, not one
 identical geometric rule. A repair may share source-history stabilization but
 must retain separate geometry acceptance metrics for the two classes.
+
+## Aggregate of all current human selections
+
+The original 650 painted faces, the 83 class-A edge owners, and the 159 class-B
+edge owners are mutually disjoint, for 892 unique human-selected triangles in
+total. Applying the same mutually exclusive classification gives:
+
+| Strict class | Triangles | Share |
+| --- | ---: | ---: |
+| Repeated mixed source voxel | 755 | 84.64% |
+| Derived-grid zero-plane phase ambiguity | 109 | 12.22% |
+| Weak temporal/layer switching | 20 | 2.24% |
+| Paint boundary or unresolved | 8 | 0.90% |
+
+Therefore `884/892` (`99.10%`) belong to the broader sign/layer-instability plus
+derived-extraction family, but only `755/892` (`84.64%`) are literal repeated
+mixed-layer/source cases. The 109 zero-plane cases may represent one physical
+surface whose near-zero SDF sign alternates across adjacent derived cells; they
+must not be mislabeled as two distinct depth layers. The last eight remain
+outside automatic repair acceptance.
