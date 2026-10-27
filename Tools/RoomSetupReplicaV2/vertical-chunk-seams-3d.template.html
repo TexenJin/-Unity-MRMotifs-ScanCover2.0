@@ -1,0 +1,352 @@
+<div id="vertical-chunk-seams-3d">
+  <h2>竖向 Chunk 接缝定位</h2>
+
+  <div class="viz-grid seam-stats" aria-label="竖向接缝检测结果">
+    <div class="card viz-stat">
+      <div class="text-muted">长直接缝链</div>
+      <div class="viz-stat-value tabular-nums" data-stat="chains"></div>
+      <div class="text-small text-muted">竖向跨度至少 0.6 m</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">近全高接缝</div>
+      <div class="viz-stat-value tabular-nums" data-stat="full"></div>
+      <div class="text-small text-muted">竖向跨度至少 2.4 m</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">未焊接边</div>
+      <div class="viz-stat-value tabular-nums" data-stat="edges"></div>
+      <div class="text-small text-muted">坐标重合但原拓扑分离</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">相邻三角形</div>
+      <div class="viz-stat-value tabular-nums" data-stat="faces"></div>
+      <div class="text-small text-muted">只用于定位，不是删除面</div>
+    </div>
+  </div>
+
+  <div class="viz-controls seam-controls" aria-label="接缝筛选">
+    <label class="form-label">
+      接缝链
+      <select class="form-select" data-chain aria-label="选择接缝链">
+        <option value="">全部18条</option>
+      </select>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-base checked>
+      <span class="form-check-label">房间基线</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-adjacent checked>
+      <span class="form-check-label">选中链相邻三角形</span>
+    </label>
+    <button class="btn" type="button" data-fit-room>适配全房间</button>
+    <button class="btn btn-primary" type="button" data-confirm disabled>确认这是截图中的连线</button>
+  </div>
+
+  <div class="seam-viewport">
+    <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格与竖向Chunk接缝三维模型"></canvas>
+    <div class="seam-help text-small text-muted">拖动旋转 · 滚轮缩放 · 点击彩色线选择接缝</div>
+  </div>
+
+  <div class="card seam-detail" aria-live="polite">
+    <div class="seam-detail-title" data-detail-title>18条高置信竖向 Chunk 接缝</div>
+    <div class="text-small" data-detail-evidence>这些边在原网格中不共享顶点；按0.1 mm坐标焊接后才成为成对边，并且全部落在切向0.8 m Chunk平面上。</div>
+    <div class="text-small text-muted" data-detail-boundary>它们与104面零平面相位伤疤不同：这里是Chunk间拓扑未焊接造成的长直连线，不应通过SDF阈值或全局平滑处理。</div>
+  </div>
+
+  <div class="seam-legend text-small" aria-label="接缝长度图例">
+    <div><span class="seam-swatch seam-full" aria-hidden="true"></span><span><strong>近全高：</strong>跨度≥2.4 m，与截图红圈中的外观最接近。</span></div>
+    <div><span class="seam-swatch seam-medium" aria-hidden="true"></span><span><strong>长接缝：</strong>跨度1.2–2.4 m。</span></div>
+    <div><span class="seam-swatch seam-short" aria-hidden="true"></span><span><strong>短接缝：</strong>跨度0.6–1.2 m，仍跨越多个10 cm单元。</span></div>
+  </div>
+</div>
+
+<style>
+#vertical-chunk-seams-3d { width: 100%; color: var(--foreground); }
+#vertical-chunk-seams-3d h2 { margin: 0 0 12px; }
+#vertical-chunk-seams-3d .seam-stats { margin-bottom: 12px; }
+#vertical-chunk-seams-3d .seam-controls { margin-bottom: 10px; align-items: end; }
+#vertical-chunk-seams-3d .form-label { min-width: 190px; margin: 0; }
+#vertical-chunk-seams-3d .form-label .form-select { margin-top: 4px; }
+#vertical-chunk-seams-3d .form-check { display: inline-flex; align-items: center; gap: 6px; }
+#vertical-chunk-seams-3d .seam-viewport {
+  position: relative;
+  width: 100%;
+  height: 560px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+#vertical-chunk-seams-3d canvas { display: block; width: 100%; height: 100%; }
+#vertical-chunk-seams-3d .seam-help {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  padding: 3px 6px;
+  background: color-mix(in srgb, var(--background) 78%, transparent);
+}
+#vertical-chunk-seams-3d .seam-detail { margin-top: 10px; }
+#vertical-chunk-seams-3d .seam-detail-title { font-weight: 500; margin-bottom: 4px; }
+#vertical-chunk-seams-3d .seam-legend { display: grid; gap: 7px; margin-top: 10px; }
+#vertical-chunk-seams-3d .seam-legend > div { display: grid; grid-template-columns: 12px 1fr; gap: 7px; align-items: start; }
+#vertical-chunk-seams-3d .seam-swatch { width: 10px; height: 10px; display: inline-block; }
+#vertical-chunk-seams-3d .seam-full { background: var(--viz-series-6); }
+#vertical-chunk-seams-3d .seam-medium { background: var(--viz-series-3); }
+#vertical-chunk-seams-3d .seam-short { background: var(--viz-series-4); }
+@media (max-width: 560px) {
+  #vertical-chunk-seams-3d .seam-viewport { height: 420px; }
+  #vertical-chunk-seams-3d .form-label { min-width: 100%; }
+}
+</style>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const root = document.getElementById('vertical-chunk-seams-3d');
+const payload = __VERTICAL_SEAM_PAYLOAD__;
+const canvas = root.querySelector('[data-canvas]');
+const viewport = root.querySelector('.seam-viewport');
+const chainSelect = root.querySelector('[data-chain]');
+const baseCheck = root.querySelector('[data-base]');
+const adjacentCheck = root.querySelector('[data-adjacent]');
+const confirmButton = root.querySelector('[data-confirm]');
+const titleNode = root.querySelector('[data-detail-title]');
+const evidenceNode = root.querySelector('[data-detail-evidence]');
+const boundaryNode = root.querySelector('[data-detail-boundary]');
+let selectedChain = null;
+
+root.querySelector('[data-stat="chains"]').textContent = payload.s.verticalChunkSeamChains.toLocaleString();
+root.querySelector('[data-stat="full"]').textContent = payload.s.fullHeightChains.toLocaleString();
+root.querySelector('[data-stat="edges"]').textContent = payload.s.seamEdges.toLocaleString();
+root.querySelector('[data-stat="faces"]').textContent = payload.s.adjacentTriangles.toLocaleString();
+
+function tokenColor(name) {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  probe.style.position = 'absolute';
+  probe.style.visibility = 'hidden';
+  root.appendChild(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  const colorCanvas = document.createElement('canvas');
+  colorCanvas.width = 1;
+  colorCanvas.height = 1;
+  const context = colorCanvas.getContext('2d');
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const pixel = context.getImageData(0, 0, 1, 1).data;
+  return new THREE.Color(pixel[0] / 255, pixel[1] / 255, pixel[2] / 255);
+}
+
+const positions = new Float32Array(payload.v.length);
+for (let index = 0; index < payload.v.length; index += 1) positions[index] = payload.v[index] / 1000;
+const faces = new Uint32Array(payload.f);
+
+function geometryForFaces(faceIds) {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+  const indices = new Uint32Array(faceIds.length * 3);
+  for (let index = 0; index < faceIds.length; index += 1) {
+    const source = faceIds[index] * 3;
+    const target = index * 3;
+    indices[target] = faces[source];
+    indices[target + 1] = faces[source + 1];
+    indices[target + 2] = faces[source + 2];
+  }
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function geometryForEdges(edgeCoordinates) {
+  const values = new Float32Array(edgeCoordinates.length);
+  for (let index = 0; index < edgeCoordinates.length; index += 1) values[index] = edgeCoordinates[index] / 1000;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(values, 3));
+  return geometry;
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.02, 100);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const allFaces = Array.from({ length: payload.s.meshTriangles }, (_, index) => index);
+const baseGeometry = geometryForFaces(allFaces);
+const baseSolid = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.026,
+  side: THREE.DoubleSide, depthWrite: false
+}));
+const baseWire = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.1,
+  wireframe: true, depthWrite: false
+}));
+scene.add(baseSolid, baseWire);
+
+const lineMaterials = [
+  new THREE.LineBasicMaterial({ color: tokenColor('--viz-series-6') }),
+  new THREE.LineBasicMaterial({ color: tokenColor('--viz-series-3') }),
+  new THREE.LineBasicMaterial({ color: tokenColor('--viz-series-4') })
+];
+const lineObjects = payload.q.map(chain => {
+  const category = chain.y >= 2400 ? 0 : chain.y >= 1200 ? 1 : 2;
+  const object = new THREE.LineSegments(geometryForEdges(chain.e), lineMaterials[category]);
+  object.userData.chain = chain.id;
+  scene.add(object);
+  return object;
+});
+
+const selectedLine = new THREE.LineSegments(geometryForEdges([]), new THREE.LineBasicMaterial({
+  color: tokenColor('--primary')
+}));
+scene.add(selectedLine);
+const selectedFaces = new THREE.Mesh(geometryForFaces([]), new THREE.MeshBasicMaterial({
+  color: tokenColor('--accent'), transparent: true, opacity: 0.45,
+  side: THREE.DoubleSide, depthWrite: false, polygonOffset: true,
+  polygonOffsetFactor: -5, polygonOffsetUnits: -5
+}));
+scene.add(selectedFaces);
+
+function fitBounds(minimum, maximum) {
+  const box = new THREE.Box3(
+    new THREE.Vector3(...minimum.map(value => value / 1000)),
+    new THREE.Vector3(...maximum.map(value => value / 1000)));
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 0.25);
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).add(
+    new THREE.Vector3(1, 0.3, 1).normalize().multiplyScalar(radius * 2.8));
+  camera.near = Math.max(0.01, radius / 100);
+  camera.far = Math.max(20, radius * 20);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function fitRoom() {
+  baseGeometry.computeBoundingBox();
+  const box = baseGeometry.boundingBox;
+  fitBounds(box.min.toArray().map(value => value * 1000), box.max.toArray().map(value => value * 1000));
+}
+
+function selectChain(identifier, shouldSave = true) {
+  const chain = payload.q[identifier];
+  if (!chain) return;
+  selectedChain = identifier;
+  chainSelect.value = String(identifier);
+  selectedLine.geometry.dispose();
+  selectedLine.geometry = geometryForEdges(chain.e);
+  selectedFaces.geometry.dispose();
+  selectedFaces.geometry = geometryForFaces(chain.f);
+  selectedFaces.visible = adjacentCheck.checked;
+  confirmButton.disabled = false;
+  titleNode.textContent = `接缝链 ${chain.id} · 竖向跨度 ${(chain.y / 1000).toFixed(2)} m`;
+  evidenceNode.textContent = `${chain.e.length / 6}条原拓扑未焊接边；相邻${chain.f.length}面；墙面法线主轴 ${chain.a.toUpperCase()}；切向Chunk轴 ${chain.t.toUpperCase()} = ${(chain.c / 1000).toFixed(2)} m；法线一致度 ${(chain.n / 1000).toFixed(3)}。`;
+  boundaryNode.textContent = '边的空间坐标已经重合，但原始顶点索引分离；修复应在Chunk共享样本/边界焊接与一致三角化层完成。';
+  fitBounds(chain.b0, chain.b1);
+  if (shouldSave) saveState();
+}
+
+for (const chain of payload.q) {
+  const option = document.createElement('option');
+  option.value = String(chain.id);
+  option.textContent = `链 ${chain.id} · ${(chain.y / 1000).toFixed(2)} m · ${chain.t.toUpperCase()}=${(chain.c / 1000).toFixed(2)} m`;
+  chainSelect.appendChild(option);
+}
+
+const raycaster = new THREE.Raycaster();
+raycaster.params.Line.threshold = 0.035;
+const pointer = new THREE.Vector2();
+canvas.addEventListener('click', event => {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(lineObjects, false)[0];
+  if (hit) selectChain(hit.object.userData.chain);
+});
+
+function saveState() {
+  if (!window.openai?.setWidgetState) return;
+  window.openai.setWidgetState({
+    modelContent: { selectedChain },
+    privateContent: {
+      baseVisible: baseCheck.checked,
+      adjacentVisible: adjacentCheck.checked
+    }
+  }).catch(() => {});
+}
+
+function restoreState(state) {
+  const model = state?.modelContent;
+  const privateState = state?.privateContent;
+  if (Number.isInteger(model?.selectedChain) && payload.q[model.selectedChain]) selectedChain = model.selectedChain;
+  if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
+  if (typeof privateState?.adjacentVisible === 'boolean') adjacentCheck.checked = privateState.adjacentVisible;
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
+}
+
+restoreState(window.openai?.widgetState);
+chainSelect.addEventListener('change', () => {
+  if (chainSelect.value === '') {
+    selectedChain = null;
+    selectedLine.geometry.dispose();
+    selectedLine.geometry = geometryForEdges([]);
+    selectedFaces.geometry.dispose();
+    selectedFaces.geometry = geometryForFaces([]);
+    confirmButton.disabled = true;
+    fitRoom();
+    saveState();
+  } else {
+    selectChain(Number(chainSelect.value));
+  }
+});
+baseCheck.addEventListener('change', () => {
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+  saveState();
+});
+adjacentCheck.addEventListener('change', () => {
+  selectedFaces.visible = adjacentCheck.checked && selectedChain != null;
+  saveState();
+});
+root.querySelector('[data-fit-room]').addEventListener('click', fitRoom);
+confirmButton.addEventListener('click', async () => {
+  if (selectedChain == null || !window.openai?.sendFollowUpMessage) return;
+  const chain = payload.q[selectedChain];
+  await window.openai.sendFollowUpMessage({
+    title: '确认截图中的竖向接缝',
+    prompt: `我确认3D模型中的接缝链 ${chain.id}（跨度 ${(chain.y / 1000).toFixed(2)} m，${chain.t.toUpperCase()}=${(chain.c / 1000).toFixed(2)} m）就是截图红圈所指的那条不美观连线。请继续追查并给出生产修复。`
+  });
+});
+window.addEventListener('openai:set_globals', event => {
+  restoreState(event.detail?.globals?.widgetState);
+  if (selectedChain != null) selectChain(selectedChain, false);
+});
+
+function resize() {
+  const width = Math.max(1, viewport.clientWidth);
+  const height = Math.max(1, viewport.clientHeight);
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(viewport);
+resize();
+if (selectedChain != null) selectChain(selectedChain, false); else fitRoom();
+
+function animate() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
