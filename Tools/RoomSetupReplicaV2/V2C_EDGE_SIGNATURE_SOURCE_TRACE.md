@@ -153,3 +153,33 @@ The causal order should be preserved in implementation and A/B testing:
 Uncertainty remains an optional future input improvement, not a prerequisite
 for correcting the demonstrated fusion/extraction amplification inside the
 replica.
+
+## Independent class B confirmation
+
+The user subsequently marked another visual category with 91 representative
+edges. It is disjoint from both the class-A 48 edges and the original 650
+painted triangles. Expanding the new edges produces 159 owner triangles:
+
+- 151/159 have repeated mixed-sign source voxels;
+- 150/159 have same-view repeated mixing;
+- 146/159 have repeated temporal sign switching;
+- 73/91 selected edges are exact derived-cell phase boundaries;
+- the remaining 18 are same-cell chain segments.
+
+Class B therefore shares the same upstream source-instability family, but it
+must remain a separate geometric subtype. Its median/P95 owner-face dihedral is
+`13.16/45.22 degrees`, versus `3.24/22.03 degrees` for class A, and its MC-pair
+family is dominated by `136/221`, `204/221`, `136/153`, and `136/204` instead
+of class A's predominantly `9/159` phase pair. The independently expanded
+high-confidence sets do not overlap.
+
+Using class B alone as the positive atlas finds 157 new high-confidence phase
+edges, 228 connected continuations, and 151 probable review-only edges. The
+working taxonomy is consequently:
+
+- **Class A:** low-dihedral mixed-layer phase chain;
+- **Class B:** high-dihedral mixed-layer phase chain.
+
+They are two manifestations of the same source/fusion instability, not one
+identical geometric rule. A repair may share source-history stabilization but
+must retain separate geometry acceptance metrics for the two classes.
