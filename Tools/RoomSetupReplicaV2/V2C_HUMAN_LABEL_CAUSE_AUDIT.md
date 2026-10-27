@@ -112,3 +112,27 @@ shows that their geometry is itself defective.
   behaviour.
 - Compare the same mesh hash input before and after; do not use a new scan to
   judge this repair.
+
+## Full-mesh localization of the 104-face signature
+
+The same rule was applied to all 26,656 triangles after reconstructing the
+aligned 10 cm cell evidence for the full frozen mesh. The result is deliberately
+split by evidence strength:
+
+| Evidence level | Triangles | Interpretation |
+| --- | ---: | --- |
+| Human-confirmed zero-plane class | 104 | Exact controller-painted positives; rule recall is 104/104 |
+| Unpainted continuation in the same shared-edge components | 72 | Strongest missed continuations of the painted structures |
+| Independent same-signature candidates | 1,616 | Review set elsewhere in the room; not automatically defective |
+
+The 1,792 same-signature triangles form 571 shared-edge components. Sixteen
+components contain at least one of the 104 confirmed faces. The remaining
+components are not counted as confirmed defects because a legitimate physical
+plane may also lie within 5 mm of the world-anchored 10 cm lattice and use a
+non-axis-planar Marching Cubes case. This is why the full-mesh result is a
+ranked localization receipt rather than a deletion mask.
+
+The visualization also keeps the other 546 human-confirmed faces visible as a
+separate class. Those faces belong to repeated mixed-source, weak temporal
+switching, or paint-boundary categories and must not be presented as evidence
+for the 104-face zero-plane mechanism.

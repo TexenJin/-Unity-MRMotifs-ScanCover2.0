@@ -1,0 +1,348 @@
+<div id="grid-phase-candidates-3d">
+  <h2>10 cm 零平面伤疤定位</h2>
+
+  <div class="viz-grid phase-stats" aria-label="定位结果">
+    <div class="card viz-stat">
+      <div class="text-muted">人工确认</div>
+      <div class="viz-stat-value tabular-nums" data-stat="confirmed"></div>
+      <div class="text-small text-muted">104 面全部被同一静态特征召回</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">同链未涂延伸</div>
+      <div class="viz-stat-value tabular-nums" data-stat="continuation"></div>
+      <div class="text-small text-muted">与确认面共享边并处于同一特征连通分量</div>
+    </div>
+    <div class="card viz-stat">
+      <div class="text-muted">全场同特征待复核</div>
+      <div class="viz-stat-value tabular-nums" data-stat="candidate"></div>
+      <div class="text-small text-muted">不能据此自动删除</div>
+    </div>
+  </div>
+
+  <div class="viz-controls phase-controls" aria-label="显示图层">
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="0" checked>
+      <span class="phase-swatch phase-confirmed" aria-hidden="true"></span>
+      <span class="form-check-label">104 面人工确认</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="1" checked>
+      <span class="phase-swatch phase-continuation" aria-hidden="true"></span>
+      <span class="form-check-label">同链未涂延伸</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="2">
+      <span class="phase-swatch phase-candidate" aria-hidden="true"></span>
+      <span class="form-check-label">全场同特征候选</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-category="3" checked>
+      <span class="phase-swatch phase-other" aria-hidden="true"></span>
+      <span class="form-check-label">其余人工确认缺陷</span>
+    </label>
+    <label class="form-check">
+      <input class="form-check-input" type="checkbox" data-base checked>
+      <span class="form-check-label">房间基线</span>
+    </label>
+    <button class="btn btn-primary" type="button" data-fit-confirmed>定位 104 面及延伸</button>
+    <button class="btn" type="button" data-fit-room>适配全房间</button>
+  </div>
+
+  <div class="phase-viewport">
+    <canvas data-canvas role="img" aria-label="可旋转缩放的房间网格与零平面伤疤候选三维模型"></canvas>
+    <div class="phase-help text-small text-muted">拖动旋转 · 滚轮缩放 · 点击彩色三角形查看证据</div>
+  </div>
+
+  <div class="card phase-detail" aria-live="polite">
+    <div class="phase-detail-title" data-detail-title>104 面人工确认＋72 面同链延伸</div>
+    <div class="text-small" data-detail-evidence>默认先显示已经指认的 104 面，以及和它们共享边、且满足同一来源特征的未涂三角形。</div>
+    <div class="text-small text-muted" data-detail-boundary>全场同特征候选是复核清单，不是“全部都错”的删除掩码；真实表面恰好落在 10 cm 格点附近时也可能命中。</div>
+  </div>
+
+  <div class="phase-legend text-small" aria-label="识别层级">
+    <div><span class="phase-swatch phase-confirmed" aria-hidden="true"></span><span><strong>人工确认：</strong>手柄涂出的 104 面；无反复混层源体素、MC 构型不是对应轴的平面构型、质心距 10 cm 格平面不超过 5 mm。</span></div>
+    <div><span class="phase-swatch phase-continuation" aria-hidden="true"></span><span><strong>同链延伸：</strong>满足同一规则，并与 104 面处于共享边连通分量；这是当前最强的未涂漏标候选。</span></div>
+    <div><span class="phase-swatch phase-candidate" aria-hidden="true"></span><span><strong>独立候选：</strong>全房间满足同一静态签名，但没有连接到人工确认链；需要视觉或运行时证据二次确认。</span></div>
+    <div><span class="phase-swatch phase-other" aria-hidden="true"></span><span><strong>其余确认缺陷：</strong>已人工点选但属于反复混层、弱时间层切换或边界未决，不属于这 104 面的成因。</span></div>
+  </div>
+</div>
+
+<style>
+#grid-phase-candidates-3d { width: 100%; color: var(--foreground); }
+#grid-phase-candidates-3d h2 { margin: 0 0 12px; }
+#grid-phase-candidates-3d .phase-stats { margin-bottom: 12px; }
+#grid-phase-candidates-3d .phase-controls { margin-bottom: 10px; align-items: center; }
+#grid-phase-candidates-3d .form-check { display: inline-flex; align-items: center; gap: 6px; }
+#grid-phase-candidates-3d .phase-viewport {
+  position: relative;
+  width: 100%;
+  height: 560px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+#grid-phase-candidates-3d canvas { display: block; width: 100%; height: 100%; }
+#grid-phase-candidates-3d .phase-help {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  padding: 3px 6px;
+  background: color-mix(in srgb, var(--background) 78%, transparent);
+}
+#grid-phase-candidates-3d .phase-detail { margin-top: 10px; }
+#grid-phase-candidates-3d .phase-detail-title { font-weight: 500; margin-bottom: 4px; }
+#grid-phase-candidates-3d .phase-legend { display: grid; gap: 7px; margin-top: 10px; }
+#grid-phase-candidates-3d .phase-legend > div { display: grid; grid-template-columns: 12px 1fr; gap: 7px; align-items: start; }
+#grid-phase-candidates-3d .phase-swatch { width: 10px; height: 10px; display: inline-block; }
+#grid-phase-candidates-3d .phase-confirmed { background: var(--viz-series-6); }
+#grid-phase-candidates-3d .phase-continuation { background: var(--viz-series-3); }
+#grid-phase-candidates-3d .phase-candidate { background: var(--viz-series-4); }
+#grid-phase-candidates-3d .phase-other { background: var(--viz-series-2); }
+@media (max-width: 560px) {
+  #grid-phase-candidates-3d .phase-viewport { height: 420px; }
+}
+</style>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const root = document.getElementById('grid-phase-candidates-3d');
+const payload = __GRID_PHASE_PAYLOAD__;
+const canvas = root.querySelector('[data-canvas]');
+const viewport = root.querySelector('.phase-viewport');
+const titleNode = root.querySelector('[data-detail-title]');
+const evidenceNode = root.querySelector('[data-detail-evidence]');
+const boundaryNode = root.querySelector('[data-detail-boundary]');
+const categoryChecks = [...root.querySelectorAll('[data-category]')];
+const baseCheck = root.querySelector('[data-base]');
+let selectedFaceId = null;
+
+root.querySelector('[data-stat="confirmed"]').textContent = payload.s.humanConfirmedGridPhaseTriangles.toLocaleString();
+root.querySelector('[data-stat="continuation"]').textContent = payload.s.connectedUnpaintedContinuationTriangles.toLocaleString();
+root.querySelector('[data-stat="candidate"]').textContent = payload.s.independentSameSignatureCandidateTriangles.toLocaleString();
+
+const categoryNames = [
+  '人工确认零平面伤疤',
+  '同链未涂延伸',
+  '独立同特征候选',
+  '其余人工确认缺陷'
+];
+const categoryEvidence = [
+  '这 104 面由手柄直接指认，并全部满足零平面相位签名。',
+  '未被手柄涂到，但和确认面共享边、处在同一个签名连通分量。',
+  '满足相同局部静态签名，但没有连接到已确认链，当前只能列为待复核候选。',
+  '人工已经确认可见异常，但来源被归入反复混层、弱时间层切换或边界未决。'
+];
+const otherCauseNames = ['', '反复混层源体素', '弱时间层切换', '涂画边界或未决'];
+
+function tokenColor(name) {
+  const probe = document.createElement('span');
+  probe.style.color = `var(${name})`;
+  probe.style.position = 'absolute';
+  probe.style.visibility = 'hidden';
+  root.appendChild(probe);
+  const value = getComputedStyle(probe).color;
+  probe.remove();
+  const colorCanvas = document.createElement('canvas');
+  colorCanvas.width = 1;
+  colorCanvas.height = 1;
+  const context = colorCanvas.getContext('2d');
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const pixel = context.getImageData(0, 0, 1, 1).data;
+  return new THREE.Color(pixel[0] / 255, pixel[1] / 255, pixel[2] / 255);
+}
+
+const positions = new Float32Array(payload.v.length);
+for (let index = 0; index < payload.v.length; index += 1) positions[index] = payload.v[index] / 1000;
+const faces = new Uint32Array(payload.f);
+const metadata = new Map(payload.m.map(row => [row[0], row]));
+
+function geometryFor(faceIds) {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+  const indices = new Uint32Array(faceIds.length * 3);
+  for (let index = 0; index < faceIds.length; index += 1) {
+    const source = faceIds[index] * 3;
+    const target = index * 3;
+    indices[target] = faces[source];
+    indices[target + 1] = faces[source + 1];
+    indices[target + 2] = faces[source + 2];
+  }
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(46, 1, 0.02, 100);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+const baseGeometry = geometryFor(Array.from({ length: payload.s.totalMeshTriangles }, (_, index) => index));
+const baseSolid = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.028,
+  side: THREE.DoubleSide, depthWrite: false
+}));
+const baseWire = new THREE.Mesh(baseGeometry, new THREE.MeshBasicMaterial({
+  color: tokenColor('--foreground'), transparent: true, opacity: 0.1,
+  wireframe: true, depthWrite: false
+}));
+scene.add(baseSolid, baseWire);
+
+const materialTokens = ['--viz-series-6', '--viz-series-3', '--viz-series-4', '--viz-series-2'];
+const meshes = [];
+for (let code = 0; code < 4; code += 1) {
+  const mesh = new THREE.Mesh(geometryFor(payload.c[code]), new THREE.MeshBasicMaterial({
+    color: tokenColor(materialTokens[code]), transparent: true,
+    opacity: code === 2 ? 0.52 : 0.94, side: THREE.DoubleSide,
+    depthWrite: code !== 2, polygonOffset: true,
+    polygonOffsetFactor: -2 - code, polygonOffsetUnits: -2 - code
+  }));
+  mesh.userData.category = code;
+  mesh.visible = categoryChecks[code].checked;
+  meshes.push(mesh);
+  scene.add(mesh);
+}
+
+const highlight = new THREE.Mesh(geometryFor([]), new THREE.MeshBasicMaterial({
+  color: tokenColor('--primary'), side: THREE.DoubleSide,
+  transparent: true, opacity: 1, polygonOffset: true,
+  polygonOffsetFactor: -8, polygonOffsetUnits: -8
+}));
+scene.add(highlight);
+
+function fitFaces(faceIds) {
+  const box = new THREE.Box3();
+  const point = new THREE.Vector3();
+  for (const faceId of faceIds) {
+    for (let corner = 0; corner < 3; corner += 1) {
+      const vertex = faces[faceId * 3 + corner] * 3;
+      point.set(positions[vertex], positions[vertex + 1], positions[vertex + 2]);
+      box.expandByPoint(point);
+    }
+  }
+  if (box.isEmpty()) return;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius, 0.25);
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).add(
+    new THREE.Vector3(1, 0.55, 1).normalize().multiplyScalar(radius * 2.6));
+  camera.near = Math.max(0.01, radius / 100);
+  camera.far = Math.max(20, radius * 20);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function showTriangle(faceId) {
+  const row = metadata.get(faceId);
+  if (!row) return;
+  selectedFaceId = faceId;
+  const [triangle, category, component, axis, planeMicrometers, configuration, switches, jumps, areaMicrometers, otherCause] = row;
+  titleNode.textContent = `三角形 ${triangle} · ${categoryNames[category]}`;
+  if (category === 3) {
+    evidenceNode.textContent = `人工分类：${otherCauseNames[otherCause] || '其他'}；它不是 104 面零平面相位类。`;
+  } else {
+    evidenceNode.textContent = `签名分量 ${component}；主法线轴 ${'XYZ'[axis]}；距最近 10 cm 格平面 ${(planeMicrometers / 1000).toFixed(2)} mm；MC 构型 ${configuration}；时间翻转/层跳最大 ${switches}/${jumps}；面积 ${(areaMicrometers / 100).toFixed(2)} cm²。`;
+  }
+  boundaryNode.textContent = category === 2
+    ? '这是同特征候选，不是自动删除结论；需要对照画面或时序深度继续确认。'
+    : categoryEvidence[category];
+  highlight.geometry.dispose();
+  highlight.geometry = geometryFor([faceId]);
+  saveState();
+}
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+canvas.addEventListener('click', event => {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const active = meshes.filter((mesh, code) => mesh.visible && payload.c[code].length);
+  const hit = raycaster.intersectObjects(active, false)[0];
+  if (!hit) return;
+  showTriangle(payload.c[hit.object.userData.category][hit.faceIndex]);
+});
+
+function saveState() {
+  if (!window.openai?.setWidgetState) return;
+  window.openai.setWidgetState({
+    modelContent: {
+      selectedFaceId,
+      enabled: categoryChecks.map(input => input.checked)
+    },
+    privateContent: { baseVisible: baseCheck.checked }
+  }).catch(() => {});
+}
+
+function restoreState(state) {
+  const model = state?.modelContent;
+  const privateState = state?.privateContent;
+  if (Array.isArray(model?.enabled) && model.enabled.length === 4) {
+    categoryChecks.forEach((input, index) => { input.checked = Boolean(model.enabled[index]); });
+  }
+  if (Number.isInteger(model?.selectedFaceId) && metadata.has(model.selectedFaceId)) {
+    selectedFaceId = model.selectedFaceId;
+  }
+  if (typeof privateState?.baseVisible === 'boolean') baseCheck.checked = privateState.baseVisible;
+  meshes.forEach((mesh, code) => { mesh.visible = categoryChecks[code].checked; });
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+}
+
+restoreState(window.openai?.widgetState);
+categoryChecks.forEach((input, code) => input.addEventListener('change', () => {
+  meshes[code].visible = input.checked;
+  titleNode.textContent = categoryNames[code];
+  evidenceNode.textContent = categoryEvidence[code];
+  boundaryNode.textContent = code === 2
+    ? '独立候选仍需二次确认；当前规则不授权自动删除。'
+    : '颜色表示证据层级，不表示全场候选已经全部确认为错误。';
+  saveState();
+}));
+baseCheck.addEventListener('change', () => {
+  baseSolid.visible = baseCheck.checked;
+  baseWire.visible = baseCheck.checked;
+  saveState();
+});
+root.querySelector('[data-fit-confirmed]').addEventListener('click', () => {
+  fitFaces([...payload.c[0], ...payload.c[1]]);
+});
+root.querySelector('[data-fit-room]').addEventListener('click', () => {
+  fitFaces(Array.from({ length: payload.s.totalMeshTriangles }, (_, index) => index));
+});
+window.addEventListener('openai:set_globals', event => {
+  restoreState(event.detail?.globals?.widgetState);
+  if (selectedFaceId != null) showTriangle(selectedFaceId);
+});
+
+function resize() {
+  const width = Math.max(1, viewport.clientWidth);
+  const height = Math.max(1, viewport.clientHeight);
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(viewport);
+resize();
+fitFaces([...payload.c[0], ...payload.c[1]]);
+if (selectedFaceId != null) showTriangle(selectedFaceId);
+
+function animate() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
