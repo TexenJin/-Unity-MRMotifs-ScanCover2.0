@@ -1,10 +1,12 @@
 using UnityEngine;
 
 /// <summary>
-/// Room Setup replica input. Right trigger toggles the paired live coverage
-/// and recording session; A replays the fixed tape, B clears the replica, and
-/// X toggles preview visibility. Replay-only annotation is disabled while live
-/// controls are open so the same trigger cannot paint and start capture.
+/// Room Setup replica input. Right trigger toggles live coverage without
+/// recording; A replays the fixed tape, B clears the replica, and
+/// X toggles preview visibility, Y toggles the classic multicolour BB depth
+/// trail, and right-stick click freezes the current live replica. Replay-only
+/// annotation is disabled while live controls are open so the same trigger
+/// cannot paint and start capture.
 /// </summary>
 [DefaultExecutionOrder(-15)]
 public sealed class RoomSetupReplicaV2Input : MonoBehaviour
@@ -53,7 +55,7 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
         _previousTrigger = trigger;
         if (triggerDown && AcceptAction())
         {
-            scanner.ToggleCoverageAndRecording();
+            scanner.ToggleScanning();
             Pulse();
         }
         if (OVRInput.GetDown(OVRInput.Button.Two, controller) &&
@@ -70,6 +72,18 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
                 reconstruction.SetPreviewVisible(
                     !reconstruction.PreviewVisible);
             Pulse();
+        }
+        if (OVRInput.GetDown(OVRInput.RawButton.Y) && AcceptAction())
+        {
+            scanner.ToggleDepthPointCloudOverlay();
+            Pulse();
+        }
+        if (OVRInput.GetDown(
+                OVRInput.Button.PrimaryThumbstick, controller) &&
+            AcceptAction())
+        {
+            if (scanner.FreezeCurrentReplica())
+                Pulse(0.55f, 0.14f);
         }
     }
 

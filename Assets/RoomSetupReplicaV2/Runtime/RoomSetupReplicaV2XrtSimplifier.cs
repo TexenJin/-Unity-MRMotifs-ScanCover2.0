@@ -12,9 +12,11 @@ using UnityEngine;
 /// </summary>
 internal static class RoomSetupReplicaV2XrtSimplifier
 {
-    // Current target: the regular 10 cm coverage mesh. Keep the recovered XRT
-    // implementation for a later performance phase, but do not coarsen the
-    // geometry published by this comparison build.
+    // Device trial 2026-11-01 falsified applying XRT after the already-derived
+    // 10 cm candidate: repeated legal collapses produced metre-scale triangles
+    // on planar walls. Native telemetry establishes two distinct products:
+    // live Resampled is the ~10 cm mesh, while saved Postprocessed extracts the
+    // dense source and only then runs XRT. Keep XRT out of the live Front.
     internal const bool Enabled = false;
     internal const int MinimumTriangles = 100;
     internal const int TargetVertexDivisor = 20;

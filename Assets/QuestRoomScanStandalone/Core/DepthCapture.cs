@@ -1284,6 +1284,20 @@ namespace Genesis.RoomScan
             Preprocessed?.Invoke();
         }
 
+        /// <summary>
+        /// Publishes the callback-owned, full-resolution stereo depth frame and
+        /// its matching matrices for read-only display shaders. This deliberately
+        /// does not consume the preprocess-dirty flag and does not run hand-mask,
+        /// temporal, bilateral, edge-clean, normal, dilation, or TSDF work.
+        /// </summary>
+        public bool PublishCurrentRawFrameGlobalsForDisplay()
+        {
+            if (!DepthAvailable || _depthTex == null)
+                return false;
+            SetGlobalShaderProperties();
+            return true;
+        }
+
         private void CapturePlatformDepthWitness()
         {
             if (!enableGunGelDualTestimony || _depthTex == null)

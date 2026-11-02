@@ -20,9 +20,6 @@ public static class RoomSetupReplicaV2SceneSetup
         "e47682b9-c270-40b1-b16d-90b627a5ce1b";
     private const string PassthroughBlock =
         "f0540b20-dfd6-420e-b20d-c270f88dc77e";
-    private const string CameraAccessBlock =
-        "0792d3af-c7d9-4f9c-a6f0-fd580a051e48";
-
     [MenuItem("Room Setup Replica V2/重建独立测试场景")]
     public static async void SetupScene()
     {
@@ -32,8 +29,6 @@ public static class RoomSetupReplicaV2SceneSetup
                 NewSceneSetup.EmptyScene, NewSceneMode.Single);
             await EnsureBuildingBlock(CameraRigBlock, "OVRCameraRig");
             await EnsureBuildingBlock(PassthroughBlock, "Passthrough");
-            await EnsureBuildingBlock(CameraAccessBlock,
-                "PassthroughCameraAccess");
             ConfigurePassthrough();
             EnsureArStack();
             GameObject root = EnsureReplicaRoot();
@@ -50,8 +45,8 @@ public static class RoomSetupReplicaV2SceneSetup
             EditorUtility.DisplayDialog(
                 "Room Setup Replica V2",
                 "独立场景已建立并设为唯一 Build Scene。\n" +
-                "右扳机同时开始/停止覆盖与录制，A 回放，" +
-                "B 清空，X 显示/隐藏。\n" +
+                "右扳机开始/停止覆盖，A 回放，B 清空，" +
+                "X 显示/隐藏，Y 深度点层。\n" +
                 "回放完成后：右手射线＋长按扳机涂选/擦除，" +
                 "B 撤销上一整笔。",
                 "好");
@@ -137,7 +132,7 @@ public static class RoomSetupReplicaV2SceneSetup
             SerializedProperty permission = serialized.FindProperty(
                 "requestPassthroughCameraAccessPermissionOnStartup");
             if (permission != null)
-                permission.boolValue = true;
+                permission.boolValue = false;
             serialized.ApplyModifiedPropertiesWithoutUndo();
             EditorUtility.SetDirty(manager);
         }

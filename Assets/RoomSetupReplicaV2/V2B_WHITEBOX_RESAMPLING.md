@@ -78,11 +78,16 @@ pass. Publication happens after the whole mesh pass so connectivity is never
 decided independently per chunk. The replay receipt records pre/post component
 and triangle counts plus cleanup time. Metric-error simplification remains a
 separate production stage and is not silently folded into either the resampler
-or this cleanup. Its implementation is retained immediately after cleanup but
-is disabled in the current comparison build: publication stops at the regular
-10 cm Marching-Cubes mesh after `<32` cleanup. XRT is reserved for a later
-performance phase. When re-enabled, the recovered wrapper and kernel establish
-the following contract:
+or this cleanup. The synchronized experimental B volume is disabled, so
+publication no longer pays for two isolated reconstruction arms. XRT is also
+disabled in production after the 2026-11-01 device trial showed that applying
+it to the already-derived 10 cm mesh creates metre-scale planar triangles.
+Native telemetry establishes that live `Resampled` and saved `Postprocessed`
+are separate products: the former reached 26,555 triangles; the latter made a
+one-shot dense-source extraction and finished at 32,616 triangles after XRT.
+The kernel remains available for isolated/save-time work, but it must never
+return to the live 10 cm publication path.
+The recovered wrapper and kernel establish the following contract:
 
 ```text
 minimum input                 100 triangles

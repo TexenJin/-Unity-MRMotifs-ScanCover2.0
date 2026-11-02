@@ -65,6 +65,7 @@ namespace Genesis.RoomScan
 
         private void Start()
         {
+            bool requestedVisible = _visible;
             Shader packShader = Resources.Load<Shader>("DepthPointSnapshotPack");
             Shader pointShader = Resources.Load<Shader>("DepthPointCloud");
             if (packShader == null || pointShader == null)
@@ -77,12 +78,13 @@ namespace Genesis.RoomScan
             _snapshotPackMaterial = new Material(packShader) { name = "QRS BB Snapshot Pack" };
             if (DepthCapture.Instance != null)
                 DepthCapture.Instance.Preprocessed += OnDepthPreprocessed;
-            SetVisible(false);
+            SetVisible(requestedVisible);
         }
 
         public void SetVisible(bool visible)
         {
             _visible = visible;
+            enabled = visible;
             if (visible)
             {
                 ClearTrail();
@@ -128,7 +130,19 @@ namespace Genesis.RoomScan
 
         private void OnDepthPreprocessed()
         {
+            CaptureCurrentFrameForDisplay();
+        }
+
+        /// <summary>
+        /// Captures the currently published depth globals without requiring the
+        /// production preprocessing event. The isolated RoomSetupReplicaV2
+        /// route deliberately consumes callback-owned raw depth, so its scanner
+        /// calls this once for each newly published platform frame.
+        /// </summary>
+        public void CaptureCurrentFrameForDisplay()
+        {
             if (!_visible || !_acquiring || !DepthCapture.DepthAvailable) return;
+            if (_snapshotPackMaterial == null) return;
 
             if (!_built)
             {
@@ -220,7 +234,7 @@ namespace Genesis.RoomScan
             DepthCapture capture = DepthCapture.Instance;
             if (capture == null || _layers == null || _layers.Length == 0) return;
 
-            int eye = useRightEye ? 1 : 0;
+            int eye = useRightEye ? DepthCapture.FusionEyeIndex : 0;
             if (capture.Proj == null || capture.ProjInv == null || capture.ViewInv == null ||
                 capture.Proj.Length <= eye || capture.ProjInv.Length <= eye || capture.ViewInv.Length <= eye)
                 return;

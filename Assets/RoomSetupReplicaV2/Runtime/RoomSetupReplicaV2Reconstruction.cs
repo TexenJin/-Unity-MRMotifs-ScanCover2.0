@@ -50,12 +50,40 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         VoxelMeters * 0.5f;
     private const byte SpatialHistoricalPairsThreshold = 3;
     private const byte ContradictionPairsToRetire = 5;
+    private const byte ReplacementPairsToPublish = 3;
     private const float ContradictionMinimumMatureWeight = 1f;
     private const float ContradictionAnchorConsistencyMeters = 0.075f;
+    // One 5 cm source voxel is already enough to move a derived 10 cm zero
+    // crossing by a visually obvious half-cell and create the repeated wall
+    // bands seen on-device. Larger thresholds missed those thin scars.
+    private const float LayerShiftChallengeMeters = VoxelMeters;
+    private const float LayerShiftDistanceConsistencyMeters = 0.025f;
+    private const float LayerShiftAnchorConsistencyMeters = 0.15f;
+    private const byte LayerShiftPairsToReplace = 2;
+    private const float Q75CandidateLayerCellMeters = DerivedVoxelMeters;
     // Compile-time A/B route. Do not use serialized defaults here: Unity hot
     // reload preserves the previously loaded component value across builds.
     private const bool SameLayerSupportEnabled = true;
     private const bool ContradictionRetirementEnabled = false;
+    // Production baseline restored to the 2026-10-27 device build.  Keep the
+    // q75 implementation available for isolated experiments, but do not let
+    // it add retirement/replacement latency to the live A route.
+    private const bool ProductionQ75Enabled = false;
+    // Evidence-only observer. Device receipts measured 6-9 ms per accepted
+    // pair while affectedReconstruction remained false, so production never
+    // creates or feeds it.
+    private const bool ShadowObserverEnabled = false;
+    // V2's logical reconstruction chunks remain the ownership/update unit, but
+    // nearby depth-only occluders are submitted through one render page. This
+    // is the active-scene counterpart of ScanCover's RESULT page batching.
+    private const bool RenderPageBatchingEnabled = true;
+    private const int RenderPageSpanChunks = 2;
+    // Candidate chunks publish into their affected render pages immediately.
+    // Whole-room seam/component classification is retained as a periodic
+    // maintenance pass instead of being repeated after every small update.
+    private const float GlobalTopologyCleanupIntervalSeconds = 4f;
+    private const int RefutationFootprintRadiusPixels = 2;
+    private const float RefutationFootprintSpreadMeters = 0.12f;
     private const int MinimumRecordedPairsToCommit = 16;
     // Recovered Room Setup input rule. The public Meta OpenXR provider used by
     // this project exposes only _EnvironmentDepthTexture, not the native
@@ -81,6 +109,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         IntegrateLeft,
         IntegrateRight,
         GarbageCollect,
+        CommitQ75History,
         Finalize
     }
 
@@ -92,10 +121,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         // voxel. It is provenance, not another filtering weight.
         public Vector3 layerAnchor;
         public Vector3 contradictionAnchor;
+        public Vector3Int contradictionLayerKey;
         public int lastEvidencePair;
         public byte contradictionStreak;
         public sbyte contradictionSign;
         public bool retiredOnce;
+        public float replacementDistance;
+        public float replacementWeight;
+        public Vector3 replacementAnchor;
+        public Vector3Int replacementLayerKey;
+        public byte replacementStreak;
+        public sbyte replacementSign;
     }
 
     private sealed class Chunk
@@ -108,7 +144,30 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public Mesh backMesh;
         public Vector3[] candidateVertices = Array.Empty<Vector3>();
         public int[] candidateTriangles = Array.Empty<int>();
+        public Vector3[] publishedVertices = Array.Empty<Vector3>();
+        public int[] publishedTriangles = Array.Empty<int>();
         public int candidateTriangleCount;
+        public int triangleCount;
+        public int pendingReplacementVoxels;
+    }
+
+    private sealed class RenderPage
+    {
+        public Vector3Int key;
+        public GameObject gameObject;
+        public MeshFilter filter;
+        public MeshRenderer renderer;
+        public Mesh frontMesh;
+        public Mesh backMesh;
+        public GameObject lineObject;
+        public MeshFilter lineFilter;
+        public MeshRenderer lineRenderer;
+        public Mesh lineFrontMesh;
+        public Mesh lineBackMesh;
+        public readonly HashSet<Vector3Int> members =
+            new HashSet<Vector3Int>();
+        public readonly List<Vector3> vertices = new List<Vector3>();
+        public readonly List<int> triangles = new List<int>();
         public int triangleCount;
     }
 
@@ -124,6 +183,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string sha256 = string.Empty;
         public int vertices;
         public int triangles;
+        public float surfaceAreaSquareMeters;
         public int connectedComponents;
         public int isolatedComponents;
         public int largestComponentTriangles;
@@ -139,6 +199,42 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int crossLayerCandidateTriangles;
         public int historicalShellCandidateTriangles;
         public int insufficientEvidenceTriangles;
+    }
+
+    [Serializable]
+    private sealed class LiveMeshReceipt
+    {
+        public string schema;
+        public string createdUtc;
+        public string arm;
+        public string mutation;
+        public string coordinateSpace;
+        public int acceptedPairs;
+        public int droppedBusyPairs;
+        public int readbackFailures;
+        public int activeChunks;
+        public int weightedVoxels;
+        public int contradictionVotes;
+        public int retiredVoxels;
+        public int pendingReplacementVoxels;
+        public int replacementPairsToPublish;
+        public bool atomicChunkFrontHold;
+        public bool productionQ75Enabled;
+        public bool q75ModelReady;
+        public float q75MaximumRisk;
+        public float q75MaximumStereoAnchorSeparationMeters;
+        public float q75CandidateLayerCellMeters;
+        public long q75QualifiedVoxelObservations;
+        public long q75DeferredVoxelObservations;
+        public long layerShiftDeferredObservations;
+        public long layerShiftPublishedVoxels;
+        public int vertices;
+        public int triangles;
+        public int connectedComponents;
+        public float surfaceAreaSquareMeters;
+        public string meshPath;
+        public string meshSha256;
+        public bool renderedDuringCapture;
     }
 
     public readonly struct ReplayProbeHit
@@ -333,6 +429,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [SerializeField] private bool showReplica = true;
     [SerializeField] private Color lineColor =
         new Color(0.02f, 0.86f, 1f, 0.88f);
+    [SerializeField, Range(0.75f, 3f)]
+    private float lineWidthPixels = 1.5f;
 
     public int AcceptedPairCount { get; private set; }
     public int DroppedBusyPairCount { get; private set; }
@@ -357,6 +455,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int SameLayerIncompatibleEdgeCount { get; private set; }
     public int ContradictionVoteCount { get; private set; }
     public int RetiredContradictedVoxelCount { get; private set; }
+    public long LayerShiftDeferredObservationCount { get; private set; }
+    public long LayerShiftPublishedVoxelCount { get; private set; }
     public bool LastSimplificationApplied { get; private set; }
     public int LastPreSimplificationVertexCount { get; private set; }
     public int LastPreSimplificationTriangleCount { get; private set; }
@@ -393,6 +493,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         $"q={PendingMeshChunkCount:D4} " +
         $"rec={(IsRecording ? 1 : 0)} rep={(IsReplaying ? 1 : 0)}";
 
+    public bool ReadyForSynchronizedDepthPair => !HasPendingWork;
+    public string RouteLabel => _abExperimentalArm
+        ? "B-atomic-retirement-hold-v2"
+        : ProductionQ75Enabled
+            ? "A-q75-layer-shift-latch-atomic-v2"
+            : "A-old-rules";
+    private bool UsesProductionQ75 =>
+        ProductionQ75Enabled && !_abExperimentalArm;
+    private bool UsesAtomicRetirement =>
+        _abExperimentalArm || UsesProductionQ75;
+
     private readonly Dictionary<Vector3Int, Chunk> _chunks =
         new Dictionary<Vector3Int, Chunk>(256);
     private readonly Stack<Chunk> _chunkPool = new Stack<Chunk>(64);
@@ -416,6 +527,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         new Dictionary<Vector3Int, DirtyStamp>();
     private readonly HashSet<Vector3Int> _meshPassPublicationChunks =
         new HashSet<Vector3Int>();
+    private readonly List<Vector3Int> _localPublicationChunks =
+        new List<Vector3Int>(128);
 
     private ComputeShader _unproject;
     private int _unprojectKernel = -1;
@@ -436,6 +549,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private int _leftChunkCursor;
     private int _rightChunkCursor;
     private int _garbageCursor;
+    private bool _integrationSliceActive;
+    private Vector3Int _integrationSliceChunkId;
+    private int _integrationSliceEye;
+    private int _integrationSliceLocal;
+    private bool _integrationSliceIsNew;
+    private bool _integrationSliceWrote;
+    private byte _integrationSliceDirtyMask;
+    private Chunk _integrationSliceChunk;
     private int _pendingFrame;
     private double _pendingCaptureTime;
     private Matrix4x4 _leftWorldToClip;
@@ -458,6 +579,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private RoomSetupReplicaV2Tape.Writer _tapeWriter;
     private RoomSetupReplicaV2Tape.Reader _tapeReader;
+    private RoomSetupReplicaV2ShadowMode _shadowMode;
+    private RoomSetupReplicaV2FusionGuardQ75 _fusionGuardQ75;
+    private bool _abExperimentalArm;
+    private string _pendingLiveExportDirectory;
+    private string _pendingLiveExportFileName;
     private bool _processingReplayFrame;
     private float _nextReplayTime;
     private int _replayedFrames;
@@ -475,10 +601,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private Task<RoomSetupReplicaV2XrtSimplifier.Result>
         _simplificationTask;
     private int _simplificationSerial;
+    private float _nextGlobalTopologyCleanupTime;
+    private bool _globalTopologyCleanupDirty;
 
     private GameObject _previewRoot;
     private Material _lineMaterial;
     private Material _depthMaterial;
+    private GameObject _globalLineObject;
+    private MeshFilter _globalLineFilter;
+    private MeshRenderer _globalLineRenderer;
+    private Mesh _globalLineFrontMesh;
+    private Mesh _globalLineBackMesh;
+    private int _globalLineIndexCount;
+    private readonly Dictionary<Vector3Int, RenderPage> _renderPages =
+        new Dictionary<Vector3Int, RenderPage>();
     private bool _meshPassActive;
     private float _nextMeshTime;
     private float _lastScheduledMeshIntervalSeconds;
@@ -511,8 +647,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private readonly float[] _cornerDistances = new float[8];
     private readonly List<Vector3> _meshVertices = new List<Vector3>(4096);
     private readonly List<int> _meshTriangles = new List<int>(8192);
-    private readonly List<int> _meshLines = new List<int>(8192);
+    private readonly List<Vector3> _lineQuadVertices =
+        new List<Vector3>(16384);
+    private readonly List<Vector3> _lineQuadOtherEndpoints =
+        new List<Vector3>(16384);
+    private readonly List<Vector2> _lineQuadExtrusions =
+        new List<Vector2>(16384);
+    private readonly List<int> _meshLines = new List<int>(24576);
     private readonly HashSet<ulong> _uniqueLines = new HashSet<ulong>();
+    private readonly Dictionary<Vector3Int, int> _globalLinePointIds =
+        new Dictionary<Vector3Int, int>(4096);
+    private int _nextGlobalLinePointId;
     private readonly List<KeyValuePair<Vector3Int, Chunk>> _orderedChunks =
         new List<KeyValuePair<Vector3Int, Chunk>>(256);
     private readonly List<int> _orderedChunkVertexBases =
@@ -554,12 +699,23 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     public void ObserveDepthFrame(DepthCapture depth)
     {
+        TryObserveDepthFrame(depth);
+    }
+
+    /// <summary>
+    /// Starts one callback-latched stereo pair and reports whether ownership of
+    /// that exact pair was accepted. The synchronized live A/B harness uses the
+    /// return value to make any accidental one-arm submission visible instead
+    /// of silently treating two different input streams as an algorithm test.
+    /// </summary>
+    public bool TryObserveDepthFrame(DepthCapture depth)
+    {
         if (IsReplaying || depth == null ||
             !DepthCapture.DepthAvailable || HasPendingWork)
         {
             if (HasPendingWork)
                 DroppedBusyPairCount++;
-            return;
+            return false;
         }
 
         Texture source = depth.ChiselSourceDepthTex;
@@ -568,7 +724,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             depth.Proj == null || depth.Proj.Length < 2 ||
             depth.View == null || depth.View.Length < 2 ||
             !EnsureUnproject() || !EnsureTargets(source.width, source.height))
-            return;
+            return false;
 
         DispatchEye(source, depth, 0, _leftWorld);
         DispatchEye(source, depth, 1, _rightWorld);
@@ -588,6 +744,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _rightReadback = AsyncGPUReadback.Request(_rightWorld);
         _pendingGeneration = _resetGeneration;
         _readbackPending = true;
+        return true;
     }
 
     public bool ToggleRecording()
@@ -640,10 +797,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public void StopRecording()
     {
         if (_tapeWriter == null)
+        {
+            _shadowMode?.FlushReceipts();
             return;
+        }
         RoomSetupReplicaV2Tape.Writer writer = _tapeWriter;
         _tapeWriter = null;
         writer.Dispose();
+        _shadowMode?.FlushReceipts();
         bool committed = writer.Failure == null &&
                          writer.WrittenFrames >=
                          MinimumRecordedPairsToCommit &&
@@ -798,6 +959,53 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         showReplica = visible;
         if (_previewRoot != null)
             _previewRoot.SetActive(visible);
+        if (_globalLineObject != null)
+            _globalLineObject.SetActive(
+                visible && _globalLineIndexCount > 0);
+    }
+
+    /// <summary>
+    /// Copies scene-tuned execution and presentation settings before a runtime
+    /// A/B arm starts processing. Reconstruction state is deliberately not
+    /// copied: both arms must build independently from the same stereo pairs.
+    /// </summary>
+    public void CopyRuntimeConfigurationFrom(
+        RoomSetupReplicaV2Reconstruction source)
+    {
+        if (source == null || source == this)
+            return;
+        reconstructionBudgetMilliseconds =
+            source.reconstructionBudgetMilliseconds;
+        integrationChunksPerFrame = source.integrationChunksPerFrame;
+        meshingBudgetMilliseconds = source.meshingBudgetMilliseconds;
+        meshChunksPerFrame = source.meshChunksPerFrame;
+        garbageCollectionFrequencyHz = source.garbageCollectionFrequencyHz;
+        maximumRecordedPairs = source.maximumRecordedPairs;
+        replayHz = source.replayHz;
+        lineColor = source.lineColor;
+        lineWidthPixels = source.lineWidthPixels;
+    }
+
+    /// <summary>
+    /// Selects the experimental B rules on this reconstruction instance before
+    /// it receives input. In synchronized diagnostic capture the baseline A and
+    /// this B instance run as isolated volumes fed by the same platform frame.
+    /// </summary>
+    public void ConfigureAsExperimentalB()
+    {
+        _abExperimentalArm = true;
+    }
+
+    public void RequestLiveExport(string directory, string fileName)
+    {
+        if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
+            return;
+        _pendingLiveExportDirectory = directory;
+        _pendingLiveExportFileName = fileName;
+        Directory.CreateDirectory(directory);
+        Debug.Log(
+            $"[RoomSetupReplicaV2] export queued route={RouteLabel} " +
+            $"pairs={AcceptedPairCount} path={Path.Combine(directory, fileName)}");
     }
 
     [ContextMenu("Clear Room Setup Replica V2")]
@@ -806,9 +1014,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _resetGeneration++;
         _readbackPending = false;
         _workStage = WorkStage.None;
+        ResetIntegrationSlice();
+        ClearRenderPages();
         foreach (Chunk chunk in _chunks.Values)
             DisposeChunk(chunk);
         _chunks.Clear();
+        ClearGlobalLinePreview();
         _chunkPool.Clear();
         _candidateSet.Clear();
         _leftCandidates.Clear();
@@ -820,8 +1031,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _meshQueue.Clear();
         _meshDirtyStamps.Clear();
         _meshPassPublicationChunks.Clear();
+        _localPublicationChunks.Clear();
         _meshPassActive = false;
         _nextMeshTime = 0f;
+        _nextGlobalTopologyCleanupTime = 0f;
+        _globalTopologyCleanupDirty = false;
         _lastScheduledMeshIntervalSeconds = 0f;
         _asyncMeshingPending = false;
         _skippedAsyncBusyCount = 0;
@@ -851,6 +1065,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         SameLayerIncompatibleEdgeCount = 0;
         ContradictionVoteCount = 0;
         RetiredContradictedVoxelCount = 0;
+        LayerShiftDeferredObservationCount = 0;
+        LayerShiftPublishedVoxelCount = 0;
         LastSimplificationApplied = false;
         LastPreSimplificationVertexCount = 0;
         LastPreSimplificationTriangleCount = 0;
@@ -870,8 +1086,17 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         LastReplayMeshPath = string.Empty;
         LastReplayMeshSha256 = string.Empty;
         LastReplayPairCount = 0;
+        _pendingLiveExportDirectory = null;
+        _pendingLiveExportFileName = null;
         _finalVertices.Clear();
         _finalTriangles.Clear();
+        if (!_abExperimentalArm)
+        {
+            if (ShadowObserverEnabled)
+                EnsureShadowMode().ResetShadowSession();
+            if (UsesProductionQ75)
+                EnsureFusionGuardQ75().ResetSession();
+        }
     }
 
     private void Update()
@@ -893,6 +1118,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         if (IsReplaying && !HasPendingWork &&
             Time.unscaledTime >= _nextReplayTime)
             StartNextReplayFrame();
+        TryCompleteLiveExport();
     }
 
     private bool EnsureUnproject()
@@ -1070,7 +1296,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 case WorkStage.GradientRight:
                     if (GradientSlice(
                             _rightDepth, _rightContinuous, deadline))
+                    {
+                        ObserveShadowPair();
                         BeginStage(WorkStage.CandidateRight);
+                    }
                     break;
                 case WorkStage.CandidateRight:
                     if (CandidateSlice(
@@ -1087,10 +1316,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                         goto Done;
                     if (_leftChunkCursor < _leftCandidates.Count)
                     {
-                        IntegrateChunk(
-                            _leftCandidates[_leftChunkCursor++],
+                        if (!IntegrateChunkSlice(
+                            _leftCandidates[_leftChunkCursor],
                             _leftPixels, _leftDepth, _leftContinuous,
-                            _leftWorldToClip);
+                            _leftWorldToClip, 0, deadline))
+                            goto Done;
+                        _leftChunkCursor++;
                         chunkWork++;
                     }
                     else
@@ -1103,10 +1334,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                         goto Done;
                     if (_rightChunkCursor < _rightCandidates.Count)
                     {
-                        IntegrateChunk(
-                            _rightCandidates[_rightChunkCursor++],
+                        if (!IntegrateChunkSlice(
+                            _rightCandidates[_rightChunkCursor],
                             _rightPixels, _rightDepth, _rightContinuous,
-                            _rightWorldToClip);
+                            _rightWorldToClip, 1, deadline))
+                            goto Done;
+                        _rightChunkCursor++;
                         chunkWork++;
                     }
                     else
@@ -1118,7 +1351,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                         }
                         else
                         {
-                            BeginStage(WorkStage.Finalize);
+                            BeginFinalizeStage();
                         }
                     }
                     break;
@@ -1133,8 +1366,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     }
                     else
                     {
-                        BeginStage(WorkStage.Finalize);
+                        BeginFinalizeStage();
                     }
+                    break;
+                case WorkStage.CommitQ75History:
+                    if (_fusionGuardQ75 == null ||
+                        _fusionGuardQ75.CommitPairSlice(deadline))
+                        BeginStage(WorkStage.Finalize);
                     break;
                 case WorkStage.Finalize:
                     FinalizePair();
@@ -1151,6 +1389,85 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         _workStage = stage;
         _cursor = 0;
+    }
+
+    private void BeginFinalizeStage()
+    {
+        if (UsesProductionQ75 && _fusionGuardQ75 != null)
+        {
+            _fusionGuardQ75.BeginCommitPair();
+            BeginStage(WorkStage.CommitQ75History);
+            return;
+        }
+        BeginStage(WorkStage.Finalize);
+    }
+
+    private RoomSetupReplicaV2ShadowMode EnsureShadowMode()
+    {
+        if (_shadowMode == null)
+            _shadowMode = GetComponent<RoomSetupReplicaV2ShadowMode>();
+        if (_shadowMode == null)
+            _shadowMode = gameObject.AddComponent<RoomSetupReplicaV2ShadowMode>();
+        return _shadowMode;
+    }
+
+    private RoomSetupReplicaV2FusionGuardQ75 EnsureFusionGuardQ75()
+    {
+        if (_fusionGuardQ75 == null)
+            _fusionGuardQ75 =
+                GetComponent<RoomSetupReplicaV2FusionGuardQ75>();
+        if (_fusionGuardQ75 == null)
+            _fusionGuardQ75 =
+                gameObject.AddComponent<RoomSetupReplicaV2FusionGuardQ75>();
+        return _fusionGuardQ75;
+    }
+
+    private void ObserveShadowPair()
+    {
+        // The B arm tests only boundary-guarded direct refutation. Running a
+        // second receipt writer would race A for the same JSONL and would add
+        // a different admission mechanism to this experiment.
+        if (_abExperimentalArm)
+            return;
+        if (UsesProductionQ75)
+        {
+            EnsureFusionGuardQ75().BeginPair(
+                _width,
+                _height,
+                _leftPixels,
+                _rightPixels,
+                _leftDepth,
+                _rightDepth,
+                _leftContinuous,
+                _rightContinuous,
+                _leftWorldToClip,
+                _rightWorldToClip,
+                _leftEye,
+                _rightEye);
+            // The old read-only shadow observer computes a second, coarser
+            // stereo/temporal state machine.  Once q75 is production, running
+            // both would add cost without affecting the selected A route.
+            return;
+        }
+        if (!ShadowObserverEnabled)
+            return;
+        RoomSetupReplicaV2ShadowMode shadow = EnsureShadowMode();
+        if (shadow == null || !shadow.ShadowModeEnabled)
+            return;
+        shadow.ObservePair(
+            _pendingFrame,
+            _pendingCaptureTime,
+            _processingReplayFrame,
+            _width,
+            _height,
+            _leftPixels,
+            _rightPixels,
+            _leftDepth,
+            _rightDepth,
+            _leftContinuous,
+            _rightContinuous,
+            _leftWorldToClip,
+            _rightWorldToClip);
     }
 
     private void RecordCurrentPair()
@@ -1211,6 +1528,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 if (_meshQueue.Count > 0 || _meshPassActive ||
                     _simplificationTask != null)
                 {
+                    _nextReplayTime = Time.unscaledTime + 0.05f;
+                    return;
+                }
+                if (_globalTopologyCleanupDirty)
+                {
+                    PublishRemoveSmallCandidateMeshes();
+                    _globalTopologyCleanupDirty = false;
+                    _nextGlobalTopologyCleanupTime = Time.unscaledTime +
+                        GlobalTopologyCleanupIntervalSeconds;
                     _nextReplayTime = Time.unscaledTime + 0.05f;
                     return;
                 }
@@ -1430,29 +1756,52 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _candidateSet.Add(new Vector3Int(x, y, z));
     }
 
-    private void IntegrateChunk(
+    private bool IntegrateChunkSlice(
         Vector3Int chunkId,
         NativeArray<Color> pixels,
         float[] depths,
         byte[] accepted,
-        Matrix4x4 worldToClip)
+        Matrix4x4 worldToClip,
+        int eye,
+        double deadline)
     {
-        bool isNew = !_chunks.TryGetValue(chunkId, out Chunk chunk);
-        if (isNew)
+        if (!_integrationSliceActive)
         {
-            chunk = AcquireChunk();
-            _chunks.Add(chunkId, chunk);
+            _integrationSliceActive = true;
+            _integrationSliceChunkId = chunkId;
+            _integrationSliceEye = eye;
+            _integrationSliceLocal = 0;
+            _integrationSliceWrote = false;
+            _integrationSliceDirtyMask = 0;
+            _integrationSliceIsNew =
+                !_chunks.TryGetValue(chunkId, out _integrationSliceChunk);
+            if (_integrationSliceIsNew)
+            {
+                _integrationSliceChunk = AcquireChunk();
+                _chunks.Add(chunkId, _integrationSliceChunk);
+            }
         }
+        else if (_integrationSliceChunkId != chunkId ||
+                 _integrationSliceEye != eye)
+        {
+            throw new InvalidOperationException(
+                "RoomSetupReplicaV2 integration slice changed owner before completion");
+        }
+
+        Chunk chunk = _integrationSliceChunk;
 
         Vector3Int origin = chunkId * ChunkSize;
         PrepareProjectionTerms(origin, worldToClip);
-        bool wrote = false;
-        byte dirtyMask = 0;
-        for (int z = 0; z < ChunkSize; z++)
-        for (int y = 0; y < ChunkSize; y++)
-        for (int x = 0; x < ChunkSize; x++)
+        while (_integrationSliceLocal < VoxelsPerChunk)
         {
-            int local = x + ChunkSize * (y + ChunkSize * z);
+            if ((_integrationSliceLocal & 15) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+            int local = _integrationSliceLocal++;
+            int x = local % ChunkSize;
+            int yz = local / ChunkSize;
+            int y = yz % ChunkSize;
+            int z = yz / ChunkSize;
             float clipX = ((_clipXX[x] + _clipXY[y]) +
                            _clipXZ[z]) + worldToClip.m03;
             float clipY = ((_clipYX[x] + _clipYY[y]) +
@@ -1489,53 +1838,174 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             Color surface = pixels[index];
             Vector3 layerAnchor = new Vector3(
                 surface.r, surface.g, surface.b);
+            Vector3 voxelWorld = new Vector3(
+                (origin.x + x) * VoxelMeters,
+                (origin.y + y) * VoxelMeters,
+                (origin.z + z) * VoxelMeters);
+            if (UsesAtomicRetirement &&
+                old.retiredOnce && old.weight <= 0f)
+            {
+                Vector3 replacementAnchor = layerAnchor;
+                if (UsesProductionQ75 &&
+                    !TryQualifyQ75Voxel(
+                        eye, index, voxelWorld,
+                        out replacementAnchor, out _))
+                {
+                    // Missing, conflicting, or high-risk evidence defers.  It
+                    // never erases the old Front and never resets a qualified
+                    // replacement streak.
+                    continue;
+                }
+                Voxel replacement = AdvanceReplacementCandidate(
+                    old, sampleDistance, sampleWeight, replacementAnchor,
+                    CandidateLayerKey(replacementAnchor), pair,
+                    out bool publishedReplacement);
+                chunk.voxels[local] = replacement;
+                if (publishedReplacement)
+                {
+                    chunk.pendingReplacementVoxels = Mathf.Max(
+                        0, chunk.pendingReplacementVoxels - 1);
+                    WeightedVoxelCount++;
+                }
+                if (MeshRelevantChange(old, replacement))
+                    AddDirtyVoxel(ref _integrationSliceDirtyMask, local);
+                _integrationSliceWrote = true;
+                continue;
+            }
+            if (UsesProductionQ75 && old.weight > 0f &&
+                !old.retiredOnce && old.replacementWeight > 0f &&
+                old.lastEvidencePair == pair)
+            {
+                // The other eye already established this pair's stereo
+                // challenger. Do not let the second integration pass clear it
+                // merely because its projective TSDF residual is slightly
+                // closer to the old dominant value.
+                _integrationSliceWrote = true;
+                continue;
+            }
             byte contradictionStreak = old.contradictionStreak;
             Vector3 contradictionAnchor = old.contradictionAnchor;
+            Vector3Int contradictionLayerKey =
+                old.contradictionLayerKey;
             sbyte contradictionSign = old.contradictionSign;
             int lastEvidencePair = old.lastEvidencePair;
-            bool oppositeDirectObservation = !old.retiredOnce &&
+            bool footprintSupported = !_abExperimentalArm ||
+                HasInteriorRefutationFootprint(depths, px, py);
+            bool matureDominant = !old.retiredOnce &&
                 old.weight >= ContradictionMinimumMatureWeight &&
                 Mathf.Abs(old.distance) >=
-                    ContradictionMinimumDistanceMeters &&
-                Mathf.Abs(sampleDistance) >=
-                    ContradictionMinimumDistanceMeters &&
+                    ContradictionMinimumDistanceMeters;
+            bool signOpposesDominant = matureDominant &&
+                sampleDistance != 0f &&
                 Mathf.Sign(old.distance) != Mathf.Sign(sampleDistance);
+            bool directOpposition = signOpposesDominant &&
+                Mathf.Abs(sampleDistance) >=
+                    ContradictionMinimumDistanceMeters;
+            bool matureLayerSurface = UsesProductionQ75 &&
+                !old.retiredOnce &&
+                old.weight >= ContradictionMinimumMatureWeight &&
+                Finite(old.layerAnchor) &&
+                old.layerAnchor.sqrMagnitude > 0.000001f;
+            bool sameSignLayerShift = matureLayerSurface &&
+                !signOpposesDominant &&
+                Mathf.Abs(sampleDistance - old.distance) >=
+                    LayerShiftChallengeMeters;
+            if (sameSignLayerShift)
+            {
+                RoomSetupReplicaV2FusionGuardQ75 guard =
+                    EnsureFusionGuardQ75();
+                if (guard == null || !guard.ModelReady ||
+                    !guard.TryGetStereoSurfaceAnchor(
+                        eye, index, out Vector3 stereoAnchor))
+                {
+                    LayerShiftDeferredObservationCount++;
+                    continue;
+                }
+                Voxel shifted = AdvanceLayerShiftCandidate(
+                    old, sampleDistance, sampleWeight, stereoAnchor,
+                    CandidateLayerKey(stereoAnchor), pair,
+                    out bool publishedShift);
+                chunk.voxels[local] = shifted;
+                if (publishedShift)
+                {
+                    LayerShiftPublishedVoxelCount++;
+                    if (MeshRelevantChange(old, shifted))
+                        AddDirtyVoxel(ref _integrationSliceDirtyMask, local);
+                }
+                else
+                {
+                    LayerShiftDeferredObservationCount++;
+                }
+                _integrationSliceWrote = true;
+                continue;
+            }
+            // replacement* is otherwise unused while a voxel still has a
+            // mature dominant surface. Returning to that surface, or entering
+            // the signed contradiction route, cancels a stale layer-shift
+            // challenger without touching the dominant TSDF value.
+            ClearLayerShiftCandidate(ref old);
+            bool q75Qualified = false;
+            Vector3 qualifiedAnchor = layerAnchor;
+            sbyte qualifiedSign = sampleDistance > 0f
+                ? (sbyte)1
+                : (sbyte)-1;
+            if (UsesProductionQ75 && directOpposition)
+            {
+                q75Qualified = TryQualifyQ75Voxel(
+                    eye, index, voxelWorld,
+                    out qualifiedAnchor, out qualifiedSign);
+            }
+            bool oppositeDirectObservation = directOpposition &&
+                footprintSupported &&
+                (!UsesProductionQ75 || q75Qualified);
             if (old.weight > 0f && pair != lastEvidencePair)
             {
                 if (oppositeDirectObservation)
                 {
-                    sbyte sampleSign = sampleDistance > 0f
-                        ? (sbyte)1
-                        : (sbyte)-1;
+                    sbyte sampleSign = UsesProductionQ75
+                        ? qualifiedSign
+                        : sampleDistance > 0f
+                            ? (sbyte)1
+                            : (sbyte)-1;
+                    Vector3 candidateAnchor = UsesProductionQ75
+                        ? qualifiedAnchor
+                        : layerAnchor;
+                    Vector3Int candidateLayerKey =
+                        CandidateLayerKey(candidateAnchor);
                     bool consistentCandidate =
                         contradictionStreak > 0 &&
                         contradictionSign == sampleSign &&
-                        Finite(layerAnchor) &&
+                        (!UsesProductionQ75 ||
+                         contradictionLayerKey == candidateLayerKey) &&
+                        Finite(candidateAnchor) &&
                         Finite(contradictionAnchor) &&
                         Vector3.Distance(
-                            layerAnchor, contradictionAnchor) <=
+                            candidateAnchor, contradictionAnchor) <=
                             ContradictionAnchorConsistencyMeters;
                     contradictionStreak = consistentCandidate
                         ? (byte)Mathf.Min(
                             byte.MaxValue, contradictionStreak + 1)
                         : (byte)1;
-                    contradictionAnchor = layerAnchor;
+                    contradictionAnchor = candidateAnchor;
+                    contradictionLayerKey = candidateLayerKey;
                     contradictionSign = sampleSign;
                     ContradictionVoteCount++;
+                    lastEvidencePair = pair;
                 }
-                else
+                else if (!UsesProductionQ75 || !signOpposesDominant)
                 {
                     contradictionStreak = 0;
                     contradictionAnchor = default;
+                    contradictionLayerKey = default;
                     contradictionSign = 0;
+                    lastEvidencePair = pair;
                 }
-                lastEvidencePair = pair;
             }
             float retained = old.weight > 0f
                 ? Mathf.Min(old.weight, MaximumWeight - sampleWeight)
                 : 0f;
             bool retiredNow = false;
-            if (ContradictionRetirementEnabled &&
+            if ((ContradictionRetirementEnabled || UsesAtomicRetirement) &&
                 contradictionStreak >= ContradictionPairsToRetire)
             {
                 // Retirement is local and evidence driven. Nothing happens
@@ -1543,55 +2013,307 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 retained = 0f;
                 contradictionStreak = 0;
                 contradictionAnchor = default;
+                contradictionLayerKey = default;
                 contradictionSign = 0;
                 retiredNow = true;
                 RetiredContradictedVoxelCount++;
             }
             retained = Mathf.Max(0f, retained);
-            float newWeight = retained + sampleWeight;
-            Voxel updated = new Voxel
+            Voxel updated;
+            if (retiredNow)
             {
-                distance = QuantizeHalf(retained > 0f
-                    ? (old.distance * retained + sampleDistance * sampleWeight) /
-                      newWeight
-                    : sampleDistance),
-                weight = QuantizeHalf(newWeight),
-                layerAnchor = Finite(layerAnchor)
-                    ? layerAnchor
-                    : old.layerAnchor,
-                contradictionAnchor = contradictionAnchor,
-                lastEvidencePair = lastEvidencePair == 0
-                    ? pair
-                    : lastEvidencePair,
-                contradictionStreak = contradictionStreak,
-                contradictionSign = contradictionSign,
-                retiredOnce = old.retiredOnce || retiredNow
-            };
+                // Do not turn the fifth contradictory sample directly into a
+                // new zero crossing. Quarantine it as a replacement candidate
+                // and keep this chunk's previous Front until all its pending
+                // replacements have survived additional direct observations.
+                updated = new Voxel
+                {
+                    distance = old.distance,
+                    weight = 0f,
+                    layerAnchor = old.layerAnchor,
+                    lastEvidencePair = pair,
+                    retiredOnce = true,
+                    replacementDistance = sampleDistance,
+                    replacementWeight = sampleWeight,
+                    replacementAnchor = UsesProductionQ75
+                        ? qualifiedAnchor
+                        : layerAnchor,
+                    replacementLayerKey = CandidateLayerKey(
+                        UsesProductionQ75
+                            ? qualifiedAnchor
+                            : layerAnchor),
+                    replacementStreak = 0,
+                    replacementSign = sampleDistance > 0f
+                        ? (sbyte)1
+                        : (sbyte)-1
+                };
+                chunk.pendingReplacementVoxels++;
+                WeightedVoxelCount = Mathf.Max(0, WeightedVoxelCount - 1);
+            }
+            else if (UsesProductionQ75 && signOpposesDominant)
+            {
+                // This is the central production change: a mature surface is
+                // not averaged toward zero by one opposing snapshot.  A q75
+                // qualified observation can advance its isolated challenger;
+                // everything else simply defers.
+                old.contradictionAnchor = contradictionAnchor;
+                old.contradictionLayerKey = contradictionLayerKey;
+                old.lastEvidencePair = lastEvidencePair;
+                old.contradictionStreak = contradictionStreak;
+                old.contradictionSign = contradictionSign;
+                chunk.voxels[local] = old;
+                _integrationSliceWrote = true;
+                continue;
+            }
+            else
+            {
+                float newWeight = retained + sampleWeight;
+                updated = new Voxel
+                {
+                    distance = QuantizeHalf(retained > 0f
+                        ? (old.distance * retained +
+                           sampleDistance * sampleWeight) / newWeight
+                        : sampleDistance),
+                    weight = QuantizeHalf(newWeight),
+                    layerAnchor = Finite(layerAnchor)
+                        ? layerAnchor
+                        : old.layerAnchor,
+                    contradictionAnchor = contradictionAnchor,
+                    contradictionLayerKey = contradictionLayerKey,
+                    lastEvidencePair = lastEvidencePair == 0
+                        ? pair
+                        : lastEvidencePair,
+                    contradictionStreak = contradictionStreak,
+                    contradictionSign = contradictionSign,
+                    retiredOnce = old.retiredOnce
+                };
+            }
             chunk.voxels[local] = updated;
-            if (old.weight <= 0f)
+            if (old.weight <= 0f && updated.weight > 0f)
                 WeightedVoxelCount++;
             if (MeshRelevantChange(old, updated))
-                AddDirtyVoxel(ref dirtyMask, local);
-            wrote = true;
+                AddDirtyVoxel(ref _integrationSliceDirtyMask, local);
+            _integrationSliceWrote = true;
+
         }
 
-        if (!wrote && isNew)
+        if (!_integrationSliceWrote && _integrationSliceIsNew)
         {
             _chunks.Remove(chunkId);
             RecycleChunk(chunk);
-            return;
         }
-        if ((dirtyMask & 8) != 0)
-            RecordTouched(chunkId, dirtyMask);
+        else if ((_integrationSliceDirtyMask & 8) != 0)
+        {
+            RecordTouched(chunkId, _integrationSliceDirtyMask);
+        }
+        ResetIntegrationSlice();
+        return true;
+    }
+
+    private void ResetIntegrationSlice()
+    {
+        _integrationSliceActive = false;
+        _integrationSliceChunkId = default;
+        _integrationSliceEye = 0;
+        _integrationSliceLocal = 0;
+        _integrationSliceIsNew = false;
+        _integrationSliceWrote = false;
+        _integrationSliceDirtyMask = 0;
+        _integrationSliceChunk = null;
     }
 
     private static bool MeshRelevantChange(Voxel old, Voxel updated)
     {
-        if (old.weight <= 0f)
+        bool oldObserved = old.weight > 0f;
+        bool updatedObserved = updated.weight > 0f;
+        if (oldObserved != updatedObserved)
             return true;
+        if (!oldObserved)
+            return false;
         // Room Setup rebuilds its derived mesh field from the current source
         // field. Do not add a ScanCover-specific geometry-change threshold.
         return old.distance != updated.distance;
+    }
+
+    private bool TryQualifyQ75Voxel(
+        int eye,
+        int pixel,
+        Vector3 voxelWorld,
+        out Vector3 anchor,
+        out sbyte sign)
+    {
+        anchor = default;
+        sign = 0;
+        RoomSetupReplicaV2FusionGuardQ75 guard = EnsureFusionGuardQ75();
+        return guard != null && guard.ModelReady &&
+               guard.TryQualifyVoxelObservation(
+                   eye, pixel, voxelWorld, out anchor, out sign);
+    }
+
+    private static Vector3Int CandidateLayerKey(Vector3 anchor)
+    {
+        return new Vector3Int(
+            Mathf.RoundToInt(anchor.x / Q75CandidateLayerCellMeters),
+            Mathf.RoundToInt(anchor.y / Q75CandidateLayerCellMeters),
+            Mathf.RoundToInt(anchor.z / Q75CandidateLayerCellMeters));
+    }
+
+    private static Voxel AdvanceReplacementCandidate(
+        Voxel old,
+        float sampleDistance,
+        float sampleWeight,
+        Vector3 layerAnchor,
+        Vector3Int layerKey,
+        int pair,
+        out bool published)
+    {
+        if (old.lastEvidencePair == pair)
+        {
+            published = false;
+            return old;
+        }
+        sbyte sampleSign = sampleDistance > 0f ? (sbyte)1 : (sbyte)-1;
+        bool consistent = old.replacementWeight > 0f &&
+                          old.replacementSign == sampleSign &&
+                          old.replacementLayerKey == layerKey &&
+                          Finite(layerAnchor) &&
+                          Finite(old.replacementAnchor) &&
+                          Vector3.Distance(
+                              layerAnchor, old.replacementAnchor) <=
+                          ContradictionAnchorConsistencyMeters;
+        float candidateWeight = consistent
+            ? old.replacementWeight + sampleWeight
+            : sampleWeight;
+        float candidateDistance = consistent
+            ? (old.replacementDistance * old.replacementWeight +
+               sampleDistance * sampleWeight) /
+              Mathf.Max(0.000001f, candidateWeight)
+            : sampleDistance;
+        byte candidateStreak = consistent
+            ? (byte)Mathf.Min(byte.MaxValue, old.replacementStreak + 1)
+            : (byte)1;
+        published = candidateStreak >= ReplacementPairsToPublish;
+        if (published)
+        {
+            return new Voxel
+            {
+                distance = QuantizeHalf(candidateDistance),
+                weight = QuantizeHalf(candidateWeight),
+                layerAnchor = layerAnchor,
+                lastEvidencePair = pair,
+                retiredOnce = true
+            };
+        }
+        return new Voxel
+        {
+            distance = old.distance,
+            weight = 0f,
+            layerAnchor = old.layerAnchor,
+            lastEvidencePair = pair,
+            retiredOnce = true,
+            replacementDistance = candidateDistance,
+            replacementWeight = candidateWeight,
+            replacementAnchor = layerAnchor,
+            replacementLayerKey = layerKey,
+            replacementStreak = candidateStreak,
+            replacementSign = sampleSign
+        };
+    }
+
+    private static Voxel AdvanceLayerShiftCandidate(
+        Voxel old,
+        float sampleDistance,
+        float sampleWeight,
+        Vector3 layerAnchor,
+        Vector3Int layerKey,
+        int pair,
+        out bool published)
+    {
+        if (old.lastEvidencePair == pair)
+        {
+            published = false;
+            return old;
+        }
+        sbyte sampleSign = sampleDistance >= 0f ? (sbyte)1 : (sbyte)-1;
+        bool consistent = old.replacementWeight > 0f &&
+                          old.replacementSign == sampleSign &&
+                          Mathf.Abs(
+                              old.replacementDistance - sampleDistance) <=
+                          LayerShiftDistanceConsistencyMeters &&
+                          Finite(layerAnchor) &&
+                          Finite(old.replacementAnchor) &&
+                          Vector3.Distance(
+                              layerAnchor, old.replacementAnchor) <=
+                          LayerShiftAnchorConsistencyMeters;
+        float candidateWeight = consistent
+            ? old.replacementWeight + sampleWeight
+            : sampleWeight;
+        float candidateDistance = consistent
+            ? (old.replacementDistance * old.replacementWeight +
+               sampleDistance * sampleWeight) /
+              Mathf.Max(0.000001f, candidateWeight)
+            : sampleDistance;
+        byte candidateStreak = consistent
+            ? (byte)Mathf.Min(byte.MaxValue, old.replacementStreak + 1)
+            : (byte)1;
+        published = candidateStreak >= LayerShiftPairsToReplace;
+        if (published)
+        {
+            return new Voxel
+            {
+                distance = QuantizeHalf(candidateDistance),
+                weight = QuantizeHalf(candidateWeight),
+                layerAnchor = layerAnchor,
+                lastEvidencePair = pair,
+                retiredOnce = old.retiredOnce
+            };
+        }
+        old.lastEvidencePair = pair;
+        old.replacementDistance = candidateDistance;
+        old.replacementWeight = candidateWeight;
+        old.replacementAnchor = layerAnchor;
+        old.replacementLayerKey = layerKey;
+        old.replacementStreak = candidateStreak;
+        old.replacementSign = sampleSign;
+        return old;
+    }
+
+    private static void ClearLayerShiftCandidate(ref Voxel voxel)
+    {
+        if (voxel.weight <= 0f || voxel.retiredOnce ||
+            voxel.replacementWeight <= 0f)
+            return;
+        voxel.replacementDistance = 0f;
+        voxel.replacementWeight = 0f;
+        voxel.replacementAnchor = default;
+        voxel.replacementLayerKey = default;
+        voxel.replacementStreak = 0;
+        voxel.replacementSign = 0;
+    }
+
+    private bool HasInteriorRefutationFootprint(
+        float[] depths, int centerX, int centerY)
+    {
+        if (depths == null ||
+            centerX < RefutationFootprintRadiusPixels ||
+            centerY < RefutationFootprintRadiusPixels ||
+            centerX >= _width - RefutationFootprintRadiusPixels ||
+            centerY >= _height - RefutationFootprintRadiusPixels)
+            return false;
+        float minimum = float.PositiveInfinity;
+        float maximum = float.NegativeInfinity;
+        for (int y = centerY - RefutationFootprintRadiusPixels;
+             y <= centerY + RefutationFootprintRadiusPixels; y++)
+        for (int x = centerX - RefutationFootprintRadiusPixels;
+             x <= centerX + RefutationFootprintRadiusPixels; x++)
+        {
+            float value = depths[x + y * _width];
+            if (!(value > 0f) || !float.IsFinite(value))
+                return false;
+            minimum = Mathf.Min(minimum, value);
+            maximum = Mathf.Max(maximum, value);
+        }
+        return maximum - minimum < RefutationFootprintSpreadMeters;
     }
 
     private void BeginGarbagePass()
@@ -1936,6 +2658,20 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float contradictionMinimumMatureWeight;
         public float contradictionAnchorConsistencyMeters;
         public int contradictionPairsToRetire;
+        public int replacementPairsToPublish;
+        public bool atomicChunkFrontHold;
+        public bool productionQ75Enabled;
+        public bool q75ModelReady;
+        public float q75MaximumRisk;
+        public float q75MaximumStereoAnchorSeparationMeters;
+        public float q75CandidateLayerCellMeters;
+        public long q75QualifiedVoxelObservations;
+        public long q75DeferredVoxelObservations;
+        public float layerShiftChallengeMeters;
+        public float layerShiftDistanceConsistencyMeters;
+        public int layerShiftPairsToReplace;
+        public long layerShiftDeferredObservations;
+        public long layerShiftPublishedVoxels;
         public bool contradictionSingleRetirementPerVoxel;
         public int contradictionVotes;
         public int retiredContradictedVoxels;
@@ -1978,12 +2714,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 "last-replay-receipt.json");
             var receipt = new ReplayReceipt
             {
-                algorithm = SameLayerSupportEnabled
-                    ? (ContradictionRetirementEnabled
-                        ? "V2CSpatialReceiptSamePairCrossingEdgeConservativeRetirement"
-                        : "V2CSpatialReceiptSamePairCrossingEdgeLayerOnly")
-                    : (ContradictionRetirementEnabled
-                        ? "V2CSpatialReceiptRepeatedContradictionOnly"
+                algorithm = _abExperimentalArm
+                    ? "V2BAtomicRetirementHoldV2"
+                    : UsesProductionQ75
+                        ? "V2AProductionQ75LayerShiftLatchAtomicV2"
+                        : (SameLayerSupportEnabled
+                        ? "V2CSpatialReceiptSamePairCrossingEdgeLayerOnly"
                         : "V2CSpatialReceiptBaseline"),
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
@@ -2177,7 +2913,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 sameLayerRule =
                     "RejectOnlyIncompatibleZeroCrossingEdgeWithSamePairWitness",
                 contradictionRetirementEnabled =
-                    ContradictionRetirementEnabled,
+                    ContradictionRetirementEnabled || UsesAtomicRetirement,
                 contradictionMinimumDistanceMeters =
                     ContradictionMinimumDistanceMeters,
                 contradictionMinimumMatureWeight =
@@ -2186,13 +2922,44 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     ContradictionAnchorConsistencyMeters,
                 contradictionPairsToRetire =
                     ContradictionPairsToRetire,
+                replacementPairsToPublish =
+                    ReplacementPairsToPublish,
+                atomicChunkFrontHold = UsesAtomicRetirement,
+                productionQ75Enabled = UsesProductionQ75,
+                q75ModelReady =
+                    _fusionGuardQ75 != null &&
+                    _fusionGuardQ75.ModelReady,
+                q75MaximumRisk =
+                    RoomSetupReplicaV2FusionGuardQ75.MaximumRisk,
+                q75MaximumStereoAnchorSeparationMeters =
+                    RoomSetupReplicaV2FusionGuardQ75
+                        .MaximumStereoAnchorSeparationMeters,
+                q75CandidateLayerCellMeters =
+                    Q75CandidateLayerCellMeters,
+                q75QualifiedVoxelObservations =
+                    _fusionGuardQ75 != null
+                        ? _fusionGuardQ75.QualifiedVoxelObservations
+                        : 0,
+                q75DeferredVoxelObservations =
+                    _fusionGuardQ75 != null
+                        ? _fusionGuardQ75.DeferredVoxelObservations
+                        : 0,
+                layerShiftChallengeMeters = LayerShiftChallengeMeters,
+                layerShiftDistanceConsistencyMeters =
+                    LayerShiftDistanceConsistencyMeters,
+                layerShiftPairsToReplace = LayerShiftPairsToReplace,
+                layerShiftDeferredObservations =
+                    LayerShiftDeferredObservationCount,
+                layerShiftPublishedVoxels =
+                    LayerShiftPublishedVoxelCount,
                 contradictionSingleRetirementPerVoxel = true,
                 contradictionVotes = ContradictionVoteCount,
                 retiredContradictedVoxels =
                     RetiredContradictedVoxelCount,
                 contradictionRetirementRule =
                     "FiveConsistentDirectPairsOpposeMatureOldSign_" +
-                    "StableAnchor_OneLocalReset_NoDecay"
+                    "StableAnchor_QuarantineThreeMorePairs_" +
+                    "AtomicChunkFrontHold_OneLocalReset_NoDecay"
             };
             File.WriteAllText(
                 receiptPath, JsonUtility.ToJson(receipt, true));
@@ -2208,11 +2975,116 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         }
     }
 
-    private FinalMeshMetrics ExportAndMeasureFinalMesh(string directory)
+    private void TryCompleteLiveExport()
+    {
+        if (string.IsNullOrEmpty(_pendingLiveExportDirectory) ||
+            string.IsNullOrEmpty(_pendingLiveExportFileName) ||
+            HasPendingWork || _meshQueue.Count > 0 || _meshPassActive ||
+            _simplificationTask != null)
+            return;
+        if (_globalTopologyCleanupDirty)
+        {
+            PublishRemoveSmallCandidateMeshes();
+            _globalTopologyCleanupDirty = false;
+            _nextGlobalTopologyCleanupTime = Time.unscaledTime +
+                GlobalTopologyCleanupIntervalSeconds;
+            return;
+        }
+        string directory = _pendingLiveExportDirectory;
+        string fileName = _pendingLiveExportFileName;
+        _pendingLiveExportDirectory = null;
+        _pendingLiveExportFileName = null;
+        try
+        {
+            FinalMeshMetrics metrics = ExportAndMeasureFinalMesh(
+                directory, fileName);
+            var receipt = new LiveMeshReceipt
+            {
+                schema = "roomsetup-replica-v2-live-mesh-v1",
+                createdUtc = DateTime.UtcNow.ToString("O"),
+                arm = RouteLabel,
+                mutation = _abExperimentalArm
+                    ? "5x5-valid-spread-under-12cm plus five-pair direct refutation; replacement quarantined for three more stable pairs and published with an atomic chunk Front"
+                    : UsesProductionQ75
+                        ? "ordinary first-surface fusion plus two-pair stereo layer-shift latch for mature same-sign TSDF jumps; signed opposition keeps the q75 dominant/challenger atomic route"
+                        : "frozen old admission fusion extraction and lifecycle rules",
+                coordinateSpace = "QuestStage",
+                acceptedPairs = AcceptedPairCount,
+                droppedBusyPairs = DroppedBusyPairCount,
+                readbackFailures = ReadbackFailureCount,
+                activeChunks = ActiveChunkCount,
+                weightedVoxels = WeightedVoxelCount,
+                contradictionVotes = ContradictionVoteCount,
+                retiredVoxels = RetiredContradictedVoxelCount,
+                pendingReplacementVoxels =
+                    CountPendingReplacementVoxels(),
+                replacementPairsToPublish = ReplacementPairsToPublish,
+                atomicChunkFrontHold = UsesAtomicRetirement,
+                productionQ75Enabled = UsesProductionQ75,
+                q75ModelReady =
+                    _fusionGuardQ75 != null &&
+                    _fusionGuardQ75.ModelReady,
+                q75MaximumRisk =
+                    RoomSetupReplicaV2FusionGuardQ75.MaximumRisk,
+                q75MaximumStereoAnchorSeparationMeters =
+                    RoomSetupReplicaV2FusionGuardQ75
+                        .MaximumStereoAnchorSeparationMeters,
+                q75CandidateLayerCellMeters =
+                    Q75CandidateLayerCellMeters,
+                q75QualifiedVoxelObservations =
+                    _fusionGuardQ75 != null
+                        ? _fusionGuardQ75.QualifiedVoxelObservations
+                        : 0,
+                q75DeferredVoxelObservations =
+                    _fusionGuardQ75 != null
+                        ? _fusionGuardQ75.DeferredVoxelObservations
+                        : 0,
+                layerShiftDeferredObservations =
+                    LayerShiftDeferredObservationCount,
+                layerShiftPublishedVoxels =
+                    LayerShiftPublishedVoxelCount,
+                vertices = metrics.vertices,
+                triangles = metrics.triangles,
+                connectedComponents = metrics.connectedComponents,
+                surfaceAreaSquareMeters = metrics.surfaceAreaSquareMeters,
+                meshPath = metrics.path,
+                meshSha256 = metrics.sha256,
+                renderedDuringCapture = showReplica
+            };
+            string receiptPath = Path.Combine(
+                directory,
+                Path.GetFileNameWithoutExtension(fileName) + ".json");
+            File.WriteAllText(
+                receiptPath, JsonUtility.ToJson(receipt, true) + "\n");
+            Debug.Log(
+                $"[RoomSetupReplicaV2] export complete route={receipt.arm} " +
+                $"pairs={receipt.acceptedPairs} tri={receipt.triangles} " +
+                $"retired={receipt.retiredVoxels} path={metrics.path}");
+        }
+        catch (Exception exception)
+        {
+            Debug.LogError(
+                $"[RoomSetupReplicaV2] export failed route={RouteLabel}: " +
+                exception);
+        }
+    }
+
+    private int CountPendingReplacementVoxels()
+    {
+        int total = 0;
+        foreach (Chunk chunk in _chunks.Values)
+            total += chunk.pendingReplacementVoxels;
+        return total;
+    }
+
+    private FinalMeshMetrics ExportAndMeasureFinalMesh(
+        string directory, string fileName = "last-replay-mesh.ply")
     {
         _orderedChunks.Clear();
         foreach (KeyValuePair<Vector3Int, Chunk> item in _chunks)
-            if (item.Value.frontMesh != null && item.Value.triangleCount > 0)
+            if (item.Value.publishedVertices != null &&
+                item.Value.publishedTriangles != null &&
+                item.Value.publishedTriangles.Length > 0)
                 _orderedChunks.Add(item);
         _orderedChunks.Sort(CompareChunks);
 
@@ -2222,9 +3094,9 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
              chunkIndex < _orderedChunks.Count;
              chunkIndex++)
         {
-            Mesh mesh = _orderedChunks[chunkIndex].Value.frontMesh;
-            Vector3[] vertices = mesh.vertices;
-            int[] triangles = mesh.GetTriangles(0);
+            Chunk chunk = _orderedChunks[chunkIndex].Value;
+            Vector3[] vertices = chunk.publishedVertices;
+            int[] triangles = chunk.publishedTriangles;
             int vertexBase = _finalVertices.Count;
             _finalVertices.AddRange(vertices);
             for (int i = 0; i < triangles.Length; i++)
@@ -2235,13 +3107,29 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         {
             vertices = _finalVertices.Count,
             triangles = _finalTriangles.Count / 3,
-            path = Path.Combine(directory, "last-replay-mesh.ply")
+            path = Path.Combine(directory, fileName)
         };
         WriteBinaryPly(metrics.path, _finalVertices, _finalTriangles);
         metrics.sha256 = ComputeFileSha256(metrics.path);
+        metrics.surfaceAreaSquareMeters = MeasureSurfaceArea(
+            _finalVertices, _finalTriangles);
         MeasureConnectedComponents(metrics);
         MeasurePlanarResidual(metrics);
         return metrics;
+    }
+
+    private static float MeasureSurfaceArea(
+        List<Vector3> vertices, List<int> triangles)
+    {
+        double area = 0d;
+        for (int index = 0; index + 2 < triangles.Count; index += 3)
+        {
+            Vector3 a = vertices[triangles[index]];
+            Vector3 b = vertices[triangles[index + 1]];
+            Vector3 c = vertices[triangles[index + 2]];
+            area += Vector3.Cross(b - a, c - a).magnitude * 0.5d;
+        }
+        return (float)area;
     }
 
     private void MeasureDirectDepthSupport(
@@ -2957,7 +3845,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void CompleteMeshPass()
     {
-        PublishRemoveSmallCandidateMeshes();
+        bool globalCleanupDue = !RenderPageBatchingEnabled ||
+            _renderPages.Count == 0 ||
+            Time.unscaledTime >= _nextGlobalTopologyCleanupTime;
+        if (globalCleanupDue)
+        {
+            PublishRemoveSmallCandidateMeshes();
+            _nextGlobalTopologyCleanupTime = Time.unscaledTime +
+                GlobalTopologyCleanupIntervalSeconds;
+            _globalTopologyCleanupDirty = false;
+        }
+        else
+        {
+            PublishDirtyCandidateMeshes();
+            _globalTopologyCleanupDirty = true;
+        }
         _meshPassPublicationChunks.Clear();
         _meshPassActive = false;
         LastDerivedValidSampleCount = _passDerivedValidSamples;
@@ -2969,6 +3871,67 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 Time.realtimeSinceStartupAsDouble - _replayStartRealtime);
             _firstMeshPair = _replayedFrames;
         }
+    }
+
+    private void PublishDirtyCandidateMeshes()
+    {
+        _localPublicationChunks.Clear();
+        foreach (Vector3Int chunkId in _meshPassPublicationChunks)
+        {
+            _localPublicationChunks.Add(chunkId);
+            if (_chunks.TryGetValue(chunkId, out Chunk chunk))
+                PublishCandidateChunkMesh(chunkId, chunk);
+        }
+
+        RebuildRenderPages(
+            _localPublicationChunks,
+            _renderPages.Count == 0);
+        PreviewTriangleCount = 0;
+        foreach (Chunk chunk in _chunks.Values)
+            PreviewTriangleCount += chunk.triangleCount;
+        for (int i = 0; i < _localPublicationChunks.Count; i++)
+            RecordCorrectionPublication(_localPublicationChunks[i]);
+        _meshPublicationCount++;
+        LastSimplificationApplied = false;
+        LastSimplificationStopReason =
+            "LocalPagePublishPendingPeriodicGlobalCleanup";
+    }
+
+    private void PublishCandidateChunkMesh(Vector3Int chunkId, Chunk chunk)
+    {
+        Vector3[] vertices = chunk.candidateVertices ??
+            Array.Empty<Vector3>();
+        int[] triangles = chunk.candidateTriangles ?? Array.Empty<int>();
+        int triangleCount = triangles.Length / 3;
+        chunk.publishedVertices = vertices;
+        chunk.publishedTriangles = triangles;
+        chunk.triangleCount = triangleCount;
+
+        if (RenderPageBatchingEnabled)
+        {
+            if (chunk.previewObject != null)
+                chunk.previewObject.SetActive(false);
+            return;
+        }
+
+        if (triangleCount <= 0)
+        {
+            if (chunk.previewObject != null)
+                chunk.previewObject.SetActive(false);
+            return;
+        }
+        EnsureChunkPreview(chunkId, chunk);
+        Mesh staging = chunk.backMesh;
+        staging.Clear(false);
+        staging.vertices = vertices;
+        staging.subMeshCount = 1;
+        staging.SetIndices(triangles, MeshTopology.Triangles, 0, false);
+        staging.RecalculateBounds();
+        staging.UploadMeshData(false);
+        chunk.previewFilter.sharedMesh = staging;
+        chunk.backMesh = chunk.frontMesh;
+        chunk.frontMesh = staging;
+        chunk.previewObject.SetActive(showReplica);
     }
 
     private void ProcessMeshSlice()
@@ -3024,11 +3987,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void RebuildChunkMesh(Vector3Int chunkId, Chunk chunk)
     {
+        if (UsesAtomicRetirement &&
+            HasPendingReplacementDependency(chunkId))
+        {
+            // Keep the last complete candidate/Front. Publishing a chunk while
+            // only some retired voxels have replacement evidence recreates the
+            // exact asynchronous zero-crossing ring this route is meant to
+            // eliminate. A derived Chunk samples its own source Chunk plus
+            // positive-boundary samples from seven neighbours, so all eight
+            // dependencies participate in the hold.
+            return;
+        }
         CacheSamples(chunkId);
         _meshVertices.Clear();
         _meshTriangles.Clear();
         _meshLines.Clear();
-        _uniqueLines.Clear();
         Array.Fill(_xEdgeVertices, -1);
         Array.Fill(_yEdgeVertices, -1);
         Array.Fill(_zEdgeVertices, -1);
@@ -3116,6 +4089,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             ? _meshTriangles.ToArray()
             : Array.Empty<int>();
         chunk.candidateTriangleCount = triangles;
+    }
+
+    private bool HasPendingReplacementDependency(Vector3Int meshChunkId)
+    {
+        for (int z = 0; z <= 1; z++)
+        for (int y = 0; y <= 1; y++)
+        for (int x = 0; x <= 1; x++)
+        {
+            Vector3Int sourceChunkId = meshChunkId +
+                new Vector3Int(x, y, z);
+            if (_chunks.TryGetValue(sourceChunkId, out Chunk source) &&
+                source.pendingReplacementVoxels > 0)
+                return true;
+        }
+        return false;
     }
 
     private void PublishRemoveSmallCandidateMeshes()
@@ -3350,6 +4338,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private void PublishSimplificationResult(
         RoomSetupReplicaV2XrtSimplifier.Result result)
     {
+        _localPublicationChunks.Clear();
         _meshPublicationCount++;
         LastSimplificationApplied = result.applied;
         LastPreSimplificationVertexCount = result.inputVertices;
@@ -3373,9 +4362,24 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         {
             Vector3Int chunkId = result.ownerChunkIds[owner];
             if (_chunks.TryGetValue(chunkId, out Chunk chunk))
-                PublishSimplifiedChunkMesh(
-                    chunkId, chunk, owner, result);
+            {
+                if (PublishSimplifiedChunkMesh(
+                        chunkId, chunk, owner, result))
+                    AddLocalPublicationChunk(chunkId);
+            }
         }
+        for (int i = 0; i < result.publicationChunkIds.Length; i++)
+            AddLocalPublicationChunk(result.publicationChunkIds[i]);
+        RebuildRenderPages(
+            _localPublicationChunks,
+            _renderPages.Count == 0);
+        // The simplifier input is already welded globally at 0.1 mm. Build
+        // one indexed line Front from that topology so every edge is submitted
+        // once and the room uses one line Renderer instead of one per chunk.
+        if (!RenderPageBatchingEnabled)
+            PublishGlobalLineMesh(result.vertices, result.triangles);
+        else
+            ClearGlobalLinePreview();
         PreviewTriangleCount = 0;
         foreach (Chunk chunk in _chunks.Values)
             PreviewTriangleCount += chunk.triangleCount;
@@ -3400,7 +4404,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             $"stop={result.stopReason} ms={result.elapsedMilliseconds:F1}");
     }
 
-    private void PublishSimplifiedChunkMesh(
+    private bool PublishSimplifiedChunkMesh(
         Vector3Int chunkId,
         Chunk chunk,
         int owner,
@@ -3408,8 +4412,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         _meshVertices.Clear();
         _meshTriangles.Clear();
-        _meshLines.Clear();
-        _uniqueLines.Clear();
         _publishedVertexRemap.Clear();
 
         int[] triangles = result.triangles;
@@ -3429,14 +4431,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             _meshTriangles.Add(a);
             _meshTriangles.Add(b);
             _meshTriangles.Add(c);
-            AddLine(a, b);
-            AddLine(b, c);
-            AddLine(c, a);
         }
 
         int publishedTriangleCount = _meshTriangles.Count / 3;
         if (publishedTriangleCount <= 0)
         {
+            bool changed = chunk.publishedTriangles != null &&
+                chunk.publishedTriangles.Length > 0;
+            chunk.publishedVertices = Array.Empty<Vector3>();
+            chunk.publishedTriangles = Array.Empty<int>();
             if (chunk.previewObject != null)
             {
                 Mesh empty = chunk.backMesh;
@@ -3447,27 +4450,356 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 chunk.previewObject.SetActive(false);
             }
             chunk.triangleCount = 0;
-            return;
+            return changed;
+        }
+
+        bool publicationChanged = !PublishedMeshEquals(
+            chunk, _meshVertices, _meshTriangles);
+        chunk.publishedVertices = _meshVertices.ToArray();
+        chunk.publishedTriangles = _meshTriangles.ToArray();
+        chunk.triangleCount = publishedTriangleCount;
+        if (RenderPageBatchingEnabled)
+        {
+            if (chunk.previewObject != null)
+                chunk.previewObject.SetActive(false);
+            return publicationChanged;
         }
 
         EnsureChunkPreview(chunkId, chunk);
         Mesh staging = chunk.backMesh;
         staging.Clear(false);
         staging.SetVertices(_meshVertices);
-        staging.subMeshCount = 2;
+        staging.subMeshCount = 1;
         staging.SetIndices(_meshTriangles, MeshTopology.Triangles, 0, false);
-        staging.SetIndices(_meshLines, MeshTopology.Lines, 1, false);
         // A legal collapse may retain the endpoint owned by a neighbouring
         // extraction chunk. Recalculate bounds from the actual surviving
         // vertices rather than assuming every point remains inside its old
         // chunk AABB.
         staging.RecalculateBounds();
         staging.UploadMeshData(false);
-        chunk.previewFilter.sharedMesh = staging;
+        if (chunk.previewFilter != null)
+            chunk.previewFilter.sharedMesh = staging;
         chunk.backMesh = chunk.frontMesh;
         chunk.frontMesh = staging;
-        chunk.triangleCount = publishedTriangleCount;
-        chunk.previewObject.SetActive(showReplica);
+        if (chunk.previewObject != null)
+            chunk.previewObject.SetActive(
+                showReplica && !RenderPageBatchingEnabled);
+        return publicationChanged;
+    }
+
+    private void AddLocalPublicationChunk(Vector3Int chunkId)
+    {
+        if (!_localPublicationChunks.Contains(chunkId))
+            _localPublicationChunks.Add(chunkId);
+    }
+
+    private static bool PublishedMeshEquals(
+        Chunk chunk,
+        IReadOnlyList<Vector3> vertices,
+        IReadOnlyList<int> triangles)
+    {
+        if (chunk.publishedVertices == null ||
+            chunk.publishedTriangles == null ||
+            chunk.publishedVertices.Length != vertices.Count ||
+            chunk.publishedTriangles.Length != triangles.Count)
+            return false;
+        for (int i = 0; i < vertices.Count; i++)
+            if (!chunk.publishedVertices[i].Equals(vertices[i]))
+                return false;
+        for (int i = 0; i < triangles.Count; i++)
+            if (chunk.publishedTriangles[i] != triangles[i])
+                return false;
+        return true;
+    }
+
+    private static Vector3Int RenderPageKey(Vector3Int chunkId)
+    {
+        return new Vector3Int(
+            Mathf.FloorToInt(chunkId.x / (float)RenderPageSpanChunks),
+            Mathf.FloorToInt(chunkId.y / (float)RenderPageSpanChunks),
+            Mathf.FloorToInt(chunkId.z / (float)RenderPageSpanChunks));
+    }
+
+    private void RebuildRenderPages(
+        IReadOnlyList<Vector3Int> dirtyChunkIds,
+        bool forceAll)
+    {
+        if (!RenderPageBatchingEnabled)
+            return;
+        EnsurePreviewResources();
+        if (_previewRoot == null || _depthMaterial == null)
+            return;
+
+        var dirtyPages = new HashSet<Vector3Int>();
+        if (forceAll)
+        {
+            foreach (KeyValuePair<Vector3Int, Chunk> item in _chunks)
+            {
+                if (item.Value.triangleCount > 0)
+                    dirtyPages.Add(RenderPageKey(item.Key));
+            }
+            foreach (Vector3Int existing in _renderPages.Keys)
+                dirtyPages.Add(existing);
+        }
+        else if (dirtyChunkIds != null)
+        {
+            for (int i = 0; i < dirtyChunkIds.Count; i++)
+                dirtyPages.Add(RenderPageKey(dirtyChunkIds[i]));
+        }
+
+        foreach (Vector3Int pageKey in dirtyPages)
+        {
+            RenderPage page = EnsureRenderPage(pageKey);
+            page.members.Clear();
+            page.vertices.Clear();
+            page.triangles.Clear();
+            Vector3Int first = pageKey * RenderPageSpanChunks;
+            for (int z = 0; z < RenderPageSpanChunks; z++)
+            for (int y = 0; y < RenderPageSpanChunks; y++)
+            for (int x = 0; x < RenderPageSpanChunks; x++)
+            {
+                Vector3Int chunkId = first + new Vector3Int(x, y, z);
+                if (!_chunks.TryGetValue(chunkId, out Chunk chunk) ||
+                    chunk.publishedVertices == null ||
+                    chunk.publishedTriangles == null ||
+                    chunk.publishedTriangles.Length == 0)
+                    continue;
+                int vertexBase = page.vertices.Count;
+                page.vertices.AddRange(chunk.publishedVertices);
+                for (int i = 0; i < chunk.publishedTriangles.Length; i++)
+                    page.triangles.Add(
+                        vertexBase + chunk.publishedTriangles[i]);
+                page.members.Add(chunkId);
+            }
+
+            if (page.triangles.Count == 0)
+            {
+                DisposeRenderPage(page);
+                _renderPages.Remove(pageKey);
+                continue;
+            }
+
+            Mesh staging = page.backMesh;
+            staging.Clear(false);
+            staging.indexFormat = page.vertices.Count > 65535
+                ? IndexFormat.UInt32
+                : IndexFormat.UInt16;
+            staging.SetVertices(page.vertices);
+            staging.SetIndices(
+                page.triangles, MeshTopology.Triangles, 0, false);
+            staging.RecalculateBounds();
+            staging.UploadMeshData(false);
+            page.filter.sharedMesh = staging;
+            page.backMesh = page.frontMesh;
+            page.frontMesh = staging;
+            page.triangleCount = page.triangles.Count / 3;
+            RebuildRenderPageLines(page);
+            page.gameObject.SetActive(showReplica);
+        }
+    }
+
+    private RenderPage EnsureRenderPage(Vector3Int pageKey)
+    {
+        if (_renderPages.TryGetValue(pageKey, out RenderPage page))
+            return page;
+        var go = new GameObject(
+            $"RS Replica render page {pageKey.x},{pageKey.y},{pageKey.z}");
+        go.transform.SetParent(_previewRoot.transform, false);
+        page = new RenderPage
+        {
+            key = pageKey,
+            gameObject = go,
+            filter = go.AddComponent<MeshFilter>(),
+            renderer = go.AddComponent<MeshRenderer>(),
+            frontMesh = CreateRenderPageMesh(pageKey, "front"),
+            backMesh = CreateRenderPageMesh(pageKey, "back")
+        };
+        page.renderer.shadowCastingMode = ShadowCastingMode.Off;
+        page.renderer.receiveShadows = false;
+        page.renderer.sharedMaterial = _depthMaterial;
+        page.filter.sharedMesh = page.frontMesh;
+        page.lineObject = new GameObject("Lines");
+        page.lineObject.transform.SetParent(go.transform, false);
+        page.lineFilter = page.lineObject.AddComponent<MeshFilter>();
+        page.lineRenderer = page.lineObject.AddComponent<MeshRenderer>();
+        page.lineRenderer.shadowCastingMode = ShadowCastingMode.Off;
+        page.lineRenderer.receiveShadows = false;
+        page.lineRenderer.sharedMaterial = _lineMaterial;
+        page.lineFrontMesh = CreateRenderPageMesh(pageKey, "lines-front");
+        page.lineBackMesh = CreateRenderPageMesh(pageKey, "lines-back");
+        page.lineFilter.sharedMesh = page.lineFrontMesh;
+        go.SetActive(false);
+        _renderPages.Add(pageKey, page);
+        return page;
+    }
+
+    private static Mesh CreateRenderPageMesh(
+        Vector3Int pageKey, string suffix)
+    {
+        var mesh = new Mesh
+        {
+            name = $"RS Replica render page {pageKey.x},{pageKey.y},{pageKey.z} {suffix}",
+            indexFormat = IndexFormat.UInt32
+        };
+        mesh.MarkDynamic();
+        return mesh;
+    }
+
+    private void RebuildRenderPageLines(RenderPage page)
+    {
+        _lineQuadVertices.Clear();
+        _lineQuadOtherEndpoints.Clear();
+        _lineQuadExtrusions.Clear();
+        _meshLines.Clear();
+        _uniqueLines.Clear();
+        _globalLinePointIds.Clear();
+        _nextGlobalLinePointId = 0;
+        for (int i = 0; i + 2 < page.triangles.Count; i += 3)
+        {
+            AddUniqueGlobalLine(
+                page.vertices, page.triangles[i], page.triangles[i + 1]);
+            AddUniqueGlobalLine(
+                page.vertices, page.triangles[i + 1], page.triangles[i + 2]);
+            AddUniqueGlobalLine(
+                page.vertices, page.triangles[i + 2], page.triangles[i]);
+        }
+
+        Mesh staging = page.lineBackMesh;
+        staging.Clear(false);
+        staging.indexFormat = _lineQuadVertices.Count > 65535
+            ? IndexFormat.UInt32
+            : IndexFormat.UInt16;
+        staging.SetVertices(_lineQuadVertices);
+        staging.SetUVs(0, _lineQuadExtrusions);
+        staging.SetUVs(1, _lineQuadOtherEndpoints);
+        staging.SetIndices(_meshLines, MeshTopology.Triangles, 0, false);
+        if (_meshLines.Count > 0)
+            staging.RecalculateBounds();
+        staging.UploadMeshData(false);
+        page.lineFilter.sharedMesh = staging;
+        page.lineBackMesh = page.lineFrontMesh;
+        page.lineFrontMesh = staging;
+        page.lineObject.SetActive(_meshLines.Count > 0);
+    }
+
+    private void ClearRenderPages()
+    {
+        foreach (RenderPage page in _renderPages.Values)
+            DisposeRenderPage(page);
+        _renderPages.Clear();
+    }
+
+    private static void DisposeRenderPage(RenderPage page)
+    {
+        if (page == null)
+            return;
+        if (page.gameObject != null)
+            Destroy(page.gameObject);
+        if (page.frontMesh != null)
+            Destroy(page.frontMesh);
+        if (page.backMesh != null)
+            Destroy(page.backMesh);
+        if (page.lineFrontMesh != null)
+            Destroy(page.lineFrontMesh);
+        if (page.lineBackMesh != null)
+            Destroy(page.lineBackMesh);
+    }
+
+    private void PublishGlobalLineMesh(Vector3[] vertices, int[] triangles)
+    {
+        EnsureGlobalLinePreview();
+        if (_globalLineObject == null || _globalLineBackMesh == null)
+            return;
+
+        _lineQuadVertices.Clear();
+        _lineQuadOtherEndpoints.Clear();
+        _lineQuadExtrusions.Clear();
+        _meshLines.Clear();
+        _uniqueLines.Clear();
+        _globalLinePointIds.Clear();
+        _nextGlobalLinePointId = 0;
+        for (int i = 0; i + 2 < triangles.Length; i += 3)
+        {
+            AddUniqueGlobalLine(vertices, triangles[i], triangles[i + 1]);
+            AddUniqueGlobalLine(vertices, triangles[i + 1], triangles[i + 2]);
+            AddUniqueGlobalLine(vertices, triangles[i + 2], triangles[i]);
+        }
+
+        Mesh staging = _globalLineBackMesh;
+        staging.Clear(false);
+        staging.SetVertices(_lineQuadVertices);
+        staging.SetUVs(0, _lineQuadExtrusions);
+        staging.SetUVs(1, _lineQuadOtherEndpoints);
+        staging.subMeshCount = 1;
+        staging.SetIndices(_meshLines, MeshTopology.Triangles, 0, false);
+        if (_meshLines.Count > 0)
+            staging.RecalculateBounds();
+        staging.UploadMeshData(false);
+        _globalLineFilter.sharedMesh = staging;
+        _globalLineBackMesh = _globalLineFrontMesh;
+        _globalLineFrontMesh = staging;
+        _globalLineIndexCount = _meshLines.Count;
+        _globalLineObject.SetActive(
+            showReplica && _globalLineIndexCount > 0);
+    }
+
+    private void AddUniqueGlobalLine(
+        IReadOnlyList<Vector3> vertices, int first, int second)
+    {
+        if (first == second || first < 0 || second < 0 ||
+            first >= vertices.Count || second >= vertices.Count)
+            return;
+        Vector3 a = vertices[first];
+        Vector3 b = vertices[second];
+        if (!Finite(a) || !Finite(b) ||
+            (a - b).sqrMagnitude <= 0.00000001f)
+            return;
+
+        uint firstPoint = (uint)GetGlobalLinePointId(a);
+        uint secondPoint = (uint)GetGlobalLinePointId(b);
+        uint low = Math.Min(firstPoint, secondPoint);
+        uint high = Math.Max(firstPoint, secondPoint);
+        ulong key = ((ulong)low << 32) | high;
+        if (!_uniqueLines.Add(key))
+            return;
+
+        int start = _lineQuadVertices.Count;
+        _lineQuadVertices.Add(a);
+        _lineQuadVertices.Add(a);
+        _lineQuadVertices.Add(b);
+        _lineQuadVertices.Add(b);
+        _lineQuadOtherEndpoints.Add(b);
+        _lineQuadOtherEndpoints.Add(b);
+        _lineQuadOtherEndpoints.Add(a);
+        _lineQuadOtherEndpoints.Add(a);
+        _lineQuadExtrusions.Add(new Vector2(-1f, 0f));
+        _lineQuadExtrusions.Add(new Vector2(1f, 0f));
+        _lineQuadExtrusions.Add(new Vector2(-1f, 1f));
+        _lineQuadExtrusions.Add(new Vector2(1f, 1f));
+        _meshLines.Add(start);
+        _meshLines.Add(start + 2);
+        _meshLines.Add(start + 1);
+        _meshLines.Add(start + 1);
+        _meshLines.Add(start + 2);
+        _meshLines.Add(start + 3);
+    }
+
+    private int GetGlobalLinePointId(Vector3 point)
+    {
+        // Marching-Cubes vertices generated by neighbouring chunks may be
+        // separate indices even when they occupy the same geometric point.
+        // A 0.1 mm key removes only duplicate display edges; it never welds
+        // or otherwise changes the published reconstruction mesh.
+        const float Quantization = 10000f;
+        var key = new Vector3Int(
+            Mathf.RoundToInt(point.x * Quantization),
+            Mathf.RoundToInt(point.y * Quantization),
+            Mathf.RoundToInt(point.z * Quantization));
+        if (_globalLinePointIds.TryGetValue(key, out int id))
+            return id;
+        id = _nextGlobalLinePointId++;
+        _globalLinePointIds.Add(key, id);
+        return id;
     }
 
     private int RemapPublishedVertex(
@@ -3661,17 +4993,6 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         return vertex;
     }
 
-    private void AddLine(int first, int second)
-    {
-        uint low = (uint)Mathf.Min(first, second);
-        uint high = (uint)Mathf.Max(first, second);
-        ulong key = ((ulong)low << 32) | high;
-        if (!_uniqueLines.Add(key))
-            return;
-        _meshLines.Add(first);
-        _meshLines.Add(second);
-    }
-
     private void EnsurePreviewResources()
     {
         if (_previewRoot == null)
@@ -3695,6 +5016,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     name = "Room Setup Replica V2 Lines"
                 };
                 _lineMaterial.SetColor("_BaseColor", lineColor);
+                _lineMaterial.SetFloat(
+                    "_LineWidthPixels", lineWidthPixels);
             }
         }
         if (_depthMaterial == null)
@@ -3708,6 +5031,49 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     name = "Room Setup Replica V2 Depth"
                 };
         }
+        EnsureGlobalLinePreview();
+    }
+
+    private void EnsureGlobalLinePreview()
+    {
+        if (_globalLineObject != null || _previewRoot == null ||
+            _lineMaterial == null)
+            return;
+        _globalLineObject = new GameObject(
+            "[Room Setup Replica V2] Global Lines");
+        _globalLineObject.transform.SetParent(_previewRoot.transform, false);
+        _globalLineFilter = _globalLineObject.AddComponent<MeshFilter>();
+        _globalLineRenderer =
+            _globalLineObject.AddComponent<MeshRenderer>();
+        _globalLineRenderer.shadowCastingMode = ShadowCastingMode.Off;
+        _globalLineRenderer.receiveShadows = false;
+        _globalLineRenderer.sharedMaterial = _lineMaterial;
+        _globalLineFrontMesh = CreateGlobalLineMesh("front");
+        _globalLineBackMesh = CreateGlobalLineMesh("back");
+        _globalLineFilter.sharedMesh = _globalLineFrontMesh;
+        _globalLineObject.SetActive(false);
+    }
+
+    private static Mesh CreateGlobalLineMesh(string suffix)
+    {
+        var mesh = new Mesh
+        {
+            name = $"RS Replica global lines {suffix}",
+            indexFormat = IndexFormat.UInt32
+        };
+        mesh.MarkDynamic();
+        return mesh;
+    }
+
+    private void ClearGlobalLinePreview()
+    {
+        if (_globalLineFrontMesh != null)
+            _globalLineFrontMesh.Clear(false);
+        if (_globalLineBackMesh != null)
+            _globalLineBackMesh.Clear(false);
+        if (_globalLineObject != null)
+            _globalLineObject.SetActive(false);
+        _globalLineIndexCount = 0;
     }
 
     private void EnsureChunkPreview(Vector3Int chunkId, Chunk chunk)
@@ -3722,8 +5088,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         chunk.previewRenderer = go.AddComponent<MeshRenderer>();
         chunk.previewRenderer.shadowCastingMode = ShadowCastingMode.Off;
         chunk.previewRenderer.receiveShadows = false;
-        chunk.previewRenderer.sharedMaterials =
-            new[] { _depthMaterial, _lineMaterial };
+        chunk.previewRenderer.sharedMaterial = _depthMaterial;
         chunk.frontMesh = CreateMesh(chunkId, "front");
         chunk.backMesh = CreateMesh(chunkId, "back");
         chunk.previewFilter.sharedMesh = chunk.frontMesh;
@@ -3750,8 +5115,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         Array.Clear(chunk.voxels, 0, chunk.voxels.Length);
         chunk.candidateVertices = Array.Empty<Vector3>();
         chunk.candidateTriangles = Array.Empty<int>();
+        chunk.publishedVertices = Array.Empty<Vector3>();
+        chunk.publishedTriangles = Array.Empty<int>();
         chunk.candidateTriangleCount = 0;
         chunk.triangleCount = 0;
+        chunk.pendingReplacementVoxels = 0;
         if (_chunkPool.Count < 64)
             _chunkPool.Push(chunk);
     }
@@ -4007,8 +5375,27 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         Array.Clear(chunk.voxels, 0, chunk.voxels.Length);
         chunk.candidateVertices = Array.Empty<Vector3>();
         chunk.candidateTriangles = Array.Empty<int>();
+        chunk.publishedVertices = Array.Empty<Vector3>();
+        chunk.publishedTriangles = Array.Empty<int>();
         chunk.candidateTriangleCount = 0;
         chunk.triangleCount = 0;
+        chunk.pendingReplacementVoxels = 0;
+    }
+
+    private void DisposeGlobalLinePreview()
+    {
+        if (_globalLineFrontMesh != null)
+            Destroy(_globalLineFrontMesh);
+        if (_globalLineBackMesh != null)
+            Destroy(_globalLineBackMesh);
+        if (_globalLineObject != null)
+            Destroy(_globalLineObject);
+        _globalLineObject = null;
+        _globalLineFilter = null;
+        _globalLineRenderer = null;
+        _globalLineFrontMesh = null;
+        _globalLineBackMesh = null;
+        _globalLineIndexCount = 0;
     }
 
     private void OnDestroy()
@@ -4021,6 +5408,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         if (_rightPixels.IsCreated) _rightPixels.Dispose();
         foreach (Chunk chunk in _chunks.Values)
             DisposeChunk(chunk);
+        ClearRenderPages();
+        DisposeGlobalLinePreview();
         if (_lineMaterial != null) Destroy(_lineMaterial);
         if (_depthMaterial != null) Destroy(_depthMaterial);
         if (_previewRoot != null) Destroy(_previewRoot);

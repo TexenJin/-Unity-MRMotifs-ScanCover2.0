@@ -5,16 +5,21 @@ production/diagnostic routes.
 
 Use Unity menu `Room Setup Replica V2 > 重建独立测试场景`. The command replaces the
 placeholder scene with a Meta XR Building Blocks scene, adds only `DepthCapture`,
-`PassthroughCameraProvider`, `RoomSetupReplicaV2Scanner`, and
+`RoomSetupReplicaV2Scanner`, and
 `RoomSetupReplicaV2Reconstruction`, then makes that scene the only build scene.
 
 Quest controls:
 
-- Right index trigger: start or stop live coverage and its matching recording
-  as one debounced action.
+- Right index trigger: start or stop live coverage. Tape recording remains an
+  explicit diagnostic action and is not coupled to normal scanning.
 - A: clear the current replica and replay the fixed last tape.
 - B: clear the current replica.
 - X: toggle replica preview visibility.
+- Y: toggle the classic v2.4 BB depth-point trail. The former fixed blue
+  observation-coverage grid is not instantiated in this scene; the trail is a
+  read-only display path and never writes TSDF or mesh state.
+- Right thumbstick click: freeze the current live replica while retaining the
+  completed visible front.
 - The replay annotation probe remains available in source for frozen-tape
   diagnosis, but is disabled while live controls are open so it cannot consume
   the same right-trigger press.
@@ -50,10 +55,20 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   exactly 32 triangles are retained. The raw candidate is preserved so a
   temporarily removed fragment can grow and reappear, and the filtered meshes
   are published together only when the mesh pass completes.
-- The recovered XRT production stage is retained after `<32` cleanup on the
-  complete seam-welded candidate, but is currently disabled. The requested
-  output is the regular 10 cm coverage mesh, not the later performance mesh.
-  When re-enabled in a future phase, it follows the observed directed-edge
+- The synchronized experimental B reconstruction, FusionGuard q75 production
+  gate and read-only Shadow observer are disabled; only the stable A
+  reconstruction runs and publishes. The recovered XRT implementation is
+  currently disabled in production. A 2026-11-01 device trial applied it after
+  the already-derived 10 cm seam-welded candidate and produced metre-scale
+  triangles on planar walls, proving that this stage placement/input density is
+  wrong even though the recovered collapse kernel is internally consistent.
+  Native telemetry resolves the lifecycle: live `Resampled` reached 26,555
+  triangles, whereas the one-shot saved `Postprocessed` mesh reached 32,616
+  triangles after simplifying a much denser extraction. XRT therefore belongs
+  to a separate save-time dense-source postprocess, never to the live 10 cm
+  Front. It must not be re-enabled here.
+  The isolated implementation
+  follows the observed directed-edge
   collapse envelope: minimum 100 input triangles, target `vertices / 20`,
   MT19937 seed 13, 16 unique directed candidates per batch, a `0.075 m`
   point-to-plane acceptance ceiling, near-zero optional regularizers loaded
@@ -65,12 +80,18 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   simplification rather than an unrelated smoothing pass. It runs on an
   immutable background snapshot with one active job. A due trigger while that
   job is busy is skipped and counted rather than queued; the current Front
-  remains visible until a complete result is ready. While disabled, the
-  post-`<32` mesh passes through unchanged. Until
+  remains visible until a complete result is ready. Until
   the exact native terminal topology rule is resolved, a
   non-empty cleaned input that simplifies to zero faces is rejected and the
   cleaned input is published unchanged; this is an explicit publication
   fail-safe rather than a substitute simplification metric.
+- Live rendering keeps logical chunks as reconstruction ownership units but
+  merges each 2x2x2 group into one depth page and one constant-pixel-width line
+  page. Dirty pages publish immediately. Whole-room seam/component maintenance
+  runs at a four-second cadence and is forced once more before replay or export
+  completion, so room growth does not trigger a full mesh upload every pass.
+  The optional multicolour depth-point overlay is created only after its Y
+  toggle and performs no hidden-frame update work.
 
 The first device-backed scheduling correction raises the per-slice chunk guard
 from 32 to 256 while retaining the 6 ms reconstruction deadline. The guard no
@@ -139,6 +160,24 @@ not used as a substitute.
 This makes parameter or topology changes comparable on identical input. It
 does not claim bit-identical output to Meta Room Setup, and it does not replace
 Quest device A/B validation.
+
+## Quest shadow mode
+
+`RoomSetupReplicaV2ShadowMode` observes the same decoded stereo pair after
+metric-depth and gradient measurement but before either eye is integrated into
+the TSDF. It derives coarse-lattice edge, stereo, temporal-reprojection and
+dominant/challenger-layer evidence. The result is diagnostic only: it never
+changes depth acceptance, source voxels, mesh candidates, cleanup or
+publication.
+
+Each run appends a session record and per-pair records below
+`Application.persistentDataPath/RoomSetupReplicaV2/shadow/` in
+`quest-shadow-receipts.jsonl`. A frame record includes the current gradient
+admission count; stereo and temporal agreement/conflict; hypothetical
+integrate, defer, challenge, promotion and old-layer retirement; and shadow
+CPU milliseconds. Thresholds are explicit experiment hypotheses stored in the
+session record. They are not represented as recovered Meta uncertainty
+semantics.
 
 The accepted Quest 3 receipt for the current geometry baseline is frozen in
 `V2B_REGULAR_10CM_BASELINE.md`. V2-C uncertainty and lifecycle changes must use
