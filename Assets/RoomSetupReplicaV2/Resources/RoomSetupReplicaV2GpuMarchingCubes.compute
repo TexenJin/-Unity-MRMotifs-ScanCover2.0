@@ -1,0 +1,454 @@
+#pragma kernel ClearMarchingCubes
+#pragma kernel EmitMarchingCubes
+#pragma kernel BuildConnectivityArgs
+#pragma kernel InitializeConnectivity
+#pragma kernel UnionConnectivity
+#pragma kernel WeldQuantizedPositions
+#pragma kernel CompressConnectivity
+#pragma kernel CountComponents
+#pragma kernel FilterComponents
+#pragma kernel BuildMarchingCubesArgs
+#pragma kernel ClearUniqueEdgeState
+#pragma kernel BuildUniqueEdgeArgs
+#pragma kernel BuildUniqueEdges
+
+// Dedicated RoomSetupReplica v0.1.1 extraction. The source volume is the
+// native 5 cm TSDF; every MC corner is an exact even source coordinate, which
+// reproduces the aligned 10 cm derived field without interpolation.
+Texture3D<float2> _TsdfVolume;
+StructuredBuffer<int> _TriangleEdges;
+RWStructuredBuffer<float3> _CandidateTriangleVertices;
+RWStructuredBuffer<float3> _FilteredTriangleVertices;
+RWStructuredBuffer<uint> _ConnectivityParents;
+RWStructuredBuffer<uint> _ComponentTriangleCounts;
+RWStructuredBuffer<uint> _PositionHashOwners;
+RWStructuredBuffer<uint> _Counters;
+RWStructuredBuffer<uint> _ConnectivityDispatchArgs;
+RWStructuredBuffer<uint> _DrawArgs;
+RWStructuredBuffer<uint> _UniqueEdgeHashOwners;
+RWStructuredBuffer<uint> _UniqueEdgeMasks;
+RWStructuredBuffer<uint> _UniqueEdgeDispatchArgs;
+
+int3 _VoxelCount;
+int3 _CellCount;
+float3 _VolumeOrigin;
+float _VoxelSize;
+uint _MaximumTriangleVertices;
+uint _ConnectivityVertexCapacity;
+uint _PositionHashCapacity;
+float _SeamWeldUnitsPerMeter;
+uint _RemoveSmallTriangleThreshold;
+uint _RemoveSmallTriangleGate;
+uint _MaximumTriangleCount;
+uint _UniqueEdgeHashCapacity;
+
+static const uint TriangleEntriesPerIndex = 16u;
+static const uint ConnectivityThreads = 128u;
+
+static const int3 CubeOffsets[8] =
+{
+    int3(0, 0, 0), int3(1, 0, 0),
+    int3(1, 1, 0), int3(0, 1, 0),
+    int3(0, 0, 1), int3(1, 0, 1),
+    int3(1, 1, 1), int3(0, 1, 1)
+};
+
+static const int2 EdgePairs[12] =
+{
+    int2(0, 1), int2(1, 2), int2(2, 3), int2(3, 0),
+    int2(4, 5), int2(5, 6), int2(6, 7), int2(7, 4),
+    int2(0, 4), int2(1, 5), int2(2, 6), int2(3, 7)
+};
+
+float3 SourceCoordinateToWorld(int3 coordinate)
+{
+    return _VolumeOrigin +
+        ((float3)coordinate - (float3)_VoxelCount * 0.5) * _VoxelSize;
+}
+
+uint FindConnectivityRoot(uint value)
+{
+    uint parent = _ConnectivityParents[value];
+    while (parent != value)
+    {
+        value = parent;
+        parent = _ConnectivityParents[value];
+    }
+    return value;
+}
+
+void UnionConnectivityRoots(uint a, uint b)
+{
+    [loop]
+    while (true)
+    {
+        a = FindConnectivityRoot(a);
+        b = FindConnectivityRoot(b);
+        if (a == b)
+            return;
+        uint lower = min(a, b);
+        uint higher = max(a, b);
+        uint previous;
+        InterlockedCompareExchange(
+            _ConnectivityParents[higher], higher, lower, previous);
+        if (previous == higher)
+            return;
+    }
+}
+
+int3 QuantizedPosition(float3 position)
+{
+    return (int3)round(position * _SeamWeldUnitsPerMeter);
+}
+
+uint PositionHash(int3 position)
+{
+    uint hash = asuint(position.x) * 73856093u;
+    hash ^= asuint(position.y) * 19349663u;
+    hash ^= asuint(position.z) * 83492791u;
+    return hash & (_PositionHashCapacity - 1u);
+}
+
+bool LexicographicallyLess(int3 first, int3 second)
+{
+    if (first.x != second.x) return first.x < second.x;
+    if (first.y != second.y) return first.y < second.y;
+    return first.z < second.z;
+}
+
+float3 LoadFinalVertex(uint vertexIndex)
+{
+    return _Counters[6] != 0u
+        ? _FilteredTriangleVertices[vertexIndex]
+        : _CandidateTriangleVertices[vertexIndex];
+}
+
+void CanonicalEdge(uint encodedEdge, out int3 first, out int3 second)
+{
+    uint triangleIndex = encodedEdge / 3u;
+    uint edge = encodedEdge - triangleIndex * 3u;
+    uint baseVertex = triangleIndex * 3u;
+    uint start = edge;
+    uint end = edge == 2u ? 0u : edge + 1u;
+    int3 a = QuantizedPosition(LoadFinalVertex(baseVertex + start));
+    int3 b = QuantizedPosition(LoadFinalVertex(baseVertex + end));
+    if (LexicographicallyLess(b, a))
+    {
+        first = b;
+        second = a;
+    }
+    else
+    {
+        first = a;
+        second = b;
+    }
+}
+
+uint EdgeHash(int3 first, int3 second)
+{
+    uint hash = asuint(first.x) * 73856093u;
+    hash ^= asuint(first.y) * 19349663u;
+    hash ^= asuint(first.z) * 83492791u;
+    hash ^= asuint(second.x) * 2654435761u;
+    hash ^= asuint(second.y) * 2246822519u;
+    hash ^= asuint(second.z) * 3266489917u;
+    hash ^= hash >> 16u;
+    return hash & (_UniqueEdgeHashCapacity - 1u);
+}
+
+void ClaimUniqueEdge(uint triangleIndex, uint edgeIndex)
+{
+    uint encoded = triangleIndex * 3u + edgeIndex;
+    int3 first;
+    int3 second;
+    CanonicalEdge(encoded, first, second);
+    if (all(first == second))
+        return;
+    uint slot = EdgeHash(first, second);
+    [loop]
+    for (uint probe = 0u; probe < _UniqueEdgeHashCapacity; probe++)
+    {
+        uint owner;
+        InterlockedCompareExchange(
+            _UniqueEdgeHashOwners[slot],
+            0xffffffffu, encoded, owner);
+        if (owner == 0xffffffffu || owner == encoded)
+        {
+            uint ignored;
+            InterlockedOr(
+                _UniqueEdgeMasks[triangleIndex],
+                1u << edgeIndex, ignored);
+            return;
+        }
+        int3 ownerFirst;
+        int3 ownerSecond;
+        CanonicalEdge(owner, ownerFirst, ownerSecond);
+        if (all(ownerFirst == first) && all(ownerSecond == second))
+            return;
+        slot = (slot + 1u) & (_UniqueEdgeHashCapacity - 1u);
+    }
+
+    // Diagnostic hash saturation must never hide real geometry.
+    uint ignored;
+    InterlockedOr(
+        _UniqueEdgeMasks[triangleIndex],
+        1u << edgeIndex, ignored);
+}
+
+void WeldCandidateVertex(uint vertexIndex)
+{
+    int3 quantized = QuantizedPosition(
+        _CandidateTriangleVertices[vertexIndex]);
+    uint slot = PositionHash(quantized);
+    [loop]
+    for (uint probe = 0u; probe < _PositionHashCapacity; probe++)
+    {
+        uint owner;
+        InterlockedCompareExchange(
+            _PositionHashOwners[slot], 0xffffffffu, vertexIndex, owner);
+        if (owner == 0xffffffffu || owner == vertexIndex)
+            return;
+        if (all(QuantizedPosition(
+                    _CandidateTriangleVertices[owner]) == quantized))
+        {
+            UnionConnectivityRoots(vertexIndex, owner);
+            return;
+        }
+        slot = (slot + 1u) & (_PositionHashCapacity - 1u);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ClearMarchingCubes(uint3 id : SV_DispatchThreadID)
+{
+    _Counters[0] = 0u; // requested candidate vertices
+    _Counters[1] = 0u; // overflow triangles
+    _Counters[2] = 0u; // rejected cross-layer cells
+    _Counters[3] = 0u; // emitted candidate triangles
+    _Counters[4] = 0u; // surviving compacted vertices
+    _Counters[5] = 0u; // removed small-component triangles
+    _Counters[6] = 0u; // cleanup applied
+    _ConnectivityDispatchArgs[0] = 0u;
+    _ConnectivityDispatchArgs[1] = 1u;
+    _ConnectivityDispatchArgs[2] = 1u;
+    _DrawArgs[0] = 0u;
+    _DrawArgs[1] = 1u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+    _DrawArgs[4] = 0u;
+}
+
+[numthreads(4, 4, 4)]
+void EmitMarchingCubes(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_CellCount))
+        return;
+
+    int3 sourceBase = (int3)id * 2;
+    float distances[8];
+    float3 positions[8];
+    uint configuration = 0u;
+
+    [unroll]
+    for (int corner = 0; corner < 8; corner++)
+    {
+        int3 source = sourceBase + CubeOffsets[corner] * 2;
+        float2 tsdfSample = _TsdfVolume[source];
+        if (!(tsdfSample.y > 0.0) || any(tsdfSample != tsdfSample))
+            return;
+        distances[corner] = tsdfSample.x;
+        positions[corner] = SourceCoordinateToWorld(source);
+        if (tsdfSample.x < 0.0)
+            configuration |= 1u << corner;
+    }
+
+    if (configuration == 0u || configuration == 255u)
+        return;
+
+    float3 edgePositions[12];
+    [unroll]
+    for (int edge = 0; edge < 12; edge++)
+    {
+        int2 endpoints = EdgePairs[edge];
+        float denominator =
+            distances[endpoints.x] - distances[endpoints.y];
+        float alpha = abs(denominator) > 0.000001
+            ? saturate(distances[endpoints.x] / denominator)
+            : 0.5;
+        edgePositions[edge] = lerp(
+            positions[endpoints.x], positions[endpoints.y], alpha);
+    }
+
+    uint tableBase = configuration * TriangleEntriesPerIndex;
+    [loop]
+    for (uint entry = 0u;
+         entry < TriangleEntriesPerIndex; entry += 3u)
+    {
+        int edge0 = _TriangleEdges[tableBase + entry];
+        if (edge0 < 0)
+            break;
+        int edge1 = _TriangleEdges[tableBase + entry + 1u];
+        int edge2 = _TriangleEdges[tableBase + entry + 2u];
+
+        uint outputBase;
+        InterlockedAdd(_Counters[0], 3u, outputBase);
+        if (outputBase + 3u > _MaximumTriangleVertices)
+        {
+            uint ignored;
+            InterlockedAdd(_Counters[1], 1u, ignored);
+            continue;
+        }
+
+        // Preserve the recovered CPU route's table winding: 2, 1, 0.
+        _CandidateTriangleVertices[outputBase] = edgePositions[edge2];
+        _CandidateTriangleVertices[outputBase + 1u] = edgePositions[edge1];
+        _CandidateTriangleVertices[outputBase + 2u] = edgePositions[edge0];
+        uint ignored;
+        InterlockedAdd(_Counters[3], 1u, ignored);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void BuildConnectivityArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleCount = _Counters[3];
+    bool applyCleanup = triangleCount < _RemoveSmallTriangleGate;
+    _Counters[6] = applyCleanup ? 1u : 0u;
+    _ConnectivityDispatchArgs[0] = applyCleanup
+        ? (triangleCount + ConnectivityThreads - 1u) / ConnectivityThreads
+        : 0u;
+    _ConnectivityDispatchArgs[1] = 1u;
+    _ConnectivityDispatchArgs[2] = 1u;
+}
+
+[numthreads(128, 1, 1)]
+void InitializeConnectivity(uint3 id : SV_DispatchThreadID)
+{
+    if (_Counters[6] == 0u)
+        return;
+    if (id.x < _ConnectivityVertexCapacity)
+    {
+        _ConnectivityParents[id.x] = id.x;
+        _ComponentTriangleCounts[id.x] = 0u;
+    }
+    if (id.x < _PositionHashCapacity)
+        _PositionHashOwners[id.x] = 0xffffffffu;
+}
+
+[numthreads(128, 1, 1)]
+void UnionConnectivity(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    if (_Counters[6] == 0u || triangleIndex >= _Counters[3])
+        return;
+    uint vertexBase = triangleIndex * 3u;
+    UnionConnectivityRoots(vertexBase, vertexBase + 1u);
+    UnionConnectivityRoots(vertexBase + 1u, vertexBase + 2u);
+}
+
+[numthreads(128, 1, 1)]
+void WeldQuantizedPositions(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    if (_Counters[6] == 0u || triangleIndex >= _Counters[3])
+        return;
+    uint vertexBase = triangleIndex * 3u;
+    WeldCandidateVertex(vertexBase);
+    WeldCandidateVertex(vertexBase + 1u);
+    WeldCandidateVertex(vertexBase + 2u);
+}
+
+[numthreads(128, 1, 1)]
+void CompressConnectivity(uint3 id : SV_DispatchThreadID)
+{
+    if (_Counters[6] == 0u || id.x >= _ConnectivityVertexCapacity)
+        return;
+    _ConnectivityParents[id.x] = FindConnectivityRoot(id.x);
+}
+
+[numthreads(128, 1, 1)]
+void CountComponents(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    if (_Counters[6] == 0u || triangleIndex >= _Counters[3])
+        return;
+    uint root = FindConnectivityRoot(triangleIndex * 3u);
+    uint ignored;
+    InterlockedAdd(_ComponentTriangleCounts[root], 1u, ignored);
+}
+
+[numthreads(128, 1, 1)]
+void FilterComponents(uint3 id : SV_DispatchThreadID)
+{
+    uint triangleIndex = id.x;
+    if (_Counters[6] == 0u || triangleIndex >= _Counters[3])
+        return;
+    uint candidateBase = triangleIndex * 3u;
+    uint root = FindConnectivityRoot(candidateBase);
+    if (_ComponentTriangleCounts[root] < _RemoveSmallTriangleThreshold)
+    {
+        uint ignored;
+        InterlockedAdd(_Counters[5], 1u, ignored);
+        return;
+    }
+
+    uint outputBase;
+    InterlockedAdd(_Counters[4], 3u, outputBase);
+    _FilteredTriangleVertices[outputBase] =
+        _CandidateTriangleVertices[candidateBase];
+    _FilteredTriangleVertices[outputBase + 1u] =
+        _CandidateTriangleVertices[candidateBase + 1u];
+    _FilteredTriangleVertices[outputBase + 2u] =
+        _CandidateTriangleVertices[candidateBase + 2u];
+}
+
+[numthreads(1, 1, 1)]
+void BuildMarchingCubesArgs(uint3 id : SV_DispatchThreadID)
+{
+    _DrawArgs[0] = _Counters[6] != 0u
+        ? _Counters[4]
+        : min(_Counters[0], _MaximumTriangleVertices);
+    _DrawArgs[1] = 1u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+    _DrawArgs[4] = 0u;
+}
+
+[numthreads(128, 1, 1)]
+void ClearUniqueEdgeState(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _UniqueEdgeHashCapacity)
+        _UniqueEdgeHashOwners[id.x] = 0xffffffffu;
+    if (id.x < _MaximumTriangleCount)
+        _UniqueEdgeMasks[id.x] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void BuildUniqueEdgeArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexCount = _Counters[6] != 0u
+        ? _Counters[4]
+        : min(_Counters[0], _MaximumTriangleVertices);
+    uint triangleCount = min(
+        vertexCount / 3u, _MaximumTriangleCount);
+    _UniqueEdgeDispatchArgs[0] =
+        (triangleCount + ConnectivityThreads - 1u) /
+        ConnectivityThreads;
+    _UniqueEdgeDispatchArgs[1] = 1u;
+    _UniqueEdgeDispatchArgs[2] = 1u;
+}
+
+[numthreads(128, 1, 1)]
+void BuildUniqueEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexCount = _Counters[6] != 0u
+        ? _Counters[4]
+        : min(_Counters[0], _MaximumTriangleVertices);
+    uint triangleCount = min(
+        vertexCount / 3u, _MaximumTriangleCount);
+    if (id.x >= triangleCount)
+        return;
+    ClaimUniqueEdge(id.x, 0u);
+    ClaimUniqueEdge(id.x, 1u);
+    ClaimUniqueEdge(id.x, 2u);
+}

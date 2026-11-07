@@ -14,6 +14,15 @@ using UnityEngine;
     typeof(RoomSetupReplicaV2Reconstruction))]
 public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
 {
+    private enum ObservationDisplayMode : byte
+    {
+        Mesh,
+        RawBackProjection,
+        RemainingPreTsdfPoints,
+        AdmissionTerrainContours,
+        PersistentBoundary
+    }
+
     // Production trial route: keep the stable A reconstruction as the only
     // volume. The synchronized B experiment fragmented the principal room
     // surface and doubled reconstruction/meshing work, so it must not be
@@ -55,6 +64,12 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
     private RoomSetupReplicaV2Reconstruction _reconstruction;
     private RoomSetupReplicaV2Reconstruction _atomicReconstruction;
     private DepthPointCloudOverlay _depthPointCloudOverlay;
+    private RoomSetupReplicaV2AdmissionPointOverlay _admissionPointOverlay;
+    private RoomSetupReplicaV2PersistentBoundaryOverlay
+        _persistentBoundaryOverlay;
+    private ObservationDisplayMode _observationDisplayMode;
+    private bool _restorePrimaryPreview;
+    private bool _restoreAtomicPreview;
     private float _nextCaptureTime;
     private int _lastSubmittedPlatformFrame = -1;
     private int _lastDisplayPlatformFrame = -1;
@@ -74,11 +89,25 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         _depthPointCloudOverlay = GetComponent<DepthPointCloudOverlay>();
         if (_depthPointCloudOverlay != null)
         {
+            _depthPointCloudOverlay.ConfigureIsolatedCurrentFrameMode();
             _depthPointCloudOverlay.SetVisible(false);
             _depthPointCloudOverlay.SetAcquiring(false);
         }
         if (SynchronizedAtomicABCapture)
             CreateSynchronizedAtomicArm();
+        _admissionPointOverlay = GetComponent<RoomSetupReplicaV2AdmissionPointOverlay>();
+        if (_admissionPointOverlay == null)
+            _admissionPointOverlay = gameObject.AddComponent<RoomSetupReplicaV2AdmissionPointOverlay>();
+        _admissionPointOverlay.SetVisible(false);
+        Reconstruction?.SetAdmissionPointOverlay(_admissionPointOverlay);
+        _persistentBoundaryOverlay =
+            GetComponent<RoomSetupReplicaV2PersistentBoundaryOverlay>();
+        if (_persistentBoundaryOverlay == null)
+            _persistentBoundaryOverlay = gameObject.AddComponent<
+                RoomSetupReplicaV2PersistentBoundaryOverlay>();
+        _persistentBoundaryOverlay.SetVisible(false);
+        Reconstruction?.SetPersistentBoundaryOverlay(
+            _persistentBoundaryOverlay);
         SetLivePreviewState();
         Debug.Log(SynchronizedAtomicABCapture
             ? "[RoomSetupReplicaV2] synchronized live A/B enabled: " +
@@ -186,6 +215,9 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         _skippedPlatformFramesWhileBusy = 0;
         _nextCaptureTime = 0f;
         _depth?.StartDepthCapture();
+        _depthPointCloudOverlay?.SetFrozen(false);
+        _admissionPointOverlay?.SetFrozen(false);
+        _persistentBoundaryOverlay?.SetFrozen(false);
         _depthPointCloudOverlay?.SetAcquiring(
             _depthPointCloudOverlay.Visible);
         Debug.Log("[RoomSetupReplicaV2] capture started");
@@ -198,6 +230,7 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         IsScanning = false;
         _depthPointCloudOverlay?.SetAcquiring(false);
         _depth?.StopDepthCapture();
+        HoldCurrentObservationDisplay();
         Debug.Log("[RoomSetupReplicaV2] capture paused");
     }
 
@@ -253,14 +286,34 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         if (!active)
             return false;
 
+        ObservationDisplayMode frozenMode = _observationDisplayMode;
         StopCoverageAndRecording();
+        _observationDisplayMode = frozenMode;
+        HoldCurrentObservationDisplay();
+        if ((frozenMode == ObservationDisplayMode.RemainingPreTsdfPoints ||
+             frozenMode == ObservationDisplayMode.AdmissionTerrainContours ||
+             frozenMode == ObservationDisplayMode.PersistentBoundary) &&
+            _admissionPointOverlay != null)
+        {
+            if (_admissionPointOverlay.ExportFrozenSnapshot(
+                    out string snapshotDirectory))
+                Debug.Log(
+                    "[RoomSetupReplicaV2] frozen remaining pre-TSDF point cloud exported: " +
+                    snapshotDirectory);
+            else
+                Debug.LogWarning(
+                    "[RoomSetupReplicaV2] frozen remaining pre-TSDF export skipped: no complete visible point snapshot");
+        }
         Debug.Log(
-            "[RoomSetupReplicaV2] current replica frozen; visible front retained");
+            "[RoomSetupReplicaV2] current display frozen; active mesh/point view retained");
         return true;
     }
 
     /// <summary>
-    /// Toggles the classic v2.4 world-locked multicolour BB depth-point trail.
+    /// Cycles mutually-exclusive inspection views: mesh, callback-latched raw
+    /// back-projection, remaining pre-TSDF points, a point-preserving
+    /// terrain-contour view, and those same points overlaid with the persistent
+    /// world-boundary state.
     /// </summary>
     public bool ToggleDepthPointCloudOverlay()
     {
@@ -268,20 +321,58 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         {
             _depthPointCloudOverlay =
                 gameObject.AddComponent<DepthPointCloudOverlay>();
-            _depthPointCloudOverlay.SetVisible(true);
-            _depthPointCloudOverlay.SetAcquiring(IsScanning);
-            Debug.Log(
-                "[RoomSetupReplicaV2] BB depth-point trail created and visible");
-            return true;
+            _depthPointCloudOverlay.ConfigureIsolatedCurrentFrameMode();
         }
 
-        bool visible = !_depthPointCloudOverlay.Visible;
-        _depthPointCloudOverlay.SetVisible(visible);
-        _depthPointCloudOverlay.SetAcquiring(visible && IsScanning);
-        Debug.Log(visible
-            ? "[RoomSetupReplicaV2] BB depth-point trail visible"
-            : "[RoomSetupReplicaV2] BB depth-point trail hidden");
-        return visible;
+        switch (_observationDisplayMode)
+        {
+            case ObservationDisplayMode.Mesh:
+                _restorePrimaryPreview = _reconstruction != null &&
+                                         _reconstruction.PreviewVisible;
+                _restoreAtomicPreview = _atomicReconstruction != null &&
+                                        _atomicReconstruction.PreviewVisible;
+                SetObservationDisplayMode(ObservationDisplayMode.RawBackProjection);
+                Debug.Log("[RoomSetupReplicaV2] isolated raw back-projection visible; mesh hidden");
+                return true;
+            case ObservationDisplayMode.RawBackProjection:
+                SetObservationDisplayMode(
+                    ObservationDisplayMode.RemainingPreTsdfPoints);
+                Debug.Log("[RoomSetupReplicaV2] isolated remaining pre-TSDF points visible; 0.1.1 stereo depth-gradient admission restored with a hard 3.0 m maximum depth");
+                return true;
+            case ObservationDisplayMode.RemainingPreTsdfPoints:
+                SetObservationDisplayMode(
+                    ObservationDisplayMode.AdmissionTerrainContours);
+                Debug.Log("[RoomSetupReplicaV2] TSDF-input terrain contours visible; inward relative depth is purple, outward is orange, connected-surface datum is cyan, contour interval is 5 mm");
+                return true;
+            case ObservationDisplayMode.AdmissionTerrainContours:
+                SetObservationDisplayMode(
+                    ObservationDisplayMode.PersistentBoundary);
+                Debug.Log("[RoomSetupReplicaV2] persistent world boundaries overlaid on TSDF-input points; mesh hidden");
+                return true;
+            default:
+                SetObservationDisplayMode(ObservationDisplayMode.Mesh);
+                Debug.Log("[RoomSetupReplicaV2] observation isolation closed; mesh view restored");
+                return false;
+        }
+    }
+
+    public void ToggleReplicaPreview()
+    {
+        if (_observationDisplayMode != ObservationDisplayMode.Mesh)
+        {
+            SetObservationDisplayMode(ObservationDisplayMode.Mesh);
+            return;
+        }
+        RoomSetupReplicaV2Reconstruction reconstruction = Reconstruction;
+        if (reconstruction != null)
+            reconstruction.SetPreviewVisible(!reconstruction.PreviewVisible);
+    }
+
+    public bool ToggleUniqueEdgeDisplay()
+    {
+        RoomSetupReplicaV2Reconstruction reconstruction = Reconstruction;
+        return reconstruction != null &&
+               reconstruction.ToggleUniqueEdgeDisplay();
     }
 
     private void QueueLiveExport()
@@ -340,6 +431,8 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
         _reconstruction?.ClearReplica();
         _atomicReconstruction?.ClearReplica();
         _depthPointCloudOverlay?.ClearTrail();
+        _admissionPointOverlay?.ClearPoints();
+        _persistentBoundaryOverlay?.ClearBoundaries();
         _lastSubmittedPlatformFrame = -1;
         _lastDisplayPlatformFrame = -1;
         _lastBusyPlatformFrame = -1;
@@ -353,6 +446,8 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
 
     public bool ReplayLastTape()
     {
+        if (_observationDisplayMode != ObservationDisplayMode.Mesh)
+            SetObservationDisplayMode(ObservationDisplayMode.Mesh);
         _recordWhenDepthReady = false;
         _coverageRecordingSession = false;
         _recordingStarted = false;
@@ -385,9 +480,74 @@ public sealed class RoomSetupReplicaV2Scanner : MonoBehaviour
 
     private void SetLivePreviewState()
     {
+        if (_observationDisplayMode != ObservationDisplayMode.Mesh)
+        {
+            _reconstruction?.SetPreviewVisible(false);
+            _atomicReconstruction?.SetPreviewVisible(false);
+            return;
+        }
         bool hasAtomicArm = _atomicReconstruction != null;
         _reconstruction?.SetPreviewVisible(!hasAtomicArm);
         _atomicReconstruction?.SetPreviewVisible(true);
+    }
+
+    private void SetObservationDisplayMode(ObservationDisplayMode mode)
+    {
+        _observationDisplayMode = mode;
+        bool raw = mode == ObservationDisplayMode.RawBackProjection;
+        bool admitted = mode == ObservationDisplayMode.RemainingPreTsdfPoints ||
+                        mode == ObservationDisplayMode.AdmissionTerrainContours ||
+                        mode == ObservationDisplayMode.PersistentBoundary;
+        bool terrain = mode == ObservationDisplayMode.AdmissionTerrainContours;
+        bool boundary = mode == ObservationDisplayMode.PersistentBoundary;
+        _depthPointCloudOverlay?.SetFrozen(false);
+        _admissionPointOverlay?.SetFrozen(false);
+        _persistentBoundaryOverlay?.SetFrozen(false);
+        _depthPointCloudOverlay?.SetVisible(raw);
+        _depthPointCloudOverlay?.SetAcquiring(raw && IsScanning);
+        _admissionPointOverlay?.SetTerrainContours(terrain);
+        _admissionPointOverlay?.SetVisible(admitted);
+        _persistentBoundaryOverlay?.SetVisible(boundary);
+
+        if (mode != ObservationDisplayMode.Mesh)
+        {
+            _reconstruction?.SetPreviewVisible(false);
+            _atomicReconstruction?.SetPreviewVisible(false);
+            return;
+        }
+
+        if (_reconstruction != null)
+            _reconstruction.SetPreviewVisible(_restorePrimaryPreview);
+        if (_atomicReconstruction != null)
+            _atomicReconstruction.SetPreviewVisible(_restoreAtomicPreview);
+    }
+
+    private void HoldCurrentObservationDisplay()
+    {
+        switch (_observationDisplayMode)
+        {
+            case ObservationDisplayMode.RawBackProjection:
+                _depthPointCloudOverlay?.SetFrozen(true);
+                _admissionPointOverlay?.SetVisible(false);
+                _reconstruction?.SetPreviewVisible(false);
+                _atomicReconstruction?.SetPreviewVisible(false);
+                break;
+            case ObservationDisplayMode.RemainingPreTsdfPoints:
+            case ObservationDisplayMode.AdmissionTerrainContours:
+                _depthPointCloudOverlay?.SetVisible(false);
+                _admissionPointOverlay?.SetFrozen(true);
+                _persistentBoundaryOverlay?.SetVisible(false);
+                _reconstruction?.SetPreviewVisible(false);
+                _atomicReconstruction?.SetPreviewVisible(false);
+                break;
+            case ObservationDisplayMode.PersistentBoundary:
+                _depthPointCloudOverlay?.SetVisible(false);
+                _admissionPointOverlay?.SetFrozen(true);
+                _persistentBoundaryOverlay?.SetFrozen(true);
+                _reconstruction?.SetPreviewVisible(false);
+                _atomicReconstruction?.SetPreviewVisible(false);
+                break;
+        }
     }
 
     private void OnDestroy()

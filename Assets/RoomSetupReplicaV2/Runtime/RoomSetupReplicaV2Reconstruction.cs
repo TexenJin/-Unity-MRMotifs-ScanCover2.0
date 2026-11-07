@@ -18,6 +18,10 @@ using UnityEngine.Rendering;
 [DisallowMultipleComponent]
 public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 {
+    // Live production no longer crosses the GPU->CPU boundary. The recovered
+    // CPU path remains in this file only for deterministic legacy tape replay
+    // and offline evidence compatibility.
+    private const bool GpuProductionEnabled = true;
     private const int ChunkSize = 16;
     private const int VoxelsPerChunk = ChunkSize * ChunkSize * ChunkSize;
     private const int SampleSize = ChunkSize + 1;
@@ -34,7 +38,24 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     // strict lastTimestamp + 1/frequency < currentTimestamp gate.
     private const float NativeGarbageFrequencyDefaultHz = -0.15f;
     private const float MinimumDepthMeters = 0.30f;
-    private const float MaximumDepthMeters = 6.00f;
+    // Hard production radius. Both observed surface anchors and every source
+    // voxel written on their truncation rays must remain within 3 m of the eye
+    // that owns the observation. The boundary may stay empty; no far support
+    // is allowed to enter TSDF merely to close it.
+    private const float MaximumDepthMeters = 3.00f;
+    private const float ProductionMaximumDepthMeters = 3.00f;
+    private const float StrongGrazingMaximumFacing = 0.50f;
+    private const int StrongGrazingNormalProbePixels = 2;
+    private const int ThinGrazingMaximumThicknessPoints = 5;
+    // A rejected thin grazing band is a hard reconstruction discontinuity,
+    // not merely a missing input sample. Keep one derived-cell radius around
+    // every rejected anchor unwritable and unmeshable so neighbouring near
+    // and far depth layers cannot average or triangulate across the band.
+    private const float ThinGrazingBarrierRadiusMeters = DerivedVoxelMeters;
+    private const float ThinGrazingBarrierReleaseBaselineMeters = 0.08f;
+    private const float ThinGrazingBarrierReleaseSurfaceMeters =
+        VoxelMeters * 1.5f;
+    private const byte ThinGrazingBarrierReleasePairs = 2;
     private const float PositiveTruncationScale = 0.20f;
     private const float NegativeTruncationScale = 0.20f / 3f;
     private const float GradientThresholdSquared = 0.01f;
@@ -60,15 +81,148 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private const float LayerShiftDistanceConsistencyMeters = 0.025f;
     private const float LayerShiftAnchorConsistencyMeters = 0.15f;
     private const byte LayerShiftPairsToReplace = 2;
+    // Production pre-fusion layer latch. A mature source voxel keeps one
+    // directly observed dominant surface. An incoming surface that is at least
+    // one source voxel away along the current viewing ray is never averaged
+    // into that dominant TSDF value. It must first be seen by both eyes in the
+    // current pair and then be confirmed again from a displaced viewpoint.
+    private const bool DominantLayerPrefusionEnabled = true;
+    private const float DominantLayerChallengeMeters = VoxelMeters;
+    private const float DominantLayerDistanceConsistencyMeters =
+        VoxelMeters * 0.5f;
+    private const float DominantLayerAnchorConsistencyMeters =
+        VoxelMeters * 1.5f;
+    private const float DominantLayerStereoAnchorSeparationMeters =
+        VoxelMeters * 1.5f;
+    private const float DominantLayerMinimumViewBaselineMeters = 0.08f;
+    private const byte DominantLayerPairsToReplace = 2;
+    private const int DominantLayerStereoSearchRadiusPixels = 2;
     private const float Q75CandidateLayerCellMeters = DerivedVoxelMeters;
+    // Public Environment Depth can spatially smooth a real foreground /
+    // background discontinuity before TSDF fusion ever sees it.  A strictly
+    // local stereo rule recovers only transition pixels bracketed by two flat,
+    // well-separated plateaus.  It changes the observation before the first
+    // TSDF write; ordinary slopes and under-evidenced pixels remain untouched.
+    private const bool FirstSurfaceStepSplitEnabled = true;
+    private const int StepSplitDirectionProbePixels = 2;
+    private const int StepSplitMinimumOuterOffsetPixels = 5;
+    private const int StepSplitMaximumOuterOffsetPixels = 19;
+    private const int StepSplitOuterOffsetStepPixels = 2;
+    private const int StepSplitPlateauThicknessPixels = 2;
+    private const float StepSplitMinimumLayerSeparationMeters = 0.15f;
+    private const float StepSplitMaximumPlateauSpreadMeters = 0.025f;
+    private const float StepSplitMinimumSnapMeters = 0.025f;
+    private const int StepSplitStereoSearchRadiusPixels = 2;
+    private const float StepSplitMaximumStereoAnchorSeparationMeters = 0.075f;
+    private const float StepSplitSameLayerSupportMeters = 0.04f;
+    private const int StepSplitMinimumSameLayerNeighbors = 2;
+    // StepSplit is a rescue operation for a narrow transition band.  If both
+    // eyes independently produce a qualified region with a fully-filled core
+    // almost as wide as the rule's maximum plateau search, the rescue has
+    // expanded into a surface rather than recovering an edge.  Detect that
+    // condition before ApplyFirstSurfaceStepSlice mutates world/depth data,
+    // then withdraw the entire paired component so the original observation
+    // continues through the ordinary gradient path.
+    private const int StepSplitOverreachCoreRadiusPixels =
+        StepSplitMaximumOuterOffsetPixels -
+        StepSplitPlateauThicknessPixels;
+    // The manually selected fault is stable across two frozen views even when
+    // gaps split it into several pieces: every piece is a tall, broad
+    // StepSplit component, while the next-largest unrelated component stays
+    // below 700 pixels.  Reject these components before StepSplit mutates the
+    // observation.  This intentionally permits an empty result where the
+    // original gradient path has no support.
+    private const int StepSplitDirectRejectMinimumAreaPixels = 1500;
+    private const int StepSplitDirectRejectMinimumWidthPixels = 24;
+    private const int StepSplitDirectRejectMinimumHeightPixels = 96;
+    private const int SharedFlapStepFamilySatelliteGapPixels = 8;
+    // Once the paired structural gate identifies the bad StepSplit sheet,
+    // retire only source voxels immediately around that sheet whose saved
+    // surface provenance agrees with it.  The 4.5 cm anchor gate is narrower
+    // than the observed 5.5 cm minimum separation to the parallel companion
+    // layer, so this is not a bounding-box or whole-component TSDF clear.
+    private const float StructuralStepRetirementRadiusMeters = VoxelMeters;
+    private const float StructuralStepRetirementAnchorRadiusMeters =
+        VoxelMeters * 0.9f;
+    // Conservative post-gradient stereo cleanup. A source point is rejected
+    // only when it projects in front of a coherent opposite-eye depth layer
+    // yet has no opposite-eye mate. A source point behind that layer is kept
+    // as potentially occluded, so the two sides cannot erase each other.
+    private const int StereoOutlierSearchRadiusPixels = 2;
+    private const int StereoOutlierMajorityRadiusPixels = 4;
+    private const int StereoOutlierMaximumSamples = 81;
+    private const int StereoOutlierMinimumMajoritySupport = 8;
+    private const float StereoOutlierSameLayerMeters = 0.04f;
+    private const float StereoOutlierMatchMeters = 0.05f;
+    private const float StereoForegroundContradictionMeters = 0.08f;
+    // A coherent public-depth bulge can be present in both eye slices, so the
+    // one-eye contradiction test above must preserve it.  This second gate is
+    // deliberately narrower: the center must be locally planar, both eyes
+    // must independently identify it, and at least 94% of a 10/16/22-pixel
+    // ring must be admitted.  A dominant parallel ring layer 5.5-18 cm away
+    // marks only the smooth, unsupported flap core. StepSplit points are
+    // included: paired structural cores seed removal of their complete
+    // StepSplit component family, independent of screen orientation or size.
+    private const int SharedFlapLocalRadiusPixels = 2;
+    private const int SharedFlapMinimumValidRingSamples = 46;
+    private const int SharedFlapMinimumClusterSupport = 20;
+    private const int SharedFlapMinimumClusterPercent = 55;
+    private const float SharedFlapMaximumLocalPlaneErrorMeters = 0.018f;
+    private const float SharedFlapMinimumOffsetMeters = 0.055f;
+    private const float SharedFlapMaximumOffsetMeters = 0.18f;
+    private const float SharedFlapStepMaximumOffsetMeters = 0.10f;
+    private const float SharedFlapProjectionMinimumMeters = -0.20f;
+    private const float SharedFlapProjectionMaximumMeters = 0.20f;
+    private const float SharedFlapProjectionBinMeters = 0.025f;
+    private const int SharedFlapProjectionBinCount = 16;
+    private const int SharedFlapStereoSearchRadiusPixels = 2;
+    private const float SharedFlapStereoMatchMeters = 0.05f;
+    private const int SharedFlapCandidateNeighborhoodRadiusPixels = 2;
+    private const int SharedFlapMinimumLocalCandidateSupport = 5;
+    private static readonly Vector2Int[] SharedFlapRingOffsets =
+    {
+        new Vector2Int(10, 0), new Vector2Int(9, 4),
+        new Vector2Int(7, 7), new Vector2Int(4, 9),
+        new Vector2Int(0, 10), new Vector2Int(-4, 9),
+        new Vector2Int(-7, 7), new Vector2Int(-9, 4),
+        new Vector2Int(-10, 0), new Vector2Int(-9, -4),
+        new Vector2Int(-7, -7), new Vector2Int(-4, -9),
+        new Vector2Int(0, -10), new Vector2Int(4, -9),
+        new Vector2Int(7, -7), new Vector2Int(9, -4),
+        new Vector2Int(16, 0), new Vector2Int(15, 6),
+        new Vector2Int(11, 11), new Vector2Int(6, 15),
+        new Vector2Int(0, 16), new Vector2Int(-6, 15),
+        new Vector2Int(-11, 11), new Vector2Int(-15, 6),
+        new Vector2Int(-16, 0), new Vector2Int(-15, -6),
+        new Vector2Int(-11, -11), new Vector2Int(-6, -15),
+        new Vector2Int(0, -16), new Vector2Int(6, -15),
+        new Vector2Int(11, -11), new Vector2Int(15, -6),
+        new Vector2Int(22, 0), new Vector2Int(20, 8),
+        new Vector2Int(16, 16), new Vector2Int(8, 20),
+        new Vector2Int(0, 22), new Vector2Int(-8, 20),
+        new Vector2Int(-16, 16), new Vector2Int(-20, 8),
+        new Vector2Int(-22, 0), new Vector2Int(-20, -8),
+        new Vector2Int(-16, -16), new Vector2Int(-8, -20),
+        new Vector2Int(0, -22), new Vector2Int(8, -20),
+        new Vector2Int(16, -16), new Vector2Int(20, -8)
+    };
     // Compile-time A/B route. Do not use serialized defaults here: Unity hot
     // reload preserves the previously loaded component value across builds.
     private const bool SameLayerSupportEnabled = true;
     private const bool ContradictionRetirementEnabled = false;
-    // Production baseline restored to the 2026-10-27 device build.  Keep the
-    // q75 implementation available for isolated experiments, but do not let
-    // it add retirement/replacement latency to the live A route.
+    // Bounded ceiling-step recovery trial. Ordinary first-surface fusion stays
+    // unchanged; only mature cross-layer conflicts enter the stereo-qualified
+    // dominant/challenger latch. A pending local replacement keeps the last
+    // complete Chunk Front visible until the replacement is ready.
+    // Production keeps the 0.1.1 admission route: both eyes pass through the
+    // original local depth-gradient rule. MaximumDepthMeters is 3 m, and the
+    // dominant-layer latch above is the only fusion change: conflicting depth
+    // layers wait outside TSDF averaging until stereo/displaced-view proof.
+    private const bool LegacyProductionAdmissionEnabled = true;
     private const bool ProductionQ75Enabled = false;
+    // Keep persistent-boundary research and its display/export plumbing
+    // available, but do not let it rewrite production admission masks.
+    private const bool PersistentBoundaryProductionGateEnabled = false;
     // Evidence-only observer. Device receipts measured 6-9 ms per accepted
     // pair while affectedReconstruction remained false, so production never
     // creates or feeds it.
@@ -100,11 +254,49 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         None,
         UnprojectReplayLeft,
         DecodeLeft,
-        GradientLeft,
-        CandidateLeft,
         UnprojectReplayRight,
         DecodeRight,
+        MarkRightStrongGrazing,
+        ClassifyRightGrazingBands,
+        BuildRightThinGrazingBarrier,
+        DetectStepLeft,
+        DetectStepRight,
+        QualifyStepLeft,
+        QualifyStepRight,
+        RejectLargeStepComponentLeft,
+        RejectLargeStepComponentRight,
+        BuildStepRejectIntegralLeft,
+        BuildStepRejectIntegralRight,
+        RejectStepSatelliteLeft,
+        RejectStepSatelliteRight,
+        BuildStepIntegralLeft,
+        BuildStepIntegralRight,
+        MarkStepOverreachCoreLeft,
+        MarkStepOverreachCoreRight,
+        PairStepOverreachLeft,
+        ExpandStepOverreachLeft,
+        PairStepOverreachRight,
+        ExpandStepOverreachRight,
+        ApplyStepOverreachRollback,
+        ApplyStepLeft,
+        ApplyStepRight,
+        GradientLeft,
         GradientRight,
+        StereoOutlierLeft,
+        StereoOutlierRight,
+        ApplyStereoOutliers,
+        SharedFlapLeft,
+        SharedFlapRight,
+        PairSharedFlapSeedLeft,
+        PairSharedFlapSeedRight,
+        BuildSharedFlapSeedIntegralLeft,
+        BuildSharedFlapSeedIntegralRight,
+        ExpandSharedFlapStepFamilyLeft,
+        ExpandSharedFlapStepFamilyRight,
+        ApplySharedFlaps,
+        RestoreRawRightAdmission,
+        RetireSharedStepFamily,
+        CandidateLeft,
         CandidateRight,
         IntegrateLeft,
         IntegrateRight,
@@ -132,6 +324,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public Vector3Int replacementLayerKey;
         public byte replacementStreak;
         public sbyte replacementSign;
+        public Vector3 replacementFirstView;
+        public int replacementLastPair;
+    }
+
+    private struct ThinGrazingBarrierState
+    {
+        public Vector3 blockingEye;
+        public int blockedPair;
+        public int lastDirectPair;
+        public byte directStreak;
     }
 
     private sealed class Chunk
@@ -209,6 +411,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string arm;
         public string mutation;
         public string coordinateSpace;
+        public string productionAdmissionSource;
+        public bool leftEyeFusionEnabled;
         public int acceptedPairs;
         public int droppedBusyPairs;
         public int readbackFailures;
@@ -216,6 +420,13 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public int weightedVoxels;
         public int contradictionVotes;
         public int retiredVoxels;
+        public long structuralStepFamilyRetiredVoxels;
+        public long strongGrazingPoints;
+        public long thinGrazingRejectedPoints;
+        public long wideGrazingRetainedPoints;
+        public long thinGrazingBarrierVoxels;
+        public long thinGrazingClearedVoxels;
+        public long thinGrazingReleasedVoxels;
         public int pendingReplacementVoxels;
         public int replacementPairsToPublish;
         public bool atomicChunkFrontHold;
@@ -226,6 +437,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float q75CandidateLayerCellMeters;
         public long q75QualifiedVoxelObservations;
         public long q75DeferredVoxelObservations;
+        public long firstSurfaceStepCandidateEyePixels;
+        public long firstSurfaceStepStereoQualifiedEyePixels;
+        public long firstSurfaceStepAppliedEyePixels;
+        public long firstSurfaceStepAcceptedEyePixels;
+        public long sharedConvexFlapCandidateEyePixels;
+        public long sharedConvexFlapRejectedEyePixels;
+        public int persistentBoundaryGuardedBands;
+        public int persistentBoundaryLastRejectedBridgePoints;
+        public long persistentBoundaryRejectedBridgePoints;
         public long layerShiftDeferredObservations;
         public long layerShiftPublishedVoxels;
         public int vertices;
@@ -435,7 +655,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int AcceptedPairCount { get; private set; }
     public int DroppedBusyPairCount { get; private set; }
     public int ReadbackFailureCount { get; private set; }
-    public int ActiveChunkCount => _chunks.Count;
+    public int ActiveChunkCount =>
+        GpuProductionEnabled && _gpuBackend != null && _gpuBackend.Ready
+            ? _gpuBackend.TileCount
+            : _chunks.Count;
     public int WeightedVoxelCount { get; private set; }
     public int PreviewTriangleCount { get; private set; }
     public int PendingMeshChunkCount => _queuedMeshChunks.Count;
@@ -457,6 +680,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public int RetiredContradictedVoxelCount { get; private set; }
     public long LayerShiftDeferredObservationCount { get; private set; }
     public long LayerShiftPublishedVoxelCount { get; private set; }
+    public long FirstSurfaceStepCandidateEyePixelCount { get; private set; }
+    public long FirstSurfaceStepStereoQualifiedEyePixelCount { get; private set; }
+    public long FirstSurfaceStepAppliedEyePixelCount { get; private set; }
+    public long FirstSurfaceStepAcceptedEyePixelCount { get; private set; }
+    public long StepSplitOverreachCoreEyePixelCount { get; private set; }
+    public long StepSplitOverreachRolledBackEyePixelCount { get; private set; }
+    public long SharedConvexFlapCandidateEyePixelCount { get; private set; }
+    public long SharedConvexFlapRejectedEyePixelCount { get; private set; }
+    public long StructuralStepFamilyRetiredVoxelCount { get; private set; }
+    public long StrongGrazingPointCount { get; private set; }
+    public long ThinGrazingRejectedPointCount { get; private set; }
+    public long WideGrazingRetainedPointCount { get; private set; }
+    public long ThinGrazingBarrierVoxelCount { get; private set; }
+    public long ThinGrazingClearedVoxelCount { get; private set; }
+    public long ThinGrazingReleasedVoxelCount { get; private set; }
     public bool LastSimplificationApplied { get; private set; }
     public int LastPreSimplificationVertexCount { get; private set; }
     public int LastPreSimplificationTriangleCount { get; private set; }
@@ -473,6 +711,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public float LastSimplificationMilliseconds { get; private set; }
     public bool HasPendingWork => _readbackPending || _workStage != WorkStage.None;
     public bool PreviewVisible => showReplica;
+    public bool UniqueEdgeDisplay =>
+        _gpuBackend != null && _gpuBackend.UniqueEdgesOnly;
     public bool IsRecording => _tapeWriter != null;
     public bool IsReplaying => _tapeReader != null;
     public bool CanProbeFinalMesh { get; private set; }
@@ -490,19 +730,34 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public string CompactStatus =>
         $"RS-V2 p={AcceptedPairCount:D6} chunk={ActiveChunkCount:D4} " +
         $"vox={WeightedVoxelCount:D7} tri={PreviewTriangleCount:D6} " +
-        $"q={PendingMeshChunkCount:D4} " +
+        $"q={PendingMeshChunkCount:D4} gap={ThinGrazingBarrierVoxelCount:D6} " +
         $"rec={(IsRecording ? 1 : 0)} rep={(IsReplaying ? 1 : 0)}";
 
     public bool ReadyForSynchronizedDepthPair => !HasPendingWork;
-    public string RouteLabel => _abExperimentalArm
+    public string RouteLabel =>
+        GpuProductionEnabled && _environmentDepthGlobalSource
+        ? "B-environment-depth-global-final-v0.1.2-gpu-mc-hard3m-v1"
+        : GpuProductionEnabled && !_abExperimentalArm
+        ? "A-gpu-v0.1.1-fusion-mc-hard3m-v9"
+        : _abExperimentalArm
         ? "B-atomic-retirement-hold-v2"
-        : ProductionQ75Enabled
-            ? "A-q75-layer-shift-latch-atomic-v2"
-            : "A-old-rules";
+        : LegacyProductionAdmissionEnabled
+            ? DominantLayerPrefusionEnabled
+                ? "A-0.1.1-hard3m-dominant-layer-prefusion-v2"
+                : "A-old-rules-3m"
+            : ProductionQ75Enabled
+                ? "A-structural-step-family-reject-shared-flap-q75-admission-v14"
+                : "A-raw-right-3m-unlockable-thin-gap-v21";
     private bool UsesProductionQ75 =>
         ProductionQ75Enabled && !_abExperimentalArm;
     private bool UsesAtomicRetirement =>
         _abExperimentalArm || UsesProductionQ75;
+    private bool UsesRawRightProductionAdmission =>
+        !LegacyProductionAdmissionEnabled &&
+        !_abExperimentalArm && !UsesProductionQ75;
+    private bool UsesLegacyProductionAdmission =>
+        LegacyProductionAdmissionEnabled && !_abExperimentalArm;
+    private bool UsesStructuralStepRetirement => false;
 
     private readonly Dictionary<Vector3Int, Chunk> _chunks =
         new Dictionary<Vector3Int, Chunk>(256);
@@ -538,6 +793,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private AsyncGPUReadbackRequest _rightReadback;
     private NativeArray<Color> _leftPixels;
     private NativeArray<Color> _rightPixels;
+    private NativeArray<Color> _leftRawPixels;
+    private NativeArray<Color> _rightRawPixels;
     private int _width;
     private int _height;
     private int _expected;
@@ -572,16 +829,62 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     private Vector3 _rightEye;
     private float[] _leftDepth;
     private float[] _rightDepth;
+    private float[] _leftRawDepth;
+    private float[] _rightRawDepth;
     private float[] _leftNdc;
     private float[] _rightNdc;
     private byte[] _leftContinuous;
     private byte[] _rightContinuous;
+    private float[] _leftStepTarget;
+    private float[] _rightStepTarget;
+    private byte[] _leftStepQualified;
+    private byte[] _rightStepQualified;
+    private int[] _leftStepQualifiedIntegral;
+    private int[] _rightStepQualifiedIntegral;
+    private byte[] _leftStepOverreachCore;
+    private byte[] _rightStepOverreachCore;
+    private byte[] _leftStepOverreachRollback;
+    private byte[] _rightStepOverreachRollback;
+    private byte[] _leftStepComponentVisited;
+    private byte[] _rightStepComponentVisited;
+    private readonly Queue<int> _stepOverreachQueue = new(4096);
+    private readonly Queue<int> _stepComponentQueue = new(4096);
+    private readonly List<int> _stepComponentMembers = new(8192);
+    private readonly HashSet<Vector3Int> _structuralRetiredVoxels = new();
+    private readonly Dictionary<Vector3Int, ThinGrazingBarrierState>
+        _thinGrazingBarrierVoxels = new();
+    private bool _stepComponentActive;
+    private bool _stepComponentTouchesDirectReject;
+    private int _stepComponentMinimumX;
+    private int _stepComponentMinimumY;
+    private int _stepComponentMaximumX;
+    private int _stepComponentMaximumY;
+    private byte[] _leftStereoOutlier;
+    private byte[] _rightStereoOutlier;
+    private byte[] _leftSharedFlap;
+    private byte[] _rightSharedFlap;
+    private byte[] _rightStrongGrazing;
+    private byte[] _rightThinGrazingReject;
+    private byte[] _rightGrazingVisited;
+    private readonly Queue<int> _grazingBandQueue = new(4096);
+    private readonly List<int> _grazingBandMembers = new(8192);
+    private bool _grazingBandActive;
+    private bool _grazingBandHasWideCore;
+    private readonly float[] _stereoOutlierDepthScratch =
+        new float[StereoOutlierMaximumSamples];
+    private readonly int[] _sharedFlapProjectionHistogram =
+        new int[SharedFlapProjectionBinCount];
+    private RoomSetupReplicaV2AdmissionPointOverlay _admissionPointOverlay;
+    private RoomSetupReplicaV2PersistentBoundaryOverlay
+        _persistentBoundaryOverlay;
 
     private RoomSetupReplicaV2Tape.Writer _tapeWriter;
     private RoomSetupReplicaV2Tape.Reader _tapeReader;
     private RoomSetupReplicaV2ShadowMode _shadowMode;
     private RoomSetupReplicaV2FusionGuardQ75 _fusionGuardQ75;
+    private RoomSetupReplicaV2GpuBackend _gpuBackend;
     private bool _abExperimentalArm;
+    private bool _environmentDepthGlobalSource;
     private string _pendingLiveExportDirectory;
     private string _pendingLiveExportFileName;
     private bool _processingReplayFrame;
@@ -697,6 +1000,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         { 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 }
     };
 
+    private static readonly int[,] StepSplitDirections =
+    {
+        { 1, 0 },
+        { 0, 1 },
+        { 1, 1 },
+        { 1, -1 }
+    };
+
     public void ObserveDepthFrame(DepthCapture depth)
     {
         TryObserveDepthFrame(depth);
@@ -716,6 +1027,18 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             if (HasPendingWork)
                 DroppedBusyPairCount++;
             return false;
+        }
+
+        if (GpuProductionEnabled && !_abExperimentalArm)
+        {
+            bool submitted = EnsureGpuBackend().TryObserveDepthFrame(depth);
+            if (submitted)
+            {
+                AcceptedPairCount++;
+                _pendingFrame = depth.CurrentPlatformFrame;
+                _pendingCaptureTime = Time.realtimeSinceStartupAsDouble;
+            }
+            return submitted;
         }
 
         Texture source = depth.ChiselSourceDepthTex;
@@ -745,6 +1068,32 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _pendingGeneration = _resetGeneration;
         _readbackPending = true;
         return true;
+    }
+
+    /// <summary>
+    /// Sequential-B input. The caller must be the only active depth owner in
+    /// its process; this deliberately does not coexist with DepthCapture.
+    /// </summary>
+    public bool TryObserveEnvironmentDepthGlobal(Camera camera)
+    {
+        if (IsReplaying || camera == null || HasPendingWork ||
+            !GpuProductionEnabled || _abExperimentalArm)
+        {
+            if (HasPendingWork)
+                DroppedBusyPairCount++;
+            return false;
+        }
+
+        _environmentDepthGlobalSource = true;
+        bool submitted = EnsureGpuBackend()
+            .TryObserveEnvironmentDepthGlobal(camera);
+        if (submitted)
+        {
+            AcceptedPairCount++;
+            _pendingFrame = Time.frameCount;
+            _pendingCaptureTime = Time.realtimeSinceStartupAsDouble;
+        }
+        return submitted;
     }
 
     public bool ToggleRecording()
@@ -886,6 +1235,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         StopRecording();
         StopReplay();
+        _gpuBackend?.SetVisible(false);
         if (!File.Exists(TapePath))
         {
             Debug.LogWarning(
@@ -947,6 +1297,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     public void PrepareForLiveCapture()
     {
+        if (GpuProductionEnabled && !_abExperimentalArm)
+            EnsureGpuBackend().SetVisible(showReplica);
         if (!_replayUsesStageSpace)
             return;
         ClearReplica();
@@ -957,11 +1309,36 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public void SetPreviewVisible(bool visible)
     {
         showReplica = visible;
+        _gpuBackend?.SetVisible(visible && !IsReplaying);
         if (_previewRoot != null)
             _previewRoot.SetActive(visible);
         if (_globalLineObject != null)
             _globalLineObject.SetActive(
                 visible && _globalLineIndexCount > 0);
+    }
+
+    public bool ToggleUniqueEdgeDisplay()
+    {
+        RoomSetupReplicaV2GpuBackend backend = EnsureGpuBackend();
+        bool enabled = !backend.UniqueEdgesOnly;
+        backend.SetUniqueEdgeDisplay(enabled);
+        Debug.Log(
+            "[RoomSetupReplicaV2] unique-edge display=" + enabled +
+            " route=" + RouteLabel +
+            " (diagnostic display only; TSDF and MC unchanged)");
+        return enabled;
+    }
+
+    public void SetAdmissionPointOverlay(
+        RoomSetupReplicaV2AdmissionPointOverlay overlay)
+    {
+        _admissionPointOverlay = overlay;
+    }
+
+    public void SetPersistentBoundaryOverlay(
+        RoomSetupReplicaV2PersistentBoundaryOverlay overlay)
+    {
+        _persistentBoundaryOverlay = overlay;
     }
 
     /// <summary>
@@ -996,6 +1373,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _abExperimentalArm = true;
     }
 
+    public void ConfigureAsEnvironmentDepthGlobalSource()
+    {
+        _environmentDepthGlobalSource = true;
+    }
+
     public void RequestLiveExport(string directory, string fileName)
     {
         if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
@@ -1011,6 +1393,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     [ContextMenu("Clear Room Setup Replica V2")]
     public void ClearReplica()
     {
+        _gpuBackend?.Clear();
         _resetGeneration++;
         _readbackPending = false;
         _workStage = WorkStage.None;
@@ -1022,6 +1405,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         ClearGlobalLinePreview();
         _chunkPool.Clear();
         _candidateSet.Clear();
+        _stepOverreachQueue.Clear();
+        ResetGrazingBandTraversal();
+        _structuralRetiredVoxels.Clear();
+        _thinGrazingBarrierVoxels.Clear();
+        ResetStepComponentTraversal();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
         _garbageCandidates.Clear();
@@ -1067,6 +1455,21 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         RetiredContradictedVoxelCount = 0;
         LayerShiftDeferredObservationCount = 0;
         LayerShiftPublishedVoxelCount = 0;
+        FirstSurfaceStepCandidateEyePixelCount = 0;
+        FirstSurfaceStepStereoQualifiedEyePixelCount = 0;
+        FirstSurfaceStepAppliedEyePixelCount = 0;
+        FirstSurfaceStepAcceptedEyePixelCount = 0;
+        StepSplitOverreachCoreEyePixelCount = 0;
+        StepSplitOverreachRolledBackEyePixelCount = 0;
+        SharedConvexFlapCandidateEyePixelCount = 0;
+        SharedConvexFlapRejectedEyePixelCount = 0;
+        StructuralStepFamilyRetiredVoxelCount = 0;
+        StrongGrazingPointCount = 0;
+        ThinGrazingRejectedPointCount = 0;
+        WideGrazingRetainedPointCount = 0;
+        ThinGrazingBarrierVoxelCount = 0;
+        ThinGrazingClearedVoxelCount = 0;
+        ThinGrazingReleasedVoxelCount = 0;
         LastSimplificationApplied = false;
         LastPreSimplificationVertexCount = 0;
         LastPreSimplificationTriangleCount = 0;
@@ -1121,6 +1524,22 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         TryCompleteLiveExport();
     }
 
+    private void LateUpdate()
+    {
+        _gpuBackend?.Render();
+    }
+
+    private RoomSetupReplicaV2GpuBackend EnsureGpuBackend()
+    {
+        if (_gpuBackend == null)
+        {
+            _gpuBackend = new RoomSetupReplicaV2GpuBackend(
+                gameObject, lineColor, lineWidthPixels);
+            _gpuBackend.SetVisible(showReplica && !IsReplaying);
+        }
+        return _gpuBackend;
+    }
+
     private bool EnsureUnproject()
     {
         if (_unproject != null && _unprojectKernel >= 0)
@@ -1144,7 +1563,32 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     {
         if (_leftWorld != null && _leftWorld.IsCreated() &&
             width == _width && height == _height)
+        {
+            EnsurePixelArray(ref _leftRawPixels, _expected);
+            EnsurePixelArray(ref _rightRawPixels, _expected);
+            EnsureArray(ref _leftRawDepth, _expected);
+            EnsureArray(ref _rightRawDepth, _expected);
+            EnsureArray(
+                ref _leftStepQualifiedIntegral,
+                (_width + 1) * (_height + 1));
+            EnsureArray(
+                ref _rightStepQualifiedIntegral,
+                (_width + 1) * (_height + 1));
+            EnsureArray(ref _leftStepOverreachCore, _expected);
+            EnsureArray(ref _rightStepOverreachCore, _expected);
+            EnsureArray(ref _leftStepOverreachRollback, _expected);
+            EnsureArray(ref _rightStepOverreachRollback, _expected);
+            EnsureArray(ref _leftStepComponentVisited, _expected);
+            EnsureArray(ref _rightStepComponentVisited, _expected);
+            EnsureArray(ref _leftStereoOutlier, _expected);
+            EnsureArray(ref _rightStereoOutlier, _expected);
+            EnsureArray(ref _leftSharedFlap, _expected);
+            EnsureArray(ref _rightSharedFlap, _expected);
+            EnsureArray(ref _rightStrongGrazing, _expected);
+            EnsureArray(ref _rightThinGrazingReject, _expected);
+            EnsureArray(ref _rightGrazingVisited, _expected);
             return true;
+        }
         ReleaseTarget(ref _leftWorld);
         ReleaseTarget(ref _rightWorld);
         _width = width;
@@ -1154,12 +1598,39 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         _rightWorld = CreateTarget("RoomSetup Replica Right", width, height);
         EnsurePixelArray(ref _leftPixels, _expected);
         EnsurePixelArray(ref _rightPixels, _expected);
+        EnsurePixelArray(ref _leftRawPixels, _expected);
+        EnsurePixelArray(ref _rightRawPixels, _expected);
         EnsureArray(ref _leftDepth, _expected);
         EnsureArray(ref _rightDepth, _expected);
+        EnsureArray(ref _leftRawDepth, _expected);
+        EnsureArray(ref _rightRawDepth, _expected);
         EnsureArray(ref _leftNdc, _expected);
         EnsureArray(ref _rightNdc, _expected);
         EnsureArray(ref _leftContinuous, _expected);
         EnsureArray(ref _rightContinuous, _expected);
+        EnsureArray(ref _leftStepTarget, _expected);
+        EnsureArray(ref _rightStepTarget, _expected);
+        EnsureArray(ref _leftStepQualified, _expected);
+        EnsureArray(ref _rightStepQualified, _expected);
+        EnsureArray(
+            ref _leftStepQualifiedIntegral,
+            (width + 1) * (height + 1));
+        EnsureArray(
+            ref _rightStepQualifiedIntegral,
+            (width + 1) * (height + 1));
+        EnsureArray(ref _leftStepOverreachCore, _expected);
+        EnsureArray(ref _rightStepOverreachCore, _expected);
+        EnsureArray(ref _leftStepOverreachRollback, _expected);
+        EnsureArray(ref _rightStepOverreachRollback, _expected);
+        EnsureArray(ref _leftStepComponentVisited, _expected);
+        EnsureArray(ref _rightStepComponentVisited, _expected);
+        EnsureArray(ref _leftStereoOutlier, _expected);
+        EnsureArray(ref _rightStereoOutlier, _expected);
+        EnsureArray(ref _leftSharedFlap, _expected);
+        EnsureArray(ref _rightSharedFlap, _expected);
+        EnsureArray(ref _rightStrongGrazing, _expected);
+        EnsureArray(ref _rightThinGrazingReject, _expected);
+        EnsureArray(ref _rightGrazingVisited, _expected);
         return _leftWorld != null && _rightWorld != null;
     }
 
@@ -1224,7 +1695,34 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         Array.Clear(_rightNdc, 0, _expected);
         Array.Clear(_leftContinuous, 0, _expected);
         Array.Clear(_rightContinuous, 0, _expected);
+        Array.Clear(_leftStepTarget, 0, _expected);
+        Array.Clear(_rightStepTarget, 0, _expected);
+        Array.Clear(_leftStepQualified, 0, _expected);
+        Array.Clear(_rightStepQualified, 0, _expected);
+        Array.Clear(
+            _leftStepQualifiedIntegral, 0,
+            (_width + 1) * (_height + 1));
+        Array.Clear(
+            _rightStepQualifiedIntegral, 0,
+            (_width + 1) * (_height + 1));
+        Array.Clear(_leftStepOverreachCore, 0, _expected);
+        Array.Clear(_rightStepOverreachCore, 0, _expected);
+        Array.Clear(_leftStepOverreachRollback, 0, _expected);
+        Array.Clear(_rightStepOverreachRollback, 0, _expected);
+        Array.Clear(_leftStepComponentVisited, 0, _expected);
+        Array.Clear(_rightStepComponentVisited, 0, _expected);
+        Array.Clear(_leftStereoOutlier, 0, _expected);
+        Array.Clear(_rightStereoOutlier, 0, _expected);
+        Array.Clear(_leftSharedFlap, 0, _expected);
+        Array.Clear(_rightSharedFlap, 0, _expected);
+        Array.Clear(_rightStrongGrazing, 0, _expected);
+        Array.Clear(_rightThinGrazingReject, 0, _expected);
+        Array.Clear(_rightGrazingVisited, 0, _expected);
         _candidateSet.Clear();
+        _stepOverreachQueue.Clear();
+        ResetGrazingBandTraversal();
+        _structuralRetiredVoxels.Clear();
+        ResetStepComponentTraversal();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
         _garbageCandidates.Clear();
@@ -1257,25 +1755,10 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     break;
                 case WorkStage.DecodeLeft:
                     if (DecodeSlice(_leftPixels, _leftDepth, _leftNdc,
-                            _leftWorldToClip, deadline))
-                        BeginStage(WorkStage.GradientLeft);
-                    break;
-                case WorkStage.GradientLeft:
-                    if (GradientSlice(
-                            _leftDepth, _leftContinuous, deadline))
-                        BeginStage(WorkStage.CandidateLeft);
-                    break;
-                case WorkStage.CandidateLeft:
-                    if (CandidateSlice(
-                            _leftPixels, _leftDepth, _leftContinuous,
-                            _leftEye, deadline))
-                    {
-                        _leftCandidates.AddRange(_candidateSet);
-                        _candidateSet.Clear();
+                            _leftWorldToClip, _leftEye, deadline))
                         BeginStage(_processingReplayFrame
                             ? WorkStage.UnprojectReplayRight
                             : WorkStage.DecodeRight);
-                    }
                     break;
                 case WorkStage.UnprojectReplayRight:
                     if (UnprojectReplaySlice(
@@ -1286,18 +1769,373 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     break;
                 case WorkStage.DecodeRight:
                     if (DecodeSlice(_rightPixels, _rightDepth, _rightNdc,
-                            _rightWorldToClip, deadline))
+                            _rightWorldToClip, _rightEye, deadline))
                     {
+                        SnapshotRawObservationPair();
                         if (!_processingReplayFrame)
                             RecordCurrentPair();
-                        BeginStage(WorkStage.GradientRight);
+                        BeginStage(UsesLegacyProductionAdmission
+                            ? WorkStage.GradientLeft
+                            : UsesRawRightProductionAdmission
+                                ? WorkStage.MarkRightStrongGrazing
+                                : WorkStage.DetectStepLeft);
                     }
+                    break;
+                case WorkStage.MarkRightStrongGrazing:
+                    if (MarkRightStrongGrazingSlice(deadline))
+                    {
+                        ResetGrazingBandTraversal();
+                        BeginStage(WorkStage.ClassifyRightGrazingBands);
+                    }
+                    break;
+                case WorkStage.ClassifyRightGrazingBands:
+                    if (ClassifyRightGrazingBandsSlice(deadline))
+                    {
+                        ResetGrazingBandTraversal();
+                        BeginStage(WorkStage.BuildRightThinGrazingBarrier);
+                    }
+                    break;
+                case WorkStage.BuildRightThinGrazingBarrier:
+                    if (BuildRightThinGrazingBarrierSlice(deadline))
+                        BeginStage(WorkStage.RestoreRawRightAdmission);
+                    break;
+                case WorkStage.DetectStepLeft:
+                    if (DetectFirstSurfaceStepSlice(
+                            _leftDepth, _leftStepTarget, deadline))
+                        BeginStage(WorkStage.DetectStepRight);
+                    break;
+                case WorkStage.DetectStepRight:
+                    if (DetectFirstSurfaceStepSlice(
+                            _rightDepth, _rightStepTarget, deadline))
+                        BeginStage(WorkStage.QualifyStepLeft);
+                    break;
+                case WorkStage.QualifyStepLeft:
+                    if (QualifyFirstSurfaceStepSlice(
+                            _leftPixels, _leftDepth, _leftStepTarget,
+                            _leftEye, _rightPixels, _rightDepth,
+                            _rightStepTarget, _rightEye,
+                            _rightWorldToClip, _leftStepQualified,
+                            deadline))
+                        BeginStage(WorkStage.QualifyStepRight);
+                    break;
+                case WorkStage.QualifyStepRight:
+                    if (QualifyFirstSurfaceStepSlice(
+                            _rightPixels, _rightDepth, _rightStepTarget,
+                            _rightEye, _leftPixels, _leftDepth,
+                            _leftStepTarget, _leftEye,
+                            _leftWorldToClip, _rightStepQualified,
+                            deadline))
+                        BeginStage(WorkStage.ApplyStepLeft);
+                    break;
+                case WorkStage.RejectLargeStepComponentLeft:
+                    if (MarkStepComponentRejectsSlice(
+                            _leftStepQualified,
+                            _leftStepComponentVisited,
+                            _leftStepOverreachRollback, null, deadline))
+                    {
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.RejectLargeStepComponentRight);
+                    }
+                    break;
+                case WorkStage.RejectLargeStepComponentRight:
+                    if (MarkStepComponentRejectsSlice(
+                            _rightStepQualified,
+                            _rightStepComponentVisited,
+                            _rightStepOverreachRollback, null, deadline))
+                    {
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.BuildStepRejectIntegralLeft);
+                    }
+                    break;
+                case WorkStage.BuildStepRejectIntegralLeft:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _leftStepOverreachRollback,
+                            _leftStepQualifiedIntegral, deadline))
+                        BeginStage(WorkStage.BuildStepRejectIntegralRight);
+                    break;
+                case WorkStage.BuildStepRejectIntegralRight:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _rightStepOverreachRollback,
+                            _rightStepQualifiedIntegral, deadline))
+                    {
+                        Array.Clear(
+                            _leftStepComponentVisited, 0, _expected);
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.RejectStepSatelliteLeft);
+                    }
+                    break;
+                case WorkStage.RejectStepSatelliteLeft:
+                    if (MarkStepComponentRejectsSlice(
+                            _leftStepQualified,
+                            _leftStepComponentVisited,
+                            _leftStepOverreachRollback,
+                            _leftStepQualifiedIntegral, deadline))
+                    {
+                        Array.Clear(
+                            _rightStepComponentVisited, 0, _expected);
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.RejectStepSatelliteRight);
+                    }
+                    break;
+                case WorkStage.RejectStepSatelliteRight:
+                    if (MarkStepComponentRejectsSlice(
+                            _rightStepQualified,
+                            _rightStepComponentVisited,
+                            _rightStepOverreachRollback,
+                            _rightStepQualifiedIntegral, deadline))
+                    {
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.BuildStepIntegralLeft);
+                    }
+                    break;
+                case WorkStage.BuildStepIntegralLeft:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _leftStepQualified,
+                            _leftStepQualifiedIntegral, deadline))
+                        BeginStage(WorkStage.BuildStepIntegralRight);
+                    break;
+                case WorkStage.BuildStepIntegralRight:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _rightStepQualified,
+                            _rightStepQualifiedIntegral, deadline))
+                        BeginStage(WorkStage.MarkStepOverreachCoreLeft);
+                    break;
+                case WorkStage.MarkStepOverreachCoreLeft:
+                    if (MarkStepOverreachCoresSlice(
+                            _leftStepQualified,
+                            _leftStepQualifiedIntegral,
+                            _leftStepOverreachCore, deadline))
+                        BeginStage(WorkStage.MarkStepOverreachCoreRight);
+                    break;
+                case WorkStage.MarkStepOverreachCoreRight:
+                    if (MarkStepOverreachCoresSlice(
+                            _rightStepQualified,
+                            _rightStepQualifiedIntegral,
+                            _rightStepOverreachCore, deadline))
+                    {
+                        _stepOverreachQueue.Clear();
+                        BeginStage(WorkStage.PairStepOverreachLeft);
+                    }
+                    break;
+                case WorkStage.PairStepOverreachLeft:
+                    if (QueuePairedStepOverreachCoresSlice(
+                            _leftPixels, _leftDepth, _leftStepTarget,
+                            _leftEye, _leftStepOverreachCore,
+                            _rightPixels, _rightDepth, _rightStepTarget,
+                            _rightEye, _rightWorldToClip,
+                            _rightStepOverreachCore,
+                            _leftStepOverreachRollback, deadline))
+                        BeginStage(WorkStage.ExpandStepOverreachLeft);
+                    break;
+                case WorkStage.ExpandStepOverreachLeft:
+                    if (ExpandStepOverreachRollbackSlice(
+                            _leftStepQualified,
+                            _leftStepOverreachRollback, deadline))
+                    {
+                        _stepOverreachQueue.Clear();
+                        BeginStage(WorkStage.PairStepOverreachRight);
+                    }
+                    break;
+                case WorkStage.PairStepOverreachRight:
+                    if (QueuePairedStepOverreachCoresSlice(
+                            _rightPixels, _rightDepth, _rightStepTarget,
+                            _rightEye, _rightStepOverreachCore,
+                            _leftPixels, _leftDepth, _leftStepTarget,
+                            _leftEye, _leftWorldToClip,
+                            _leftStepOverreachCore,
+                            _rightStepOverreachRollback, deadline))
+                        BeginStage(WorkStage.ExpandStepOverreachRight);
+                    break;
+                case WorkStage.ExpandStepOverreachRight:
+                    if (ExpandStepOverreachRollbackSlice(
+                            _rightStepQualified,
+                            _rightStepOverreachRollback, deadline))
+                        BeginStage(WorkStage.ApplyStepOverreachRollback);
+                    break;
+                case WorkStage.ApplyStepOverreachRollback:
+                    if (ApplyStepOverreachRollbackSlice(deadline))
+                        BeginStage(WorkStage.ApplyStepLeft);
+                    break;
+                case WorkStage.ApplyStepLeft:
+                    if (ApplyFirstSurfaceStepSlice(
+                            _leftPixels, _leftDepth, _leftStepTarget,
+                            _leftStepQualified, _leftEye, deadline))
+                        BeginStage(WorkStage.ApplyStepRight);
+                    break;
+                case WorkStage.ApplyStepRight:
+                    if (ApplyFirstSurfaceStepSlice(
+                            _rightPixels, _rightDepth, _rightStepTarget,
+                            _rightStepQualified, _rightEye, deadline))
+                        BeginStage(WorkStage.GradientLeft);
+                    break;
+                case WorkStage.GradientLeft:
+                    if (GradientSlice(
+                            _leftDepth, _leftContinuous,
+                            _leftStepQualified,
+                            _leftStepOverreachRollback, deadline))
+                        BeginStage(WorkStage.GradientRight);
                     break;
                 case WorkStage.GradientRight:
                     if (GradientSlice(
-                            _rightDepth, _rightContinuous, deadline))
+                            _rightDepth, _rightContinuous,
+                            _rightStepQualified,
+                            _rightStepOverreachRollback, deadline))
+                        BeginStage(UsesLegacyProductionAdmission
+                            ? WorkStage.RetireSharedStepFamily
+                            : UsesStructuralStepRetirement
+                                ? WorkStage.SharedFlapLeft
+                                : WorkStage.StereoOutlierLeft);
+                    break;
+                case WorkStage.StereoOutlierLeft:
+                    if (MarkOneEyeOutliersSlice(
+                            _leftPixels, _leftContinuous,
+                            _leftStepQualified,
+                            _rightPixels, _rightDepth, _rightContinuous,
+                            _rightWorldToClip, _leftStereoOutlier, deadline))
+                        BeginStage(WorkStage.StereoOutlierRight);
+                    break;
+                case WorkStage.StereoOutlierRight:
+                    if (MarkOneEyeOutliersSlice(
+                            _rightPixels, _rightContinuous,
+                            _rightStepQualified,
+                            _leftPixels, _leftDepth, _leftContinuous,
+                            _leftWorldToClip, _rightStereoOutlier, deadline))
+                        BeginStage(WorkStage.ApplyStereoOutliers);
+                    break;
+                case WorkStage.ApplyStereoOutliers:
+                    if (ApplyOneEyeOutliersSlice(deadline))
+                        BeginStage(WorkStage.SharedFlapLeft);
+                    break;
+                case WorkStage.SharedFlapLeft:
+                    if (MarkSharedConvexFlapsSlice(
+                            _leftPixels, _leftContinuous,
+                            _leftStepQualified,
+                            _rightPixels, _rightContinuous,
+                            _rightWorldToClip, _leftSharedFlap, deadline))
+                        BeginStage(WorkStage.SharedFlapRight);
+                    break;
+                case WorkStage.SharedFlapRight:
+                    if (MarkSharedConvexFlapsSlice(
+                            _rightPixels, _rightContinuous,
+                            _rightStepQualified,
+                            _leftPixels, _leftContinuous,
+                            _leftWorldToClip, _rightSharedFlap, deadline))
+                        BeginStage(WorkStage.PairSharedFlapSeedLeft);
+                    break;
+                case WorkStage.PairSharedFlapSeedLeft:
+                    if (MarkPairedSharedFlapSeedsSlice(
+                            _leftPixels, _leftSharedFlap,
+                            _leftStepQualified,
+                            _rightPixels, _rightSharedFlap,
+                            _rightWorldToClip,
+                            _leftStepOverreachCore, deadline))
+                        BeginStage(WorkStage.PairSharedFlapSeedRight);
+                    break;
+                case WorkStage.PairSharedFlapSeedRight:
+                    if (MarkPairedSharedFlapSeedsSlice(
+                            _rightPixels, _rightSharedFlap,
+                            _rightStepQualified,
+                            _leftPixels, _leftSharedFlap,
+                            _leftWorldToClip,
+                            _rightStepOverreachCore, deadline))
+                        BeginStage(WorkStage.BuildSharedFlapSeedIntegralLeft);
+                    break;
+                case WorkStage.BuildSharedFlapSeedIntegralLeft:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _leftStepOverreachCore,
+                            _leftStepQualifiedIntegral, deadline))
+                        BeginStage(WorkStage.BuildSharedFlapSeedIntegralRight);
+                    break;
+                case WorkStage.BuildSharedFlapSeedIntegralRight:
+                    if (BuildStepQualifiedIntegralSlice(
+                            _rightStepOverreachCore,
+                            _rightStepQualifiedIntegral, deadline))
                     {
+                        Array.Clear(
+                            _leftStepComponentVisited, 0, _expected);
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.ExpandSharedFlapStepFamilyLeft);
+                    }
+                    break;
+                case WorkStage.ExpandSharedFlapStepFamilyLeft:
+                    if (MarkStepComponentRejectsSlice(
+                            _leftStepQualified,
+                            _leftStepComponentVisited,
+                            _leftStepOverreachRollback,
+                            _leftStepQualifiedIntegral, deadline))
+                    {
+                        Array.Clear(
+                            _rightStepComponentVisited, 0, _expected);
+                        ResetStepComponentTraversal();
+                        BeginStage(WorkStage.ExpandSharedFlapStepFamilyRight);
+                    }
+                    break;
+                case WorkStage.ExpandSharedFlapStepFamilyRight:
+                    if (MarkStepComponentRejectsSlice(
+                            _rightStepQualified,
+                            _rightStepComponentVisited,
+                            _rightStepOverreachRollback,
+                            _rightStepQualifiedIntegral, deadline))
+                    {
+                        ResetStepComponentTraversal();
+                        BeginStage(UsesStructuralStepRetirement
+                            ? WorkStage.RestoreRawRightAdmission
+                            : WorkStage.ApplySharedFlaps);
+                    }
+                    break;
+                case WorkStage.ApplySharedFlaps:
+                    if (ApplySharedConvexFlapsSlice(deadline))
+                        BeginStage(WorkStage.RetireSharedStepFamily);
+                    break;
+                case WorkStage.RestoreRawRightAdmission:
+                    if (RestoreRawRightAdmissionSlice(deadline))
+                        BeginStage(WorkStage.RetireSharedStepFamily);
+                    break;
+                case WorkStage.RetireSharedStepFamily:
+                    if (RetireSharedStepFamilySlice(deadline))
+                    {
+                        // The fitted-boundary experiment remains behind an
+                        // explicit compile-time production switch. Structural
+                        // retirement has already removed only matching old
+                        // source voxels; the surviving admission points below
+                        // are still the sole inputs to this pair's fusion.
+                        if (PersistentBoundaryProductionGateEnabled)
+                        {
+                            _persistentBoundaryOverlay?.Publish(
+                                _leftPixels, _leftDepth, _leftContinuous,
+                                _leftStepQualified,
+                                _rightPixels, _rightDepth, _rightContinuous,
+                                _rightStepQualified, _width, _height);
+                        }
+                        _admissionPointOverlay?.Publish(
+                            _leftPixels, _leftContinuous,
+                            _leftDepth, _leftStepQualified,
+                            _rightPixels, _rightContinuous,
+                            _rightDepth, _rightStepQualified,
+                            _width, _height, _pendingFrame,
+                            RouteLabel,
+                            StepSplitOverreachCoreEyePixelCount,
+                            StepSplitOverreachRolledBackEyePixelCount,
+                            SharedConvexFlapCandidateEyePixelCount,
+                            SharedConvexFlapRejectedEyePixelCount,
+                            StructuralStepFamilyRetiredVoxelCount,
+                            StrongGrazingPointCount,
+                            ThinGrazingRejectedPointCount,
+                            WideGrazingRetainedPointCount,
+                            ThinGrazingBarrierVoxelCount,
+                            ThinGrazingClearedVoxelCount,
+                            ThinGrazingReleasedVoxelCount);
                         ObserveShadowPair();
+                        BeginStage(WorkStage.CandidateLeft);
+                    }
+                    break;
+                case WorkStage.CandidateLeft:
+                    if (CandidateSlice(
+                            _leftPixels, _leftDepth, _leftContinuous,
+                            _leftEye, deadline))
+                    {
+                        _leftCandidates.AddRange(_candidateSet);
+                        _candidateSet.Clear();
                         BeginStage(WorkStage.CandidateRight);
                     }
                     break;
@@ -1568,7 +2406,34 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         Array.Clear(_rightDepth, 0, _expected);
         Array.Clear(_leftContinuous, 0, _expected);
         Array.Clear(_rightContinuous, 0, _expected);
+        Array.Clear(_leftStepTarget, 0, _expected);
+        Array.Clear(_rightStepTarget, 0, _expected);
+        Array.Clear(_leftStepQualified, 0, _expected);
+        Array.Clear(_rightStepQualified, 0, _expected);
+        Array.Clear(
+            _leftStepQualifiedIntegral, 0,
+            (_width + 1) * (_height + 1));
+        Array.Clear(
+            _rightStepQualifiedIntegral, 0,
+            (_width + 1) * (_height + 1));
+        Array.Clear(_leftStepOverreachCore, 0, _expected);
+        Array.Clear(_rightStepOverreachCore, 0, _expected);
+        Array.Clear(_leftStepOverreachRollback, 0, _expected);
+        Array.Clear(_rightStepOverreachRollback, 0, _expected);
+        Array.Clear(_leftStepComponentVisited, 0, _expected);
+        Array.Clear(_rightStepComponentVisited, 0, _expected);
+        Array.Clear(_leftStereoOutlier, 0, _expected);
+        Array.Clear(_rightStereoOutlier, 0, _expected);
+        Array.Clear(_leftSharedFlap, 0, _expected);
+        Array.Clear(_rightSharedFlap, 0, _expected);
+        Array.Clear(_rightStrongGrazing, 0, _expected);
+        Array.Clear(_rightThinGrazingReject, 0, _expected);
+        Array.Clear(_rightGrazingVisited, 0, _expected);
         _candidateSet.Clear();
+        _stepOverreachQueue.Clear();
+        ResetGrazingBandTraversal();
+        _structuralRetiredVoxels.Clear();
+        ResetStepComponentTraversal();
         _leftCandidates.Clear();
         _rightCandidates.Clear();
         _garbageCandidates.Clear();
@@ -1634,6 +2499,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         float[] depths,
         float[] ndcDepths,
         Matrix4x4 worldToClip,
+        Vector3 eye,
         double deadline)
     {
         while (_cursor < _expected)
@@ -1647,7 +2513,14 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             {
                 float depth = ProjectiveDepth(
                     worldToClip, encoded.r, encoded.g, encoded.b);
-                if (float.IsFinite(depth) &&
+                Vector3 surface = new Vector3(
+                    encoded.r, encoded.g, encoded.b);
+                float range = Vector3.Distance(surface, eye);
+                if (Finite(surface) && Finite(eye) &&
+                    float.IsFinite(range) &&
+                    range >= MinimumDepthMeters &&
+                    range <= MaximumDepthMeters &&
+                    float.IsFinite(depth) &&
                     depth >= MinimumDepthMeters &&
                     depth <= MaximumDepthMeters)
                     depths[index] = depth;
@@ -1659,13 +2532,1020 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         return true;
     }
 
+    private bool DetectFirstSurfaceStepSlice(
+        float[] depths, float[] targets, double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            targets[index] = 0f;
+            if (FirstSurfaceStepSplitEnabled &&
+                TryFindFirstSurfaceStepTarget(
+                    depths, index, out float targetDepth))
+            {
+                targets[index] = targetDepth;
+                FirstSurfaceStepCandidateEyePixelCount++;
+            }
+            if ((_cursor & 127) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private void SnapshotRawObservationPair()
+    {
+        NativeArray<Color>.Copy(
+            _leftPixels, _leftRawPixels, _expected);
+        NativeArray<Color>.Copy(
+            _rightPixels, _rightRawPixels, _expected);
+        Array.Copy(_leftDepth, _leftRawDepth, _expected);
+        Array.Copy(_rightDepth, _rightRawDepth, _expected);
+    }
+
+    private bool MarkRightStrongGrazingSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            bool strong = IsRightStrongGrazing(index);
+            _rightStrongGrazing[index] = strong ? (byte)1 : (byte)0;
+            if (strong)
+                StrongGrazingPointCount++;
+            if ((_cursor & 127) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsRightStrongGrazing(int index)
+    {
+        if (_rightRawDepth[index] <= 0f ||
+            _rightRawDepth[index] > ProductionMaximumDepthMeters)
+            return false;
+        int x = index % _width;
+        int y = index / _width;
+        int probe = StrongGrazingNormalProbePixels;
+        if (x + probe >= _width || y + probe >= _height)
+            return false;
+        int horizontal = index + probe;
+        int vertical = index + probe * _width;
+        if (_rightRawDepth[horizontal] <= 0f ||
+            _rightRawDepth[horizontal] > ProductionMaximumDepthMeters ||
+            _rightRawDepth[vertical] <= 0f ||
+            _rightRawDepth[vertical] > ProductionMaximumDepthMeters)
+            return false;
+
+        Vector3 center = EncodedWorld(_rightRawPixels[index]);
+        Vector3 across = EncodedWorld(_rightRawPixels[horizontal]);
+        Vector3 down = EncodedWorld(_rightRawPixels[vertical]);
+        if (!Finite(center) || !Finite(across) || !Finite(down))
+            return false;
+        Vector3 cross = Vector3.Cross(across - center, down - center);
+        float crossLengthSquared = cross.sqrMagnitude;
+        Vector3 toCamera = _rightEye - center;
+        float cameraLengthSquared = toCamera.sqrMagnitude;
+        if (crossLengthSquared <= 0.000000000001f ||
+            cameraLengthSquared <= 0.000001f)
+            return false;
+        float facing = Mathf.Abs(Vector3.Dot(
+            cross / Mathf.Sqrt(crossLengthSquared),
+            toCamera / Mathf.Sqrt(cameraLengthSquared)));
+        return facing <= StrongGrazingMaximumFacing;
+    }
+
+    private bool ClassifyRightGrazingBandsSlice(double deadline)
+    {
+        while (_cursor < _expected || _grazingBandActive)
+        {
+            if (!_grazingBandActive)
+            {
+                while (_cursor < _expected &&
+                       (_rightStrongGrazing[_cursor] == 0 ||
+                        _rightGrazingVisited[_cursor] != 0))
+                    _cursor++;
+                if (_cursor >= _expected)
+                    return true;
+                int seed = _cursor++;
+                _rightGrazingVisited[seed] = 1;
+                _grazingBandQueue.Enqueue(seed);
+                _grazingBandActive = true;
+                _grazingBandHasWideCore = false;
+            }
+
+            int work = 0;
+            while (_grazingBandQueue.Count > 0)
+            {
+                int index = _grazingBandQueue.Dequeue();
+                _grazingBandMembers.Add(index);
+                if (!_grazingBandHasWideCore &&
+                    IsWideGrazingBandCore(index))
+                    _grazingBandHasWideCore = true;
+                int centerX = index % _width;
+                int centerY = index / _width;
+                for (int oy = -1; oy <= 1; oy++)
+                for (int ox = -1; ox <= 1; ox++)
+                {
+                    if (ox == 0 && oy == 0)
+                        continue;
+                    int x = centerX + ox;
+                    int y = centerY + oy;
+                    if (x < 0 || x >= _width || y < 0 || y >= _height)
+                        continue;
+                    int neighbor = x + y * _width;
+                    if (_rightStrongGrazing[neighbor] == 0 ||
+                        _rightGrazingVisited[neighbor] != 0)
+                        continue;
+                    _rightGrazingVisited[neighbor] = 1;
+                    _grazingBandQueue.Enqueue(neighbor);
+                }
+                work++;
+                if ((work & 31) == 0 &&
+                    Time.realtimeSinceStartupAsDouble >= deadline)
+                    return false;
+            }
+
+            int count = _grazingBandMembers.Count;
+            if (_grazingBandHasWideCore)
+            {
+                WideGrazingRetainedPointCount += count;
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    _rightThinGrazingReject[
+                        _grazingBandMembers[i]] = 1;
+                ThinGrazingRejectedPointCount += count;
+            }
+            _grazingBandQueue.Clear();
+            _grazingBandMembers.Clear();
+            _grazingBandActive = false;
+            _grazingBandHasWideCore = false;
+            if (Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsWideGrazingBandCore(int index)
+    {
+        int required = ThinGrazingMaximumThicknessPoints + 1;
+        return HasGrazingRun(index, 1, 0, required) &&
+               HasGrazingRun(index, 0, 1, required) &&
+               HasGrazingRun(index, 1, 1, required) &&
+               HasGrazingRun(index, 1, -1, required);
+    }
+
+    private bool HasGrazingRun(
+        int index, int directionX, int directionY, int required)
+    {
+        int centerX = index % _width;
+        int centerY = index / _width;
+        int count = 1;
+        for (int sign = -1; sign <= 1; sign += 2)
+        {
+            for (int step = 1; step < required; step++)
+            {
+                int x = centerX + directionX * step * sign;
+                int y = centerY + directionY * step * sign;
+                if (x < 0 || x >= _width || y < 0 || y >= _height ||
+                    _rightStrongGrazing[x + y * _width] == 0)
+                    break;
+                count++;
+                if (count >= required)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private void ResetGrazingBandTraversal()
+    {
+        _grazingBandQueue.Clear();
+        _grazingBandMembers.Clear();
+        _grazingBandActive = false;
+        _grazingBandHasWideCore = false;
+    }
+
+    private bool BuildRightThinGrazingBarrierSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (_rightThinGrazingReject[index] != 0)
+            {
+                Vector3 anchor = EncodedWorld(_rightRawPixels[index]);
+                if (Finite(anchor))
+                {
+                    AddThinGrazingBarrier(anchor);
+                    AddThinGrazingBarrierConnections(index, anchor);
+                }
+            }
+            if ((_cursor & 7) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private void AddThinGrazingBarrierConnections(int index, Vector3 anchor)
+    {
+        int centerX = index % _width;
+        int centerY = index / _width;
+        // Visit one half of the eight-neighbourhood so every screen-space
+        // connection is covered exactly once, including diagonal-only bands.
+        AddThinGrazingBarrierConnection(centerX + 1, centerY, anchor);
+        AddThinGrazingBarrierConnection(centerX, centerY + 1, anchor);
+        AddThinGrazingBarrierConnection(centerX + 1, centerY + 1, anchor);
+        AddThinGrazingBarrierConnection(centerX - 1, centerY + 1, anchor);
+    }
+
+    private void AddThinGrazingBarrierConnection(
+        int x, int y, Vector3 anchor)
+    {
+        if (x < 0 || x >= _width || y < 0 || y >= _height)
+            return;
+        int neighbor = x + y * _width;
+        if (_rightThinGrazingReject[neighbor] == 0)
+            return;
+        Vector3 other = EncodedWorld(_rightRawPixels[neighbor]);
+        if (!Finite(other))
+            return;
+        float distance = Vector3.Distance(anchor, other);
+        int steps = Mathf.Max(1, Mathf.CeilToInt(
+            distance / ThinGrazingBarrierRadiusMeters));
+        for (int step = 1; step < steps; step++)
+        {
+            AddThinGrazingBarrier(Vector3.LerpUnclamped(
+                anchor, other, step / (float)steps));
+        }
+    }
+
+    private void AddThinGrazingBarrier(Vector3 anchor)
+    {
+        float radius = ThinGrazingBarrierRadiusMeters;
+        float radiusSquared = radius * radius;
+        int pair = CurrentObservationPair();
+        int minimumX = Mathf.CeilToInt((anchor.x - radius) / VoxelMeters);
+        int maximumX = Mathf.FloorToInt((anchor.x + radius) / VoxelMeters);
+        int minimumY = Mathf.CeilToInt((anchor.y - radius) / VoxelMeters);
+        int maximumY = Mathf.FloorToInt((anchor.y + radius) / VoxelMeters);
+        int minimumZ = Mathf.CeilToInt((anchor.z - radius) / VoxelMeters);
+        int maximumZ = Mathf.FloorToInt((anchor.z + radius) / VoxelMeters);
+
+        for (int z = minimumZ; z <= maximumZ; z++)
+        for (int y = minimumY; y <= maximumY; y++)
+        for (int x = minimumX; x <= maximumX; x++)
+        {
+            Vector3Int global = new Vector3Int(x, y, z);
+            Vector3 voxelWorld = (Vector3)global * VoxelMeters;
+            if ((voxelWorld - anchor).sqrMagnitude > radiusSquared)
+                continue;
+
+            if (_thinGrazingBarrierVoxels.TryGetValue(
+                    global, out ThinGrazingBarrierState state))
+            {
+                state.blockingEye = _rightEye;
+                state.blockedPair = pair;
+                state.lastDirectPair = 0;
+                state.directStreak = 0;
+                _thinGrazingBarrierVoxels[global] = state;
+            }
+            else
+            {
+                _thinGrazingBarrierVoxels.Add(
+                    global, new ThinGrazingBarrierState
+                    {
+                        blockingEye = _rightEye,
+                        blockedPair = pair
+                    });
+                ThinGrazingBarrierVoxelCount++;
+            }
+            Vector3Int chunkId = new Vector3Int(
+                FloorDivide(global.x, ChunkSize),
+                FloorDivide(global.y, ChunkSize),
+                FloorDivide(global.z, ChunkSize));
+            if (!_chunks.TryGetValue(chunkId, out Chunk chunk))
+                continue;
+            Vector3Int local = global - chunkId * ChunkSize;
+            int localIndex = local.x + ChunkSize *
+                (local.y + ChunkSize * local.z);
+            if (chunk.voxels[localIndex].weight <= 0f)
+                continue;
+
+            chunk.voxels[localIndex] = default;
+            WeightedVoxelCount = Mathf.Max(0, WeightedVoxelCount - 1);
+            ThinGrazingClearedVoxelCount++;
+            byte dirtyMask = 0;
+            AddDirtyVoxel(ref dirtyMask, localIndex);
+            RecordTouched(chunkId, dirtyMask);
+        }
+    }
+
+    private int CurrentObservationPair()
+    {
+        return _processingReplayFrame
+            ? _replayedFrames + 1
+            : AcceptedPairCount + 1;
+    }
+
+    private bool TryReleaseThinGrazingBarrier(
+        Vector3Int global,
+        Vector3 observationEye,
+        float observedDepth,
+        float voxelDepth,
+        int pair)
+    {
+        if (!_thinGrazingBarrierVoxels.TryGetValue(
+                global, out ThinGrazingBarrierState state))
+            return true;
+        if (pair <= state.blockedPair ||
+            Vector3.Distance(observationEye, state.blockingEye) <
+                ThinGrazingBarrierReleaseBaselineMeters ||
+            Mathf.Abs(observedDepth - voxelDepth) >
+                ThinGrazingBarrierReleaseSurfaceMeters)
+            return false;
+
+        if (state.lastDirectPair == pair)
+            return false;
+        state.directStreak = state.lastDirectPair == pair - 1
+            ? (byte)Mathf.Min(byte.MaxValue, state.directStreak + 1)
+            : (byte)1;
+        state.lastDirectPair = pair;
+        if (state.directStreak < ThinGrazingBarrierReleasePairs)
+        {
+            _thinGrazingBarrierVoxels[global] = state;
+            return false;
+        }
+
+        _thinGrazingBarrierVoxels.Remove(global);
+        ThinGrazingBarrierVoxelCount = Math.Max(
+            0L, ThinGrazingBarrierVoxelCount - 1L);
+        ThinGrazingReleasedVoxelCount++;
+        return true;
+    }
+
+    private static Vector3 EncodedWorld(Color encoded)
+    {
+        return new Vector3(encoded.r, encoded.g, encoded.b);
+    }
+
+    private bool TryFindFirstSurfaceStepTarget(
+        float[] depths, int index, out float targetDepth)
+    {
+        targetDepth = 0f;
+        if (depths == null || index < 0 || index >= _expected)
+            return false;
+        float center = depths[index];
+        if (center <= 0f)
+            return false;
+        int x = index % _width;
+        int y = index / _width;
+        int bestDirection = -1;
+        float strongestLocalChange = 0f;
+        for (int direction = 0;
+             direction < StepSplitDirections.GetLength(0);
+             direction++)
+        {
+            int probeDx = StepSplitDirections[direction, 0] *
+                          StepSplitDirectionProbePixels;
+            int probeDy = StepSplitDirections[direction, 1] *
+                          StepSplitDirectionProbePixels;
+            if (!TryDepthAt(
+                    depths, x - probeDx, y - probeDy,
+                    out float before) ||
+                !TryDepthAt(
+                    depths, x + probeDx, y + probeDy,
+                    out float after))
+                continue;
+            float change = Mathf.Abs(after - before);
+            if (change <= strongestLocalChange)
+                continue;
+            strongestLocalChange = change;
+            bestDirection = direction;
+        }
+        if (bestDirection < 0 || strongestLocalChange <= 0.001f)
+            return false;
+
+        float bestScore = float.NegativeInfinity;
+        int dx = StepSplitDirections[bestDirection, 0];
+        int dy = StepSplitDirections[bestDirection, 1];
+        for (int outerOffset = StepSplitMinimumOuterOffsetPixels;
+             outerOffset <= StepSplitMaximumOuterOffsetPixels;
+             outerOffset += StepSplitOuterOffsetStepPixels)
+        {
+            int firstOuterX = x - dx * outerOffset;
+            int firstOuterY = y - dy * outerOffset;
+            int secondOuterX = x + dx * outerOffset;
+            int secondOuterY = y + dy * outerOffset;
+            if (!TryDepthAt(
+                    depths, firstOuterX, firstOuterY,
+                    out float firstOuter) ||
+                !TryDepthAt(
+                    depths, secondOuterX, secondOuterY,
+                    out float secondOuter))
+                continue;
+            float outerLow = Mathf.Min(firstOuter, secondOuter);
+            float outerHigh = Mathf.Max(firstOuter, secondOuter);
+            if (outerHigh - outerLow <
+                    StepSplitMinimumLayerSeparationMeters ||
+                center <= outerLow + StepSplitMinimumSnapMeters ||
+                center >= outerHigh - StepSplitMinimumSnapMeters)
+                continue;
+            if (!TryStableStepPlateau(
+                    depths, x, y, dx, dy, -1, outerOffset,
+                    out float first) ||
+                !TryStableStepPlateau(
+                    depths, x, y, dx, dy, 1, outerOffset,
+                    out float second))
+                continue;
+            float low = Mathf.Min(first, second);
+            float high = Mathf.Max(first, second);
+            float separation = high - low;
+            if (separation < StepSplitMinimumLayerSeparationMeters ||
+                center <= low + StepSplitMinimumSnapMeters ||
+                center >= high - StepSplitMinimumSnapMeters)
+                continue;
+            float lowDelta = center - low;
+            float highDelta = high - center;
+            // Bias an exact midpoint toward the nearer physical layer.  The
+            // half-millimetre epsilon prevents float representation noise from
+            // making left and right eyes choose opposite layers at the tie.
+            float candidate = lowDelta <= highDelta + 0.0005f ? low : high;
+            // Prefer the nearest valid two-plateau explanation.  Wider bands
+            // remain recoverable, but they do not displace an equally strong
+            // compact edge around the same pixel.
+            float score = separation -
+                          Mathf.Min(lowDelta, highDelta) * 0.1f -
+                          outerOffset * 0.001f;
+            if (score <= bestScore)
+                continue;
+            bestScore = score;
+            targetDepth = candidate;
+        }
+        return targetDepth > 0f;
+    }
+
+    private bool TryDepthAt(
+        float[] depths, int x, int y, out float depth)
+    {
+        depth = 0f;
+        if (depths == null || x < 0 || x >= _width ||
+            y < 0 || y >= _height)
+            return false;
+        depth = depths[x + y * _width];
+        return depth > 0f && float.IsFinite(depth);
+    }
+
+    private bool TryStableStepPlateau(
+        float[] depths,
+        int centerX,
+        int centerY,
+        int dx,
+        int dy,
+        int sign,
+        int outerOffset,
+        out float plateauDepth)
+    {
+        plateauDepth = 0f;
+        int perpendicularX = -dy;
+        int perpendicularY = dx;
+        float minimum = float.PositiveInfinity;
+        float maximum = float.NegativeInfinity;
+        float sum = 0f;
+        int count = 0;
+        for (int sample = 0; sample < 2; sample++)
+        {
+            int offset = sample == 0
+                ? outerOffset - StepSplitPlateauThicknessPixels
+                : outerOffset;
+            int baseX = centerX + dx * offset * sign;
+            int baseY = centerY + dy * offset * sign;
+            for (int cross = -1; cross <= 1; cross++)
+            {
+                int x = baseX + perpendicularX * cross;
+                int y = baseY + perpendicularY * cross;
+                if (x < 0 || x >= _width || y < 0 || y >= _height)
+                    return false;
+                float depth = depths[x + y * _width];
+                if (depth <= 0f || !float.IsFinite(depth))
+                    return false;
+                minimum = Mathf.Min(minimum, depth);
+                maximum = Mathf.Max(maximum, depth);
+                sum += depth;
+                count++;
+            }
+        }
+        if (count <= 0 ||
+            maximum - minimum > StepSplitMaximumPlateauSpreadMeters)
+            return false;
+        plateauDepth = sum / count;
+        return float.IsFinite(plateauDepth) && plateauDepth > 0f;
+    }
+
+    private bool QualifyFirstSurfaceStepSlice(
+        NativeArray<Color> sourcePixels,
+        float[] sourceDepths,
+        float[] sourceTargets,
+        Vector3 sourceEye,
+        NativeArray<Color> otherPixels,
+        float[] otherDepths,
+        float[] otherTargets,
+        Vector3 otherEye,
+        Matrix4x4 otherWorldToClip,
+        byte[] qualified,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            qualified[index] = 0;
+            float target = sourceTargets[index];
+            if (target > 0f &&
+                TryBuildStepAnchor(
+                    sourcePixels, sourceDepths, index,
+                    target, sourceEye, out Vector3 sourceAnchor) &&
+                TryProjectWorldPixel(
+                    otherWorldToClip, sourceAnchor,
+                    out int otherCenter))
+            {
+                int centerX = otherCenter % _width;
+                int centerY = otherCenter / _width;
+                float bestDistance = float.PositiveInfinity;
+                for (int oy = -StepSplitStereoSearchRadiusPixels;
+                     oy <= StepSplitStereoSearchRadiusPixels; oy++)
+                for (int ox = -StepSplitStereoSearchRadiusPixels;
+                     ox <= StepSplitStereoSearchRadiusPixels; ox++)
+                {
+                    int otherX = centerX + ox;
+                    int otherY = centerY + oy;
+                    if (otherX < 0 || otherX >= _width ||
+                        otherY < 0 || otherY >= _height)
+                        continue;
+                    int otherIndex = otherX + otherY * _width;
+                    float otherTarget = otherTargets[otherIndex];
+                    if (otherTarget <= 0f ||
+                        !TryBuildStepAnchor(
+                            otherPixels, otherDepths, otherIndex,
+                            otherTarget, otherEye, out Vector3 otherAnchor))
+                        continue;
+                    bestDistance = Mathf.Min(
+                        bestDistance,
+                        Vector3.Distance(sourceAnchor, otherAnchor));
+                }
+                if (bestDistance <=
+                    StepSplitMaximumStereoAnchorSeparationMeters)
+                {
+                    qualified[index] = 1;
+                    FirstSurfaceStepStereoQualifiedEyePixelCount++;
+                }
+            }
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool BuildStepQualifiedIntegralSlice(
+        byte[] qualified,
+        int[] integral,
+        double deadline)
+    {
+        int stride = _width + 1;
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            int x = index % _width;
+            int y = index / _width;
+            int destination = x + 1 + (y + 1) * stride;
+            integral[destination] =
+                (qualified[index] != 0 ? 1 : 0) +
+                integral[destination - 1] +
+                integral[destination - stride] -
+                integral[destination - stride - 1];
+            if ((_cursor & 255) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private void ResetStepComponentTraversal()
+    {
+        _stepComponentQueue.Clear();
+        _stepComponentMembers.Clear();
+        _stepComponentActive = false;
+        _stepComponentTouchesDirectReject = false;
+        _stepComponentMinimumX = 0;
+        _stepComponentMinimumY = 0;
+        _stepComponentMaximumX = 0;
+        _stepComponentMaximumY = 0;
+    }
+
+    private bool MarkStepComponentRejectsSlice(
+        byte[] qualified,
+        byte[] visited,
+        byte[] rollback,
+        int[] directRejectIntegral,
+        double deadline)
+    {
+        while (true)
+        {
+            if (_stepComponentQueue.Count > 0)
+            {
+                int index = _stepComponentQueue.Dequeue();
+                _stepComponentMembers.Add(index);
+                int centerX = index % _width;
+                int centerY = index / _width;
+                _stepComponentMinimumX = Mathf.Min(
+                    _stepComponentMinimumX, centerX);
+                _stepComponentMinimumY = Mathf.Min(
+                    _stepComponentMinimumY, centerY);
+                _stepComponentMaximumX = Mathf.Max(
+                    _stepComponentMaximumX, centerX);
+                _stepComponentMaximumY = Mathf.Max(
+                    _stepComponentMaximumY, centerY);
+                if (directRejectIntegral != null &&
+                    !_stepComponentTouchesDirectReject)
+                {
+                    int gap = SharedFlapStepFamilySatelliteGapPixels;
+                    int minimumX = Mathf.Max(0, centerX - gap);
+                    int minimumY = Mathf.Max(0, centerY - gap);
+                    int maximumX = Mathf.Min(_width - 1, centerX + gap);
+                    int maximumY = Mathf.Min(_height - 1, centerY + gap);
+                    _stepComponentTouchesDirectReject =
+                        SumStepQualifiedRectangle(
+                            directRejectIntegral,
+                            minimumX, minimumY, maximumX, maximumY) > 0;
+                }
+
+                for (int oy = -1; oy <= 1; oy++)
+                for (int ox = -1; ox <= 1; ox++)
+                {
+                    if (ox == 0 && oy == 0)
+                        continue;
+                    int x = centerX + ox;
+                    int y = centerY + oy;
+                    if (x < 0 || x >= _width || y < 0 || y >= _height)
+                        continue;
+                    int neighbor = x + y * _width;
+                    if (qualified[neighbor] == 0 || visited[neighbor] != 0)
+                        continue;
+                    visited[neighbor] = 1;
+                    _stepComponentQueue.Enqueue(neighbor);
+                }
+
+                if ((_stepComponentMembers.Count & 63) == 0 &&
+                    Time.realtimeSinceStartupAsDouble >= deadline)
+                    return false;
+                continue;
+            }
+
+            if (_stepComponentActive)
+            {
+                int componentWidth =
+                    _stepComponentMaximumX - _stepComponentMinimumX + 1;
+                int componentHeight =
+                    _stepComponentMaximumY - _stepComponentMinimumY + 1;
+                bool reject = directRejectIntegral != null
+                    ? _stepComponentTouchesDirectReject
+                    : _stepComponentMembers.Count >=
+                          StepSplitDirectRejectMinimumAreaPixels &&
+                      componentWidth >= StepSplitDirectRejectMinimumWidthPixels &&
+                      componentHeight >= StepSplitDirectRejectMinimumHeightPixels;
+                if (reject)
+                {
+                    for (int i = 0; i < _stepComponentMembers.Count; i++)
+                        rollback[_stepComponentMembers[i]] = 1;
+                }
+                _stepComponentMembers.Clear();
+                _stepComponentActive = false;
+                _stepComponentTouchesDirectReject = false;
+                if (Time.realtimeSinceStartupAsDouble >= deadline)
+                    return false;
+            }
+
+            while (_cursor < _expected &&
+                   (qualified[_cursor] == 0 || visited[_cursor] != 0))
+                _cursor++;
+            if (_cursor >= _expected)
+                return true;
+
+            int seed = _cursor++;
+            int seedX = seed % _width;
+            int seedY = seed / _width;
+            visited[seed] = 1;
+            _stepComponentQueue.Enqueue(seed);
+            _stepComponentActive = true;
+            _stepComponentTouchesDirectReject = false;
+            _stepComponentMinimumX = seedX;
+            _stepComponentMaximumX = seedX;
+            _stepComponentMinimumY = seedY;
+            _stepComponentMaximumY = seedY;
+        }
+    }
+
+    private bool MarkStepOverreachCoresSlice(
+        byte[] qualified,
+        int[] integral,
+        byte[] cores,
+        double deadline)
+    {
+        int radius = StepSplitOverreachCoreRadiusPixels;
+        int diameter = radius * 2 + 1;
+        int required = diameter * diameter;
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            cores[index] = 0;
+            if (qualified[index] != 0)
+            {
+                int x = index % _width;
+                int y = index / _width;
+                if (x >= radius && x < _width - radius &&
+                    y >= radius && y < _height - radius &&
+                    SumStepQualifiedRectangle(
+                        integral,
+                        x - radius, y - radius,
+                        x + radius, y + radius) == required)
+                {
+                    cores[index] = 1;
+                    StepSplitOverreachCoreEyePixelCount++;
+                }
+            }
+            if ((_cursor & 255) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private int SumStepQualifiedRectangle(
+        int[] integral,
+        int minimumX,
+        int minimumY,
+        int maximumX,
+        int maximumY)
+    {
+        int stride = _width + 1;
+        int left = minimumX;
+        int top = minimumY;
+        int right = maximumX + 1;
+        int bottom = maximumY + 1;
+        return integral[right + bottom * stride] -
+               integral[left + bottom * stride] -
+               integral[right + top * stride] +
+               integral[left + top * stride];
+    }
+
+    private bool QueuePairedStepOverreachCoresSlice(
+        NativeArray<Color> sourcePixels,
+        float[] sourceDepths,
+        float[] sourceTargets,
+        Vector3 sourceEye,
+        byte[] sourceCores,
+        NativeArray<Color> otherPixels,
+        float[] otherDepths,
+        float[] otherTargets,
+        Vector3 otherEye,
+        Matrix4x4 otherWorldToClip,
+        byte[] otherCores,
+        byte[] rollback,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (sourceCores[index] != 0 && rollback[index] == 0 &&
+                HasNearbyPairedStepOverreachCore(
+                    index,
+                    sourcePixels, sourceDepths, sourceTargets, sourceEye,
+                    otherPixels, otherDepths, otherTargets, otherEye,
+                    otherWorldToClip, otherCores))
+            {
+                rollback[index] = 1;
+                _stepOverreachQueue.Enqueue(index);
+            }
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool HasNearbyPairedStepOverreachCore(
+        int sourceIndex,
+        NativeArray<Color> sourcePixels,
+        float[] sourceDepths,
+        float[] sourceTargets,
+        Vector3 sourceEye,
+        NativeArray<Color> otherPixels,
+        float[] otherDepths,
+        float[] otherTargets,
+        Vector3 otherEye,
+        Matrix4x4 otherWorldToClip,
+        byte[] otherCores)
+    {
+        if (!TryBuildStepAnchor(
+                sourcePixels, sourceDepths, sourceIndex,
+                sourceTargets[sourceIndex], sourceEye,
+                out Vector3 sourceAnchor) ||
+            !TryProjectWorldPixel(
+                otherWorldToClip, sourceAnchor, out int otherCenter))
+            return false;
+
+        int centerX = otherCenter % _width;
+        int centerY = otherCenter / _width;
+        for (int oy = -StepSplitStereoSearchRadiusPixels;
+             oy <= StepSplitStereoSearchRadiusPixels; oy++)
+        for (int ox = -StepSplitStereoSearchRadiusPixels;
+             ox <= StepSplitStereoSearchRadiusPixels; ox++)
+        {
+            int otherX = centerX + ox;
+            int otherY = centerY + oy;
+            if (otherX < 0 || otherX >= _width ||
+                otherY < 0 || otherY >= _height)
+                continue;
+            int otherIndex = otherX + otherY * _width;
+            if (otherCores[otherIndex] == 0 ||
+                !TryBuildStepAnchor(
+                    otherPixels, otherDepths, otherIndex,
+                    otherTargets[otherIndex], otherEye,
+                    out Vector3 otherAnchor))
+                continue;
+            if (Vector3.Distance(sourceAnchor, otherAnchor) <=
+                StepSplitMaximumStereoAnchorSeparationMeters)
+                return true;
+        }
+        return false;
+    }
+
+    private bool ExpandStepOverreachRollbackSlice(
+        byte[] qualified,
+        byte[] rollback,
+        double deadline)
+    {
+        while (_stepOverreachQueue.Count > 0)
+        {
+            int index = _stepOverreachQueue.Dequeue();
+            int centerX = index % _width;
+            int centerY = index / _width;
+            for (int oy = -1; oy <= 1; oy++)
+            for (int ox = -1; ox <= 1; ox++)
+            {
+                if (ox == 0 && oy == 0)
+                    continue;
+                int x = centerX + ox;
+                int y = centerY + oy;
+                if (x < 0 || x >= _width || y < 0 || y >= _height)
+                    continue;
+                int neighbor = x + y * _width;
+                if (qualified[neighbor] == 0 || rollback[neighbor] != 0)
+                    continue;
+                rollback[neighbor] = 1;
+                _stepOverreachQueue.Enqueue(neighbor);
+            }
+            _cursor++;
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool ApplyStepOverreachRollbackSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (_leftStepOverreachRollback[index] != 0 &&
+                _leftStepQualified[index] != 0)
+            {
+                _leftStepQualified[index] = 0;
+                _leftStepTarget[index] = 0f;
+                StepSplitOverreachRolledBackEyePixelCount++;
+            }
+            if (_rightStepOverreachRollback[index] != 0 &&
+                _rightStepQualified[index] != 0)
+            {
+                _rightStepQualified[index] = 0;
+                _rightStepTarget[index] = 0f;
+                StepSplitOverreachRolledBackEyePixelCount++;
+            }
+            if ((_cursor & 255) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool ApplyFirstSurfaceStepSlice(
+        NativeArray<Color> pixels,
+        float[] depths,
+        float[] targets,
+        byte[] qualified,
+        Vector3 eye,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (qualified[index] != 0 &&
+                TryBuildStepAnchor(
+                    pixels, depths, index, targets[index], eye,
+                    out Vector3 anchor))
+            {
+                Color encoded = pixels[index];
+                pixels[index] = new Color(
+                    anchor.x, anchor.y, anchor.z, encoded.a);
+                depths[index] = targets[index];
+                FirstSurfaceStepAppliedEyePixelCount++;
+            }
+            if ((_cursor & 127) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private static bool TryBuildStepAnchor(
+        NativeArray<Color> pixels,
+        float[] depths,
+        int index,
+        float targetDepth,
+        Vector3 eye,
+        out Vector3 anchor)
+    {
+        anchor = default;
+        if (!pixels.IsCreated || depths == null ||
+            index < 0 || index >= pixels.Length || index >= depths.Length ||
+            targetDepth <= 0f || depths[index] <= 0f || !Finite(eye))
+            return false;
+        Color encoded = pixels[index];
+        Vector3 surface = new Vector3(encoded.r, encoded.g, encoded.b);
+        if (!Finite(surface))
+            return false;
+        float scale = targetDepth / depths[index];
+        if (!float.IsFinite(scale) || scale <= 0f)
+            return false;
+        anchor = eye + (surface - eye) * scale;
+        return Finite(anchor);
+    }
+
+    private bool TryProjectWorldPixel(
+        Matrix4x4 worldToClip, Vector3 world, out int pixel)
+    {
+        return TryProjectWorldPixelDepth(
+            worldToClip, world, out pixel, out _);
+    }
+
+    private bool TryProjectWorldPixelDepth(
+        Matrix4x4 worldToClip,
+        Vector3 world,
+        out int pixel,
+        out float projectiveDepth)
+    {
+        pixel = -1;
+        projectiveDepth = 0f;
+        if (!Finite(world))
+            return false;
+        Vector4 clip = worldToClip * new Vector4(
+            world.x, world.y, world.z, 1f);
+        if (!float.IsFinite(clip.x) || !float.IsFinite(clip.y) ||
+            !float.IsFinite(clip.w) || clip.w <= 0.000001f)
+            return false;
+        float u = clip.x / clip.w * 0.5f + 0.5f;
+        float v = clip.y / clip.w * 0.5f + 0.5f;
+        if (u < 0f || u >= 1f || v < 0f || v >= 1f)
+            return false;
+        int x = Mathf.Clamp(Mathf.FloorToInt(u * _width), 0, _width - 1);
+        int y = Mathf.Clamp(Mathf.FloorToInt(v * _height), 0, _height - 1);
+        pixel = x + y * _width;
+        projectiveDepth = clip.w;
+        return pixel >= 0 && pixel < _expected;
+    }
+
     private bool GradientSlice(
-        float[] depths, byte[] accepted, double deadline)
+        float[] depths,
+        byte[] accepted,
+        byte[] stepQualified,
+        byte[] directReject,
+        double deadline)
     {
         while (_cursor < _expected)
         {
             int index = _cursor++;
             accepted[index] = 0;
+            if (directReject != null && index < directReject.Length &&
+                directReject[index] != 0)
+            {
+                if ((_cursor & 255) == 0 &&
+                    Time.realtimeSinceStartupAsDouble >= deadline)
+                    return false;
+                continue;
+            }
             int x = index % _width;
             int y = index / _width;
             if (depths[index] > 0f && x > 0 && x < _width - 1 &&
@@ -1680,7 +3560,25 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     float dx = right - left;
                     float dy = down - up;
                     if (dx * dx + dy * dy <= GradientThresholdSquared)
+                    {
                         accepted[index] = 1;
+                        if (stepQualified != null &&
+                            index < stepQualified.Length &&
+                            stepQualified[index] != 0)
+                            FirstSurfaceStepAcceptedEyePixelCount++;
+                    }
+                    else if (stepQualified != null &&
+                             index < stepQualified.Length &&
+                             stepQualified[index] != 0 &&
+                             HasSameStepLayerSupport(depths, index))
+                    {
+                        // This pixel already survived flat-plateau detection
+                        // and same-layer stereo agreement.  Do not reject it
+                        // merely because the opposite side of the real step is
+                        // more than the legacy 10 cm gradient threshold away.
+                        accepted[index] = 1;
+                        FirstSurfaceStepAcceptedEyePixelCount++;
+                    }
                 }
             }
             if ((_cursor & 255) == 0 &&
@@ -1688,6 +3586,645 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 return false;
         }
         return true;
+    }
+
+    private bool HasSameStepLayerSupport(float[] depths, int index)
+    {
+        float center = depths[index];
+        int sameLayer = 0;
+        if (SameStepLayer(depths[index - 1], center)) sameLayer++;
+        if (SameStepLayer(depths[index + 1], center)) sameLayer++;
+        if (SameStepLayer(depths[index - _width], center)) sameLayer++;
+        if (SameStepLayer(depths[index + _width], center)) sameLayer++;
+        return sameLayer >= StepSplitMinimumSameLayerNeighbors;
+    }
+
+    private bool MarkOneEyeOutliersSlice(
+        NativeArray<Color> sourcePixels,
+        byte[] sourceAccepted,
+        byte[] sourceStepQualified,
+        NativeArray<Color> otherPixels,
+        float[] otherDepths,
+        byte[] otherAccepted,
+        Matrix4x4 otherWorldToClip,
+        byte[] outliers,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            outliers[index] = IsOneEyeForegroundContradiction(
+                index, sourcePixels, sourceAccepted,
+                sourceStepQualified, otherPixels, otherDepths,
+                otherAccepted, otherWorldToClip)
+                ? (byte)1
+                : (byte)0;
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsOneEyeForegroundContradiction(
+        int index,
+        NativeArray<Color> sourcePixels,
+        byte[] sourceAccepted,
+        byte[] sourceStepQualified,
+        NativeArray<Color> otherPixels,
+        float[] otherDepths,
+        byte[] otherAccepted,
+        Matrix4x4 otherWorldToClip)
+    {
+        if (sourceAccepted[index] == 0 ||
+            sourceStepQualified[index] != 0)
+            return false;
+
+        Color encoded = sourcePixels[index];
+        Vector3 sourceWorld = new Vector3(
+            encoded.r, encoded.g, encoded.b);
+        if (!Finite(sourceWorld) ||
+            !TryProjectWorldPixel(
+                otherWorldToClip, sourceWorld, out int otherCenter))
+            return false;
+
+        int centerX = otherCenter % _width;
+        int centerY = otherCenter / _width;
+        int sampleCount = 0;
+        bool hasStereoMate = false;
+        for (int oy = -StereoOutlierMajorityRadiusPixels;
+             oy <= StereoOutlierMajorityRadiusPixels; oy++)
+        for (int ox = -StereoOutlierMajorityRadiusPixels;
+             ox <= StereoOutlierMajorityRadiusPixels; ox++)
+        {
+            int otherX = centerX + ox;
+            int otherY = centerY + oy;
+            if (otherX < 0 || otherX >= _width ||
+                otherY < 0 || otherY >= _height)
+                continue;
+            int otherIndex = otherX + otherY * _width;
+            if (otherAccepted[otherIndex] == 0 ||
+                otherDepths[otherIndex] <= 0f)
+                continue;
+            Color otherEncoded = otherPixels[otherIndex];
+            Vector3 otherWorld = new Vector3(
+                otherEncoded.r, otherEncoded.g, otherEncoded.b);
+            if (!Finite(otherWorld))
+                continue;
+            float worldDistanceSquared =
+                (sourceWorld - otherWorld).sqrMagnitude;
+            if (Mathf.Abs(ox) <= StereoOutlierSearchRadiusPixels &&
+                Mathf.Abs(oy) <= StereoOutlierSearchRadiusPixels &&
+                worldDistanceSquared <=
+                    StereoOutlierMatchMeters * StereoOutlierMatchMeters)
+                hasStereoMate = true;
+            if (sampleCount < StereoOutlierMaximumSamples)
+            {
+                _stereoOutlierDepthScratch[sampleCount] =
+                    otherDepths[otherIndex];
+                sampleCount++;
+            }
+        }
+
+        // A genuine mate always wins. For an unmatched point, find the
+        // dominant same-depth cluster in the opposite-eye 9x9 footprint.
+        if (hasStereoMate ||
+            sampleCount < StereoOutlierMinimumMajoritySupport)
+            return false;
+        int majoritySupport = 0;
+        float majorityDepth = 0f;
+        for (int candidate = 0; candidate < sampleCount; candidate++)
+        {
+            int support = 0;
+            float depthSum = 0f;
+            float candidateDepth = _stereoOutlierDepthScratch[candidate];
+            for (int sample = 0; sample < sampleCount; sample++)
+            {
+                if (Mathf.Abs(
+                        _stereoOutlierDepthScratch[sample] - candidateDepth) >
+                    StereoOutlierSameLayerMeters)
+                    continue;
+                support++;
+                depthSum += _stereoOutlierDepthScratch[sample];
+            }
+            if (support > majoritySupport)
+            {
+                majoritySupport = support;
+                majorityDepth = depthSum / Mathf.Max(1, support);
+            }
+        }
+
+        float sourceDepthInOtherEye = ProjectiveDepth(
+            otherWorldToClip, sourceWorld.x, sourceWorld.y, sourceWorld.z);
+        return majoritySupport >= StereoOutlierMinimumMajoritySupport &&
+               sourceDepthInOtherEye > 0f &&
+               sourceDepthInOtherEye +
+                   StereoForegroundContradictionMeters <= majorityDepth;
+    }
+
+    private bool ApplyOneEyeOutliersSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (_leftStereoOutlier[index] != 0)
+                _leftContinuous[index] = 0;
+            if (_rightStereoOutlier[index] != 0)
+                _rightContinuous[index] = 0;
+            if ((_cursor & 255) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool MarkSharedConvexFlapsSlice(
+        NativeArray<Color> sourcePixels,
+        byte[] sourceAccepted,
+        byte[] sourceStepQualified,
+        NativeArray<Color> otherPixels,
+        byte[] otherAccepted,
+        Matrix4x4 otherWorldToClip,
+        byte[] candidates,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            bool candidate = IsSharedConvexFlapCandidate(
+                index, sourcePixels, sourceAccepted,
+                sourceStepQualified, otherPixels, otherAccepted,
+                otherWorldToClip);
+            candidates[index] = candidate ? (byte)1 : (byte)0;
+            if (candidate)
+                SharedConvexFlapCandidateEyePixelCount++;
+            if ((_cursor & 31) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsSharedConvexFlapCandidate(
+        int index,
+        NativeArray<Color> sourcePixels,
+        byte[] sourceAccepted,
+        byte[] sourceStepQualified,
+        NativeArray<Color> otherPixels,
+        byte[] otherAccepted,
+        Matrix4x4 otherWorldToClip)
+    {
+        if (sourceAccepted[index] == 0)
+            return false;
+
+        int centerX = index % _width;
+        int centerY = index / _width;
+        const int maximumRingRadius = 22;
+        if (centerX < maximumRingRadius ||
+            centerX >= _width - maximumRingRadius ||
+            centerY < maximumRingRadius ||
+            centerY >= _height - maximumRingRadius ||
+            !TryGetAcceptedWorld(
+                sourcePixels, sourceAccepted,
+                centerX, centerY, out Vector3 center) ||
+            !HasNearbyMarkedWorldPoint(
+                center, otherPixels, otherAccepted,
+                otherWorldToClip, SharedFlapStereoSearchRadiusPixels,
+                SharedFlapStereoMatchMeters))
+            return false;
+
+        int local = SharedFlapLocalRadiusPixels;
+        if (!TryGetAcceptedWorld(
+                sourcePixels, sourceAccepted,
+                centerX - local, centerY, out Vector3 left) ||
+            !TryGetAcceptedWorld(
+                sourcePixels, sourceAccepted,
+                centerX + local, centerY, out Vector3 right) ||
+            !TryGetAcceptedWorld(
+                sourcePixels, sourceAccepted,
+                centerX, centerY - local, out Vector3 up) ||
+            !TryGetAcceptedWorld(
+                sourcePixels, sourceAccepted,
+                centerX, centerY + local, out Vector3 down))
+            return false;
+
+        Vector3 normal = Vector3.Cross(right - left, down - up);
+        float normalLength = normal.magnitude;
+        if (normalLength <= 0.000001f)
+            return false;
+        normal /= normalLength;
+
+        if (!SharedFlapCornerFollowsPlane(
+                sourcePixels, sourceAccepted, center,
+                normal, centerX - local, centerY - local) ||
+            !SharedFlapCornerFollowsPlane(
+                sourcePixels, sourceAccepted, center,
+                normal, centerX + local, centerY - local) ||
+            !SharedFlapCornerFollowsPlane(
+                sourcePixels, sourceAccepted, center,
+                normal, centerX - local, centerY + local) ||
+            !SharedFlapCornerFollowsPlane(
+                sourcePixels, sourceAccepted, center,
+                normal, centerX + local, centerY + local))
+            return false;
+
+        Array.Clear(
+            _sharedFlapProjectionHistogram, 0,
+            _sharedFlapProjectionHistogram.Length);
+        int validRingSamples = 0;
+        for (int sampleIndex = 0;
+             sampleIndex < SharedFlapRingOffsets.Length;
+             sampleIndex++)
+        {
+            Vector2Int offset = SharedFlapRingOffsets[sampleIndex];
+            if (!TryGetAcceptedWorld(
+                    sourcePixels, sourceAccepted,
+                    centerX + offset.x, centerY + offset.y,
+                    out Vector3 sample))
+                continue;
+            validRingSamples++;
+            float projection = Vector3.Dot(sample - center, normal);
+            if (projection < SharedFlapProjectionMinimumMeters ||
+                projection >= SharedFlapProjectionMaximumMeters)
+                continue;
+            int bin = Mathf.FloorToInt(
+                (projection - SharedFlapProjectionMinimumMeters) /
+                SharedFlapProjectionBinMeters);
+            if (bin >= 0 && bin < SharedFlapProjectionBinCount)
+                _sharedFlapProjectionHistogram[bin]++;
+        }
+        if (validRingSamples < SharedFlapMinimumValidRingSamples)
+            return false;
+
+        int bestSupport = 0;
+        bool isStepSplit = sourceStepQualified != null &&
+                           sourceStepQualified[index] != 0;
+        float maximumOffset = isStepSplit
+            ? SharedFlapStepMaximumOffsetMeters
+            : SharedFlapMaximumOffsetMeters;
+        for (int bin = 1;
+             bin < SharedFlapProjectionBinCount - 1;
+             bin++)
+        {
+            float clusterCenter =
+                SharedFlapProjectionMinimumMeters +
+                (bin + 0.5f) * SharedFlapProjectionBinMeters;
+            float magnitude = Mathf.Abs(clusterCenter);
+            if (magnitude < SharedFlapMinimumOffsetMeters ||
+                magnitude > maximumOffset)
+                continue;
+            int support =
+                _sharedFlapProjectionHistogram[bin - 1] +
+                _sharedFlapProjectionHistogram[bin] +
+                _sharedFlapProjectionHistogram[bin + 1];
+            if (support > bestSupport)
+                bestSupport = support;
+        }
+        return bestSupport >= SharedFlapMinimumClusterSupport &&
+               bestSupport * 100 >=
+                   validRingSamples * SharedFlapMinimumClusterPercent;
+    }
+
+    private bool SharedFlapCornerFollowsPlane(
+        NativeArray<Color> pixels,
+        byte[] accepted,
+        Vector3 center,
+        Vector3 normal,
+        int x,
+        int y)
+    {
+        return TryGetAcceptedWorld(
+                   pixels, accepted, x, y, out Vector3 corner) &&
+               Mathf.Abs(Vector3.Dot(corner - center, normal)) <=
+                   SharedFlapMaximumLocalPlaneErrorMeters;
+    }
+
+    private bool TryGetAcceptedWorld(
+        NativeArray<Color> pixels,
+        byte[] accepted,
+        int x,
+        int y,
+        out Vector3 world)
+    {
+        world = Vector3.zero;
+        if (x < 0 || x >= _width || y < 0 || y >= _height)
+            return false;
+        int index = x + y * _width;
+        if (accepted[index] == 0)
+            return false;
+        Color encoded = pixels[index];
+        world = new Vector3(encoded.r, encoded.g, encoded.b);
+        return Finite(world);
+    }
+
+    private bool HasNearbyMarkedWorldPoint(
+        Vector3 sourceWorld,
+        NativeArray<Color> otherPixels,
+        byte[] otherMask,
+        Matrix4x4 otherWorldToClip,
+        int searchRadiusPixels,
+        float maximumWorldDistanceMeters)
+    {
+        if (!TryProjectWorldPixel(
+                otherWorldToClip, sourceWorld, out int otherCenter))
+            return false;
+        int centerX = otherCenter % _width;
+        int centerY = otherCenter / _width;
+        float maximumDistanceSquared =
+            maximumWorldDistanceMeters * maximumWorldDistanceMeters;
+        for (int oy = -searchRadiusPixels;
+             oy <= searchRadiusPixels; oy++)
+        for (int ox = -searchRadiusPixels;
+             ox <= searchRadiusPixels; ox++)
+        {
+            int x = centerX + ox;
+            int y = centerY + oy;
+            if (x < 0 || x >= _width || y < 0 || y >= _height)
+                continue;
+            int otherIndex = x + y * _width;
+            if (otherMask[otherIndex] == 0)
+                continue;
+            Color encoded = otherPixels[otherIndex];
+            Vector3 otherWorld = new Vector3(
+                encoded.r, encoded.g, encoded.b);
+            if (Finite(otherWorld) &&
+                (sourceWorld - otherWorld).sqrMagnitude <=
+                    maximumDistanceSquared)
+                return true;
+        }
+        return false;
+    }
+
+    private bool MarkPairedSharedFlapSeedsSlice(
+        NativeArray<Color> sourcePixels,
+        byte[] sourceCandidates,
+        byte[] sourceStepQualified,
+        NativeArray<Color> otherPixels,
+        byte[] otherCandidates,
+        Matrix4x4 otherWorldToClip,
+        byte[] seeds,
+        double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            bool seed = false;
+            if (sourceCandidates[index] != 0 &&
+                sourceStepQualified[index] != 0 &&
+                HasSharedFlapCandidateSupport(sourceCandidates, index))
+            {
+                Color encoded = sourcePixels[index];
+                Vector3 world = new Vector3(
+                    encoded.r, encoded.g, encoded.b);
+                seed = Finite(world) &&
+                       HasNearbyCoherentSharedFlapPoint(
+                           world, otherPixels, otherCandidates,
+                           otherWorldToClip,
+                           SharedFlapStereoSearchRadiusPixels,
+                           SharedFlapStereoMatchMeters);
+            }
+            seeds[index] = seed ? (byte)1 : (byte)0;
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool ApplySharedConvexFlapsSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (_leftStepOverreachRollback[index] != 0 &&
+                _leftContinuous[index] != 0)
+            {
+                _leftContinuous[index] = 0;
+                StepSplitOverreachRolledBackEyePixelCount++;
+                SharedConvexFlapRejectedEyePixelCount++;
+            }
+            else if (_leftSharedFlap[index] != 0 &&
+                HasSharedFlapCandidateSupport(_leftSharedFlap, index))
+            {
+                Color encoded = _leftPixels[index];
+                Vector3 world = new Vector3(
+                    encoded.r, encoded.g, encoded.b);
+                if (Finite(world) && HasNearbyCoherentSharedFlapPoint(
+                        world, _rightPixels, _rightSharedFlap,
+                        _rightWorldToClip,
+                        SharedFlapStereoSearchRadiusPixels,
+                        SharedFlapStereoMatchMeters))
+                {
+                    _leftContinuous[index] = 0;
+                    SharedConvexFlapRejectedEyePixelCount++;
+                }
+            }
+            if (_rightStepOverreachRollback[index] != 0 &&
+                _rightContinuous[index] != 0)
+            {
+                _rightContinuous[index] = 0;
+                StepSplitOverreachRolledBackEyePixelCount++;
+                SharedConvexFlapRejectedEyePixelCount++;
+            }
+            else if (_rightSharedFlap[index] != 0 &&
+                HasSharedFlapCandidateSupport(_rightSharedFlap, index))
+            {
+                Color encoded = _rightPixels[index];
+                Vector3 world = new Vector3(
+                    encoded.r, encoded.g, encoded.b);
+                if (Finite(world) && HasNearbyCoherentSharedFlapPoint(
+                        world, _leftPixels, _leftSharedFlap,
+                        _leftWorldToClip,
+                        SharedFlapStereoSearchRadiusPixels,
+                        SharedFlapStereoMatchMeters))
+                {
+                    _rightContinuous[index] = 0;
+                    SharedConvexFlapRejectedEyePixelCount++;
+                }
+            }
+            if ((_cursor & 63) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool RestoreRawRightAdmissionSlice(double deadline)
+    {
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            _leftPixels[index] = _leftRawPixels[index];
+            _rightPixels[index] = _rightRawPixels[index];
+            _leftDepth[index] = _leftRawDepth[index];
+            _rightDepth[index] = _rightRawDepth[index];
+
+            // A-route production is exactly the callback-owned right eye with
+            // a hard 3.0 m projective-depth limit. The left eye and every
+            // historical structural mask are outside this admission set.
+            _leftContinuous[index] = 0;
+            _rightContinuous[index] =
+                _rightRawDepth[index] > 0f &&
+                _rightRawDepth[index] <= ProductionMaximumDepthMeters &&
+                _rightThinGrazingReject[index] == 0
+                    ? (byte)1
+                    : (byte)0;
+            if ((_cursor & 255) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private bool RetireSharedStepFamilySlice(double deadline)
+    {
+        if (!UsesStructuralStepRetirement)
+            return true;
+        while (_cursor < _expected)
+        {
+            int index = _cursor++;
+            if (_leftStepOverreachRollback[index] != 0)
+                RetireStructuralStepVoxels(_leftPixels[index]);
+            if (_rightStepOverreachRollback[index] != 0)
+                RetireStructuralStepVoxels(_rightPixels[index]);
+            if ((_cursor & 31) == 0 &&
+                Time.realtimeSinceStartupAsDouble >= deadline)
+                return false;
+        }
+        return true;
+    }
+
+    private void RetireStructuralStepVoxels(Color encoded)
+    {
+        Vector3 sheetAnchor = new Vector3(
+            encoded.r, encoded.g, encoded.b);
+        if (!Finite(sheetAnchor))
+            return;
+
+        float radius = StructuralStepRetirementRadiusMeters;
+        float radiusSquared = radius * radius;
+        float anchorRadiusSquared =
+            StructuralStepRetirementAnchorRadiusMeters *
+            StructuralStepRetirementAnchorRadiusMeters;
+        int minimumX = Mathf.CeilToInt(
+            (sheetAnchor.x - radius) / VoxelMeters);
+        int maximumX = Mathf.FloorToInt(
+            (sheetAnchor.x + radius) / VoxelMeters);
+        int minimumY = Mathf.CeilToInt(
+            (sheetAnchor.y - radius) / VoxelMeters);
+        int maximumY = Mathf.FloorToInt(
+            (sheetAnchor.y + radius) / VoxelMeters);
+        int minimumZ = Mathf.CeilToInt(
+            (sheetAnchor.z - radius) / VoxelMeters);
+        int maximumZ = Mathf.FloorToInt(
+            (sheetAnchor.z + radius) / VoxelMeters);
+
+        for (int z = minimumZ; z <= maximumZ; z++)
+        for (int y = minimumY; y <= maximumY; y++)
+        for (int x = minimumX; x <= maximumX; x++)
+        {
+            Vector3Int global = new Vector3Int(x, y, z);
+            if (_structuralRetiredVoxels.Contains(global))
+                continue;
+            Vector3 voxelWorld = (Vector3)global * VoxelMeters;
+            if ((voxelWorld - sheetAnchor).sqrMagnitude > radiusSquared)
+                continue;
+
+            Vector3Int chunkId = new Vector3Int(
+                FloorDivide(global.x, ChunkSize),
+                FloorDivide(global.y, ChunkSize),
+                FloorDivide(global.z, ChunkSize));
+            if (!_chunks.TryGetValue(chunkId, out Chunk chunk))
+                continue;
+            Vector3Int local = global - chunkId * ChunkSize;
+            int localIndex = local.x + ChunkSize *
+                (local.y + ChunkSize * local.z);
+            Voxel old = chunk.voxels[localIndex];
+            if (old.weight <= 0f || !Finite(old.layerAnchor) ||
+                old.layerAnchor.sqrMagnitude <= 0.000001f ||
+                (old.layerAnchor - sheetAnchor).sqrMagnitude >
+                    anchorRadiusSquared)
+                continue;
+
+            chunk.voxels[localIndex] = default;
+            _structuralRetiredVoxels.Add(global);
+            WeightedVoxelCount = Mathf.Max(0, WeightedVoxelCount - 1);
+            StructuralStepFamilyRetiredVoxelCount++;
+            byte dirtyMask = 0;
+            AddDirtyVoxel(ref dirtyMask, localIndex);
+            RecordTouched(chunkId, dirtyMask);
+        }
+    }
+
+    private bool HasNearbyCoherentSharedFlapPoint(
+        Vector3 sourceWorld,
+        NativeArray<Color> otherPixels,
+        byte[] otherCandidates,
+        Matrix4x4 otherWorldToClip,
+        int searchRadiusPixels,
+        float maximumWorldDistanceMeters)
+    {
+        if (!TryProjectWorldPixel(
+                otherWorldToClip, sourceWorld, out int otherCenter))
+            return false;
+        int centerX = otherCenter % _width;
+        int centerY = otherCenter / _width;
+        float maximumDistanceSquared =
+            maximumWorldDistanceMeters * maximumWorldDistanceMeters;
+        for (int oy = -searchRadiusPixels;
+             oy <= searchRadiusPixels; oy++)
+        for (int ox = -searchRadiusPixels;
+             ox <= searchRadiusPixels; ox++)
+        {
+            int x = centerX + ox;
+            int y = centerY + oy;
+            if (x < 0 || x >= _width || y < 0 || y >= _height)
+                continue;
+            int otherIndex = x + y * _width;
+            if (otherCandidates[otherIndex] == 0 ||
+                !HasSharedFlapCandidateSupport(
+                    otherCandidates, otherIndex))
+                continue;
+            Color encoded = otherPixels[otherIndex];
+            Vector3 otherWorld = new Vector3(
+                encoded.r, encoded.g, encoded.b);
+            if (Finite(otherWorld) &&
+                (sourceWorld - otherWorld).sqrMagnitude <=
+                    maximumDistanceSquared)
+                return true;
+        }
+        return false;
+    }
+
+    private bool HasSharedFlapCandidateSupport(
+        byte[] candidates,
+        int index)
+    {
+        int centerX = index % _width;
+        int centerY = index / _width;
+        int support = 0;
+        int radius = SharedFlapCandidateNeighborhoodRadiusPixels;
+        for (int oy = -radius; oy <= radius; oy++)
+        for (int ox = -radius; ox <= radius; ox++)
+        {
+            int x = centerX + ox;
+            int y = centerY + oy;
+            if (x < 0 || x >= _width || y < 0 || y >= _height)
+                continue;
+            if (candidates[x + y * _width] == 0)
+                continue;
+            support++;
+            if (support >= SharedFlapMinimumLocalCandidateSupport)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool SameStepLayer(float candidate, float center)
+    {
+        return candidate > 0f &&
+               Mathf.Abs(candidate - center) <=
+                   StepSplitSameLayerSupportMeters;
     }
 
     private bool CandidateSlice(
@@ -1725,6 +4262,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         if (!Finite(surface) || !Finite(eye) || observedDepth <= 0f ||
             ray.sqrMagnitude <= 0.000001f)
             return;
+        float surfaceRange = ray.magnitude;
+        if (!float.IsFinite(surfaceRange) ||
+            surfaceRange < MinimumDepthMeters ||
+            surfaceRange > MaximumDepthMeters)
+            return;
         float positive = PositiveTruncationScale * (observedDepth + 1f);
         float negative = NegativeTruncationScale * (observedDepth + 1f);
         float startScale = Mathf.Max(
@@ -1732,6 +4274,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         float endScale = (observedDepth + negative) / observedDepth;
         Vector3 start = eye + ray * startScale;
         Vector3 end = eye + ray * endScale;
+        float endRange = Vector3.Distance(eye, end);
+        if (endRange > MaximumDepthMeters)
+        {
+            end = eye + (end - eye) *
+                (MaximumDepthMeters / Mathf.Max(endRange, 0.000001f));
+        }
         float length = Vector3.Distance(start, end);
         int steps = Mathf.Max(1, Mathf.CeilToInt(
             length / Mathf.Max(VoxelMeters, chunkWorld * 0.65f)));
@@ -1832,9 +4380,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             float sampleWeight = 1f /
                 Mathf.Max(0.000001f, factor * factor);
             Voxel old = chunk.voxels[local];
-            int pair = _processingReplayFrame
-                ? _replayedFrames + 1
-                : AcceptedPairCount + 1;
+            int pair = CurrentObservationPair();
             Color surface = pixels[index];
             Vector3 layerAnchor = new Vector3(
                 surface.r, surface.g, surface.b);
@@ -1842,6 +4388,81 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 (origin.x + x) * VoxelMeters,
                 (origin.y + y) * VoxelMeters,
                 (origin.z + z) * VoxelMeters);
+            Vector3Int globalVoxel = origin + new Vector3Int(x, y, z);
+            Vector3 observationEye = eye == 0 ? _leftEye : _rightEye;
+            // Final authority: the prefilter and candidate allocator are not
+            // trusted to enforce the production radius. A surface or TSDF
+            // support voxel outside the current observation eye's 3 m sphere
+            // is left completely unwritten, even when that creates a hole.
+            if (!Finite(layerAnchor) || !Finite(observationEye) ||
+                Vector3.Distance(layerAnchor, observationEye) >
+                    MaximumDepthMeters ||
+                Vector3.Distance(voxelWorld, observationEye) >
+                    MaximumDepthMeters)
+                continue;
+            if (!TryReleaseThinGrazingBarrier(
+                    globalVoxel, observationEye,
+                    observedDepth, voxelDepth, pair))
+                continue;
+            if (DominantLayerPrefusionEnabled &&
+                UsesLegacyProductionAdmission &&
+                old.weight >= ContradictionMinimumMatureWeight &&
+                Finite(old.layerAnchor) &&
+                old.layerAnchor.sqrMagnitude > 0.000001f)
+            {
+                // The other eye must not average into the dominant value after
+                // this pair has already opened or advanced a challenger.
+                if (old.replacementWeight > 0f &&
+                    old.replacementLastPair == pair)
+                {
+                    LayerShiftDeferredObservationCount++;
+                    _integrationSliceWrote = true;
+                    continue;
+                }
+
+                bool layerConflict = IsDominantLayerConflict(
+                    old, sampleDistance, layerAnchor, observationEye,
+                    voxelWorld);
+                if (layerConflict)
+                {
+                    // A conflict is evidence of two possible surfaces, never
+                    // a measurement to average between them. Without current
+                    // stereo agreement it remains quarantined and the old
+                    // dominant TSDF value is left byte-for-byte unchanged.
+                    if (!TryGetCurrentStereoLayerAnchor(
+                            eye, index, voxelWorld, sampleDistance,
+                            layerAnchor, out Vector3 stereoAnchor,
+                            out Vector3 viewPosition))
+                    {
+                        LayerShiftDeferredObservationCount++;
+                        _integrationSliceWrote = true;
+                        continue;
+                    }
+
+                    Voxel challenged = AdvanceDominantLayerCandidate(
+                        old, sampleDistance, sampleWeight, stereoAnchor,
+                        viewPosition, pair, out bool publishedChallenge);
+                    chunk.voxels[local] = challenged;
+                    if (publishedChallenge)
+                    {
+                        LayerShiftPublishedVoxelCount++;
+                        if (MeshRelevantChange(old, challenged))
+                            AddDirtyVoxel(
+                                ref _integrationSliceDirtyMask, local);
+                    }
+                    else
+                    {
+                        LayerShiftDeferredObservationCount++;
+                    }
+                    _integrationSliceWrote = true;
+                    continue;
+                }
+
+                // Direct support for the dominant layer cancels an unresolved
+                // challenger. Alternating foreground/background pixels can
+                // therefore never accumulate enough evidence to switch.
+                ClearDominantLayerCandidate(ref old);
+            }
             if (UsesAtomicRetirement &&
                 old.retiredOnce && old.weight <= 0f)
             {
@@ -2291,6 +4912,199 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         voxel.replacementSign = 0;
     }
 
+    private static bool IsDominantLayerConflict(
+        Voxel dominant,
+        float sampleDistance,
+        Vector3 incomingAnchor,
+        Vector3 eye,
+        Vector3 voxelWorld)
+    {
+        if (!Finite(incomingAnchor) || !Finite(dominant.layerAnchor) ||
+            !Finite(eye) || !Finite(voxelWorld))
+            return false;
+        Vector3 viewRay = voxelWorld - eye;
+        float rayLength = viewRay.magnitude;
+        if (!(rayLength > 0.000001f) || !float.IsFinite(rayLength))
+            return false;
+        viewRay /= rayLength;
+        float layerSeparation = Mathf.Abs(Vector3.Dot(
+            incomingAnchor - dominant.layerAnchor, viewRay));
+        return layerSeparation >= DominantLayerChallengeMeters &&
+               Mathf.Abs(sampleDistance - dominant.distance) >=
+                   DominantLayerChallengeMeters;
+    }
+
+    private bool TryGetCurrentStereoLayerAnchor(
+        int sourceEye,
+        int sourcePixel,
+        Vector3 voxelWorld,
+        float sourceSampleDistance,
+        Vector3 sourceAnchor,
+        out Vector3 stereoAnchor,
+        out Vector3 viewPosition)
+    {
+        stereoAnchor = default;
+        viewPosition = (_leftEye + _rightEye) * 0.5f;
+        if (sourceEye < 0 || sourceEye > 1 ||
+            sourcePixel < 0 || sourcePixel >= _expected ||
+            !Finite(sourceAnchor) || !Finite(voxelWorld) ||
+            !Finite(viewPosition))
+            return false;
+
+        NativeArray<Color> otherPixels = sourceEye == 0
+            ? _rightPixels
+            : _leftPixels;
+        float[] otherDepths = sourceEye == 0
+            ? _rightDepth
+            : _leftDepth;
+        byte[] otherAccepted = sourceEye == 0
+            ? _rightContinuous
+            : _leftContinuous;
+        Matrix4x4 otherWorldToClip = sourceEye == 0
+            ? _rightWorldToClip
+            : _leftWorldToClip;
+        if (!TryProjectWorldPixelDepth(
+                otherWorldToClip, voxelWorld, out int centerPixel,
+                out float otherVoxelDepth))
+            return false;
+
+        int centerX = centerPixel % _width;
+        int centerY = centerPixel / _width;
+        float bestSeparation = float.PositiveInfinity;
+        Vector3 bestAnchor = default;
+        int radius = DominantLayerStereoSearchRadiusPixels;
+        for (int oy = -radius; oy <= radius; oy++)
+        for (int ox = -radius; ox <= radius; ox++)
+        {
+            int x = centerX + ox;
+            int y = centerY + oy;
+            if (x < 0 || x >= _width || y < 0 || y >= _height)
+                continue;
+            int candidate = x + y * _width;
+            if (otherAccepted[candidate] == 0 ||
+                !(otherDepths[candidate] > 0f))
+                continue;
+            float otherSampleDistance =
+                otherDepths[candidate] - otherVoxelDepth;
+            if (!float.IsFinite(otherSampleDistance) ||
+                Mathf.Abs(otherSampleDistance - sourceSampleDistance) >
+                    DominantLayerDistanceConsistencyMeters)
+                continue;
+            Color encoded = otherPixels[candidate];
+            Vector3 otherAnchor = new Vector3(
+                encoded.r, encoded.g, encoded.b);
+            if (!Finite(otherAnchor))
+                continue;
+            float separation = Vector3.Distance(
+                sourceAnchor, otherAnchor);
+            if (separation > DominantLayerStereoAnchorSeparationMeters ||
+                separation >= bestSeparation)
+                continue;
+            bestSeparation = separation;
+            bestAnchor = otherAnchor;
+        }
+        if (!float.IsFinite(bestSeparation))
+            return false;
+        stereoAnchor = (sourceAnchor + bestAnchor) * 0.5f;
+        return Finite(stereoAnchor);
+    }
+
+    private static Voxel AdvanceDominantLayerCandidate(
+        Voxel old,
+        float sampleDistance,
+        float sampleWeight,
+        Vector3 stereoAnchor,
+        Vector3 viewPosition,
+        int pair,
+        out bool published)
+    {
+        published = false;
+        if (old.replacementLastPair == pair)
+            return old;
+
+        bool hasCandidate = old.replacementWeight > 0f &&
+                            old.replacementStreak > 0;
+        bool consistent = hasCandidate &&
+                          Mathf.Abs(
+                              old.replacementDistance - sampleDistance) <=
+                              DominantLayerDistanceConsistencyMeters &&
+                          Finite(old.replacementAnchor) &&
+                          Vector3.Distance(
+                              old.replacementAnchor, stereoAnchor) <=
+                              DominantLayerAnchorConsistencyMeters;
+        if (!consistent)
+        {
+            old.replacementDistance = sampleDistance;
+            old.replacementWeight = sampleWeight;
+            old.replacementAnchor = stereoAnchor;
+            old.replacementLayerKey = CandidateLayerKey(stereoAnchor);
+            old.replacementStreak = 1;
+            old.replacementSign = sampleDistance >= 0f
+                ? (sbyte)1
+                : (sbyte)-1;
+            old.replacementFirstView = viewPosition;
+            old.replacementLastPair = pair;
+            return old;
+        }
+
+        // Repeated frames from effectively the same head position refresh no
+        // authority. They are deliberately held outside the production TSDF.
+        if (!Finite(old.replacementFirstView) ||
+            Vector3.Distance(
+                old.replacementFirstView, viewPosition) <
+                DominantLayerMinimumViewBaselineMeters)
+        {
+            old.replacementLastPair = pair;
+            return old;
+        }
+
+        float candidateWeight = old.replacementWeight + sampleWeight;
+        float candidateDistance =
+            (old.replacementDistance * old.replacementWeight +
+             sampleDistance * sampleWeight) /
+            Mathf.Max(0.000001f, candidateWeight);
+        Vector3 candidateAnchor = Vector3.Lerp(
+            old.replacementAnchor, stereoAnchor,
+            sampleWeight / Mathf.Max(0.000001f, candidateWeight));
+        byte candidateStreak = (byte)Mathf.Min(
+            byte.MaxValue, old.replacementStreak + 1);
+        published = candidateStreak >= DominantLayerPairsToReplace;
+        if (published)
+        {
+            return new Voxel
+            {
+                distance = QuantizeHalf(candidateDistance),
+                weight = QuantizeHalf(candidateWeight),
+                layerAnchor = candidateAnchor,
+                lastEvidencePair = pair,
+                retiredOnce = old.retiredOnce
+            };
+        }
+
+        old.replacementDistance = candidateDistance;
+        old.replacementWeight = candidateWeight;
+        old.replacementAnchor = candidateAnchor;
+        old.replacementLayerKey = CandidateLayerKey(candidateAnchor);
+        old.replacementStreak = candidateStreak;
+        old.replacementFirstView = viewPosition;
+        old.replacementLastPair = pair;
+        return old;
+    }
+
+    private static void ClearDominantLayerCandidate(ref Voxel voxel)
+    {
+        if (voxel.replacementWeight <= 0f)
+            return;
+        voxel.replacementDistance = 0f;
+        voxel.replacementWeight = 0f;
+        voxel.replacementAnchor = default;
+        voxel.replacementLayerKey = default;
+        voxel.replacementStreak = 0;
+        voxel.replacementSign = 0;
+        voxel.replacementFirstView = default;
+        voxel.replacementLastPair = 0;
+    }
+
     private bool HasInteriorRefutationFootprint(
         float[] depths, int centerX, int centerY)
     {
@@ -2550,6 +5364,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public string uncertaintyInputStatus;
         public string tape;
         public string coordinateSpace;
+        public string productionAdmissionSource;
+        public bool leftEyeFusionEnabled;
         public int inputWidth;
         public int inputHeight;
         public int replayedPairs;
@@ -2667,14 +5483,38 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         public float q75CandidateLayerCellMeters;
         public long q75QualifiedVoxelObservations;
         public long q75DeferredVoxelObservations;
+        public bool firstSurfaceStepSplitEnabled;
+        public float firstSurfaceStepMinimumLayerSeparationMeters;
+        public float firstSurfaceStepMaximumPlateauSpreadMeters;
+        public float firstSurfaceStepMaximumStereoAnchorSeparationMeters;
+        public int firstSurfaceStepMaximumOuterOffsetPixels;
+        public float firstSurfaceStepSameLayerSupportMeters;
+        public long firstSurfaceStepCandidateEyePixels;
+        public long firstSurfaceStepStereoQualifiedEyePixels;
+        public long firstSurfaceStepAppliedEyePixels;
+        public long firstSurfaceStepAcceptedEyePixels;
+        public int persistentBoundaryGuardedBands;
+        public int persistentBoundaryLastRejectedBridgePoints;
+        public long persistentBoundaryRejectedBridgePoints;
         public float layerShiftChallengeMeters;
         public float layerShiftDistanceConsistencyMeters;
+        public float layerShiftMinimumViewBaselineMeters;
+        public float layerShiftStereoAnchorSeparationMeters;
+        public bool dominantLayerPrefusionEnabled;
         public int layerShiftPairsToReplace;
         public long layerShiftDeferredObservations;
         public long layerShiftPublishedVoxels;
         public bool contradictionSingleRetirementPerVoxel;
         public int contradictionVotes;
         public int retiredContradictedVoxels;
+        public long structuralStepFamilyRetiredVoxels;
+        public long strongGrazingPoints;
+        public long thinGrazingRejectedPoints;
+        public long wideGrazingRetainedPoints;
+        public long thinGrazingBarrierVoxels;
+        public long thinGrazingClearedVoxels;
+        public long thinGrazingReleasedVoxels;
+        public string structuralStepRetirementRule;
         public string contradictionRetirementRule;
     }
 
@@ -2716,11 +5556,11 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             {
                 algorithm = _abExperimentalArm
                     ? "V2BAtomicRetirementHoldV2"
-                    : UsesProductionQ75
-                        ? "V2AProductionQ75LayerShiftLatchAtomicV2"
-                        : (SameLayerSupportEnabled
-                        ? "V2CSpatialReceiptSamePairCrossingEdgeLayerOnly"
-                        : "V2CSpatialReceiptBaseline"),
+                    : UsesLegacyProductionAdmission
+                        ? "V2AOldRulesStereoGradient3m"
+                        : UsesProductionQ75
+                            ? "V2AProductionQ75LayerShiftLatchAtomicV2"
+                            : "V2ARawRight3mUnlockableThinGapV21",
                 sourceVoxelMeters = VoxelMeters,
                 derivedVoxelMeters = DerivedVoxelMeters,
                 resampleRatio = ResampleRatio,
@@ -2739,6 +5579,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 coordinateSpace = reader != null
                     ? reader.CoordinateSpace
                     : "QuestStage",
+                productionAdmissionSource = UsesLegacyProductionAdmission
+                    ? "0.1.1 legacy filtered stereo admission; both surface anchors and every written TSDF support voxel are hard-limited to 3.0 m per observation eye; dominant-layer conflicts remain pre-fusion quarantined"
+                    : UsesRawRightProductionAdmission
+                        ? "callback-owned right-eye raw at or below 3.0 m minus strong-grazing bands at most 5 points thick; rejected bands become TSDF write and mesh barriers until two direct surface observations from a view displaced by at least 8 cm release each voxel"
+                        : "legacy filtered stereo admission",
+                leftEyeFusionEnabled = !UsesRawRightProductionAdmission,
                 inputWidth = reader != null ? reader.Width : _width,
                 inputHeight = reader != null ? reader.Height : _height,
                 replayedPairs = _replayedFrames,
@@ -2921,9 +5767,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 contradictionAnchorConsistencyMeters =
                     ContradictionAnchorConsistencyMeters,
                 contradictionPairsToRetire =
-                    ContradictionPairsToRetire,
+                    ContradictionRetirementEnabled || UsesAtomicRetirement
+                        ? ContradictionPairsToRetire
+                        : 0,
                 replacementPairsToPublish =
-                    ReplacementPairsToPublish,
+                    DominantLayerPrefusionEnabled &&
+                    UsesLegacyProductionAdmission
+                        ? DominantLayerPairsToReplace
+                        : UsesAtomicRetirement
+                            ? ReplacementPairsToPublish
+                            : 0,
                 atomicChunkFrontHold = UsesAtomicRetirement,
                 productionQ75Enabled = UsesProductionQ75,
                 q75ModelReady =
@@ -2944,10 +5797,59 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                     _fusionGuardQ75 != null
                         ? _fusionGuardQ75.DeferredVoxelObservations
                         : 0,
-                layerShiftChallengeMeters = LayerShiftChallengeMeters,
+                firstSurfaceStepSplitEnabled =
+                    FirstSurfaceStepSplitEnabled,
+                firstSurfaceStepMinimumLayerSeparationMeters =
+                    StepSplitMinimumLayerSeparationMeters,
+                firstSurfaceStepMaximumPlateauSpreadMeters =
+                    StepSplitMaximumPlateauSpreadMeters,
+                firstSurfaceStepMaximumStereoAnchorSeparationMeters =
+                    StepSplitMaximumStereoAnchorSeparationMeters,
+                firstSurfaceStepMaximumOuterOffsetPixels =
+                    StepSplitMaximumOuterOffsetPixels,
+                firstSurfaceStepSameLayerSupportMeters =
+                    StepSplitSameLayerSupportMeters,
+                firstSurfaceStepCandidateEyePixels =
+                    FirstSurfaceStepCandidateEyePixelCount,
+                firstSurfaceStepStereoQualifiedEyePixels =
+                    FirstSurfaceStepStereoQualifiedEyePixelCount,
+                firstSurfaceStepAppliedEyePixels =
+                    FirstSurfaceStepAppliedEyePixelCount,
+                firstSurfaceStepAcceptedEyePixels =
+                    FirstSurfaceStepAcceptedEyePixelCount,
+                persistentBoundaryGuardedBands =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay.GuardedBandCount
+                        : 0,
+                persistentBoundaryLastRejectedBridgePoints =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay
+                            .LastRejectedBridgePointCount
+                        : 0,
+                persistentBoundaryRejectedBridgePoints =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay
+                            .RejectedBridgePointCount
+                        : 0,
+                layerShiftChallengeMeters =
+                    DominantLayerPrefusionEnabled
+                        ? DominantLayerChallengeMeters
+                        : LayerShiftChallengeMeters,
                 layerShiftDistanceConsistencyMeters =
-                    LayerShiftDistanceConsistencyMeters,
-                layerShiftPairsToReplace = LayerShiftPairsToReplace,
+                    DominantLayerPrefusionEnabled
+                        ? DominantLayerDistanceConsistencyMeters
+                        : LayerShiftDistanceConsistencyMeters,
+                layerShiftMinimumViewBaselineMeters =
+                    DominantLayerMinimumViewBaselineMeters,
+                layerShiftStereoAnchorSeparationMeters =
+                    DominantLayerStereoAnchorSeparationMeters,
+                dominantLayerPrefusionEnabled =
+                    DominantLayerPrefusionEnabled &&
+                    UsesLegacyProductionAdmission,
+                layerShiftPairsToReplace =
+                    DominantLayerPrefusionEnabled
+                        ? DominantLayerPairsToReplace
+                        : LayerShiftPairsToReplace,
                 layerShiftDeferredObservations =
                     LayerShiftDeferredObservationCount,
                 layerShiftPublishedVoxels =
@@ -2956,6 +5858,22 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 contradictionVotes = ContradictionVoteCount,
                 retiredContradictedVoxels =
                     RetiredContradictedVoxelCount,
+                structuralStepFamilyRetiredVoxels =
+                    StructuralStepFamilyRetiredVoxelCount,
+                strongGrazingPoints = StrongGrazingPointCount,
+                thinGrazingRejectedPoints =
+                    ThinGrazingRejectedPointCount,
+                wideGrazingRetainedPoints =
+                    WideGrazingRetainedPointCount,
+                thinGrazingBarrierVoxels =
+                    ThinGrazingBarrierVoxelCount,
+                thinGrazingClearedVoxels =
+                    ThinGrazingClearedVoxelCount,
+                thinGrazingReleasedVoxels =
+                    ThinGrazingReleasedVoxelCount,
+                structuralStepRetirementRule =
+                    "PairedStructuralStepFamily_5cmVoxelRadius_" +
+                    "SavedLayerAnchorWithin4.5cm_ClearBeforeCurrentFusion",
                 contradictionRetirementRule =
                     "FiveConsistentDirectPairsOpposeMatureOldSign_" +
                     "StableAnchor_QuarantineThreeMorePairs_" +
@@ -3005,10 +5923,18 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 arm = RouteLabel,
                 mutation = _abExperimentalArm
                     ? "5x5-valid-spread-under-12cm plus five-pair direct refutation; replacement quarantined for three more stable pairs and published with an atomic chunk Front"
-                    : UsesProductionQ75
-                        ? "ordinary first-surface fusion plus two-pair stereo layer-shift latch for mature same-sign TSDF jumps; signed opposition keeps the q75 dominant/challenger atomic route"
-                        : "frozen old admission fusion extraction and lifecycle rules",
+                    : UsesLegacyProductionAdmission
+                        ? "0.1.1 stereo depth-gradient admission; surface anchors, candidate rays and every written TSDF support voxel are hard-limited to 3.0 m per observation eye even when the result is an empty boundary; mature cross-layer observations are quarantined before TSDF averaging, require current stereo agreement plus a second coherent pair from at least 8 cm displaced view, and then replace only the local voxel while chunk Front publication remains complete"
+                        : UsesProductionQ75
+                            ? "persistent-boundary production mutation disabled; paired locally planar StepSplit cores with a dominant parallel ring layer 5.5-10 cm away seed complete component-family rejection with non-chaining eight-pixel satellites, independent of screen orientation or size; visibility-ordered one-eye foreground contradiction rejection and q75 atomic conflict handling retained"
+                            : "callback-owned right-eye raw back-projection at or below 3.0 m is classified with the same strong-grazing facing rule as the raw display; connected grazing bands at most five points thick become 10 cm TSDF write/mesh barriers, then release voxel-by-voxel after two consecutive direct near-surface observations from a view displaced by at least 8 cm; bands with a greater-than-five-point wide core are retained; left-eye fusion and all legacy structural masks remain disabled",
                 coordinateSpace = "QuestStage",
+                productionAdmissionSource = UsesLegacyProductionAdmission
+                    ? "0.1.1 legacy filtered stereo admission; both surface anchors and every written TSDF support voxel are hard-limited to 3.0 m per observation eye; dominant-layer conflicts remain pre-fusion quarantined"
+                    : UsesRawRightProductionAdmission
+                        ? "callback-owned right-eye raw at or below 3.0 m minus strong-grazing bands at most 5 points thick; rejected bands remain TSDF write and mesh barriers until displaced-view direct surface support releases them"
+                        : "legacy filtered stereo admission",
+                leftEyeFusionEnabled = !UsesRawRightProductionAdmission,
                 acceptedPairs = AcceptedPairCount,
                 droppedBusyPairs = DroppedBusyPairCount,
                 readbackFailures = ReadbackFailureCount,
@@ -3016,9 +5942,28 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 weightedVoxels = WeightedVoxelCount,
                 contradictionVotes = ContradictionVoteCount,
                 retiredVoxels = RetiredContradictedVoxelCount,
+                structuralStepFamilyRetiredVoxels =
+                    StructuralStepFamilyRetiredVoxelCount,
+                strongGrazingPoints = StrongGrazingPointCount,
+                thinGrazingRejectedPoints =
+                    ThinGrazingRejectedPointCount,
+                wideGrazingRetainedPoints =
+                    WideGrazingRetainedPointCount,
+                thinGrazingBarrierVoxels =
+                    ThinGrazingBarrierVoxelCount,
+                thinGrazingClearedVoxels =
+                    ThinGrazingClearedVoxelCount,
+                thinGrazingReleasedVoxels =
+                    ThinGrazingReleasedVoxelCount,
                 pendingReplacementVoxels =
                     CountPendingReplacementVoxels(),
-                replacementPairsToPublish = ReplacementPairsToPublish,
+                replacementPairsToPublish =
+                    DominantLayerPrefusionEnabled &&
+                    UsesLegacyProductionAdmission
+                        ? DominantLayerPairsToReplace
+                        : UsesAtomicRetirement
+                            ? ReplacementPairsToPublish
+                            : 0,
                 atomicChunkFrontHold = UsesAtomicRetirement,
                 productionQ75Enabled = UsesProductionQ75,
                 q75ModelReady =
@@ -3038,6 +5983,32 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
                 q75DeferredVoxelObservations =
                     _fusionGuardQ75 != null
                         ? _fusionGuardQ75.DeferredVoxelObservations
+                        : 0,
+                firstSurfaceStepCandidateEyePixels =
+                    FirstSurfaceStepCandidateEyePixelCount,
+                firstSurfaceStepStereoQualifiedEyePixels =
+                    FirstSurfaceStepStereoQualifiedEyePixelCount,
+                firstSurfaceStepAppliedEyePixels =
+                    FirstSurfaceStepAppliedEyePixelCount,
+                firstSurfaceStepAcceptedEyePixels =
+                    FirstSurfaceStepAcceptedEyePixelCount,
+                sharedConvexFlapCandidateEyePixels =
+                    SharedConvexFlapCandidateEyePixelCount,
+                sharedConvexFlapRejectedEyePixels =
+                    SharedConvexFlapRejectedEyePixelCount,
+                persistentBoundaryGuardedBands =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay.GuardedBandCount
+                        : 0,
+                persistentBoundaryLastRejectedBridgePoints =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay
+                            .LastRejectedBridgePointCount
+                        : 0,
+                persistentBoundaryRejectedBridgePoints =
+                    _persistentBoundaryOverlay != null
+                        ? _persistentBoundaryOverlay
+                            .RejectedBridgePointCount
                         : 0,
                 layerShiftDeferredObservations =
                     LayerShiftDeferredObservationCount,
@@ -4929,6 +7900,15 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private bool TryGetVoxel(Vector3Int global, out Voxel voxel)
     {
+        // A rejected thin grazing band is an unknown-space barrier until a
+        // displaced later view supplies repeated direct surface support.
+        // Returning it as unobserved prevents Marching Cubes from constructing
+        // a zero crossing between the near and far sides of the removed band.
+        if (_thinGrazingBarrierVoxels.ContainsKey(global))
+        {
+            voxel = default;
+            return false;
+        }
         Vector3Int chunkId = new Vector3Int(
             FloorDivide(global.x, ChunkSize),
             FloorDivide(global.y, ChunkSize),
@@ -5327,6 +8307,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
             array = new float[length];
     }
 
+    private static void EnsureArray(ref int[] array, int length)
+    {
+        if (array == null || array.Length < length)
+            array = new int[length];
+    }
+
     private static void EnsureArray(ref byte[] array, int length)
     {
         if (array == null || array.Length < length)
@@ -5400,12 +8386,16 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 
     private void OnDestroy()
     {
+        _gpuBackend?.Dispose();
+        _gpuBackend = null;
         StopRecording();
         StopReplay();
         ReleaseTarget(ref _leftWorld);
         ReleaseTarget(ref _rightWorld);
         if (_leftPixels.IsCreated) _leftPixels.Dispose();
         if (_rightPixels.IsCreated) _rightPixels.Dispose();
+        if (_leftRawPixels.IsCreated) _leftRawPixels.Dispose();
+        if (_rightRawPixels.IsCreated) _rightRawPixels.Dispose();
         foreach (Chunk chunk in _chunks.Values)
             DisposeChunk(chunk);
         ClearRenderPages();

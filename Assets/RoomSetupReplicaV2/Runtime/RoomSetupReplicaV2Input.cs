@@ -3,8 +3,10 @@ using UnityEngine;
 /// <summary>
 /// Room Setup replica input. Right trigger toggles live coverage without
 /// recording; A replays the fixed tape, B clears the replica, and
-/// X toggles preview visibility, Y toggles the classic multicolour BB depth
-/// trail, and right-stick click freezes the current live replica. Replay-only
+/// X toggles the mesh view. Y cycles mesh -> isolated raw back-projection ->
+/// isolated remaining pre-TSDF points -> terrain contours -> persistent
+/// boundary overlay -> mesh, and right-stick click freezes the
+/// current live replica. Replay-only
 /// annotation is disabled while live controls are open so the same trigger
 /// cannot paint and start capture.
 /// </summary>
@@ -66,11 +68,7 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
         }
         if (OVRInput.GetDown(OVRInput.RawButton.X) && AcceptAction())
         {
-            RoomSetupReplicaV2Reconstruction reconstruction =
-                scanner.Reconstruction;
-            if (reconstruction != null)
-                reconstruction.SetPreviewVisible(
-                    !reconstruction.PreviewVisible);
+            scanner.ToggleReplicaPreview();
             Pulse();
         }
         if (OVRInput.GetDown(OVRInput.RawButton.Y) && AcceptAction())
@@ -84,6 +82,13 @@ public sealed class RoomSetupReplicaV2Input : MonoBehaviour
         {
             if (scanner.FreezeCurrentReplica())
                 Pulse(0.55f, 0.14f);
+        }
+        if (OVRInput.GetDown(
+                OVRInput.Button.PrimaryThumbstick,
+                OVRInput.Controller.LTouch) && AcceptAction())
+        {
+            scanner.ToggleUniqueEdgeDisplay();
+            Pulse(0.45f, 0.10f);
         }
     }
 

@@ -55,10 +55,21 @@ V2 keeps V1 intact and changes two deliberately isolated parts:
   exactly 32 triangles are retained. The raw candidate is preserved so a
   temporarily removed fragment can grow and reappear, and the filtered meshes
   are published together only when the mesh pass completes.
-- The synchronized experimental B reconstruction, FusionGuard q75 production
-  gate and read-only Shadow observer are disabled; only the stable A
-  reconstruction runs and publishes. The recovered XRT implementation is
-  currently disabled in production. A 2026-11-01 device trial applied it after
+- The synchronized experimental B reconstruction and read-only Shadow observer
+  remain disabled. The single live A reconstruction now runs the bounded
+  `A-multiscale-step-band-q75-atomic-v4` ceiling-step recovery trial. Before
+  the first TSDF write, a 5--19 pixel search may return a transition pixel to
+  its nearer depth layer only when both eyes independently bracket it with two
+  locally flat plateaus separated by at least 15 cm and the snapped world
+  anchors agree within 7.5 cm. A qualified pixel may pass the legacy gradient
+  gate using at least two same-layer cardinal neighbours, so the newly restored
+  hard edge is not immediately discarded. Ordinary slopes and under-evidenced
+  pixels remain unchanged.
+  Mature cross-layer conflicts still use stereo-qualified
+  dominant/challenger evidence and retain the last complete local Front until
+  a replacement is ready. This route is source-integrated and Unity-compiled,
+  but not yet APK-packaged or Quest-validated. The recovered XRT implementation is
+  still disabled in production. A 2026-11-01 device trial applied it after
   the already-derived 10 cm seam-welded candidate and produced metre-scale
   triangles on planar walls, proving that this stage placement/input density is
   wrong even though the recovered collapse kernel is internally consistent.

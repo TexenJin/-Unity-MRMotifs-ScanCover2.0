@@ -1,0 +1,344 @@
+#pragma kernel ClearVolume
+#pragma kernel IntegrateStereo
+#pragma kernel IntegrateEnvironmentDepth
+
+// RoomSetupReplica production fusion. One thread owns one persistent voxel;
+// there is no full-frame GPU readback and no cross-voxel write authority.
+Texture2DArray<float> _DepthTex;
+Texture2DArray<float> _EnvironmentDepthTexture;
+RWTexture3D<float2> _TsdfVolume;
+
+int3 _VoxelCount;
+int2 _DepthSize;
+float3 _VolumeOrigin;
+float _VoxelSize;
+float _MinimumDepthMeters;
+float _MaximumDepthMeters;
+float _PositiveTruncationScale;
+float _NegativeTruncationScale;
+float _GradientThresholdSquared;
+float _MaximumWeight;
+float4x4 _Projection[2];
+float4x4 _ProjectionInverse[2];
+float4x4 _View[2];
+float4x4 _ViewInverse[2];
+float4x4 _EnvironmentDepthReprojectionMatrices[2];
+float4x4 _EnvironmentDepthReprojectionInverse[2];
+float4 _EnvironmentDepthZBufferParams;
+float3 _EnvironmentEyeCentre;
+
+struct Observation
+{
+    float valid;
+    float distance;
+    float weight;
+};
+
+bool Finite1(float value)
+{
+    return value == value && abs(value) < 100000.0;
+}
+
+bool Finite3(float3 value)
+{
+    return all(value == value) && all(abs(value) < 100000.0);
+}
+
+float3 EyePosition(int eye)
+{
+    return mul(_ViewInverse[eye], float4(0, 0, 0, 1)).xyz;
+}
+
+float3 VoxelToWorld(uint3 coordinate)
+{
+    return _VolumeOrigin +
+           ((float3)coordinate - (float3)_VoxelCount * 0.5) *
+           _VoxelSize;
+}
+
+bool LoadWorld(int2 pixel, int eye, out float3 world)
+{
+    world = 0.0;
+    if (pixel.x < 0 || pixel.y < 0 ||
+        pixel.x >= _DepthSize.x || pixel.y >= _DepthSize.y)
+        return false;
+
+    float depthNdc = _DepthTex.Load(int4(pixel, eye, 0));
+    if (!(depthNdc > 0.0 && depthNdc < 1.0))
+        return false;
+
+    float2 uv = ((float2)pixel + 0.5) / (float2)_DepthSize;
+    float4 clip = float4(uv * 2.0 - 1.0,
+                         depthNdc * 2.0 - 1.0, 1.0);
+    float4 viewH = mul(_ProjectionInverse[eye], clip);
+    float4 worldH = mul(_ViewInverse[eye], viewH);
+    if (abs(viewH.w) <= 0.00001 || abs(worldH.w) <= 0.00001)
+        return false;
+    world = worldH.xyz / worldH.w;
+    return Finite3(world);
+}
+
+bool LoadProjectiveDepth(int2 pixel, int eye, out float depth,
+                         out float3 world)
+{
+    depth = 0.0;
+    if (!LoadWorld(pixel, eye, world))
+        return false;
+    float4 clip = mul(_Projection[eye],
+                      mul(_View[eye], float4(world, 1.0)));
+    depth = clip.w;
+    return Finite1(depth) && depth >= _MinimumDepthMeters &&
+           depth <= _MaximumDepthMeters;
+}
+
+bool LoadEnvironmentProjectiveDepth(
+    int2 pixel, int eye, out float depth, out float3 world)
+{
+    depth = 0.0;
+    world = 0.0;
+    if (pixel.x < 0 || pixel.y < 0 ||
+        pixel.x >= _DepthSize.x || pixel.y >= _DepthSize.y)
+        return false;
+
+    float depthTexture = _EnvironmentDepthTexture.Load(
+        int4(pixel, eye, 0));
+    if (!(depthTexture > 0.0 && depthTexture < 1.0))
+        return false;
+
+    float depthNdc = depthTexture * 2.0 - 1.0;
+    float denominator =
+        depthNdc + _EnvironmentDepthZBufferParams.y;
+    if (abs(denominator) <= 0.000001)
+        return false;
+    depth = _EnvironmentDepthZBufferParams.x / denominator;
+    if (!Finite1(depth) || depth < _MinimumDepthMeters ||
+        depth > _MaximumDepthMeters)
+        return false;
+
+    float2 uv = ((float2)pixel + 0.5) / (float2)_DepthSize;
+    float4 depthSpace = float4(
+        uv * 2.0 - 1.0, depthNdc, 1.0);
+    float4 worldH = mul(
+        _EnvironmentDepthReprojectionInverse[eye], depthSpace);
+    if (abs(worldH.w) <= 0.00001)
+        return false;
+    world = worldH.xyz / worldH.w;
+    return Finite3(world);
+}
+
+bool GradientAccepted(int2 pixel, int eye)
+{
+    if (pixel.x <= 0 || pixel.y <= 0 ||
+        pixel.x >= _DepthSize.x - 1 || pixel.y >= _DepthSize.y - 1)
+        return false;
+
+    float leftDepth, rightDepth, upDepth, downDepth;
+    float3 ignoredWorld;
+    if (!LoadProjectiveDepth(pixel + int2(-1, 0), eye,
+                             leftDepth, ignoredWorld) ||
+        !LoadProjectiveDepth(pixel + int2(1, 0), eye,
+                             rightDepth, ignoredWorld) ||
+        !LoadProjectiveDepth(pixel + int2(0, -1), eye,
+                             upDepth, ignoredWorld) ||
+        !LoadProjectiveDepth(pixel + int2(0, 1), eye,
+                             downDepth, ignoredWorld))
+        return false;
+
+    float dx = rightDepth - leftDepth;
+    float dy = downDepth - upDepth;
+    return dx * dx + dy * dy <= _GradientThresholdSquared;
+}
+
+Observation ObserveVoxel(float3 voxelWorld, int eye)
+{
+    Observation result = (Observation)0;
+    float3 eyePosition = EyePosition(eye);
+    float voxelRange = distance(voxelWorld, eyePosition);
+    if (!Finite1(voxelRange) || voxelRange > _MaximumDepthMeters)
+        return result;
+
+    float4 clip = mul(_Projection[eye],
+                      mul(_View[eye], float4(voxelWorld, 1.0)));
+    if (!Finite1(clip.w) || clip.w <= 0.00001)
+        return result;
+    float2 uv = clip.xy / clip.w * 0.5 + 0.5;
+    if (any(uv < 0.0) || any(uv >= 1.0))
+        return result;
+    int2 pixel = clamp((int2)floor(uv * (float2)_DepthSize),
+                       int2(0, 0), _DepthSize - 1);
+
+    // Recovered v0.1.1 admission: the central projective-depth gradient must
+    // be supported by all four direct neighbours and stay below 0.1 m.
+    if (!GradientAccepted(pixel, eye))
+        return result;
+
+    float observedDepth;
+    float3 surface;
+    if (!LoadProjectiveDepth(pixel, eye, observedDepth, surface))
+        return result;
+    float surfaceRange = distance(surface, eyePosition);
+    if (!Finite1(surfaceRange) || surfaceRange < _MinimumDepthMeters ||
+        surfaceRange > _MaximumDepthMeters)
+        return result;
+
+    float voxelDepth = clip.w;
+    if (!Finite1(voxelDepth) || voxelDepth <= 0.0)
+        return result;
+    float factor = voxelDepth + 1.0;
+    float positive = _PositiveTruncationScale * factor;
+    float negative = _NegativeTruncationScale * factor;
+    float sampleDistance = min(observedDepth - voxelDepth, positive);
+    if (sampleDistance <= -negative)
+        return result;
+
+    result.valid = 1.0;
+    result.distance = sampleDistance;
+    result.weight = rcp(max(0.000001, factor * factor));
+    return result;
+}
+
+bool GradientEnvironmentAccepted(int2 pixel, int eye)
+{
+    if (pixel.x <= 0 || pixel.y <= 0 ||
+        pixel.x >= _DepthSize.x - 1 || pixel.y >= _DepthSize.y - 1)
+        return false;
+
+    float leftDepth, rightDepth, upDepth, downDepth;
+    float3 ignoredWorld;
+    if (!LoadEnvironmentProjectiveDepth(pixel + int2(-1, 0), eye,
+                                        leftDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(1, 0), eye,
+                                        rightDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(0, -1), eye,
+                                        upDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(0, 1), eye,
+                                        downDepth, ignoredWorld))
+        return false;
+
+    float dx = rightDepth - leftDepth;
+    float dy = downDepth - upDepth;
+    return dx * dx + dy * dy <= _GradientThresholdSquared;
+}
+
+Observation ObserveEnvironmentVoxel(float3 voxelWorld, int eye)
+{
+    Observation result = (Observation)0;
+    float voxelRange = distance(voxelWorld, _EnvironmentEyeCentre);
+    if (!Finite1(voxelRange) || voxelRange > _MaximumDepthMeters)
+        return result;
+
+    float4 depthSpace = mul(
+        _EnvironmentDepthReprojectionMatrices[eye],
+        float4(voxelWorld, 1.0));
+    if (!Finite1(depthSpace.w) || depthSpace.w <= 0.00001)
+        return result;
+    float2 uv = depthSpace.xy / depthSpace.w * 0.5 + 0.5;
+    if (any(uv < 0.0) || any(uv >= 1.0))
+        return result;
+    int2 pixel = clamp((int2)floor(uv * (float2)_DepthSize),
+                       int2(0, 0), _DepthSize - 1);
+    if (!GradientEnvironmentAccepted(pixel, eye))
+        return result;
+
+    float observedDepth;
+    float3 surface;
+    if (!LoadEnvironmentProjectiveDepth(
+            pixel, eye, observedDepth, surface))
+        return result;
+    float surfaceRange = distance(surface, _EnvironmentEyeCentre);
+    if (!Finite1(surfaceRange) || surfaceRange < _MinimumDepthMeters ||
+        surfaceRange > _MaximumDepthMeters)
+        return result;
+
+    float denominator = depthSpace.z / depthSpace.w +
+                        _EnvironmentDepthZBufferParams.y;
+    if (abs(denominator) <= 0.000001)
+        return result;
+    float voxelDepth =
+        _EnvironmentDepthZBufferParams.x / denominator;
+    if (!Finite1(voxelDepth) || voxelDepth <= 0.0)
+        return result;
+
+    float factor = voxelDepth + 1.0;
+    float positive = _PositiveTruncationScale * factor;
+    float negative = _NegativeTruncationScale * factor;
+    float sampleDistance = min(observedDepth - voxelDepth, positive);
+    if (sampleDistance <= -negative)
+        return result;
+
+    result.valid = 1.0;
+    result.distance = sampleDistance;
+    result.weight = rcp(max(0.000001, factor * factor));
+    return result;
+}
+
+void FuseV011Observation(
+    inout float2 accumulated,
+    Observation observation)
+{
+    float retained = accumulated.y > 0.0
+        ? min(accumulated.y, _MaximumWeight - observation.weight)
+        : 0.0;
+    retained = max(0.0, retained);
+    float newWeight = retained + observation.weight;
+    float newDistance = retained > 0.0
+        ? (accumulated.x * retained +
+           observation.distance * observation.weight) /
+          max(newWeight, 0.000001)
+        : observation.distance;
+    accumulated = float2(newDistance, newWeight);
+}
+
+[numthreads(4, 4, 4)]
+void ClearVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount))
+        return;
+    _TsdfVolume[id] = float2(1.0, 0.0);
+}
+
+[numthreads(4, 4, 4)]
+void IntegrateStereo(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount))
+        return;
+
+    float3 voxelWorld = VoxelToWorld(id);
+    Observation left = ObserveVoxel(voxelWorld, 0);
+    Observation right = ObserveVoxel(voxelWorld, 1);
+    if (left.valid < 0.5 && right.valid < 0.5)
+        return;
+
+    // Match v0.1.1's two sequential eye integrations. Every accepted sample
+    // has ordinary weighted authority; there is no mature residual latch,
+    // deadband, bounded correction step, or single-eye mature freeze.
+    float2 accumulated = _TsdfVolume[id];
+    if (left.valid > 0.5)
+        FuseV011Observation(accumulated, left);
+    if (right.valid > 0.5)
+        FuseV011Observation(accumulated, right);
+
+    _TsdfVolume[id] = accumulated;
+}
+
+[numthreads(4, 4, 4)]
+void IntegrateEnvironmentDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount))
+        return;
+
+    float3 voxelWorld = VoxelToWorld(id);
+    Observation left = ObserveEnvironmentVoxel(voxelWorld, 0);
+    Observation right = ObserveEnvironmentVoxel(voxelWorld, 1);
+    if (left.valid < 0.5 && right.valid < 0.5)
+        return;
+
+    // B changes only the source publication contract. Fusion authority,
+    // ordering, truncation and accumulated weight remain v0.1.1-identical.
+    float2 accumulated = _TsdfVolume[id];
+    if (left.valid > 0.5)
+        FuseV011Observation(accumulated, left);
+    if (right.valid > 0.5)
+        FuseV011Observation(accumulated, right);
+    _TsdfVolume[id] = accumulated;
+}

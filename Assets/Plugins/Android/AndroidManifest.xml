@@ -22,5 +22,8 @@
   <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
   <uses-permission android:name="com.oculus.permission.USE_SCENE" />
   <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
+  <!-- Unity/Meta dependencies may contribute this phone-only permission. Quest does not
+       support it, and the room-mesh probe never reads telephony state. -->
+  <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
   <horizonos:uses-horizonos-sdk horizonos:minSdkVersion="60" horizonos:targetSdkVersion="203" />
 </manifest>
