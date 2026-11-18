@@ -8,26 +8,34 @@
 #pragma kernel CountComponents
 #pragma kernel FilterComponents
 #pragma kernel BuildMarchingCubesArgs
+#pragma kernel ClearDisplayEdgeState
 #pragma kernel ClearUniqueEdgeState
 #pragma kernel BuildUniqueEdgeArgs
 #pragma kernel BuildUniqueEdges
+#pragma kernel CompactDisplayEdges
+#pragma kernel BuildDisplayEdgeArgs
 
 // Dedicated RoomSetupReplica v0.1.1 extraction. The source volume is the
 // native 5 cm TSDF; every MC corner is an exact even source coordinate, which
 // reproduces the aligned 10 cm derived field without interpolation.
 Texture3D<float2> _TsdfVolume;
+Texture3D<float2> _StabilityProbeVolume;
 StructuredBuffer<int> _TriangleEdges;
 RWStructuredBuffer<float3> _CandidateTriangleVertices;
 RWStructuredBuffer<float3> _FilteredTriangleVertices;
+RWStructuredBuffer<float> _CandidateVertexStability;
+RWStructuredBuffer<float> _FilteredVertexStability;
 RWStructuredBuffer<uint> _ConnectivityParents;
 RWStructuredBuffer<uint> _ComponentTriangleCounts;
 RWStructuredBuffer<uint> _PositionHashOwners;
 RWStructuredBuffer<uint> _Counters;
 RWStructuredBuffer<uint> _ConnectivityDispatchArgs;
 RWStructuredBuffer<uint> _DrawArgs;
+RWStructuredBuffer<uint> _LineDrawArgs;
 RWStructuredBuffer<uint> _UniqueEdgeHashOwners;
 RWStructuredBuffer<uint> _UniqueEdgeMasks;
 RWStructuredBuffer<uint> _UniqueEdgeDispatchArgs;
+RWStructuredBuffer<uint> _CompactDisplayEdges;
 
 int3 _VoxelCount;
 int3 _CellCount;
@@ -41,6 +49,9 @@ uint _RemoveSmallTriangleThreshold;
 uint _RemoveSmallTriangleGate;
 uint _MaximumTriangleCount;
 uint _UniqueEdgeHashCapacity;
+uint _CompactDisplayEdgeCapacity;
+int _UniqueEdgesOnly;
+float _ProbeStableVoteThreshold;
 
 static const uint TriangleEntriesPerIndex = 16u;
 static const uint ConnectivityThreads = 128u;
@@ -165,8 +176,12 @@ void ClaimUniqueEdge(uint triangleIndex, uint edgeIndex)
     if (all(first == second))
         return;
     uint slot = EdgeHash(first, second);
+    // A nearly full diagnostic hash must not turn one edge into a multi-million
+    // probe stall on Quest. If 64 nearby slots are occupied, fall back to
+    // drawing this edge; that can only add a duplicate, never hide geometry.
     [loop]
-    for (uint probe = 0u; probe < _UniqueEdgeHashCapacity; probe++)
+    for (uint probe = 0u;
+         probe < min(_UniqueEdgeHashCapacity, 64u); probe++)
     {
         uint owner;
         InterlockedCompareExchange(
@@ -228,6 +243,8 @@ void ClearMarchingCubes(uint3 id : SV_DispatchThreadID)
     _Counters[4] = 0u; // surviving compacted vertices
     _Counters[5] = 0u; // removed small-component triangles
     _Counters[6] = 0u; // cleanup applied
+    _Counters[7] = 0u; // compact display edges
+    _Counters[8] = 0u; // display-edge overflow
     _ConnectivityDispatchArgs[0] = 0u;
     _ConnectivityDispatchArgs[1] = 1u;
     _ConnectivityDispatchArgs[2] = 1u;
@@ -247,6 +264,7 @@ void EmitMarchingCubes(uint3 id : SV_DispatchThreadID)
     int3 sourceBase = (int3)id * 2;
     float distances[8];
     float3 positions[8];
+    float minimumStability = 1000000.0;
     uint configuration = 0u;
 
     [unroll]
@@ -257,6 +275,11 @@ void EmitMarchingCubes(uint3 id : SV_DispatchThreadID)
         if (!(tsdfSample.y > 0.0) || any(tsdfSample != tsdfSample))
             return;
         distances[corner] = tsdfSample.x;
+        float2 probeSample = _StabilityProbeVolume[source];
+        float stability = all(probeSample == probeSample)
+            ? max(probeSample.y, 0.0)
+            : 0.0;
+        minimumStability = min(minimumStability, stability);
         positions[corner] = SourceCoordinateToWorld(source);
         if (tsdfSample.x < 0.0)
             configuration |= 1u << corner;
@@ -280,6 +303,8 @@ void EmitMarchingCubes(uint3 id : SV_DispatchThreadID)
     }
 
     uint tableBase = configuration * TriangleEntriesPerIndex;
+    float normalizedStability = saturate(
+        minimumStability / max(_ProbeStableVoteThreshold, 1.0));
     [loop]
     for (uint entry = 0u;
          entry < TriangleEntriesPerIndex; entry += 3u)
@@ -303,6 +328,9 @@ void EmitMarchingCubes(uint3 id : SV_DispatchThreadID)
         _CandidateTriangleVertices[outputBase] = edgePositions[edge2];
         _CandidateTriangleVertices[outputBase + 1u] = edgePositions[edge1];
         _CandidateTriangleVertices[outputBase + 2u] = edgePositions[edge0];
+        _CandidateVertexStability[outputBase] = normalizedStability;
+        _CandidateVertexStability[outputBase + 1u] = normalizedStability;
+        _CandidateVertexStability[outputBase + 2u] = normalizedStability;
         uint ignored;
         InterlockedAdd(_Counters[3], 1u, ignored);
     }
@@ -400,18 +428,48 @@ void FilterComponents(uint3 id : SV_DispatchThreadID)
         _CandidateTriangleVertices[candidateBase + 1u];
     _FilteredTriangleVertices[outputBase + 2u] =
         _CandidateTriangleVertices[candidateBase + 2u];
+    _FilteredVertexStability[outputBase] =
+        _CandidateVertexStability[candidateBase];
+    _FilteredVertexStability[outputBase + 1u] =
+        _CandidateVertexStability[candidateBase + 1u];
+    _FilteredVertexStability[outputBase + 2u] =
+        _CandidateVertexStability[candidateBase + 2u];
 }
 
 [numthreads(1, 1, 1)]
 void BuildMarchingCubesArgs(uint3 id : SV_DispatchThreadID)
 {
-    _DrawArgs[0] = _Counters[6] != 0u
+    uint triangleVertexCount = _Counters[6] != 0u
         ? _Counters[4]
         : min(_Counters[0], _MaximumTriangleVertices);
+    _DrawArgs[0] = triangleVertexCount;
     _DrawArgs[1] = 1u;
     _DrawArgs[2] = 0u;
     _DrawArgs[3] = 0u;
     _DrawArgs[4] = 0u;
+
+    // The display edge pass is populated after edge compaction. Six vertices
+    // form two portable triangles per instanced edge. Unity's procedural draw
+    // API does not expose TriangleStrip on the Quest-compatible path.
+    _LineDrawArgs[0] = 6u;
+    _LineDrawArgs[1] = 0u;
+    _LineDrawArgs[2] = 0u;
+    _LineDrawArgs[3] = 0u;
+    _LineDrawArgs[4] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void ClearDisplayEdgeState(uint3 id : SV_DispatchThreadID)
+{
+    // Kept separate from ClearMarchingCubes so the Y-key display toggle can
+    // rebuild the compact edge list without touching extracted geometry.
+    _Counters[7] = 0u;
+    _Counters[8] = 0u;
+    _LineDrawArgs[0] = 6u;
+    _LineDrawArgs[1] = 0u;
+    _LineDrawArgs[2] = 0u;
+    _LineDrawArgs[3] = 0u;
+    _LineDrawArgs[4] = 0u;
 }
 
 [numthreads(128, 1, 1)]
@@ -451,4 +509,48 @@ void BuildUniqueEdges(uint3 id : SV_DispatchThreadID)
     ClaimUniqueEdge(id.x, 0u);
     ClaimUniqueEdge(id.x, 1u);
     ClaimUniqueEdge(id.x, 2u);
+}
+
+[numthreads(128, 1, 1)]
+void CompactDisplayEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint vertexCount = _Counters[6] != 0u
+        ? _Counters[4]
+        : min(_Counters[0], _MaximumTriangleVertices);
+    uint triangleCount = min(
+        vertexCount / 3u, _MaximumTriangleCount);
+    uint triangleIndex = id.x;
+    if (triangleIndex >= triangleCount)
+        return;
+
+    uint mask = _UniqueEdgesOnly != 0
+        ? _UniqueEdgeMasks[triangleIndex]
+        : 7u;
+    [unroll]
+    for (uint edgeIndex = 0u; edgeIndex < 3u; edgeIndex++)
+    {
+        if ((mask & (1u << edgeIndex)) == 0u)
+            continue;
+        uint outputIndex;
+        InterlockedAdd(_Counters[7], 1u, outputIndex);
+        if (outputIndex < _CompactDisplayEdgeCapacity)
+            _CompactDisplayEdges[outputIndex] =
+                triangleIndex * 3u + edgeIndex;
+        else
+        {
+            uint ignored;
+            InterlockedAdd(_Counters[8], 1u, ignored);
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void BuildDisplayEdgeArgs(uint3 id : SV_DispatchThreadID)
+{
+    _LineDrawArgs[0] = 6u;
+    _LineDrawArgs[1] = min(
+        _Counters[7], _CompactDisplayEdgeCapacity);
+    _LineDrawArgs[2] = 0u;
+    _LineDrawArgs[3] = 0u;
+    _LineDrawArgs[4] = 0u;
 }

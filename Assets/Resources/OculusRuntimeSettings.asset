@@ -22,3 +22,5 @@ MonoBehaviour:
   bodyTrackingJointSet: 0
   allowVisibilityMesh: 1
   QuestVisibilityMeshOverriden: 0
+  fovSimulationEnabled: 0
+  fovSimulationDrawDesignAreaGuideline: 1

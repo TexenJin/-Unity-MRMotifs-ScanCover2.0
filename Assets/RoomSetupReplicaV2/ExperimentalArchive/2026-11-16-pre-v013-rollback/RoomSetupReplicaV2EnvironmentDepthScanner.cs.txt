@@ -1,0 +1,186 @@
+using Meta.XR.EnvironmentDepth;
+using UnityEngine;
+
+/// <summary>
+/// Sequential-B capture loop. EnvironmentDepthManager is the sole owner of
+/// depth acquisition in this scene; no DepthCapture/AROcclusionManager chain
+/// may coexist with it.
+/// </summary>
+[DefaultExecutionOrder(-20)]
+[DisallowMultipleComponent]
+[RequireComponent(
+    typeof(EnvironmentDepthManager),
+    typeof(RoomSetupReplicaV2Reconstruction))]
+public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
+{
+    public static RoomSetupReplicaV2EnvironmentDepthScanner Instance
+        { get; private set; }
+
+    [SerializeField, Range(1f, 30f)] private float captureHz = 10f;
+    [SerializeField] private bool startAutomatically = false;
+    [SerializeField] private Camera xrCamera;
+
+    public bool IsScanning { get; private set; }
+    public RoomSetupReplicaV2Reconstruction Reconstruction =>
+        _reconstruction;
+
+    private EnvironmentDepthManager _environmentDepth;
+    private RoomSetupReplicaV2Reconstruction _reconstruction;
+    private float _nextCaptureTime;
+    private bool _routeLogged;
+    private bool _snapshotHold;
+
+    private void Awake()
+    {
+        Instance = this;
+        _environmentDepth = GetComponent<EnvironmentDepthManager>();
+        _reconstruction = GetComponent<RoomSetupReplicaV2Reconstruction>();
+        _reconstruction.ConfigureAsEnvironmentDepthGlobalSource();
+
+        _environmentDepth.OcclusionShadersMode =
+            OcclusionShadersMode.None;
+        _environmentDepth.RemoveHands = false;
+        _environmentDepth.MaskMeshFilters.Clear();
+        // Keep the SDK 209/OpenXR depth provider registered for the lifetime
+        // of the scene.  The trigger still owns fusion through IsScanning;
+        // it no longer repeatedly starts and stops the provider itself.
+        // This preserves every post-v0.1.3 mesh/export feature while avoiding
+        // the observed EnvDepth=0 state after a runtime enable transition.
+        _environmentDepth.enabled = true;
+
+    }
+
+    private void Start()
+    {
+        ResolveCamera();
+        if (_environmentDepth != null && !_environmentDepth.enabled)
+            _environmentDepth.enabled = true;
+        if (startAutomatically)
+            StartScanning();
+    }
+
+    private void Update()
+    {
+        if (!IsScanning || _snapshotHold || _environmentDepth == null ||
+            !_environmentDepth.IsDepthAvailable ||
+            Time.unscaledTime < _nextCaptureTime ||
+            _reconstruction == null)
+            return;
+        if (xrCamera == null)
+            ResolveCamera();
+        if (xrCamera == null)
+            return;
+
+        _nextCaptureTime = Time.unscaledTime +
+                           1f / Mathf.Max(1f, captureHz);
+        if (!_reconstruction.TryObserveEnvironmentDepthGlobal(xrCamera))
+            return;
+        if (_routeLogged)
+            return;
+        _routeLogged = true;
+        Debug.Log(
+            "[RoomSetupReplicaV2] first global Environment Depth frame " +
+            "accepted; route=" + _reconstruction.RouteLabel);
+    }
+
+    public void StartScanning()
+    {
+        if (IsScanning || !enabled)
+            return;
+        if (!EnvironmentDepthManager.IsSupported)
+        {
+            Debug.LogError(
+                "[RoomSetupReplicaV2] Environment Depth is not supported " +
+                "on this runtime/provider.");
+            return;
+        }
+        _reconstruction.StopReplay();
+        GetComponent<RoomSetupReplicaV2StructuralExtractor>()?
+            .ClearSimplifiedRoom();
+        _reconstruction.PrepareForLiveCapture();
+        ResolveCamera();
+        _nextCaptureTime = 0f;
+        _snapshotHold = false;
+        // Normally already warm from scene startup.  Keep this fallback for
+        // lifecycle resumes where Unity or the provider disabled the component.
+        if (!_environmentDepth.enabled)
+            _environmentDepth.enabled = true;
+        IsScanning = true;
+        Debug.Log(
+            "[RoomSetupReplicaV2] capture started; source=" +
+            "_EnvironmentDepthTexture, hardRange=3.00m, masks=off, route=" +
+            _reconstruction.RouteLabel);
+    }
+
+    public void PauseScanning()
+    {
+        if (!IsScanning)
+            return;
+        IsScanning = false;
+        _snapshotHold = false;
+        Debug.Log("[RoomSetupReplicaV2] capture paused");
+    }
+
+    public void ToggleScanning()
+    {
+        if (IsScanning) PauseScanning();
+        else StartScanning();
+    }
+
+    public void SetSnapshotHold(bool hold)
+    {
+        _snapshotHold = hold && IsScanning;
+    }
+
+    public void ClearReplica()
+    {
+        _reconstruction?.ClearReplica();
+    }
+
+    public void ToggleReplicaPreview()
+    {
+        if (_reconstruction != null)
+            _reconstruction.SetPreviewVisible(
+                !_reconstruction.PreviewVisible);
+    }
+
+    public bool ToggleUniqueEdgeDisplay()
+    {
+        return _reconstruction != null &&
+               _reconstruction.ToggleUniqueEdgeDisplay();
+    }
+
+    public bool FreezeCurrentReplica()
+    {
+        if (!IsScanning)
+            return false;
+        PauseScanning();
+        RoomSetupReplicaV2StructuralExtractor extractor =
+            GetComponent<RoomSetupReplicaV2StructuralExtractor>();
+        if (extractor == null ||
+            !extractor.RequestSimplifiedRoomGeneration())
+            Debug.LogWarning(
+                "[RoomSetupReplicaV2] scan froze, but the on-device " +
+                "simplified-room readback could not start.", this);
+        return true;
+    }
+
+    private void ResolveCamera()
+    {
+        if (xrCamera != null)
+            return;
+        OVRCameraRig rig = FindAnyObjectByType<OVRCameraRig>();
+        if (rig != null && rig.centerEyeAnchor != null)
+            xrCamera = rig.centerEyeAnchor.GetComponent<Camera>();
+        if (xrCamera == null)
+            xrCamera = Camera.main;
+        if (xrCamera == null)
+            xrCamera = FindAnyObjectByType<Camera>();
+    }
+
+    private void OnDestroy()
+    {
+        if (Instance == this)
+            Instance = null;
+    }
+}

@@ -28,6 +28,7 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
     private RoomSetupReplicaV2Reconstruction _reconstruction;
     private float _nextCaptureTime;
     private bool _routeLogged;
+    private bool _snapshotHold;
 
     private void Awake()
     {
@@ -40,7 +41,8 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
             OcclusionShadersMode.None;
         _environmentDepth.RemoveHands = false;
         _environmentDepth.MaskMeshFilters.Clear();
-        // Acquisition starts only when the user pulls the trigger.
+        // Match the complete v0.1.3 lifecycle: acquisition begins only when
+        // the user pulls the trigger.
         _environmentDepth.enabled = false;
 
     }
@@ -54,7 +56,7 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
 
     private void Update()
     {
-        if (!IsScanning || _environmentDepth == null ||
+        if (!IsScanning || _snapshotHold || _environmentDepth == null ||
             !_environmentDepth.IsDepthAvailable ||
             Time.unscaledTime < _nextCaptureTime ||
             _reconstruction == null)
@@ -88,14 +90,18 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
             return;
         }
         _reconstruction.StopReplay();
+        GetComponent<RoomSetupReplicaV2StructuralExtractor>()?
+            .ClearSimplifiedRoom();
         _reconstruction.PrepareForLiveCapture();
         ResolveCamera();
         _nextCaptureTime = 0f;
+        _snapshotHold = false;
         _environmentDepth.enabled = true;
         IsScanning = true;
         Debug.Log(
             "[RoomSetupReplicaV2] capture started; source=" +
-            "_EnvironmentDepthTexture, hardRange=3.00m, masks=off");
+            "_EnvironmentDepthTexture, hardRange=3.00m, masks=off, route=" +
+            _reconstruction.RouteLabel);
     }
 
     public void PauseScanning()
@@ -103,6 +109,7 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
         if (!IsScanning)
             return;
         IsScanning = false;
+        _snapshotHold = false;
         if (_environmentDepth != null)
             _environmentDepth.enabled = false;
         Debug.Log("[RoomSetupReplicaV2] capture paused");
@@ -112,6 +119,11 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
     {
         if (IsScanning) PauseScanning();
         else StartScanning();
+    }
+
+    public void SetSnapshotHold(bool hold)
+    {
+        _snapshotHold = hold && IsScanning;
     }
 
     public void ClearReplica()
@@ -137,6 +149,13 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthScanner : MonoBehaviour
         if (!IsScanning)
             return false;
         PauseScanning();
+        RoomSetupReplicaV2StructuralExtractor extractor =
+            GetComponent<RoomSetupReplicaV2StructuralExtractor>();
+        if (extractor == null ||
+            !extractor.RequestSimplifiedRoomGeneration())
+            Debug.LogWarning(
+                "[RoomSetupReplicaV2] scan froze, but the on-device " +
+                "simplified-room readback could not start.", this);
         return true;
     }
 

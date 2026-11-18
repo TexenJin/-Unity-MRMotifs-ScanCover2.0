@@ -1,4 +1,16 @@
+using System;
 using UnityEngine;
+
+// Kept as a compatibility label for existing exports. Production is pinned to
+// V013Weighted; the experimental implementations are archived outside the
+// compiled runtime instead of being selectable here.
+public enum RoomSetupReplicaV2FusionMode
+{
+    V013Weighted = 0,
+    LatestSampleProbe = 1,
+    RobustCandidateV1 = 2,
+    RobustCandidateV2 = 3
+}
 
 /// <summary>
 /// Production owner. EnvironmentDepthManager publishes the current
@@ -26,6 +38,12 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public bool UniqueEdgeDisplay =>
         _gpuBackend != null && _gpuBackend.UniqueEdgesOnly;
     public bool HasPendingWork => false;
+    public int IntegrationCount =>
+        _gpuBackend != null ? _gpuBackend.IntegrationCount : 0;
+    public bool LatestSampleStabilityProbe => false;
+    public bool CapturesFusionStability => false;
+    public RoomSetupReplicaV2FusionMode FusionMode =>
+        RoomSetupReplicaV2FusionMode.V013Weighted;
     public string RouteLabel =>
         "environment-depth-global-v0.1.3-gpu-mc-hard3m-v1";
 
@@ -59,6 +77,8 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
     public void ClearReplica()
     {
         _gpuBackend?.Clear();
+        GetComponent<RoomSetupReplicaV2StructuralExtractor>()?
+            .ClearExtractedPlanes();
         AcceptedPairCount = 0;
         DroppedBusyPairCount = 0;
     }
@@ -74,6 +94,24 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
         RoomSetupReplicaV2GpuBackend backend = EnsureGpuBackend();
         backend.SetUniqueEdgeDisplay(!backend.UniqueEdgesOnly);
         return backend.UniqueEdgesOnly;
+    }
+
+    public bool TryRequestStructuralSamples(Action<Vector4[]> completed)
+    {
+        return _gpuBackend != null &&
+               _gpuBackend.TryRequestStructuralSamples(completed);
+    }
+
+    public bool TryRequestMeshSnapshot(
+        Action<Vector3[], float[], uint[]> completed)
+    {
+        return _gpuBackend != null &&
+               _gpuBackend.TryRequestMeshSnapshot(completed);
+    }
+
+    public void CancelMeshSnapshot()
+    {
+        _gpuBackend?.CancelMeshSnapshot();
     }
 
     private RoomSetupReplicaV2GpuBackend EnsureGpuBackend()

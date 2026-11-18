@@ -22,6 +22,10 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
             Blend SrcAlpha OneMinusSrcAlpha
             ZWrite Off
             ZTest LEqual
+            // Pull the screen-space strip slightly toward the camera. At sharp
+            // corners the adjacent triangle depth prepass can otherwise
+            // consume its covered MSAA samples even though the edge is visible.
+            Offset -1, -1
             Cull Off
 
             HLSLPROGRAM
@@ -34,21 +38,25 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
 
             StructuredBuffer<float3> _RoomSetupMcCandidateVertices;
             StructuredBuffer<float3> _RoomSetupMcFilteredVertices;
+            StructuredBuffer<float> _RoomSetupMcCandidateStability;
+            StructuredBuffer<float> _RoomSetupMcFilteredStability;
             StructuredBuffer<uint> _RoomSetupMcCounters;
-            StructuredBuffer<uint> _RoomSetupMcUniqueEdgeMasks;
+            StructuredBuffer<uint> _RoomSetupMcCompactDisplayEdges;
 
             struct Attributes
             {
                 uint vertexID : SV_VertexID;
-                UNITY_VERTEX_INPUT_INSTANCE_ID
+                // Explicitly keep SV_InstanceID in the non-instancing compile
+                // variant too. UNITY_SETUP_INSTANCE_ID still decodes it for
+                // single-pass stereo when XR instancing is enabled.
+                uint instanceID : SV_InstanceID;
             };
 
             struct Varyings
             {
                 float4 positionHCS : SV_POSITION;
-                float3 barycentric : TEXCOORD0;
-                nointerpolation uint edgeMask : TEXCOORD1;
-                float3 positionWS : TEXCOORD2;
+                float edgeCoordinate : TEXCOORD0;
+                nointerpolation float stability : TEXCOORD1;
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -66,11 +74,11 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
                     : _RoomSetupMcCandidateVertices[vertexID];
             }
 
-            uint BuildUniqueEdgeMask(uint triangleBase)
+            float LoadStability(uint vertexID)
             {
-                if (_UniqueEdgesOnly < 0.5)
-                    return 7u;
-                return _RoomSetupMcUniqueEdgeMasks[triangleBase / 3u];
+                return _RoomSetupMcCounters[6] != 0u
+                    ? _RoomSetupMcFilteredStability[vertexID]
+                    : _RoomSetupMcCandidateStability[vertexID];
             }
 
             Varyings Vert(Attributes input)
@@ -78,60 +86,65 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
                 Varyings output = (Varyings)0;
                 UNITY_SETUP_INSTANCE_ID(input);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
-                uint triangleBase = input.vertexID - input.vertexID % 3u;
-                float3 positionWS = LoadPosition(input.vertexID);
-                output.positionHCS = TransformWorldToHClip(positionWS);
-                output.positionWS = positionWS;
-                output.edgeMask = BuildUniqueEdgeMask(triangleBase);
-                uint corner = input.vertexID % 3u;
-                output.barycentric = corner == 0u
-                    ? float3(1, 0, 0)
-                    : corner == 1u
-                        ? float3(0, 1, 0)
-                        : float3(0, 0, 1);
+                uint displayEdgeIndex = input.instanceID;
+                #if UNITY_ANY_INSTANCING_ENABLED
+                    displayEdgeIndex = unity_InstanceID;
+                #endif
+                uint encodedEdge =
+                    _RoomSetupMcCompactDisplayEdges[displayEdgeIndex];
+                uint triangleIndex = encodedEdge / 3u;
+                uint edgeIndex = encodedEdge - triangleIndex * 3u;
+                uint cornerA = edgeIndex;
+                uint cornerB = edgeIndex == 2u ? 0u : edgeIndex + 1u;
+                uint triangleBase = triangleIndex * 3u;
+                float3 positionA = LoadPosition(triangleBase + cornerA);
+                float3 positionB = LoadPosition(triangleBase + cornerB);
+                output.stability = min(
+                    LoadStability(triangleBase + cornerA),
+                    LoadStability(triangleBase + cornerB));
+                float4 clipA = TransformWorldToHClip(positionA);
+                float4 clipB = TransformWorldToHClip(positionB);
+                float2 ndcA = clipA.xy / max(abs(clipA.w), 0.00001);
+                float2 ndcB = clipB.xy / max(abs(clipB.w), 0.00001);
+                float2 pixelDelta = (ndcB - ndcA) *
+                    max(_ScreenParams.xy, 1.0) * 0.5;
+                float pixelLength = max(length(pixelDelta), 0.0001);
+                float2 normalPixels =
+                    float2(-pixelDelta.y, pixelDelta.x) / pixelLength;
+
+                // Two triangles with corners A-, A+, B-, B-, A+, B+.
+                // Boolean expressions avoid dynamic local-array indexing on
+                // the Quest mobile shader compiler.
+                uint quadVertex = min(input.vertexID, 5u);
+                bool useB = quadVertex == 2u || quadVertex == 3u ||
+                            quadVertex == 5u;
+                float side = (quadVertex == 0u || quadVertex == 2u ||
+                              quadVertex == 3u) ? -1.0 : 1.0;
+                output.positionHCS = useB ? clipB : clipA;
+                float rasterWidth = max(_LineWidthPixels, 1.0);
+                float2 offsetNdc = normalPixels * side * rasterWidth /
+                                   max(_ScreenParams.xy, 1.0);
+                output.positionHCS.xy += offsetNdc * output.positionHCS.w;
+                output.edgeCoordinate = side;
                 return output;
             }
 
             half4 Frag(Varyings input) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-                if (input.edgeMask == 0u)
-                    discard;
-                float edgeDistance = 2.0;
-                // bit 0 owns v0-v1 (barycentric.z == 0), bit 1 owns
-                // v1-v2 (x == 0), and bit 2 owns v2-v0 (y == 0).
-                if ((input.edgeMask & 1u) != 0u)
-                    edgeDistance = min(
-                        edgeDistance, input.barycentric.z);
-                if ((input.edgeMask & 2u) != 0u)
-                    edgeDistance = min(
-                        edgeDistance, input.barycentric.x);
-                if ((input.edgeMask & 4u) != 0u)
-                    edgeDistance = min(
-                        edgeDistance, input.barycentric.y);
-                // _LineWidthPixels used directly would keep a constant screen
-                // footprint, so it becomes progressively heavier relative to
-                // the shrinking projected mesh. Convert it to an inverse-
-                // distance width, approximating a stable world-space stroke.
-                float distanceWS = distance(
-                    GetCameraPositionWS(), input.positionWS);
-                float widthPixels = _LineWidthPixels *
-                    min(1.0, _LineReferenceDistance /
-                        max(distanceWS, 0.0001));
-
-                // Preserve a one-pixel filtering footprint for sub-pixel
-                // strokes, while scaling their energy to the requested width.
-                float rasterWidthPixels = max(widthPixels, 1.0);
-                float subpixelCoverage = min(widthPixels, 1.0);
-                float width = max(
-                    fwidth(edgeDistance) * rasterWidthPixels,
-                                  0.00001);
-                float coverage = 1.0 - smoothstep(width, width * 1.8,
-                                                  edgeDistance);
-                coverage *= subpixelCoverage;
+                float edge = abs(input.edgeCoordinate);
+                float feather = max(fwidth(edge), 0.02);
+                float coverage = 1.0 - smoothstep(
+                    1.0 - feather, 1.0, edge);
                 clip(coverage - 0.01);
-                return half4(_BaseColor.rgb,
-                             _BaseColor.a * coverage);
+                half3 changing = half3(1.0, 0.05, 0.03);
+                half3 settling = half3(1.0, 0.75, 0.05);
+                half3 stabilityColor = input.stability < 0.5
+                    ? lerp(changing, settling,
+                           saturate(input.stability * 2.0))
+                    : lerp(settling, _BaseColor.rgb,
+                           saturate((input.stability - 0.5) * 2.0));
+                return half4(stabilityColor, _BaseColor.a * coverage);
             }
             ENDHLSL
         }

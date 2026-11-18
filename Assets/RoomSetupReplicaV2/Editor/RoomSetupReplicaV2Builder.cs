@@ -12,7 +12,7 @@ using UnityEngine.XR.ARFoundation;
 internal static class RoomSetupReplicaV2Builder
 {
     public const string PackageName =
-        "com.pcaii.roomsetupreplicav2environmentteacher";
+        "com.pcaii.scancover.quest3";
     public const string ProductName = "RoomSetup Replica V2 v0.1.3";
     public const string ScenePath =
         "Assets/RoomSetupReplicaV2/Scenes/" +
@@ -38,6 +38,49 @@ internal static class RoomSetupReplicaV2Builder
                 "found " + reconstructions.Length + ".");
 
         GameObject host = reconstructions[0].gameObject;
+        RoomSetupReplicaV2StructuralExtractor structuralExtractor =
+            host.GetComponent<RoomSetupReplicaV2StructuralExtractor>();
+        if (structuralExtractor == null)
+            structuralExtractor =
+                host.AddComponent<RoomSetupReplicaV2StructuralExtractor>();
+        if (UnityEngine.Object.FindObjectsByType<
+                RoomSetupReplicaV2StructuralExtractor>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None).Length != 1)
+            throw new InvalidOperationException(
+                "The production scene must contain exactly one V2 " +
+                "structural extractor.");
+        structuralExtractor.SetPreviewVisible(false);
+        structuralExtractor.SetAutomaticExtraction(false);
+        RoomSetupReplicaV2CaptureExporter[] captureExporters =
+            UnityEngine.Object.FindObjectsByType<
+                RoomSetupReplicaV2CaptureExporter>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (captureExporters.Length > 1)
+            throw new InvalidOperationException(
+                "The production scene must contain at most one V2 " +
+                "capture exporter; found " + captureExporters.Length + ".");
+        RoomSetupReplicaV2CaptureExporter captureExporter =
+            captureExporters.Length == 1
+                ? captureExporters[0]
+                : host.AddComponent<RoomSetupReplicaV2CaptureExporter>();
+        if (captureExporter.gameObject != host)
+            throw new InvalidOperationException(
+                "The V2 capture exporter must share the reconstruction host.");
+        ScanCoverMetaSceneMeshAuditExporter[] exporters =
+            UnityEngine.Object.FindObjectsByType<
+                ScanCoverMetaSceneMeshAuditExporter>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+        if (exporters.Length != 1)
+            throw new InvalidOperationException(
+                "The production scene must contain exactly one restored " +
+                "classic Scene Mesh exporter; found " + exporters.Length + ".");
+        ScanCoverMetaSceneMeshAuditExporter exporter = exporters[0];
+        if (exporter.GetComponent("RoomMeshEvent") == null ||
+            exporter.GetComponent("RoomMeshController") == null)
+            throw new InvalidOperationException(
+                "The restored classic exporter is missing RoomMeshEvent " +
+                "or RoomMeshController.");
         RoomSetupReplicaV2EnvironmentDepthScanner scanner =
             host.GetComponent<RoomSetupReplicaV2EnvironmentDepthScanner>();
         RoomSetupReplicaV2EnvironmentDepthInput input =
@@ -55,6 +98,7 @@ internal static class RoomSetupReplicaV2Builder
                 FindObjectsSortMode.None).Length != 1)
             throw new InvalidOperationException(
                 "The production scene must contain exactly one producer.");
+        ValidateNoLocomotionInputOwners();
 
         EnvironmentDepthManager manager =
             host.GetComponent<EnvironmentDepthManager>();
@@ -75,8 +119,56 @@ internal static class RoomSetupReplicaV2Builder
                 FindObjectsSortMode.None).Length != 0)
             throw new InvalidOperationException(
                 "RoomSetupReplicaV2 still contains a competing depth owner.");
+        if (UnityEngine.Object.FindObjectsByType<ARSession>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None).Length != 0 ||
+            UnityEngine.Object.FindObjectsByType<ARCameraManager>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None).Length != 0)
+            throw new InvalidOperationException(
+                "The production scene must not contain AR Foundation " +
+                "session or camera components; EnvironmentDepthManager " +
+                "is the sole capture route.");
+        if (UnityEngine.Object.FindObjectsByType<
+                RoomSetupReplicaV2DepthObservationWindow>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None).Length != 0)
+            throw new InvalidOperationException(
+                "The production scene must not contain the retired depth " +
+                "observation window.");
 
-        Debug.Log("[RoomSetupReplicaV2Builder] validated " + scene.path);
+        EditorUtility.SetDirty(exporter);
+        EditorUtility.SetDirty(structuralExtractor);
+        EditorUtility.SetDirty(captureExporter);
+        if (!EditorSceneManager.SaveScene(scene))
+            throw new InvalidOperationException(
+                "Failed to save the prepared production scene.");
+        Debug.Log(
+            "[RoomSetupReplicaV2Builder] validated restored classic " +
+            "Scene Mesh building block, hidden V2 structural preview, " +
+            "post-freeze Quest room generation, and V2 capture exporter in " +
+            scene.path);
+    }
+
+    private static void ValidateNoLocomotionInputOwners()
+    {
+        MonoBehaviour[] behaviours = UnityEngine.Object.FindObjectsByType<
+            MonoBehaviour>(FindObjectsInactive.Include,
+                FindObjectsSortMode.None);
+        foreach (MonoBehaviour behaviour in behaviours)
+        {
+            if (behaviour == null) continue;
+            string typeName = behaviour.GetType().Name;
+            if (!typeName.Contains("MoveProvider",
+                    StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(typeName, "OVRPlayerController",
+                    StringComparison.OrdinalIgnoreCase))
+                continue;
+            throw new InvalidOperationException(
+                "Left-thumbstick export requires exclusive input ownership; " +
+                "remove locomotion component " + typeName + " from " +
+                behaviour.gameObject.name + ".");
+        }
     }
 
     [MenuItem("Codex/RoomSetup Replica V2/Build APK")]

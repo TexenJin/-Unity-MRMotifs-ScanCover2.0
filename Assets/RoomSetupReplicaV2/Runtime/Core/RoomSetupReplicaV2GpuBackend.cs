@@ -34,6 +34,11 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
     private const float NegativeTruncationScale = 0.20f / 3f;
     private const float GradientThresholdSquared = 0.01f;
     private const float MaximumWeight = 1000f;
+    private const float ProbeStableDeltaMeters = 0.025f;
+    private const float ProbeUnstableDeltaMeters = 0.050f;
+    private const float ProbeMaximumStability = 16f;
+    private const float ProbeStableVoteThreshold = 8f;
+    private const float ProbeUnstablePenalty = 4f;
     private const int RemoveSmallTriangleThreshold = 32;
     private const int RemoveSmallTriangleGate = 40000;
     private const int ConnectivityVertexCapacity =
@@ -41,15 +46,20 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
     private const int PositionHashCapacity = 262144;
     private const float SeamWeldUnitsPerMeter = 10000f;
     private const int MeshEveryIntegrations = 2;
+    private const int MaximumStructuralSamples = 16384;
 
     private static readonly int CandidateTriangleVerticesId =
         Shader.PropertyToID("_RoomSetupMcCandidateVertices");
     private static readonly int FilteredTriangleVerticesId =
         Shader.PropertyToID("_RoomSetupMcFilteredVertices");
+    private static readonly int CandidateStabilityId =
+        Shader.PropertyToID("_RoomSetupMcCandidateStability");
+    private static readonly int FilteredStabilityId =
+        Shader.PropertyToID("_RoomSetupMcFilteredStability");
     private static readonly int MarchingCubesCountersId =
         Shader.PropertyToID("_RoomSetupMcCounters");
-    private static readonly int UniqueEdgeMasksId =
-        Shader.PropertyToID("_RoomSetupMcUniqueEdgeMasks");
+    private static readonly int CompactDisplayEdgesId =
+        Shader.PropertyToID("_RoomSetupMcCompactDisplayEdges");
     private static readonly int BaseColorId =
         Shader.PropertyToID("_BaseColor");
     private static readonly int LineWidthPixelsId =
@@ -73,10 +83,14 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         public Vector3 volumeOrigin;
         public Bounds bounds;
         public RenderTexture tsdf;
+        public RenderTexture stabilityProbe;
     }
 
     private ComputeShader _fusion;
     private ComputeShader _marchingCubes;
+    // Readback-only companion for export and simplified-room generation. It
+    // never participates in the live fusion or draw path.
+    private ComputeShader _structuralReduction;
     private Material _wireMaterial;
     private Material _depthMaterial;
     private MaterialPropertyBlock _drawProperties;
@@ -92,33 +106,171 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
     private int _mcCountComponentsKernel = -1;
     private int _mcFilterComponentsKernel = -1;
     private int _mcArgsKernel = -1;
+    private int _mcClearDisplayEdgesKernel = -1;
     private int _mcClearUniqueEdgesKernel = -1;
     private int _mcBuildUniqueEdgeArgsKernel = -1;
     private int _mcBuildUniqueEdgesKernel = -1;
+    private int _mcCompactDisplayEdgesKernel = -1;
+    private int _mcBuildDisplayEdgeArgsKernel = -1;
+    private int _structuralSampleKernel = -1;
     private GraphicsBuffer _triangleEdges;
     private GraphicsBuffer _candidateTriangleVertices;
     private GraphicsBuffer _filteredTriangleVertices;
+    private GraphicsBuffer _candidateVertexStability;
+    private GraphicsBuffer _filteredVertexStability;
     private GraphicsBuffer _connectivityParents;
     private GraphicsBuffer _componentTriangleCounts;
     private GraphicsBuffer _positionHashOwners;
     private GraphicsBuffer _mcCounters;
     private GraphicsBuffer _connectivityDispatchArgs;
     private GraphicsBuffer _drawArgs;
+    private GraphicsBuffer _lineDrawArgs;
     private GraphicsBuffer _uniqueEdgeHashOwners;
     private GraphicsBuffer _uniqueEdgeMasks;
     private GraphicsBuffer _uniqueEdgeDispatchArgs;
+    private GraphicsBuffer _compactDisplayEdges;
+    private GraphicsBuffer _structuralSamples;
     private Bounds _drawBounds;
     private bool _hasDrawBounds;
     private bool _initialized;
     private bool _visible = true;
     private bool _failureLogged;
-    private bool _uniqueEdgesOnly;
+    // A manifold triangle mesh has about 1.5 unique edges per triangle. With
+    // six portable triangle vertices per compacted edge this is about nine
+    // vertex shader invocations per source triangle, half the old 18.
+    private bool _uniqueEdgesOnly = true;
     private int _integrationCount;
+    private bool _structuralReadbackPending;
+    private bool _meshReadbackPending;
+    private int _meshReadbackGeneration;
 
     public int IntegrationCount => _integrationCount;
     public int TileCount => _tiles.Count;
     public bool Ready => _initialized;
     public bool UniqueEdgesOnly => _uniqueEdgesOnly;
+
+    public bool TryRequestStructuralSamples(Action<Vector4[]> completed)
+    {
+        if (!_initialized || _structuralReadbackPending ||
+            _structuralReduction == null || _structuralSamples == null ||
+            _candidateTriangleVertices == null ||
+            _filteredTriangleVertices == null || _mcCounters == null)
+            return false;
+
+        _structuralReduction.SetInt(
+            "_MaximumTriangleVertices", MaximumTriangleVertices);
+        _structuralReduction.SetInt(
+            "_MaximumStructuralSamples", MaximumStructuralSamples);
+        _structuralReduction.SetBuffer(
+            _structuralSampleKernel,
+            "_CandidateTriangleVertices", _candidateTriangleVertices);
+        _structuralReduction.SetBuffer(
+            _structuralSampleKernel,
+            "_FilteredTriangleVertices", _filteredTriangleVertices);
+        _structuralReduction.SetBuffer(
+            _structuralSampleKernel, "_Counters", _mcCounters);
+        _structuralReduction.SetBuffer(
+            _structuralSampleKernel,
+            "_StructuralSamples", _structuralSamples);
+        _structuralReduction.Dispatch(
+            _structuralSampleKernel,
+            Mathf.CeilToInt(MaximumStructuralSamples / 64f), 1, 1);
+
+        _structuralReadbackPending = true;
+        AsyncGPUReadback.Request(_structuralSamples, request =>
+        {
+            _structuralReadbackPending = false;
+            if (request.hasError)
+            {
+                completed?.Invoke(null);
+                return;
+            }
+            var data = request.GetData<Vector4>();
+            var copy = new Vector4[data.Length];
+            data.CopyTo(copy);
+            completed?.Invoke(copy);
+        });
+        return true;
+    }
+
+    public bool TryRequestMeshSnapshot(
+        Action<Vector3[], float[], uint[]> completed)
+    {
+        if (!_initialized || _meshReadbackPending ||
+            _mcCounters == null || _candidateTriangleVertices == null ||
+            _filteredTriangleVertices == null)
+            return false;
+
+        _meshReadbackPending = true;
+        int generation = ++_meshReadbackGeneration;
+        AsyncGPUReadback.Request(_mcCounters, counterRequest =>
+        {
+            if (!IsCurrentMeshReadback(generation))
+                return;
+            if (counterRequest.hasError)
+            {
+                _meshReadbackPending = false;
+                completed?.Invoke(null, null, null);
+                return;
+            }
+            var counterData = counterRequest.GetData<uint>();
+            var counters = new uint[counterData.Length];
+            counterData.CopyTo(counters);
+            bool cleanupApplied = counters.Length > 6 && counters[6] != 0u;
+            uint rawCount = cleanupApplied && counters.Length > 4
+                ? counters[4]
+                : counters.Length > 0 ? counters[0] : 0u;
+            int vertexCount = Mathf.Min(
+                (int)Math.Min(rawCount, int.MaxValue),
+                cleanupApplied
+                    ? ConnectivityVertexCapacity
+                    : MaximumTriangleVertices);
+            vertexCount -= vertexCount % 3;
+            if (vertexCount <= 0)
+            {
+                _meshReadbackPending = false;
+                completed?.Invoke(Array.Empty<Vector3>(),
+                    Array.Empty<float>(), counters);
+                return;
+            }
+
+            GraphicsBuffer source = cleanupApplied
+                ? _filteredTriangleVertices
+                : _candidateTriangleVertices;
+            AsyncGPUReadback.Request(
+                source, vertexCount * sizeof(float) * 3, 0,
+                vertexRequest =>
+                {
+                    if (!IsCurrentMeshReadback(generation))
+                        return;
+                    _meshReadbackPending = false;
+                    if (vertexRequest.hasError)
+                    {
+                        completed?.Invoke(null, null, counters);
+                        return;
+                    }
+                    var vertexData = vertexRequest.GetData<Vector3>();
+                    var vertices = new Vector3[vertexData.Length];
+                    vertexData.CopyTo(vertices);
+                    // v0.1.3 has no experimental stability channel.
+                    completed?.Invoke(vertices, Array.Empty<float>(), counters);
+                });
+        });
+        return true;
+    }
+
+    public void CancelMeshSnapshot()
+    {
+        if (!_meshReadbackPending)
+            return;
+        _meshReadbackPending = false;
+        _meshReadbackGeneration++;
+    }
+
+    private bool IsCurrentMeshReadback(int generation)
+    {
+        return _meshReadbackPending && generation == _meshReadbackGeneration;
+    }
 
     public RoomSetupReplicaV2GpuBackend(
         GameObject owner, Color lineColor, float lineWidthPixels)
@@ -202,6 +354,7 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
     public void Render()
     {
         if (!_initialized || !_visible || _drawArgs == null ||
+            _lineDrawArgs == null ||
             _candidateTriangleVertices == null || _drawProperties == null)
             return;
 
@@ -230,7 +383,7 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             layer = _owner != null ? _owner.layer : 0
         };
         Graphics.RenderPrimitivesIndirect(
-            wireParams, MeshTopology.Triangles, _drawArgs, 1);
+            wireParams, MeshTopology.Triangles, _lineDrawArgs, 1);
     }
 
     public void SetVisible(bool visible)
@@ -244,7 +397,9 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         float value = enabled ? 1f : 0f;
         _wireMaterial?.SetFloat(UniqueEdgesOnlyId, value);
         _drawProperties?.SetFloat(UniqueEdgesOnlyId, value);
-        if (enabled && _initialized)
+        if (_marchingCubes != null)
+            _marchingCubes.SetInt("_UniqueEdgesOnly", enabled ? 1 : 0);
+        if (_initialized)
             BuildUniqueEdgeVisibility();
     }
 
@@ -273,11 +428,14 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
                 "RoomSetupReplicaV2GpuFusion");
             _marchingCubes = Resources.Load<ComputeShader>(
                 "RoomSetupReplicaV2GpuMarchingCubes");
+            _structuralReduction = Resources.Load<ComputeShader>(
+                "RoomSetupReplicaV2StructuralReduction");
             Shader wireShader = Resources.Load<Shader>(
                 "RoomSetupReplicaV2GpuMarchingCubes");
             Shader depthShader = Resources.Load<Shader>(
                 "RoomSetupReplicaV2GpuMarchingCubesDepth");
             if (_fusion == null || _marchingCubes == null ||
+                _structuralReduction == null ||
                 wireShader == null || depthShader == null)
             {
                 throw new InvalidOperationException(
@@ -307,12 +465,20 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
                 "FilterComponents");
             _mcArgsKernel = _marchingCubes.FindKernel(
                 "BuildMarchingCubesArgs");
+            _mcClearDisplayEdgesKernel = _marchingCubes.FindKernel(
+                "ClearDisplayEdgeState");
             _mcClearUniqueEdgesKernel = _marchingCubes.FindKernel(
                 "ClearUniqueEdgeState");
             _mcBuildUniqueEdgeArgsKernel = _marchingCubes.FindKernel(
                 "BuildUniqueEdgeArgs");
             _mcBuildUniqueEdgesKernel = _marchingCubes.FindKernel(
                 "BuildUniqueEdges");
+            _mcCompactDisplayEdgesKernel = _marchingCubes.FindKernel(
+                "CompactDisplayEdges");
+            _mcBuildDisplayEdgeArgsKernel = _marchingCubes.FindKernel(
+                "BuildDisplayEdgeArgs");
+            _structuralSampleKernel = _structuralReduction.FindKernel(
+                "BuildStructuralSamples");
 
             CreateMarchingCubesBuffers();
             _wireMaterial = new Material(wireShader)
@@ -336,9 +502,13 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             _drawProperties.SetBuffer(
                 FilteredTriangleVerticesId, _filteredTriangleVertices);
             _drawProperties.SetBuffer(
+                CandidateStabilityId, _candidateVertexStability);
+            _drawProperties.SetBuffer(
+                FilteredStabilityId, _filteredVertexStability);
+            _drawProperties.SetBuffer(
                 MarchingCubesCountersId, _mcCounters);
             _drawProperties.SetBuffer(
-                UniqueEdgeMasksId, _uniqueEdgeMasks);
+                CompactDisplayEdgesId, _compactDisplayEdges);
             _drawProperties.SetColor(BaseColorId, _lineColor);
             _drawProperties.SetFloat(
                 LineWidthPixelsId, Mathf.Clamp(_lineWidthPixels, 0.75f, 3f));
@@ -362,8 +532,11 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
                 "truncation=depth-scaled(+0.20,-0.0667) " +
                 "maxWeight=1000 firstWrite=any-valid-eye " +
                 "mesh=GPU-MarchingCubes direct-current-TSDF " +
+                "stability=display-only-red-yellow-cyan " +
                 "cleanup=global-RemoveSmall<32-if-triangles<40000 " +
-                "rangeOrigin=current-eyes draw=indirect cpuReadback=none");
+                "rangeOrigin=current-eyes " +
+                "draw=compacted-instanced-2.25px-edge-quads " +
+                "readback=export-or-simplified-room-only");
             return true;
         }
         catch (Exception exception)
@@ -398,6 +571,12 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         _filteredTriangleVertices = new GraphicsBuffer(
             GraphicsBuffer.Target.Structured,
             ConnectivityVertexCapacity, sizeof(float) * 3);
+        _candidateVertexStability = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured,
+            MaximumTriangleVertices, sizeof(float));
+        _filteredVertexStability = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured,
+            ConnectivityVertexCapacity, sizeof(float));
         _connectivityParents = new GraphicsBuffer(
             GraphicsBuffer.Target.Structured,
             ConnectivityVertexCapacity, sizeof(uint));
@@ -408,12 +587,16 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             GraphicsBuffer.Target.Structured,
             PositionHashCapacity, sizeof(uint));
         _mcCounters = new GraphicsBuffer(
-            GraphicsBuffer.Target.Structured, 7, sizeof(uint));
+            GraphicsBuffer.Target.Structured, 9, sizeof(uint));
         _connectivityDispatchArgs = new GraphicsBuffer(
             GraphicsBuffer.Target.Structured |
             GraphicsBuffer.Target.IndirectArguments,
             3, sizeof(uint));
         _drawArgs = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured |
+            GraphicsBuffer.Target.IndirectArguments,
+            5, sizeof(uint));
+        _lineDrawArgs = new GraphicsBuffer(
             GraphicsBuffer.Target.Structured |
             GraphicsBuffer.Target.IndirectArguments,
             5, sizeof(uint));
@@ -427,9 +610,16 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             GraphicsBuffer.Target.Structured |
             GraphicsBuffer.Target.IndirectArguments,
             3, sizeof(uint));
-        _mcCounters.SetData(new uint[7]);
+        _compactDisplayEdges = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured,
+            MaximumTriangleVertices, sizeof(uint));
+        _structuralSamples = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured,
+            MaximumStructuralSamples * 4, sizeof(float) * 4);
+        _mcCounters.SetData(new uint[9]);
         _connectivityDispatchArgs.SetData(new uint[] { 0, 1, 1 });
         _drawArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
+        _lineDrawArgs.SetData(new uint[] { 0, 1, 0, 0, 0 });
         _uniqueEdgeDispatchArgs.SetData(new uint[] { 0, 1, 1 });
     }
 
@@ -448,6 +638,14 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         _fusion.SetFloat(
             "_GradientThresholdSquared", GradientThresholdSquared);
         _fusion.SetFloat("_MaximumWeight", MaximumWeight);
+        _fusion.SetFloat(
+            "_ProbeStableDeltaMeters", ProbeStableDeltaMeters);
+        _fusion.SetFloat(
+            "_ProbeUnstableDeltaMeters", ProbeUnstableDeltaMeters);
+        _fusion.SetFloat(
+            "_ProbeMaximumStability", ProbeMaximumStability);
+        _fusion.SetFloat(
+            "_ProbeUnstablePenalty", ProbeUnstablePenalty);
     }
 
     private void ConfigureMarchingCubesConstants()
@@ -474,11 +672,19 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             "_MaximumTriangleCount", MaximumTriangleCount);
         _marchingCubes.SetInt(
             "_UniqueEdgeHashCapacity", UniqueEdgeHashCapacity);
+        _marchingCubes.SetInt(
+            "_CompactDisplayEdgeCapacity", MaximumTriangleVertices);
+        _marchingCubes.SetInt(
+            "_UniqueEdgesOnly", _uniqueEdgesOnly ? 1 : 0);
+        _marchingCubes.SetFloat(
+            "_ProbeStableVoteThreshold", ProbeStableVoteThreshold);
     }
 
     private void BindFusionVolumes(int kernel, GpuTile tile)
     {
         _fusion.SetTexture(kernel, "_TsdfVolume", tile.tsdf);
+        _fusion.SetTexture(
+            kernel, "_StabilityProbeVolume", tile.stabilityProbe);
     }
 
     private void EnsureActiveTiles(
@@ -552,6 +758,11 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
                 SupportedLoadStoreFormat(
                     GraphicsFormat.R16G16_SFloat,
                     GraphicsFormat.R32G32_SFloat));
+            tile.stabilityProbe = CreateVolume(
+                "RoomSetup Tile Stability Probe " + suffix,
+                SupportedLoadStoreFormat(
+                    GraphicsFormat.R16G16_SFloat,
+                    GraphicsFormat.R32G32_SFloat));
             BindFusionVolumes(_clearKernel, tile);
             DispatchFusionVolume(_clearKernel);
             return tile;
@@ -602,6 +813,9 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             _mcEmitKernel, "_CandidateTriangleVertices",
             _candidateTriangleVertices);
         _marchingCubes.SetBuffer(
+            _mcEmitKernel, "_CandidateVertexStability",
+            _candidateVertexStability);
+        _marchingCubes.SetBuffer(
             _mcEmitKernel, "_Counters", _mcCounters);
         int tileCellGroups = Mathf.CeilToInt(TileCellCount / 4f);
         foreach (GpuTile tile in _tiles.Values)
@@ -609,6 +823,9 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             _marchingCubes.SetVector("_VolumeOrigin", tile.volumeOrigin);
             _marchingCubes.SetTexture(
                 _mcEmitKernel, "_TsdfVolume", tile.tsdf);
+            _marchingCubes.SetTexture(
+                _mcEmitKernel, "_StabilityProbeVolume",
+                tile.stabilityProbe);
             _marchingCubes.Dispatch(
                 _mcEmitKernel,
                 tileCellGroups, tileCellGroups, tileCellGroups);
@@ -690,6 +907,12 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             _mcFilterComponentsKernel, "_FilteredTriangleVertices",
             _filteredTriangleVertices);
         _marchingCubes.SetBuffer(
+            _mcFilterComponentsKernel, "_CandidateVertexStability",
+            _candidateVertexStability);
+        _marchingCubes.SetBuffer(
+            _mcFilterComponentsKernel, "_FilteredVertexStability",
+            _filteredVertexStability);
+        _marchingCubes.SetBuffer(
             _mcFilterComponentsKernel, "_ConnectivityParents",
             _connectivityParents);
         _marchingCubes.SetBuffer(
@@ -702,29 +925,25 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
             _mcArgsKernel, "_Counters", _mcCounters);
         _marchingCubes.SetBuffer(
             _mcArgsKernel, "_DrawArgs", _drawArgs);
+        _marchingCubes.SetBuffer(
+            _mcArgsKernel, "_LineDrawArgs", _lineDrawArgs);
         _marchingCubes.Dispatch(_mcArgsKernel, 1, 1, 1);
-        if (_uniqueEdgesOnly)
-            BuildUniqueEdgeVisibility();
+        BuildUniqueEdgeVisibility();
     }
 
     private void BuildUniqueEdgeVisibility()
     {
         if (_marchingCubes == null ||
             _uniqueEdgeHashOwners == null || _uniqueEdgeMasks == null ||
-            _uniqueEdgeDispatchArgs == null)
+            _uniqueEdgeDispatchArgs == null ||
+            _compactDisplayEdges == null || _lineDrawArgs == null)
             return;
 
         _marchingCubes.SetBuffer(
-            _mcClearUniqueEdgesKernel,
-            "_UniqueEdgeHashOwners", _uniqueEdgeHashOwners);
+            _mcClearDisplayEdgesKernel, "_Counters", _mcCounters);
         _marchingCubes.SetBuffer(
-            _mcClearUniqueEdgesKernel,
-            "_UniqueEdgeMasks", _uniqueEdgeMasks);
-        int clearGroups = Mathf.CeilToInt(
-            Mathf.Max(UniqueEdgeHashCapacity, MaximumTriangleCount) /
-            128f);
-        _marchingCubes.Dispatch(
-            _mcClearUniqueEdgesKernel, clearGroups, 1, 1);
+            _mcClearDisplayEdgesKernel, "_LineDrawArgs", _lineDrawArgs);
+        _marchingCubes.Dispatch(_mcClearDisplayEdgesKernel, 1, 1, 1);
 
         _marchingCubes.SetBuffer(
             _mcBuildUniqueEdgeArgsKernel, "_Counters", _mcCounters);
@@ -734,22 +953,57 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         _marchingCubes.Dispatch(
             _mcBuildUniqueEdgeArgsKernel, 1, 1, 1);
 
+        if (_uniqueEdgesOnly)
+        {
+            _marchingCubes.SetBuffer(
+                _mcClearUniqueEdgesKernel,
+                "_UniqueEdgeHashOwners", _uniqueEdgeHashOwners);
+            _marchingCubes.SetBuffer(
+                _mcClearUniqueEdgesKernel,
+                "_UniqueEdgeMasks", _uniqueEdgeMasks);
+            int clearGroups = Mathf.CeilToInt(
+                Mathf.Max(UniqueEdgeHashCapacity, MaximumTriangleCount) /
+                128f);
+            _marchingCubes.Dispatch(
+                _mcClearUniqueEdgesKernel, clearGroups, 1, 1);
+
+            _marchingCubes.SetBuffer(
+                _mcBuildUniqueEdgesKernel, "_Counters", _mcCounters);
+            _marchingCubes.SetBuffer(
+                _mcBuildUniqueEdgesKernel,
+                "_CandidateTriangleVertices", _candidateTriangleVertices);
+            _marchingCubes.SetBuffer(
+                _mcBuildUniqueEdgesKernel,
+                "_FilteredTriangleVertices", _filteredTriangleVertices);
+            _marchingCubes.SetBuffer(
+                _mcBuildUniqueEdgesKernel,
+                "_UniqueEdgeHashOwners", _uniqueEdgeHashOwners);
+            _marchingCubes.SetBuffer(
+                _mcBuildUniqueEdgesKernel,
+                "_UniqueEdgeMasks", _uniqueEdgeMasks);
+            _marchingCubes.DispatchIndirect(
+                _mcBuildUniqueEdgesKernel, _uniqueEdgeDispatchArgs);
+        }
+
+        _marchingCubes.SetInt(
+            "_UniqueEdgesOnly", _uniqueEdgesOnly ? 1 : 0);
         _marchingCubes.SetBuffer(
-            _mcBuildUniqueEdgesKernel, "_Counters", _mcCounters);
+            _mcCompactDisplayEdgesKernel, "_Counters", _mcCounters);
         _marchingCubes.SetBuffer(
-            _mcBuildUniqueEdgesKernel,
-            "_CandidateTriangleVertices", _candidateTriangleVertices);
-        _marchingCubes.SetBuffer(
-            _mcBuildUniqueEdgesKernel,
-            "_FilteredTriangleVertices", _filteredTriangleVertices);
-        _marchingCubes.SetBuffer(
-            _mcBuildUniqueEdgesKernel,
-            "_UniqueEdgeHashOwners", _uniqueEdgeHashOwners);
-        _marchingCubes.SetBuffer(
-            _mcBuildUniqueEdgesKernel,
+            _mcCompactDisplayEdgesKernel,
             "_UniqueEdgeMasks", _uniqueEdgeMasks);
+        _marchingCubes.SetBuffer(
+            _mcCompactDisplayEdgesKernel,
+            "_CompactDisplayEdges", _compactDisplayEdges);
         _marchingCubes.DispatchIndirect(
-            _mcBuildUniqueEdgesKernel, _uniqueEdgeDispatchArgs);
+            _mcCompactDisplayEdgesKernel, _uniqueEdgeDispatchArgs);
+
+        _marchingCubes.SetBuffer(
+            _mcBuildDisplayEdgeArgsKernel, "_Counters", _mcCounters);
+        _marchingCubes.SetBuffer(
+            _mcBuildDisplayEdgeArgsKernel,
+            "_LineDrawArgs", _lineDrawArgs);
+        _marchingCubes.Dispatch(_mcBuildDisplayEdgeArgsKernel, 1, 1, 1);
     }
 
     private void DispatchFusionVolume(int kernel)
@@ -831,15 +1085,20 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         Release(ref _triangleEdges);
         Release(ref _candidateTriangleVertices);
         Release(ref _filteredTriangleVertices);
+        Release(ref _candidateVertexStability);
+        Release(ref _filteredVertexStability);
         Release(ref _connectivityParents);
         Release(ref _componentTriangleCounts);
         Release(ref _positionHashOwners);
         Release(ref _mcCounters);
         Release(ref _connectivityDispatchArgs);
         Release(ref _drawArgs);
+        Release(ref _lineDrawArgs);
         Release(ref _uniqueEdgeHashOwners);
         Release(ref _uniqueEdgeMasks);
         Release(ref _uniqueEdgeDispatchArgs);
+        Release(ref _compactDisplayEdges);
+        Release(ref _structuralSamples);
         if (_wireMaterial != null)
             Object.Destroy(_wireMaterial);
         if (_depthMaterial != null)
@@ -849,6 +1108,7 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         _drawProperties = null;
         _fusion = null;
         _marchingCubes = null;
+        _structuralReduction = null;
     }
 
     private void ReleaseAllTiles()
@@ -866,6 +1126,7 @@ internal sealed class RoomSetupReplicaV2GpuBackend : IDisposable
         if (tile == null)
             return;
         Release(ref tile.tsdf);
+        Release(ref tile.stabilityProbe);
     }
 
     private static void Release(ref RenderTexture texture)

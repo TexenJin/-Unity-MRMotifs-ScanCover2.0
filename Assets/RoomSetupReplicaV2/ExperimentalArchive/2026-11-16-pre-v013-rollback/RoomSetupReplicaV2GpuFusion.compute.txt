@@ -1,0 +1,469 @@
+#pragma kernel ClearVolume
+#pragma kernel IntegrateEnvironmentDepth
+
+// RoomSetupReplica production fusion. One thread owns one persistent voxel;
+// there is no full-frame GPU readback and no cross-voxel write authority.
+Texture2DArray<float> _EnvironmentDepthTexture;
+RWTexture3D<float2> _TsdfVolume;
+RWTexture3D<float4> _FusionStateVolume;
+
+int3 _VoxelCount;
+int2 _DepthSize;
+float3 _VolumeOrigin;
+float _VoxelSize;
+float _MinimumDepthMeters;
+float _MaximumDepthMeters;
+float _PositiveTruncationScale;
+float _NegativeTruncationScale;
+float _GradientThresholdSquared;
+float _MaximumWeight;
+int _FusionMode;
+float _ProbeStableDeltaMeters;
+float _ProbeUnstableDeltaMeters;
+float _ProbeMaximumStability;
+float _ProbeUnstablePenalty;
+float _RobustAgreementDeltaMeters;
+float _RobustCandidateDeltaMeters;
+float _RobustCandidateAgreementMeters;
+float _RobustStereoAgreementMeters;
+float _RobustMaximumMaturity;
+float _RobustCandidatePromotionSupport;
+float _RobustFreeSpacePromotionConflict;
+float _RobustOccupiedPromotionConflict;
+float _RobustSameViewSupport;
+float _RobustSingleEyeSupport;
+float4x4 _EnvironmentDepthReprojectionMatrices[2];
+float4x4 _EnvironmentDepthReprojectionInverse[2];
+float4 _EnvironmentDepthZBufferParams;
+float3 _EnvironmentEyeCentre;
+
+struct Observation
+{
+    float valid;
+    float distance;
+    float weight;
+};
+
+bool Finite1(float value)
+{
+    return value == value && abs(value) < 100000.0;
+}
+
+bool Finite3(float3 value)
+{
+    return all(value == value) && all(abs(value) < 100000.0);
+}
+
+float3 VoxelToWorld(uint3 coordinate)
+{
+    return _VolumeOrigin +
+           ((float3)coordinate - (float3)_VoxelCount * 0.5) *
+           _VoxelSize;
+}
+
+bool LoadEnvironmentProjectiveDepth(
+    int2 pixel, int eye, out float depth, out float3 world)
+{
+    depth = 0.0;
+    world = 0.0;
+    if (pixel.x < 0 || pixel.y < 0 ||
+        pixel.x >= _DepthSize.x || pixel.y >= _DepthSize.y)
+        return false;
+
+    float depthTexture = _EnvironmentDepthTexture.Load(
+        int4(pixel, eye, 0));
+    if (!(depthTexture > 0.0 && depthTexture < 1.0))
+        return false;
+
+    float depthNdc = depthTexture * 2.0 - 1.0;
+    float denominator =
+        depthNdc + _EnvironmentDepthZBufferParams.y;
+    if (abs(denominator) <= 0.000001)
+        return false;
+    depth = _EnvironmentDepthZBufferParams.x / denominator;
+    if (!Finite1(depth) || depth < _MinimumDepthMeters ||
+        depth > _MaximumDepthMeters)
+        return false;
+
+    float2 uv = ((float2)pixel + 0.5) / (float2)_DepthSize;
+    float4 depthSpace = float4(
+        uv * 2.0 - 1.0, depthNdc, 1.0);
+    float4 worldH = mul(
+        _EnvironmentDepthReprojectionInverse[eye], depthSpace);
+    if (abs(worldH.w) <= 0.00001)
+        return false;
+    world = worldH.xyz / worldH.w;
+    return Finite3(world);
+}
+
+bool GradientEnvironmentAccepted(int2 pixel, int eye)
+{
+    if (pixel.x <= 0 || pixel.y <= 0 ||
+        pixel.x >= _DepthSize.x - 1 || pixel.y >= _DepthSize.y - 1)
+        return false;
+
+    float leftDepth, rightDepth, upDepth, downDepth;
+    float3 ignoredWorld;
+    if (!LoadEnvironmentProjectiveDepth(pixel + int2(-1, 0), eye,
+                                        leftDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(1, 0), eye,
+                                        rightDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(0, -1), eye,
+                                        upDepth, ignoredWorld) ||
+        !LoadEnvironmentProjectiveDepth(pixel + int2(0, 1), eye,
+                                        downDepth, ignoredWorld))
+        return false;
+
+    float dx = rightDepth - leftDepth;
+    float dy = downDepth - upDepth;
+    return dx * dx + dy * dy <= _GradientThresholdSquared;
+}
+
+Observation ObserveEnvironmentVoxel(float3 voxelWorld, int eye)
+{
+    Observation result = (Observation)0;
+    float voxelRange = distance(voxelWorld, _EnvironmentEyeCentre);
+    if (!Finite1(voxelRange) || voxelRange > _MaximumDepthMeters)
+        return result;
+
+    float4 depthSpace = mul(
+        _EnvironmentDepthReprojectionMatrices[eye],
+        float4(voxelWorld, 1.0));
+    if (!Finite1(depthSpace.w) || depthSpace.w <= 0.00001)
+        return result;
+    float2 uv = depthSpace.xy / depthSpace.w * 0.5 + 0.5;
+    if (any(uv < 0.0) || any(uv >= 1.0))
+        return result;
+    int2 pixel = clamp((int2)floor(uv * (float2)_DepthSize),
+                       int2(0, 0), _DepthSize - 1);
+    if (!GradientEnvironmentAccepted(pixel, eye))
+        return result;
+
+    float observedDepth;
+    float3 surface;
+    if (!LoadEnvironmentProjectiveDepth(
+            pixel, eye, observedDepth, surface))
+        return result;
+    float surfaceRange = distance(surface, _EnvironmentEyeCentre);
+    if (!Finite1(surfaceRange) || surfaceRange < _MinimumDepthMeters ||
+        surfaceRange > _MaximumDepthMeters)
+        return result;
+
+    float denominator = depthSpace.z / depthSpace.w +
+                        _EnvironmentDepthZBufferParams.y;
+    if (abs(denominator) <= 0.000001)
+        return result;
+    float voxelDepth =
+        _EnvironmentDepthZBufferParams.x / denominator;
+    if (!Finite1(voxelDepth) || voxelDepth <= 0.0)
+        return result;
+
+    float factor = voxelDepth + 1.0;
+    float positive = _PositiveTruncationScale * factor;
+    float negative = _NegativeTruncationScale * factor;
+    float sampleDistance = min(observedDepth - voxelDepth, positive);
+    if (sampleDistance <= -negative)
+        return result;
+
+    result.valid = 1.0;
+    result.distance = sampleDistance;
+    result.weight = rcp(max(0.000001, factor * factor));
+    return result;
+}
+
+void FuseV011Observation(
+    inout float2 accumulated,
+    Observation observation)
+{
+    float retained = accumulated.y > 0.0
+        ? min(accumulated.y, _MaximumWeight - observation.weight)
+        : 0.0;
+    retained = max(0.0, retained);
+    float newWeight = retained + observation.weight;
+    float newDistance = retained > 0.0
+        ? (accumulated.x * retained +
+           observation.distance * observation.weight) /
+          max(newWeight, 0.000001)
+        : observation.distance;
+    accumulated = float2(newDistance, newWeight);
+}
+
+void WriteLatestSampleProbe(
+    inout float2 accumulated, Observation left, Observation right)
+{
+    float totalWeight = 0.0;
+    float weightedDistance = 0.0;
+    if (left.valid > 0.5)
+    {
+        totalWeight += left.weight;
+        weightedDistance += left.distance * left.weight;
+    }
+    if (right.valid > 0.5)
+    {
+        totalWeight += right.weight;
+        weightedDistance += right.distance * right.weight;
+    }
+    if (!(totalWeight > 0.0))
+        return;
+
+    float currentDistance = weightedDistance / totalWeight;
+    if (!(accumulated.y > 0.0) || any(accumulated != accumulated))
+    {
+        accumulated = float2(currentDistance, 1.0);
+        return;
+    }
+
+    float temporalDelta = abs(currentDistance - accumulated.x);
+    float stereoDelta = left.valid > 0.5 && right.valid > 0.5
+        ? abs(left.distance - right.distance)
+        : 0.0;
+    float worstDelta = max(temporalDelta, stereoDelta);
+    float stability = accumulated.y;
+    if (worstDelta <= _ProbeStableDeltaMeters)
+        stability = min(_ProbeMaximumStability, stability + 1.0);
+    else if (worstDelta >= _ProbeUnstableDeltaMeters)
+        stability = max(1.0, stability - _ProbeUnstablePenalty);
+    else
+        stability = max(1.0, stability - 1.0);
+
+    // Deliberately discard historical distance averaging.  The second
+    // channel is a temporal-consistency vote count, not fusion authority.
+    accumulated = float2(currentDistance, stability);
+}
+
+Observation CombineRobustStereo(
+    Observation left, Observation right)
+{
+    Observation combined = (Observation)0;
+    bool hasLeft = left.valid > 0.5;
+    bool hasRight = right.valid > 0.5;
+    if (hasLeft && hasRight)
+    {
+        if (abs(left.distance - right.distance) >
+            _RobustStereoAgreementMeters)
+            return combined;
+        float totalWeight = left.weight + right.weight;
+        combined.valid = 1.0;
+        combined.distance =
+            (left.distance * left.weight +
+             right.distance * right.weight) /
+            max(totalWeight, 0.000001);
+        combined.weight = 1.0;
+        return combined;
+    }
+    if (hasLeft || hasRight)
+    {
+        Observation single = left;
+        if (!hasLeft)
+            single = right;
+        combined.valid = 1.0;
+        combined.distance = single.distance;
+        combined.weight = _RobustSingleEyeSupport;
+    }
+    return combined;
+}
+
+uint RobustViewBit(float3 voxelWorld)
+{
+    float3 direction = voxelWorld - _EnvironmentEyeCentre;
+    float directionLength = length(direction);
+    if (!(directionLength > 0.000001))
+        return 1u;
+    direction /= directionLength;
+    float3 magnitude = abs(direction);
+    uint bucket;
+    if (magnitude.x >= magnitude.y && magnitude.x >= magnitude.z)
+        bucket = direction.x >= 0.0 ? 0u : 1u;
+    else if (magnitude.y >= magnitude.z)
+        bucket = direction.y >= 0.0 ? 2u : 3u;
+    else
+        bucket = direction.z >= 0.0 ? 4u : 5u;
+    return 1u << bucket;
+}
+
+float RobustConflictGain(
+    float candidateDistance, float publishedDistance, float quality)
+{
+    // A farther surface proves that the old nearer surface lies in measured
+    // free space.  A nearer surface may be a real occluder, so it receives
+    // deliberately weaker contradiction authority.
+    return candidateDistance > publishedDistance
+        ? quality
+        : quality * 0.5;
+}
+
+void StartRobustCandidate(
+    inout float4 candidate, float distance, float quality, uint viewBit,
+    float publishedDistance)
+{
+    candidate.x = distance;
+    candidate.y = quality;
+    candidate.z = (float)viewBit;
+    candidate.w = RobustConflictGain(
+        distance, publishedDistance, quality);
+}
+
+void UpdateRobustCandidate(
+    inout float2 published, inout float4 candidate,
+    Observation observation, uint viewBit)
+{
+    float quality = observation.weight;
+    if (!(candidate.y > 0.0) || any(candidate != candidate))
+    {
+        StartRobustCandidate(
+            candidate, observation.distance, quality, viewBit,
+            published.x);
+        return;
+    }
+
+    float candidateDelta = abs(observation.distance - candidate.x);
+    if (candidateDelta > _RobustCandidateAgreementMeters)
+    {
+        candidate.y = max(0.0, candidate.y - quality);
+        candidate.w = max(0.0, candidate.w - quality);
+        if (candidate.y <= 0.25)
+        {
+            StartRobustCandidate(
+                candidate, observation.distance, quality, viewBit,
+                published.x);
+        }
+        return;
+    }
+
+    uint viewMask = (uint)round(max(candidate.z, 0.0));
+    bool newView = (viewMask & viewBit) == 0u;
+    float supportGain = quality *
+        (newView ? 1.0 : _RobustSameViewSupport);
+    float blend = quality / max(candidate.y + quality, 0.000001);
+    candidate.x = lerp(candidate.x, observation.distance, saturate(blend));
+    candidate.y = min(12.0, candidate.y + supportGain);
+    candidate.z = (float)(viewMask | viewBit);
+    candidate.w = min(
+        12.0, candidate.w + RobustConflictGain(
+            candidate.x, published.x, quality));
+
+    bool freeSpaceCorrection = candidate.x > published.x;
+    float requiredConflict = freeSpaceCorrection
+        ? _RobustFreeSpacePromotionConflict
+        : _RobustOccupiedPromotionConflict;
+    if (candidate.y >= _RobustCandidatePromotionSupport &&
+        candidate.w >= requiredConflict)
+    {
+        published.x = candidate.x;
+        published.y = clamp(
+            candidate.y, 1.0, _RobustMaximumMaturity);
+        candidate = 0.0;
+    }
+}
+
+void FuseRobustPublishedCandidate(
+    inout float2 published, inout float4 candidate,
+    Observation observation, uint viewBit)
+{
+    if (!(published.y > 0.0) || any(published != published))
+    {
+        published = float2(observation.distance, observation.weight);
+        candidate = 0.0;
+        return;
+    }
+
+    float residual = observation.distance - published.x;
+    float absoluteResidual = abs(residual);
+    if (absoluteResidual <= _RobustAgreementDeltaMeters)
+    {
+        // Bounded history keeps a stable wall quiet without making it
+        // impossible to correct.  This is the only path that raises maturity.
+        float retained = min(published.y, 8.0);
+        float gain = observation.weight /
+                     max(retained + observation.weight, 0.000001);
+        published.x += residual * gain;
+        published.y = min(
+            _RobustMaximumMaturity,
+            published.y + observation.weight);
+        candidate.y = max(
+            0.0, candidate.y - observation.weight * 0.5);
+        candidate.w = max(
+            0.0, candidate.w - observation.weight);
+        if (candidate.y <= 0.25)
+            candidate = 0.0;
+        return;
+    }
+
+    if (absoluteResidual < _RobustCandidateDeltaMeters)
+    {
+        // The measured 95th-percentile wall jitter sits below this band.
+        // Move only by a clipped, low-gain robust step; do not grant maturity.
+        float retained = min(published.y, 12.0);
+        float gain = 0.5 * observation.weight /
+                     max(retained + observation.weight, 0.000001);
+        published.x += clamp(
+            residual,
+            -_RobustAgreementDeltaMeters,
+            _RobustAgreementDeltaMeters) * gain;
+        candidate.y = max(
+            0.0, candidate.y - observation.weight * 0.25);
+        candidate.w = max(
+            0.0, candidate.w - observation.weight * 0.5);
+        if (candidate.y <= 0.25)
+            candidate = 0.0;
+        return;
+    }
+
+    UpdateRobustCandidate(
+        published, candidate, observation, viewBit);
+    if (candidate.y >= 1.0)
+        published.y = max(
+            1.0, published.y - observation.weight * 0.25);
+}
+
+[numthreads(4, 4, 4)]
+void ClearVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount))
+        return;
+    _TsdfVolume[id] = float2(1.0, 0.0);
+    if (_FusionMode == 2 || _FusionMode == 3)
+        _FusionStateVolume[id] = 0.0;
+}
+
+[numthreads(4, 4, 4)]
+void IntegrateEnvironmentDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VoxelCount))
+        return;
+
+    float3 voxelWorld = VoxelToWorld(id);
+    Observation left = ObserveEnvironmentVoxel(voxelWorld, 0);
+    Observation right = ObserveEnvironmentVoxel(voxelWorld, 1);
+    if (left.valid < 0.5 && right.valid < 0.5)
+        return;
+
+    // B changes only the source publication contract. Fusion authority,
+    // ordering, truncation and accumulated weight remain v0.1.1-identical.
+    float2 accumulated = _TsdfVolume[id];
+    if (_FusionMode == 2 || _FusionMode == 3)
+    {
+        Observation combined = CombineRobustStereo(left, right);
+        if (combined.valid > 0.5)
+        {
+            float4 candidate = _FusionStateVolume[id];
+            FuseRobustPublishedCandidate(
+                accumulated, candidate, combined,
+                RobustViewBit(voxelWorld));
+            _TsdfVolume[id] = accumulated;
+            _FusionStateVolume[id] = candidate;
+        }
+        return;
+    }
+    if (_FusionMode == 1)
+    {
+        WriteLatestSampleProbe(accumulated, left, right);
+        _TsdfVolume[id] = accumulated;
+        return;
+    }
+    if (left.valid > 0.5)
+        FuseV011Observation(accumulated, left);
+    if (right.valid > 0.5)
+        FuseV011Observation(accumulated, right);
+    _TsdfVolume[id] = accumulated;
+}

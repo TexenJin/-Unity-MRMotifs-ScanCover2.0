@@ -5,6 +5,9 @@
 // there is no full-frame GPU readback and no cross-voxel write authority.
 Texture2DArray<float> _EnvironmentDepthTexture;
 RWTexture3D<float2> _TsdfVolume;
+// Observation-only temporal probe. It never contributes to TSDF distance or
+// weight; it exists solely to colour the published mesh by local stability.
+RWTexture3D<float2> _StabilityProbeVolume;
 
 int3 _VoxelCount;
 int2 _DepthSize;
@@ -16,6 +19,10 @@ float _PositiveTruncationScale;
 float _NegativeTruncationScale;
 float _GradientThresholdSquared;
 float _MaximumWeight;
+float _ProbeStableDeltaMeters;
+float _ProbeUnstableDeltaMeters;
+float _ProbeMaximumStability;
+float _ProbeUnstablePenalty;
 float4x4 _EnvironmentDepthReprojectionMatrices[2];
 float4x4 _EnvironmentDepthReprojectionInverse[2];
 float4 _EnvironmentDepthZBufferParams;
@@ -172,12 +179,54 @@ void FuseV011Observation(
     accumulated = float2(newDistance, newWeight);
 }
 
+void UpdateStabilityProbe(
+    inout float2 probe, Observation left, Observation right)
+{
+    float totalWeight = 0.0;
+    float weightedDistance = 0.0;
+    if (left.valid > 0.5)
+    {
+        totalWeight += left.weight;
+        weightedDistance += left.distance * left.weight;
+    }
+    if (right.valid > 0.5)
+    {
+        totalWeight += right.weight;
+        weightedDistance += right.distance * right.weight;
+    }
+    if (!(totalWeight > 0.0))
+        return;
+
+    float currentDistance = weightedDistance / totalWeight;
+    if (!(probe.y > 0.0) || any(probe != probe))
+    {
+        probe = float2(currentDistance, 1.0);
+        return;
+    }
+
+    float temporalDelta = abs(currentDistance - probe.x);
+    float stereoDelta = left.valid > 0.5 && right.valid > 0.5
+        ? abs(left.distance - right.distance)
+        : 0.0;
+    float worstDelta = max(temporalDelta, stereoDelta);
+    float stability = probe.y;
+    if (worstDelta <= _ProbeStableDeltaMeters)
+        stability = min(_ProbeMaximumStability, stability + 1.0);
+    else if (worstDelta >= _ProbeUnstableDeltaMeters)
+        stability = max(1.0, stability - _ProbeUnstablePenalty);
+    else
+        stability = max(1.0, stability - 1.0);
+
+    probe = float2(currentDistance, stability);
+}
+
 [numthreads(4, 4, 4)]
 void ClearVolume(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)_VoxelCount))
         return;
     _TsdfVolume[id] = float2(1.0, 0.0);
+    _StabilityProbeVolume[id] = float2(0.0, 0.0);
 }
 
 [numthreads(4, 4, 4)]
@@ -191,6 +240,10 @@ void IntegrateEnvironmentDepth(uint3 id : SV_DispatchThreadID)
     Observation right = ObserveEnvironmentVoxel(voxelWorld, 1);
     if (left.valid < 0.5 && right.valid < 0.5)
         return;
+
+    float2 probe = _StabilityProbeVolume[id];
+    UpdateStabilityProbe(probe, left, right);
+    _StabilityProbeVolume[id] = probe;
 
     // B changes only the source publication contract. Fusion authority,
     // ordering, truncation and accumulated weight remain v0.1.1-identical.

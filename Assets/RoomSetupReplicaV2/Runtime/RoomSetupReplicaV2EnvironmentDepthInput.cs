@@ -13,7 +13,6 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthInput : MonoBehaviour
     private float _previousTrigger;
     private float _nextActionTime;
     private Coroutine _hapticsStop;
-
     private void Update()
     {
         RoomSetupReplicaV2EnvironmentDepthScanner scanner =
@@ -48,7 +47,8 @@ public sealed class RoomSetupReplicaV2EnvironmentDepthInput : MonoBehaviour
             Pulse(0.45f, 0.10f);
         }
         if (OVRInput.GetDown(
-                OVRInput.Button.PrimaryThumbstick, controller) &&
+                OVRInput.RawButton.RThumbstick,
+                OVRInput.Controller.RTouch) &&
             AcceptAction() && scanner.FreezeCurrentReplica())
         {
             Pulse(0.55f, 0.14f);

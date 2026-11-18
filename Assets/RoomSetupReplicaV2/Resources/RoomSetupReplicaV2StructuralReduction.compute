@@ -1,0 +1,70 @@
+#pragma kernel BuildStructuralSamples
+
+StructuredBuffer<float3> _CandidateTriangleVertices;
+StructuredBuffer<float3> _FilteredTriangleVertices;
+StructuredBuffer<uint> _Counters;
+RWStructuredBuffer<float4> _StructuralSamples;
+
+uint _MaximumTriangleVertices;
+uint _MaximumStructuralSamples;
+
+float3 LoadFinalVertex(uint vertexIndex)
+{
+    return _Counters[6] != 0u
+        ? _FilteredTriangleVertices[vertexIndex]
+        : _CandidateTriangleVertices[vertexIndex];
+}
+
+[numthreads(64, 1, 1)]
+void BuildStructuralSamples(uint3 id : SV_DispatchThreadID)
+{
+    uint sampleIndex = id.x;
+    if (sampleIndex >= _MaximumStructuralSamples)
+        return;
+
+    uint vertexCount = _Counters[6] != 0u
+        ? _Counters[4]
+        : min(_Counters[0], _MaximumTriangleVertices);
+    uint triangleCount = vertexCount / 3u;
+    uint sampleCount = min(triangleCount, _MaximumStructuralSamples);
+    uint outputBase = sampleIndex * 4u;
+    if (sampleIndex >= sampleCount || sampleCount == 0u)
+    {
+        _StructuralSamples[outputBase] = 0.0;
+        _StructuralSamples[outputBase + 1u] = 0.0;
+        _StructuralSamples[outputBase + 2u] = 0.0;
+        _StructuralSamples[outputBase + 3u] = 0.0;
+        return;
+    }
+
+    // Evenly sample the exact buffer selected by the production draw path.
+    uint triangleIndex = min(
+        (uint)floor((float)sampleIndex * (float)triangleCount /
+                    (float)sampleCount),
+        triangleCount - 1u);
+    uint vertexBase = triangleIndex * 3u;
+    float3 a = LoadFinalVertex(vertexBase);
+    float3 b = LoadFinalVertex(vertexBase + 1u);
+    float3 c = LoadFinalVertex(vertexBase + 2u);
+    float3 crossValue = cross(b - a, c - a);
+    float twiceArea = length(crossValue);
+    if (!(twiceArea > 0.000001) || any(a != a) || any(b != b) || any(c != c))
+    {
+        _StructuralSamples[outputBase] = 0.0;
+        _StructuralSamples[outputBase + 1u] = 0.0;
+        _StructuralSamples[outputBase + 2u] = 0.0;
+        _StructuralSamples[outputBase + 3u] = 0.0;
+        return;
+    }
+
+    float representedTriangleCount =
+        (float)triangleCount / (float)sampleCount;
+    float representedArea = 0.5 * twiceArea * representedTriangleCount;
+    // Preserve the triangle footprint so the structural pass can distinguish
+    // supported regions from the empty space inside a plane's min/max bounds.
+    _StructuralSamples[outputBase] = float4(a, representedArea);
+    _StructuralSamples[outputBase + 1u] = float4(b, 1.0);
+    _StructuralSamples[outputBase + 2u] = float4(c, 1.0);
+    _StructuralSamples[outputBase + 3u] =
+        float4(crossValue / twiceArea, 1.0);
+}
