@@ -2,7 +2,7 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
 {
     Properties
     {
-        _BaseColor ("Color", Color) = (0.02, 0.86, 1.0, 0.88)
+        _BaseColor ("Color", Color) = (1.0, 1.0, 1.0, 0.92)
         _LineWidthPixels ("Line Width", Range(0.75, 3.0)) = 1.5
         _LineReferenceDistance ("Full Width Distance", Float) = 0.5
         _UniqueEdgesOnly ("Unique Edges Only", Float) = 0
@@ -38,8 +38,6 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
 
             StructuredBuffer<float3> _RoomSetupMcCandidateVertices;
             StructuredBuffer<float3> _RoomSetupMcFilteredVertices;
-            StructuredBuffer<float> _RoomSetupMcCandidateStability;
-            StructuredBuffer<float> _RoomSetupMcFilteredStability;
             StructuredBuffer<uint> _RoomSetupMcCounters;
             StructuredBuffer<uint> _RoomSetupMcCompactDisplayEdges;
 
@@ -56,7 +54,6 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
             {
                 float4 positionHCS : SV_POSITION;
                 float edgeCoordinate : TEXCOORD0;
-                nointerpolation float stability : TEXCOORD1;
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -72,13 +69,6 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
                 return _RoomSetupMcCounters[6] != 0u
                     ? _RoomSetupMcFilteredVertices[vertexID]
                     : _RoomSetupMcCandidateVertices[vertexID];
-            }
-
-            float LoadStability(uint vertexID)
-            {
-                return _RoomSetupMcCounters[6] != 0u
-                    ? _RoomSetupMcFilteredStability[vertexID]
-                    : _RoomSetupMcCandidateStability[vertexID];
             }
 
             Varyings Vert(Attributes input)
@@ -99,9 +89,6 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
                 uint triangleBase = triangleIndex * 3u;
                 float3 positionA = LoadPosition(triangleBase + cornerA);
                 float3 positionB = LoadPosition(triangleBase + cornerB);
-                output.stability = min(
-                    LoadStability(triangleBase + cornerA),
-                    LoadStability(triangleBase + cornerB));
                 float4 clipA = TransformWorldToHClip(positionA);
                 float4 clipB = TransformWorldToHClip(positionB);
                 float2 ndcA = clipA.xy / max(abs(clipA.w), 0.00001);
@@ -137,14 +124,8 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubes"
                 float coverage = 1.0 - smoothstep(
                     1.0 - feather, 1.0, edge);
                 clip(coverage - 0.01);
-                half3 changing = half3(1.0, 0.05, 0.03);
-                half3 settling = half3(1.0, 0.75, 0.05);
-                half3 stabilityColor = input.stability < 0.5
-                    ? lerp(changing, settling,
-                           saturate(input.stability * 2.0))
-                    : lerp(settling, _BaseColor.rgb,
-                           saturate((input.stability - 0.5) * 2.0));
-                return half4(stabilityColor, _BaseColor.a * coverage);
+                return half4(1.0, 1.0, 1.0,
+                             _BaseColor.a * coverage);
             }
             ENDHLSL
         }

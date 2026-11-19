@@ -1,24 +1,4 @@
-# RoomSetup Replica V2 — v0.1.4
-
-## v0.1.4 simplified-room archive
-
-This release archives the improved simplified-room result currently accepted
-on Quest.  After the scan is frozen, the runtime reads the current complete
-Marching Cubes mesh and runs the full blind route on that same snapshot:
-
-1. open 5 cm contour-stack evidence;
-2. four graph-cut variants and three-of-four consensus;
-3. rectilinear topology and mother-wall micro-step refit;
-4. cross-height final-surface registration;
-5. the double-sided transparent wall, floor and ceiling room shell.
-
-No previous simplified outline, offline fitted polygon, annotated region or
-intermediate JSON is accepted as runtime input.  End-to-end blind mode is
-required by default.  If the frozen full-mesh readback or any blind contour
-stage fails, the runtime leaves the simplified room absent and reports the
-failed stage instead of silently publishing the legacy floor/ceiling fallback.
-Successful exports identify themselves with
-`equivalenceMode=end_to_end_blind_current_frozen_mesh`.
+# RoomSetup Replica V2 — v0.1.3
 
 ## Current weighted production selection and comparison routes
 
@@ -94,12 +74,34 @@ probe, or offline training route remains in the production directory.
 - Fusion and geometry: `Runtime/Core/` and `Resources/` contain the production GPU TSDF
   and GPU Marching Cubes implementation.
 - Range: hard 3 m admission boundary; unsupported space remains empty.
-- Fusion, truncation, admission range, tile scheduling, MC cadence and display
-  remain identical to the tagged `v0.1.3` production route.
+- Truncation, depth range, tile scheduling and MC cadence remain identical to
+  the tagged `v0.1.3` route. Fusion now has a binocular-common 80% circular
+  write gate: the 70-80% annulus may accumulate and correct TSDF history in
+  the background, while samples outside 80% update neither TSDF weight nor the
+  stability probe. Existing history outside the gate is preserved, not erased.
 - Mesh admission and cleanup are the tagged `v0.1.3` behavior: any positive
   accumulated support is admissible, with GPU-resident `RemoveSmall<32`
   component cleanup for meshes below 40,000 triangles.
-- Display: cyan wireframe with inverse-distance stroke width and optional unique-edge display.
+- Display: white wireframe with optional unique-edge display. The central 70%
+  binocular circle stamps persistent 10 cm world-space MC cells as revealed.
+  Already revealed cells remain visible after the viewer looks away; unseen
+  cells in the 70-80% working annulus continue fusing and extracting but do
+  not enter the display edge list.
+  Foreground Environment Depth blocks reveal-through. Both eyes consume the
+  same reveal ledger, so there is no independent per-eye screen clip.
+- Reveal is display-only. Export, structural sampling and simplified-room
+  generation continue to consume the complete extracted mesh.
+- Simplified-room fitting keeps the blind 5 cm contour-stack mother-wall route.
+  After mother-wall cleanup it may promote a large elevated outward recess to
+  a full-height notch only when the same continuous height band is shared by
+  the back wall and both side returns, and horizontal lower and upper caps are
+  both present. Exact cells are used; nearby mother-wall cells cannot lend
+  support. The minimum coherent height is 0.80 m, rejecting low cabinets,
+  floor-connected doorways, unobserved openings and small local dents.
+- A separate inward-pier pass restores only compact faces with continuous
+  near-floor-to-ceiling support and two full-height returns. Weak/partial
+  mother-wall evidence now abstains from flattening a <=15 cm step, and compact
+  recess/pier topology is excluded from the later surface-registration snap.
 - Observation: the former head-locked stereo depth window is retired from the
   production scene and is not created by the controller input path.
 
@@ -154,6 +156,4 @@ a small ADB-readable success/failure receipt.
 
 ## Frozen outcome
 
-On 2026-11-18 the current weighted mesh route and improved end-to-end blind
-simplified-room route were archived as `v0.1.4`. Unity packaging and final
-Quest acceptance remain user-owned.
+On 2026-11-08 this production route was frozen for its calmer presentation and closer resemblance to native RoomSetup. Unity packaging and final Quest acceptance remain user-owned.

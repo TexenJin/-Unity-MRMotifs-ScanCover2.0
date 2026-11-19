@@ -30,6 +30,8 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubesDepth"
             StructuredBuffer<float3> _RoomSetupMcCandidateVertices;
             StructuredBuffer<float3> _RoomSetupMcFilteredVertices;
             StructuredBuffer<uint> _RoomSetupMcCounters;
+            StructuredBuffer<uint> _RoomSetupMcCandidateRevealed;
+            StructuredBuffer<uint> _RoomSetupMcFilteredRevealed;
 
             struct Attributes
             {
@@ -39,6 +41,7 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubesDepth"
             struct Varyings
             {
                 float4 positionHCS : SV_POSITION;
+                nointerpolation float revealed : TEXCOORD0;
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -50,13 +53,19 @@ Shader "Genesis/RoomSetupReplicaV2GpuMarchingCubesDepth"
                 float3 positionWS = _RoomSetupMcCounters[6] != 0u
                     ? _RoomSetupMcFilteredVertices[input.vertexID]
                     : _RoomSetupMcCandidateVertices[input.vertexID];
+                uint triangleIndex = input.vertexID / 3u;
+                uint revealed = _RoomSetupMcCounters[6] != 0u
+                    ? _RoomSetupMcFilteredRevealed[triangleIndex]
+                    : _RoomSetupMcCandidateRevealed[triangleIndex];
                 output.positionHCS = TransformWorldToHClip(positionWS);
+                output.revealed = revealed != 0u ? 1.0 : 0.0;
                 return output;
             }
 
             half4 Frag(Varyings input) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+                clip(input.revealed - 0.5);
                 return 0;
             }
             ENDHLSL

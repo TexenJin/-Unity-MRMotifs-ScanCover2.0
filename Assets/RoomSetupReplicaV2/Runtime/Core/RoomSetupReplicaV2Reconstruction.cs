@@ -22,7 +22,7 @@ public sealed class RoomSetupReplicaV2Reconstruction : MonoBehaviour
 {
     [SerializeField] private bool showReplica = true;
     [SerializeField] private Color lineColor =
-        new Color(0.02f, 0.86f, 1f, 0.88f);
+        new Color(1f, 1f, 1f, 0.92f);
     [SerializeField, Range(0.75f, 3f)]
     private float lineWidthPixels = 1.5f;
 
