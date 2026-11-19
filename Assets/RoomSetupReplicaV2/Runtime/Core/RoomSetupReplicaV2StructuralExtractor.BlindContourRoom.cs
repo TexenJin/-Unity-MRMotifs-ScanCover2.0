@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 /// <summary>
@@ -34,20 +36,34 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
 
     private bool TryBuildRuntimeBlindContourFootprint(
         Vector3[] vertices, float floor, float ceiling,
+        CancellationToken token,
         out RuntimeFootprintSelection selection, out string issue)
     {
         selection = null;
         issue = "blind contour stack was empty";
         RuntimeBlindStack stack = BuildRuntimeBlindStack(
-            vertices, floor, ceiling);
+            vertices, floor, ceiling, token);
         if (stack == null)
             return false;
 
         bool[][,] variants = new bool[4][,];
-        variants[0] = SolveRuntimeBlindGraphCut(stack, 14f, 3f, 10f, 3f);
-        variants[1] = SolveRuntimeBlindGraphCut(stack, 20f, 2f, 12f, 3f);
-        variants[2] = SolveRuntimeBlindGraphCut(stack, 24f, 3f, 16f, 4f);
-        variants[3] = SolveRuntimeBlindGraphCut(stack, 30f, 2f, 18f, 5f);
+        float[] pairWeights = { 14f, 20f, 24f, 30f };
+        float[] boundaryWeights = { 3f, 2f, 3f, 2f };
+        float[] evidenceWeights = { 10f, 12f, 16f, 18f };
+        float[] anchorWeights = { 3f, 3f, 4f, 5f };
+        ParallelOptions options = new()
+        {
+            MaxDegreeOfParallelism = Math.Max(
+                1, Math.Min(variants.Length, runtimeGraphCutWorkerCount)),
+            CancellationToken = token
+        };
+        Parallel.For(0, variants.Length, options, variant =>
+        {
+            variants[variant] = SolveRuntimeBlindGraphCut(
+                stack, pairWeights[variant], boundaryWeights[variant],
+                evidenceWeights[variant], anchorWeights[variant]);
+        });
+        token.ThrowIfCancellationRequested();
 
         int width = stack.grid.cells.GetLength(0);
         int height = stack.grid.cells.GetLength(1);
@@ -128,7 +144,8 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     }
 
     private RuntimeBlindStack BuildRuntimeBlindStack(
-        Vector3[] vertices, float floor, float ceiling)
+        Vector3[] vertices, float floor, float ceiling,
+        CancellationToken token)
     {
         RuntimeEvidenceGrid grid = BuildRuntimeSliceGridTemplate(
             vertices, floor, ceiling);
@@ -153,6 +170,8 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         int vertexCount = vertices.Length - vertices.Length % 3;
         for (int i = 0; i < vertexCount; i += 3)
         {
+            if (i % 768 == 0)
+                token.ThrowIfCancellationRequested();
             Vector3 a = vertices[i];
             Vector3 b = vertices[i + 1];
             Vector3 c = vertices[i + 2];

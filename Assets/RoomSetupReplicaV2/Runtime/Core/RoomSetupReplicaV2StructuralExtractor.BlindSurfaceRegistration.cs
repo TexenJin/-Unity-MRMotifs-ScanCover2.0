@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
 
 /// <summary>
@@ -14,6 +15,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     private const float RuntimeSurfaceSearchRadius = 0.15f;
     private const float RuntimeSurfaceSearchStep = 0.005f;
     private const float RuntimeSurfaceKernelSigma = 0.018f;
+    private const float RuntimeSurfaceIndexBinSize = 0.05f;
 
     private struct RuntimeSurfaceObservation
     {
@@ -24,6 +26,15 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         public float heightMaximum;
         public float weight;
         public int heightFold;
+        public int sourceOrder;
+    }
+
+    private sealed class RuntimeSurfaceObservationIndex
+    {
+        public readonly Dictionary<int, List<RuntimeSurfaceObservation>>
+            constantU = new();
+        public readonly Dictionary<int, List<RuntimeSurfaceObservation>>
+            constantV = new();
     }
 
     private sealed class RuntimeSurfaceEdgeEvidence
@@ -55,6 +66,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     private bool TryRegisterRuntimeBlindWallSurfaces(
         Vector3[] vertices, List<Vector2> topology,
         float floor, float ceiling,
+        CancellationToken token,
         out List<Vector2> registered,
         out RuntimeSurfaceRegistrationStats stats)
     {
@@ -67,13 +79,17 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             ceiling - floor < RuntimeMinimumRoomHeight)
             return false;
 
+        RuntimeSurfaceObservationIndex index =
+            BuildRuntimeSurfaceObservationIndex(
+                vertices, floor, ceiling, token);
         List<RuntimeSurfaceEdgeEvidence> edges = new(topology.Count);
         List<float> acceptedShifts = new();
         for (int i = 0; i < topology.Count; i++)
         {
+            token.ThrowIfCancellationRequested();
             RuntimeSurfaceEdgeEvidence edge =
                 FitRuntimeBlindSurfaceEdge(
-                    vertices, topology[i], topology[(i + 1) % topology.Count],
+                    index, topology[i], topology[(i + 1) % topology.Count],
                     floor, ceiling);
             edges.Add(edge);
             if (!edge.accepted) continue;
@@ -124,7 +140,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     }
 
     private RuntimeSurfaceEdgeEvidence FitRuntimeBlindSurfaceEdge(
-        Vector3[] vertices, Vector2 a, Vector2 b,
+        RuntimeSurfaceObservationIndex index, Vector2 a, Vector2 b,
         float floor, float ceiling)
     {
         Vector2 delta = b - a;
@@ -149,7 +165,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
 
         List<RuntimeSurfaceObservation> observations =
             GatherRuntimeSurfaceObservations(
-                vertices, vertical, original,
+                index, vertical, original,
                 alongMinimum, alongMaximum, floor, ceiling);
         RuntimeSurfaceProfile full = FitRuntimeSurfaceProfile(
             observations, -1, original, alongMinimum, alongMaximum,
@@ -180,17 +196,16 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         return result;
     }
 
-    private List<RuntimeSurfaceObservation> GatherRuntimeSurfaceObservations(
-        Vector3[] vertices, bool constantU, float coordinate,
-        float alongMinimum, float alongMaximum,
-        float floor, float ceiling)
+    private RuntimeSurfaceObservationIndex BuildRuntimeSurfaceObservationIndex(
+        Vector3[] vertices, float floor, float ceiling,
+        CancellationToken token)
     {
-        List<RuntimeSurfaceObservation> observations = new();
-        Vector3 normalAxis = constantU ? _lastAxisA : _lastAxisB;
-        Vector3 tangentAxis = constantU ? _lastAxisB : _lastAxisA;
+        RuntimeSurfaceObservationIndex index = new();
         int count = vertices.Length - vertices.Length % 3;
         for (int i = 0; i < count; i += 3)
         {
+            if (i % 768 == 0)
+                token.ThrowIfCancellationRequested();
             Vector3 a = vertices[i];
             Vector3 b = vertices[i + 1];
             Vector3 c = vertices[i + 2];
@@ -201,40 +216,100 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             if (doubleArea <= 0.000001f)
                 continue;
             Vector3 normal = cross / doubleArea;
-            float alignment = Mathf.Abs(Vector3.Dot(normal, normalAxis));
-            if (Mathf.Abs(normal.y) > 0.55f || alignment < 0.78f)
-                continue;
-
-            Vector3 center = (a + b + c) / 3f;
-            float crossCoordinate = Vector3.Dot(center, normalAxis);
-            if (Mathf.Abs(crossCoordinate - coordinate) > 0.18f)
-                continue;
-            float ta = Vector3.Dot(a, tangentAxis);
-            float tb = Vector3.Dot(b, tangentAxis);
-            float tc = Vector3.Dot(c, tangentAxis);
-            float localAlongMinimum = Mathf.Min(ta, Mathf.Min(tb, tc));
-            float localAlongMaximum = Mathf.Max(ta, Mathf.Max(tb, tc));
-            if (localAlongMaximum < alongMinimum - 0.04f ||
-                localAlongMinimum > alongMaximum + 0.04f)
+            if (Mathf.Abs(normal.y) > 0.55f)
                 continue;
             float heightMinimum = Mathf.Min(a.y, Mathf.Min(b.y, c.y));
             float heightMaximum = Mathf.Max(a.y, Mathf.Max(b.y, c.y));
             if (heightMaximum < floor + 0.20f ||
                 heightMinimum > ceiling - 0.08f)
                 continue;
-            int heightFold = Mathf.FloorToInt(
-                (center.y - floor) / RuntimeSurfaceHeightBand) & 1;
-            observations.Add(new RuntimeSurfaceObservation
-            {
-                cross = crossCoordinate,
-                alongMinimum = localAlongMinimum,
-                alongMaximum = localAlongMaximum,
-                heightMinimum = heightMinimum,
-                heightMaximum = heightMaximum,
-                weight = doubleArea * 0.5f * alignment,
-                heightFold = heightFold
-            });
+            Vector3 center = (a + b + c) / 3f;
+            AddRuntimeSurfaceObservationToIndex(
+                index.constantU, a, b, c, center, normal, doubleArea,
+                _lastAxisA, _lastAxisB, heightMinimum, heightMaximum,
+                floor, i / 3);
+            AddRuntimeSurfaceObservationToIndex(
+                index.constantV, a, b, c, center, normal, doubleArea,
+                _lastAxisB, _lastAxisA, heightMinimum, heightMaximum,
+                floor, i / 3);
         }
+        return index;
+    }
+
+    private static void AddRuntimeSurfaceObservationToIndex(
+        Dictionary<int, List<RuntimeSurfaceObservation>> buckets,
+        Vector3 a, Vector3 b, Vector3 c, Vector3 center,
+        Vector3 normal, float doubleArea,
+        Vector3 normalAxis, Vector3 tangentAxis,
+        float heightMinimum, float heightMaximum,
+        float floor, int sourceOrder)
+    {
+        float alignment = Mathf.Abs(Vector3.Dot(normal, normalAxis));
+        if (alignment < 0.78f)
+            return;
+        float crossCoordinate = Vector3.Dot(center, normalAxis);
+        float ta = Vector3.Dot(a, tangentAxis);
+        float tb = Vector3.Dot(b, tangentAxis);
+        float tc = Vector3.Dot(c, tangentAxis);
+        RuntimeSurfaceObservation observation = new()
+        {
+            cross = crossCoordinate,
+            alongMinimum = Mathf.Min(ta, Mathf.Min(tb, tc)),
+            alongMaximum = Mathf.Max(ta, Mathf.Max(tb, tc)),
+            heightMinimum = heightMinimum,
+            heightMaximum = heightMaximum,
+            weight = doubleArea * 0.5f * alignment,
+            heightFold = Mathf.FloorToInt(
+                (center.y - floor) / RuntimeSurfaceHeightBand) & 1,
+            sourceOrder = sourceOrder
+        };
+        int bin = Mathf.FloorToInt(
+            crossCoordinate / RuntimeSurfaceIndexBinSize);
+        if (!buckets.TryGetValue(bin,
+                out List<RuntimeSurfaceObservation> values))
+        {
+            values = new List<RuntimeSurfaceObservation>();
+            buckets.Add(bin, values);
+        }
+        values.Add(observation);
+    }
+
+    private static List<RuntimeSurfaceObservation>
+        GatherRuntimeSurfaceObservations(
+        RuntimeSurfaceObservationIndex index,
+        bool constantU, float coordinate,
+        float alongMinimum, float alongMaximum,
+        float floor, float ceiling)
+    {
+        List<RuntimeSurfaceObservation> observations = new();
+        Dictionary<int, List<RuntimeSurfaceObservation>> buckets =
+            constantU ? index.constantU : index.constantV;
+        int firstBin = Mathf.FloorToInt(
+            (coordinate - 0.18f) / RuntimeSurfaceIndexBinSize);
+        int lastBin = Mathf.FloorToInt(
+            (coordinate + 0.18f) / RuntimeSurfaceIndexBinSize);
+        for (int bin = firstBin; bin <= lastBin; bin++)
+        {
+            if (!buckets.TryGetValue(bin,
+                    out List<RuntimeSurfaceObservation> values))
+                continue;
+            for (int i = 0; i < values.Count; i++)
+            {
+                RuntimeSurfaceObservation observation = values[i];
+                if (Mathf.Abs(observation.cross - coordinate) > 0.18f ||
+                    observation.alongMaximum < alongMinimum - 0.04f ||
+                    observation.alongMinimum > alongMaximum + 0.04f ||
+                    observation.heightMaximum < floor + 0.20f ||
+                    observation.heightMinimum > ceiling - 0.08f)
+                    continue;
+                observations.Add(observation);
+            }
+        }
+        // Restore source triangle order so floating-point accumulation and
+        // therefore the selected registration coordinate stay equivalent to
+        // the former full scan.
+        observations.Sort((left, right) =>
+            left.sourceOrder.CompareTo(right.sourceOrder));
         return observations;
     }
 

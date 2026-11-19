@@ -1517,6 +1517,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor : MonoBehaviou
     private void OnDestroy()
     {
         _requestPending = false;
+        CancelRuntimeRoomComputation();
         DestroyPreview();
         ReleaseObject(_wallMaterial);
         ReleaseObject(_floorMaterial);

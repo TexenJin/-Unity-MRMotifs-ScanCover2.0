@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -29,6 +31,10 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     private bool runtimeRequireEndToEndBlindRoom = true;
     [SerializeField]
     private bool runtimeRegisterBlindWallSurfaces = true;
+    [SerializeField]
+    private bool runtimeComputeRoomInBackground = true;
+    [SerializeField, Range(1, 4)]
+    private int runtimeGraphCutWorkerCount = 2;
     [SerializeField, Range(0.02f, 0.08f)]
     private float runtimeSurfaceFoldAgreement = 0.04f;
     [SerializeField, Range(0.05f, 0.20f)]
@@ -43,6 +49,8 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         new Color(0.02f, 0.95f, 1f, 0.95f);
 
     private bool _runtimeRoomBuildPending;
+    private CancellationTokenSource _runtimeRoomComputationCancellation;
+    private int _runtimeRoomComputationGeneration;
     private Transform _runtimeRoomRoot;
     private Material _runtimeWallMaterial;
     private Material _runtimeFloorMaterial;
@@ -51,6 +59,28 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     private readonly List<Vector3> _runtimeRoomOutline = new();
     private Vector3 _runtimeRoomAxisA = Vector3.right;
     private Vector3 _runtimeRoomAxisB = Vector3.forward;
+
+    private sealed class RuntimeRoomComputation
+    {
+        public bool success;
+        public string issue;
+        public List<Vector2> polygon;
+        public float floor;
+        public float ceiling;
+        public Vector3 axisA;
+        public Vector3 axisB;
+        public int sourceTriangleCount;
+        public int candidateCount;
+        public int appliedFeatureCount;
+        public int strongEdges;
+        public int moderateEdges;
+        public int weakEdges;
+        public string method;
+        public string parameter;
+        public float selectionScore;
+        public float maskIoU;
+        public long computeMilliseconds;
+    }
 
     public string SimplifiedRoomStatus { get; private set; } = "not built";
     public int SimplifiedRoomWallCount { get; private set; }
@@ -262,9 +292,9 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
     {
         if (!_runtimeRoomBuildPending || this == null || !isActiveAndEnabled)
             return;
-        _runtimeRoomBuildPending = false;
         if (vertices == null || vertices.Length < 12)
         {
+            _runtimeRoomBuildPending = false;
             if (runtimeRequireEndToEndBlindRoom)
             {
                 SimplifiedRoomStatus =
@@ -285,7 +315,13 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         }
 
         SimplifiedRoomSourceTriangleCount = vertices.Length / 3;
+        if (runtimeComputeRoomInBackground)
+        {
+            BeginRuntimeRoomComputation(vertices);
+            return;
+        }
 
+        _runtimeRoomBuildPending = false;
         if (!TryBuildRuntimeRoom(vertices, out string issue))
         {
             SimplifiedRoomStatus = issue;
@@ -300,7 +336,14 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
 
     public void ClearSimplifiedRoom()
     {
-        _runtimeRoomBuildPending = false;
+        CancelRuntimeRoomComputation();
+        ClearSimplifiedRoomInternal(true);
+    }
+
+    private void ClearSimplifiedRoomInternal(bool resetPending)
+    {
+        if (resetPending)
+            _runtimeRoomBuildPending = false;
         _runtimeRoomOutline.Clear();
         SimplifiedRoomWallCount = 0;
         SimplifiedRoomAttachedPierCount = 0;
@@ -334,17 +377,121 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         }
     }
 
+    private void CancelRuntimeRoomComputation()
+    {
+        _runtimeRoomComputationGeneration++;
+        CancellationTokenSource cancellation =
+            _runtimeRoomComputationCancellation;
+        _runtimeRoomComputationCancellation = null;
+        if (cancellation == null)
+            return;
+        cancellation.Cancel();
+        cancellation.Dispose();
+    }
+
+    private async void BeginRuntimeRoomComputation(Vector3[] frozenMesh)
+    {
+        CancelRuntimeRoomComputation();
+        int generation = _runtimeRoomComputationGeneration;
+        CancellationTokenSource cancellation = new();
+        CancellationToken token = cancellation.Token;
+        _runtimeRoomComputationCancellation = cancellation;
+        int sourceTriangleCount = frozenMesh.Length / 3;
+
+        // Unity objects are removed and recreated only on the main thread.
+        // The frozen Vector3 array and structural evidence are read-only for
+        // the lifetime of this request.
+        ClearSimplifiedRoomInternal(false);
+        SimplifiedRoomSourceTriangleCount = sourceTriangleCount;
+        SimplifiedRoomStatus = "computing simplified room off main thread";
+
+        RuntimeRoomComputation computation;
+        try
+        {
+            computation = await Task.Run(
+                () => ComputeRuntimeRoomData(
+                    frozenMesh, sourceTriangleCount, token), token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            if (generation != _runtimeRoomComputationGeneration ||
+                token.IsCancellationRequested)
+                return;
+            _runtimeRoomBuildPending = false;
+            SimplifiedRoomStatus =
+                "background simplified-room computation failed: " +
+                exception.Message;
+            Debug.LogException(exception, this);
+            return;
+        }
+
+        if (this == null || !isActiveAndEnabled ||
+            generation != _runtimeRoomComputationGeneration ||
+            token.IsCancellationRequested)
+            return;
+
+        if (ReferenceEquals(_runtimeRoomComputationCancellation,
+                            cancellation))
+        {
+            _runtimeRoomComputationCancellation = null;
+            cancellation.Dispose();
+        }
+        _runtimeRoomBuildPending = false;
+        if (!computation.success)
+        {
+            SimplifiedRoomStatus = computation.issue;
+            Debug.LogWarning("[RoomSetupReplicaV2] simplified room failed: " +
+                             computation.issue, this);
+            return;
+        }
+        if (!TryApplyRuntimeRoomData(computation, out string issue))
+        {
+            SimplifiedRoomStatus = issue;
+            Debug.LogWarning("[RoomSetupReplicaV2] simplified room failed: " +
+                             issue, this);
+            return;
+        }
+        Debug.Log("[RoomSetupReplicaV2] simplified room generated on Quest; " +
+                  SimplifiedRoomStatus, this);
+    }
+
     private bool TryBuildRuntimeRoom(Vector3[] frozenMesh,
                                      out string issue)
     {
         int sourceTriangleCount = SimplifiedRoomSourceTriangleCount;
-        ClearSimplifiedRoom();
+        ClearSimplifiedRoomInternal(true);
         SimplifiedRoomSourceTriangleCount = sourceTriangleCount;
+        RuntimeRoomComputation computation = ComputeRuntimeRoomData(
+            frozenMesh, sourceTriangleCount, CancellationToken.None);
+        if (!computation.success)
+        {
+            issue = computation.issue;
+            return false;
+        }
+        return TryApplyRuntimeRoomData(computation, out issue);
+    }
+
+    private RuntimeRoomComputation ComputeRuntimeRoomData(
+        Vector3[] frozenMesh, int sourceTriangleCount,
+        CancellationToken token)
+    {
+        System.Diagnostics.Stopwatch stopwatch =
+            System.Diagnostics.Stopwatch.StartNew();
+        RuntimeRoomComputation result = new()
+        {
+            sourceTriangleCount = sourceTriangleCount,
+            issue = "simplified-room computation did not complete"
+        };
+        token.ThrowIfCancellationRequested();
         if (!TryResolveRuntimeEnvelope(out float floor,
                                        out float ceiling))
         {
-            issue = "main floor/ceiling pair was not supported";
-            return false;
+            result.issue = "main floor/ceiling pair was not supported";
+            return result;
         }
 
         RuntimeEvidenceGrid raster = null;
@@ -359,18 +506,19 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             frozenMesh != null && frozenMesh.Length >= 12)
         {
             usedBlindContourStack = TryBuildRuntimeBlindContourFootprint(
-                frozenMesh, floor, ceiling, out selection,
+                frozenMesh, floor, ceiling, token, out selection,
                 out blindContourIssue);
         }
+        token.ThrowIfCancellationRequested();
         if (runtimeRequireEndToEndBlindRoom && !usedBlindContourStack)
         {
-            issue = !runtimeUseBlindContourStack
+            result.issue = !runtimeUseBlindContourStack
                 ? "blind end-to-end is required but contour stack is disabled"
                 : frozenMesh == null || frozenMesh.Length < 12
                 ? "blind end-to-end requires the current frozen full mesh"
                 : "blind end-to-end contour stage failed: " +
                   blindContourIssue;
-            return false;
+            return result;
         }
         if (!usedBlindContourStack &&
             frozenMesh != null && frozenMesh.Length >= 12)
@@ -385,8 +533,9 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             raster = BuildRuntimeFootprintEvidence(floor, ceiling);
         if (!usedBlindContourStack && raster == null)
         {
-            issue = "multi-height stack and floor/ceiling evidence were empty";
-            return false;
+            result.issue =
+                "multi-height stack and floor/ceiling evidence were empty";
+            return result;
         }
 
         if (!usedBlindContourStack)
@@ -403,26 +552,26 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
                 closed, raster, false, floor, ceiling);
             if (uLines.Count < 2 || vLines.Count < 2)
             {
-                issue = "not enough supported wall coordinates";
-                return false;
+                result.issue = "not enough supported wall coordinates";
+                return result;
             }
 
             if (!TrySelectRuntimeFootprint(closed, raster, uLines, vLines,
                     floor, ceiling, out selection,
                     out string selectionIssue))
             {
-                issue = selectionIssue;
-                return false;
+                result.issue = selectionIssue;
+                return result;
             }
         }
-        List<Vector2> polygon = selection.polygon;
-        SimplifiedRoomCandidateCount = selection.candidateCount;
-        SimplifiedRoomMethod = usedBlindContourStack
+        token.ThrowIfCancellationRequested();
+        List<Vector2> polygon = new(selection.polygon);
+        string method = usedBlindContourStack
             ? "fully_blind_end_to_end_current_mesh+" + selection.method
             : usedMultiHeightSlice
             ? "multi_height_5cm_stack+" + selection.method
             : "floor_ceiling_fallback+" + selection.method;
-        SimplifiedRoomParameter = usedBlindContourStack
+        string parameter = usedBlindContourStack
             ? selection.parameter
             : usedMultiHeightSlice
             ? $"heightRange={sliceMinimumHeight:F3}-" +
@@ -430,18 +579,12 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
               $"stackScore={sliceScore:F3}," +
               $"validLayers={validSliceLayers};{selection.parameter}"
             : selection.parameter;
-        SimplifiedRoomSelectionScore = selection.score;
-        SimplifiedRoomMaskIoU = selection.maskIoU;
-        SimplifiedRoomFloorHeight = floor;
-        SimplifiedRoomCeilingHeight = ceiling;
-        _runtimeRoomAxisA = _lastAxisA;
-        _runtimeRoomAxisB = _lastAxisB;
-
         CleanupRuntimePolygon(polygon);
         if (polygon.Count < 4 || Mathf.Abs(RuntimePolygonArea(polygon)) < 1f)
         {
-            issue = "outer footprint was too small after simplification";
-            return false;
+            result.issue =
+                "outer footprint was too small after simplification";
+            return result;
         }
         if (RuntimePolygonArea(polygon) < 0f)
             polygon.Reverse();
@@ -462,6 +605,7 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             polygon = ApplyRuntimeBoundaryFeatures(
                 polygon, boundaryFeatures, out appliedFeatureCount);
         }
+        token.ThrowIfCancellationRequested();
         CleanupRuntimePolygon(polygon);
         if (RuntimePolygonArea(polygon) < 0f)
             polygon.Reverse();
@@ -476,13 +620,13 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
             frozenMesh != null && frozenMesh.Length >= 12)
         {
             bool registrationApplied = TryRegisterRuntimeBlindWallSurfaces(
-                frozenMesh, polygon, floor, ceiling,
+                frozenMesh, polygon, floor, ceiling, token,
                 out List<Vector2> registeredPolygon,
                 out RuntimeSurfaceRegistrationStats registration);
             if (registrationApplied)
                 polygon = registeredPolygon;
-            SimplifiedRoomMethod += "+cross_height_surface_registration";
-            SimplifiedRoomParameter +=
+            method += "+cross_height_surface_registration";
+            parameter +=
                 $";surfaceRegistered={registration.acceptedEdges}/" +
                 $"{registration.edgeCount}," +
                 $"surfaceApplied={(registrationApplied ? 1 : 0)}," +
@@ -491,6 +635,52 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
                 $"foldAgreement={runtimeSurfaceFoldAgreement:F3}," +
                 $"shiftLimit={runtimeSurfaceMaximumShift:F3}";
         }
+        token.ThrowIfCancellationRequested();
+        stopwatch.Stop();
+        result.success = true;
+        result.issue = "";
+        result.polygon = new List<Vector2>(polygon);
+        result.floor = floor;
+        result.ceiling = ceiling;
+        result.axisA = _lastAxisA;
+        result.axisB = _lastAxisB;
+        result.candidateCount = selection.candidateCount;
+        result.appliedFeatureCount = appliedFeatureCount;
+        result.strongEdges = selection.strongEdges;
+        result.moderateEdges = selection.moderateEdges;
+        result.weakEdges = selection.weakEdges;
+        result.method = method;
+        result.parameter = parameter;
+        result.selectionScore = selection.score;
+        result.maskIoU = selection.maskIoU;
+        result.computeMilliseconds = stopwatch.ElapsedMilliseconds;
+        return result;
+    }
+
+    private bool TryApplyRuntimeRoomData(RuntimeRoomComputation computation,
+                                         out string issue)
+    {
+        if (computation == null || !computation.success ||
+            computation.polygon == null)
+        {
+            issue = computation != null ? computation.issue :
+                "simplified-room result was empty";
+            return false;
+        }
+        List<Vector2> polygon = computation.polygon;
+        float floor = computation.floor;
+        float ceiling = computation.ceiling;
+        SimplifiedRoomSourceTriangleCount = computation.sourceTriangleCount;
+        SimplifiedRoomCandidateCount = computation.candidateCount;
+        SimplifiedRoomMethod = computation.method;
+        SimplifiedRoomParameter = computation.parameter;
+        SimplifiedRoomSelectionScore = computation.selectionScore;
+        SimplifiedRoomMaskIoU = computation.maskIoU;
+        SimplifiedRoomFloorHeight = floor;
+        SimplifiedRoomCeilingHeight = ceiling;
+        _runtimeRoomAxisA = computation.axisA;
+        _runtimeRoomAxisB = computation.axisB;
+
         Mesh roomMesh = BuildRuntimeRoomMesh(polygon, floor, ceiling);
         if (roomMesh == null || roomMesh.vertexCount == 0)
         {
@@ -503,18 +693,20 @@ public sealed partial class RoomSetupReplicaV2StructuralExtractor
         for (int i = 0; i < polygon.Count; i++)
             _runtimeRoomOutline.Add(RuntimeWorld(polygon[i], floor));
         SimplifiedRoomWallCount = polygon.Count;
-        SimplifiedRoomAttachedPierCount = appliedFeatureCount;
+        SimplifiedRoomAttachedPierCount = computation.appliedFeatureCount;
         SimplifiedRoomStatus =
             $"ready method={SimplifiedRoomMethod} " +
             $"parameter={SimplifiedRoomParameter} candidates=" +
-            $"{selection.candidateCount} samples=" +
+            $"{computation.candidateCount} samples=" +
             $"{SimplifiedRoomSourceTriangleCount} walls={polygon.Count} " +
-            $"strong={selection.strongEdges} " +
-            $"moderate={selection.moderateEdges} " +
-            $"weak={selection.weakEdges} " +
-            $"score={selection.score:F4} iou={selection.maskIoU:F4} " +
+            $"strong={computation.strongEdges} " +
+            $"moderate={computation.moderateEdges} " +
+            $"weak={computation.weakEdges} " +
+            $"score={computation.selectionScore:F4} " +
+            $"iou={computation.maskIoU:F4} " +
             $"boundaryFeatures={SimplifiedRoomAttachedPierCount} " +
-            $"floor={floor:F2}m ceiling={ceiling:F2}m";
+            $"floor={floor:F2}m ceiling={ceiling:F2}m " +
+            $"computeMs={computation.computeMilliseconds}";
         issue = "";
         return true;
     }
